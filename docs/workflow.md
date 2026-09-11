@@ -11,7 +11,14 @@ Use them from interactive CLI sessions as the owner requests.
 The owner authorized the initial bootstrap on `master`. `origin` is
 `https://github.com/coghex/hetoimasia.git`, matching the local project name.
 The owner corrected the repository-name typo during setup; the new target was empty.
-Local standalone design work uses a `docs-wip` worktree. CI is not configured.
+Local standalone design work uses a `docs-wip` worktree.
+GitHub Actions runs the validation pipeline described in
+[validation.md](validation.md): `plan` resolves the candidate's groups,
+`haskell-engine` and `haskell-workflow` execute the selected ones, and
+`build-test` publishes the aggregate verdict, alongside `review-approved` and
+its `dismiss-stale-approval` job from the review gate. A ruleset on `master`
+requires `build-test` and `review-approved` and requires branches to be up to
+date before merging.
 The issue-approval service and PR drainer were installed for this repository
 on the owner's machine on 2026-09-10. Both jobs are loaded under launchd and
 have not been started.

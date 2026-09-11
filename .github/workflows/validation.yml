@@ -1,0 +1,433 @@
+# Resolve this candidate's validation plan, execute the groups it selects, and
+# publish one honest `build-test` verdict.
+#
+# The plan is cheap and runs first on Python and Git alone, so a documentation
+# candidate never pays for a Haskell image to learn that it needs one job. The
+# workers execute only what the plan selected. `build-test` then runs whatever
+# happened upstream and decides the verdict from the receipts, so a selected
+# group can never pass because nothing ran it, and an explained omission is
+# never reported as a failure.
+name: validation
+
+on:
+  pull_request:
+    # `edited` is included because the pull-request body carries the validation
+    # request: changing which groups are asked for must re-plan, even though no
+    # commit moved.
+    types: [opened, reopened, synchronize, edited]
+  push:
+    branches: [master]
+
+concurrency:
+  # One group per pull request, and deliberately no cancellation: a prose edit
+  # must not destroy a code run that is still the newest useful execution.
+  # Freshness is enforced by `build-test` comparing the plan against the pull
+  # request's current state, not by throwing work away.
+  group: validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+# Every job reads; none writes, and none uses a secret.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      selected: ${{ steps.resolve.outputs.selected }}
+      engine: ${{ steps.resolve.outputs.engine }}
+      workflow: ${{ steps.resolve.outputs.workflow }}
+      base: ${{ steps.range.outputs.base }}
+      head: ${{ steps.range.outputs.head }}
+      # Selection uses the merge-base range, but every job executes this one
+      # integration candidate. Publishing it pins the revision the workers must
+      # confirm they checked out, so two jobs can never report on two trees.
+      candidate: ${{ github.sha }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          # The planner compares two commits, so it needs their history rather
+          # than a shallow tip.
+          fetch-depth: 0
+
+      - name: Resolve the comparison range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # A pull request's contribution is its merge-base range: upstream
+            # commits the branch has not touched are not this candidate's work.
+            git fetch --no-tags --quiet origin "$PR_BASE_SHA" "$PR_HEAD_SHA" 2>/dev/null || true
+            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            head="$PR_HEAD_SHA"
+          else
+            # A push's range is the commits it actually added. When its starting
+            # point is unavailable — a new branch, or history replaced by a
+            # force push — there is no honest comparison to make, and inventing
+            # a narrower one would under-select silently.
+            head="$PUSH_AFTER"
+            if [ -z "${PUSH_BEFORE:-}" ] \
+              || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+              echo "::error::the pushed range's starting commit ${PUSH_BEFORE:-<absent>} is unavailable; refusing to plan against an unknown base"
+              exit 1
+            fi
+            base="$(git merge-base "$PUSH_BEFORE" "$PUSH_AFTER")"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "planning $base..$head for $EVENT_NAME"
+
+      - name: Capture the validation request
+        env:
+          # The body reaches the file through the environment and never through
+          # shell interpolation: it is contributor-authored text, and the
+          # planner is the only thing that may interpret it.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          : > request.txt
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            printf '%s' "$PR_BODY" > request.txt
+          fi
+
+      - name: Resolve the plan
+        id: resolve
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+          HEAD: ${{ steps.range.outputs.head }}
+        run: |
+          set -uo pipefail
+          arguments=(--base "$BASE" --head "$HEAD" --json)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # A push carries no pull-request body, so it carries no request.
+            arguments+=(--request-file request.txt)
+          fi
+          if ! python3 tools/validation/plan.py "${arguments[@]}" > plan.json 2> plan.err; then
+            cat plan.err >&2
+            echo "::error::the validation planner failed; see the diagnostic above"
+            {
+              echo "## Validation plan"
+              echo
+              echo '```'
+              cat plan.err
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          plan = json.load(open("plan.json", encoding="utf-8"))
+          selected = plan["selected"]
+          engine = {"build.all", "test.engine", "smoke.console"}
+          print("selected=" + " ".join(selected))
+          print("engine=" + ("true" if engine & set(selected) else "false"))
+          print("workflow=" + ("true" if "test.workflow" in selected else "false"))
+
+          rows = [
+              "## Validation plan",
+              "",
+              f"`{plan['base']['commit'][:12]}`..`{plan['head']['commit'][:12]}`,"
+              f" policy version {plan['policy_version']}.",
+              "",
+              "| Group | Selected | Reason | Inputs changed |",
+              "| --- | --- | --- | --- |",
+          ]
+          for entry in plan["groups"]:
+              rows.append(
+                  f"| `{entry['id']}` | {'yes' if entry['selected'] else 'no'} |"
+                  f" {entry['reason']} | {'yes' if entry['inputs_changed'] else 'no'} |"
+              )
+          rows.append("")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n".join(rows))
+          PY
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-plan
+          path: plan.json
+          if-no-files-found: error
+
+  haskell-engine:
+    needs: plan
+    # A worker whose groups the plan all explained away is skipped entirely
+    # rather than started to do nothing.
+    if: needs.plan.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+
+      - name: Confirm the pinned candidate
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$CANDIDATE" ]; then
+            echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
+            exit 1
+          fi
+
+      - name: Download the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: validation-plan
+
+      - name: Restore the toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.ghcup
+          # The toolchain depends on the compiler and Cabal versions and on
+          # nothing in the repository, so no source edit can evict it.
+          key: ghcup-${{ runner.os }}-ghc-9.12.2-cabal-3.16.1.0
+
+      - name: Install GHC and Cabal
+        id: setup
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.12.2'
+          cabal-version: '3.16.1.0'
+          cabal-update: true
+
+      - name: Restore the package store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          # `cabal.project` carries the pinned Hackage index state, and the
+          # `.cabal` files carry the dependency bounds. Nothing else can change
+          # which packages are built, so a Markdown edit never evicts this.
+          key: cabal-store-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          restore-keys: |
+            cabal-store-${{ runner.os }}-ghc-9.12.2-
+
+      - name: Restore the build tree
+        uses: actions/cache@v4
+        with:
+          path: dist-newstyle
+          key: dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          # A partial match still saves most of the compile: a cache miss costs
+          # time and can never change a result.
+          restore-keys: |
+            dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-
+
+      - name: Run the selected groups
+        env:
+          SELECTED: ${{ needs.plan.outputs.selected }}
+        run: |
+          set -uo pipefail
+          mkdir -p receipts
+          status=0
+          # Every owned group runs even after one fails, so the aggregate sees
+          # a receipt for each of them rather than inferring the rest from the
+          # first failure.
+          for group in build.all test.engine smoke.console; do
+            case " $SELECTED " in
+              *" $group "*) ;;
+              *) echo "skipping $group: the plan did not select it"; continue ;;
+            esac
+            python3 tools/validation/run.py "$group" \
+              --plan plan.json \
+              --receipts receipts \
+              --toolchain "ghc=$(ghc --numeric-version)" \
+              --toolchain "cabal=$(cabal --numeric-version)" || status=1
+          done
+          exit "$status"
+
+      - name: Upload the receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-receipts-haskell-engine
+          path: receipts/
+          if-no-files-found: warn
+
+  haskell-workflow:
+    needs: plan
+    if: needs.plan.outputs.workflow == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+
+      - name: Confirm the pinned candidate
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$CANDIDATE" ]; then
+            echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
+            exit 1
+          fi
+
+      - name: Download the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: validation-plan
+
+      - name: Restore the toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.ghcup
+          key: ghcup-${{ runner.os }}-ghc-9.12.2-cabal-3.16.1.0
+
+      - name: Install GHC and Cabal
+        id: setup
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.12.2'
+          cabal-version: '3.16.1.0'
+          cabal-update: true
+
+      - name: Restore the package store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-store-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          restore-keys: |
+            cabal-store-${{ runner.os }}-ghc-9.12.2-
+
+      - name: Restore the build tree
+        uses: actions/cache@v4
+        with:
+          path: dist-newstyle
+          key: dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-
+
+      - name: Run the selected groups
+        env:
+          SELECTED: ${{ needs.plan.outputs.selected }}
+        run: |
+          set -uo pipefail
+          mkdir -p receipts
+          status=0
+          for group in test.workflow; do
+            case " $SELECTED " in
+              *" $group "*) ;;
+              *) echo "skipping $group: the plan did not select it"; continue ;;
+            esac
+            python3 tools/validation/run.py "$group" \
+              --plan plan.json \
+              --receipts receipts \
+              --toolchain "ghc=$(ghc --numeric-version)" \
+              --toolchain "cabal=$(cabal --numeric-version)" || status=1
+          done
+          exit "$status"
+
+      - name: Upload the receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-receipts-haskell-workflow
+          path: receipts/
+          if-no-files-found: warn
+
+  build-test:
+    needs: [plan, haskell-engine, haskell-workflow]
+    # This is the required check, so it must reach a conclusion whatever
+    # happened upstream. A skipped required workflow is not a verdict, and a
+    # documentation candidate reaches its status through exactly this path.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Reading the pull request's current head, base, and body is what proves
+      # this run's plan still describes it; reading the run's own jobs is what
+      # produces the timings. Neither needs write access.
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Require a resolved plan
+        if: needs.plan.result != 'success'
+        run: |
+          echo "::error::the plan job ${{ needs.plan.result }}, so there is no plan to decide a verdict against"
+          exit 1
+
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: validation-plan
+
+      - name: Download the receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: validation-receipts-*
+          path: receipts
+          merge-multiple: true
+        # A worker that never uploaded receipts is an obstacle the aggregate
+        # reports by name; failing the download here would hide it behind a
+        # generic artifact error.
+        continue-on-error: true
+
+      - name: Read the pull request's current state
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha' > current-head.txt
+          gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.base.sha' > current-base.txt
+          # The body goes straight to a file: it is contributor-authored text,
+          # and only the planner's grammar may interpret it.
+          gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.body // ""' > current-body.txt
+          git fetch --no-tags --quiet origin "$(cat current-base.txt)" "$(cat current-head.txt)" 2>/dev/null || true
+          git merge-base "$(cat current-base.txt)" "$(cat current-head.txt)" > current-merge-base.txt
+
+      - name: Record the run timings
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" > jobs.json
+          python3 tools/validation/timings.py --jobs jobs.json --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide the verdict
+        run: |
+          set -uo pipefail
+          arguments=(--plan plan.json --receipts receipts --summary "$GITHUB_STEP_SUMMARY")
+          arguments+=(--worker "haskell-engine=${{ needs['haskell-engine'].result }}:build.all,test.engine,smoke.console")
+          arguments+=(--worker "haskell-workflow=${{ needs['haskell-workflow'].result }}:test.workflow")
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            arguments+=(--expect-head "$(cat current-head.txt)")
+            arguments+=(--expect-base "$(cat current-merge-base.txt)")
+            arguments+=(--expect-request-file current-body.txt)
+          fi
+          python3 tools/validation/aggregate.py "${arguments[@]}"

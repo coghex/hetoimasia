@@ -1,0 +1,166 @@
+# Publish `review-approved`, and invalidate an approval the pushed code moved
+# out from under.
+#
+# Neither verdict is read from the event payload. A `synchronize` run exists
+# because the head moved, and the same push starts the stale-approval decision
+# that may be about to remove `reviewed:approve`: answering from the payload
+# would publish the label state from before that decision. Both jobs therefore
+# read the pull request's current state, and both refuse to act for a head that
+# has already been superseded.
+#
+# This slice never keeps an approval across a content-changing push. Carrying
+# review through a clean base merge is CI-4's work, and inventing it here would
+# let approved-looking code reach the drainer without a review of that code.
+name: review-gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+# There is deliberately no concurrency group: queueing these runs against each
+# other would let GitHub cancel a pending `dismiss-stale-approval`, and a
+# cancelled invalidation decision is indistinguishable from one that never
+# reached a verdict. Each event gets its own run, and the current-head check
+# below is what stops a superseded one from publishing.
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dismiss-stale-approval:
+    # Only a push can invalidate an approval. Label events are answered by
+    # `review-approved` alone, so the copies they start are skipped rather than
+    # allowed to re-decide an untouched head.
+    if: github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The only write this workflow needs, and the only job that has it. It
+      # checks out nothing and runs no repository script, so the elevated token
+      # never reaches contributor-authored code.
+      pull-requests: write
+    steps:
+      - name: Decide and apply the approval's fate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          LABEL: reviewed:approve
+        run: |
+          set -euo pipefail
+
+          current_head="$(gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha')"
+          if [ "$current_head" != "$EVENT_HEAD" ]; then
+            # Removing approval from a head this run never examined would
+            # invalidate someone else's newer review. The run started for that
+            # newer head is the one entitled to decide.
+            echo "::error::this run was started for head $EVENT_HEAD, but the head is now $current_head; refusing to change approval for a superseded head"
+            exit 1
+          fi
+
+          # Whether the push changed any file is a question about trees, not
+          # about commits: a re-pushed identical tree changes nothing a reviewer
+          # read. An unavailable starting point is treated as a change, because
+          # an unreadable comparison cannot establish that nothing moved.
+          before_tree=""
+          if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            before_tree="$(gh api "repos/$REPOSITORY/commits/$BEFORE" --jq '.commit.tree.sha' 2>/dev/null || true)"
+          fi
+          after_tree="$(gh api "repos/$REPOSITORY/commits/$AFTER" --jq '.commit.tree.sha')"
+
+          if [ -n "$before_tree" ] && [ "$before_tree" = "$after_tree" ]; then
+            changed=no
+          else
+            changed=yes
+          fi
+
+          attached=no
+          if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
+            | grep -qxF "$LABEL"; then
+            attached=yes
+          fi
+
+          echo "push $BEFORE..$AFTER changed tracked files: $changed; $LABEL attached: $attached"
+
+          if [ "$changed" = "no" ]; then
+            verdict="kept: the push changed no tracked file"
+          elif [ "$attached" = "no" ]; then
+            verdict="absent: the push changed tracked files, and $LABEL was not attached"
+          else
+            gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
+            # Confirm from the repository rather than from the command's exit
+            # status: the drainer reads this job's success together with the
+            # label, so a removal that did not take must not look like one that
+            # did.
+            if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
+              | grep -qxF "$LABEL"; then
+              echo "::error::$LABEL is still attached after the removal"
+              exit 1
+            fi
+            verdict="removed: the push changed tracked files"
+          fi
+
+          echo "$LABEL $verdict"
+          {
+            echo "## Stale approval"
+            echo
+            echo "- Push: \`${BEFORE:0:12}\`..\`${AFTER:0:12}\`"
+            echo "- Changed tracked files: $changed"
+            echo "- \`$LABEL\`: $verdict"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  review-approved:
+    # Runs after the invalidation decision on every event, so a synchronize can
+    # never publish approval before that decision has been made.
+    needs: [dismiss-stale-approval]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Publish the review verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          DISMISSAL: ${{ needs['dismiss-stale-approval'].result }}
+          LABEL: reviewed:approve
+        run: |
+          set -euo pipefail
+          current_head="$(gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha')"
+          attached=false
+          if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
+            | grep -qxF "$LABEL"; then
+            attached=true
+          fi
+          {
+            echo "## Review gate"
+            echo
+            echo "- Head: \`${current_head:0:12}\`"
+            echo "- Stale-approval decision: $DISMISSAL"
+            echo "- \`$LABEL\` attached: $attached"
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/validation/review_gate.py \
+            --event-action "$EVENT_ACTION" \
+            --event-head "$EVENT_HEAD" \
+            --current-head "$current_head" \
+            --dismissal-result "$DISMISSAL" \
+            --label-attached "$attached" \
+            --label "$LABEL"
