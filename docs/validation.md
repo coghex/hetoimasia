@@ -426,7 +426,9 @@ gh api -X POST repos/coghex/hetoimasia/rulesets --input - <<'JSON'
   "target": "branch",
   "enforcement": "active",
   "conditions": {"ref_name": {"include": ["refs/heads/master"], "exclude": []}},
-  "bypass_actors": [],
+  "bypass_actors": [
+    {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+  ],
   "rules": [
     {
       "type": "required_status_checks",
@@ -444,16 +446,27 @@ gh api -X POST repos/coghex/hetoimasia/rulesets --input - <<'JSON'
 JSON
 ```
 
-Verify the active configuration, including each required check, with:
+The active ruleset is `22930055`. Verify it, including each required check, with:
 
 ```bash
 gh api repos/coghex/hetoimasia/rulesets
-gh api repos/coghex/hetoimasia/rulesets/<id>
+gh api repos/coghex/hetoimasia/rulesets/22930055
 ```
 
-The strict up-to-date policy applies to direct pushes as well as merges, so
-landing anything on `master` outside a pull request requires that commit to
-carry both passing checks first.
+A ruleset's required status checks apply to direct pushes as well as merges: a
+commit pushed straight to `master` is rejected because it cannot carry a passing
+`build-test` before it exists. That would have retired the standalone
+documentation lane through `tools/docs_land.sh`, so the repository Admin role
+holds an `always` bypass and the owner keeps that lane.
+
+The bypass makes enforcement advisory for the owner, and therefore for the
+drainer, which merges under the owner's identity. That is a deliberate trade,
+and it costs less than it appears: the drainer reads `build-test` and
+`review-approved` itself and will not merge without them, so the ruleset's job
+here is the freshness signal rather than the gate. It still supplies that
+signal — an out-of-date candidate reports `mergeStateStatus: BEHIND` with the
+bypass in place, which is what makes the drainer request a branch update. A
+candidate whose checks have not passed reports `BLOCKED`.
 
 ## What the hosted platform cannot cover
 
