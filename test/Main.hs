@@ -138,6 +138,7 @@ main = hspec $ do
     it "rejects a malformed override list" testParseOverridesRejected
     it "parses the Debug selection and collapses repeats" testParseDebug
     it "rejects a malformed Debug selection" testParseDebugRejected
+    it "quotes and escapes a rejected value in its message" testParseEscaping
   describe "Startup configuration" $ do
     it "keeps every default when no variable is present" testResolveDefaults
     it "assembles the filter from all three variables" testResolveAll
@@ -148,6 +149,7 @@ main = hspec $ do
     it "emits the smoke records under the default configuration" testConsoleDefault
     it "applies a threshold and an exact override to the smoke path" testConsoleThreshold
     it "fails before any entry for each invalid variable" testConsoleInvalid
+    it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
     it "keeps help visible and validates configuration on that path" testConsoleHelp
 
 -- Fixtures -------------------------------------------------------------------
@@ -964,6 +966,26 @@ testParseDebugRejected = forM_ rejected (rejects parseDebugSelection)
       , ("", "required")
       ]
 
+testParseEscaping ∷ IO ()
+testParseEscaping = do
+  -- A rejected value is quoted and escaped the way the record layout escapes
+  -- text, so nothing a value carries can split the diagnostic or forge a line.
+  forM_ rejections $ \(parse, value) → case parse value of
+    Right accepted → expectationFailure ("accepted " <> show value <> ": " <> accepted)
+    Left reason → do
+      Text.unpack reason `shouldContain` "\"bad\\nforged\""
+      Text.lines reason `shouldBe` [reason]
+  where
+    forged = "bad\nforged"
+    -- Each parser reports through the same helper, including the component
+    -- rejection an override list propagates.
+    rejections =
+      [ (fmap show . parseLogLevel, forged)
+      , (fmap show . parseComponentLevels, forged <> "=warn")
+      , (fmap show . parseDebugSelection, forged)
+      , (fmap show . mkComponent, forged)
+      ]
+
 -- Startup configuration -------------------------------------------------------
 
 -- | A lookup over a fixed table, with no environment behind it at all.
@@ -1155,6 +1177,18 @@ testConsoleInvalid = forM_ invalid $ \(name, value) → do
       , ("HETOIMASIA_LOG_LEVELS", "gpu.vulkan=warn,gpu.vulkan=info")
       , ("HETOIMASIA_DEBUG", "All")
       ]
+
+testConsoleForgedValue ∷ IO ()
+testConsoleForgedValue = do
+  -- An embedded newline in a value must not reach stderr as a second line: the
+  -- startup contract is one line naming the variable and the reason.
+  (code, output, diagnostics) ←
+    runConsole [("HETOIMASIA_LOG_LEVEL", "bad\nforged")] ["--smoke"]
+  code `shouldNotBe` ExitSuccess
+  output `shouldBe` ""
+  length (lines diagnostics) `shouldBe` 1
+  diagnostics `shouldStartWith` "HETOIMASIA_LOG_LEVEL: "
+  diagnostics `shouldContain` "\"bad\\nforged\""
 
 testConsoleHelp ∷ IO ()
 testConsoleHelp = do

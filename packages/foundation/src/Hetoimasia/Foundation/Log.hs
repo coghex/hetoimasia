@@ -166,8 +166,13 @@ validSegment segment = case Text.uncons segment of
 rejected ∷ Text → Text → Text
 rejected name reason = "invalid component name " <> quoted name <> ": " <> reason
 
+-- | Text as a double-quoted, escaped literal inside a message. Every diagnostic
+-- that names text it rejected goes through this, so a value carrying a newline,
+-- a quote, or any other control character cannot split the message across lines
+-- or forge a second one. It is the same escaping the record layout applies (see
+-- 'renderText'), and ordinary text is unchanged inside the quotes.
 quoted ∷ Text → Text
-quoted value = "\"" <> value <> "\""
+quoted value = "\"" <> Text.concatMap escaped value <> "\""
 
 -- | Which components may emit 'Debug' entries. A threshold never enables
 -- 'Debug'; this selection is the only control that does.
@@ -333,9 +338,11 @@ data LogVariables = LogVariables
 --
 -- An absent value keeps the base configuration's own. A present but invalid one
 -- yields a message naming the variable it came from, and the first such
--- variable in that order is the one reported. 'filterEnabled' and
--- 'filterSource' are carried through untouched: they stay programmatic
--- configuration with no variable of their own.
+-- variable in that order is the one reported. That message is always one line:
+-- the rejected value is quoted and escaped, so a value carrying a newline
+-- cannot forge a second line of output. 'filterEnabled' and 'filterSource' are
+-- carried through untouched: they stay programmatic configuration with no
+-- variable of their own.
 --
 -- The lookup performs whatever IO reading the environment needs; this function
 -- performs none of its own, so a test supplies a pure, exhaustive, or counting
@@ -480,7 +487,7 @@ formatTimestamp time =
 renderText ∷ Text → Text
 renderText value
   | not (Text.null value) && Text.all bare value = value
-  | otherwise = "\"" <> Text.concatMap escaped value <> "\""
+  | otherwise = quoted value
   where
     bare character =
       isPrint character

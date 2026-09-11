@@ -180,6 +180,17 @@ $ echo $?
 1
 ```
 
+That diagnostic is always one line. A rejected value is quoted and escaped by the
+same rule the record layout applies to text (see
+[Quoting and escaping](#quoting-and-escaping)), so a value carrying a newline, a
+quote, or any other control character cannot split the message or forge a second
+line of output:
+
+```text
+$ HETOIMASIA_LOG_LEVEL=$'bad\nforged' hetoimasia --smoke
+HETOIMASIA_LOG_LEVEL: invalid level "bad\nforged": expected debug, info, warn, warning, or error
+```
+
 `--help` validates the same configuration and fails the same way. Help text
 itself is ordinary application output on stdout rather than a diagnostic, so it
 stays visible at any threshold; diagnostics go through the configured logger.
