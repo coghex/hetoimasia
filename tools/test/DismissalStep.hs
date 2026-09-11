@@ -60,6 +60,11 @@ originHead = "ffffffffffffffffffffffffffffffffffffffff"
 approval ∷ String
 approval = "reviewed:approve"
 
+-- | The run this fixture job believes it is: what its record has to name, so
+-- the proof can later ask whether that run's job actually concluded.
+recordingRun ∷ String
+recordingRun = "34650000001"
+
 -- | The account whose review markers are canonical in the fixture repository.
 owner ∷ String
 owner = "coghex"
@@ -218,14 +223,17 @@ spec = describe "Stale approval mutation" $ do
   describe "the carry it records" $ do
     it "records a kept approval at the head it was carried to" $
       -- The record is what the next push's decision reads to prove this head,
-      -- so it names the link exactly: where the carry started, where it landed,
-      -- and the revision the review was granted at.
+      -- so it names the link exactly — where the carry started, where it
+      -- landed, and the revision the review was granted at — and the run and
+      -- attempt writing it, since it is posted before this job has concluded
+      -- and is only as good as that conclusion.
       withStep settled {labelsAfter = [approval], replay = "keep"} "none" "kept" $ \outcome → do
         result outcome `shouldBe` ExitSuccess
         calls outcome `shouldSatisfy` any (isInfixOf "-X POST")
         unwords (calls outcome)
           `shouldContain` ( "<!-- approval-provenance:v1 origin=" ++ approvedHead
-                              ++ " before=" ++ approvedHead ++ " after=" ++ pushedHead ++ " -->"
+                              ++ " before=" ++ approvedHead ++ " after=" ++ pushedHead
+                              ++ " run=" ++ recordingRun ++ " attempt=2 -->"
                           )
 
     it "records nothing when a canonical review named the head itself" $
@@ -388,6 +396,8 @@ withStep repository action expected assertion = do
           , ("HEAD_APPROVED", headApproved repository)
           , ("OWNER", owner)
           , ("LABEL", approval)
+          , ("GITHUB_RUN_ID", recordingRun)
+          , ("GITHUB_RUN_ATTEMPT", "2")
           , ("GITHUB_STEP_SUMMARY", directory </> "summary")
           ]
         -- Every one of those has to *replace* the inherited entry rather than

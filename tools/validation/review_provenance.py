@@ -19,20 +19,27 @@ approved revision? One is
   that exact head reads ``verdict=APPROVE``; or
 - a head reached from such a revision through an **unbroken chain of recorded
   carries**: one ``approval-provenance`` record per push, authored by this
-  repository's own workflow identity and written only by the mutation job that
-  confirmed the label attached at the pushed head after a successful decision.
+  repository's own workflow identity by the mutation job that confirmed the
+  label attached at the pushed head, naming the run and attempt that wrote it.
+  A record is only as good as that job's conclusion: it is posted while the
+  job is still running, so the proof verifies through the Actions jobs listing
+  that the named attempt's ``dismiss-stale-approval`` concluded ``success`` at
+  exactly the recorded head. A job that failed or was cancelled after posting,
+  or that has not finished, leaves a record that proves nothing.
 
 A ``before`` whose own decision was superseded, failed, cancelled, or never ran
-left no record and is therefore unproven, however the trees compare. A fresh
-canonical approval at any head is a new origin: it needs no chain behind it and
-survives an earlier strip.
+is therefore unproven, however the trees compare. A revision whose newest
+canonical verdict requests changes is a terminal denial: it is not approved,
+and no recorded carry passes through it, until that exact revision is approved
+again. A fresh canonical approval at any head is a new origin: it needs no
+chain behind it and survives an earlier strip.
 
-The feed is read from a file the caller fetched, so that this decision is
-proven in tests against fixture feeds exactly as it runs in the workflow. A
-feed that is missing, unreadable, malformed, or incomplete proves nothing — it
-is reported as ``unproven`` with the reason, never as ``proven`` from tree
-equality or replay eligibility, and never as a refusal that would abort the
-workflow before the label removal it justifies.
+The feed and the jobs listings are read from files the caller fetched, so that
+this decision is proven in tests against fixtures exactly as it runs in the
+workflow. Evidence that is missing, unreadable, malformed, or incomplete
+proves nothing — it is reported as ``unproven`` with the reason, never as
+``proven`` from tree equality or replay eligibility, and never as a refusal
+that would abort the workflow before the label removal it justifies.
 
 **Every outcome this tool can reach is an answer, so it always exits 0.** Only a
 usage error fails (exit 2, from ``argparse``). Output is ``key=value`` lines
@@ -43,6 +50,9 @@ safe to append to ``$GITHUB_OUTPUT``::
     origin=<the canonically approved revision the carried review originates from, or empty>
     chain=<origin,...,before: every revision the carry passed through, or empty>
     head_approved=true|false   whether a canonical review named the pushed head itself
+
+``--list-runs`` instead prints one ``<run id> <attempt>`` line per run the
+records name, so the caller can fetch exactly those jobs listings.
 """
 
 from __future__ import annotations
@@ -69,13 +79,20 @@ REVIEW_MARKER = re.compile(
 )
 
 # One record per carried push, written by `dismiss-stale-approval` after it
-# confirmed the label attached at `after`. Its `origin` is the canonically
-# approved revision that decision traced the carry back to; the proof below
-# re-walks the links rather than trusting that field.
+# confirmed the label attached at `after`, naming the run and attempt that
+# wrote it. Its `origin` is the canonically approved revision that decision
+# traced the carry back to; the proof below re-walks the links rather than
+# trusting that field.
 CARRY_RECORD = re.compile(
     r"<!--\s*approval-provenance:v1\s+origin=(?P<origin>[0-9a-fA-F]{40})\s+"
-    r"before=(?P<before>[0-9a-fA-F]{40})\s+after=(?P<after>[0-9a-fA-F]{40})\s*-->"
+    r"before=(?P<before>[0-9a-fA-F]{40})\s+after=(?P<after>[0-9a-fA-F]{40})\s+"
+    r"run=(?P<run>[0-9]+)\s+attempt=(?P<attempt>[0-9]+)\s*-->"
 )
+
+# The job whose successful conclusion a record depends on, in the workflow
+# that writes it.
+RECORDING_JOB = "dismiss-stale-approval"
+RECORDING_WORKFLOW = "review-gate"
 
 NO_STARTING_POINT = "0000000000000000000000000000000000000000"
 
@@ -145,8 +162,8 @@ def ordered(comments: list[dict]) -> list[dict]:
     return sorted(comments, key=key)
 
 
-def canonical_approvals(comments: list[dict], owner: str) -> set[str]:
-    """Every head whose newest owner-authored review marker approves it."""
+def canonical_verdicts(comments: list[dict], owner: str) -> dict[str, str]:
+    """Each head's newest owner-authored review verdict."""
     verdicts: dict[str, str] = {}
     for comment in ordered(comments):
         if author_of(comment) != owner.casefold():
@@ -156,34 +173,95 @@ def canonical_approvals(comments: list[dict], owner: str) -> set[str]:
             continue
         for marker in REVIEW_MARKER.finditer(body):
             verdicts[marker.group("head").lower()] = marker.group("verdict")
-    return {head for head, verdict in verdicts.items() if verdict == "APPROVE"}
+    return verdicts
 
 
-def recorded_carries(comments: list[dict], recorder: str) -> dict[str, list[str]]:
-    """Each pushed head, mapped to the starting points recorded as carried into it."""
-    carries: dict[str, list[str]] = {}
+def records_by(comments: list[dict], recorder: str) -> list[re.Match[str]]:
+    """Every carry record the workflow identity posted, oldest first."""
+    records: list[re.Match[str]] = []
     for comment in ordered(comments):
         if author_of(comment) != recorder.casefold():
             continue
         body = comment.get("body")
         if not isinstance(body, str):
             continue
-        for record in CARRY_RECORD.finditer(body):
-            after = record.group("after").lower()
-            before = record.group("before").lower()
-            if before not in carries.setdefault(after, []):
-                carries[after].append(before)
-    return carries
+        records.extend(CARRY_RECORD.finditer(body))
+    return records
+
+
+def recording_succeeded(record: re.Match[str], runs: str) -> str:
+    """Why the run a record names does not vouch for it, or empty if it does.
+
+    The jobs listing for that run attempt is a file the caller fetched. It
+    has to show this workflow's mutation job concluded ``success`` at exactly
+    the recorded head; a listing that is missing, malformed, or shows
+    anything else — a failure, a cancellation, a job still running — leaves
+    the record unusable, because the record was posted before that job
+    reached its conclusion.
+    """
+    run, attempt, after = record.group("run"), record.group("attempt"), record.group("after").lower()
+    where = f"run {run} attempt {attempt}"
+    if not runs:
+        return f"the jobs of {where} were not fetched, so the record cannot be verified"
+    try:
+        document = json.loads(Path(runs, f"{run}-{attempt}.json").read_text(encoding="utf-8"))
+    except OSError:
+        return f"the jobs of {where} could not be read, so the record cannot be verified"
+    except ValueError:
+        return f"the jobs listing of {where} is not valid JSON"
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, list):
+        return f"the jobs listing of {where} names no jobs"
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("name") != RECORDING_JOB:
+            continue
+        if job.get("workflow_name") != RECORDING_WORKFLOW:
+            return f"{where} is not a {RECORDING_WORKFLOW} run"
+        if str(job.get("run_attempt", attempt)) != attempt:
+            return f"the jobs listing of {where} is for another attempt"
+        head = job.get("head_sha")
+        if not isinstance(head, str) or head.lower() != after:
+            return f"{where} ran for another head than the recorded {short(after)}"
+        conclusion = job.get("conclusion")
+        if conclusion != "success":
+            state = conclusion if isinstance(conclusion, str) and conclusion else "unfinished"
+            return f"{RECORDING_JOB} in {where} was {state}, not success"
+        return ""
+    return f"{where} has no {RECORDING_JOB} job"
+
+
+def recorded_carries(
+    comments: list[dict], recorder: str, runs: str
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Each pushed head, mapped to the starting points verifiably carried into it.
+
+    The second result explains, per pushed head, why a record into it could
+    not be used — the reason a reader needs when that head is where a proof
+    ran out.
+    """
+    carries: dict[str, list[str]] = {}
+    unusable: dict[str, str] = {}
+    for record in records_by(comments, recorder):
+        after = record.group("after").lower()
+        before = record.group("before").lower()
+        failure = recording_succeeded(record, runs)
+        if failure:
+            unusable.setdefault(after, failure)
+        elif before not in carries.setdefault(after, []):
+            carries[after].append(before)
+    return carries, unusable
 
 
 def prove(
-    before: str, approvals: set[str], carries: dict[str, list[str]]
+    before: str, verdicts: dict[str, str], carries: dict[str, list[str]]
 ) -> tuple[str, list[str], str]:
     """Trace ``before`` back to a canonical approval through recorded carries.
 
     Returns the origin and the chain from it to ``before`` when one exists.
     Otherwise the origin is empty and the third field names the revision at
-    which the trace ran out — the link that could not be proven.
+    which the trace ran out — the link that could not be proven. A revision
+    whose newest verdict requests changes is such a link: the denial is
+    terminal, and no carry recorded into it is followed.
     """
     pending = [(before, [before])]
     visited: set[str] = set()
@@ -192,12 +270,12 @@ def prove(
     dead_end, dead_end_depth = before, 0
     while pending:
         revision, path = pending.pop()
-        if revision in approvals:
+        if verdicts.get(revision) == "APPROVE":
             return revision, list(reversed(path)), ""
         if revision in visited:
             continue
         visited.add(revision)
-        previous = carries.get(revision, [])
+        previous = [] if revision in verdicts else carries.get(revision, [])
         if not previous and len(path) > dead_end_depth:
             dead_end, dead_end_depth = revision, len(path)
         for earlier in previous:
@@ -206,19 +284,48 @@ def prove(
     return "", [], dead_end
 
 
-def decide(before: str, after: str, feed: str, owner: str, recorder: str) -> int:
+def explain(revision: str, before: str, verdicts: dict[str, str], unusable: dict[str, str]) -> str:
+    """Why the trace ran out at ``revision``."""
+    if verdicts.get(revision) == "CHANGES_REQUESTED":
+        what = "its newest canonical review requested changes"
+    elif revision in unusable:
+        what = f"the carry recorded into it cannot be trusted: {unusable[revision]}"
+    else:
+        what = "it has no canonical approval and no verified carry leads into it"
+    if revision == before:
+        return f"the starting point {short(before)} is not a proven approved revision: {what}"
+    return (
+        f"the carry into {short(before)} is recorded, but it traces back to "
+        f"{short(revision)}, and {what}"
+    )
+
+
+def list_runs(feed: str, recorder: str) -> int:
+    comments, failure = load_feed(feed)
+    if failure:
+        return 0
+    seen: set[tuple[str, str]] = set()
+    for record in records_by(comments, recorder):
+        key = (record.group("run"), record.group("attempt"))
+        if key not in seen:
+            seen.add(key)
+            print(f"{key[0]} {key[1]}")
+    return 0
+
+
+def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: str) -> int:
     comments, failure = load_feed(feed)
     if failure:
         return render(UNPROVEN, f"{failure}, so no starting point can be proven approved", "", [], False)
 
-    approvals = canonical_approvals(comments, owner)
-    carries = recorded_carries(comments, recorder)
-    head_approved = after.lower() in approvals
+    verdicts = canonical_verdicts(comments, owner)
+    carries, unusable = recorded_carries(comments, recorder, runs)
+    head_approved = verdicts.get(after.lower()) == "APPROVE"
 
     if not before or before == NO_STARTING_POINT:
         return render(UNPROVEN, "the push named no starting point", "", [], head_approved)
 
-    origin, chain, dead_end = prove(before.lower(), approvals, carries)
+    origin, chain, dead_end = prove(before.lower(), verdicts, carries)
     if origin == before.lower():
         return render(
             PROVEN,
@@ -237,17 +344,7 @@ def decide(before: str, after: str, feed: str, owner: str, recorder: str) -> int
             chain,
             head_approved,
         )
-    if dead_end == before.lower():
-        reason = (
-            f"the starting point {short(before)} has no canonical approval and no "
-            "recorded carry leads into it"
-        )
-    else:
-        reason = (
-            f"the carry into {short(before)} is recorded, but it traces back to "
-            f"{short(dead_end)}, which has no canonical approval and no recorded carry into it"
-        )
-    return render(UNPROVEN, reason, "", [], head_approved)
+    return render(UNPROVEN, explain(dead_end, before.lower(), verdicts, unusable), "", [], head_approved)
 
 
 def main(argv: list[str]) -> int:
@@ -255,16 +352,26 @@ def main(argv: list[str]) -> int:
         prog="review_provenance.py",
         description="Decide whether a push's starting point is a proven approved revision.",
     )
-    parser.add_argument("--before", required=True, help="the head the push started from")
-    parser.add_argument("--after", required=True, help="the head the push landed on")
+    parser.add_argument("--before", default="", help="the head the push started from")
+    parser.add_argument("--after", default="", help="the head the push landed on")
     parser.add_argument(
         "--comments",
         required=True,
         help="a file holding the pull request's comment feed as GitHub returned it",
     )
     parser.add_argument(
+        "--runs",
+        default="",
+        help="a directory holding each recorded run attempt's jobs listing as <run>-<attempt>.json",
+    )
+    parser.add_argument(
+        "--list-runs",
+        action="store_true",
+        help="print the run attempts the records name, one per line, instead of deciding",
+    )
+    parser.add_argument(
         "--owner",
-        required=True,
+        default="",
         help="the login whose review markers are canonical: the repository owner",
     )
     parser.add_argument(
@@ -273,8 +380,18 @@ def main(argv: list[str]) -> int:
         help="the login that authors carry records: the workflow's own identity",
     )
     arguments = parser.parse_args(argv)
+    if arguments.list_runs:
+        return list_runs(arguments.comments, arguments.recorder)
+    for name in ("before", "after", "owner"):
+        if not getattr(arguments, name):
+            parser.error(f"--{name} is required to decide")
     return decide(
-        arguments.before, arguments.after, arguments.comments, arguments.owner, arguments.recorder
+        arguments.before,
+        arguments.after,
+        arguments.comments,
+        arguments.runs,
+        arguments.owner,
+        arguments.recorder,
     )
 
 

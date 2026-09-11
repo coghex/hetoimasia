@@ -56,6 +56,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # The provenance proof reads the jobs of the runs that wrote each carry
+      # record, to verify the recording job actually concluded successfully.
+      actions: read
     outputs:
       action: ${{ steps.decide.outputs.action }}
       expected: ${{ steps.decide.outputs.expected }}
@@ -121,10 +124,24 @@ jobs:
           if ! gh api --paginate --slurp "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" > "$feed"; then
             rm -f "$feed"
           fi
+          # A carry record is posted while the job that writes it is still
+          # running, so each one is only as good as that job's conclusion.
+          # Fetch the jobs of every run attempt the records name; a listing
+          # that cannot be fetched is left missing, and the record it would
+          # have vouched for proves nothing.
+          runs="$RUNNER_TEMP/runs"
+          mkdir -p "$runs"
+          while read -r run attempt; do
+            [ -n "$run" ] || continue
+            if ! gh api "repos/$REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" > "$runs/$run-$attempt.json"; then
+              rm -f "$runs/$run-$attempt.json"
+            fi
+          done < <(python3 tools/validation/review_provenance.py --list-runs --comments "$feed")
           python3 tools/validation/review_provenance.py \
             --before "$BEFORE" \
             --after "$AFTER" \
             --comments "$feed" \
+            --runs "$runs" \
             --owner "$OWNER" | tee -a "$GITHUB_OUTPUT"
 
       - name: Decide the approval's fate
@@ -307,8 +324,12 @@ jobs:
           # by this job alone — the only identity in this repository's
           # workflows that can — and a record that could not be written is a
           # carry the next push cannot see, which is reported rather than
-          # left for that push to discover. A head a canonical review named
-          # itself needs no record: the marker is its proof.
+          # left for that push to discover. It names this run and attempt,
+          # because it is posted before this job has concluded: the proof
+          # that reads it verifies that this job went on to succeed, so a
+          # failure or cancellation after this point leaves a record that
+          # proves nothing. A head a canonical review named itself needs no
+          # record: the marker is its proof.
           carried=false
           if [ "$EXPECTED" = "kept" ] && [ "$HEAD_APPROVED" != "true" ]; then
             if [ -z "$ORIGIN" ]; then
@@ -316,9 +337,9 @@ jobs:
               exit 1
             fi
             if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
-              record="$(printf "Carried \`%s\` from \`%s\` to \`%s\`. The review it carries was granted at \`%s\`; no reviewer examined \`%s\`.\n\n<!-- approval-provenance:v1 origin=%s before=%s after=%s -->" \
-                "$LABEL" "${BEFORE:0:12}" "${EVENT_HEAD:0:12}" "${ORIGIN:0:12}" "${EVENT_HEAD:0:12}" \
-                "$ORIGIN" "$BEFORE" "$EVENT_HEAD")"
+              record="$(printf "Carried \`%s\` from \`%s\` to \`%s\`. The review it carries was granted at \`%s\`; no reviewer examined \`%s\`. This record proves the carry only if run %s attempt %s concluded successfully.\n\n<!-- approval-provenance:v1 origin=%s before=%s after=%s run=%s attempt=%s -->" \
+                "$LABEL" "${BEFORE:0:12}" "${EVENT_HEAD:0:12}" "${ORIGIN:0:12}" "${EVENT_HEAD:0:12}" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+                "$ORIGIN" "$BEFORE" "$EVENT_HEAD" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")"
               if ! gh api -X POST "repos/$REPOSITORY/issues/$NUMBER/comments" -f body="$record" > /dev/null; then
                 echo "::error::the carried approval could not be recorded at $EVENT_HEAD, so this decision is unconfirmed"
                 exit 1

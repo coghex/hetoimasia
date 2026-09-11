@@ -759,23 +759,37 @@ starting point from the pull request's own comment feed. A revision is a
 - a head reached from such a revision through an **unbroken chain of recorded
   carries**: one `approval-provenance:v1` record per push, authored by this
   repository's own workflow identity (`github-actions[bot]`), naming the
-  `before` it carried from, the `after` it carried to, and the origin the
-  decision traced the carry back to. The proof re-walks the links rather than
-  trusting that origin field.
+  `before` it carried from, the `after` it carried to, the origin the decision
+  traced the carry back to, and the run and attempt that wrote it. The proof
+  re-walks the links rather than trusting that origin field.
 
 A record is written by `dismiss-stale-approval` alone — the only job in this
 repository's workflows that can — and only after the decision concluded with
-the head still current and the label confirmed attached at the pushed head. A
-`before` whose own decision was superseded, failed, cancelled, or never ran
-left no record and is unproven, and so is one whose carry the job could not
-record: a record that fails to post fails the job rather than leaving the next
-push to discover the gap. A head a canonical review named itself needs no
-record, since the marker is its proof. Nothing else counts: a green
-`review-approved` check, an observed label, a successful dismissal that found
-no label, and every success of the earlier algorithm that never wrote a record
-prove no carry. A pull request approved before this rule existed therefore
-keeps its label only until its next push, unless that push's starting point or
-its own head carries a canonical marker.
+the head still current and the label confirmed attached at the pushed head.
+It is posted while that job is still running, so it is only as good as the
+job's conclusion: for every record it would follow, the proof fetches the jobs
+of the named run attempt (which is why `decide-dismissal` holds
+`actions: read`) and requires that a `review-gate` run's
+`dismiss-stale-approval` concluded `success` at exactly the recorded head. A
+job that failed or was cancelled after posting, one that has not finished — a
+record another push's decision reads while the job that wrote it is still
+running — a listing that could not be fetched, and a run for another head or
+another workflow all leave the record unusable. A `before` whose own decision
+was superseded, failed, cancelled, or never ran is therefore unproven, and so
+is one whose carry the job could not record: a record that fails to post
+fails the job rather than leaving the next push to discover the gap.
+
+A revision whose newest canonical verdict is `CHANGES_REQUESTED` is a
+**terminal denial**: it is not approved, and no recorded carry into it is
+followed, so a head that inherited an approval and was then refused in its
+own right ends every chain passing through it — until that exact revision is
+approved again. A head a canonical review named itself needs no record, since
+the marker is its proof. Nothing else counts: a green `review-approved` check,
+an observed label, a successful dismissal that found no label, and every
+success of the earlier algorithm that never wrote a record prove no carry. A
+pull request approved before this rule existed therefore keeps its label only
+until its next push, unless that push's starting point or its own head carries
+a canonical marker.
 
 The script always exits 0, for the same reason the replay does: `unproven` is
 an answer the caller removes a label on, and a feed that is missing,
@@ -788,13 +802,20 @@ origin to the starting point, comma-separated), and `head_approved`. The
 superseded-head and unreadable-label refusals are unchanged and are answered
 before provenance is consulted.
 
-Run it against a feed the same way the job does:
+Run it against a feed the same way the job does — `--list-runs` names the run
+attempts the records depend on, and each one's jobs listing goes into the
+directory `--runs` names as `<run>-<attempt>.json`:
 
 ```bash
 gh api --paginate --slurp "repos/<owner>/<repo>/issues/<number>/comments?per_page=100" > comments.json
+mkdir -p runs
+python3 tools/validation/review_provenance.py --list-runs --comments comments.json |
+  while read -r run attempt; do
+    gh api "repos/<owner>/<repo>/actions/runs/$run/attempts/$attempt/jobs?per_page=100" > "runs/$run-$attempt.json"
+  done
 python3 tools/validation/review_provenance.py \
   --before <the starting point> --after <the pushed head> \
-  --comments comments.json --owner <the repository owner>
+  --comments comments.json --runs runs --owner <the repository owner>
 ```
 
 `dismiss-stale-approval` reads the owner's markers once more **immediately
@@ -1015,9 +1036,14 @@ point, and a head approved after an earlier strip starting a new chain; an
 identical-tree re-push and a clean base merge of a proven head, and three
 successive base merges each recorded from the last, proven back to the origin
 with the chain named; a chain broken in the middle naming the link that ran
-out; a carried head's push that still carries more than the merge; and the
-failing sequence composed end to end — decision, the shipped mutation step, and
-the verdict withholding approval.
+out; a carried head's push that still carries more than the merge; the run a
+record names failing, cancelled, or unfinished after posting it, its jobs
+unfetched, run for another head, or belonging to another workflow, each
+stripping, and the run listing the workflow fetches; a later denial ending
+the chain at an inherited head and at a denied head a descendant passes
+through, and a later approval of that exact head lifting it; and the failing
+sequence composed end to end — decision, the shipped mutation step, and the
+verdict withholding approval.
 
 The replay rule itself is proven against real Git histories in temporary
 repositories, because rename detection, conflict resolution, and reachability are
@@ -1044,7 +1070,8 @@ decision is covered there too: the removal withheld for a marker naming this
 exact head, the newest marker for that head winning, a fresh approval of some
 other head ignored, and a marker read that failed refused. So is the record it
 writes: a kept approval recorded at the head it was carried to with the link
-named exactly, no record for a head a canonical review named itself or when
+and the recording run attempt named exactly, no record for a head a canonical
+review named itself or when
 the label was gone by the time the decision was applied, and a record that
 could not be posted or has no proven origin failing the job. The provenance it
 publishes is asserted there too — every revision a carried approval was decided

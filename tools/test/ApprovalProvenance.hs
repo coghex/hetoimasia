@@ -9,9 +9,10 @@
 --
 -- Every example here builds that situation for real: a temporary Git history
 -- with the heads the sequence names, a comment feed holding the canonical
--- review markers and carry records the workflow would find, and the shipped
--- @review_replay.py@, @review_provenance.py@, and @review_gate.py@ composed
--- exactly as @review-gate.yml@ composes them. No replay verdict is fabricated
+-- review markers and carry records the workflow would find, the jobs listings
+-- of the runs those records name, and the shipped @review_replay.py@,
+-- @review_provenance.py@, and @review_gate.py@ composed exactly as
+-- @review-gate.yml@ composes them. No replay verdict is fabricated
 -- and no sleep is waited on: the delayed run is simply asked its question
 -- after the head it was started for has been superseded.
 module ApprovalProvenance (spec) where
@@ -70,7 +71,8 @@ spec = describe "Approval provenance" $ do
         decision ← decide fixture [approvedBy owner reviewed] unreviewed merged
         field "replay_decision" (replayOutput decision) `shouldBe` Just "keep"
         shouldRemove decision
-        gateOutput decision `shouldContain` ("reason=the starting point " ++ take 12 unreviewed ++ " has no canonical approval")
+        gateOutput decision
+          `shouldContain` ("reason=the starting point " ++ take 12 unreviewed ++ " is not a proven approved revision")
 
     it "removes an approval an identical-tree push inherited from an unproven intermediate head" $
       -- The same race with the cheaper proof: C carries exactly B's tree, so
@@ -173,9 +175,24 @@ spec = describe "Approval provenance" $ do
         first ← mergeBase fixture
         advanceBase fixture "docs/later.md" "A later upstream note.\n" "Note upstream again"
         second ← mergeBase fixture
+        recordedRun fixture 1 (Just "success") first
         decision ←
-          decide fixture [approvedBy owner reviewed, carriedBy owner reviewed reviewed first] first second
+          decide fixture [approvedBy owner reviewed, carriedBy owner 1 reviewed reviewed first] first second
         shouldRemove decision
+
+    it "lists the run attempts the records name" $
+      -- The workflow fetches exactly these jobs listings before deciding.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        writeFixtureFile
+          (root fixture)
+          "feed.json"
+          (feed [carriedBy workflow 7 reviewed reviewed repushed, carriedBy workflow 7 reviewed reviewed repushed, carriedBy workflow 9 reviewed repushed repushed])
+        (status, listed, errors) ←
+          tool fixture "review_provenance.py" ["--list-runs", "--comments", root fixture </> "feed.json"]
+        (status, errors) `shouldBe` (ExitSuccess, "")
+        lines listed `shouldBe` ["7 1", "9 1"]
 
     it "lets a later marker withdraw an approval of the same head" $
       withFixture $ \fixture → do
@@ -200,6 +217,119 @@ spec = describe "Approval provenance" $ do
             reviewed
             repushed
         shouldKeepFrom reviewed decision
+
+  describe "the job that recorded a carry" $ do
+    it "strips when the recording job failed after posting its record" $
+      -- The record is posted while its job is still running. A job that
+      -- failed afterwards never confirmed the carry, whatever it posted.
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "failure") first
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "dismiss-stale-approval in run 1 attempt 1 was failure, not success"
+
+    it "strips when the recording job was cancelled after posting its record" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "cancelled") first
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "was cancelled, not success"
+
+    it "strips when the recording job has not concluded" $
+      -- Another push's decision can read a record while the job that wrote it
+      -- is still running; an unfinished job vouches for nothing yet.
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 Nothing first
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "was unfinished, not success"
+
+    it "strips when the recording run's jobs could not be fetched" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "the jobs of run 1 attempt 1 could not be read"
+
+    it "strips when the recording run was for another head" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "success") second
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "ran for another head"
+
+    it "strips when the record names a run of some other workflow" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        writeFixtureFile (root fixture) "runs/1-1.json" (jobsListing "validation" 1 (Just "success") first)
+        decision ← decide fixture [approvedBy owner reviewed, carriedBy workflow 1 reviewed reviewed first] first second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "is not a review-gate run"
+
+  describe "a canonical review that requested changes" $ do
+    it "ends the chain at an inherited head it denied" $
+      -- M1 inherited A's approval through a verified carry, and was then
+      -- reviewed in its own right and refused. The refusal is terminal: the
+      -- carry into it no longer proves anything.
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "success") first
+        decision ←
+          decide
+            fixture
+            [ approvedBy owner reviewed
+            , carriedBy workflow 1 reviewed reviewed first
+            , Comment owner (approvalMarker first "CHANGES_REQUESTED")
+            ]
+            first
+            second
+        shouldRemove decision
+        gateOutput decision `shouldContain` "its newest canonical review requested changes"
+
+    it "ends a descendant's chain at the denied head it passes through" $
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        advanceBase fixture "docs/notes.md" "The first upstream note.\n" "Note upstream"
+        first ← mergeBase fixture
+        advanceBase fixture "docs/later.md" "A later upstream note.\n" "Note upstream again"
+        second ← mergeBase fixture
+        advanceBase fixture "docs/last.md" "The last upstream note.\n" "Note upstream once more"
+        third ← mergeBase fixture
+        recordedRun fixture 1 (Just "success") first
+        recordedRun fixture 2 (Just "success") second
+        decision ←
+          decide
+            fixture
+            [ approvedBy owner reviewed
+            , carriedBy workflow 1 reviewed reviewed first
+            , carriedBy workflow 2 reviewed first second
+            , Comment owner (approvalMarker first "CHANGES_REQUESTED")
+            ]
+            second
+            third
+        shouldRemove decision
+        gateOutput decision
+          `shouldContain` ("traces back to " ++ take 12 first ++ ", and its newest canonical review requested changes")
+
+    it "is lifted by a later approval of that exact head" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "success") first
+        decision ←
+          decide
+            fixture
+            [ approvedBy owner reviewed
+            , carriedBy workflow 1 reviewed reviewed first
+            , Comment owner (approvalMarker first "CHANGES_REQUESTED")
+            , approvedBy owner first
+            ]
+            first
+            second
+        shouldKeepFrom first decision
 
   describe "a head that was actually reviewed" $ do
     it "keeps a fresh canonical approval of the pushed head over an unproven starting point" $
@@ -258,12 +388,14 @@ spec = describe "Approval provenance" $ do
         second ← mergeBase fixture
         advanceBase fixture "docs/last.md" "The last upstream note.\n" "Note upstream once more"
         third ← mergeBase fixture
+        recordedRun fixture 1 (Just "success") first
+        recordedRun fixture 2 (Just "success") second
         decision ←
           decide
             fixture
             [ approvedBy owner reviewed
-            , carriedBy workflow reviewed reviewed first
-            , carriedBy workflow reviewed first second
+            , carriedBy workflow 1 reviewed reviewed first
+            , carriedBy workflow 2 reviewed first second
             ]
             second
             third
@@ -282,12 +414,13 @@ spec = describe "Approval provenance" $ do
         second ← mergeBase fixture
         advanceBase fixture "docs/last.md" "The last upstream note.\n" "Note upstream once more"
         third ← mergeBase fixture
+        recordedRun fixture 2 (Just "success") second
         decision ←
-          decide fixture [approvedBy owner reviewed, carriedBy workflow reviewed first second] second third
+          decide fixture [approvedBy owner reviewed, carriedBy workflow 2 reviewed first second] second third
         shouldRemove decision
         gateOutput decision
           `shouldContain` ( "reason=the carry into " ++ take 12 second ++ " is recorded, but it traces back to "
-                              ++ take 12 first ++ ", which has no canonical approval"
+                              ++ take 12 first ++ ", and it has no canonical approval and no verified carry leads into it"
                           )
 
     it "still strips a carried head's push that carries more than the merge" $
@@ -387,7 +520,7 @@ decideFrom fixture feedPath before after current = do
     tool
       fixture
       "review_provenance.py"
-      ["--before", before, "--after", after, "--comments", feedPath, "--owner", owner]
+      ["--before", before, "--after", after, "--comments", feedPath, "--runs", root fixture </> "runs", "--owner", owner]
   (provenanceStatus, provenanceErrors) `shouldBe` (ExitSuccess, "")
   beforeTree ← tree fixture before
   afterTree ← tree fixture after
@@ -447,14 +580,34 @@ tool fixture name arguments =
 approvedBy ∷ String → String → Comment
 approvedBy login granted = Comment login (approvalMarker granted "APPROVE")
 
--- | The record the mutation job writes after confirming a carry.
-carriedBy ∷ String → String → String → String → Comment
-carriedBy login origin' before after =
+-- | The record the mutation job writes after confirming a carry, naming the
+-- run (always its first attempt here) that wrote it.
+carriedBy ∷ String → Int → String → String → String → Comment
+carriedBy login recording origin' before after =
   Comment
     login
     ( "Carried `" ++ approval ++ "` from `" ++ take 12 before ++ "` to `" ++ take 12 after ++ "`.\n\n"
-        ++ "<!-- approval-provenance:v1 origin=" ++ origin' ++ " before=" ++ before ++ " after=" ++ after ++ " -->"
+        ++ "<!-- approval-provenance:v1 origin=" ++ origin' ++ " before=" ++ before ++ " after=" ++ after
+        ++ " run=" ++ show recording ++ " attempt=1 -->"
     )
+
+-- | The jobs listing of one recording run's first attempt, as the workflow
+-- fetches it: the mutation job at the given head with the given conclusion,
+-- or none when it has not finished.
+recordedRun ∷ Fixture → Int → Maybe String → String → IO ()
+recordedRun fixture recording conclusion headSha =
+  writeFixtureFile
+    (root fixture)
+    ("runs/" ++ show recording ++ "-1.json")
+    (jobsListing "review-gate" recording conclusion headSha)
+
+jobsListing ∷ String → Int → Maybe String → String → String
+jobsListing workflowName recording conclusion headSha =
+  "{\"total_count\": 3, \"jobs\": [{\"name\": \"decide-dismissal\", \"conclusion\": \"success\"}, "
+    ++ "{\"name\": \"dismiss-stale-approval\", \"workflow_name\": " ++ quoted workflowName
+    ++ ", \"run_id\": " ++ show recording ++ ", \"run_attempt\": 1, \"head_sha\": " ++ quoted headSha
+    ++ ", \"conclusion\": " ++ maybe "null" quoted conclusion ++ "}, "
+    ++ "{\"name\": \"review-approved\", \"conclusion\": \"success\"}]}"
 
 -- | The feed as GitHub returns it, in posting order.
 feed ∷ [Comment] → String
@@ -542,6 +695,17 @@ advanceBase fixture path contents message = do
   writeFixtureFile (root fixture) path contents
   void $ commitAll fixture message
   void $ at fixture ["checkout", "feature"]
+
+-- | The reviewed head and two successive base updates of it: the first is the
+-- carry whose record is under examination, the second the push being decided.
+twoUpdates ∷ Fixture → IO (String, String, String)
+twoUpdates fixture = do
+  reviewed ← approvedWork fixture
+  advanceBase fixture "docs/notes.md" "The first upstream note.\n" "Note upstream"
+  first ← mergeBase fixture
+  advanceBase fixture "docs/later.md" "A later upstream note.\n" "Note upstream again"
+  second ← mergeBase fixture
+  pure (reviewed, first, second)
 
 -- | The merge a branch update performs: the base into the current head.
 mergeBase ∷ Fixture → IO String
