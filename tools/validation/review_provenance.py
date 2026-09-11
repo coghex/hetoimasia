@@ -47,9 +47,13 @@ safe to append to ``$GITHUB_OUTPUT``::
 
     provenance=proven|unproven
     provenance_reason=<one line saying why>
-    origin=<the canonically approved revision the carried review originates from, or empty>
+    origin=<the canonically approved revision the approval originates from, or empty>
     chain=<origin,...,before: every revision the carry passed through, or empty>
     head_verdict=approved|denied|none   what the newest canonical review of the pushed head itself said
+
+A pushed head that was approved directly is its own origin: ``origin`` names
+it and ``chain`` is empty, whatever the starting point would have proven,
+because nothing is being carried.
 
 ``--list-runs`` instead prints one ``<run id> <attempt>`` line per run the
 records name, so the caller can fetch exactly those jobs listings.
@@ -352,28 +356,29 @@ def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: 
     head_verdict = HEAD_VERDICTS.get(verdicts.get(after.lower(), ""), "none")
 
     if not before or before == NO_STARTING_POINT:
-        return render(UNPROVEN, "the push named no starting point", "", [], head_verdict)
+        verdict, reason = UNPROVEN, "the push named no starting point"
+        origin, chain = "", []
+    else:
+        origin, chain, dead_end = prove(before.lower(), verdicts, carries)
+        if origin == before.lower():
+            verdict = PROVEN
+            reason = f"a canonical review approved the starting point {short(before)} itself"
+        elif origin:
+            hops = len(chain) - 1
+            verdict = PROVEN
+            reason = (
+                f"the starting point {short(before)} was reached from the canonically approved "
+                f"{short(origin)} through {hops} recorded carr{'y' if hops == 1 else 'ies'}"
+            )
+        else:
+            verdict = UNPROVEN
+            reason = explain(dead_end, before.lower(), verdicts, unusable)
 
-    origin, chain, dead_end = prove(before.lower(), verdicts, carries)
-    if origin == before.lower():
-        return render(
-            PROVEN,
-            f"a canonical review approved the starting point {short(before)} itself",
-            origin,
-            chain,
-            head_verdict,
-        )
-    if origin:
-        hops = len(chain) - 1
-        return render(
-            PROVEN,
-            f"the starting point {short(before)} was reached from the canonically approved "
-            f"{short(origin)} through {hops} recorded carr{'y' if hops == 1 else 'ies'}",
-            origin,
-            chain,
-            head_verdict,
-        )
-    return render(UNPROVEN, explain(dead_end, before.lower(), verdicts, unusable), "", [], head_verdict)
+    if head_verdict == "approved":
+        # Nothing is carried into a head a reviewer approved in its own right:
+        # it is the origin, whatever the starting point would have been.
+        origin, chain = after.lower(), []
+    return render(verdict, reason, origin, chain, head_verdict)
 
 
 def main(argv: list[str]) -> int:

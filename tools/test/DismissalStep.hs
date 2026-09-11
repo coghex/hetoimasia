@@ -226,6 +226,26 @@ spec = describe "Stale approval mutation" $ do
           summary outcome `shouldContain` ("- Proven origin: `" ++ pushedHead ++ "`")
           summary outcome `shouldNotContain` "no reviewer examined"
 
+    it "names this head as the origin for an approval the decision already saw" $
+      -- The decision knew the head was approved but still handed over the
+      -- starting point's origin; the re-read normalises it to this head.
+      withStep
+        settled
+          { labelsAfter = [approval]
+          , replay = "keep"
+          , headVerdict = "approved"
+          , origin = approvedHead
+          , chain = approvedHead
+          , markers = [approvalMarker pushedHead "APPROVE"]
+          }
+        "none"
+        "kept"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+          summary outcome `shouldContain` ("- Proven origin: `" ++ pushedHead ++ "`")
+          summary outcome `shouldContain` "named this head itself"
+
     it "reports a late denial even when the removal was already planned" $
       withStep settled {markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]} "remove" "removed" $
         \outcome → do

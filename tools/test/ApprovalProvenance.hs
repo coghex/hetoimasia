@@ -483,8 +483,43 @@ spec = describe "Approval provenance" $ do
         decision ← decide fixture [approvedBy owner reviewed, approvedBy owner merged] unreviewed merged
         field "provenance" (provenanceOutput decision) `shouldBe` Just "unproven"
         field "head_verdict" (provenanceOutput decision) `shouldBe` Just "approved"
+        field "origin" (provenanceOutput decision) `shouldBe` Just merged
+        field "chain" (provenanceOutput decision) `shouldBe` Just ""
         shouldKeep decision
         gateOutput decision `shouldContain` ("reason=a canonical review approved head " ++ take 12 merged ++ " itself")
+
+    it "names the pushed head as the origin even when its starting point was approved too" $
+      -- Approved A, then separately approved B: B is its own origin, and the
+      -- summary the shipped step publishes says so rather than crediting A.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        advanceBase fixture "docs/notes.md" "An upstream note.\n" "Note upstream"
+        merged ← mergeBase fixture
+        decision ← decide fixture [approvedBy owner reviewed, approvedBy owner merged] reviewed merged
+        field "provenance" (provenanceOutput decision) `shouldBe` Just "proven"
+        field "head_verdict" (provenanceOutput decision) `shouldBe` Just "approved"
+        field "origin" (provenanceOutput decision) `shouldBe` Just merged
+        field "chain" (provenanceOutput decision) `shouldBe` Just ""
+        shouldKeep decision
+        let decided name = value name (gateOutput decision)
+            proven name = value name (provenanceOutput decision)
+            repository =
+              settled
+                { labelsAfter = [approval]
+                , replay = value "replay_decision" (replayOutput decision)
+                , provenance = proven "provenance"
+                , provenanceReason = proven "provenance_reason"
+                , origin = proven "origin"
+                , chain = proven "chain"
+                , headVerdict = proven "head_verdict"
+                }
+        withStep repository (decided "action") (decided "expected") $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+          unwords (calls outcome) `shouldNotContain` "--remove-label"
+          summary outcome `shouldContain` ("- Proven origin: `" ++ merged ++ "`")
+          summary outcome `shouldContain` "named this head itself"
+          summary outcome `shouldNotContain` "no reviewer examined"
 
     it "keeps a head approved after an earlier strip as a new origin" $
       -- B was stripped, then reviewed and approved in its own right. The

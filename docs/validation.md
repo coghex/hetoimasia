@@ -806,7 +806,11 @@ failure that would abort the job before the removal it justifies. Its `key=value
 `provenance`, `provenance_reason`, `origin`, `chain` (every revision from the
 origin to the starting point, comma-separated), and `head_verdict` — a
 tri-state `approved`, `denied`, or `none`, because a canonical denial of the
-pushed head is not the absence of an approval of it. The superseded-head and
+pushed head is not the absence of an approval of it. A head approved directly
+is its own origin: `origin` names it and `chain` is empty whatever the
+starting point would have proven, and the mutation job normalises the same
+way for an approval it observes, so the summary never credits an earlier
+revision for a review this head received itself. The superseded-head and
 unreadable-label refusals are unchanged and are answered before provenance is
 consulted.
 
@@ -1053,7 +1057,9 @@ marker by anyone but the owner
 and a carry record by anyone but the workflow, each ignored; a later marker
 withdrawing an approval of the same head and a later one re-establishing it; a
 fresh canonical approval of the pushed head surviving over an unproven starting
-point, and a head approved after an earlier strip starting a new chain; an
+point and named as the origin, the same when the starting point was approved
+too — through the shipped step, which credits this head rather than the earlier
+one — and a head approved after an earlier strip starting a new chain; an
 identical-tree re-push and a clean base merge of a proven head, and three
 successive base merges each recorded from the last, proven back to the origin
 with the chain named; a chain broken in the middle naming the link that ran
@@ -1091,7 +1097,8 @@ failed rather than returning nothing, and a decision that never concluded
 refused rather than confirmed. A canonical approval that arrived after the
 decision is covered there too: the removal withheld for an approval naming
 this exact head, a keep turned into a removal by a denial naming it, a late
-approval taken as the origin of a keep the decision had already reached and a
+approval taken as the origin of a keep the decision had already reached, an
+approval the decision already saw normalised to this head as the origin, and a
 late denial reported on a removal already planned, the newest marker for that
 head winning, a fresh approval of some other head
 ignored, and a marker read that failed refused before a removal and before a

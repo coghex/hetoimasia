@@ -295,10 +295,12 @@ jobs:
                 if [ "$HEAD_VERDICT" != "approved" ]; then
                   echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
                   REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
-                  HEAD_VERDICT=approved
-                  ORIGIN="$EVENT_HEAD"
-                  CHAIN=""
                 fi
+                # A head approved in its own right is its own origin, whether
+                # the decision already knew that or not.
+                HEAD_VERDICT=approved
+                ORIGIN="$EVENT_HEAD"
+                CHAIN=""
                 if [ "$ACTION" = "remove" ]; then
                   ACTION=none
                   EXPECTED=kept
@@ -308,10 +310,10 @@ jobs:
                 if [ "$HEAD_VERDICT" != "denied" ]; then
                   echo "a canonical review requested changes on head $EVENT_HEAD after the decision was made; removing $LABEL"
                   REASON="a canonical review requested changes on head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
-                  HEAD_VERDICT=denied
-                  ORIGIN=""
-                  CHAIN=""
                 fi
+                HEAD_VERDICT=denied
+                ORIGIN=""
+                CHAIN=""
                 if [ "$ACTION" != "remove" ]; then
                   ACTION=remove
                   EXPECTED=removed
