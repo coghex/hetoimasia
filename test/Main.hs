@@ -104,6 +104,7 @@ main = hspec $ do
     it "passes non-ASCII text through unchanged" testLayoutNonAscii
     it "quotes and escapes the source filename" testLayoutSourceFilename
     it "renders empty text as a pair of quotes" testLayoutEmptyText
+    it "keeps an unvalidated field key from disturbing the layout" testLayoutFieldKeys
     it "truncates the timestamp to three fractional digits" testLayoutTimestamp
   describe "Handle sink" $ do
     it "terminates each record itself" testHandleRecordTerminator
@@ -514,7 +515,7 @@ testLayoutEscaping = do
   -- A breadcrumb holding the separator is quoted, so the join stays readable.
   rendered plainEntry { entryBreadcrumbs = ["a>b", "c"] }
     `shouldSatisfy` Text.isInfixOf " crumbs=\"a>b\">c "
-  -- Keys and component names are never quoted.
+  -- An ordinary key is bare, as every example shows.
   rendered plainEntry { entryFields = Map.fromList [("odd.key-1", "v")] }
     `shouldSatisfy` Text.isInfixOf " odd.key-1=v"
 
@@ -549,6 +550,27 @@ testLayoutEmptyText = do
     , entryFields = Map.fromList [("key", "")]
     }
     `shouldBe` "2026-09-10T12:34:56.000Z INFO test thread=3 crumbs=\"\">gpu msg=\"\" key=\"\""
+
+-- | Field keys are raw 'Text' from the caller, unlike the validated component
+-- name beside them, so the layout rule has to cover them too.
+testLayoutFieldKeys ∷ IO ()
+testLayoutFieldKeys = do
+  let withKey key = rendered plainEntry { entryFields = Map.fromList [(key, "v")] }
+  -- A key that would split the record is quoted and escaped instead.
+  withKey "a\nb" `shouldBe` "2026-09-10T12:34:56.000Z INFO test thread=3 msg=plain \"a\\nb\"=v"
+  withKey "a\nb" `shouldSatisfy` not . Text.isInfixOf "\n"
+  -- So is one that would forge a segment, or an empty one.
+  withKey "a b" `shouldSatisfy` Text.isInfixOf " \"a b\"=v"
+  withKey "a=b" `shouldSatisfy` Text.isInfixOf " \"a=b\"=v"
+  withKey "a>b" `shouldSatisfy` Text.isInfixOf " \"a>b\"=v"
+  withKey "a\"b" `shouldSatisfy` Text.isInfixOf " \"a\\\"b\"=v"
+  withKey "a\\b" `shouldSatisfy` Text.isInfixOf " \"a\\\\b\"=v"
+  withKey "a\tb" `shouldSatisfy` Text.isInfixOf " \"a\\tb\"=v"
+  withKey "a\SOHb" `shouldSatisfy` Text.isInfixOf " \"a\\u0001b\"=v"
+  withKey "" `shouldSatisfy` Text.isInfixOf " \"\"=v"
+  -- Keys still sort by their own text, whatever rendering they need.
+  rendered plainEntry { entryFields = Map.fromList [("b key", "2"), ("a", "1"), ("c", "3")] }
+    `shouldBe` "2026-09-10T12:34:56.000Z INFO test thread=3 msg=plain a=1 \"b key\"=2 c=3"
 
 testLayoutTimestamp ∷ IO ()
 testLayoutTimestamp = do

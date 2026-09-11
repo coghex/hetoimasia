@@ -257,9 +257,11 @@ defaultFormatOptions = FormatOptions { formatThread = True, formatFlush = True }
 -- a source location and @crumbs=@ only when there is at least one breadcrumb.
 -- Fields follow the message, sorted by key.
 --
--- Message, breadcrumb, field-value, source-file, and thread text is written
--- bare when it is nonempty and holds only printable non-space characters other
--- than the four the layout reserves:
+-- Every piece of text in a record — message, breadcrumb, field key, field
+-- value, source filename, and thread — goes through one rule, so nothing a
+-- caller supplies can split a record or forge a segment. Text is written bare
+-- when it is nonempty and holds only printable non-space characters other than
+-- the four the layout reserves:
 --
 -- > " \ = >
 --
@@ -268,8 +270,12 @@ defaultFormatOptions = FormatOptions { formatThread = True, formatFlush = True }
 -- > \" \\ \n \r \t
 --
 -- and every other control character written as a backslash, a @u@, and four
--- uppercase hex digits. Empty text renders as a pair of quotes. Field keys and
--- component names are never quoted.
+-- uppercase hex digits. Empty text renders as a pair of quotes.
+--
+-- A component name is validated before it can reach an entry, so it is always
+-- bare. A field key is not, so it follows the same rule as everything else:
+-- ordinary keys are bare, and only a key that would otherwise disturb the
+-- layout is quoted.
 formatEntry ∷ FormatOptions → LogEntry → Text
 formatEntry options entry = Text.intercalate " " (concat parts)
   where
@@ -281,7 +287,9 @@ formatEntry options entry = Text.intercalate " " (concat parts)
       , foldMap (pure . sourceSegment) (entrySource entry)
       , [crumbSegment (entryBreadcrumbs entry) | not (null (entryBreadcrumbs entry))]
       , ["msg=" <> renderText (entryMessage entry)]
-      , [key <> "=" <> renderText value | (key, value) ← Map.toAscList (entryFields entry)]
+      , [ renderText key <> "=" <> renderText value
+        | (key, value) ← Map.toAscList (entryFields entry)
+        ]
       ]
 
     sourceSegment location =

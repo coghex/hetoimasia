@@ -132,9 +132,11 @@ renders as `2026-09-10T12:34:56.789Z`, and a whole second renders as `.000`.
 
 ### Quoting and escaping
 
-Message, breadcrumb, field-value, source-file, and thread text is written bare
-when it is nonempty and holds only printable non-space characters other than the
-four the layout reserves:
+Every piece of text in a record — message, breadcrumb, field key, field value,
+source filename, and thread — goes through one rule, so nothing a caller
+supplies can split a record or forge a segment. Text is written bare when it is
+nonempty and holds only printable non-space characters other than the four the
+layout reserves:
 
 ```text
 " \ = >
@@ -142,8 +144,13 @@ four the layout reserves:
 
 Anything else is wrapped in double quotes, with `\"`, `\\`, `\n`, `\r`, and
 `\t` escapes and every other control character written as `\uXXXX` with
-uppercase hex digits. Empty text renders as `""`. Field keys and component
-names are never quoted — both are already constrained to safe characters.
+uppercase hex digits. Empty text renders as `""`.
+
+A component name is validated by `mkComponent` before it can reach an entry, so
+it is always bare. A field key is not validated — `withFields` and the emission
+helpers take raw `Text` — so it follows the same rule as everything else:
+ordinary keys such as `attempt` or `gpu.device-id` are bare, and only a key that
+would otherwise disturb the layout is quoted.
 
 Quoting applies to the filename in `src=<file>:<line>` as well, so an unusual
 path cannot split a record across lines; the line number stays outside the
