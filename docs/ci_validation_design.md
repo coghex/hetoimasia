@@ -22,15 +22,17 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish effective, selective CI and validation reuse
-- [ ] CI-1. Define the shared catalog and explainable test selection
-- [ ] CI-2. Run selected validation through stable, parallel GitHub checks
-- [ ] CI-3. Preserve valid CI evidence across documentation changes
+- [#8] EPIC. Establish effective, selective CI and validation reuse
+- [#10] CI-1. Define the shared catalog and explainable test selection
+- [#11] CI-2. Run selected validation through stable, parallel GitHub checks
+- [#12] CI-3. Preserve valid CI evidence across documentation changes
 - [ ] CI-4. Carry review approval through clean base merges independently of CI
 - [deferred] CI-5. Integrate `test` and `autotest` with the shared testing contract
 
 These delivery boundaries are ready for issue processing and mirrored below.
-No tracker artifacts have been created.
+CI-1 and CI-2 have landed; the behaviour they established is described in
+[validation.md](validation.md) rather than here, because this document records
+the design rather than the shipped system.
 CI-5 resumes when the owner requests skill integration; inspect the skills'
 actual interfaces then before choosing adapter or scheduler changes.
 

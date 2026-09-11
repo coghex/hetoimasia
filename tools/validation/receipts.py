@@ -18,8 +18,25 @@ import hashlib
 import json
 import os
 
-PLAN_SCHEMA_VERSION = 1
-RECEIPT_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 2
+APPLICABILITY_SCHEMA_VERSION = 1
+
+# The fields an earlier execution and the current candidate must agree on
+# before that execution's result may stand in for one. They are deliberately
+# the whole comparison: content, policy, toolchain, and platform.
+COMPATIBILITY_FIELDS = ("input_identity", "policy_version", "toolchain", "runner_os")
+
+# The artifact one group's receipt is published under. The identity is in the
+# name so a lookup asks for evidence about *these* inputs rather than fetching
+# every receipt a group ever produced and filtering afterwards. It is defined
+# here because both the side that publishes evidence and the side that reads a
+# record back have to agree on what a stored artifact was named.
+ARTIFACT_PREFIX = "receipt"
+
+
+def artifact_name(group: str, identity: str) -> str:
+    return f"{ARTIFACT_PREFIX}-{group}-{identity}"
 
 # Outcomes a receipt may record. ``timeout`` is distinct from ``failed``
 # because a group that exhausted its declared budget is a different obstacle
@@ -118,6 +135,30 @@ def require_str_list(document: dict, key: str, description: str) -> list[str]:
     return value
 
 
+def parse_toolchain(entries: list[str]) -> dict[str, str]:
+    """Read repeated ``NAME=VERSION`` declarations into one mapping.
+
+    The planner and the runner both declare a toolchain, and reuse compares the
+    two for equality, so they parse the declaration the same way here rather
+    than twice.
+    """
+    toolchain: dict[str, str] = {}
+    for entry in entries:
+        name, separator, version = entry.partition("=")
+        if not separator or not name:
+            raise EvidenceError(f"--toolchain expects NAME=VERSION, not {entry!r}")
+        toolchain[name] = version
+    return toolchain
+
+
+def require_toolchain(document: dict, key: str, description: str) -> dict[str, str]:
+    value = require_dict(document, key, description)
+    for name, version in value.items():
+        if not isinstance(version, str):
+            raise EvidenceError(f"{description} records a non-string version for {name!r}")
+    return value
+
+
 # --------------------------------------------------------------------------
 # Plans
 
@@ -130,8 +171,12 @@ def load_plan(path: str) -> dict:
         raise EvidenceError(
             f"plan {path} declares schema version {schema}, but this tool reads {PLAN_SCHEMA_VERSION}"
         )
-    require_int(document, "policy_version", "plan")
-    for endpoint in ("base", "head"):
+    require_str(document, "policy_version", "plan")
+    require_int(document, "catalog_policy_version", "plan")
+    require_str(document, "input_identity", "plan")
+    require_str(document, "runner_os", "plan")
+    require_toolchain(document, "toolchain", "plan")
+    for endpoint in ("base", "head", "candidate"):
         revision = require_dict(document, endpoint, "plan")
         require_str(revision, "commit", f"plan {endpoint}")
         require_str(revision, "tree", f"plan {endpoint}")
@@ -187,17 +232,23 @@ def plan_identity(plan: dict) -> str:
     """The fingerprint a receipt names so evidence cannot cross plans.
 
     It covers everything that decides what must run and how: the plan and
-    policy revisions, both compared endpoints, the normalized request, and
-    every group's selection and exact execution definition. It deliberately
-    omits the catalog and request *paths*, which are run-local filenames rather
-    than contract, and the changed-path listing, which explains a selection
-    without being able to alter it.
+    policy revisions, the candidate's input identity and pinned toolchain, all
+    three revisions, the normalized request, and every group's selection and
+    exact execution definition. It deliberately omits the catalog and request
+    *paths*, which are run-local filenames rather than contract, and the
+    changed-path listing, which explains a selection without being able to
+    alter it.
     """
     payload = {
         "plan_schema_version": plan["schema_version"],
         "policy_version": plan["policy_version"],
+        "catalog_policy_version": plan["catalog_policy_version"],
+        "input_identity": plan["input_identity"],
+        "toolchain": dict(plan["toolchain"]),
+        "runner_os": plan["runner_os"],
         "base": {"commit": plan["base"]["commit"], "tree": plan["base"]["tree"]},
         "head": {"commit": plan["head"]["commit"], "tree": plan["head"]["tree"]},
+        "candidate": {"commit": plan["candidate"]["commit"], "tree": plan["candidate"]["tree"]},
         "request": {
             "ids": sorted(plan["request"]["ids"]),
             "all_hspec": plan["request"]["all_hspec"],
@@ -233,37 +284,48 @@ def receipt_path(directory: str, identifier: str) -> str:
     return os.path.join(directory, identifier + ".json")
 
 
-def load_receipt(path: str) -> dict:
-    """Read a receipt, rejecting any shape that cannot support a verdict."""
-    document = read_document(path, "receipt")
-    schema = require_int(document, "schema_version", "receipt")
+def validate_receipt(document: dict, description: str) -> dict:
+    """Hold one receipt to the shape a verdict can rest on.
+
+    A receipt read from a file and a receipt carried inside an applicability
+    record are the same contract, so both come through here. A reused execution
+    is held to exactly what a fresh one is held to; anything less would let a
+    truncated document satisfy a group precisely because it was old.
+    """
+    schema = require_int(document, "schema_version", description)
     if schema != RECEIPT_SCHEMA_VERSION:
         raise EvidenceError(
-            f"receipt {path} declares schema version {schema}, but this tool reads {RECEIPT_SCHEMA_VERSION}"
+            f"{description} declares schema version {schema}, "
+            f"but this tool reads {RECEIPT_SCHEMA_VERSION}"
         )
-    require_str(document, "group", "receipt")
-    require_str_list(document, "command", "receipt")
-    outcome = require_str(document, "outcome", "receipt")
+    require_str(document, "group", description)
+    require_str_list(document, "command", description)
+    outcome = require_str(document, "outcome", description)
     if outcome not in OUTCOMES:
         raise EvidenceError(
-            f"receipt {path} records outcome {outcome!r}, which is not one of " + ", ".join(OUTCOMES)
+            f"{description} records outcome {outcome!r}, which is not one of " + ", ".join(OUTCOMES)
         )
-    require_int(document, "exit_status", "receipt")
-    require_str(document, "started_at", "receipt")
-    require_str(document, "ended_at", "receipt")
-    require_number(document, "duration_seconds", "receipt")
-    require_int(document, "timeout_seconds", "receipt")
-    require_str(document, "plan_identity", "receipt")
-    require_str(document, "head_commit", "receipt")
-    require_str(document, "executed_commit", "receipt")
-    require_str(document, "executed_tree", "receipt")
-    require_str(document, "runner_os", "receipt")
-    require_str(document, "runner_arch", "receipt")
-    toolchain = require_dict(document, "toolchain", "receipt")
-    for name, version in toolchain.items():
-        if not isinstance(version, str):
-            raise EvidenceError(f"receipt {path} records a non-string version for {name!r}")
+    require_int(document, "exit_status", description)
+    require_str(document, "started_at", description)
+    require_str(document, "ended_at", description)
+    require_number(document, "duration_seconds", description)
+    require_int(document, "timeout_seconds", description)
+    require_str(document, "plan_identity", description)
+    require_str(document, "head_commit", description)
+    require_str(document, "executed_commit", description)
+    require_str(document, "executed_tree", description)
+    require_str(document, "runner_os", description)
+    require_str(document, "runner_arch", description)
+    require_str(document, "input_identity", description)
+    require_str(document, "policy_version", description)
+    require_str(document, "source_run_url", description)
+    require_toolchain(document, "toolchain", description)
     return document
+
+
+def load_receipt(path: str) -> dict:
+    """Read a receipt, rejecting any shape that cannot support a verdict."""
+    return validate_receipt(read_document(path, "receipt"), f"receipt {path}")
 
 
 def write_receipt(directory: str, receipt: dict) -> str:
@@ -276,3 +338,117 @@ def write_receipt(directory: str, receipt: dict) -> str:
         handle.write("\n")
     os.replace(temporary, target)
     return target
+
+
+# --------------------------------------------------------------------------
+# Applicability
+#
+# An applicability record is the proof that an earlier execution still applies
+# to this candidate. It is deliberately not a receipt: the receipt it carries
+# keeps its original timestamps, commit, tree, and run attribution, and the
+# record beside it states why that older execution answers this candidate's
+# question. Nothing here ever rewrites a receipt into a fresh one.
+
+
+def candidate_identity(plan: dict) -> dict:
+    """The compatibility fields a reusable execution has to match."""
+    return {
+        "input_identity": plan["input_identity"],
+        "policy_version": plan["policy_version"],
+        "toolchain": dict(plan["toolchain"]),
+        "runner_os": plan["runner_os"],
+    }
+
+
+def compatibility_problems(candidate: dict, evidence: dict, description: str) -> list[str]:
+    """Why an execution does not describe this candidate, if it does not."""
+    problems: list[str] = []
+    for name in COMPATIBILITY_FIELDS:
+        if name not in evidence:
+            problems.append(f"{description} declares no {name}")
+        elif evidence[name] != candidate[name]:
+            problems.append(f"{description} records a different {name}")
+    return problems
+
+
+def load_applicability(path: str) -> dict:
+    """Read an applicability document, rejecting any shape a verdict cannot rest on."""
+    document = read_document(path, "applicability")
+    schema = require_int(document, "schema_version", "applicability")
+    if schema != APPLICABILITY_SCHEMA_VERSION:
+        raise EvidenceError(
+            f"applicability {path} declares schema version {schema}, "
+            f"but this tool reads {APPLICABILITY_SCHEMA_VERSION}"
+        )
+    require_str(document, "plan_identity", "applicability")
+    require_str(document, "input_identity", "applicability")
+    require_str(document, "policy_version", "applicability")
+    require_str(document, "runner_os", "applicability")
+    require_toolchain(document, "toolchain", f"applicability {path}")
+    require_str_list(document, "obstacles", "applicability")
+    reused = require_list(document, "reused", "applicability")
+    seen: set[str] = set()
+    for record in reused:
+        if not isinstance(record, dict):
+            raise EvidenceError(f"applicability {path} field 'reused' contains a non-object entry")
+        identifier = require_str(record, "group", "applicability record")
+        if identifier in seen:
+            raise EvidenceError(f"applicability {path} records group {identifier!r} more than once")
+        seen.add(identifier)
+        where = f"applicability record {identifier}"
+        source = require_str(record, "source_run_url", where)
+        executed_commit = require_str(record, "executed_commit", where)
+        executed_tree = require_str(record, "executed_tree", where)
+        receipt = validate_receipt(require_dict(record, "receipt", where), f"{where}'s receipt")
+        artifact = require_dict(record, "artifact", where)
+        require_int(artifact, "id", f"{where}'s artifact")
+        require_str(artifact, "created_at", f"{where}'s artifact")
+        # The name is where the group and the identity are stored, so it is
+        # also where a record can be made to describe evidence it did not come
+        # from. It has to name this group under this candidate's inputs.
+        expected = artifact_name(identifier, document["input_identity"])
+        if require_str(artifact, "name", f"{where}'s artifact") != expected:
+            raise EvidenceError(f"{where}'s artifact is not named {expected!r}")
+        proof = require_dict(record, "proof", where)
+        for name in COMPATIBILITY_FIELDS:
+            if name not in proof:
+                raise EvidenceError(f"{where}'s proof declares no {name}")
+            if proof[name] != document[name]:
+                raise EvidenceError(f"{where}'s proof disagrees with the candidate's {name}")
+        # The record restates three of the receipt's own fields for legibility.
+        # A restatement that disagrees with the receipt it sits beside is not a
+        # summary of that execution, so it cannot describe one.
+        for name, restated in (
+            ("source_run_url", source),
+            ("executed_commit", executed_commit),
+            ("executed_tree", executed_tree),
+        ):
+            if receipt[name] != restated:
+                raise EvidenceError(f"{where} restates a {name} its receipt does not record")
+    rejected = require_list(document, "rejected", "applicability")
+    for record in rejected:
+        if not isinstance(record, dict):
+            raise EvidenceError(f"applicability {path} field 'rejected' contains a non-object entry")
+        identifier = require_str(record, "group", "applicability rejection")
+        require_str(record, "reason", f"applicability rejection {identifier}")
+        require_str(record, "source_run_url", f"applicability rejection {identifier}")
+    return document
+
+
+def applicability_problems(document: dict, plan: dict, identity: str) -> list[str]:
+    """Why this applicability document does not describe this plan.
+
+    A record resolved for another plan, another candidate, another policy, or
+    another platform is stale rather than merely unrelated, and a stale record
+    must never excuse a group from executing.
+    """
+    problems: list[str] = []
+    if document["plan_identity"] != identity:
+        problems.append(
+            f"the applicability record was resolved for plan {document['plan_identity'][:12]}, "
+            f"not {identity[:12]}"
+        )
+    problems += compatibility_problems(
+        candidate_identity(plan), document, "the applicability record"
+    )
+    return problems
