@@ -85,6 +85,20 @@ spec = describe "Validation evidence reuse" $ do
             after ← identityNow fixture
             (path, after) `shouldNotBe` (path, before)
 
+    it "changes when an included path is renamed, and again when one is deleted" $
+      withFixture $ \fixture → do
+        before ← identityNow fixture
+        void $ gitIn fixture ["mv", "src/note.txt", "src/renamed.txt"]
+        void $ gitIn fixture ["commit", "-q", "-m", "Rename an included fixture"]
+        -- The path is part of the digest, not merely its contents: a group
+        -- reads a file at a location, and moving it is a different tree.
+        renamed ← identityNow fixture
+        renamed `shouldNotBe` before
+        void $ gitIn fixture ["rm", "-q", "docs/consumed.md"]
+        void $ gitIn fixture ["commit", "-q", "-m", "Delete a consumed document"]
+        deleted ← identityNow fixture
+        deleted `shouldNotBe` renamed
+
     it "changes when an included path's file mode changes" $
       withFixture $ \fixture → do
         before ← identityNow fixture
@@ -337,6 +351,20 @@ spec = describe "Validation evidence reuse" $ do
         (result, _, errors) ← aggregate fixture plan []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "not valid JSON"
+
+    it "refuses a record whose artifact names other evidence than the record's own" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [passing receipt]
+        looked ← reuse fixture plan
+        exitOf looked `shouldBe` ExitSuccess
+        -- The artifact name is where the group and the identity are stored, so
+        -- it is also where a record could be made to describe evidence it did
+        -- not come from.
+        rename fixture (root fixture </> "applicability.json") "receipt-test.fail-0123456789abcdef"
+        (result, _, errors) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "is not named"
 
     it "refuses a record whose embedded receipt is not a whole receipt" $
       withReceipt $ \fixture receipt → do
@@ -622,6 +650,26 @@ patched fixture source name key value = do
   let target = root fixture </> name
   patch fixture source target key value
   pure target
+
+-- | Rename the artifact every record in an applicability document came from.
+rename ∷ Fixture → FilePath → String → IO ()
+rename fixture path name = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json, sys\n\
+        \path, name = sys.argv[1:3]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \for record in document['reused']:\n\
+        \    record['artifact']['name'] = name\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , path
+      , name
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
 
 -- | Drop one field from every receipt an applicability document carries.
 truncate' ∷ Fixture → FilePath → String → IO ()

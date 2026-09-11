@@ -39,11 +39,6 @@ import zipfile
 import receipts
 from receipts import EvidenceError
 
-# The artifact name every worker uploads a receipt under. The identity is in
-# the name so a lookup asks for evidence about *these* inputs rather than
-# fetching every receipt a group ever produced and filtering afterwards.
-ARTIFACT_PREFIX = "receipt"
-
 # Run conclusions that describe a finished execution. A run still in progress
 # has not finished the group, and a cancelled or timed-out one may have uploaded
 # a receipt for work it never completed.
@@ -57,10 +52,6 @@ CALL_SECONDS = 30
 # the pattern so a receipt that names only the run can be told apart from one
 # that names another run entirely.
 RUN_URL_PATTERN = re.compile(r"/actions/runs/(\d+)(?:/attempts/(\d+))?/?$")
-
-
-def artifact_name(group: str, identity: str) -> str:
-    return f"{ARTIFACT_PREFIX}-{group}-{identity}"
 
 
 class Budget:
@@ -280,7 +271,7 @@ def consider(
     past a newer failure for an older pass would publish a green verdict while
     a known failure for the very same inputs sat unmentioned one artifact back.
     """
-    name = artifact_name(group, plan["input_identity"])
+    name = receipts.artifact_name(group, plan["input_identity"])
     listing = api.json(
         f"repos/{repository}/actions/artifacts?name={urllib.parse.quote(name)}&per_page=100"
     )

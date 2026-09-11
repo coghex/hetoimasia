@@ -581,9 +581,12 @@ of the run looks.
 A selected group with no receipt at all is satisfied instead by an applicability
 record, and only then. The receipt that record carries is read through the same
 contract a fresh one is: a document truncated to the fields the verdict happens
-to compare satisfies nothing, and neither does a record whose stored proof,
-artifact metadata, or restated commit, tree, and run disagree with the receipt
-beside it. A fresh receipt always outranks one: a failure that just
+to compare satisfies nothing, and neither does a record whose stored proof or
+restated commit, tree, and run disagree with the receipt beside it. The stored
+artifact must be named `receipt-<group-id>-<input-identity>` for that record's
+own group under this candidate's inputs: the name is where the group and the
+identity are kept, so it is also where a record could be made to describe
+evidence it did not come from. A fresh receipt always outranks one: a failure that just
 happened is never overruled by an older pass. The record is held to the
 candidate's compatibility fields rather than to this plan's identity and head,
 which belong to the run that executed, and a record resolved for another plan or
@@ -790,7 +793,7 @@ Candidate identity and reuse are covered against temporary Git repositories and
 a stub `gh` answering from canned files. The identity examples assert that a
 prose edit, rename, and deletion leave `input_identity` untouched while a
 source, package description, project file, fixture, consumed Markdown document,
-or file mode change moves it; that a catalog or workflow edit moves the policy
+or file mode change moves it, as do renaming and deleting an included path; that a catalog or workflow edit moves the policy
 identity and the input identity with it; that a code change followed by a
 prose-only push keeps the identity while selection still reports the code as
 affected; and that an upstream change merged into the integration candidate
@@ -814,8 +817,9 @@ cannot answer at all leaves an obstacle and returns every group to execution.
 
 The aggregate examples cover a covered group satisfied and its worker excused, a
 selected group with neither an execution nor a record, a record resolved for
-another plan, a malformed record, a record whose embedded receipt is not a whole
-receipt, and a fresh failure standing rather than the older pass behind it.
+another plan, a malformed record, a record whose artifact names other evidence
+than its own, a record whose embedded receipt is not a whole receipt, and a
+fresh failure standing rather than the older pass behind it.
 
 The stub is what makes those reachable: a run still executing, a newer failure
 in front of an older pass, and an API that does not answer do not happen on

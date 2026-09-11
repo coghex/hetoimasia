@@ -27,6 +27,17 @@ APPLICABILITY_SCHEMA_VERSION = 1
 # the whole comparison: content, policy, toolchain, and platform.
 COMPATIBILITY_FIELDS = ("input_identity", "policy_version", "toolchain", "runner_os")
 
+# The artifact one group's receipt is published under. The identity is in the
+# name so a lookup asks for evidence about *these* inputs rather than fetching
+# every receipt a group ever produced and filtering afterwards. It is defined
+# here because both the side that publishes evidence and the side that reads a
+# record back have to agree on what a stored artifact was named.
+ARTIFACT_PREFIX = "receipt"
+
+
+def artifact_name(group: str, identity: str) -> str:
+    return f"{ARTIFACT_PREFIX}-{group}-{identity}"
+
 # Outcomes a receipt may record. ``timeout`` is distinct from ``failed``
 # because a group that exhausted its declared budget is a different obstacle
 # from one that ran to completion and disagreed with the code.
@@ -391,8 +402,13 @@ def load_applicability(path: str) -> dict:
         receipt = validate_receipt(require_dict(record, "receipt", where), f"{where}'s receipt")
         artifact = require_dict(record, "artifact", where)
         require_int(artifact, "id", f"{where}'s artifact")
-        require_str(artifact, "name", f"{where}'s artifact")
         require_str(artifact, "created_at", f"{where}'s artifact")
+        # The name is where the group and the identity are stored, so it is
+        # also where a record can be made to describe evidence it did not come
+        # from. It has to name this group under this candidate's inputs.
+        expected = artifact_name(identifier, document["input_identity"])
+        if require_str(artifact, "name", f"{where}'s artifact") != expected:
+            raise EvidenceError(f"{where}'s artifact is not named {expected!r}")
         proof = require_dict(record, "proof", where)
         for name in COMPATIBILITY_FIELDS:
             if name not in proof:
