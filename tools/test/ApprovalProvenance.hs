@@ -151,6 +151,39 @@ spec = describe "Approval provenance" $ do
         value "provenance_reason" (provenanceOutput decision) `shouldContain` "not a list of comments"
         shouldRemove decision
 
+    it "strips when a comment cannot be ordered against the others" $
+      -- The reviewer's own example: a withdrawal that lacks its timestamp
+      -- would otherwise sort before the approval it withdrew. A feed with a
+      -- comment the proof cannot place proves nothing at all.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        writeFixtureFile
+          (root fixture)
+          "feed.json"
+          ( "[" ++ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker reviewed "APPROVE")
+              ++ ", " ++ feedEntry 2 Nothing owner (approvalMarker reviewed "CHANGES_REQUESTED") ++ "]"
+          )
+        decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
+        field "provenance" (provenanceOutput decision) `shouldBe` Just "unproven"
+        value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable created_at"
+        field "head_verdict" (provenanceOutput decision) `shouldBe` Just "none"
+        shouldRemove decision
+
+    it "strips when a comment cannot be attributed" $
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        writeFixtureFile
+          (root fixture)
+          "feed.json"
+          ( "[" ++ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker reviewed "APPROVE")
+              ++ ", {\"id\": 2, \"created_at\": \"2026-09-11T00:00:02Z\", \"user\": {}, \"body\": \"\"}]"
+          )
+        decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
+        value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable user.login"
+        shouldRemove decision
+
     it "accepts the paged feed the workflow fetches" $
       -- `gh api --paginate --slurp` writes a list of pages, not of comments.
       withFixture $ \fixture → do
@@ -664,14 +697,18 @@ jobsListing workflowName recording conclusion headSha =
 feed ∷ [Comment] → String
 feed comments = "[" ++ commaSeparated (zipWith render [1 ..] comments) ++ "]"
   where
-    render ∷ Int → Comment → String
     render number comment =
-      "{\"id\": " ++ show number
-        ++ ", \"created_at\": \"2026-09-11T00:00:" ++ pad number ++ "Z\""
-        ++ ", \"user\": {\"login\": " ++ quoted (author comment) ++ ", \"type\": \"User\"}"
-        ++ ", \"body\": " ++ quoted (body comment) ++ "}"
+      feedEntry number (Just ("2026-09-11T00:00:" ++ pad number ++ "Z")) (author comment) (body comment)
     pad number = let text = show number in replicate (2 - length text) '0' ++ text
     commaSeparated = foldr (\item rest → if null rest then item else item ++ ", " ++ rest) ""
+
+-- | One comment object, with or without the timestamp that orders it.
+feedEntry ∷ Int → Maybe String → String → String → String
+feedEntry number created login text =
+  "{\"id\": " ++ show number
+    ++ maybe "" (\stamp → ", \"created_at\": " ++ quoted stamp) created
+    ++ ", \"user\": {\"login\": " ++ quoted login ++ ", \"type\": \"User\"}"
+    ++ ", \"body\": " ++ quoted text ++ "}"
 
 quoted ∷ String → String
 quoted text = "\"" ++ concatMap escape text ++ "\""

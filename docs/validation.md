@@ -795,10 +795,13 @@ a canonical marker.
 
 The script always exits 0, for the same reason the replay does: `unproven` is
 an answer the caller removes a label on, and a feed that is missing,
-unreadable, malformed, or not a list of comments proves nothing and is
-reported as `unproven` with the reason — never inferred `proven` from tree
-equality or replay eligibility, and never turned into a failure that would
-abort the job before the removal it justifies. Its `key=value` lines are
+unreadable, malformed, not a list of comments, or **incomplete** — any comment
+without a usable `id`, `created_at`, `user.login`, or `body`, since a marker
+that cannot be ordered could be taken for older than the verdict it withdrew
+and one that cannot be attributed could be taken for the owner's — proves
+nothing and is reported as `unproven` with the reason — never inferred
+`proven` from tree equality or replay eligibility, and never turned into a
+failure that would abort the job before the removal it justifies. Its `key=value` lines are
 `provenance`, `provenance_reason`, `origin`, `chain` (every revision from the
 origin to the starting point, comma-separated), and `head_verdict` — a
 tri-state `approved`, `denied`, or `none`, because a canonical denial of the
@@ -829,8 +832,12 @@ exact head while the decision was queued, since the head did not move:
 stripping past a fresh approval would remove a review somebody just granted to
 this very revision, and confirming a keep past a fresh denial would record a
 carry a reviewer just refused. So the newest marker naming the event head wins
-there too, in both directions, and a marker read that fails refuses like every
-other unconfirmed read in that job. Its summary states the starting point's
+there too, in both directions, and it is applied to the provenance the job
+publishes whether or not it changes the action: a head approved in its own
+right is a new origin even when the decision was already keeping, so no carry
+is recorded for it, and a denial is reported even when the removal was already
+planned. A marker read that fails refuses like every other unconfirmed read in
+that job. Its summary states the starting point's
 verdict and reason, the proven origin, and, for a carry, the route from that
 origin through every recorded head to the pushed one; for a strip it names the
 link that could not be proven — the starting point itself, or the revision an
@@ -1036,7 +1043,10 @@ push on top of one, each stripping — and the delayed earlier invalidation
 refused for its superseded head before the next push strips; an earlier carry
 whose mutation failed or never ran and so recorded nothing; a feed that could
 not be read, is not valid JSON, or is not a list of comments, each stripping;
-the paged feed the workflow fetches; a review marker by anyone but the owner
+the paged feed the workflow fetches; a comment that cannot be ordered — the
+withdrawal without a timestamp that would otherwise sort before the approval
+it withdrew — and one that cannot be attributed, each stripping; a review
+marker by anyone but the owner
 and a carry record by anyone but the workflow, each ignored; a later marker
 withdrawing an approval of the same head and a later one re-establishing it; a
 fresh canonical approval of the pushed head surviving over an unproven starting
@@ -1077,8 +1087,10 @@ because the head advanced, a removal that did not take, and a label read that
 failed rather than returning nothing, and a decision that never concluded
 refused rather than confirmed. A canonical approval that arrived after the
 decision is covered there too: the removal withheld for an approval naming
-this exact head, a keep turned into a removal by a denial naming it, the
-newest marker for that head winning, a fresh approval of some other head
+this exact head, a keep turned into a removal by a denial naming it, a late
+approval taken as the origin of a keep the decision had already reached and a
+late denial reported on a removal already planned, the newest marker for that
+head winning, a fresh approval of some other head
 ignored, and a marker read that failed refused before a removal and before a
 keep alike. So is the record it
 writes: a kept approval recorded at the head it was carried to with the link

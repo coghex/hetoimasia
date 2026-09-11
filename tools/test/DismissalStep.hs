@@ -210,6 +210,30 @@ spec = describe "Stale approval mutation" $ do
           summary outcome `shouldContain` "- `reviewed:approve`: removed"
           summary outcome `shouldContain` "requested changes on this head itself"
 
+    it "treats a late approval as the origin even when the decision already kept" $
+      -- The action does not change, but the provenance does: a head approved
+      -- in its own right is a new origin, so no carry is recorded for it and
+      -- the summary does not claim nobody read it.
+      withStep
+        settled {labelsAfter = [approval], replay = "keep", markers = [approvalMarker pushedHead "APPROVE"]}
+        "none"
+        "kept"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          unwords (calls outcome) `shouldNotContain` "--remove-label"
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+          summary outcome `shouldContain` "named this head itself"
+          summary outcome `shouldContain` ("- Proven origin: `" ++ pushedHead ++ "`")
+          summary outcome `shouldNotContain` "no reviewer examined"
+
+    it "reports a late denial even when the removal was already planned" $
+      withStep settled {markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]} "remove" "removed" $
+        \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+          summary outcome `shouldContain` "requested changes on this head itself"
+          summary outcome `shouldContain` "- Proven origin: not established"
+
     it "fails a keep it cannot re-verify against the markers" $
       withStep settled {labelsAfter = [approval], replay = "keep", markerReadFails = True} "none" "kept" $
         \outcome → do

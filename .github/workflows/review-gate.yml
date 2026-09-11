@@ -272,10 +272,14 @@ jobs:
           # review markers again immediately before acting on either verdict,
           # and let the newest marker naming this head win: an approval keeps
           # a label the decision would have removed, and a denial removes one
-          # the decision would have kept. A read that fails is not an empty
-          # one: acting on it could strip an approval somebody just granted or
-          # confirm one somebody just refused, so it is refused like every
-          # other unconfirmed read here.
+          # the decision would have kept. The verdict is applied to the
+          # provenance whether or not it changes the action: a head approved
+          # in its own right is a new origin even when the decision was
+          # already keeping, so no carry is recorded for it, and a denial is
+          # reported even when the removal was already planned. A read that
+          # fails is not an empty one: acting on it could strip an approval
+          # somebody just granted or confirm one somebody just refused, so it
+          # is refused like every other unconfirmed read here.
           if [ "$ACTION" = "remove" ] || [ "$EXPECTED" = "kept" ]; then
             owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
             if ! markers="$(gh api --paginate "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" \
@@ -288,25 +292,29 @@ jobs:
               | tail -n 1 || true)"
             case "$newest" in
               *'verdict=APPROVE -->')
-                if [ "$ACTION" = "remove" ]; then
+                if [ "$HEAD_VERDICT" != "approved" ]; then
                   echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
-                  ACTION=none
-                  EXPECTED=kept
                   REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
                   HEAD_VERDICT=approved
                   ORIGIN="$EVENT_HEAD"
                   CHAIN=""
                 fi
+                if [ "$ACTION" = "remove" ]; then
+                  ACTION=none
+                  EXPECTED=kept
+                fi
                 ;;
               *'verdict=CHANGES_REQUESTED -->')
-                if [ "$ACTION" != "remove" ]; then
+                if [ "$HEAD_VERDICT" != "denied" ]; then
                   echo "a canonical review requested changes on head $EVENT_HEAD after the decision was made; removing $LABEL"
-                  ACTION=remove
-                  EXPECTED=removed
                   REASON="a canonical review requested changes on head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
                   HEAD_VERDICT=denied
                   ORIGIN=""
                   CHAIN=""
+                fi
+                if [ "$ACTION" != "remove" ]; then
+                  ACTION=remove
+                  EXPECTED=removed
                 fi
                 ;;
             esac

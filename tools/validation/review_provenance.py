@@ -113,13 +113,38 @@ def render(verdict: str, reason: str, origin: str, chain: list[str], head_verdic
     return 0
 
 
+# What every comment has to carry before anything in the feed is believed:
+# its identity and timestamp, which order it against the others; its author,
+# which decides whether it may say anything at all; and its body.
+COMMENT_FIELDS = ("id", "created_at", "user", "body")
+
+
+def incomplete(comment: dict) -> str:
+    """Which required field a comment lacks, or empty when it carries them all."""
+    for name in COMMENT_FIELDS:
+        if name not in comment:
+            return name
+    if not isinstance(comment["id"], int):
+        return "id"
+    if not isinstance(comment["created_at"], str):
+        return "created_at"
+    if not isinstance(comment["user"], dict) or not isinstance(comment["user"].get("login"), str):
+        return "user.login"
+    if not isinstance(comment["body"], str):
+        return "body"
+    return ""
+
+
 def load_feed(path: str) -> tuple[list[dict], str]:
     """The comments, flattened, or the reason they could not be read.
 
     Accepts one page or the list of pages ``gh api --paginate --slurp``
-    writes. Anything that is not a list of comment objects is malformed, and a
-    malformed feed is not an empty one: no comment in it can be trusted to be
-    the whole story, so nothing in it proves anything.
+    writes. Anything that is not a list of comment objects is malformed, and
+    so is a comment missing a field the proof needs: a marker that cannot be
+    ordered could be taken for older than the verdict it withdrew, and one
+    that cannot be attributed could be taken for the owner's. An incomplete
+    feed is not an empty one — no comment in it can be trusted to be the
+    whole story, so nothing in it proves anything.
     """
     if not path:
         return [], "no provenance feed was supplied"
@@ -141,28 +166,23 @@ def load_feed(path: str) -> tuple[list[dict], str]:
         for comment in page:
             if not isinstance(comment, dict):
                 return [], "the provenance feed contains an entry that is not a comment"
+            missing = incomplete(comment)
+            if missing:
+                return [], f"the provenance feed contains a comment without a usable {missing}"
             comments.append(comment)
     return comments, ""
 
 
 def author_of(comment: dict) -> str:
-    user = comment.get("user")
-    login = user.get("login") if isinstance(user, dict) else None
-    return login.casefold() if isinstance(login, str) else ""
+    return comment["user"]["login"].casefold()
 
 
 def ordered(comments: list[dict]) -> list[dict]:
-    """Oldest first, so a later verdict on the same head is the one that wins."""
+    """Oldest first, so a later verdict on the same head is the one that wins.
 
-    def key(comment: dict) -> tuple[str, int]:
-        created = comment.get("created_at")
-        identifier = comment.get("id")
-        return (
-            created if isinstance(created, str) else "",
-            identifier if isinstance(identifier, int) else 0,
-        )
-
-    return sorted(comments, key=key)
+    Every comment carries both keys: ``load_feed`` refused the feed otherwise.
+    """
+    return sorted(comments, key=lambda comment: (comment["created_at"], comment["id"]))
 
 
 def canonical_verdicts(comments: list[dict], owner: str) -> dict[str, str]:
@@ -171,10 +191,7 @@ def canonical_verdicts(comments: list[dict], owner: str) -> dict[str, str]:
     for comment in ordered(comments):
         if author_of(comment) != owner.casefold():
             continue
-        body = comment.get("body")
-        if not isinstance(body, str):
-            continue
-        for marker in REVIEW_MARKER.finditer(body):
+        for marker in REVIEW_MARKER.finditer(comment["body"]):
             verdicts[marker.group("head").lower()] = marker.group("verdict")
     return verdicts
 
@@ -185,10 +202,7 @@ def records_by(comments: list[dict], recorder: str) -> list[re.Match[str]]:
     for comment in ordered(comments):
         if author_of(comment) != recorder.casefold():
             continue
-        body = comment.get("body")
-        if not isinstance(body, str):
-            continue
-        records.extend(CARRY_RECORD.finditer(body))
+        records.extend(CARRY_RECORD.finditer(comment["body"]))
     return records
 
 
