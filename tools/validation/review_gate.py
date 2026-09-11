@@ -11,9 +11,12 @@ approval that belongs to a newer head, nor publish a success for code the pull
 request no longer proposes.
 
 ``dismissal`` decides what should happen to the approval label after a push.
-``apply`` guards the mutation itself, immediately before it happens rather than
-only when the decision was made. ``confirm`` checks that the mutation took.
 ``verdict`` decides whether ``review-approved`` may report success.
+
+Both run in read-only jobs. The job that actually mutates the label holds the
+only write token in this repository's workflows and therefore runs no repository
+code at all — not this file either — so its own guard is inline shell in
+``review-gate.yml``, executed by ``workflow-tests`` against a stubbed ``gh``.
 
 The label state is a *tri-state*, not a boolean. A read of the labels can fail,
 and a failed read is not an absent label: treating it as one would let a
@@ -22,8 +25,8 @@ standing. ``unknown`` therefore refuses rather than guesses.
 
 Exit status: ``0`` decided, ``1`` not approved (``verdict`` only), ``2`` a usage
 diagnostic, ``3`` the head moved while this run was working, ``4`` the required
-stale-approval decision did not complete successfully (``verdict`` only) or a
-removal did not take (``confirm`` only), ``5`` the label state could not be read.
+stale-approval decision did not complete successfully (``verdict`` only), ``5``
+the label state could not be read.
 """
 
 from __future__ import annotations
@@ -117,35 +120,6 @@ def dismissal(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def apply(arguments: argparse.Namespace) -> int:
-    """Whether the decided mutation may still be performed, asked at write time.
-
-    The decision was made from a head read moments earlier, and the API calls in
-    between take time. A push landing in that window would leave this run
-    stripping an approval that belongs to a head it never examined, so the
-    comparison is made again here, against a head read immediately before the
-    write, and a mismatch stops the write rather than reporting it.
-    """
-    if superseded(arguments.event_head, arguments.current_head):
-        return report_superseded(arguments.event_head, arguments.current_head, "change approval")
-    print("mutate=yes" if arguments.action == "remove" else "mutate=no")
-    return 0
-
-
-def confirm(arguments: argparse.Namespace) -> int:
-    """Whether the repository now reflects the decision that was applied."""
-    if arguments.label_attached == UNKNOWN:
-        return report_unreadable(arguments.label, "confirm this push's effect on approval")
-    if arguments.expected == "removed" and arguments.label_attached == ATTACHED:
-        print(
-            f"error: {arguments.label} is still attached after the removal",
-            file=sys.stderr,
-        )
-        return DISMISSAL_INCOMPLETE
-    print(f"{arguments.label} {arguments.expected}")
-    return 0
-
-
 def verdict(arguments: argparse.Namespace) -> int:
     if superseded(arguments.event_head, arguments.current_head):
         return report_superseded(
@@ -191,37 +165,20 @@ def main(argv: list[str]) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("dismissal", "apply", "confirm", "verdict"):
+    for name in ("dismissal", "verdict"):
         command = commands.add_parser(name)
         command.add_argument("--label", default="reviewed:approve", help="the approval label's name")
-        if name != "confirm":
-            command.add_argument(
-                "--event-head", required=True, help="the head this run was started for"
-            )
-            command.add_argument(
-                "--current-head", required=True, help="the head the pull request has now"
-            )
-        if name != "apply":
-            command.add_argument(
-                "--label-attached",
-                required=True,
-                type=label_state,
-                help="whether the approval label is attached: true, false, or unknown",
-            )
+        command.add_argument("--event-head", required=True, help="the head this run was started for")
+        command.add_argument("--current-head", required=True, help="the head the pull request has now")
+        command.add_argument(
+            "--label-attached",
+            required=True,
+            type=label_state,
+            help="whether the approval label is attached: true, false, or unknown",
+        )
         if name == "dismissal":
             command.add_argument("--before-tree", default="", help="the tree the push started from")
             command.add_argument("--after-tree", required=True, help="the tree the push landed on")
-        elif name == "apply":
-            command.add_argument(
-                "--action", required=True, choices=("remove", "none"), help="the decided action"
-            )
-        elif name == "confirm":
-            command.add_argument(
-                "--expected",
-                required=True,
-                choices=("kept", "removed", "absent"),
-                help="what the decision expected the label's state to become",
-            )
         else:
             command.add_argument(
                 "--event-action", required=True, help="the pull_request action that started this run"
@@ -233,9 +190,7 @@ def main(argv: list[str]) -> int:
             )
 
     arguments = parser.parse_args(argv)
-    return {"dismissal": dismissal, "apply": apply, "confirm": confirm, "verdict": verdict}[
-        arguments.command
-    ](arguments)
+    return (dismissal if arguments.command == "dismissal" else verdict)(arguments)
 
 
 if __name__ == "__main__":

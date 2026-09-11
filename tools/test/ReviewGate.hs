@@ -13,7 +13,7 @@ import Sandbox (run, sanitizedEnvironment)
 import System.Directory (getCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldContain)
 
 -- | Two distinct heads, so an example can say which one a run answers for.
 reviewedHead, newerHead ∷ String
@@ -63,45 +63,6 @@ spec = describe "Review gate" $ do
       result `shouldBe` ExitFailure 5
       errors `shouldContain` "unreadable label state is not an absent one"
       output `shouldBe` ""
-
-  describe "the mutation-time guard" $ do
-    it "allows a decided removal while the head still stands" $ do
-      (result, output, _) ← apply reviewedHead reviewedHead "remove"
-      result `shouldBe` ExitSuccess
-      output `shouldContain` "mutate=yes"
-
-    it "stops a decided removal when the head advanced after the decision" $ do
-      -- The staged failure the guard exists for: the decision was made for
-      -- reviewedHead and was correct then, and the head moved while the
-      -- decision was being handed to the job that writes. The write must not
-      -- happen, and the job must not report that it did.
-      (decided, decision, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "true"
-      decided `shouldBe` ExitSuccess
-      decision `shouldContain` "action=remove"
-      (result, output, errors) ← apply reviewedHead newerHead "remove"
-      result `shouldBe` ExitFailure 3
-      errors `shouldContain` "superseded head"
-      output `shouldNotContain` "mutate=yes"
-
-    it "asks for no write when the decision was to keep the approval" $ do
-      (result, output, _) ← apply reviewedHead reviewedHead "none"
-      result `shouldBe` ExitSuccess
-      output `shouldContain` "mutate=no"
-
-  describe "confirming the mutation" $ do
-    it "accepts a removal the repository reflects" $ do
-      (result, _, _) ← confirm "removed" "false"
-      result `shouldBe` ExitSuccess
-
-    it "fails a removal that did not take" $ do
-      (result, _, errors) ← confirm "removed" "true"
-      result `shouldBe` ExitFailure 4
-      errors `shouldContain` "still attached after the removal"
-
-    it "refuses to confirm from a label read that failed" $ do
-      (result, _, errors) ← confirm "removed" "unknown"
-      result `shouldBe` ExitFailure 5
-      errors `shouldContain` "unreadable label state is not an absent one"
 
   it "publishes approval when the label is attached at the current head" $ do
     (result, output, _) ← verdict "synchronize" reviewedHead reviewedHead "success" "true"
@@ -164,14 +125,6 @@ dismissal eventHead currentHead beforeTree afterTree attached =
     , "--label-attached"
     , attached
     ]
-
-apply ∷ String → String → String → IO (ExitCode, String, String)
-apply eventHead currentHead action =
-  gate ["apply", "--event-head", eventHead, "--current-head", currentHead, "--action", action]
-
-confirm ∷ String → String → IO (ExitCode, String, String)
-confirm expected attached =
-  gate ["confirm", "--expected", expected, "--label-attached", attached]
 
 verdict ∷ String → String → String → String → String → IO (ExitCode, String, String)
 verdict action eventHead currentHead decision attached =

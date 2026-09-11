@@ -109,19 +109,6 @@ jobs:
       # checks nothing out and runs no repository script.
       pull-requests: write
     steps:
-      # A sparse checkout of the gate helper alone, so the write-scoped token
-      # never sits beside the project's build and test tooling. See the review
-      # note in the pull request: the amended contract keeps this job away from
-      # contributor-authored code, and the guard below has to be a tested helper
-      # rather than untested inline shell.
-      - name: Check out the gate helper
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          sparse-checkout: tools/validation
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-
       - name: Apply the decision
         env:
           GH_TOKEN: ${{ github.token }}
@@ -136,36 +123,42 @@ jobs:
         run: |
           set -euo pipefail
 
+          # This job holds the only write token in this repository's workflows,
+          # so it checks nothing out and runs no repository code: a script from
+          # the pull request's own head would be executing beside that token,
+          # and neither a sparse checkout nor unpersisted credentials would make
+          # it trusted. Everything below is this workflow's own shell and `gh`.
+          # `workflow-tests` executes this exact step body against a stubbed
+          # `gh`, so the paths that cannot be reached live are still covered.
+
           # Read the head again here, immediately before the mutation rather
           # than only when the decision was made. The decision job's own API
           # calls take time, and a push landing in that window would leave this
           # run stripping an approval that belongs to a head it never examined.
           current_head="$(gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha')"
-          guard="$(python3 tools/validation/review_gate.py apply \
-            --event-head "$EVENT_HEAD" \
-            --current-head "$current_head" \
-            --action "$ACTION")"
+          if [ "$current_head" != "$EVENT_HEAD" ]; then
+            echo "::error::this run was started for head $EVENT_HEAD, but the head is now $current_head; refusing to change approval for a superseded head"
+            exit 1
+          fi
 
-          if [ "$guard" = "mutate=yes" ]; then
+          if [ "$ACTION" = "remove" ]; then
             gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
           fi
 
           # Confirm from the repository rather than from the command's exit
           # status: the drainer reads this job's success together with the
           # label, so a removal that did not take must not look like one that
-          # did. An unreadable label state is not a confirmed one.
-          if labels="$(gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name')"; then
-            attached=false
-            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
-              attached=true
-            fi
-          else
-            attached=unknown
+          # did. The read is captured rather than piped into a condition, where
+          # Bash would exempt its failure from `set -e` and an API error would
+          # arrive indistinguishable from an absent label.
+          if ! labels="$(gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name')"; then
+            echo "::error::the labels could not be read back, so this decision is unconfirmed"
+            exit 1
           fi
-          python3 tools/validation/review_gate.py confirm \
-            --expected "$EXPECTED" \
-            --label-attached "$attached" \
-            --label "$LABEL"
+          if [ "$EXPECTED" = "removed" ] && printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+            echo "::error::$LABEL is still attached after the removal"
+            exit 1
+          fi
 
           echo "$LABEL $EXPECTED: $REASON"
           {

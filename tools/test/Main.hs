@@ -7,6 +7,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
+import qualified DismissalStep
 import qualified Execution
 import qualified ReviewGate
 import qualified Timings
@@ -69,6 +70,7 @@ main = hspec $ do
   Execution.spec
   Timings.spec
   ReviewGate.spec
+  DismissalStep.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a
 withRepository alias action = do

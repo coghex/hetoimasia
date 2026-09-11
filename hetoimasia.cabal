@@ -60,6 +60,7 @@ test-suite workflow-tests
     main-is: Main.hs
     hs-source-dirs: tools/test
     other-modules:
+        DismissalStep
         Execution
         Json
         ReviewGate

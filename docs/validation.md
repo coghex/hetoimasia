@@ -444,22 +444,27 @@ The decision itself:
   actually attached.
 
 `dismiss-stale-approval` holds the only write permission in this repository's
-workflows. It re-reads the head **again, immediately before mutating** rather
-than trusting the read the decision was made from: the decision job's own API
-calls take time, and a push landing in that window would leave a superseded run
-stripping an approval that belongs to a head it never examined. That guard is
-`review_gate.py apply`, and `review_gate.py confirm` then checks that a removal
-took — the drainer reads this job's success together with the label, so a
-removal that did not take must not look like one that did, and an unreadable
-label state is not a confirmed one.
+workflows, and it **checks nothing out and runs no repository code** — not even
+`review_gate.py`. A helper taken from the pull request's own head would be
+executing beside a token that can mutate pull requests, and neither a sparse
+checkout nor unpersisted credentials would make that code trusted: the token
+reaches it through the environment either way. Its steps are this workflow's own
+shell and `gh`, nothing else.
 
-Both guards are tested helpers rather than inline shell, which is why this job
-takes a **sparse checkout of `tools/validation` alone**, with credentials not
-persisted. The amended contract keeps the write-scoped token away from
-contributor-authored code, and that is what the sparse path preserves: the token
-never sits beside the project's build and test tooling, which is the code a
-worker would run. The alternative was an untested guard on the only mutation
-either workflow performs.
+It re-reads the head **immediately before mutating** rather than trusting the
+read the decision was made from: the decision job's own API calls take time, and
+a push landing in that window would leave a superseded run stripping an approval
+that belongs to a head it never examined. It then applies the decision and
+confirms a removal by reading the labels back — the drainer reads this job's
+success together with the label, so a removal that did not take must not look
+like one that did, and a label read that *failed* is not a confirmed one either.
+
+Inline is not a reason to leave it unproven. `workflow-tests` extracts that
+step's own `run` body out of `review-gate.yml` and executes it against a stubbed
+`gh`, so what is asserted is the shell that actually ships rather than a
+restatement of it. The stub is also what makes the races reachable: a head that
+advances between the decision and the write, and a label read that fails rather
+than returning nothing, do not happen on demand against a real repository.
 
 This slice never keeps an approval across a content-changing push. Carrying
 review through a clean base merge is a later slice's work.
@@ -569,10 +574,14 @@ nothing it owns was selected, a plan that registers no groups or whose
 after the plan was resolved, the planner's own failure leaving no plan, an
 unfinished job's timings reported as unavailable, and every review-gate
 decision: the keep, remove, absent, and unreadable-starting-point cases, a
-delayed run refusing to touch a newer head's approval, a decision that was
-correct when made and is stopped at write time because the head advanced, a
-removal that did not take, a label read that failed, a failed, cancelled, or
+delayed run refusing to touch a newer head's approval, a failed, cancelled, or
 unexpectedly skipped invalidation, and an absent label.
+
+The mutation itself is covered by running the shipped step body: the removal a
+content-changing push earns, the write that must not happen when the decision
+was to keep, a decision that was correct when made and is stopped at write time
+because the head advanced, a removal that did not take, and a label read that
+failed rather than returning nothing.
 
 It also covers the comparison range: a pull request across its merge base, a
 push from the commit it started at, a push whose starting commit is absent or
