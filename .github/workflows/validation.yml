@@ -3,10 +3,13 @@
 #
 # The plan is cheap and runs first on Python and Git alone, so a documentation
 # candidate never pays for a Haskell image to learn that it needs one job. The
-# workers execute only what the plan selected. `build-test` then runs whatever
-# happened upstream and decides the verdict from the receipts, so a selected
-# group can never pass because nothing ran it, and an explained omission is
-# never reported as a failure.
+# plan job then asks whether a finished run already executed any selected group
+# against byte-identical inputs, and records the answer as applicability. The
+# workers execute whatever is left. `build-test` then runs whatever happened
+# upstream and decides the verdict from the receipts and that applicability, so
+# a selected group can never pass because nothing ran it, an explained omission
+# is never reported as a failure, and a reused group is always reported as an
+# earlier execution rather than as a fresh pass.
 name: validation
 
 on:
@@ -30,6 +33,14 @@ concurrency:
 permissions:
   contents: read
 
+# The pinned platform is declared once. The planner folds these exact values
+# into the candidate's input identity and the workers install them, so evidence
+# can never be reused across a toolchain the candidate was not planned for.
+env:
+  GHC_VERSION: '9.12.2'
+  CABAL_VERSION: '3.16.1.0'
+  WORKER_OS: Linux
+
 defaults:
   run:
     shell: bash
@@ -40,10 +51,16 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # Reading another run's artifacts is what lets a prose-only candidate
+      # inherit code evidence. It reads; it never writes or deletes.
+      actions: read
     outputs:
       selected: ${{ steps.resolve.outputs.selected }}
-      engine: ${{ steps.resolve.outputs.engine }}
-      workflow: ${{ steps.resolve.outputs.workflow }}
+      execute: ${{ steps.reuse.outputs.execute }}
+      reused: ${{ steps.reuse.outputs.reused }}
+      identity: ${{ steps.reuse.outputs.input_identity }}
+      engine: ${{ steps.reuse.outputs.run-haskell-engine }}
+      workflow: ${{ steps.reuse.outputs.run-haskell-workflow }}
       base: ${{ steps.range.outputs.base }}
       head: ${{ steps.range.outputs.head }}
       # Selection uses the merge-base range, but every job executes this one
@@ -97,9 +114,18 @@ jobs:
         env:
           BASE: ${{ steps.range.outputs.base }}
           HEAD: ${{ steps.range.outputs.head }}
+          CANDIDATE: ${{ github.sha }}
+          GHC_VERSION: ${{ env.GHC_VERSION }}
+          CABAL_VERSION: ${{ env.CABAL_VERSION }}
+          WORKER_OS: ${{ env.WORKER_OS }}
         run: |
           set -uo pipefail
-          arguments=(--base "$BASE" --head "$HEAD" --json)
+          # Selection compares the contribution, but identity fingerprints the
+          # integration candidate the workers actually check out, and the
+          # toolchain and platform this workflow pins are part of it.
+          arguments=(--base "$BASE" --head "$HEAD" --candidate "$CANDIDATE" --json)
+          arguments+=(--toolchain "ghc=$GHC_VERSION" --toolchain "cabal=$CABAL_VERSION")
+          arguments+=(--runner-os "$WORKER_OS")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
             arguments+=(--request-file request.txt)
@@ -121,17 +147,16 @@ jobs:
           import os
 
           plan = json.load(open("plan.json", encoding="utf-8"))
-          selected = plan["selected"]
-          engine = {"build.all", "test.engine", "smoke.console"}
-          print("selected=" + " ".join(selected))
-          print("engine=" + ("true" if engine & set(selected) else "false"))
-          print("workflow=" + ("true" if "test.workflow" in selected else "false"))
+          print("selected=" + " ".join(plan["selected"]))
 
           rows = [
               "## Validation plan",
               "",
-              f"`{plan['base']['commit'][:12]}`..`{plan['head']['commit'][:12]}`,"
-              f" policy version {plan['policy_version']}.",
+              f"`{plan['base']['commit'][:12]}`..`{plan['head']['commit'][:12]}`"
+              f" on candidate `{plan['candidate']['commit'][:12]}`,"
+              f" policy version {plan['catalog_policy_version']}"
+              f" (`{plan['policy_version'][:12]}`),"
+              f" inputs `{plan['input_identity'][:12]}`.",
               "",
               "| Group | Selected | Reason | Inputs changed |",
               "| --- | --- | --- | --- |",
@@ -146,11 +171,47 @@ jobs:
               handle.write("\n".join(rows))
           PY
 
+      - name: Reuse evidence an earlier run already produced
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # This step never decides a verdict, so it must never be the reason a
+          # candidate fails: an unreachable API, an expired artifact, or a
+          # refused receipt all have to end with the group executing. It writes
+          # an applicability document that reuses nothing rather than failing,
+          # and `--offline` is the same answer for a lookup that never started.
+          if ! python3 tools/validation/reuse.py \
+            --plan plan.json \
+            --repo "$REPOSITORY" \
+            --output applicability.json \
+            --budget-seconds 120 \
+            --worker "haskell-engine=build.all,test.engine,smoke.console" \
+            --worker "haskell-workflow=test.workflow" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            > reuse.out; then
+            echo "::warning::the reuse lookup failed; every selected group will execute"
+            python3 tools/validation/reuse.py \
+              --plan plan.json \
+              --repo "$REPOSITORY" \
+              --output applicability.json \
+              --offline \
+              --worker "haskell-engine=build.all,test.engine,smoke.console" \
+              --worker "haskell-workflow=test.workflow" \
+              > reuse.out || exit 1
+          fi
+          cat reuse.out >> "$GITHUB_OUTPUT"
+          cat reuse.out
+
       - name: Upload the plan
         uses: actions/upload-artifact@v7
         with:
           name: validation-plan
-          path: plan.json
+          path: |
+            plan.json
+            applicability.json
           if-no-files-found: error
 
   haskell-engine:
@@ -188,14 +249,14 @@ jobs:
           path: ~/.ghcup
           # The toolchain depends on the compiler and Cabal versions and on
           # nothing in the repository, so no source edit can evict it.
-          key: ghcup-${{ runner.os }}-ghc-9.12.2-cabal-3.16.1.0
+          key: ghcup-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-${{ env.CABAL_VERSION }}
 
       - name: Install GHC and Cabal
         id: setup
         uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.12.2'
-          cabal-version: '3.16.1.0'
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
           cabal-update: true
 
       - name: Restore the package store
@@ -205,35 +266,44 @@ jobs:
           # `cabal.project` carries the pinned Hackage index state, and the
           # `.cabal` files carry the dependency bounds. Nothing else can change
           # which packages are built, so a Markdown edit never evicts this.
-          key: cabal-store-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
           restore-keys: |
-            cabal-store-${{ runner.os }}-ghc-9.12.2-
+            cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
 
       - name: Restore the build tree
         uses: actions/cache@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           # A partial match still saves most of the compile: a cache miss costs
           # time and can never change a result.
           restore-keys: |
-            dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-
-            dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-
+            dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
 
-      - name: Run the selected groups
+      - name: Run the groups this candidate still needs
         env:
           SELECTED: ${{ needs.plan.outputs.selected }}
+          EXECUTE: ${{ needs.plan.outputs.execute }}
         run: |
           set -uo pipefail
           mkdir -p receipts
           status=0
           # Every owned group runs even after one fails, so the aggregate sees
           # a receipt for each of them rather than inferring the rest from the
-          # first failure.
+          # first failure. A group the plan selected but an earlier execution
+          # already covered is announced as reused rather than as unselected:
+          # the two are different facts and the log must not conflate them.
           for group in build.all test.engine smoke.console; do
-            case " $SELECTED " in
+            case " $EXECUTE " in
               *" $group "*) ;;
-              *) echo "skipping $group: the plan did not select it"; continue ;;
+              *)
+                case " $SELECTED " in
+                  *" $group "*) echo "skipping $group: an earlier execution already covers it" ;;
+                  *) echo "skipping $group: the plan did not select it" ;;
+                esac
+                continue
+                ;;
             esac
             python3 tools/validation/run.py "$group" \
               --plan plan.json \
@@ -250,6 +320,51 @@ jobs:
           name: validation-receipts-haskell-engine
           path: receipts/
           if-no-files-found: warn
+
+      - name: Publish the build.all receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/build.all.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-build.all-${{ needs.plan.outputs.identity }}
+          path: receipts/build.all.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
+      - name: Publish the test.engine receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/test.engine.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.engine-${{ needs.plan.outputs.identity }}
+          path: receipts/test.engine.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
+      - name: Publish the smoke.console receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/smoke.console.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-smoke.console-${{ needs.plan.outputs.identity }}
+          path: receipts/smoke.console.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
 
   haskell-workflow:
     needs: plan
@@ -282,44 +397,51 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ghcup
-          key: ghcup-${{ runner.os }}-ghc-9.12.2-cabal-3.16.1.0
+          key: ghcup-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-${{ env.CABAL_VERSION }}
 
       - name: Install GHC and Cabal
         id: setup
         uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.12.2'
-          cabal-version: '3.16.1.0'
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
           cabal-update: true
 
       - name: Restore the package store
         uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-store-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
           restore-keys: |
-            cabal-store-${{ runner.os }}-ghc-9.12.2-
+            cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
 
       - name: Restore the build tree
         uses: actions/cache@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           restore-keys: |
-            dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-
-            dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-
+            dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
 
-      - name: Run the selected groups
+      - name: Run the groups this candidate still needs
         env:
           SELECTED: ${{ needs.plan.outputs.selected }}
+          EXECUTE: ${{ needs.plan.outputs.execute }}
         run: |
           set -uo pipefail
           mkdir -p receipts
           status=0
           for group in test.workflow; do
-            case " $SELECTED " in
+            case " $EXECUTE " in
               *" $group "*) ;;
-              *) echo "skipping $group: the plan did not select it"; continue ;;
+              *)
+                case " $SELECTED " in
+                  *" $group "*) echo "skipping $group: an earlier execution already covers it" ;;
+                  *) echo "skipping $group: the plan did not select it" ;;
+                esac
+                continue
+                ;;
             esac
             python3 tools/validation/run.py "$group" \
               --plan plan.json \
@@ -336,6 +458,21 @@ jobs:
           name: validation-receipts-haskell-workflow
           path: receipts/
           if-no-files-found: warn
+
+      - name: Publish the test.workflow receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/test.workflow.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.workflow-${{ needs.plan.outputs.identity }}
+          path: receipts/test.workflow.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
 
   build-test:
     needs: [plan, haskell-engine, haskell-workflow]
@@ -410,6 +547,7 @@ jobs:
         run: |
           set -uo pipefail
           arguments=(--plan plan.json --receipts receipts --summary "$GITHUB_STEP_SUMMARY")
+          arguments+=(--applicability applicability.json)
           arguments+=(--worker "haskell-engine=${{ needs['haskell-engine'].result }}:build.all,test.engine,smoke.console")
           arguments+=(--worker "haskell-workflow=${{ needs['haskell-workflow'].result }}:test.workflow")
           if [ "${{ github.event_name }}" = "pull_request" ]; then

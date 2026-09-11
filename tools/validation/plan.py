@@ -15,15 +15,29 @@ request block, and the plan's JSON structure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 
-SCHEMA_VERSION = 1
+import receipts
+
+# The catalog's schema and the plan's are separate contracts: the plan gained
+# the identity fields this slice added, while the catalog's keys did not move.
+CATALOG_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
+IDENTITY_SCHEMA_VERSION = 1
 DEFAULT_CATALOG = "tools/validation/catalog.json"
 PROJECT_FILE = "cabal.project"
+
+# Packaging inputs decide what is compiled, so they are never prose however a
+# catalog classifies them. Every other exclusion is derived from the declared
+# inputs and the declared non-affecting classes rather than hard-coded here.
+NEVER_HARMLESS_PATHS = ("cabal.project",)
+NEVER_HARMLESS_SUFFIXES = (".cabal",)
 
 COMPONENT_KINDS = ("lib", "exe", "test")
 FRAMEWORKS = ("hspec", "none")
@@ -493,9 +507,10 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
     if problems:
         return problems
 
-    if document["schema_version"] != SCHEMA_VERSION:
+    if document["schema_version"] != CATALOG_SCHEMA_VERSION:
         problems.append(
-            f"{path}: schema_version {document['schema_version']} is not the supported version {SCHEMA_VERSION}"
+            f"{path}: schema_version {document['schema_version']} is not the supported version "
+            f"{CATALOG_SCHEMA_VERSION}"
         )
     if document["policy_version"] < 1:
         problems.append(f"{path}: policy_version must be a positive integer")
@@ -679,6 +694,129 @@ def changed_paths(root: str, base: GitTree, head: GitTree) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Identity
+#
+# Selection answers "what does this contribution touch?" from a two-endpoint
+# diff. Reuse asks a different question: "is this candidate's content the same
+# content an earlier execution already proved?" Answering that from a diff would
+# be wrong, because a code pull request followed by a prose-only push still
+# contains code changes relative to its merge base while its tree is identical
+# to the one the previous run validated. So identity is a fingerprint of the
+# *candidate tree itself*, derived without looking at either endpoint.
+
+
+def tree_entries(root: str, commit: str) -> list[tuple[str, str, str, str]]:
+    """Every tracked path of one commit with its Git object type, mode, and id.
+
+    The mode and the type are part of the fingerprint because a file that
+    becomes executable, or a path that becomes a submodule, changes what an
+    execution sees while its content digest stays put. Output is read NUL-safe
+    so a path containing a newline or a quote cannot be silently truncated.
+    """
+    listing = run_git(root, "ls-tree", "-r", "-z", commit)
+    entries: list[tuple[str, str, str, str]] = []
+    for record in listing.split("\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or not path:
+            raise PlannerError(f"cannot read the tree of {commit}: unexpected entry {record!r}")
+        mode, kind, object_name = fields
+        entries.append((path, mode, kind, object_name))
+    entries.sort()
+    return entries
+
+
+def digest(payload: dict) -> str:
+    """A SHA-256 over one canonical JSON encoding of a payload."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def policy_identity(catalog: dict, entries: list[tuple[str, str, str, str]]) -> str:
+    """A digest of the policy that classified this candidate.
+
+    The catalog, the validation scripts, and the workflows are exactly the
+    catalog's declared ``policy_inputs``, so a classification change — a new
+    harmless class, an edited runner, a rewritten aggregate — produces a
+    different policy identity and can never inherit evidence gathered under the
+    policy it replaced.
+    """
+    patterns = list(catalog["policy_inputs"])
+    included = [
+        list(entry) for entry in entries if any(matches_input(entry[0], pattern) for pattern in patterns)
+    ]
+    return digest(
+        {
+            "identity_schema_version": IDENTITY_SCHEMA_VERSION,
+            "catalog_schema_version": catalog["schema_version"],
+            "catalog_policy_version": catalog["policy_version"],
+            "entries": included,
+        }
+    )
+
+
+def consumed_entries(catalog: dict, packages: dict[str, Package]) -> set[str]:
+    """Every input entry any registered group derives, from one tree alone.
+
+    Selection unions both revisions' declarations so a retired input still
+    counts for the group that owned it. Identity deliberately does not: a
+    fingerprint that depended on the base would differ between two runs over
+    the very same tree, which is the equivalence reuse exists to recognize.
+    """
+    entries: set[str] = set(catalog["policy_inputs"])
+    for group in catalog["groups"]:
+        entries |= set(group["inputs"])
+        entries |= component_inputs(packages, group["component"])
+    return entries
+
+
+def harmless_prose(path: str, consumed: set[str], catalog: dict) -> bool:
+    """Whether one path is prose no execution reads.
+
+    Harmless prose is Markdown that no group declares as an input, plus the
+    catalog's declared non-affecting classes. A declared input outranks both, so
+    a test-consumed Markdown file, a fixture, a shader, an asset, or any
+    packaging description is never harmless however it is spelled.
+    """
+    if path in NEVER_HARMLESS_PATHS or path.endswith(NEVER_HARMLESS_SUFFIXES):
+        return False
+    if any(matches_input(path, entry) for entry in consumed):
+        return False
+    if path.endswith(".md"):
+        return True
+    return any(matches_class(path, pattern) for pattern in catalog["non_affecting_paths"])
+
+
+def input_identity(
+    catalog: dict,
+    packages: dict[str, Package],
+    entries: list[tuple[str, str, str, str]],
+    policy: str,
+    toolchain: dict[str, str],
+) -> str:
+    """The fingerprint two candidates must share before evidence can cross.
+
+    It covers every included path's name, mode, type, and content id — so
+    ``cabal.project``, the package descriptions, and every declared non-Haskell
+    input are in it — plus the pinned toolchain and the policy identity. It
+    omits commit metadata entirely: an execution reads a tree, not an author or
+    a timestamp, so two commits with identical trees are the same candidate.
+    """
+    consumed = consumed_entries(catalog, packages)
+    included = [list(entry) for entry in entries if not harmless_prose(entry[0], consumed, catalog)]
+    return digest(
+        {
+            "identity_schema_version": IDENTITY_SCHEMA_VERSION,
+            "policy_version": policy,
+            "toolchain": dict(toolchain),
+            "entries": included,
+        }
+    )
+
+
+# --------------------------------------------------------------------------
 # Planning
 
 
@@ -686,6 +824,8 @@ def build_plan(
     root: str,
     base: GitTree,
     head: GitTree,
+    candidate: GitTree,
+    identity: dict,
     catalog: dict,
     catalog_source: str,
     request_ids: list[str],
@@ -801,11 +941,28 @@ def build_plan(
         )
 
     return {
-        "schema_version": SCHEMA_VERSION,
-        "policy_version": catalog["policy_version"],
+        "schema_version": PLAN_SCHEMA_VERSION,
+        # The catalog's declared revision stays an integer a person can read,
+        # and is the one recorded here under its own name. `policy_version` is
+        # the digest reuse compares, because a classification change that never
+        # touches the declared revision still has to invalidate evidence.
+        "catalog_policy_version": catalog["policy_version"],
+        "policy_version": identity["policy_version"],
+        "input_identity": identity["input_identity"],
+        "toolchain": dict(identity["toolchain"]),
+        # The platform an execution's result is a claim about. A receipt from
+        # another operating system describes another machine's behaviour.
+        "runner_os": identity["runner_os"],
         "catalog": {"source": catalog_source, "groups": len(groups)},
         "base": {"revision": base.revision, "commit": base.commit, "tree": base.tree},
         "head": {"revision": head.revision, "commit": head.commit, "tree": head.tree},
+        # Selection compares the contribution; execution happens on the
+        # integration candidate, and that is the tree identity fingerprints.
+        "candidate": {
+            "revision": candidate.revision,
+            "commit": candidate.commit,
+            "tree": candidate.tree,
+        },
         "base_package_metadata": "present" if base_packages else "absent",
         "base_catalog": base_catalog_state,
         "request": {
@@ -825,10 +982,15 @@ def render_prose(plan: dict) -> str:
     lines = ["Validation plan"]
     lines.append(f"  base     {plan['base']['revision']} ({plan['base']['commit'][:12]})")
     lines.append(f"  head     {plan['head']['revision']} ({plan['head']['commit'][:12]})")
+    lines.append(f"  candidate {plan['candidate']['revision']} ({plan['candidate']['commit'][:12]})")
     lines.append(
         f"  catalog  {plan['catalog']['source']} "
-        f"({plan['catalog']['groups']} groups, policy version {plan['policy_version']})"
+        f"({plan['catalog']['groups']} groups, policy version {plan['catalog_policy_version']})"
     )
+    lines.append(f"  policy   {plan['policy_version'][:12]}")
+    lines.append(f"  inputs   {plan['input_identity'][:12]}")
+    declared = ", ".join(f"{name} {version}" for name, version in sorted(plan["toolchain"].items()))
+    lines.append(f"  pinned   {declared or 'no toolchain'} on {plan['runner_os']}")
     request = plan["request"]
     if request["resolved"]:
         lines.append(f"  request  {', '.join(request['resolved'])} (from {request['source']})")
@@ -941,6 +1103,21 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--base", help="base revision of the comparison")
     parser.add_argument("--head", help="head revision of the comparison")
+    parser.add_argument(
+        "--candidate",
+        help="the integration revision workers execute (default: the head revision)",
+    )
+    parser.add_argument(
+        "--toolchain",
+        action="append",
+        default=[],
+        metavar="NAME=VERSION",
+        help="a pinned toolchain version the candidate's identity covers; repeatable",
+    )
+    parser.add_argument(
+        "--runner-os",
+        help="the operating system the workers execute on (default: this runner's)",
+    )
     parser.add_argument("--request-file", help="file holding a PR body with a validation-request block")
     parser.add_argument("--catalog", help="fixture catalog path, read from the filesystem")
     parser.add_argument("--repo-root", help="repository to plan for (default: the enclosing checkout)")
@@ -951,7 +1128,7 @@ def main(argv: list[str]) -> int:
     root = repository_root(arguments.repo_root)
 
     if arguments.catalog_check:
-        for name in ("base", "head", "request_file"):
+        for name in ("base", "head", "candidate", "request_file"):
             if getattr(arguments, name):
                 raise PlannerError(f"--catalog-check takes no --{name.replace('_', '-')}")
         tree = WorkTree(root)
@@ -981,6 +1158,40 @@ def main(argv: list[str]) -> int:
     base_packages = load_packages(base, required=False)
     base_catalog, base_catalog_state = read_base_catalog(base, arguments.catalog)
 
+    # The candidate defaults to the head so a local plan needs no extra
+    # revision; CI supplies the integration commit its workers check out, which
+    # is neither endpoint and is the only tree an execution actually reads.
+    if arguments.candidate:
+        candidate = GitTree(root, arguments.candidate)
+    else:
+        candidate = head
+    if candidate.commit == head.commit:
+        candidate_catalog, candidate_catalog_source = document, catalog_source
+        candidate_packages = head_packages
+    else:
+        candidate_catalog, candidate_catalog_source = read_catalog(candidate, arguments.catalog, root)
+        candidate_packages = load_packages(candidate, required=True)
+        problems = validate_catalog(candidate_catalog, candidate_catalog_source, candidate_packages)
+        if problems:
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            return 2
+
+    try:
+        toolchain = receipts.parse_toolchain(arguments.toolchain)
+    except receipts.EvidenceError as failure:
+        raise PlannerError(str(failure)) from failure
+    entries = tree_entries(root, candidate.commit)
+    policy = policy_identity(candidate_catalog, entries)
+    identity = {
+        "runner_os": arguments.runner_os or os.environ.get("RUNNER_OS") or platform.system(),
+        "policy_version": policy,
+        "input_identity": input_identity(
+            candidate_catalog, candidate_packages, entries, policy, toolchain
+        ),
+        "toolchain": toolchain,
+    }
+
     request_ids: list[str] = []
     request_all_hspec = False
     request_source = None
@@ -999,6 +1210,8 @@ def main(argv: list[str]) -> int:
         root,
         base,
         head,
+        candidate,
+        identity,
         document,
         catalog_source,
         request_ids,

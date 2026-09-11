@@ -29,6 +29,9 @@ python3 tools/validation/plan.py --catalog-check
 | Option | Meaning |
 | --- | --- |
 | `--base`, `--head` | The two revisions to compare. Both are required unless `--catalog-check` is used. |
+| `--candidate` | The integration revision the workers execute. Defaults to the head; CI supplies the commit GitHub resolved for the event, which on a pull request is neither endpoint. |
+| `--toolchain NAME=VERSION` | A pinned toolchain version the candidate's identity covers. Repeatable. |
+| `--runner-os` | The operating system the workers execute on. Defaults to `RUNNER_OS`, then this machine's. |
 | `--request-file` | A file holding a pull-request body; its `validation-request` block is read from there. |
 | `--catalog` | A catalog path read from the filesystem instead of the default. Fixture catalogs use this, with planning and with `--catalog-check` alike. |
 | `--repo-root` | The repository to plan for. Defaults to the enclosing checkout. |
@@ -58,8 +61,8 @@ The catalog is a JSON object. Keys are fixed; an unknown key is an error.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Must be `1`. |
-| `policy_version` | integer | The selection policy revision, recorded in every plan. |
+| `schema_version` | integer | Must be `1`. The catalog's schema is versioned separately from the plan's. |
+| `policy_version` | integer | The selection policy revision a person reads, recorded in every plan as `catalog_policy_version`. The plan's own `policy_version` is the digest reuse compares. |
 | `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are an input of *every* group, so a planner, catalog, runner, aggregate, or workflow edit widens non-optional coverage conservatively and still marks an optional group's inputs changed when its own definition moved — without ever selecting an optional group, since selection reaches those only through a request. |
 | `non_affecting_paths` | array of strings | Declared harmless classes (see below). |
 | `floor` | array of strings | The mandatory floor. Every entry must name a registered, non-optional group. |
@@ -83,13 +86,19 @@ Each group declares:
 Observed durations and pass/fail history are deliberately absent: the catalog
 declares what a group is, not how it has behaved.
 
-The registered policy inputs are the planner, the catalog, the runner, the
-aggregate, their shared evidence contract, and `.github/workflows/`. All of them
-decide what a result means rather than what a group tests, so a change to any of
-them has to reach every group. Classifying the workflows here is also what keeps
-a CI edit from arriving as an *unknown* path: the conservative coverage is the
-same either way, but an explained widening is auditable and an unclassified one
-is only a warning.
+The registered policy inputs are `tools/validation/` and `.github/workflows/` —
+every validation script, the catalog, and every workflow. All of them decide
+what a result *means* rather than what a group tests, so a change to any of them
+has to reach every group. They are declared as directory prefixes rather than as
+a list of filenames deliberately: a new script added to the validation tools is
+policy from the moment it exists, and a list would have to be remembered.
+Classifying the workflows here is also what keeps a CI edit from arriving as an
+*unknown* path: the conservative coverage is the same either way, but an
+explained widening is auditable and an unclassified one is only a warning.
+
+The same two prefixes are what [the policy identity](#candidate-identity)
+digests, so a classification change never lets a candidate inherit evidence
+gathered under the policy it replaced.
 
 Groups are emitted in catalog order everywhere, so catalog order is the
 canonical order of a plan. `changed_paths` is sorted by path, and the request's
@@ -170,8 +179,12 @@ and `optional-unrequested`. When several apply, the first matching rule wins:
 6. a non-optional group under unknown-input fallback — `unknown-input`;
 7. otherwise — `unaffected`.
 
-`inputs_changed` is independent of selection, because CI-3 consumes it to decide
-whether earlier evidence still applies:
+`inputs_changed` is independent of selection, and describes the *contribution*:
+which groups this change touches relative to the base it is compared against. It
+is deliberately **not** what decides whether earlier evidence applies — a code
+pull request followed by a prose-only push reports its code as changed against
+the merge base while its tree is the one an earlier run already validated. That
+question is answered by [candidate identity](#candidate-identity) instead.
 
 - floor membership or a request alone leaves it `false`;
 - a changed relevant input makes it `true`;
@@ -179,6 +192,58 @@ whether earlier evidence still applies:
   uncertainty can never reach a consumer as equivalence;
 - an optional group still reports `true` when its own inputs changed or its own
   catalog definition moved, even though it stays unselected.
+
+## Candidate identity
+
+Selection answers *what does this contribution touch?* from a two-endpoint diff.
+Reuse asks a different question — *is this candidate's content the same content
+an earlier execution already proved?* — and a diff cannot answer it. A code pull
+request followed by a prose-only push still contains code changes relative to
+its merge base while its tree is byte-identical to the one the previous run
+validated. So every plan carries two digests taken from the **candidate tree
+itself**, without looking at either endpoint:
+
+| Field | What it covers |
+| --- | --- |
+| `policy_version` | Every path matching the catalog's `policy_inputs` — the validation scripts, the catalog, and the workflows — plus the catalog's schema and declared revision. |
+| `input_identity` | Every included path's name, file mode, Git object type, and object id, plus the pinned toolchain and `policy_version`. |
+
+The candidate is the tree the workers execute, not the pull request's head. On a
+pull request those differ: CI passes the commit GitHub resolved for the event,
+so an upstream change merged into the integration candidate reaches the identity
+even though the contribution is prose. Locally, `--candidate` defaults to the
+head and there is nothing to distinguish.
+
+Commit metadata is deliberately absent. An execution reads a tree, not an author
+or a timestamp, so two commits with identical trees are the same candidate. File
+modes and object types are present for the opposite reason: a file that becomes
+executable, or a path that becomes a submodule, changes what an execution sees
+while its content digest stays put. The tree is read NUL-safe, so a path
+containing a newline or a quote cannot be silently truncated out of the digest.
+
+### Harmless prose
+
+A path is excluded from `input_identity` only when it is prose no execution
+reads. That is exactly:
+
+- Markdown that **no** group declares as an input, and
+- the `non_affecting_paths` classes the catalog already declares.
+
+A declared input outranks both, so a test-consumed Markdown file, a fixture, a
+shader, Lua, or an asset is never harmless. Neither is `cabal.project` or any
+`.cabal` file, which are refused as prose independently of how a catalog
+classifies them: packaging decides what is compiled.
+
+The group inputs this rule consults are derived from the **candidate tree
+alone**, unlike selection, which unions both revisions so a retired input still
+counts for the group that owned it. A fingerprint that depended on the base
+would differ between two runs over the very same tree, which is precisely the
+equivalence reuse exists to recognize.
+
+The consequence the acceptance criteria name: editing, renaming, or deleting
+harmless prose leaves `input_identity` unchanged, while a source, package
+description, project file, fixture, consumed document, file mode, catalog, or
+workflow change moves it.
 
 ## Requesting groups from a pull request
 
@@ -212,9 +277,13 @@ planner reads the text from `--request-file`.
 
 | Key | Meaning |
 | --- | --- |
-| `schema_version`, `policy_version` | Plan format and catalog policy revisions. |
+| `schema_version` | The plan format's revision. |
+| `policy_version` | The policy identity digest. |
+| `catalog_policy_version` | The catalog's declared policy revision, as an integer. |
+| `input_identity` | The candidate's input identity digest. |
+| `toolchain`, `runner_os` | The pinned platform the identity covers and a reusable receipt must match. |
 | `catalog` | The resolved catalog source and its group count. |
-| `base`, `head` | Each revision's name with its resolved `commit` and `tree`. |
+| `base`, `head`, `candidate` | Each revision's name with its resolved `commit` and `tree`. |
 | `base_package_metadata` | `present` or `absent`. |
 | `base_catalog` | `present`, `absent`, or `not-applicable` when `--catalog` overrode it. |
 | `request` | The request `source`, its literal `ids`, its `all_hspec` flag, and the `resolved` identifier set. |
@@ -234,6 +303,13 @@ that is still the newest useful execution. Freshness is enforced by comparing
 the plan against the pull request's current state, not by throwing work away.
 
 The workflow's default permission is `contents: read`, and no job uses a secret.
+The `plan` job adds `actions: read` so it can look up an earlier run's receipt
+artifacts, and `build-test` already held it for the timings.
+
+The pinned platform is declared once, as workflow-level `env`: the planner folds
+those exact values into the candidate's input identity and the workers install
+them, so evidence can never be reused across a toolchain the candidate was not
+planned for.
 
 ### `plan`
 
@@ -268,8 +344,13 @@ payload's environment variable, never through shell interpolation: it is
 contributor-authored text, and the planner's grammar is the only thing that may
 interpret it. A push carries no body and therefore no request.
 
-The job uploads `plan.json` as an artifact and publishes the selected group IDs
-as job outputs. A planner error fails the job with the planner's own diagnostic.
+The job then runs [the reuse lookup](#reusing-an-earlier-execution), which needs
+the `actions: read` permission and nothing else, and uploads `plan.json` and
+`applicability.json` together as one artifact. It publishes the selected group
+IDs, the groups that still have to execute, the candidate's input identity, and
+one boolean per worker as job outputs. A planner error fails the job with the
+planner's own diagnostic; a reuse lookup that fails does not fail the job, it
+publishes an applicability document that reuses nothing.
 
 ### Workers
 
@@ -282,10 +363,19 @@ selected none of the groups it owns:
 | `haskell-engine` | `build.all`, `test.engine`, `smoke.console` |
 | `haskell-workflow` | `test.workflow` |
 
-A worker runs every selected group it owns and continues past a failure, so the
-aggregate sees a receipt for each of them rather than inferring the rest from
-the first one that failed. It uploads its receipts whatever happened, then fails
-if any of its groups failed.
+A worker runs every group it still has to execute and continues past a failure,
+so the aggregate sees a receipt for each of them rather than inferring the rest
+from the first one that failed. It uploads its receipts whatever happened, then
+fails if any of its groups failed. A group the plan selected but an earlier
+execution already covers is announced as reused rather than as unselected: those
+are different facts and the log must not conflate them. A worker every one of
+whose groups is covered is skipped as a job.
+
+Each receipt is also uploaded on its own, named
+`receipt-<group-id>-<input-identity>`, on pull-request runs and `master` pushes
+alike. That is the evidence a later candidate looks up: the identity is in the
+name so a lookup asks for evidence about *these* inputs rather than fetching
+every receipt a group ever produced and filtering afterwards.
 
 Selection uses the merge-base range, but every job executes one integration
 candidate — the commit GitHub resolved for the event. Each worker asserts that
@@ -324,11 +414,21 @@ explained away is refused rather than executed, and leaves no receipt.
 
 The receipt records the group, the exact command, the outcome, the exit status,
 start and end timestamps, the duration, the declared timeout, the plan identity,
-the pull request's head commit, the commit and tree that actually executed, the
-runner's OS and architecture, and the toolchain versions. The head and the
-executed revision are recorded separately because a pull request is validated on
-an integration candidate that is neither endpoint; a receipt must not imply that
-the head itself ran.
+the candidate's input identity and policy identity, the pull request's head
+commit, the commit and tree that actually executed, the runner's OS and
+architecture, the toolchain versions, and the run it can be read back from. The
+head and the executed revision are recorded separately because a pull request is
+validated on an integration candidate that is neither endpoint; a receipt must
+not imply that the head itself ran.
+
+The identity fields are **copied from the plan**, never recomputed: the receipt
+has to name the identity the candidate was planned under, and a runner that
+derived its own could disagree with the plan it is executing. `toolchain` is
+exactly the declaration the workflow passes, because that is what reuse compares
+against the candidate's pinned versions; the runner's own interpreter is
+recorded beside it as `runner_python` rather than inside it. `source_run_url`
+names this run and attempt, from the environment GitHub publishes; an execution
+no later run can attribute is not reusable evidence.
 
 `outcome` is `passed`, `failed`, or `timeout`. A timeout is distinct because an
 exhausted budget and a disagreeing test are different obstacles. The runner
@@ -360,6 +460,79 @@ It deliberately omits the catalog and request *paths*, which are run-local
 filenames rather than contract, and the changed-path listing, which explains a
 selection without being able to alter it.
 
+### Reusing an earlier execution
+
+`tools/validation/reuse.py` runs in the `plan` job and asks, for every selected
+group, whether some finished run already executed it against byte-identical
+inputs. It writes `applicability.json`, which the workers and the aggregate both
+read:
+
+```bash
+python3 tools/validation/reuse.py --plan plan.json --repo <owner/name> --output applicability.json
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--plan`, `--repo`, `--output` | The resolved plan, the repository to read evidence from, and the applicability document to write. |
+| `--workflow` | The workflow whose runs may produce reusable evidence. Defaults to `.github/workflows/validation.yml`. |
+| `--worker NAME=GROUP[,GROUP...]` | A worker job and the groups it owns, so the step can report whether that job still has work. Repeatable. |
+| `--budget-seconds` | The whole lookup's budget. Defaults to 120. |
+| `--gh` | The GitHub CLI executable to read through. |
+| `--summary` | A Markdown file the reuse table is appended to. |
+| `--offline` | Write a document that reuses nothing, without any lookup. |
+
+Eligibility is **not** gated on `inputs_changed`. A code pull request followed by
+a prose-only push still reports its code as changed against the merge base, and
+vetoing reuse on that would refuse exactly the case this slice exists for.
+Contribution-based selection is preserved unchanged and decides what is
+*selected*; identity decides what may be *inherited*.
+
+For each selected group the step lists the artifacts named
+`receipt-<group-id>-<input-identity>`, discards expired ones, and orders what is
+left newest first by creation time with the artifact id breaking ties — two
+artifacts can share a timestamp, and without a total order the same lookup could
+prefer different evidence on two runs. **Only the newest is ever considered.**
+Reaching past a newer failure for an older pass would publish a green verdict
+while a known failure for the very same inputs sat unmentioned one artifact
+back.
+
+That artifact is accepted only when all of this holds:
+
+- its run belongs to this repository and to `--workflow`;
+- its run is `completed` and concluded `success` or `failure` — a run still
+  executing has not finished the group, and a cancelled one may have uploaded a
+  receipt for work it never completed;
+- the archive holds exactly `<group-id>.json`, and that document passes the same
+  receipt contract a fresh receipt does;
+- the receipt names that same run, records the command the plan selected, and
+  matches the candidate's `input_identity`, `policy_version`, `toolchain`, and
+  `runner_os`;
+- the receipt records `passed` with exit status `0`.
+
+Everything else is an obstacle, never a pass. An expired, missing, malformed,
+failed, incompatible, or unreachable receipt returns the group to execution, and
+a lookup that exhausts its budget does the same for every group it did not
+reach — the budget exists so an unresponsive API leaves the `plan` job time to
+dispatch the work inside its five-minute timeout. A refused artifact is recorded
+in `rejected` with the run it came from, and `build-test` names that run beside
+the execution it forced.
+
+Retention is GitHub's artifact default. Nothing is copied anywhere else, nothing
+is pinned, and an artifact deleted through the Actions UI simply stops being
+available: the affected groups execute.
+
+In-flight work is never shared. A prose push while a code run is still executing
+plans its own run, finds that run incomplete, and executes; neither run cancels
+the other, because the workflow's concurrency group deliberately does not.
+
+**Reuse is a claim about declared inputs, not proof against nondeterminism.** It
+states that the inputs this repository declares for a group are byte-identical
+to the ones an earlier execution ran against, on the same pinned platform, under
+the same classification policy. It does not state that the group is
+deterministic, that an undeclared input did not move, or that re-running would
+agree. Where that matters, the remedy is a declared input, not a narrower
+comparison here.
+
 ### The aggregate and `build-test`
 
 `build-test` runs after the plan and both workers with `if: always()`, so the
@@ -375,6 +548,7 @@ python3 tools/validation/aggregate.py --plan plan.json --receipts <dir>
 | Option | Meaning |
 | --- | --- |
 | `--plan`, `--receipts` | The plan the verdict is about, and the collected receipts. |
+| `--applicability` | The document recording earlier executions that still apply. |
 | `--worker NAME=RESULT:GROUP[,GROUP...]` | A worker job, its result, and the groups it owns. Repeatable. |
 | `--expect-head`, `--expect-base` | The pull request's current head and merge base. |
 | `--expect-request-file` | A file holding the pull request's current body. |
@@ -386,9 +560,20 @@ selected. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
 than a failure. Everything else fails: a missing receipt, a failed or timed-out
 one, a malformed one, one belonging to another plan or head, and **any worker
-that did not conclude `success` while its groups were selected**. A selected
-gate nothing vouched for has not been satisfied, however green the rest of the
-run looks.
+that did not conclude `success` while its groups were asked to execute**. A
+selected gate nothing vouched for has not been satisfied, however green the rest
+of the run looks.
+
+A selected group with no receipt at all is satisfied instead by an applicability
+record, and only then. A fresh receipt always outranks one: a failure that just
+happened is never overruled by an older pass. The record is held to the
+candidate's compatibility fields rather than to this plan's identity and head,
+which belong to the run that executed, and a record resolved for another plan or
+another candidate is stale — it satisfies nothing and is reported as an
+obstacle. A reused group is reported with outcome `reused`, and the summary
+states for each of them that it is an earlier execution and links the run that
+produced it. A worker skipped because every group it owns was covered left
+nothing unvouched for and is not an obstacle.
 
 `failure` is not excused by receipts, and deliberately so. A job can fail after
 its groups passed, or fail before it wrote a receipt at all, so passing evidence
@@ -582,6 +767,35 @@ content-changing push earns, the write that must not happen when the decision
 was to keep, a decision that was correct when made and is stopped at write time
 because the head advanced, a removal that did not take, and a label read that
 failed rather than returning nothing.
+
+Candidate identity and reuse are covered against temporary Git repositories and
+a stub `gh` answering from canned files. The identity examples assert that a
+prose edit, rename, and deletion leave `input_identity` untouched while a
+source, package description, project file, fixture, consumed Markdown document,
+or file mode change moves it; that a catalog or workflow edit moves the policy
+identity and the input identity with it; that a code change followed by a
+prose-only push keeps the identity while selection still reports the code as
+affected; and that an upstream change merged into the integration candidate
+moves the identity even when the contribution is prose.
+
+The reuse examples assert that a finished passing receipt for identical inputs
+is accepted, recorded with the earlier run's own commit and run URL, and removes
+the worker that owned it; and that a receipt from another toolchain, another
+input identity, or a non-zero exit, an artifact from another workflow, and a run
+still in progress or cancelled are each refused. A newer failure standing in
+front of an older pass is asserted both ways: the pass is genuine and would have
+been accepted alone, and it must stay unused while the failure it hides behind
+stays named. A lookup that cannot answer at all leaves an obstacle and returns
+every group to execution.
+
+The aggregate examples cover a covered group satisfied and its worker excused, a
+selected group with neither an execution nor a record, a record resolved for
+another plan, a malformed record, and a fresh failure standing rather than the
+older pass behind it.
+
+The stub is what makes those reachable: a run still executing, a newer failure
+in front of an older pass, and an API that does not answer do not happen on
+demand against a real repository.
 
 It also covers the comparison range: a pull request across its merge base, a
 push from the commit it started at, a push whose starting commit is absent or

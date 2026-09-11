@@ -114,7 +114,7 @@ spec = describe "Validation execution" $ do
         (result, output, _) ← aggregate fixture plan []
         result `shouldBe` ExitFailure 1
         output `shouldContain` "build.pass"
-        output `shouldContain` "no receipt was produced"
+        output `shouldContain` "neither an execution nor an applicable earlier receipt"
 
     it "passes omitted unaffected and optional groups without receipts" $
       withFixture $ \fixture → do
@@ -412,6 +412,9 @@ requiredReceiptFields =
   , "executed_tree"
   , "runner_os"
   , "runner_arch"
+  , "input_identity"
+  , "policy_version"
+  , "source_run_url"
   ]
 
 -- | Stand-ins for a merge candidate that is neither endpoint of the plan.
@@ -547,10 +550,15 @@ emptyPlan ∷ String
 emptyPlan =
   unlines
     [ "{"
-    , "  \"schema_version\": 1,"
-    , "  \"policy_version\": 1,"
+    , "  \"schema_version\": 2,"
+    , "  \"policy_version\": \"eeee\","
+    , "  \"catalog_policy_version\": 1,"
+    , "  \"input_identity\": \"ffff\","
+    , "  \"runner_os\": \"Linux\","
+    , "  \"toolchain\": {},"
     , "  \"base\": {\"commit\": \"aaaa\", \"tree\": \"bbbb\"},"
     , "  \"head\": {\"commit\": \"cccc\", \"tree\": \"dddd\"},"
+    , "  \"candidate\": {\"commit\": \"cccc\", \"tree\": \"dddd\"},"
     , "  \"request\": {\"ids\": [], \"all_hspec\": false, \"resolved\": []},"
     , "  \"groups\": [],"
     , "  \"selected\": []"

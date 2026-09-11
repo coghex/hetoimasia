@@ -51,14 +51,20 @@ def git_output(root: str, *arguments: str) -> str:
     return process.stdout.decode("utf-8", errors="replace").strip()
 
 
-def parse_toolchain(entries: list[str]) -> dict[str, str]:
-    toolchain: dict[str, str] = {}
-    for entry in entries:
-        name, separator, version = entry.partition("=")
-        if not separator or not name:
-            raise EvidenceError(f"--toolchain expects NAME=VERSION, not {entry!r}")
-        toolchain[name] = version
-    return toolchain
+def source_run_url() -> str:
+    """Where this execution can be read back from, when a run produced it.
+
+    An execution that no later run can attribute is not reusable evidence, so
+    the attribution is recorded from the environment the run publishes rather
+    than reconstructed from an artifact's metadata afterwards.
+    """
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not (server and repository and run_id):
+        return ""
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT") or "1"
+    return f"{server}/{repository}/actions/runs/{run_id}/attempts/{attempt}"
 
 
 def group_alive(group: int | None) -> bool:
@@ -152,6 +158,10 @@ def main(argv: list[str]) -> int:
         metavar="NAME=VERSION",
         help="a toolchain version to record; repeatable",
     )
+    parser.add_argument(
+        "--source-run-url",
+        help="where this execution can be read back from (default: this run, from the environment)",
+    )
     arguments = parser.parse_args(argv)
 
     root = os.path.abspath(arguments.repo_root or os.getcwd())
@@ -164,8 +174,10 @@ def main(argv: list[str]) -> int:
             "an omitted group has no execution to record"
         )
 
-    toolchain = parse_toolchain(arguments.toolchain)
-    toolchain.setdefault("python", platform.python_version())
+    # The declared toolchain is exactly what reuse compares against the
+    # candidate's pinned versions, so the interpreter this runner happens to
+    # be is recorded beside it rather than inside it.
+    toolchain = receipts.parse_toolchain(arguments.toolchain)
 
     executed_commit = arguments.executed_commit or git_output(root, "rev-parse", "HEAD")
     executed_tree = arguments.executed_tree or git_output(root, "rev-parse", "HEAD^{tree}")
@@ -205,7 +217,14 @@ def main(argv: list[str]) -> int:
         "executed_tree": executed_tree,
         "runner_os": os.environ.get("RUNNER_OS") or platform.system(),
         "runner_arch": os.environ.get("RUNNER_ARCH") or platform.machine(),
+        "runner_python": platform.python_version(),
         "toolchain": toolchain,
+        # Copied from the plan rather than recomputed: the receipt has to name
+        # the identity the candidate was planned under, and a runner that
+        # derived its own could disagree with the plan it is executing.
+        "input_identity": plan["input_identity"],
+        "policy_version": plan["policy_version"],
+        "source_run_url": arguments.source_run_url or source_run_url(),
     }
     written = receipts.write_receipt(arguments.receipts, receipt)
     print(

@@ -123,8 +123,9 @@ not a verdict that Synarchy's design should be discarded.
 
 - CI runs the validation pipeline and the review gate described in
   [validation.md](docs/validation.md). `build-test` and `review-approved` are
-  the checks the installed drainer reads. Evidence reuse across prose-only
-  updates and clean-merge review inheritance are still unimplemented. The
+  the checks the installed drainer reads. A prose-only update now inherits an
+  earlier run's code evidence through candidate input identity and receipt
+  artifacts; clean-merge review inheritance is still unimplemented. The
   selected GitHub repo was verified empty with zero issues and PRs before the
   initial publication on 2026-09-10; repeat deduplication when turning designs
   into tracker artifacts.

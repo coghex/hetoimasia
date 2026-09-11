@@ -9,6 +9,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
 import qualified DismissalStep
 import qualified Execution
+import qualified Reuse
 import qualified ReviewGate
 import qualified Timings
 import qualified Validation
@@ -68,6 +69,7 @@ main = hspec $ do
 
   Validation.spec
   Execution.spec
+  Reuse.spec
   Timings.spec
   ReviewGate.spec
   DismissalStep.spec

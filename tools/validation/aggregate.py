@@ -10,6 +10,11 @@ a malformed one, one that belongs to another plan or head, and any worker that
 did not conclude ``success`` while its groups were selected all fail, because a
 selected gate nothing vouched for has not been satisfied.
 
+``--applicability`` adds the second way a selected group can be satisfied: an
+earlier execution of byte-identical inputs, recorded by ``reuse.py``. A reused
+group is reported as an earlier execution and links the run that produced it;
+it never reads as a fresh pass, and a fresh receipt always outranks it.
+
 ``--expect-head``, ``--expect-base``, and ``--expect-request-file`` add the
 freshness question a published verdict depends on: does this plan still
 describe the pull request as it stands now? An older run, or a rerun of an
@@ -124,8 +129,14 @@ def describe_request(identifiers: list[str], all_hspec: bool) -> str:
     return ", ".join(parts) if parts else "nothing"
 
 
-def worker_problems(plan: dict, workers: list[Worker]) -> list[str]:
-    selected = set(plan["selected"])
+def worker_problems(plan: dict, workers: list[Worker], covered: set[str]) -> list[str]:
+    """A worker only has to account for the groups it was actually asked to run.
+
+    A job skipped because every group it owns was satisfied by earlier evidence
+    left nothing unvouched for, so it is not an obstacle. A job that was asked
+    to execute something and did not conclude ``success`` still is.
+    """
+    selected = set(plan["selected"]) - covered
     problems: list[str] = []
     for worker in workers:
         owned = [identifier for identifier in worker.groups if identifier in selected]
@@ -139,7 +150,41 @@ def worker_problems(plan: dict, workers: list[Worker]) -> list[str]:
     return problems
 
 
-def inspect_group(entry: dict, plan: dict, identity: str, directory: str) -> Finding:
+def reuse_finding(record: dict, entry: dict, plan: dict) -> Finding:
+    """Judge one applicability record against the group it claims to satisfy.
+
+    The record carries an older run's receipt, so this deliberately does not ask
+    the questions a fresh receipt answers — the plan identity and the head
+    commit belong to the run that executed, not to this one. What it does ask is
+    whether that execution was of this candidate's inputs, under this policy,
+    toolchain, and platform, and whether it actually passed.
+    """
+    identifier = entry["id"]
+    reason = entry["reason"]
+    receipt = record["receipt"]
+    problems = receipts.compatibility_problems(
+        receipts.candidate_identity(plan), receipt, "the reused receipt"
+    )
+    if receipt.get("group") != identifier:
+        problems.append(f"the reused receipt records group {receipt.get('group')!r}")
+    if receipt.get("command") != list(entry["command"]):
+        problems.append("the reused receipt records a different command from the one the plan selected")
+    if receipt.get("outcome") != "passed" or receipt.get("exit_status") != 0:
+        problems.append(f"the reused receipt records outcome {receipt.get('outcome')!r}")
+    if problems:
+        return Finding(identifier, reason, "unusable", "; ".join(problems), False)
+    return Finding(
+        identifier,
+        reason,
+        "reused",
+        f"an earlier execution at {record['executed_commit'][:12]}, from {record['source_run_url']}",
+        True,
+    )
+
+
+def inspect_group(
+    entry: dict, plan: dict, identity: str, directory: str, applicable: dict[str, dict]
+) -> Finding:
     identifier = entry["id"]
     reason = entry["reason"]
     if not entry["selected"]:
@@ -154,7 +199,18 @@ def inspect_group(entry: dict, plan: dict, identity: str, directory: str) -> Fin
         )
     path = receipts.receipt_path(directory, identifier)
     if not os.path.exists(path):
-        return Finding(identifier, reason, "missing", "no receipt was produced for a selected group", False)
+        # A fresh receipt outranks an applicability record, so this is reached
+        # only when nothing executed the group in this run at all. A fresh
+        # failure is never overridden by an older pass.
+        if identifier in applicable:
+            return reuse_finding(applicable[identifier], entry, plan)
+        return Finding(
+            identifier,
+            reason,
+            "missing",
+            "neither an execution nor an applicable earlier receipt vouched for a selected group",
+            False,
+        )
     try:
         receipt = receipts.load_receipt(path)
     except EvidenceError as failure:
@@ -208,7 +264,13 @@ def inspect_group(entry: dict, plan: dict, identity: str, directory: str) -> Fin
     )
 
 
-def render_summary(findings: list[Finding], problems: list[str], plan: dict, identity: str) -> str:
+def render_summary(
+    findings: list[Finding],
+    problems: list[str],
+    plan: dict,
+    identity: str,
+    rejected: list[dict],
+) -> str:
     lines = [
         "## Validation verdict",
         "",
@@ -222,11 +284,50 @@ def render_summary(findings: list[Finding], problems: list[str], plan: dict, ide
         lines.append(
             f"| `{finding.group}` | {finding.reason} | {finding.outcome} | {finding.detail} |"
         )
+    reused = [finding for finding in findings if finding.outcome == "reused"]
+    if reused:
+        lines += ["", "### Reused evidence", ""]
+        lines += [
+            f"- `{finding.group}` was not executed by this run: it is {finding.detail}."
+            for finding in reused
+        ]
+    if rejected:
+        # A known failure for these very inputs stays visible beside the
+        # execution it forced, rather than disappearing behind a green run.
+        lines += ["", "### Refused evidence", ""]
+        lines += [
+            f"- `{record['group']}` executed instead of reusing "
+            f"{record['source_run_url'] or 'an unattributed run'}: {record['reason']}"
+            for record in rejected
+        ]
     if problems:
         lines += ["", "### Obstacles", ""]
         lines += [f"- {problem}" for problem in problems]
     lines.append("")
     return "\n".join(lines)
+
+
+def read_applicability(
+    path: str | None, plan: dict, identity: str
+) -> tuple[dict[str, dict], list[dict], list[str]]:
+    """Read the applicability document, keeping only records this plan may use.
+
+    A document resolved for another plan or another candidate is stale, and a
+    stale record cannot satisfy anything: it is reported as an obstacle so the
+    verdict fails rather than quietly excusing a group nothing ran.
+    """
+    if not path:
+        return {}, [], []
+    document = receipts.load_applicability(path)
+    problems = receipts.applicability_problems(document, plan, identity)
+    if problems:
+        return {}, list(document["rejected"]), problems
+    selected = set(plan["selected"])
+    applicable: dict[str, dict] = {}
+    for record in document["reused"]:
+        if record["group"] in selected:
+            applicable[record["group"]] = record
+    return applicable, list(document["rejected"]), []
 
 
 def main(argv: list[str]) -> int:
@@ -236,6 +337,10 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--plan", required=True, help="the resolved plan the verdict is about")
     parser.add_argument("--receipts", required=True, help="directory holding the collected receipts")
+    parser.add_argument(
+        "--applicability",
+        help="the applicability document recording earlier executions that still apply",
+    )
     parser.add_argument(
         "--worker",
         action="append",
@@ -253,10 +358,12 @@ def main(argv: list[str]) -> int:
     identity = receipts.plan_identity(plan)
     workers = [parse_worker(entry) for entry in arguments.worker]
 
-    problems = freshness_problems(plan, arguments)
-    problems += worker_problems(plan, workers)
+    applicable, rejected, problems = read_applicability(arguments.applicability, plan, identity)
+    problems += freshness_problems(plan, arguments)
+    problems += worker_problems(plan, workers, set(applicable))
     findings = [
-        inspect_group(entry, plan, identity, arguments.receipts) for entry in plan["groups"]
+        inspect_group(entry, plan, identity, arguments.receipts, applicable)
+        for entry in plan["groups"]
     ]
 
     width = max((len(finding.group) for finding in findings), default=1)
@@ -273,7 +380,7 @@ def main(argv: list[str]) -> int:
     if arguments.summary:
         try:
             with open(arguments.summary, "a", encoding="utf-8") as handle:
-                handle.write(render_summary(findings, problems, plan, identity))
+                handle.write(render_summary(findings, problems, plan, identity, rejected))
         except OSError as error:
             raise EvidenceError(f"cannot write the summary {arguments.summary}: {error}") from error
 

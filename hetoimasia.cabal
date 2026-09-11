@@ -63,6 +63,7 @@ test-suite workflow-tests
         DismissalStep
         Execution
         Json
+        Reuse
         ReviewGate
         Sandbox
         Timings
