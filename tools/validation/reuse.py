@@ -111,16 +111,8 @@ class Api:
             raise ApiError(f"{path} did not answer with a JSON object")
         return document
 
-    def zip_member(self, path: str, member: str) -> bytes:
-        raw = self._call(path)
-        try:
-            archive = zipfile.ZipFile(io.BytesIO(raw))
-            names = archive.namelist()
-            if names != [member]:
-                raise ApiError(f"{path} holds {names!r} rather than exactly {member!r}")
-            return archive.read(member)
-        except (zipfile.BadZipFile, KeyError) as error:
-            raise ApiError(f"{path} is not a readable artifact archive: {error}") from error
+    def download(self, path: str) -> bytes:
+        return self._call(path)
 
 
 def newest_first(artifacts: list[dict]) -> list[dict]:
@@ -191,18 +183,28 @@ def source_run(api: Api, repository: str, artifact: dict, workflow: str) -> dict
 
 
 def fetch_receipt(api: Api, repository: str, artifact: dict, group: str, url: str) -> dict:
-    raw = api.zip_member(
-        f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", f"{group}.json"
-    )
+    member = f"{group}.json"
+    raw = api.download(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip")
+    # What the archive holds is a statement about the evidence, not about the
+    # transport, so an archive carrying anything else is refused by name rather
+    # than reported as a lookup that did not answer.
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+        names = archive.namelist()
+        if names != [member]:
+            raise Rejection(f"its artifact holds {names!r} rather than exactly {member!r}", url)
+        content = archive.read(member)
+    except (zipfile.BadZipFile, KeyError) as error:
+        raise Rejection(f"its artifact is not a readable archive: {error}", url) from error
     # The downloaded receipt is read through the shared contract rather than
     # parsed here, so a reused receipt is held to exactly the shape a fresh one
     # is. It lands in a scratch directory that leaves nothing in the checkout
     # this candidate's own identity was fingerprinted from.
     with tempfile.TemporaryDirectory(prefix="validation-reuse-") as scratch:
-        path = os.path.join(scratch, f"{group}.json")
+        path = os.path.join(scratch, member)
         try:
             with open(path, "wb") as handle:
-                handle.write(raw)
+                handle.write(content)
             return receipts.load_receipt(path)
         except OSError as error:
             raise Rejection(f"its receipt could not be read: {error}", url) from error
