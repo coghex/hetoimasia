@@ -73,7 +73,7 @@ jobs:
       provenance_reason: ${{ steps.provenance.outputs.provenance_reason }}
       origin: ${{ steps.provenance.outputs.origin }}
       chain: ${{ steps.provenance.outputs.chain }}
-      head_approved: ${{ steps.provenance.outputs.head_approved }}
+      head_verdict: ${{ steps.provenance.outputs.head_verdict }}
     steps:
       - name: Check out the head
         uses: actions/checkout@v7
@@ -157,7 +157,7 @@ jobs:
           REPLAY_REASON: ${{ steps.replay.outputs.replay_reason }}
           PROVENANCE: ${{ steps.provenance.outputs.provenance }}
           PROVENANCE_REASON: ${{ steps.provenance.outputs.provenance_reason }}
-          HEAD_APPROVED: ${{ steps.provenance.outputs.head_approved }}
+          HEAD_VERDICT: ${{ steps.provenance.outputs.head_verdict }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -191,7 +191,7 @@ jobs:
             --replay-reason "$REPLAY_REASON" \
             --provenance "$PROVENANCE" \
             --provenance-reason "$PROVENANCE_REASON" \
-            --head-approved "$HEAD_APPROVED" \
+            --head-verdict "$HEAD_VERDICT" \
             --label-attached "$attached" \
             --label "$LABEL" | tee -a "$GITHUB_OUTPUT"
 
@@ -233,7 +233,7 @@ jobs:
           PROVENANCE_REASON: ${{ needs['decide-dismissal'].outputs.provenance_reason }}
           ORIGIN: ${{ needs['decide-dismissal'].outputs.origin }}
           CHAIN: ${{ needs['decide-dismissal'].outputs.chain }}
-          HEAD_APPROVED: ${{ needs['decide-dismissal'].outputs.head_approved }}
+          HEAD_VERDICT: ${{ needs['decide-dismissal'].outputs.head_verdict }}
           OWNER: ${{ github.repository_owner }}
           LABEL: reviewed:approve
         run: |
@@ -265,15 +265,18 @@ jobs:
             exit 1
           fi
 
-          # A canonical review may have approved this exact head after the
-          # decision was made — a fresh approval for the newest push arrives
-          # whenever a reviewer is faster than a queued run — and the head
-          # check above cannot see it, since the head did not move. Read the
-          # owner's review markers again immediately before removing, and let
-          # the newest marker naming this head win. A read that fails is not
-          # an empty one: removing on it could strip an approval somebody just
-          # granted, so it is refused like every other unconfirmed read here.
-          if [ "$ACTION" = "remove" ]; then
+          # A canonical review may have judged this exact head after the
+          # decision was made — a verdict for the newest push arrives whenever
+          # a reviewer is faster than a queued run — and the head check above
+          # cannot see it, since the head did not move. Read the owner's
+          # review markers again immediately before acting on either verdict,
+          # and let the newest marker naming this head win: an approval keeps
+          # a label the decision would have removed, and a denial removes one
+          # the decision would have kept. A read that fails is not an empty
+          # one: acting on it could strip an approval somebody just granted or
+          # confirm one somebody just refused, so it is refused like every
+          # other unconfirmed read here.
+          if [ "$ACTION" = "remove" ] || [ "$EXPECTED" = "kept" ]; then
             owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
             if ! markers="$(gh api --paginate "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" \
                 --jq ".[] | select(((.user.login // \"\") | ascii_downcase) == \"$owner\") | .body")"; then
@@ -285,13 +288,26 @@ jobs:
               | tail -n 1 || true)"
             case "$newest" in
               *'verdict=APPROVE -->')
-                echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
-                ACTION=none
-                EXPECTED=kept
-                REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
-                HEAD_APPROVED=true
-                ORIGIN="$EVENT_HEAD"
-                CHAIN=""
+                if [ "$ACTION" = "remove" ]; then
+                  echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
+                  ACTION=none
+                  EXPECTED=kept
+                  REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
+                  HEAD_VERDICT=approved
+                  ORIGIN="$EVENT_HEAD"
+                  CHAIN=""
+                fi
+                ;;
+              *'verdict=CHANGES_REQUESTED -->')
+                if [ "$ACTION" != "remove" ]; then
+                  echo "a canonical review requested changes on head $EVENT_HEAD after the decision was made; removing $LABEL"
+                  ACTION=remove
+                  EXPECTED=removed
+                  REASON="a canonical review requested changes on head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
+                  HEAD_VERDICT=denied
+                  ORIGIN=""
+                  CHAIN=""
+                fi
                 ;;
             esac
           fi
@@ -331,7 +347,7 @@ jobs:
           # proves nothing. A head a canonical review named itself needs no
           # record: the marker is its proof.
           carried=false
-          if [ "$EXPECTED" = "kept" ] && [ "$HEAD_APPROVED" != "true" ]; then
+          if [ "$EXPECTED" = "kept" ] && [ "$HEAD_VERDICT" != "approved" ]; then
             if [ -z "$ORIGIN" ]; then
               echo "::error::the decision kept $LABEL without a proven origin, so no carry can be recorded"
               exit 1
@@ -372,8 +388,10 @@ jobs:
             provenance "Incorporated base commit" "$INCORPORATED_BASE"
             provenance "Replay tree" "$REPLAY_TREE"
             provenance "Resulting head" "$RESULTING_HEAD"
-            if [ "$HEAD_APPROVED" = "true" ]; then
+            if [ "$HEAD_VERDICT" = "approved" ]; then
               echo "- A canonical review named this head itself, so nothing is inherited."
+            elif [ "$HEAD_VERDICT" = "denied" ]; then
+              echo "- A canonical review requested changes on this head itself, so no approval stands on it whatever its starting point proved."
             elif [ "$carried" = "true" ]; then
               route=""
               IFS=',' read -ra hops <<< "$CHAIN"

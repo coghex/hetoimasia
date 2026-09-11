@@ -21,7 +21,8 @@ the composition — an approval is carried only from a proven starting point, an
 then by either of two independent proofs that the push itself changed nothing a
 reviewer read (it moved no tracked file at all, or it is exactly the clean
 replay of the approved work onto the base it incorporated); a canonical review
-naming the pushed head itself is a new origin that needs neither — and the
+naming the pushed head itself settles it before either — an approval is a new
+origin that needs neither, a denial strips whatever they prove — and the
 states in which no answer may be given at all.
 
 Both run in read-only jobs. The job that actually mutates the label holds the
@@ -68,14 +69,11 @@ STRIP = "strip"
 PROVEN = "proven"
 UNPROVEN = "unproven"
 
-
-def flag(value: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in ("true", "yes", "1"):
-        return True
-    if lowered in ("false", "no", "0"):
-        return False
-    raise argparse.ArgumentTypeError(f"expected true or false, not {value!r}")
+# What the newest canonical review of the pushed head itself said, from the
+# same tool. Tri-state on purpose: a denial is not the absence of an approval.
+APPROVED = "approved"
+DENIED = "denied"
+NO_VERDICT = "none"
 
 
 def label_state(value: str) -> str:
@@ -118,10 +116,13 @@ def dismissal(arguments: argparse.Namespace) -> int:
     """What a push should do to the approval label.
 
     A canonical review that named the pushed head itself settles the question
-    first: the label belongs to this head, whatever the push that reached it
-    looked like. That is what lets a fresh approval survive a decision that was
-    still queued when it was granted, and what lets a head approved after an
-    earlier strip start a new chain.
+    first, whatever the push that reached it looked like. An approval means
+    the label belongs to this head: that is what lets a fresh approval survive
+    a decision that was still queued when it was granted, and what lets a head
+    approved after an earlier strip start a new chain. A denial means no
+    approval may stand on it, however proven its starting point and however
+    clean the push: an inherited approval must not outlive a reviewer's
+    refusal of the very revision it stands on.
 
     Otherwise the starting point has to be a proven approved revision, decided
     by ``review_provenance.py`` and arriving here as ``proven`` or ``unproven``.
@@ -155,7 +156,10 @@ def dismissal(arguments: argparse.Namespace) -> int:
         return report_unreadable(arguments.label, "decide this push's effect on approval")
 
     changed = not arguments.before_tree or arguments.before_tree != arguments.after_tree
-    if arguments.head_approved:
+    if arguments.head_verdict == DENIED:
+        carries = False
+        reason = f"a canonical review requested changes on head {arguments.event_head[:12]} itself"
+    elif arguments.head_verdict == APPROVED:
         carries = True
         reason = f"a canonical review approved head {arguments.event_head[:12]} itself"
     elif arguments.provenance != PROVEN:
@@ -263,10 +267,10 @@ def main(argv: list[str]) -> int:
                 help="the one-line reason review_provenance.py gave for that decision",
             )
             command.add_argument(
-                "--head-approved",
+                "--head-verdict",
                 required=True,
-                type=flag,
-                help="whether a canonical review named the pushed head itself: true or false",
+                choices=(APPROVED, DENIED, NO_VERDICT),
+                help="what the newest canonical review of the pushed head itself said",
             )
         else:
             command.add_argument(

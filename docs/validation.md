@@ -650,9 +650,11 @@ The decision itself:
 
 - it refuses outright when the head has moved on, because removing approval from
   a head it never examined would invalidate someone else's newer review;
-- it keeps the label when a canonical review named the pushed head itself: that
+- it answers from the newest canonical review of the pushed head itself, when
+  there is one, before anything else: an approval keeps the label — that
   approval is a new origin, and neither the push's history nor its starting
-  point has anything to say about it;
+  point has anything to say about it — and a denial removes it, however
+  proven the starting point and however clean the push;
 - otherwise it requires the push's **starting point to be a proven approved
   revision**, as decided by `review_provenance.py` below — an attached label
   proves nothing about the head it was left on, so an unproven starting point
@@ -798,9 +800,11 @@ reported as `unproven` with the reason — never inferred `proven` from tree
 equality or replay eligibility, and never turned into a failure that would
 abort the job before the removal it justifies. Its `key=value` lines are
 `provenance`, `provenance_reason`, `origin`, `chain` (every revision from the
-origin to the starting point, comma-separated), and `head_approved`. The
-superseded-head and unreadable-label refusals are unchanged and are answered
-before provenance is consulted.
+origin to the starting point, comma-separated), and `head_verdict` — a
+tri-state `approved`, `denied`, or `none`, because a canonical denial of the
+pushed head is not the absence of an approval of it. The superseded-head and
+unreadable-label refusals are unchanged and are answered before provenance is
+consulted.
 
 Run it against a feed the same way the job does — `--list-runs` names the run
 attempts the records depend on, and each one's jobs listing goes into the
@@ -819,16 +823,19 @@ python3 tools/validation/review_provenance.py \
 ```
 
 `dismiss-stale-approval` reads the owner's markers once more **immediately
-before removing** the label. The head-equality guard cannot see a canonical
-approval granted to this exact head while the decision was queued — the head
-did not move — and stripping it would remove a review somebody just granted to
-this very revision, so the newest marker naming the event head wins there too,
-and a marker read that fails refuses like every other unconfirmed read in that
-job. Its summary states the starting point's verdict and reason, the proven
-origin, and, for a carry, the route from that origin through every recorded
-head to the pushed one; for a strip it names the link that could not be
-proven — the starting point itself, or the revision an otherwise recorded
-chain traced back to without arriving anywhere.
+before acting on either verdict** — before a removal, and before confirming a
+keep. The head-equality guard cannot see a canonical verdict reached for this
+exact head while the decision was queued, since the head did not move:
+stripping past a fresh approval would remove a review somebody just granted to
+this very revision, and confirming a keep past a fresh denial would record a
+carry a reviewer just refused. So the newest marker naming the event head wins
+there too, in both directions, and a marker read that fails refuses like every
+other unconfirmed read in that job. Its summary states the starting point's
+verdict and reason, the proven origin, and, for a carry, the route from that
+origin through every recorded head to the pushed one; for a strip it names the
+link that could not be proven — the starting point itself, or the revision an
+otherwise recorded chain traced back to without arriving anywhere — or the
+denial of the head itself.
 
 Review inheritance decides review, and nothing else. `review-approved` stays
 label-only and never reads `build-test`; `build-test` never reads the label. A
@@ -1016,9 +1023,10 @@ own reason reaching the summary unrewritten, and an unrecognized verdict refused
 rather than guessed. So is the composition that consumes the provenance
 verdict: an unproven starting point stripping through an identical tree and
 through a clean replay, a canonical approval of the pushed head keeping through
-a `strip`, that approval asking for no mutation when no label is attached, the
-superseded-head and unreadable-label refusals answered first, and unrecognized
-provenance and head-approval inputs refused.
+a `strip`, a canonical denial of it stripping through a proven starting point
+and an identical tree, that approval asking for no mutation when no label is
+attached, the superseded-head and unreadable-label refusals answered first, and
+unrecognized provenance and head-verdict inputs refused.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly
@@ -1041,9 +1049,11 @@ record names failing, cancelled, or unfinished after posting it, its jobs
 unfetched, run for another head, or belonging to another workflow, each
 stripping, and the run listing the workflow fetches; a later denial ending
 the chain at an inherited head and at a denied head a descendant passes
-through, and a later approval of that exact head lifting it; and the failing
-sequence composed end to end — decision, the shipped mutation step, and the
-verdict withholding approval.
+through, a denial of the pushed head itself stripping past a proven starting
+point — present at decision time, and arriving after it and caught by the
+shipped mutation step before the keep is confirmed — and a later approval of
+that exact head lifting it; and the failing sequence composed end to end —
+decision, the shipped mutation step, and the verdict withholding approval.
 
 The replay rule itself is proven against real Git histories in temporary
 repositories, because rename detection, conflict resolution, and reachability are
@@ -1066,9 +1076,11 @@ was to keep, a decision that was correct when made and is stopped at write time
 because the head advanced, a removal that did not take, and a label read that
 failed rather than returning nothing, and a decision that never concluded
 refused rather than confirmed. A canonical approval that arrived after the
-decision is covered there too: the removal withheld for a marker naming this
-exact head, the newest marker for that head winning, a fresh approval of some
-other head ignored, and a marker read that failed refused. So is the record it
+decision is covered there too: the removal withheld for an approval naming
+this exact head, a keep turned into a removal by a denial naming it, the
+newest marker for that head winning, a fresh approval of some other head
+ignored, and a marker read that failed refused before a removal and before a
+keep alike. So is the record it
 writes: a kept approval recorded at the head it was carried to with the link
 and the recording run attempt named exactly, no record for a head a canonical
 review named itself or when

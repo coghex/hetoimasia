@@ -23,8 +23,9 @@ An approval survives a push only from a proven approved revision — the head a
 canonical review named, or one reached from it through carries the review gate
 itself recorded — and only when the push is an identical-tree re-push of that
 revision or exactly Git's clean merge of it with a commit `master` already
-contains: any other push to a reviewed candidate needs a fresh review, and a
-fresh canonical approval of the pushed head always stands. CI is independent of
+contains: any other push to a reviewed candidate needs a fresh review, a fresh
+canonical approval of the pushed head always stands, and a canonical denial of
+it always strips. CI is independent of
 that — the affected groups still run on the integrated head, and approval alone
 never makes them green. [validation.md](validation.md) documents the rule.
 The issue-approval service and PR drainer were installed for this repository

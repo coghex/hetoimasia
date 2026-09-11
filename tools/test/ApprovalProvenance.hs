@@ -20,7 +20,7 @@ module ApprovalProvenance (spec) where
 import Control.Monad (void)
 import Data.List (isInfixOf)
 import Data.Maybe (fromMaybe)
-import DismissalStep (Outcome (..), Repository (..), approval, approvalMarker, settled, withStep)
+import DismissalStep (Outcome (..), Repository (..), approval, approvalMarker, pushedHead, settled, withStep)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory (getCurrentDirectory)
 import System.Exit (ExitCode (..))
@@ -315,6 +315,57 @@ spec = describe "Approval provenance" $ do
         gateOutput decision
           `shouldContain` ("traces back to " ++ take 12 first ++ ", and its newest canonical review requested changes")
 
+    it "removes an inherited approval when it denied the pushed head itself" $
+      -- A proven starting point and an identical tree, and a reviewer who
+      -- refused this very revision: the refusal wins.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        decision ←
+          decide
+            fixture
+            [approvedBy owner reviewed, Comment owner (approvalMarker repushed "CHANGES_REQUESTED")]
+            reviewed
+            repushed
+        field "provenance" (provenanceOutput decision) `shouldBe` Just "proven"
+        field "head_verdict" (provenanceOutput decision) `shouldBe` Just "denied"
+        shouldRemove decision
+        gateOutput decision
+          `shouldContain` ("reason=a canonical review requested changes on head " ++ take 12 repushed ++ " itself")
+
+    it "removes an inherited approval when it denied the pushed head after the decision" $
+      -- The denial lands between the decision and the mutation. The decision
+      -- was to keep; the shipped step re-reads the markers before confirming
+      -- it and strips instead, recording no carry.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        decision ← decide fixture [approvedBy owner reviewed] reviewed repushed
+        shouldKeepFrom reviewed decision
+        let decided name = value name (gateOutput decision)
+            proven name = value name (provenanceOutput decision)
+            repository =
+              settled
+                { labelsAfter = []
+                , replay = value "replay_decision" (replayOutput decision)
+                , -- The step answers for the harness's own event head, so the
+                  -- denial has to name that head rather than the Git fixture's.
+                  markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]
+                , provenance = proven "provenance"
+                , provenanceReason = proven "provenance_reason"
+                , origin = proven "origin"
+                , chain = proven "chain"
+                , headVerdict = proven "head_verdict"
+                }
+        withStep repository (decided "action") (decided "expected") $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+          unwords (calls outcome) `shouldNotContain` "approval-provenance:v1"
+          summary outcome `shouldContain` "requested changes on this head itself"
+        (published, verdictOutput, _) ← verdict fixture repushed "success" "false"
+        published `shouldBe` ExitFailure 1
+        verdictOutput `shouldContain` "is not attached"
+
     it "is lifted by a later approval of that exact head" $
       withFixture $ \fixture → do
         (reviewed, first, second) ← twoUpdates fixture
@@ -343,7 +394,7 @@ spec = describe "Approval provenance" $ do
         merged ← mergeBase fixture
         decision ← decide fixture [approvedBy owner reviewed, approvedBy owner merged] unreviewed merged
         field "provenance" (provenanceOutput decision) `shouldBe` Just "unproven"
-        field "head_approved" (provenanceOutput decision) `shouldBe` Just "true"
+        field "head_verdict" (provenanceOutput decision) `shouldBe` Just "approved"
         shouldKeep decision
         gateOutput decision `shouldContain` ("reason=a canonical review approved head " ++ take 12 merged ++ " itself")
 
@@ -457,7 +508,7 @@ spec = describe "Approval provenance" $ do
                 , provenanceReason = proven "provenance_reason"
                 , origin = proven "origin"
                 , chain = proven "chain"
-                , headApproved = proven "head_approved"
+                , headVerdict = proven "head_verdict"
                 }
         withStep repository (decided "action") (decided "expected") $ \outcome → do
           result outcome `shouldBe` ExitSuccess
@@ -545,8 +596,8 @@ decideFrom fixture feedPath before after current = do
       , value "provenance" proven
       , "--provenance-reason"
       , value "provenance_reason" proven
-      , "--head-approved"
-      , value "head_approved" proven
+      , "--head-verdict"
+      , value "head_verdict" proven
       , "--label-attached"
       , "true"
       ]

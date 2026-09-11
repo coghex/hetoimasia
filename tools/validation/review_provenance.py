@@ -49,7 +49,7 @@ safe to append to ``$GITHUB_OUTPUT``::
     provenance_reason=<one line saying why>
     origin=<the canonically approved revision the carried review originates from, or empty>
     chain=<origin,...,before: every revision the carry passed through, or empty>
-    head_approved=true|false   whether a canonical review named the pushed head itself
+    head_verdict=approved|denied|none   what the newest canonical review of the pushed head itself said
 
 ``--list-runs`` instead prints one ``<run id> <attempt>`` line per run the
 records name, so the caller can fetch exactly those jobs listings.
@@ -101,12 +101,15 @@ def short(revision: str) -> str:
     return revision[:12] if revision else "(none)"
 
 
-def render(verdict: str, reason: str, origin: str, chain: list[str], head_approved: bool) -> int:
+HEAD_VERDICTS = {"APPROVE": "approved", "CHANGES_REQUESTED": "denied"}
+
+
+def render(verdict: str, reason: str, origin: str, chain: list[str], head_verdict: str) -> int:
     print(f"provenance={verdict}")
     print(f"provenance_reason={reason}")
     print(f"origin={origin}")
     print(f"chain={','.join(chain)}")
-    print(f"head_approved={'true' if head_approved else 'false'}")
+    print(f"head_verdict={head_verdict}")
     return 0
 
 
@@ -316,14 +319,17 @@ def list_runs(feed: str, recorder: str) -> int:
 def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: str) -> int:
     comments, failure = load_feed(feed)
     if failure:
-        return render(UNPROVEN, f"{failure}, so no starting point can be proven approved", "", [], False)
+        return render(UNPROVEN, f"{failure}, so no starting point can be proven approved", "", [], "none")
 
     verdicts = canonical_verdicts(comments, owner)
     carries, unusable = recorded_carries(comments, recorder, runs)
-    head_approved = verdicts.get(after.lower()) == "APPROVE"
+    # Tri-state on purpose: a denial of the pushed head is not the absence of
+    # an approval of it. The gate strips on a denial whatever the starting
+    # point proves, and keeps on an approval whatever it fails to prove.
+    head_verdict = HEAD_VERDICTS.get(verdicts.get(after.lower(), ""), "none")
 
     if not before or before == NO_STARTING_POINT:
-        return render(UNPROVEN, "the push named no starting point", "", [], head_approved)
+        return render(UNPROVEN, "the push named no starting point", "", [], head_verdict)
 
     origin, chain, dead_end = prove(before.lower(), verdicts, carries)
     if origin == before.lower():
@@ -332,7 +338,7 @@ def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: 
             f"a canonical review approved the starting point {short(before)} itself",
             origin,
             chain,
-            head_approved,
+            head_verdict,
         )
     if origin:
         hops = len(chain) - 1
@@ -342,9 +348,9 @@ def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: 
             f"{short(origin)} through {hops} recorded carr{'y' if hops == 1 else 'ies'}",
             origin,
             chain,
-            head_approved,
+            head_verdict,
         )
-    return render(UNPROVEN, explain(dead_end, before.lower(), verdicts, unusable), "", [], head_approved)
+    return render(UNPROVEN, explain(dead_end, before.lower(), verdicts, unusable), "", [], head_verdict)
 
 
 def main(argv: list[str]) -> int:

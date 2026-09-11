@@ -90,7 +90,7 @@ data Repository = Repository
   , provenanceReason ∷ String
   , origin ∷ String
   , chain ∷ String
-  , headApproved ∷ String
+  , headVerdict ∷ String
   }
 
 -- | A repository that behaves: the head is the pushed one, the removal took,
@@ -112,7 +112,7 @@ settled =
     , provenanceReason = "a canonical review approved the starting point itself"
     , origin = approvedHead
     , chain = approvedHead
-    , headApproved = "false"
+    , headVerdict = "none"
     }
 
 -- | The outcome of running the shipped step: its own result, every `gh` call it
@@ -193,6 +193,30 @@ spec = describe "Stale approval mutation" $ do
           summary outcome `shouldContain` "named this head itself"
           unwords (calls outcome) `shouldNotContain` "approval-provenance:v1"
 
+    it "removes an approval the decision kept when a review denied this head afterwards" $
+      -- The mirror image: the decision found a proven carry and kept, and a
+      -- reviewer then refused this very revision. The markers are re-read
+      -- before every keep is confirmed, not only before a removal, so the
+      -- denial strips instead of being recorded as a carry.
+      withStep
+        settled {replay = "keep", markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]}
+        "none"
+        "kept"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+          output outcome `shouldContain` "requested changes on head"
+          summary outcome `shouldContain` "- `reviewed:approve`: removed"
+          summary outcome `shouldContain` "requested changes on this head itself"
+
+    it "fails a keep it cannot re-verify against the markers" $
+      withStep settled {labelsAfter = [approval], replay = "keep", markerReadFails = True} "none" "kept" $
+        \outcome → do
+          result outcome `shouldSatisfy` (/= ExitSuccess)
+          output outcome `shouldContain` "review markers could not be read back"
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+
     it "lets the newest marker naming the head win" $
       -- An approval later withdrawn for the same head is not an approval.
       withStep
@@ -239,7 +263,7 @@ spec = describe "Stale approval mutation" $ do
     it "records nothing when a canonical review named the head itself" $
       -- The marker is that head's own proof; a record would only restate it.
       withStep
-        settled {labelsAfter = [approval], headApproved = "true", origin = pushedHead, chain = ""}
+        settled {labelsAfter = [approval], headVerdict = "approved", origin = pushedHead, chain = ""}
         "none"
         "kept"
         $ \outcome → do
@@ -393,7 +417,7 @@ withStep repository action expected assertion = do
           , ("PROVENANCE_REASON", provenanceReason repository)
           , ("ORIGIN", origin repository)
           , ("CHAIN", chain repository)
-          , ("HEAD_APPROVED", headApproved repository)
+          , ("HEAD_VERDICT", headVerdict repository)
           , ("OWNER", owner)
           , ("LABEL", approval)
           , ("GITHUB_RUN_ID", recordingRun)

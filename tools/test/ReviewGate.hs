@@ -13,8 +13,9 @@
 -- history is proven against real repositories in "ReviewReplay"; what is proven
 -- here is that this composition consumes it — and that it consumes the
 -- provenance verdict "ApprovalProvenance" proves the same way: an unproven
--- starting point strips whatever the trees and the replay say, and a canonical
--- approval of the pushed head itself keeps whatever they say.
+-- starting point strips whatever the trees and the replay say, a canonical
+-- approval of the pushed head itself keeps whatever they say, and a canonical
+-- denial of it strips whatever the starting point proves.
 module ReviewGate (spec) where
 
 import Sandbox (run, sanitizedEnvironment)
@@ -117,7 +118,7 @@ spec = describe "Review gate" $ do
         -- The trees match, so the cheap proof says nothing moved. It is right,
         -- and irrelevant: nobody proved the head the label was left standing on.
         (result, output, _) ←
-          dismissalFrom "unproven" "false" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
+          dismissalFrom "unproven" "none" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
         result `shouldBe` ExitSuccess
         output `shouldContain` "action=remove"
         output `shouldContain` "expected=removed"
@@ -125,7 +126,7 @@ spec = describe "Review gate" $ do
 
       it "removes an approval a clean replay inherited from an unproven head" $ do
         (result, output, _) ←
-          dismissalFrom "unproven" "false" reviewedHead reviewedHead "tree-one" "tree-two" "keep" "true"
+          dismissalFrom "unproven" "none" reviewedHead reviewedHead "tree-one" "tree-two" "keep" "true"
         result `shouldBe` ExitSuccess
         output `shouldContain` "action=remove"
         output `shouldContain` ("reason=" ++ provenanceReason)
@@ -134,7 +135,7 @@ spec = describe "Review gate" $ do
         -- A fresh approval is a new origin. Neither the unproven starting point
         -- nor a replay that strips has anything to say about it.
         (result, output, _) ←
-          dismissalFrom "unproven" "true" reviewedHead reviewedHead "tree-one" "tree-two" "strip" "true"
+          dismissalFrom "unproven" "approved" reviewedHead reviewedHead "tree-one" "tree-two" "strip" "true"
         result `shouldBe` ExitSuccess
         output `shouldContain` "action=none"
         output `shouldContain` "expected=kept"
@@ -142,35 +143,45 @@ spec = describe "Review gate" $ do
 
       it "asks for no mutation when the head is approved but no label is attached" $ do
         (result, output, _) ←
-          dismissalFrom "unproven" "true" reviewedHead reviewedHead "tree-one" "tree-two" "strip" "false"
+          dismissalFrom "unproven" "approved" reviewedHead reviewedHead "tree-one" "tree-two" "strip" "false"
         result `shouldBe` ExitSuccess
         output `shouldContain` "action=none"
         output `shouldContain` "expected=absent"
 
       it "still refuses a superseded head before consulting provenance" $ do
         (result, output, errors) ←
-          dismissalFrom "unproven" "true" reviewedHead newerHead "tree-one" "tree-one" "strip" "true"
+          dismissalFrom "unproven" "approved" reviewedHead newerHead "tree-one" "tree-one" "strip" "true"
         result `shouldBe` ExitFailure 3
         errors `shouldContain` "superseded head"
         output `shouldBe` ""
 
       it "still refuses an unreadable label state before consulting provenance" $ do
         (result, _, errors) ←
-          dismissalFrom "unproven" "true" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "unknown"
+          dismissalFrom "unproven" "approved" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "unknown"
         result `shouldBe` ExitFailure 5
         errors `shouldContain` "unreadable label state is not an absent one"
 
       it "refuses a provenance verdict it does not recognize" $ do
         (result, _, errors) ←
-          dismissalFrom "" "false" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
+          dismissalFrom "" "none" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "--provenance"
 
-      it "refuses a head-approval flag it does not recognize" $ do
+      it "removes an inherited approval when a canonical review denied the pushed head itself" $ do
+        -- The starting point is proven and the tree did not move; a reviewer
+        -- nonetheless refused this very revision, and that is terminal.
+        (result, output, _) ←
+          dismissalFrom "proven" "denied" reviewedHead reviewedHead "tree-one" "tree-one" "keep" "true"
+        result `shouldBe` ExitSuccess
+        output `shouldContain` "action=remove"
+        output `shouldContain` "expected=removed"
+        output `shouldContain` ("reason=a canonical review requested changes on head " ++ take 12 reviewedHead)
+
+      it "refuses a head verdict it does not recognize" $ do
         (result, _, errors) ←
-          dismissalFrom "proven" "" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
+          dismissalFrom "proven" "unknown" reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
         result `shouldBe` ExitFailure 2
-        errors `shouldContain` "--head-approved"
+        errors `shouldContain` "--head-verdict"
 
   it "publishes approval when the label is attached at the current head" $ do
     (result, output, _) ← verdict "synchronize" reviewedHead reviewedHead "success" "true"
@@ -230,7 +241,7 @@ provenanceReason = "the starting point has no canonical approval and no recorded
 -- the situation every example about trees and replays is about.
 dismissal
   ∷ String → String → String → String → String → String → IO (ExitCode, String, String)
-dismissal = dismissalFrom "proven" "false"
+dismissal = dismissalFrom "proven" "none"
 
 dismissalFrom
   ∷ String
@@ -242,7 +253,7 @@ dismissalFrom
   → String
   → String
   → IO (ExitCode, String, String)
-dismissalFrom provenance headApproved eventHead currentHead beforeTree afterTree replay attached =
+dismissalFrom provenance headVerdict eventHead currentHead beforeTree afterTree replay attached =
   gate
     [ "dismissal"
     , "--event-head"
@@ -261,8 +272,8 @@ dismissalFrom provenance headApproved eventHead currentHead beforeTree afterTree
     , provenance
     , "--provenance-reason"
     , provenanceReason
-    , "--head-approved"
-    , headApproved
+    , "--head-verdict"
+    , headVerdict
     , "--label-attached"
     , attached
     ]
