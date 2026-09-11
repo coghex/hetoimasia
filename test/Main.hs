@@ -43,7 +43,9 @@ import GHC.Stack
   )
 import Hetoimasia.Foundation.Log
 import Hetoimasia.Runtime (runApplication)
-import System.Directory (getFileSize)
+import System.Directory (findExecutable, getFileSize)
+import System.Environment (getEnvironment)
+import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.IO
   ( BufferMode (BlockBuffering, LineBuffering)
@@ -60,18 +62,27 @@ import System.IO
   )
 import System.IO.Error (ioeGetErrorString)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (createPipe)
+import System.Process
+  ( CreateProcess (env)
+  , createPipe
+  , proc
+  , readCreateProcessWithExitCode
+  )
 import System.Timeout (timeout)
 import Test.Hspec
-  ( anyIOException
+  ( Expectation
+  , anyIOException
   , describe
   , expectationFailure
   , hspec
   , it
   , shouldBe
+  , shouldContain
   , shouldNotBe
+  , shouldNotContain
   , shouldReturn
   , shouldSatisfy
+  , shouldStartWith
   , shouldThrow
   )
 import Text.Read (readMaybe)
@@ -121,6 +132,25 @@ main = hspec $ do
   describe "runApplication" $ do
     it "orders events and returns the application result" testRuntime
     it "propagates failure without reporting completion" testRuntimeFailure
+  describe "Configuration parsing" $ do
+    it "accepts every level spelling and rejects the rest" testParseLevel
+    it "parses exact per-component overrides" testParseOverrides
+    it "rejects a malformed override list" testParseOverridesRejected
+    it "parses the Debug selection and collapses repeats" testParseDebug
+    it "rejects a malformed Debug selection" testParseDebugRejected
+    it "quotes and escapes a rejected value in its message" testParseEscaping
+  describe "Startup configuration" $ do
+    it "keeps every default when no variable is present" testResolveDefaults
+    it "assembles the filter from all three variables" testResolveAll
+    it "names the variable an invalid value came from" testResolveInvalid
+    it "leaves the master and source switches programmatic" testResolveProgrammatic
+    it "consults each variable exactly once and nothing afterwards" testResolveOnce
+  describe "Console startup" $ do
+    it "emits the smoke records under the default configuration" testConsoleDefault
+    it "applies a threshold and an exact override to the smoke path" testConsoleThreshold
+    it "fails before any entry for each invalid variable" testConsoleInvalid
+    it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
+    it "keeps help visible and validates configuration on that path" testConsoleHelp
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -132,6 +162,9 @@ gpuComponent = unsafeComponent "gpu.vulkan"
 
 gameComponent ∷ Component
 gameComponent = unsafeComponent "game.world"
+
+luaComponent ∷ Component
+luaComponent = unsafeComponent "lua"
 
 fixedTime ∷ UTCTime
 fixedTime = UTCTime (fromGregorian 2026 9 10) (secondsToDiffTime 43200)
@@ -850,3 +883,325 @@ testCallbackFailure = do
   (reverse <$> readMVar seen) `shouldReturn` ["second", "third"]
   -- A failing flush propagates the same way.
   flushLogger derived `shouldThrow` ((== "flush unavailable") . ioeGetErrorString)
+
+-- Configuration parsing -------------------------------------------------------
+
+-- | The variable names the console application chooses, used by both the
+-- injected-lookup assembly cases and the child-process startup cases so the two
+-- describe one contract.
+consoleVariables ∷ LogVariables
+consoleVariables = LogVariables
+  { variableGlobalLevel = "HETOIMASIA_LOG_LEVEL"
+  , variableComponentLevels = "HETOIMASIA_LOG_LEVELS"
+  , variableDebug = "HETOIMASIA_DEBUG"
+  }
+
+-- | A rejection must carry the text that identifies what was wrong, because
+-- that message is the whole startup diagnostic.
+rejects ∷ Show a ⇒ (Text → Either Text a) → (Text, Text) → Expectation
+rejects parse (value, expected) = case parse value of
+  Right accepted →
+    expectationFailure ("accepted " <> show value <> " as " <> show accepted)
+  Left reason → Text.unpack reason `shouldContain` Text.unpack expected
+
+testParseLevel ∷ IO ()
+testParseLevel = do
+  forM_ accepted $ \(value, level) → parseLogLevel value `shouldBe` Right level
+  forM_ rejected (rejects parseLogLevel)
+  where
+    -- Spellings are case-insensitive and surrounding whitespace is trimmed;
+    -- "warn" and "warning" are the same level.
+    accepted =
+      [ ("info", Info)
+      , ("INFO", Info)
+      , ("Warn", Warning)
+      , ("warning", Warning)
+      , ("error", Error)
+      , ("debug", Debug)
+      , (" info ", Info)
+      ]
+    -- An empty value is an error rather than the default.
+    rejected = [("verbose", "verbose"), ("warnings", "warnings"), ("", "required")]
+
+testParseOverrides ∷ IO ()
+testParseOverrides = do
+  parseComponentLevels "gpu.vulkan=warn,lua=info"
+    `shouldBe` Right (Map.fromList [(gpuComponent, Warning), (luaComponent, Info)])
+  -- Whitespace around an entry, a name, and a value is trimmed.
+  parseComponentLevels " gpu.vulkan = warn "
+    `shouldBe` Right (Map.fromList [(gpuComponent, Warning)])
+
+testParseOverridesRejected ∷ IO ()
+testParseOverridesRejected = forM_ rejected (rejects parseComponentLevels)
+  where
+    rejected =
+      [ ("gpu.vulkan=warn,gpu.vulkan=info", "appears twice")
+      , ("gpu.vulkan", "expected component=level")
+      , ("Gpu.Vulkan=warn", "Gpu.Vulkan")
+      , ("gpu vulkan=warn", "gpu vulkan")
+      , ("gpu.vulkan=warn,", "an entry is empty")
+      , ("lua=verbose", "expected debug, info")
+      , ("", "required")
+      ]
+
+testParseDebug ∷ IO ()
+testParseDebug = do
+  parseDebugSelection "none" `shouldBe` Right DebugNone
+  parseDebugSelection "all" `shouldBe` Right DebugAll
+  parseDebugSelection "gpu.vulkan,lua"
+    `shouldBe` Right (DebugComponents (Set.fromList [gpuComponent, luaComponent]))
+  -- A repeated component is one selection, not an error.
+  parseDebugSelection "gpu.vulkan,gpu.vulkan"
+    `shouldBe` Right (DebugComponents (Set.fromList [gpuComponent]))
+
+testParseDebugRejected ∷ IO ()
+testParseDebugRejected = forM_ rejected (rejects parseDebugSelection)
+  where
+    -- The selectors are exactly lowercase and never mix with component names.
+    rejected =
+      [ ("all,gpu.vulkan", "cannot be combined")
+      , ("NONE", "lowercase")
+      , ("All", "lowercase")
+      , ("gpu.vulkan,", "an entry is empty")
+      , ("", "required")
+      ]
+
+testParseEscaping ∷ IO ()
+testParseEscaping = do
+  -- A rejected value is quoted and escaped the way the record layout escapes
+  -- text, so nothing a value carries can split the diagnostic or forge a line.
+  forM_ rejections $ \(parse, value) → case parse value of
+    Right accepted → expectationFailure ("accepted " <> show value <> ": " <> accepted)
+    Left reason → do
+      Text.unpack reason `shouldContain` "\"bad\\nforged\""
+      Text.lines reason `shouldBe` [reason]
+  where
+    forged = "bad\nforged"
+    -- Each parser reports through the same helper, including the component
+    -- rejection an override list propagates.
+    rejections =
+      [ (fmap show . parseLogLevel, forged)
+      , (fmap show . parseComponentLevels, forged <> "=warn")
+      , (fmap show . parseDebugSelection, forged)
+      , (fmap show . mkComponent, forged)
+      ]
+
+-- Startup configuration -------------------------------------------------------
+
+-- | A lookup over a fixed table, with no environment behind it at all.
+tableLookup ∷ [(Text, Text)] → Text → IO (Maybe Text)
+tableLookup table name = pure (lookup name table)
+
+-- | The resolved configuration, failing the example with the reason instead.
+expectResolved ∷ Either Text LogFilter → IO LogFilter
+expectResolved = either reject pure
+  where
+    reject reason = do
+      expectationFailure ("startup rejected a valid configuration: " <> Text.unpack reason)
+      -- Unreachable: 'expectationFailure' throws.
+      pure defaultLogFilter
+
+testResolveDefaults ∷ IO ()
+testResolveDefaults =
+  -- An absent variable keeps its default, so an empty environment resolves to
+  -- exactly the default filter.
+  resolveLogFilter consoleVariables (tableLookup []) defaultLogFilter
+    `shouldReturn` Right defaultLogFilter
+
+testResolveAll ∷ IO ()
+testResolveAll = do
+  resolved ← resolveLogFilter consoleVariables (tableLookup table) defaultLogFilter
+  resolved `shouldBe` Right defaultLogFilter
+    { filterGlobalLevel = Warning
+    , filterComponentLevels = Map.fromList [(gpuComponent, Error), (gameComponent, Debug)]
+    , filterDebug = DebugComponents (Set.fromList [gpuComponent])
+    }
+  where
+    table =
+      [ ("HETOIMASIA_LOG_LEVEL", "Warn")
+      , ("HETOIMASIA_LOG_LEVELS", "gpu.vulkan=error, game.world=debug ")
+      , ("HETOIMASIA_DEBUG", "gpu.vulkan")
+      ]
+
+testResolveInvalid ∷ IO ()
+testResolveInvalid = forM_ invalid $ \(name, value) → do
+  -- Each variable is invalid while the other two are absent, so only the one
+  -- under test can be the variable the message names.
+  resolved ← resolveLogFilter consoleVariables (tableLookup [(name, value)]) defaultLogFilter
+  case resolved of
+    Right accepted → expectationFailure ("startup accepted " <> show value <> ": " <> show accepted)
+    Left reason → Text.unpack reason `shouldStartWith` (Text.unpack name <> ": ")
+  where
+    invalid =
+      [ ("HETOIMASIA_LOG_LEVEL", "verbose")
+      , ("HETOIMASIA_LOG_LEVELS", "gpu.vulkan=warn,gpu.vulkan=info")
+      , ("HETOIMASIA_DEBUG", "All")
+      ]
+
+testResolveProgrammatic ∷ IO ()
+testResolveProgrammatic = forM_ [False, True] $ \switch → do
+  -- No variable controls the master or source switch: whatever the base
+  -- configuration set, the resolved one keeps.
+  let base = defaultLogFilter { filterEnabled = switch, filterSource = switch }
+  configuration ←
+    resolveLogFilter consoleVariables (tableLookup table) base >>= expectResolved
+  filterEnabled configuration `shouldBe` switch
+  filterSource configuration `shouldBe` switch
+  filterGlobalLevel configuration `shouldBe` Error
+  where
+    table =
+      [ ("HETOIMASIA_LOG_LEVEL", "error")
+      , ("HETOIMASIA_LOG_LEVELS", "lua=info")
+      , ("HETOIMASIA_DEBUG", "all")
+      ]
+
+testResolveOnce ∷ IO ()
+testResolveOnce = do
+  -- Acquisition consults each supported variable exactly once, in order, and
+  -- consults nothing else.
+  (valid, configuration) ← consult table
+  valid `shouldBe` names
+  -- Logging through the resolved filter reads no variable again: the filter is
+  -- a value and the logger holds no lookup.
+  (sink, collected) ← newCollector
+  let logger = mkLoggerWith configuration fixedMetadata sink
+  logInfo logger testComponent "after startup" []
+  logDebug logger gpuComponent "detail" []
+  (length <$> collected) `shouldReturn` 2
+  consulted ← consult table
+  fst consulted `shouldBe` names
+  -- An invalid value does not short-circuit acquisition either: every lookup
+  -- happens before any value is parsed.
+  rejectedLookups ← newMVar ([] ∷ [Text])
+  void $ resolveLogFilter consoleVariables (recording rejectedLookups broken) defaultLogFilter
+  (reverse <$> readMVar rejectedLookups) `shouldReturn` names
+  where
+    names = ["HETOIMASIA_LOG_LEVEL", "HETOIMASIA_LOG_LEVELS", "HETOIMASIA_DEBUG"]
+    table =
+      [ ("HETOIMASIA_LOG_LEVEL", "info")
+      , ("HETOIMASIA_LOG_LEVELS", "gpu.vulkan=debug")
+      , ("HETOIMASIA_DEBUG", "gpu.vulkan")
+      ]
+    broken = [("HETOIMASIA_LOG_LEVEL", "verbose")]
+
+    recording seen values name = do
+      modifyMVar_ seen (pure . (name :))
+      pure (lookup name values)
+
+    consult values = do
+      seen ← newMVar []
+      configuration ←
+        resolveLogFilter consoleVariables (recording seen values) defaultLogFilter
+          >>= expectResolved
+      (,) <$> (reverse <$> readMVar seen) <*> pure configuration
+
+-- Console startup -------------------------------------------------------------
+
+-- | The three variable names the console application reads, as the environment
+-- spells them.
+consoleVariableNames ∷ [String]
+consoleVariableNames =
+  map Text.unpack
+    [ variableGlobalLevel consoleVariables
+    , variableComponentLevels consoleVariables
+    , variableDebug consoleVariables
+    ]
+
+-- | Run the built console executable with exactly the logging variables a case
+-- asks for: the inherited environment is stripped of all three first, so an
+-- inherited value can neither defeat a quiet run nor fail a default one. The
+-- executable is reached through this suite's @build-tool-depends@ on it rather
+-- than a guessed build path.
+runConsole ∷ [(String, String)] → [String] → IO (ExitCode, String, String)
+runConsole variables arguments = do
+  found ← findExecutable "hetoimasia"
+  case found of
+    Nothing → fail "the hetoimasia executable is not on this test's search path"
+    Just executable → do
+      inherited ← getEnvironment
+      let controlled =
+            [ pair | pair@(name, _) ← inherited, name `notElem` consoleVariableNames ]
+              <> variables
+      readCreateProcessWithExitCode
+        (proc executable arguments) { env = Just controlled }
+        ""
+
+-- | The component of each rendered record, which is its third segment. A line
+-- that is not a record is kept whole so a failure shows it.
+recordComponents ∷ String → [String]
+recordComponents = map component . lines
+  where
+    component line = case words line of
+      (_ : _ : name : _) → name
+      _ → line
+
+testConsoleDefault ∷ IO ()
+testConsoleDefault = do
+  (code, output, diagnostics) ← runConsole [] ["--smoke"]
+  code `shouldBe` ExitSuccess
+  -- Records are diagnostics on stderr; the smoke path writes no application
+  -- output of its own.
+  output `shouldBe` ""
+  recordComponents diagnostics `shouldBe` ["runtime", "console", "runtime"]
+
+testConsoleThreshold ∷ IO ()
+testConsoleThreshold = do
+  -- Only the variable under test is set, so this quiet run cannot be defeated
+  -- by an inherited component override.
+  (quiet, output, silent) ← runConsole [("HETOIMASIA_LOG_LEVEL", "warn")] ["--smoke"]
+  quiet `shouldBe` ExitSuccess
+  output `shouldBe` ""
+  silent `shouldBe` ""
+  -- An exact override silences one component while the other keeps the global
+  -- default, which is the precedence the filter promises.
+  (overridden, _, records) ←
+    runConsole [("HETOIMASIA_LOG_LEVELS", "runtime=warn")] ["--smoke"]
+  overridden `shouldBe` ExitSuccess
+  recordComponents records `shouldBe` ["console"]
+
+testConsoleInvalid ∷ IO ()
+testConsoleInvalid = forM_ invalid $ \(name, value) → do
+  (code, output, diagnostics) ← runConsole [(name, value)] ["--smoke"]
+  code `shouldNotBe` ExitSuccess
+  -- Exactly one line, naming the variable and the reason. Nothing else reached
+  -- stderr, so startup failed before any entry was emitted, and the smoke
+  -- action never ran.
+  length (lines diagnostics) `shouldBe` 1
+  diagnostics `shouldStartWith` (name <> ": ")
+  diagnostics `shouldContain` value
+  diagnostics `shouldNotContain` "Hello from Hetoimasia."
+  output `shouldBe` ""
+  where
+    invalid =
+      [ ("HETOIMASIA_LOG_LEVEL", "verbose")
+      , ("HETOIMASIA_LOG_LEVELS", "gpu.vulkan=warn,gpu.vulkan=info")
+      , ("HETOIMASIA_DEBUG", "All")
+      ]
+
+testConsoleForgedValue ∷ IO ()
+testConsoleForgedValue = do
+  -- An embedded newline in a value must not reach stderr as a second line: the
+  -- startup contract is one line naming the variable and the reason.
+  (code, output, diagnostics) ←
+    runConsole [("HETOIMASIA_LOG_LEVEL", "bad\nforged")] ["--smoke"]
+  code `shouldNotBe` ExitSuccess
+  output `shouldBe` ""
+  length (lines diagnostics) `shouldBe` 1
+  diagnostics `shouldStartWith` "HETOIMASIA_LOG_LEVEL: "
+  diagnostics `shouldContain` "\"bad\\nforged\""
+
+testConsoleHelp ∷ IO ()
+testConsoleHelp = do
+  -- Help is ordinary application output, so a threshold that silences every
+  -- record leaves it visible, and it names all three variables.
+  (code, output, diagnostics) ← runConsole [("HETOIMASIA_LOG_LEVEL", "error")] ["--help"]
+  code `shouldBe` ExitSuccess
+  diagnostics `shouldBe` ""
+  output `shouldContain` "Usage: hetoimasia"
+  forM_ consoleVariableNames (shouldContain output)
+  -- The help path resolves configuration first, so an invalid value fails it
+  -- too, printing no help at all.
+  (rejected, helpOutput, reason) ← runConsole [("HETOIMASIA_DEBUG", "NONE")] ["--help"]
+  rejected `shouldNotBe` ExitSuccess
+  helpOutput `shouldBe` ""
+  reason `shouldStartWith` "HETOIMASIA_DEBUG: "

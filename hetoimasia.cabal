@@ -42,6 +42,7 @@ executable hetoimasia
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.21 && <4.22,
+        text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0
 
@@ -64,6 +65,7 @@ test-suite hetoimasia-tests
     main-is: Main.hs
     hs-source-dirs: test
     ghc-options: -threaded -rtsopts
+    build-tool-depends: hetoimasia:hetoimasia
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
