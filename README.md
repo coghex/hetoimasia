@@ -61,8 +61,8 @@ can import root application modules. Add future packages explicitly to
 ## Project status
 
 The bootstrap uses `master` and the owner-selected GitHub repository
-[coghex/hetiomasia](https://github.com/coghex/hetiomasia). The remote spelling
-is intentional; local directories and Haskell packages use `hetoimasia`.
+[coghex/hetoimasia](https://github.com/coghex/hetoimasia). Repository, local
+directory, and Haskell package names all use `hetoimasia`.
 CI and per-repository Kanban services remain to be configured.
 
 ## License

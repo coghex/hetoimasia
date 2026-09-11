@@ -16,7 +16,7 @@ extra-doc-files: README.md
 
 source-repository head
     type: git
-    location: https://github.com/coghex/hetiomasia.git
+    location: https://github.com/coghex/hetoimasia.git
     subdir: packages/foundation
 
 library

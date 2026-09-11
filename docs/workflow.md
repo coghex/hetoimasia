@@ -1,7 +1,7 @@
 # Development through Kanban
 
 The workflow application lives at `~/work/kanban`. Issues and PRs for this
-project belong to [coghex/hetiomasia](https://github.com/coghex/hetiomasia).
+project belong to [coghex/hetoimasia](https://github.com/coghex/hetoimasia).
 The installed Kanban
 skills own readiness checks, claims, isolated solving, and opposite-agent review.
 Use them from interactive CLI sessions as the owner requests.
@@ -9,9 +9,10 @@ Use them from interactive CLI sessions as the owner requests.
 ## Current status
 
 The owner authorized the initial bootstrap on `master`. `origin` is
-`https://github.com/coghex/hetiomasia.git`; preserve that exact spelling even
-though the local project is named `hetoimasia`. The tracker was empty at setup.
-There is no CI, docs worktree, or configured per-repository drainer yet.
+`https://github.com/coghex/hetoimasia.git`, matching the local project name.
+The owner corrected the repository-name typo during setup; the new target was empty.
+Local standalone design work uses a `docs-wip` worktree. There is no CI or
+configured per-repository drainer yet.
 Installed plugins being available in a conversation does not establish readiness
 of a future CLI session or repository service.
 

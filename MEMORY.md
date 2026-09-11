@@ -25,8 +25,10 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 - Use Hspec wherever possible; Python probes are the fallback only where Hspec
   cannot reasonably exercise the boundary. This applies to future resource,
   concurrency, and Vulkan integration tests as well as pure code.
-- GitHub target: `coghex/hetiomasia` (public), deliberately spelled differently
-  from the local `hetoimasia` directory/packages. Use `master`, not `main`.
+- GitHub target: `coghex/hetoimasia` (public). Use `master`, not `main`.
+  The owner corrected the original repository-name typo on 2026-09-10 and
+  created the correctly named empty repository. Preserve the local bootstrap
+  history when republishing; local directory/package names already match.
   The owner explicitly requested the initial commit and remote setup.
 - License: GNU GPLv3, requested explicitly by the owner; recorded as
   `GPL-3.0-only` in every Cabal package with the full license text included.
@@ -64,7 +66,7 @@ not a verdict that Synarchy's design should be discarded.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
-  `https://github.com/coghex/hetiomasia.git` for the authorized initial baseline.
+  `https://github.com/coghex/hetoimasia.git` for the authorized initial baseline.
 - GHC 9.12.2 / Cabal 3.16.1.0 verified locally. Hackage index baseline copied
   deliberately from Synarchy: 2026-08-14T00:00:00Z.
 

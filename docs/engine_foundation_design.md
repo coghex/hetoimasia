@@ -34,7 +34,7 @@ concrete precondition
 The directory was empty at the start of the 2026-09-10 bootstrap. The authorized
 scaffold creates foundation logging, a runtime entry point, a console consumer,
 and focused Hspec tests. It has no Vulkan/Lua/windowing code. Planned package
-directories are notes only. The owner selected `coghex/hetiomasia` and authorized
+directories are notes only. The owner selected `coghex/hetoimasia` and authorized
 the initial `master` commit. The remote was verified empty with zero issues/PRs;
 repeat tracker deduplication before drafting future issues.
 
@@ -137,9 +137,9 @@ Python probes are a fallback when Hspec cannot reasonably exercise the boundary.
 
 ### D-6. Publish the initial baseline on master
 
-The owner selected the public repository `coghex/hetiomasia`, requested remote
-setup and an initial commit, and specified `master`. Keep local/package naming
-as `hetoimasia`; do not silently correct the remote's spelling.
+The owner selected the public repository `coghex/hetoimasia`, requested remote
+setup and an initial commit, and specified `master`. The owner corrected the
+original repository-name typo during setup; local/package names already match.
 
 ## Proposals
 

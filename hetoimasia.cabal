@@ -12,8 +12,8 @@ maintainer: Vincent Coghlan
 category: Game
 build-type: Simple
 tested-with: GHC ==9.12.2
-homepage: https://github.com/coghex/hetiomasia
-bug-reports: https://github.com/coghex/hetiomasia/issues
+homepage: https://github.com/coghex/hetoimasia
+bug-reports: https://github.com/coghex/hetoimasia/issues
 extra-doc-files:
     README.md
     MEMORY.md
@@ -23,7 +23,7 @@ extra-doc-files:
 
 source-repository head
     type: git
-    location: https://github.com/coghex/hetiomasia.git
+    location: https://github.com/coghex/hetoimasia.git
 
 common language
     default-language: GHC2024
