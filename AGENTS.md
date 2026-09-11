@@ -43,6 +43,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Routine build: `cabal build all`.
 - Console smoke: `cabal run exe:hetoimasia -- --smoke`.
 - Current focused tests: `cabal test hetoimasia-tests --test-show-details=direct`.
+- Every validation group is declared once in `tools/validation/catalog.json`.
+  Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
+  groups a change requires and why; see [validation.md](docs/validation.md) for
+  the schema, the mandatory floor, and the pull-request request block.
 - Keep builds warning-clean. `cabal.project` applies `-Werror` only to local
   packages and pins the Hackage index. Maintain bounds with dependency changes.
 - Preserve `semaphore: False` for this multi-worktree GHC/Cabal baseline.

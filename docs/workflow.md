@@ -122,6 +122,13 @@ the boundary. Run `cabal check` in the root and each active
 package directory when editing package metadata. Vulkan validation, offscreen
 captures, and meaningful performance workloads arrive with rendering.
 
-For changes to the documentation landing integration, run
-`cabal test workflow-tests --test-show-details=direct`. These Hspec checks use
-temporary Git repositories and a local bare origin, without GitHub access.
+For changes to the documentation landing integration or the validation
+planner, run `cabal test workflow-tests --test-show-details=direct`. These Hspec
+checks use temporary Git repositories and a local bare origin, without GitHub
+access.
+
+To find out which of those checks a change actually requires, run
+`python3 tools/validation/plan.py --base origin/master --head HEAD`. It needs
+Python 3 and Git only, and explains every group it selects or omits.
+[validation.md](validation.md) documents the catalog, the mandatory floor, and
+the `validation-request` block a pull request uses to ask for more.

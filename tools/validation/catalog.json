@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "policy_version": 1,
+  "policy_inputs": [
+    "tools/validation/plan.py",
+    "tools/validation/catalog.json"
+  ],
+  "non_affecting_paths": [
+    "*.md",
+    ".editorconfig",
+    ".gitignore",
+    "LICENSE",
+    "tools/KANBAN-LICENSE"
+  ],
+  "floor": [
+    "build.all",
+    "test.engine",
+    "smoke.console"
+  ],
+  "groups": [
+    {
+      "id": "build.all",
+      "description": "Compile every local component warning-clean.",
+      "command": ["cabal", "build", "all"],
+      "component": "all",
+      "inputs": [],
+      "framework": "none",
+      "runner": "cpu",
+      "timeout_seconds": 3600,
+      "category": "build",
+      "optional": false
+    },
+    {
+      "id": "test.engine",
+      "description": "Focused Hspec examples for the logger, sinks, configuration, runtime, and console startup.",
+      "command": ["cabal", "test", "hetoimasia-tests", "--test-show-details=direct"],
+      "component": "hetoimasia:test:hetoimasia-tests",
+      "inputs": [],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "smoke.console",
+      "description": "Run the console executable's smoke mode end to end.",
+      "command": ["cabal", "run", "exe:hetoimasia", "--", "--smoke"],
+      "component": "hetoimasia:exe:hetoimasia",
+      "inputs": [],
+      "framework": "none",
+      "runner": "cpu",
+      "timeout_seconds": 900,
+      "category": "smoke",
+      "optional": false
+    },
+    {
+      "id": "test.workflow",
+      "description": "Hspec examples driving the documentation landing helper and this planner against temporary Git repositories.",
+      "command": ["cabal", "test", "workflow-tests", "--test-show-details=direct"],
+      "component": "hetoimasia:test:workflow-tests",
+      "inputs": [
+        "tools/docs_land.sh",
+        "tools/docs_land_paths.py",
+        "tools/validation/"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    }
+  ]
+}
