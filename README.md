@@ -64,7 +64,8 @@ can import root application modules. Add future packages explicitly to
 The bootstrap uses `master` and the owner-selected GitHub repository
 [coghex/hetoimasia](https://github.com/coghex/hetoimasia). Repository, local
 directory, and Haskell package names all use `hetoimasia`.
-CI and per-repository Kanban services remain to be configured.
+Kanban's issue-approval and PR-drainer jobs are installed on the owner's machine
+and await an explicit start from the board. CI remains to be configured.
 
 ## License
 

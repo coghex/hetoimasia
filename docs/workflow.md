@@ -11,10 +11,19 @@ Use them from interactive CLI sessions as the owner requests.
 The owner authorized the initial bootstrap on `master`. `origin` is
 `https://github.com/coghex/hetoimasia.git`, matching the local project name.
 The owner corrected the repository-name typo during setup; the new target was empty.
-Local standalone design work uses a `docs-wip` worktree. There is no CI or
-configured per-repository drainer yet.
+Local standalone design work uses a `docs-wip` worktree. CI is not configured.
+The issue-approval service and PR drainer were installed for this repository
+on the owner's machine on 2026-09-10. Both jobs are loaded under launchd and
+have not been started.
 Installed plugins being available in a conversation does not establish readiness
 of a future CLI session or repository service.
+
+On 2026-09-10 Kanban's `--doctor` passed against this checkout for all issue
+review/revision, solve, auto-solve, and PR review/revision/repair actions. Both
+CLI providers and GitHub were authenticated, both Kanban plugins were enabled,
+and the shared review backend was present. The canonical setup tool reported
+all three components unchanged; no reinstall was necessary. Re-run the doctor
+when diagnosing future sessions.
 
 ## Launching the board
 
@@ -51,8 +60,24 @@ does not install plugins, launch agent windows, or start background services.
 6. Let the configured drainer merge eligible PRs. The `kanban:finalize` fallback
    is only for an explicit request meeting that workflow's requirements.
 
-This describes the intended workflow, not an installed per-repository service.
-Per-repository service installation remains a separate setup task.
+The service installations are local machine state, separate from the tracked
+repository and CLI plugins. Kanban's board uses `a` to start/stop issue approval
+and `d` to start/stop the PR drainer. Installing either starts no review or merge.
+An approval service that has never run can report `unknown` with no status
+document; its installed launchd job is still present and not running.
+
+To reproduce the service installation on another machine, first install the
+shared components using Kanban's setup guide, then run from `~/work/kanban`:
+
+```sh
+python3 tools/install_issue_approval.py --repo ~/work/hetoimasia --dry-run --json
+python3 tools/install_drainer.py --repo ~/work/hetoimasia --dry-run --json
+```
+
+After inspecting the plans, remove `--dry-run` to install the stopped jobs.
+For lifecycle operations use the installed controllers or Kanban's sidebar;
+the installed `kanban:drain-prs` skill owns drainer control. Always target
+`coghex/hetoimasia` and its primary checkout.
 
 ## Worktrees and documentation
 
@@ -61,9 +86,32 @@ isolated worktrees. Resolve an existing docs worktree by its `docs-wip` branch.
 Standalone design/report work may accumulate there. Documentation accompanying
 code belongs in the code worktree and PR, regardless of its extension.
 
-No `tools/docs_land.sh` exists here. Do not use another project's helper against
-this repository. A future standalone-doc publication policy/helper must be
-established before relying on `$push-docs`.
+The repository vendors `tools/docs_land.sh` and its Python path checker from
+Kanban; [the provenance and local adaptation](../tools/README.md) are tracked
+with them. `AGENTS.md` remains a regular authoritative document; `CLAUDE.md`
+continues to direct Claude sessions to it.
+
+After the owner requests standalone documentation publication, use the installed
+`kanban:push-docs` skill. The helper resolves `docs-wip` and `master` by branch,
+lands only named Markdown paths, verifies publication to `origin/master`, and
+fast-forwards the clean primary checkout. A refusal or warning needs resolution
+before publication. For inspection from the primary checkout:
+
+```sh
+tools/docs_land.sh -h
+tools/docs_land.sh -l
+tools/docs_land.sh -n -m "docs: describe the selected change" docs/example_design.md
+```
+
+The last command illustrates a selection; replace the example path with the
+actual approved document. Remove `-n` only after the dry run succeeds.
+The helper accepts Markdown paths when no publication classification contract
+exists, as here; callers must still enforce the standalone-task boundary.
+
+Design-processing and report helpers ship inside the plugins. Locate those
+installed copies as the skills instruct; do not expect copies in this project's
+`tools/` directory. No unattended document-publication path is configured here;
+approved ledger changes can accumulate in `docs-wip` for a requested batch landing.
 
 ## Local checks
 
@@ -73,3 +121,7 @@ resource tests too; use Python probes only where Hspec cannot reasonably exercis
 the boundary. Run `cabal check` in the root and each active
 package directory when editing package metadata. Vulkan validation, offscreen
 captures, and meaningful performance workloads arrive with rendering.
+
+For changes to the documentation landing integration, run
+`cabal test workflow-tests --test-show-details=direct`. These Hspec checks use
+temporary Git repositories and a local bare origin, without GitHub access.

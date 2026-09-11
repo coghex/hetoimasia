@@ -82,9 +82,30 @@ not a verdict that Synarchy's design should be discarded.
 - Local documentation links resolve; all package copies of GPLv3 match the
   full text retrieved from `https://www.gnu.org/licenses/gpl-3.0.txt`.
 
+## Kanban integration — 2026-09-10
+
+- Kanban's read-only doctor passed all issue/PR actions for this checkout.
+  Shared review backend, Codex plugin, and Claude plugin setup plans all reported
+  unchanged. These dependencies are user-installed outside the repository.
+- The repository vendors the docs landing helper and checker from Kanban,
+  with its MIT notice retained under `tools/`. The local adaptation supports
+  the regular authoritative `AGENTS.md`; no instruction-file migration is needed.
+  Provenance and checks are recorded in [tools/README.md](tools/README.md).
+- Use `kanban:push-docs` for user-requested standalone documentation batches.
+  Mixed code/docs remain in the same PR. Plugin-owned design/report helpers
+  come from the installed bundle, not this repository's `tools/` directory.
+- The owner then supplied Kanban's missing-service screenshot. Installed the
+  issue-approval and PR-drainer jobs for `coghex/hetoimasia` using Kanban's
+  installer/controller. Both are loaded in launchd and have not been started;
+  the approval controller has no run-status document yet. Board keys `a` and
+  `d` control them. CI remains unconfigured.
+- The owner explicitly approved publishing this tested tooling setup directly
+  to `master` as a bootstrap exception. Subsequent implementation still follows
+  the normal PR lane. The ready designs were separately published in `0d9be37`.
+
 ## Open choices and next work
 
-- CI and Kanban per-repository services remain unset. The selected GitHub repo
+- CI remains unset. The selected GitHub repo
   was verified empty with zero issues and PRs before the initial publication on
   2026-09-10; repeat deduplication when turning designs into tracker artifacts.
 - On 2026-09-10 the owner requested review and readiness of both discussed

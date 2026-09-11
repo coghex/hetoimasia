@@ -68,8 +68,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   the same worktree and PR. Use `Closes #N` when that PR completes the issue.
 - Standalone documentation may use a `docs-wip` worktree, resolved by branch.
   This is separate from documentation accompanying implementation.
-- No docs landing helper is installed here. Do not invoke Synarchy's helper or
-  claim `$push-docs` is configured. See workflow.md for the current status.
+- User-requested standalone documentation lands through the vendored
+  `tools/docs_land.sh` and the installed `kanban:push-docs` skill. Inventory and
+  dry-run the selection first; stop on warnings or refusals. Never use this
+  lane for documentation required by a code change. See workflow.md.
 - Follow the selected Kanban workflow's claim and opposite-agent review gates.
   A label alone is not proof of a fresh approval. Do not self-approve or merge
   on your own initiative; the installed drainer or explicitly requested

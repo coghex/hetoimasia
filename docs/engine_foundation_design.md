@@ -122,8 +122,10 @@ foundation, with game-specific compatibility implemented in an adapter.
 ### D-3. Use Kanban's existing interactive issue/PR workflows
 
 Accepted by the owner. Keep required docs/evidence with code in each PR.
-Initial scaffolding/publication is directly authorized; Kanban per-repository
-services remain to be configured.
+Initial scaffolding/publication is directly authorized. Kanban's per-repository
+issue-approval and PR-drainer jobs were installed on 2026-09-10 and await an
+explicit start. The owner also approved direct publication of the tested
+documentation-landing integration as a bootstrap exception.
 
 ### D-4. License the project under GNU GPLv3
 
