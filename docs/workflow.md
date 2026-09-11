@@ -19,6 +19,11 @@ GitHub Actions runs the validation pipeline described in
 its `dismiss-stale-approval` job from the review gate. A ruleset on `master`
 requires `build-test` and `review-approved` and requires branches to be up to
 date before merging.
+An approval survives a base update that is exactly Git's clean merge of the
+approved head with a commit `master` already contains, and nothing else: any
+other push to a reviewed candidate needs a fresh review. CI is independent of
+that — the affected groups still run on the integrated head, and approval alone
+never makes them green. [validation.md](validation.md) documents the rule.
 The issue-approval service and PR drainer were installed for this repository
 on the owner's machine on 2026-09-10. Both jobs are loaded under launchd and
 have not been started.

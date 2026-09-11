@@ -14,9 +14,11 @@
 # workflow and checks nothing out, so that token never reaches
 # contributor-authored code.
 #
-# This slice never keeps an approval across a content-changing push. Carrying
-# review through a clean base merge is CI-4's work, and inventing it here would
-# let approved-looking code reach the drainer without a review of that code.
+# A content-changing push keeps its approval in exactly one case: the push is
+# Git's own clean merge of the approved head with a commit the base already
+# contains, so the submitted tree is one the earlier review already covers.
+# `review_replay.py` proves that in the checkout; nothing here decides it from
+# the payload, and everything it cannot prove invalidates the approval.
 name: review-gate
 
 on:
@@ -51,11 +53,39 @@ jobs:
       action: ${{ steps.decide.outputs.action }}
       expected: ${{ steps.decide.outputs.expected }}
       reason: ${{ steps.decide.outputs.reason }}
+      replay: ${{ steps.replay.outputs.replay_decision }}
+      replay_reason: ${{ steps.replay.outputs.replay_reason }}
+      approved_head: ${{ steps.replay.outputs.approved_head }}
+      incorporated_base: ${{ steps.replay.outputs.incorporated_base }}
+      replay_tree: ${{ steps.replay.outputs.replay_tree }}
+      resulting_head: ${{ steps.replay.outputs.resulting_head }}
     steps:
       - name: Check out the head
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.after }}
+          # The replay reads the approved head, the commit the update merged in,
+          # and the base's own history. A shallow clone has none of them, and a
+          # replay that cannot reach its inputs strips an approval that was
+          # valid.
+          fetch-depth: 0
+
+      - name: Replay the approved head onto the incorporated base
+        id: replay
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # `origin/<base>` rather than the local branch: this checkout is at the
+          # pushed head and has no local base branch. The script answers `strip`
+          # if that ref is missing, so a fetch that came up short invalidates the
+          # approval instead of silently inheriting it.
+          python3 tools/validation/review_replay.py \
+            --before "$BEFORE" \
+            --after "$AFTER" \
+            --base "origin/$BASE_REF" | tee -a "$GITHUB_OUTPUT"
 
       - name: Decide the approval's fate
         id: decide
@@ -63,9 +93,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
-          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD: ${{ github.event.after }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
+          REPLAY: ${{ steps.replay.outputs.replay_decision }}
+          REPLAY_REASON: ${{ steps.replay.outputs.replay_reason }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -95,12 +127,20 @@ jobs:
             --current-head "$current_head" \
             --before-tree "$before_tree" \
             --after-tree "$after_tree" \
+            --replay-decision "$REPLAY" \
+            --replay-reason "$REPLAY_REASON" \
             --label-attached "$attached" \
             --label "$LABEL" | tee -a "$GITHUB_OUTPUT"
 
   dismiss-stale-approval:
     needs: [decide-dismissal]
-    if: github.event.action == 'synchronize'
+    # `always()`, because a push must always leave this check with a verdict.
+    # Without it a failed decision would *skip* this job, and the drainer reads
+    # its success together with the label: a skip is neither the success that
+    # carries an approval nor the failure that is a drainer error, so an
+    # unreached decision would arrive looking like a category that does not
+    # exist. A label event still skips it, which is the expected result there.
+    if: always() && github.event.action == 'synchronize'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -114,11 +154,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
-          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD: ${{ github.event.after }}
           BEFORE: ${{ github.event.before }}
+          DECISION: ${{ needs['decide-dismissal'].result }}
           ACTION: ${{ needs['decide-dismissal'].outputs.action }}
           EXPECTED: ${{ needs['decide-dismissal'].outputs.expected }}
           REASON: ${{ needs['decide-dismissal'].outputs.reason }}
+          REPLAY: ${{ needs['decide-dismissal'].outputs.replay }}
+          REPLAY_REASON: ${{ needs['decide-dismissal'].outputs.replay_reason }}
+          APPROVED_HEAD: ${{ needs['decide-dismissal'].outputs.approved_head }}
+          INCORPORATED_BASE: ${{ needs['decide-dismissal'].outputs.incorporated_base }}
+          REPLAY_TREE: ${{ needs['decide-dismissal'].outputs.replay_tree }}
+          RESULTING_HEAD: ${{ needs['decide-dismissal'].outputs.resulting_head }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -130,6 +177,14 @@ jobs:
           # it trusted. Everything below is this workflow's own shell and `gh`.
           # `workflow-tests` executes this exact step body against a stubbed
           # `gh`, so the paths that cannot be reached live are still covered.
+
+          # Reached only because this job runs on `always()`. A decision that
+          # did not conclude is not a decision to keep the approval, and the
+          # outputs below would be empty strings rather than a verdict.
+          if [ "$DECISION" != "success" ]; then
+            echo "::error::the stale-approval decision for this push was $DECISION, so no verdict on $LABEL can be confirmed"
+            exit 1
+          fi
 
           # Read the head again here, immediately before the mutation rather
           # than only when the decision was made. The decision job's own API
@@ -161,11 +216,34 @@ jobs:
           fi
 
           echo "$LABEL $EXPECTED: $REASON"
+
+          # Provenance, not a review. Every field below names a revision this
+          # decision was actually made from, and the closing line says plainly
+          # whose review is being carried and that nobody read the integration
+          # tree — an approval standing on a merged head must never be mistaken
+          # in the log for one somebody granted to that head.
+          provenance() {
+            if [ -n "$2" ]; then
+              printf -- '- %s: `%s`\n' "$1" "$2"
+            else
+              printf -- '- %s: not established\n' "$1"
+            fi
+          }
           {
             echo "## Stale approval"
             echo
             echo "- Push: \`${BEFORE:0:12}\`..\`${EVENT_HEAD:0:12}\`"
+            echo "- Replay: $REPLAY — $REPLAY_REASON"
             echo "- \`$LABEL\`: $EXPECTED — $REASON"
+            provenance "Approved head" "$APPROVED_HEAD"
+            provenance "Incorporated base commit" "$INCORPORATED_BASE"
+            provenance "Replay tree" "$REPLAY_TREE"
+            provenance "Resulting head" "$RESULTING_HEAD"
+            if [ "$REPLAY" = "keep" ] && [ "$EXPECTED" = "kept" ]; then
+              echo "- The approved head is the immediately preceding approval-bearing head, which repeated clean updates may have carried the original review through; it is not necessarily the revision a reviewer read, and no reviewer examined the resulting integration tree."
+            elif [ "$REPLAY" = "keep" ]; then
+              echo "- The push was replay-eligible, but \`$LABEL\` was not attached, so no review is being carried forward."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   review-approved:
