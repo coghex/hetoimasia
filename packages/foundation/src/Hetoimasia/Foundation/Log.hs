@@ -16,6 +16,12 @@
 -- across the loggers sharing it. The handle stays the caller's: the sink never
 -- closes it and never changes its buffering.
 --
+-- 'parseLogLevel', 'parseComponentLevels', and 'parseDebugSelection' validate
+-- the three configurable parts of a 'LogFilter' without performing IO and
+-- without knowing where the text came from. 'resolveLogFilter' assembles them
+-- over a caller-supplied lookup and a caller-supplied 'LogVariables', so the
+-- variable names and the environment access both belong to the application.
+--
 -- See @docs/logging.md@ for the same contract in prose, including the record
 -- layout, the quoting rules, and the ownership and failure obligations.
 module Hetoimasia.Foundation.Log
@@ -32,6 +38,13 @@ module Hetoimasia.Foundation.Log
   , LogFilter (..)
   , DebugSelection (..)
   , defaultLogFilter
+
+    -- * Startup configuration
+  , parseLogLevel
+  , parseComponentLevels
+  , parseDebugSelection
+  , LogVariables (..)
+  , resolveLogFilter
 
     -- * Entries
   , LogEntry (..)
@@ -76,7 +89,7 @@ module Hetoimasia.Foundation.Log
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.MVar (newMVar, withMVar)
-import Control.Monad (when)
+import Control.Monad (foldM, when)
 import Data.Char (isAsciiLower, isControl, isDigit, isPrint, isSpace, ord)
 import Data.List (find)
 import Data.Map.Strict (Map)
@@ -199,6 +212,158 @@ defaultLogFilter = LogFilter
   , filterDebug = DebugNone
   , filterSource = True
   }
+
+-- | Parse a threshold: @debug@, @info@, @warn@, @warning@, or @error@,
+-- case-insensitively, with surrounding whitespace trimmed. An empty or
+-- unrecognized value is an error, never a silent default.
+parseLogLevel ∷ Text → Either Text LogLevel
+parseLogLevel value = case Text.toLower trimmed of
+  "debug" → Right Debug
+  "info" → Right Info
+  "warn" → Right Warning
+  "warning" → Right Warning
+  "error" → Right Error
+  _
+    | Text.null trimmed → Left ("a level is required: " <> levelForms)
+    | otherwise → Left (invalid "level" trimmed levelForms)
+  where
+    trimmed = Text.strip value
+
+levelForms ∷ Text
+levelForms = "expected debug, info, warn, warning, or error"
+
+-- | Parse exact per-component thresholds: a comma-separated list of
+-- @component=level@ pairs whose component name and level are each trimmed, for
+-- example @gpu.vulkan=warn,lua=info@.
+--
+-- A missing @=@, an empty entry, an empty value, a component name
+-- 'mkComponent' rejects — internal whitespace included — and a component key
+-- that appears twice are all errors. Matching stays exact: a key is the
+-- validated name and nothing is normalized.
+parseComponentLevels ∷ Text → Either Text (Map Component LogLevel)
+parseComponentLevels value = do
+  entries ← splitList "override list" overrideForms value
+  pairs ← traverse pair entries
+  foldM insert Map.empty pairs
+  where
+    pair entry
+      | Text.null rest = Left (invalid "override" entry "expected component=level")
+      | otherwise = do
+          component ← mkComponent (Text.strip name)
+          level ← either (const (Left (invalid "override" entry levelForms))) Right
+                    (parseLogLevel (Text.drop 1 rest))
+          Right (component, level)
+      where
+        (name, rest) = Text.breakOn "=" entry
+
+    insert known (component, level)
+      | Map.member component known =
+          Left (invalid "override list" (Text.strip value)
+                 ("component " <> quoted (componentText component) <> " appears twice"))
+      | otherwise = Right (Map.insert component level known)
+
+overrideForms ∷ Text
+overrideForms = "expected a comma-separated list of component=level pairs"
+
+-- | Parse a Debug selection: exactly lowercase @none@, exactly lowercase
+-- @all@, or a comma-separated component list in which a repeated name collapses
+-- to one entry.
+--
+-- Any other spelling of either selector, a selector combined with component
+-- names, an empty entry, an empty value, and a name 'mkComponent' rejects are
+-- all errors.
+parseDebugSelection ∷ Text → Either Text DebugSelection
+parseDebugSelection value
+  | trimmed == "none" = Right DebugNone
+  | trimmed == "all" = Right DebugAll
+  | selector trimmed =
+      Left (invalid "Debug selection" trimmed
+             "the selectors \"all\" and \"none\" are spelled in lowercase")
+  | otherwise = do
+      entries ← splitList "Debug selection" debugForms value
+      case find selector entries of
+        Just reserved →
+          Left (invalid "Debug selection" trimmed
+                 (quoted reserved <> " cannot be combined with component names"))
+        Nothing → DebugComponents . Set.fromList <$> traverse mkComponent entries
+  where
+    trimmed = Text.strip value
+
+debugForms ∷ Text
+debugForms = "expected none, all, or a comma-separated component list"
+
+-- | Whether text is one of the two reserved selectors in any spelling, which
+-- is what separates a bad spelling from a component name.
+selector ∷ Text → Bool
+selector value = lowered == "all" || lowered == "none"
+  where
+    lowered = Text.toLower value
+
+-- | Split a comma-separated value and trim each entry, rejecting an empty
+-- value or an empty entry rather than dropping it.
+splitList ∷ Text → Text → Text → Either Text [Text]
+splitList kind forms value
+  | Text.null trimmed = Left ("a " <> kind <> " is required: " <> forms)
+  | any Text.null entries = Left (invalid kind trimmed "an entry is empty")
+  | otherwise = Right entries
+  where
+    trimmed = Text.strip value
+    entries = map Text.strip (Text.splitOn "," trimmed)
+
+invalid ∷ Text → Text → Text → Text
+invalid kind value reason = "invalid " <> kind <> " " <> quoted value <> ": " <> reason
+
+-- | The environment variable names an application reads its logging
+-- configuration from. The names belong to the application: the parsers above
+-- and 'resolveLogFilter' take values, so another application is free to use
+-- another prefix over the same contract.
+data LogVariables = LogVariables
+  { variableGlobalLevel ∷ !Text
+    -- ^ Supplies 'filterGlobalLevel'.
+  , variableComponentLevels ∷ !Text
+    -- ^ Supplies 'filterComponentLevels'.
+  , variableDebug ∷ !Text
+    -- ^ Supplies 'filterDebug'.
+  }
+  deriving (Eq, Show)
+
+-- | Assemble a 'LogFilter' from a base configuration and a lookup, consulting
+-- each of the three names exactly once, in a fixed order, and before any value
+-- is parsed.
+--
+-- An absent value keeps the base configuration's own. A present but invalid one
+-- yields a message naming the variable it came from, and the first such
+-- variable in that order is the one reported. 'filterEnabled' and
+-- 'filterSource' are carried through untouched: they stay programmatic
+-- configuration with no variable of their own.
+--
+-- The lookup performs whatever IO reading the environment needs; this function
+-- performs none of its own, so a test supplies a pure, exhaustive, or counting
+-- lookup instead.
+resolveLogFilter
+  ∷ Monad m
+  ⇒ LogVariables → (Text → m (Maybe Text)) → LogFilter → m (Either Text LogFilter)
+resolveLogFilter names lookupValue base = do
+  global ← lookupValue (variableGlobalLevel names)
+  overrides ← lookupValue (variableComponentLevels names)
+  debug ← lookupValue (variableDebug names)
+  pure $ do
+    level ←
+      configured (variableGlobalLevel names) parseLogLevel (filterGlobalLevel base) global
+    levels ←
+      configured (variableComponentLevels names) parseComponentLevels
+        (filterComponentLevels base) overrides
+    selection ←
+      configured (variableDebug names) parseDebugSelection (filterDebug base) debug
+    Right base
+      { filterGlobalLevel = level
+      , filterComponentLevels = levels
+      , filterDebug = selection
+      }
+  where
+    configured name parse fallback =
+      maybe (Right fallback) (either (Left . named name) Right . parse)
+    named name reason = name <> ": " <> reason
 
 -- | The external call site an entry was emitted from. 'sourceFunction' names
 -- the function whose call produced that site.

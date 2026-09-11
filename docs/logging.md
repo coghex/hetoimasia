@@ -5,11 +5,12 @@ The approved contract and its alternatives live in
 [the logging design](logging_design.md) (P-1 and P-2); this document describes
 what the code does today.
 
-Scope of this slice: the logger model, validated components, filtering, scoped
-context, injectable metadata, the record layout, the two sink kinds, flushing,
-and the ownership and failure contract. Reading `HETOIMASIA_LOG_LEVEL`,
-`HETOIMASIA_LOG_LEVELS`, and `HETOIMASIA_DEBUG`, and the module authoring
-guide, are LOG-3 work.
+Scope: the logger model, validated components, filtering, startup
+configuration, scoped context, injectable metadata, the record layout, the two
+sink kinds, flushing, the ownership and failure contract, and the authoring
+conventions new subsystems follow. The logging arc is complete; queues,
+rotation, telemetry, JSON output, live reload, and a logging monad are not part
+of it.
 
 ## Public interface
 
@@ -103,6 +104,92 @@ Filtering happens before the message or the fields are forced and before either
 metadata provider runs. A suppressed entry whose payload would throw when
 forced does not throw, and it costs no timestamp or thread lookup. No
 allocation or throughput claim is made here beyond that ordering.
+
+## Startup configuration
+
+A `LogFilter` is a value, so configuration is resolved once at startup and never
+reconfigured in place. The foundation supplies pure parsers for the three
+configurable parts of one, plus an assembly over a caller-supplied lookup:
+
+```haskell
+parseLogLevel        ∷ Text → Either Text LogLevel
+parseComponentLevels ∷ Text → Either Text (Map Component LogLevel)
+parseDebugSelection  ∷ Text → Either Text DebugSelection
+
+data LogVariables = LogVariables
+  { variableGlobalLevel     ∷ Text
+  , variableComponentLevels ∷ Text
+  , variableDebug           ∷ Text
+  }
+
+resolveLogFilter
+  ∷ Monad m
+  ⇒ LogVariables → (Text → m (Maybe Text)) → LogFilter → m (Either Text LogFilter)
+```
+
+The parsers take values and never the name of a variable, and `resolveLogFilter`
+takes the names and the lookup as arguments, so both the spelling of the
+variables and the environment access belong to the application. Another
+application over this library is free to use another prefix for the same
+contract, and a test supplies a pure or counting lookup instead of the
+environment.
+
+The console executable chooses these three:
+
+| Variable | Configures | Accepted form | Default |
+|---|---|---|---|
+| `HETOIMASIA_LOG_LEVEL` | `filterGlobalLevel` | `debug`, `info`, `warn`, `warning`, or `error`, case-insensitively | `info` |
+| `HETOIMASIA_LOG_LEVELS` | `filterComponentLevels` | comma-separated `component=level` pairs, such as `gpu.vulkan=warn,lua=info` | no overrides |
+| `HETOIMASIA_DEBUG` | `filterDebug` | exactly `none`, exactly `all`, or a comma-separated component list such as `gpu.vulkan,lua` | `none` |
+
+`filterEnabled` and `filterSource` stay programmatic. No variable controls
+them, and `resolveLogFilter` carries whatever the base configuration set for
+them through untouched.
+
+Surrounding whitespace is trimmed from a value, from each list entry, and from
+each side of a pair, so ` info ` and ` gpu.vulkan = warn ` are accepted.
+Whitespace *inside* a name is not: a component name still has to satisfy
+[`mkComponent`](#component-names). A repeated component in `HETOIMASIA_DEBUG`
+collapses to one selection.
+
+An absent variable keeps its default; an empty or malformed value is an error
+rather than a default:
+
+| Rejected value | Reason |
+|---|---|
+| `HETOIMASIA_LOG_LEVEL=verbose`, `=warnings`, `=` | not one of the five spellings, or empty |
+| `HETOIMASIA_LOG_LEVELS=gpu.vulkan` | no `=` in the entry |
+| `HETOIMASIA_LOG_LEVELS=gpu.vulkan=warn,gpu.vulkan=info` | the same component key twice |
+| `HETOIMASIA_LOG_LEVELS=Gpu.Vulkan=warn`, `=gpu vulkan=warn` | `mkComponent` rejects the name |
+| `HETOIMASIA_LOG_LEVELS=gpu.vulkan=warn,` | an empty entry |
+| `HETOIMASIA_DEBUG=NONE`, `=All` | the selectors are spelled in lowercase |
+| `HETOIMASIA_DEBUG=all,gpu.vulkan` | a selector combined with component names |
+
+### Failure behavior
+
+The application reads the environment exactly once, consulting each variable a
+single time before any value is parsed, and it does so before either supported
+command-line path runs. A present but invalid value fails startup: one line
+naming the variable and the reason goes to stderr and the process exits
+non-zero, before any entry is emitted and before the application action runs.
+
+```text
+$ HETOIMASIA_LOG_LEVEL=bogus hetoimasia --smoke
+HETOIMASIA_LOG_LEVEL: invalid level "bogus": expected debug, info, warn, warning, or error
+$ echo $?
+1
+```
+
+`--help` validates the same configuration and fails the same way. Help text
+itself is ordinary application output on stdout rather than a diagnostic, so it
+stays visible at any threshold; diagnostics go through the configured logger.
+
+```sh
+hetoimasia --smoke                                    # three records: runtime, console, runtime
+HETOIMASIA_LOG_LEVEL=warn hetoimasia --smoke          # none: the smoke path only emits at Info
+HETOIMASIA_LOG_LEVELS=runtime=warn hetoimasia --smoke # the console record only
+HETOIMASIA_DEBUG=gpu.vulkan,lua hetoimasia --smoke    # those two components may emit Debug
+```
 
 ## Record layout
 
@@ -326,3 +413,125 @@ buffer, an untouched borrowed handle, propagated write, flush, and callback
 failures, and serialization state released after both a failed write and an
 interruption mid-write. They coordinate with `MVar`s and use timeouts only to
 bound a stuck test.
+
+The startup cases inject a lookup rather than an environment: a recording lookup
+shows all three variables consulted exactly once and in order, before any value
+is parsed and with nothing consulted afterwards, and the same injection covers
+the defaults, the assembled filter, each variable being invalid alone, and the
+programmatic master and source switches. The console cases run the built
+executable as a child process with all three variables stripped from the
+inherited environment and only the one under test set, which is what makes exit
+status, the stderr diagnostic, an absent record, and the `--help` path
+observable.
+
+## Module authoring guide
+
+These are the conventions a new subsystem follows. They are the reason the
+interface looks the way it does, so a module that ignores them gets less out of
+it than one that does not.
+
+**Take a logger, never reach for one.** A subsystem receives a `Logger` as a
+plain argument and holds it in its own state if it needs to. There is no ambient
+logger, no global to initialize, and no service locator to ask: a module that
+cannot be given a logger does not log. This is what makes a subsystem testable
+with a callback sink and what keeps two subsystems from sharing mutable context.
+
+**Choose one stable component name per subsystem.** Pick it when the subsystem
+is written, spell it as a source literal through `unsafeComponent`, and keep it.
+Matching is exact, so `gpu` and `gpu.vulkan` are unrelated names and a reader
+filtering on one will not see the other. A name that changes between releases
+breaks every threshold and Debug selection that mentioned it.
+
+**Add context at subsystem boundaries.** Derive a logger with `withFields` or
+`withBreadcrumb` where a scope begins — entering a subsystem, accepting a
+request, starting a worker — and pass the derived value inward. Entries then
+carry the scope they happened in without every call site repeating it, and the
+parent keeps its own context.
+
+**Put identifiers and values in fields, not in the message.** The message says
+what happened and stays the same text across occurrences; the varying parts go
+in fields, where they are quoted, sorted, and machine-readable. Write
+`logWarning logger component "Device lost" [("device", name), ("attempt", "2")]`
+rather than interpolating `name` into the message. Fields survive grepping and
+future structured output; interpolated text does not.
+
+**Mean one thing by each level.**
+
+| Level | What belongs at it |
+|---|---|
+| `Debug` | Optional detail for someone already investigating this component. Off unless selected. |
+| `Info` | Meaningful lifecycle activity: something started, finished, connected, or loaded. |
+| `Warning` | Degraded or recoverable behavior — work continued, but not as intended. |
+| `Error` | Failed work. Logging it raises nothing; the failure itself is reported by returning or throwing. |
+
+No routine per-frame `Info` output. A per-frame or per-entity diagnostic is
+`Debug`, behind its own component, or it is a counter summarized at a boundary.
+An `Info` record that appears sixty times a second makes the level useless for
+everything else.
+
+**Report a propagated failure once, at the boundary that handles it.** A
+subsystem that returns or rethrows has not handled anything yet, so it should
+not also log an `Error` about it: the handling boundary — the one that retries,
+degrades, or fails the operation — logs it, with the context it has. Logging at
+every frame of the propagation turns one failure into a pile of records that
+look like several.
+
+**Engine libraries log; applications print.** A library reports diagnostics
+through its injected logger and writes to no handle of its own. Command-line
+help, results, and anything the user asked to see are application output on
+stdout, which is why they stay visible at any threshold. The console
+executable's `--help` text is application output; the records its smoke path
+emits are diagnostics.
+
+**Logging imposes no error type.** Nothing here asks a game or engine module to
+adopt a shared exception or result type. `logError` is a severity on a record,
+not a way to fail, and a failing sink is the only exception this module raises
+(see [Ownership and failures](#ownership-and-failures)).
+
+### Usage
+
+A root logger is built once, where the application assembles its services, from
+the configuration resolved at startup and a sink over a handle the application
+owns:
+
+```haskell
+main ∷ IO ()
+main = do
+  configuration ← resolveLogFilter logVariables readVariable defaultLogFilter
+  logFilter ← either (die . Text.unpack) pure configuration
+  root ← handleLogger logFilter stderr
+  runApplication root "hetoimasia" (application root)
+```
+
+A subsystem takes that logger, derives its own scope once, and uses its own
+component for every entry:
+
+```haskell
+renderComponent ∷ Component
+renderComponent = unsafeComponent "render"
+
+startRenderer ∷ Logger → Text → IO Renderer
+startRenderer logger device = do
+  let scoped = withFields [("device", device)] (withBreadcrumb "render" logger)
+  logInfo scoped renderComponent "Starting renderer" []
+  renderer ← openRenderer device
+  logDebug scoped renderComponent "Renderer details" [("queues", "2")]
+  pure renderer { rendererLogger = scoped }
+```
+
+A worker gets its own derived logger rather than sharing one mutable context, so
+two workers cannot observe each other's fields while their records still reach
+the one sink in each worker's own order:
+
+```haskell
+spawnUploader ∷ Logger → Int → IO ThreadId
+spawnUploader logger worker = forkIO $ do
+  let scoped = withFields [("worker", Text.pack (show worker))] logger
+  outcome ← try (drainUploadQueue scoped)
+  case outcome of
+    Right uploaded → logInfo scoped renderComponent "Uploads drained"
+                       [("uploaded", Text.pack (show uploaded))]
+    -- The boundary that decides what the failure means reports it, once.
+    Left failure → logError scoped renderComponent "Uploads abandoned"
+                     [("reason", Text.pack (show (failure ∷ SomeException)))]
+```

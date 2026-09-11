@@ -3,10 +3,11 @@
 A modular Haskell/Vulkan game engine with a planned Lua scripting host and
 separate 2D and 3D rendering modules. Synarchy is a potential future client.
 
-**Current implementation:** an injectable logging library, a small runtime
-entry point, a console smoke executable, and focused Hspec tests. Vulkan,
-Lua, input, fonts, and rendering are not implemented yet. Planned directories
-are explicitly marked and are not included in the Cabal package list.
+**Current implementation:** an injectable logging library with
+environment-configured filtering, a small runtime entry point, a console smoke
+executable, and focused Hspec tests. Vulkan, Lua, input, fonts, and rendering
+are not implemented yet. Planned directories are explicitly marked and are not
+included in the Cabal package list.
 
 ## Start here
 
@@ -38,8 +39,21 @@ thread, and source line of the run:
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
-2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:34 msg="Hello from Hetoimasia."
+2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:90 msg="Hello from Hetoimasia."
 2026-09-10T12:34:56.790Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
+```
+
+Logging is configured from the environment, read once at startup:
+`HETOIMASIA_LOG_LEVEL` sets the global threshold, `HETOIMASIA_LOG_LEVELS` sets
+exact per-component thresholds, and `HETOIMASIA_DEBUG` selects which components
+may emit `Debug`. An absent variable keeps its default; a present but invalid
+one fails startup with a non-zero exit and a message naming it. `--help` lists
+the accepted forms, and
+[startup configuration](docs/logging.md#startup-configuration) is the contract.
+
+```sh
+HETOIMASIA_LOG_LEVEL=warn cabal run exe:hetoimasia -- --smoke      # no records
+HETOIMASIA_LOG_LEVELS=runtime=warn cabal run exe:hetoimasia -- --smoke
 ```
 
 ## Layout

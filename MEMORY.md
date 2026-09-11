@@ -72,7 +72,13 @@ not a verdict that Synarchy's design should be discarded.
   serialize writes and flushes across the loggers sharing them and release that
   state on failure or interruption; callback sinks carry their own flush.
   Borrowed handles stay the caller's, unclosed and with their buffering intact.
-  LOG-3 still owns environment configuration and the authoring guide.
+- LOG-3 completed the arc: foundation parses the three configurable parts of a
+  filter purely, `resolveLogFilter` assembles them over caller-supplied variable
+  names and a caller-supplied lookup, and the console reads
+  `HETOIMASIA_LOG_LEVEL`, `HETOIMASIA_LOG_LEVELS`, and `HETOIMASIA_DEBUG` once at
+  startup, failing non-zero on an invalid value before any entry. The master and
+  source switches stay programmatic. `docs/logging.md` now carries the startup
+  contract and the module authoring guide AGENTS.md points new subsystems to.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

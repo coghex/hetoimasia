@@ -19,6 +19,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   document its owner, readers/writers, thread, lifetime, and reset/disposal
   behavior in its owning module or design. GPU completion is distinct from
   CPU scope exit.
+- New subsystems follow the
+  [module authoring guide](docs/logging.md#module-authoring-guide) for logger
+  injection, component naming, scoped context, level meaning, and which output
+  is a diagnostic rather than application output.
 - Publish coherent data across thread boundaries. Add concurrency for a
   concrete need and establish queue/snapshot ownership and cancellation first.
 - Use explicit `IO` or a small local context initially. The resource design
