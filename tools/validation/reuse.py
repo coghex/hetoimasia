@@ -28,6 +28,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,11 @@ FINISHED_CONCLUSIONS = ("success", "failure")
 # No single API call may consume the whole budget, or one hung request would
 # spend the time the remaining groups need.
 CALL_SECONDS = 30
+
+# A receipt's own attribution, as `run.py` writes it. The attempt is optional in
+# the pattern so a receipt that names only the run can be told apart from one
+# that names another run entirely.
+RUN_URL_PATTERN = re.compile(r"/actions/runs/(\d+)(?:/attempts/(\d+))?/?$")
 
 
 def artifact_name(group: str, identity: str) -> str:
@@ -122,36 +128,59 @@ def newest_first(artifacts: list[dict]) -> list[dict]:
     workers finishing together — so the identifier breaks the tie. Without a
     total order the same lookup could prefer different evidence on two runs.
     """
-    return sorted(
-        artifacts,
-        key=lambda artifact: (str(artifact.get("created_at") or ""), int(artifact.get("id") or 0)),
-        reverse=True,
-    )
+
+    def key(artifact: dict) -> tuple[str, int]:
+        identifier = artifact.get("id")
+        return (
+            str(artifact.get("created_at") or ""),
+            identifier if isinstance(identifier, int) else 0,
+        )
+
+    return sorted(artifacts, key=key, reverse=True)
 
 
-def usable_artifacts(document: dict, name: str) -> list[dict]:
+def matching_artifacts(document: dict, name: str) -> list[dict]:
+    """Every artifact of this name, newest first.
+
+    Nothing is filtered out before the ordering. An expired or unusable
+    artifact that is *newer* than a passing one still has to be the one
+    considered, or the lookup would quietly reach backward past it — which is
+    the same hazard as reaching past a newer failure.
+    """
     listing = document.get("artifacts")
     if not isinstance(listing, list):
         raise ApiError("the artifact listing has no 'artifacts' array")
-    usable: list[dict] = []
-    for artifact in listing:
-        if not isinstance(artifact, dict) or artifact.get("name") != name:
-            continue
-        if artifact.get("expired") is True:
-            continue
-        if not isinstance(artifact.get("id"), int):
-            continue
-        usable.append(artifact)
-    return newest_first(usable)
+    return newest_first(
+        [
+            artifact
+            for artifact in listing
+            if isinstance(artifact, dict) and artifact.get("name") == name
+        ]
+    )
 
 
 def run_url(run: dict, artifact: dict) -> str:
+    """Where the execution can be read back from, including its attempt.
+
+    A run's generic page always shows its latest attempt, so attribution that
+    stopped at the run would name a different execution once the run had been
+    re-run. The attempt is part of the address.
+    """
     url = run.get("html_url")
+    attempt = run.get("run_attempt")
     if isinstance(url, str) and url:
-        return url
+        return f"{url}/attempts/{attempt}" if isinstance(attempt, int) and attempt > 0 else url
     workflow_run = artifact.get("workflow_run")
     identifier = workflow_run.get("id") if isinstance(workflow_run, dict) else None
     return f"run {identifier}" if identifier else "an unattributed run"
+
+
+def attributed_attempt(source_run_url: str, identifier: int) -> int | None:
+    """The attempt a receipt attributes itself to, if it names this run at all."""
+    match = RUN_URL_PATTERN.search(source_run_url)
+    if match is None or int(match.group(1)) != identifier:
+        return None
+    return int(match.group(2)) if match.group(2) else 0
 
 
 class Rejection(Exception):
@@ -218,8 +247,19 @@ def check_receipt(receipt: dict, group: str, entry: dict, candidate: dict, run: 
     if receipt["command"] != list(entry["command"]):
         raise Rejection("its receipt records a different command from the plan's", url)
     identifier = run.get("id")
-    if f"/actions/runs/{identifier}/" not in (receipt["source_run_url"] + "/"):
+    attempt = run.get("run_attempt")
+    attributed = attributed_attempt(receipt["source_run_url"], identifier) if isinstance(identifier, int) else None
+    if attributed is None:
         raise Rejection("its receipt attributes itself to another run", url)
+    if isinstance(attempt, int) and attempt > 0 and attributed != attempt:
+        # The run has been re-run since. Whatever its newest attempt did, this
+        # artifact is not that attempt's evidence, and a surviving older upload
+        # must not stand in for an execution nobody has looked at.
+        raise Rejection(
+            f"its receipt was produced by attempt {attributed or 'unstated'} "
+            f"while the run is now on attempt {attempt}",
+            url,
+        )
     problems = receipts.compatibility_problems(candidate, receipt, "its receipt")
     if problems:
         raise Rejection("; ".join(problems), url)
@@ -244,10 +284,14 @@ def consider(
     listing = api.json(
         f"repos/{repository}/actions/artifacts?name={urllib.parse.quote(name)}&per_page=100"
     )
-    usable = usable_artifacts(listing, name)
-    if not usable:
+    matching = matching_artifacts(listing, name)
+    if not matching:
         return None
-    artifact = usable[0]
+    artifact = matching[0]
+    if artifact.get("expired") is True:
+        raise Rejection("the newest artifact for these inputs has expired")
+    if not isinstance(artifact.get("id"), int):
+        raise Rejection("the newest artifact for these inputs names no usable identifier")
     run = source_run(api, repository, artifact, workflow)
     url = run_url(run, artifact)
     receipt = fetch_receipt(api, repository, artifact, group, url)
@@ -257,7 +301,10 @@ def consider(
         "receipt": receipt,
         "executed_commit": receipt["executed_commit"],
         "executed_tree": receipt["executed_tree"],
-        "source_run_url": url,
+        # The receipt's own attribution, which has just been checked against the
+        # run's metadata down to the attempt. The run page's generic address
+        # would name whatever attempt is newest when someone opens it.
+        "source_run_url": receipt["source_run_url"],
         "artifact": {
             "id": artifact["id"],
             "name": name,

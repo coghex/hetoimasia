@@ -205,8 +205,16 @@ itself**, without looking at either endpoint:
 
 | Field | What it covers |
 | --- | --- |
-| `policy_version` | Every path matching the catalog's `policy_inputs` — the validation scripts, the catalog, and the workflows — plus the catalog's schema and declared revision. |
+| `policy_version` | Every path matching the catalog's `policy_inputs` **unioned with `tools/validation/` and `.github/workflows/`**, plus the catalog's schema and declared revision. |
 | `input_identity` | Every included path's name, file mode, Git object type, and object id, plus the pinned toolchain and `policy_version`. |
+
+Those two roots are required rather than merely declared. `policy_inputs` is
+catalog data and the catalog is one of the files it governs, so a candidate that
+dropped them from its own catalog would otherwise rewrite the scripts deciding
+what a result means while leaving both digests — and therefore the evidence it
+may inherit — unmoved. Declaring more still widens the policy; declaring less
+cannot narrow it. The same union is what a group's inputs are checked against
+when deciding harmless prose.
 
 The candidate is the tree the workers execute, not the pull request's head. On a
 pull request those differ: CI passes the commit GitHub resolved for the event,
@@ -488,25 +496,31 @@ Contribution-based selection is preserved unchanged and decides what is
 *selected*; identity decides what may be *inherited*.
 
 For each selected group the step lists the artifacts named
-`receipt-<group-id>-<input-identity>`, discards expired ones, and orders what is
-left newest first by creation time with the artifact id breaking ties — two
-artifacts can share a timestamp, and without a total order the same lookup could
-prefer different evidence on two runs. **Only the newest is ever considered.**
-Reaching past a newer failure for an older pass would publish a green verdict
-while a known failure for the very same inputs sat unmentioned one artifact
-back.
+`receipt-<group-id>-<input-identity>` and orders **all** of them newest first by
+creation time, with the artifact id breaking ties — two artifacts can share a
+timestamp, and without a total order the same lookup could prefer different
+evidence on two runs. Nothing is filtered out before that ordering, expired
+artifacts included: an unusable artifact is not an absent one, and discarding it
+first would quietly promote whatever sits behind it. **Only the newest is ever
+considered.** Reaching past a newer failure — or a newer expiry — for an older
+pass would publish a green verdict while the evidence that actually described
+these inputs sat unmentioned one artifact back.
 
 That artifact is accepted only when all of this holds:
 
+- the newest artifact has not expired and names a usable identifier;
 - its run belongs to this repository and to `--workflow`;
 - its run is `completed` and concluded `success` or `failure` — a run still
   executing has not finished the group, and a cancelled one may have uploaded a
   receipt for work it never completed;
 - the archive holds exactly `<group-id>.json`, and that document passes the same
   receipt contract a fresh receipt does;
-- the receipt names that same run, records the command the plan selected, and
-  matches the candidate's `input_identity`, `policy_version`, `toolchain`, and
-  `runner_os`;
+- the receipt names that same run **and the attempt the run is currently on** —
+  a run's generic page always shows its newest attempt, so an upload that
+  survived a re-run is not that re-run's evidence and must not stand in for an
+  execution nobody has looked at;
+- the receipt records the command the plan selected, and matches the
+  candidate's `input_identity`, `policy_version`, `toolchain`, and `runner_os`;
 - the receipt records `passed` with exit status `0`.
 
 Everything else is an obstacle, never a pass. An expired, missing, malformed,
@@ -565,7 +579,11 @@ selected gate nothing vouched for has not been satisfied, however green the rest
 of the run looks.
 
 A selected group with no receipt at all is satisfied instead by an applicability
-record, and only then. A fresh receipt always outranks one: a failure that just
+record, and only then. The receipt that record carries is read through the same
+contract a fresh one is: a document truncated to the fields the verdict happens
+to compare satisfies nothing, and neither does a record whose stored proof,
+artifact metadata, or restated commit, tree, and run disagree with the receipt
+beside it. A fresh receipt always outranks one: a failure that just
 happened is never overruled by an older pass. The record is held to the
 candidate's compatibility fields rather than to this plan's identity and head,
 which belong to the run that executed, and a record resolved for another plan or
@@ -778,20 +796,26 @@ prose-only push keeps the identity while selection still reports the code as
 affected; and that an upstream change merged into the integration candidate
 moves the identity even when the contribution is prose.
 
+They also assert that a catalog which drops the required policy roots from its
+own `policy_inputs` still cannot exempt a validation tool or a workflow from the
+policy digest.
+
 The reuse examples assert that a finished passing receipt for identical inputs
-is accepted, recorded with the earlier run's own commit and run URL, and removes
-the worker that owned it; and that a receipt from another toolchain, another
-input identity, or a non-zero exit, an artifact from another workflow, and a run
-still in progress or cancelled are each refused. A newer failure standing in
-front of an older pass is asserted both ways: the pass is genuine and would have
-been accepted alone, and it must stay unused while the failure it hides behind
-stays named. A lookup that cannot answer at all leaves an obstacle and returns
-every group to execution.
+is accepted, recorded with the earlier run's own commit and attempt-specific run
+URL, and removes the worker that owned it; and that a receipt from another
+toolchain, another input identity, a non-zero exit, or an attempt the run has
+since moved past, an artifact from another workflow, and a run still in progress
+or cancelled are each refused. A newer failure standing in front of an older
+pass is asserted both ways: the pass is genuine and would have been accepted
+alone, and it must stay unused while the failure it hides behind stays named. A
+newer *expired* artifact is asserted the same way, because filtering it out
+before the ordering would silently promote the pass behind it. A lookup that
+cannot answer at all leaves an obstacle and returns every group to execution.
 
 The aggregate examples cover a covered group satisfied and its worker excused, a
 selected group with neither an execution nor a record, a record resolved for
-another plan, a malformed record, and a fresh failure standing rather than the
-older pass behind it.
+another plan, a malformed record, a record whose embedded receipt is not a whole
+receipt, and a fresh failure standing rather than the older pass behind it.
 
 The stub is what makes those reachable: a run still executing, a newer failure
 in front of an older pass, and an API that does not answer do not happen on

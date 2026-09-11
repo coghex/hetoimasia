@@ -273,37 +273,48 @@ def receipt_path(directory: str, identifier: str) -> str:
     return os.path.join(directory, identifier + ".json")
 
 
-def load_receipt(path: str) -> dict:
-    """Read a receipt, rejecting any shape that cannot support a verdict."""
-    document = read_document(path, "receipt")
-    schema = require_int(document, "schema_version", "receipt")
+def validate_receipt(document: dict, description: str) -> dict:
+    """Hold one receipt to the shape a verdict can rest on.
+
+    A receipt read from a file and a receipt carried inside an applicability
+    record are the same contract, so both come through here. A reused execution
+    is held to exactly what a fresh one is held to; anything less would let a
+    truncated document satisfy a group precisely because it was old.
+    """
+    schema = require_int(document, "schema_version", description)
     if schema != RECEIPT_SCHEMA_VERSION:
         raise EvidenceError(
-            f"receipt {path} declares schema version {schema}, but this tool reads {RECEIPT_SCHEMA_VERSION}"
+            f"{description} declares schema version {schema}, "
+            f"but this tool reads {RECEIPT_SCHEMA_VERSION}"
         )
-    require_str(document, "group", "receipt")
-    require_str_list(document, "command", "receipt")
-    outcome = require_str(document, "outcome", "receipt")
+    require_str(document, "group", description)
+    require_str_list(document, "command", description)
+    outcome = require_str(document, "outcome", description)
     if outcome not in OUTCOMES:
         raise EvidenceError(
-            f"receipt {path} records outcome {outcome!r}, which is not one of " + ", ".join(OUTCOMES)
+            f"{description} records outcome {outcome!r}, which is not one of " + ", ".join(OUTCOMES)
         )
-    require_int(document, "exit_status", "receipt")
-    require_str(document, "started_at", "receipt")
-    require_str(document, "ended_at", "receipt")
-    require_number(document, "duration_seconds", "receipt")
-    require_int(document, "timeout_seconds", "receipt")
-    require_str(document, "plan_identity", "receipt")
-    require_str(document, "head_commit", "receipt")
-    require_str(document, "executed_commit", "receipt")
-    require_str(document, "executed_tree", "receipt")
-    require_str(document, "runner_os", "receipt")
-    require_str(document, "runner_arch", "receipt")
-    require_str(document, "input_identity", "receipt")
-    require_str(document, "policy_version", "receipt")
-    require_str(document, "source_run_url", "receipt")
-    require_toolchain(document, "toolchain", f"receipt {path}")
+    require_int(document, "exit_status", description)
+    require_str(document, "started_at", description)
+    require_str(document, "ended_at", description)
+    require_number(document, "duration_seconds", description)
+    require_int(document, "timeout_seconds", description)
+    require_str(document, "plan_identity", description)
+    require_str(document, "head_commit", description)
+    require_str(document, "executed_commit", description)
+    require_str(document, "executed_tree", description)
+    require_str(document, "runner_os", description)
+    require_str(document, "runner_arch", description)
+    require_str(document, "input_identity", description)
+    require_str(document, "policy_version", description)
+    require_str(document, "source_run_url", description)
+    require_toolchain(document, "toolchain", description)
     return document
+
+
+def load_receipt(path: str) -> dict:
+    """Read a receipt, rejecting any shape that cannot support a verdict."""
+    return validate_receipt(read_document(path, "receipt"), f"receipt {path}")
 
 
 def write_receipt(directory: str, receipt: dict) -> str:
@@ -374,10 +385,30 @@ def load_applicability(path: str) -> dict:
             raise EvidenceError(f"applicability {path} records group {identifier!r} more than once")
         seen.add(identifier)
         where = f"applicability record {identifier}"
-        require_str(record, "source_run_url", where)
-        require_str(record, "executed_commit", where)
-        require_str(record, "executed_tree", where)
-        require_dict(record, "receipt", where)
+        source = require_str(record, "source_run_url", where)
+        executed_commit = require_str(record, "executed_commit", where)
+        executed_tree = require_str(record, "executed_tree", where)
+        receipt = validate_receipt(require_dict(record, "receipt", where), f"{where}'s receipt")
+        artifact = require_dict(record, "artifact", where)
+        require_int(artifact, "id", f"{where}'s artifact")
+        require_str(artifact, "name", f"{where}'s artifact")
+        require_str(artifact, "created_at", f"{where}'s artifact")
+        proof = require_dict(record, "proof", where)
+        for name in COMPATIBILITY_FIELDS:
+            if name not in proof:
+                raise EvidenceError(f"{where}'s proof declares no {name}")
+            if proof[name] != document[name]:
+                raise EvidenceError(f"{where}'s proof disagrees with the candidate's {name}")
+        # The record restates three of the receipt's own fields for legibility.
+        # A restatement that disagrees with the receipt it sits beside is not a
+        # summary of that execution, so it cannot describe one.
+        for name, restated in (
+            ("source_run_url", source),
+            ("executed_commit", executed_commit),
+            ("executed_tree", executed_tree),
+        ):
+            if receipt[name] != restated:
+                raise EvidenceError(f"{where} restates a {name} its receipt does not record")
     rejected = require_list(document, "rejected", "applicability")
     for record in rejected:
         if not isinstance(record, dict):

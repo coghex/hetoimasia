@@ -47,9 +47,11 @@ data Evidence = Evidence
   { artifactId ∷ Int
   , createdAt ∷ String
   , runIdentifier ∷ Int
+  , runAttempt ∷ Int
   , runStatus ∷ String
   , runConclusion ∷ String
   , runWorkflow ∷ String
+  , hasExpired ∷ Bool
   , receiptFile ∷ FilePath
   }
 
@@ -108,6 +110,25 @@ spec = describe "Validation evidence reuse" $ do
         afterInputs ← identityNow fixture
         afterInputs `shouldNotBe` beforeInputs
 
+    it "moves for a validation tool a catalog tried to exempt from its own policy" $
+      withFixture $ \fixture → do
+        -- `policy_inputs` is catalog data, and the catalog is one of the files
+        -- it governs. A candidate that drops the validation tools and the
+        -- workflows from its own catalog must not thereby stop its edits to
+        -- them from moving the policy the evidence was gathered under.
+        change fixture "tools/validation/catalog.json" (fixtureCatalogWith 1 "[\"docs/consumed.md\"]")
+        exemptedPolicy ← policyNow fixture
+        exemptedInputs ← identityNow fixture
+        change fixture "tools/validation/helper.py" "# a revised validation tool\n"
+        movedTool ← policyNow fixture
+        movedTool `shouldNotBe` exemptedPolicy
+        identityNow fixture >>= \moved → moved `shouldNotBe` exemptedInputs
+        afterTool ← identityNow fixture
+        change fixture ".github/workflows/validation.yml" "name: validation\non: push\n"
+        movedWorkflow ← policyNow fixture
+        movedWorkflow `shouldNotBe` movedTool
+        identityNow fixture >>= \moved → moved `shouldNotBe` afterTool
+
     it "survives a code change followed by a prose-only push, while selection still reports the code" $
       withFixture $ \fixture → do
         change fixture "src/note.txt" "a revised fixture\n"
@@ -152,7 +173,7 @@ spec = describe "Validation evidence reuse" $ do
         output `shouldContain` "run-engine=false"
         output `shouldContain` "run-extra=true"
         document ← applicability fixture
-        recordText document "build.pass" "source_run_url" `shouldBe` Just (runUrl 41)
+        recordText document "build.pass" "source_run_url" `shouldBe` Just (runUrl 41 1)
         -- The record preserves the earlier run's own commit rather than
         -- restating this candidate's, so a reused result stays attributable to
         -- the execution that actually happened.
@@ -199,7 +220,7 @@ spec = describe "Validation evidence reuse" $ do
       withReceipt $ \fixture receipt → do
         failed ← patched fixture receipt "newer-failure.json" "outcome" "\"failed\""
         broken ← patched fixture failed "newer-failure.json" "exit_status" "1"
-        newer ← patched fixture broken "newer-failure.json" "source_run_url" (show (runUrl 42))
+        newer ← patched fixture broken "newer-failure.json" "source_run_url" (show (runUrl 42 1))
         plan ← proseCandidate fixture
         install
           fixture
@@ -216,7 +237,34 @@ spec = describe "Validation evidence reuse" $ do
         -- It must stay unused, and the failure it sits behind must stay named.
         rejectionReason document "build.pass" `shouldContain` "records failed"
         recordText document "build.pass" "source_run_url" `shouldBe` Nothing
-        rejectionText document "build.pass" "source_run_url" `shouldBe` Just (runUrl 42)
+        rejectionText document "build.pass" "source_run_url" `shouldBe` Just (runUrl 42 1)
+
+    it "never reaches past a newer expired artifact for an older pass" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install
+          fixture
+          plan
+          "build.pass"
+          [ (passing receipt) {artifactId = 7, createdAt = "2026-09-11T10:00:00Z", runIdentifier = 41}
+          , (passing receipt)
+              { artifactId = 9
+              , createdAt = "2026-09-11T11:00:00Z"
+              , runIdentifier = 42
+              , hasExpired = True
+              }
+          ]
+        -- An expired newer artifact is unusable, not absent. Filtering it away
+        -- before the ordering would silently promote the pass behind it.
+        refusal fixture plan "build.pass" "has expired"
+
+    it "refuses a receipt produced by an attempt the run has since moved past" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [(passing receipt) {runAttempt = 2}]
+        -- The receipt names attempt 1 while the run is on attempt 2. Whatever
+        -- that newer attempt did, this artifact is not its evidence.
+        refusal fixture plan "build.pass" "attempt 2"
 
     it "returns the candidate to execution when the lookup cannot answer" $
       withReceipt $ \fixture receipt → do
@@ -249,11 +297,11 @@ spec = describe "Validation evidence reuse" $ do
         -- that had to execute still decides the verdict on its own merits.
         result `shouldBe` ExitFailure 1
         output `shouldContain` "reused"
-        output `shouldContain` runUrl 41
+        output `shouldContain` runUrl 41 1
         output `shouldNotContain` "worker engine was skipped"
         summary ← readFile (root fixture </> "summary.md")
         summary `shouldContain` "an earlier execution"
-        summary `shouldContain` runUrl 41
+        summary `shouldContain` runUrl 41 1
 
     it "fails a selected group with neither an execution nor a record" $
       withReceipt $ \fixture receipt → do
@@ -289,6 +337,20 @@ spec = describe "Validation evidence reuse" $ do
         (result, _, errors) ← aggregate fixture plan []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "not valid JSON"
+
+    it "refuses a record whose embedded receipt is not a whole receipt" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [passing receipt]
+        looked ← reuse fixture plan
+        exitOf looked `shouldBe` ExitSuccess
+        -- A reused execution is held to exactly the contract a fresh one is.
+        -- A receipt truncated to the fields the aggregate happens to compare
+        -- would otherwise satisfy a group precisely because it was old.
+        truncate' fixture (root fixture </> "applicability.json") "plan_identity"
+        (result, _, errors) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "plan_identity"
 
     it "lets a fresh failure stand rather than the older pass behind it" $
       withReceipt $ \fixture receipt → do
@@ -352,7 +414,7 @@ runGroup fixture plan group extra =
       , "--plan", plan
       , "--receipts", receiptsDirectory fixture
       , "--toolchain", "ghc=9.12.2"
-      , "--source-run-url", runUrl 41
+      , "--source-run-url", runUrl 41 1
       ]
         ++ extra
     )
@@ -402,11 +464,16 @@ exitOf (result, _, _) = result
 -- ---------------------------------------------------------------------------
 -- The stub GitHub
 
-runUrl ∷ Int → String
-runUrl identifier = "https://github.invalid/owner/project/actions/runs/" ++ show identifier
+-- | A receipt's own attribution names the run *and* the attempt, because a
+-- run's generic page always shows whichever attempt is newest.
+runUrl ∷ Int → Int → String
+runUrl identifier attempt = runPage identifier ++ "/attempts/" ++ show attempt
+
+runPage ∷ Int → String
+runPage identifier = "https://github.invalid/owner/project/actions/runs/" ++ show identifier
 
 passing ∷ FilePath → Evidence
-passing = Evidence 7 "2026-09-11T10:00:00Z" 41 "completed" "success" ".github/workflows/validation.yml"
+passing = Evidence 7 "2026-09-11T10:00:00Z" 41 1 "completed" "success" ".github/workflows/validation.yml" False
 
 stubDirectory ∷ Fixture → FilePath
 stubDirectory fixture = root fixture </> "gh-stub"
@@ -439,7 +506,9 @@ artifactDocument item group identity =
     ++ group
     ++ "-"
     ++ identity
-    ++ "\", \"expired\": false, \"created_at\": \""
+    ++ "\", \"expired\": "
+    ++ (if hasExpired item then "true" else "false")
+    ++ ", \"created_at\": \""
     ++ createdAt item
     ++ "\", \"workflow_run\": {\"id\": "
     ++ show (runIdentifier item)
@@ -449,6 +518,8 @@ runDocument ∷ Evidence → String
 runDocument item =
   "{\"id\": "
     ++ show (runIdentifier item)
+    ++ ", \"run_attempt\": "
+    ++ show (runAttempt item)
     ++ ", \"status\": "
     ++ show (runStatus item)
     ++ ", \"conclusion\": "
@@ -456,7 +527,7 @@ runDocument item =
     ++ ", \"path\": "
     ++ show (runWorkflow item)
     ++ ", \"html_url\": "
-    ++ show (runUrl (runIdentifier item))
+    ++ show (runPage (runIdentifier item))
     ++ ", \"repository\": {\"full_name\": \"owner/project\"}}\n"
 
 -- | Pack one receipt into an artifact archive the stub can serve.
@@ -551,6 +622,26 @@ patched fixture source name key value = do
   let target = root fixture </> name
   patch fixture source target key value
   pure target
+
+-- | Drop one field from every receipt an applicability document carries.
+truncate' ∷ Fixture → FilePath → String → IO ()
+truncate' fixture path key = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json, sys\n\
+        \path, key = sys.argv[1:3]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \for record in document['reused']:\n\
+        \    record['receipt'].pop(key, None)\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , path
+      , key
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
 
 patchInPlace ∷ Fixture → FilePath → String → String → IO ()
 patchInPlace fixture path key value = patch fixture path path key value
@@ -656,6 +747,7 @@ fixtureFiles =
   , ("docs/consumed.md", "a document the failing group consumes\n")
   , ("README.md", "ordinary prose\n")
   , (".github/workflows/validation.yml", "name: validation\n")
+  , ("tools/validation/helper.py", "# a validation tool beside the catalog\n")
   ]
 
 demoPackage ∷ String
@@ -677,12 +769,17 @@ demoPackage =
 -- | A catalog whose groups decide their own outcome, and whose policy inputs
 -- are the validation tools and the workflows, as this repository's own are.
 fixtureCatalog ∷ Int → String
-fixtureCatalog policy =
+fixtureCatalog policy = fixtureCatalogWith policy "[\"tools/validation/\", \".github/workflows/\"]"
+
+-- | A catalog that declares whichever policy inputs an example needs, so one
+-- can declare none of the roots the planner requires anyway.
+fixtureCatalogWith ∷ Int → String → String
+fixtureCatalogWith policy inputs =
   unlines
     [ "{"
     , "  \"schema_version\": 1,"
     , "  \"policy_version\": " ++ show policy ++ ","
-    , "  \"policy_inputs\": [\"tools/validation/\", \".github/workflows/\"],"
+    , "  \"policy_inputs\": " ++ inputs ++ ","
     , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["

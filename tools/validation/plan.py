@@ -44,6 +44,15 @@ PROJECT_FILE = "cabal.project"
 NEVER_HARMLESS_PATHS = ("cabal.project",)
 NEVER_HARMLESS_SUFFIXES = (".cabal",)
 
+# The policy roots a candidate can never exempt itself from. `policy_inputs` is
+# catalog data, and the catalog is one of the files it governs: a candidate that
+# dropped these prefixes from its own catalog would otherwise leave the policy
+# identity — and therefore the input identity — unmoved while rewriting the very
+# scripts that decide what a result means. They are unioned with whatever the
+# catalog declares, so declaring more still widens and declaring less cannot
+# narrow.
+REQUIRED_POLICY_ROOTS = ("tools/validation/", ".github/workflows/")
+
 COMPONENT_KINDS = ("lib", "exe", "test")
 FRAMEWORKS = ("hspec", "none")
 RUNNERS = ("cpu",)
@@ -742,13 +751,14 @@ def digest(payload: dict) -> str:
 def policy_identity(catalog: dict, entries: list[tuple[str, str, str, str]]) -> str:
     """A digest of the policy that classified this candidate.
 
-    The catalog, the validation scripts, and the workflows are exactly the
-    catalog's declared ``policy_inputs``, so a classification change — a new
-    harmless class, an edited runner, a rewritten aggregate — produces a
-    different policy identity and can never inherit evidence gathered under the
-    policy it replaced.
+    The catalog, the validation scripts, and the workflows are the catalog's
+    declared ``policy_inputs`` unioned with ``REQUIRED_POLICY_ROOTS``, so a
+    classification change — a new harmless class, an edited runner, a rewritten
+    aggregate — produces a different policy identity and can never inherit
+    evidence gathered under the policy it replaced. The union is what stops a
+    candidate exempting its own tooling by editing the catalog that names it.
     """
-    patterns = list(catalog["policy_inputs"])
+    patterns = sorted(set(catalog["policy_inputs"]) | set(REQUIRED_POLICY_ROOTS))
     included = [
         list(entry) for entry in entries if any(matches_input(entry[0], pattern) for pattern in patterns)
     ]
@@ -770,7 +780,7 @@ def consumed_entries(catalog: dict, packages: dict[str, Package]) -> set[str]:
     fingerprint that depended on the base would differ between two runs over
     the very same tree, which is the equivalence reuse exists to recognize.
     """
-    entries: set[str] = set(catalog["policy_inputs"])
+    entries: set[str] = set(catalog["policy_inputs"]) | set(REQUIRED_POLICY_ROOTS)
     for group in catalog["groups"]:
         entries |= set(group["inputs"])
         entries |= component_inputs(packages, group["component"])
