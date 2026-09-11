@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Execute one planned validation group and write its receipt.
+
+The resolved plan is the runner's only authority. A group's command, its
+timeout, and the plan identity a receipt must name all come from the plan file
+supplied with ``--plan``, so a runner never has to infer a request-dependent
+selection from a group ID and a checkout. That is also what lets the workflow
+tests drive real executions against a fixture catalog: plan with
+``plan.py --catalog <fixture>``, then run against that same plan.
+
+The receipt is the result contract later slices consume. It records what ran,
+where it ran, and how it ended — including a timeout as an outcome distinct
+from a failure, because an exhausted budget and a disagreeing test are
+different obstacles.
+
+Exit status: ``0`` when the group passed, ``1`` when it failed or timed out
+(its receipt is still written), and ``2`` for a diagnostic that prevented any
+execution at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+import receipts
+from receipts import EvidenceError
+
+# How long a timed-out process group is given to exit on SIGTERM before it is
+# killed outright. The runner always reaps the whole group: a command that
+# leaves a build server or a test child behind would otherwise keep holding the
+# runner's CPU and scratch space after its budget expired.
+TERMINATION_GRACE_SECONDS = 10
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def git_output(root: str, *arguments: str) -> str:
+    process = subprocess.run(
+        ("git", "-C", root) + arguments, capture_output=True, check=False
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.decode("utf-8", errors="replace").strip()
+        raise EvidenceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
+    return process.stdout.decode("utf-8", errors="replace").strip()
+
+
+def parse_toolchain(entries: list[str]) -> dict[str, str]:
+    toolchain: dict[str, str] = {}
+    for entry in entries:
+        name, separator, version = entry.partition("=")
+        if not separator or not name:
+            raise EvidenceError(f"--toolchain expects NAME=VERSION, not {entry!r}")
+        toolchain[name] = version
+    return toolchain
+
+
+def terminate_group(process: subprocess.Popen) -> None:
+    """End the command and every descendant it started."""
+    try:
+        group = os.getpgid(process.pid)
+    except OSError:
+        group = None
+    for attempt in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None and attempt is signal.SIGKILL:
+            break
+        try:
+            if group is not None:
+                os.killpg(group, attempt)
+            else:
+                process.send_signal(attempt)
+        except OSError:
+            break
+        try:
+            process.wait(timeout=TERMINATION_GRACE_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if process.poll() is None:
+        process.wait()
+
+
+def execute(command: list[str], root: str, timeout_seconds: int) -> tuple[int, bool, float, str, str]:
+    started_at = timestamp()
+    started = time.monotonic()
+    # A new session gives the command its own process group, so a timeout can
+    # reap the descendants it spawned rather than only the process it launched.
+    process = subprocess.Popen(command, cwd=root, start_new_session=True)
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate_group(process)
+    duration = time.monotonic() - started
+    return process.returncode, timed_out, duration, started_at, timestamp()
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="run.py",
+        description="Execute one group of a resolved validation plan and write its receipt.",
+    )
+    parser.add_argument("group", help="the catalog group to execute")
+    parser.add_argument("--plan", required=True, help="the resolved plan this execution belongs to")
+    parser.add_argument("--receipts", required=True, help="directory the receipt is written to")
+    parser.add_argument("--repo-root", help="the checkout to execute in (default: the working directory)")
+    parser.add_argument("--executed-commit", help="override the executed commit recorded in the receipt")
+    parser.add_argument("--executed-tree", help="override the executed tree recorded in the receipt")
+    parser.add_argument(
+        "--toolchain",
+        action="append",
+        default=[],
+        metavar="NAME=VERSION",
+        help="a toolchain version to record; repeatable",
+    )
+    arguments = parser.parse_args(argv)
+
+    root = os.path.abspath(arguments.repo_root or os.getcwd())
+    plan = receipts.load_plan(arguments.plan)
+    identity = receipts.plan_identity(plan)
+    group = receipts.plan_group(plan, arguments.group)
+    if not group["selected"]:
+        raise EvidenceError(
+            f"the plan did not select {arguments.group!r} ({group['reason']}); "
+            "an omitted group has no execution to record"
+        )
+
+    toolchain = parse_toolchain(arguments.toolchain)
+    toolchain.setdefault("python", platform.python_version())
+
+    executed_commit = arguments.executed_commit or git_output(root, "rev-parse", "HEAD")
+    executed_tree = arguments.executed_tree or git_output(root, "rev-parse", "HEAD^{tree}")
+
+    command = list(group["command"])
+    timeout_seconds = group["timeout_seconds"]
+    print(
+        f"validation: running {arguments.group} ({group['reason']}) "
+        f"under a {timeout_seconds}s budget: " + " ".join(command),
+        flush=True,
+    )
+    try:
+        status, timed_out, duration, started_at, ended_at = execute(command, root, timeout_seconds)
+    except OSError as error:
+        raise EvidenceError(f"cannot execute {arguments.group}: {error}") from error
+
+    if timed_out:
+        outcome = "timeout"
+    elif status == 0:
+        outcome = "passed"
+    else:
+        outcome = "failed"
+
+    receipt = {
+        "schema_version": receipts.RECEIPT_SCHEMA_VERSION,
+        "group": arguments.group,
+        "command": command,
+        "outcome": outcome,
+        "exit_status": status,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": round(duration, 3),
+        "timeout_seconds": timeout_seconds,
+        "plan_identity": identity,
+        "head_commit": plan["head"]["commit"],
+        "executed_commit": executed_commit,
+        "executed_tree": executed_tree,
+        "runner_os": os.environ.get("RUNNER_OS") or platform.system(),
+        "runner_arch": os.environ.get("RUNNER_ARCH") or platform.machine(),
+        "toolchain": toolchain,
+    }
+    written = receipts.write_receipt(arguments.receipts, receipt)
+    print(
+        f"validation: {arguments.group} {outcome} after {duration:.1f}s "
+        f"(exit {status}); receipt {written}",
+        flush=True,
+    )
+    return 0 if outcome == "passed" else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except EvidenceError as failure:
+        print(f"error: {failure}", file=sys.stderr)
+        sys.exit(2)

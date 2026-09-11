@@ -27,6 +27,11 @@ extra-source-files:
     tools/docs_land_paths.py
     tools/validation/plan.py
     tools/validation/catalog.json
+    tools/validation/receipts.py
+    tools/validation/run.py
+    tools/validation/aggregate.py
+    tools/validation/review_gate.py
+    tools/validation/timings.py
 
 source-repository head
     type: git
@@ -54,8 +59,11 @@ test-suite workflow-tests
     main-is: Main.hs
     hs-source-dirs: tools/test
     other-modules:
+        Execution
         Json
+        ReviewGate
         Sandbox
+        Timings
         Validation
     build-depends:
         base >=4.21 && <4.22,
