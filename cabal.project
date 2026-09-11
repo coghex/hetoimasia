@@ -1,0 +1,21 @@
+packages:
+  .
+  packages/foundation
+  packages/runtime
+
+-- Use the known index baseline from Synarchy; advance deliberately.
+index-state: 2026-08-14T00:00:00Z
+optimization: 2
+jobs: $ncpus
+-- Keep the existing multi-worktree toolchain's jobserver setting.
+semaphore: False
+
+-- Apply strict build policy only to our packages, never dependencies.
+package hetoimasia
+  ghc-options: -Werror -j
+
+package hetoimasia-foundation
+  ghc-options: -Werror -j
+
+package hetoimasia-runtime
+  ghc-options: -Werror -j

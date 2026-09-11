@@ -1,0 +1,30 @@
+cabal-version: 3.16
+name: hetoimasia-foundation
+version: 0.1.0.0
+synopsis: Small independent services for Hetoimasia
+description:
+    An injectable logging interface with explicit sink ownership. This library
+    has no application state, graphics, scripting, or game dependencies.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.12.2
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetiomasia.git
+    subdir: packages/foundation
+
+library
+    exposed-modules: Hetoimasia.Foundation.Log
+    hs-source-dirs: src
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    build-depends:
+        base >=4.21 && <4.22,
+        text >=2.1 && <2.2

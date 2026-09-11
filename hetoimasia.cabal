@@ -1,0 +1,53 @@
+cabal-version: 3.16
+name: hetoimasia
+version: 0.1.0.0
+synopsis: Console bootstrap for a modular Haskell game engine
+description:
+    Application composition and focused tests for Hetoimasia's foundation
+    and runtime libraries. Rendering and Lua integration are planned components.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.12.2
+homepage: https://github.com/coghex/hetiomasia
+bug-reports: https://github.com/coghex/hetiomasia/issues
+extra-doc-files:
+    README.md
+    MEMORY.md
+    AGENTS.md
+    CLAUDE.md
+    docs/*.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetiomasia.git
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+executable hetoimasia
+    import: language
+    main-is: Main.hs
+    hs-source-dirs: app
+    ghc-options: -threaded -rtsopts
+    build-depends:
+        base >=4.21 && <4.22,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0
+
+test-suite hetoimasia-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    ghc-options: -threaded -rtsopts
+    build-depends:
+        base >=4.21 && <4.22,
+        hspec >=2.11 && <3,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0
