@@ -32,12 +32,14 @@ Run `cabal update` if the local Hackage index does not cover the pinned
 `index-state` in `cabal.project`. Local packages build with warnings as errors.
 `cabal build all` does not run or build the test suite by default.
 
-Expected smoke output on stderr:
+Expected smoke output on stderr — three `INFO` records in the
+[logging record layout](docs/logging.md#record-layout), with the timestamp,
+thread, and source line of the run:
 
 ```text
-[INFO] runtime: Starting hetoimasia
-[INFO] console: Hello from Hetoimasia.
-[INFO] runtime: Completed hetoimasia
+2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
+2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:34 msg="Hello from Hetoimasia."
+2026-09-10T12:34:56.790Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
 ```
 
 ## Layout

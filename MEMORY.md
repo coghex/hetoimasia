@@ -63,11 +63,16 @@ not a verdict that Synarchy's design should be discarded.
 - Logger accepts an injected sink and injectable clock/thread metadata, applies
   a pure filter (master switch, global and per-component thresholds, independent
   Debug selection, source switch), carries immutable derived fields and
-  breadcrumbs, validates dotted component names, and borrows output handles.
-  It is synchronous; see [docs/logging.md](docs/logging.md). LOG-2 still owns the
-  final record layout, serialization, and flushing. Runtime invokes a supplied
-  action and propagates failures. Both were written from scratch; no Synarchy
+  breadcrumbs, and validates dotted component names. It is synchronous; see
+  [docs/logging.md](docs/logging.md). Runtime invokes a supplied action and
+  propagates failures. Both were written from scratch; no Synarchy
   implementation was copied.
+- LOG-2 settled the record layout: one line per entry, UTC to the millisecond,
+  quoted text that cannot split a record, and fields sorted by key. Handle sinks
+  serialize writes and flushes across the loggers sharing them and release that
+  state on failure or interruption; callback sinks carry their own flush.
+  Borrowed handles stay the caller's, unclosed and with their buffering intact.
+  LOG-3 still owns environment configuration and the authoring guide.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
