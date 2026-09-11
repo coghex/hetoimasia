@@ -1,6 +1,12 @@
 module Main (main) where
 
-import Hetoimasia.Foundation.Log (LogLevel (Info), handleLogger, logMessage)
+import Hetoimasia.Foundation.Log
+  ( Component
+  , defaultLogFilter
+  , handleLogger
+  , logInfo
+  , unsafeComponent
+  )
 import Hetoimasia.Runtime (runApplication)
 import System.Environment (getArgs)
 import System.Exit (die)
@@ -15,8 +21,12 @@ main = do
     ["--help"] → putStrLn "Usage: hetoimasia [--smoke | --help]"
     _ → die "Usage: hetoimasia [--smoke | --help]"
 
+-- | The component this executable's own entries use.
+consoleComponent ∷ Component
+consoleComponent = unsafeComponent "console"
+
 smoke ∷ IO ()
 smoke = do
-  let logger = handleLogger Info stderr
+  let logger = handleLogger defaultLogFilter stderr
   runApplication logger "hetoimasia" $
-    logMessage logger Info "console" "Hello from Hetoimasia."
+    logInfo logger consoleComponent "Hello from Hetoimasia." []

@@ -66,6 +66,9 @@ test-suite hetoimasia-tests
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.21 && <4.22,
+        containers >=0.7 && <0.8,
         hspec >=2.11 && <3,
+        text >=2.1 && <2.2,
+        time >=1.14 && <1.15,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0
