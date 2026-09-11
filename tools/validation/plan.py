@@ -103,18 +103,24 @@ def matches_class(path: str, pattern: str) -> bool:
 # Trees
 
 
+def decode(raw: bytes, description: str) -> str:
+    """Decode strictly: silently repaired metadata is not readable metadata."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PlannerError(f"{description} is not valid UTF-8: {error}") from error
+
+
 def run_git(root: str, *args: str) -> str:
     process = subprocess.run(
         ("git", "-C", root) + args,
         capture_output=True,
-        text=True,
         check=False,
     )
     if process.returncode != 0:
-        raise PlannerError(
-            "git " + " ".join(args) + " failed: " + (process.stderr.strip() or "no output")
-        )
-    return process.stdout
+        stderr = process.stderr.decode("utf-8", errors="replace").strip()
+        raise PlannerError("git " + " ".join(args) + " failed: " + (stderr or "no output"))
+    return decode(process.stdout, "git " + " ".join(args) + " output")
 
 
 class GitTree:
@@ -153,7 +159,7 @@ class GitTree:
         )
         if process.returncode != 0:
             raise PlannerError(f"cannot read {path} at {self.label}")
-        return process.stdout.decode("utf-8", errors="replace")
+        return decode(process.stdout, f"{path} at {self.label}")
 
 
 class WorkTree:
@@ -182,10 +188,11 @@ class WorkTree:
 
     def read(self, path: str) -> str:
         try:
-            with open(os.path.join(self.root, path), "r", encoding="utf-8", errors="replace") as handle:
-                return handle.read()
+            with open(os.path.join(self.root, path), "rb") as handle:
+                raw = handle.read()
         except OSError as error:
             raise PlannerError(f"cannot read {path}: {error}") from error
+        return decode(raw, path)
 
 
 # --------------------------------------------------------------------------
@@ -584,30 +591,49 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
 
 
 def parse_request(text: str, source: str) -> tuple[list[str], bool]:
-    """Read the ``validation-request`` fenced block from a PR body."""
-    lines = text.splitlines()
-    blocks: list[list[str]] = []
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].strip()
-        match = re.fullmatch(r"(`{3,}|~{3,})\s*([A-Za-z0-9_-]*)\s*", stripped)
-        if match and match.group(2) == REQUEST_FENCE:
-            fence = match.group(1)[0] * len(match.group(1))
-            body: list[str] = []
-            index += 1
-            closed = False
-            while index < len(lines):
-                candidate = lines[index].strip()
-                if re.fullmatch(re.escape(fence) + r"`*~*\s*", candidate):
-                    closed = True
-                    break
-                body.append(candidate)
-                index += 1
-            if not closed:
-                raise PlannerError(f"{source}: the validation-request block is never closed")
-            blocks.append(body)
-        index += 1
+    """Read the ``validation-request`` fenced block from a PR body.
 
+    Fence nesting is honoured: a ``validation-request`` example shown inside an
+    outer fenced block is documentation, not a request. A fence whose info
+    string starts with the reserved word but carries anything else is a
+    malformed request rather than a block to ignore.
+    """
+    opener = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+    blocks: list[list[str]] = []
+    body: list[str] = []
+    fence = ""
+    collecting = False
+    for line in text.splitlines():
+        match = opener.match(line.rstrip())
+        if fence:
+            closes = (
+                match is not None
+                and match.group(1)[0] == fence[0]
+                and len(match.group(1)) >= len(fence)
+                and not match.group(2).strip()
+            )
+            if closes:
+                if collecting:
+                    blocks.append(body)
+                    body, collecting = [], False
+                fence = ""
+            elif collecting:
+                body.append(line.strip())
+            continue
+        if match is None:
+            continue
+        fence = match.group(1)
+        info = match.group(2).strip()
+        if info.split()[0:1] == [REQUEST_FENCE]:
+            if info != REQUEST_FENCE:
+                raise PlannerError(
+                    f"{source}: malformed validation-request info string {info!r}; "
+                    f"the fence takes the bare word {REQUEST_FENCE!r}"
+                )
+            collecting = True
+
+    if collecting:
+        raise PlannerError(f"{source}: the validation-request block is never closed")
     if not blocks:
         return [], False
     if len(blocks) > 1:
@@ -667,19 +693,31 @@ def build_plan(
     request_source: str | None,
     base_packages: dict[str, Package],
     head_packages: dict[str, Package],
+    base_catalog: dict | None,
+    base_catalog_state: str,
 ) -> dict:
     groups = catalog["groups"]
     groups_by_id = {group["id"]: group for group in groups}
 
-    # Inputs are derived from both revisions so a removed or relocated source
-    # still counts for the group that used to own it.
+    base_inputs: dict[str, list[str]] = {}
+    base_policy_inputs: list[str] = []
+    if base_catalog is not None:
+        base_policy_inputs = base_catalog["policy_inputs"]
+        base_inputs = {group["id"]: group["inputs"] for group in base_catalog["groups"]}
+
+    # Inputs are derived from both revisions so a removed or relocated source,
+    # or an input a group used to declare, still counts for that group. Policy
+    # inputs reach every group, optional ones included: an optional group's
+    # definition can change without selecting it, and a downstream consumer must
+    # not read that as an unchanged execution definition.
     inputs_by_group: dict[str, set[str]] = {}
     for group in groups:
         derived = component_inputs(head_packages, group["component"])
         derived |= component_inputs(base_packages, group["component"])
-        derived |= {entry for entry in group["inputs"]}
-        if not group["optional"]:
-            derived |= set(catalog["policy_inputs"])
+        derived |= set(group["inputs"])
+        derived |= set(base_inputs.get(group["id"], []))
+        derived |= set(catalog["policy_inputs"])
+        derived |= set(base_policy_inputs)
         inputs_by_group[group["id"]] = derived
 
     for identifier in request_ids:
@@ -769,6 +807,7 @@ def build_plan(
         "base": {"revision": base.revision, "commit": base.commit, "tree": base.tree},
         "head": {"revision": head.revision, "commit": head.commit, "tree": head.tree},
         "base_package_metadata": "present" if base_packages else "absent",
+        "base_catalog": base_catalog_state,
         "request": {
             "source": request_source,
             "ids": sorted(request_ids),
@@ -797,6 +836,8 @@ def render_prose(plan: dict) -> str:
         lines.append("  request  none")
     if plan["base_package_metadata"] == "absent":
         lines.append("  note     the base revision carries no package metadata; head inputs alone were derived")
+    if plan["base_catalog"] == "absent":
+        lines.append("  note     the base revision carries no catalog; head declarations alone were read")
 
     lines.append("")
     if plan["changed_paths"]:
@@ -853,15 +894,44 @@ def read_catalog(tree, override: str | None, root: str) -> tuple[dict, str]:
     if override:
         path = override if os.path.isabs(override) else os.path.join(root, override)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                text = handle.read()
+            with open(path, "rb") as handle:
+                raw = handle.read()
         except OSError as error:
             raise PlannerError(f"cannot read catalog {override}: {error}") from error
-        return load_catalog_document(override, text), override
+        return load_catalog_document(override, decode(raw, override)), override
     if not tree.exists(DEFAULT_CATALOG):
         raise PlannerError(f"{DEFAULT_CATALOG} does not exist at {tree.label}")
     source = f"{DEFAULT_CATALOG}@{tree.label}"
     return load_catalog_document(source, tree.read(DEFAULT_CATALOG)), source
+
+
+def read_base_catalog(tree: GitTree, override: str | None) -> tuple[dict | None, str]:
+    """Read the base revision's catalog so a group's retired inputs still count.
+
+    A base predating the catalog is the supported rollout case. A base catalog
+    that exists but cannot be read is a diagnostic, never a silent omission. A
+    fixture catalog supplied with ``--catalog`` has no base counterpart.
+    """
+    if override:
+        return None, "not-applicable"
+    if not tree.exists(DEFAULT_CATALOG):
+        return None, "absent"
+    source = f"{DEFAULT_CATALOG}@{tree.label}"
+    document = load_catalog_document(source, tree.read(DEFAULT_CATALOG))
+    groups = document.get("groups")
+    policy_inputs = document.get("policy_inputs")
+    if not isinstance(groups, list) or not isinstance(policy_inputs, list):
+        raise PlannerError(f"{source} declares no readable 'groups' and 'policy_inputs'")
+    for group in groups:
+        if (
+            not isinstance(group, dict)
+            or not isinstance(group.get("id"), str)
+            or not isinstance(group.get("inputs"), list)
+        ):
+            raise PlannerError(f"{source} declares a group with no readable 'id' and 'inputs'")
+    if not all(isinstance(entry, str) for entry in policy_inputs):
+        raise PlannerError(f"{source} declares a non-string policy input")
+    return document, "present"
 
 
 def main(argv: list[str]) -> int:
@@ -909,6 +979,7 @@ def main(argv: list[str]) -> int:
             print(problem, file=sys.stderr)
         return 2
     base_packages = load_packages(base, required=False)
+    base_catalog, base_catalog_state = read_base_catalog(base, arguments.catalog)
 
     request_ids: list[str] = []
     request_all_hspec = False
@@ -916,11 +987,13 @@ def main(argv: list[str]) -> int:
     if arguments.request_file:
         request_source = arguments.request_file
         try:
-            with open(arguments.request_file, "r", encoding="utf-8") as handle:
-                request_text = handle.read()
+            with open(arguments.request_file, "rb") as handle:
+                raw_request = handle.read()
         except OSError as error:
             raise PlannerError(f"cannot read request file {arguments.request_file}: {error}") from error
-        request_ids, request_all_hspec = parse_request(request_text, request_source)
+        request_ids, request_all_hspec = parse_request(
+            decode(raw_request, arguments.request_file), request_source
+        )
 
     plan = build_plan(
         root,
@@ -933,6 +1006,8 @@ def main(argv: list[str]) -> int:
         request_source,
         base_packages,
         head_packages,
+        base_catalog,
+        base_catalog_state,
     )
     if arguments.as_json:
         print(json.dumps(plan, indent=2, sort_keys=False))

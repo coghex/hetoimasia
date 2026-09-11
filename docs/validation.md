@@ -43,7 +43,11 @@ depends on uncommitted working-tree contents. `--catalog-check` has no revision
 and therefore reads the working tree. Invalid revisions and unreadable package
 metadata are diagnostics, never a successful unchanged-input plan. A base
 revision that predates the catalog or the package graph is supported: the plan
-records `base_package_metadata: "absent"` and derives inputs from the head alone.
+records `base_package_metadata` and `base_catalog` as `"absent"` and derives
+inputs from the head alone. A base catalog that exists but cannot be read is a
+diagnostic rather than a silent omission, and every file the planner reads is
+decoded as strict UTF-8: metadata that would have to be repaired to parse is
+reported, never quietly accepted.
 
 ## Catalog schema
 
@@ -53,7 +57,7 @@ The catalog is a JSON object. Keys are fixed; an unknown key is an error.
 | --- | --- | --- |
 | `schema_version` | integer | Must be `1`. |
 | `policy_version` | integer | The selection policy revision, recorded in every plan. |
-| `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are treated as an input of every non-optional group, so a planner or catalog edit conservatively widens non-optional coverage without ever selecting an optional group. |
+| `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are an input of *every* group, so a planner or catalog edit widens non-optional coverage conservatively and still marks an optional group's inputs changed when its own definition moved — without ever selecting an optional group, since selection reaches those only through a request. |
 | `non_affecting_paths` | array of strings | Declared harmless classes (see below). |
 | `floor` | array of strings | The mandatory floor. Every entry must name a registered, non-optional group. |
 | `groups` | array of objects | The registered groups, in canonical order. |
@@ -97,8 +101,9 @@ registered yet; optional handling is proven with fixture catalogs in
 
 A group's inputs are the union of:
 
-- its declared `inputs`;
-- for a non-optional group, the catalog's `policy_inputs`;
+- its declared `inputs`, unioned with the inputs the same group declared in the
+  base revision's catalog;
+- the catalog's `policy_inputs`, from both revisions;
 - the Cabal closure of its `component`: each component's `hs-source-dirs` (as
   directory prefixes), its `main-is`, the owning package's `.cabal` file, and
   `cabal.project`, followed transitively across local `build-depends` and
@@ -106,7 +111,8 @@ A group's inputs are the union of:
   package.
 
 The closure is derived from **both** revisions and unioned, so a source that was
-removed or relocated still counts for the group that used to own it. A change to
+removed or relocated — or an input a group has since stopped declaring — still
+counts for the group that used to own it. A change to
 `hetoimasia-foundation` therefore selects `test.engine` even when `test/` is
 untouched, and a change to `app/Main.hs` selects it through the
 `build-tool-depends: hetoimasia:hetoimasia` edge.
@@ -160,8 +166,8 @@ whether earlier evidence still applies:
 - a changed relevant input makes it `true`;
 - unknown-input fallback marks every non-optional group's inputs changed, so
   uncertainty can never reach a consumer as equivalence;
-- an optional group still reports `true` when its own inputs changed, even
-  though it stays unselected.
+- an optional group still reports `true` when its own inputs changed or its own
+  catalog definition moved, even though it stays unselected.
 
 ## Requesting groups from a pull request
 
@@ -181,6 +187,11 @@ malformed or unterminated block, more than one block, or an `all-hspec` request
 matching no Hspec group is an error exit with a diagnostic. A request only ever
 adds coverage: it can never remove the floor or an affected group.
 
+Fence nesting is honoured, so an example shown inside an outer fenced block — as
+in this document — is documentation rather than a live request. The info string
+must be the bare word `validation-request`; a fence that starts with that word
+and carries anything else is reported as malformed instead of being ignored.
+
 Extracting this block from the live pull-request body is CI-2's work. The
 planner reads the text from `--request-file`.
 
@@ -194,6 +205,7 @@ planner reads the text from `--request-file`.
 | `catalog` | The resolved catalog source and its group count. |
 | `base`, `head` | Each revision's name with its resolved `commit` and `tree`. |
 | `base_package_metadata` | `present` or `absent`. |
+| `base_catalog` | `present`, `absent`, or `not-applicable` when `--catalog` overrode it. |
 | `request` | The request `source`, its literal `ids`, its `all_hspec` flag, and the `resolved` identifier set. |
 | `changed_paths` | Each path with its Git `status`, its `classification`, and its `consumers`. |
 | `unknown_inputs` | The unclassified paths, sorted. |
@@ -207,8 +219,10 @@ fixture catalogs. It covers transitive and build-tool dependency selection,
 documentation-only changes, consumed Markdown overriding its prose class,
 build-policy changes, renames and deletions, base-revision derivation, unknown
 inputs and their `inputs_changed` behaviour, optional exclusion through fallback
-and through a shared harness input, request validation and `all-hspec`, the
-empty Hspec match, malformed and missing catalogs, unresolvable revisions, and
-the explained omissions in the prose output.
+and through a shared harness input, optional and retired catalog definition
+changes, request validation, nested and malformed request fences, `all-hspec`,
+the empty Hspec match, malformed, missing, and non-UTF-8 catalogs and package
+metadata, unresolvable revisions, and the explained omissions in the prose
+output.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

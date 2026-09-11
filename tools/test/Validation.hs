@@ -9,9 +9,10 @@ import Control.Monad (void)
 import Data.List (isInfixOf)
 import Json (asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (getCurrentDirectory, removeFile, renameFile)
+import System.Directory (createDirectoryIfMissing, getCurrentDirectory, removeFile, renameFile)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
+import System.IO (IOMode (WriteMode), hClose, hPutStr, hSetEncoding, latin1, openFile)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldSatisfy)
 
@@ -119,6 +120,29 @@ spec = describe "Validation planner" $ do
         selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
         selectionOf plan "probe.slow" `shouldBe` Just (Selection "optional-unrequested" False True)
 
+  describe "definition changes" $ do
+    it "marks an optional group's inputs changed when its own definition changes" $
+      withFixture $ \fixture → do
+        change fixture "tools/validation/catalog.json" revisedOptionalCatalog
+        plan ← planJson fixture []
+        selectionOf plan "probe.slow" `shouldBe` Just (Selection "optional-unrequested" False True)
+
+    it "keeps an explicitly requested group's changed definition visible" $
+      withFixture $ \fixture → do
+        change fixture "tools/validation/catalog.json" revisedOptionalCatalog
+        writeFixtureFile (root fixture) "request.md" (requestBlock ["probe.slow"])
+        plan ← planJson fixture ["--request-file", root fixture </> "request.md"]
+        selectionOf plan "probe.slow" `shouldBe` Just (Selection "requested" True True)
+
+    it "counts an input a group declared at the base but no longer declares" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "tools/validation/catalog.json" retiredInputCatalog
+        writeFixtureFile (root fixture) "docs/consumed.md" "revised fixture document\n"
+        commit fixture "retire a declared input and change it"
+        plan ← planJson fixture []
+        classificationOf plan "docs/consumed.md" `shouldBe` Just "consumed"
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
+
   describe "requests" $ do
     it "adds a requested group without removing floor coverage or inventing changed inputs" $
       withFixture $ \fixture → do
@@ -156,6 +180,26 @@ spec = describe "Validation planner" $ do
         (result, _, errors) ← planRaw fixture (seeded fixture) ["--request-file", root fixture </> "request.md"]
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "never closed"
+
+    it "rejects a malformed validation-request info string" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "request.md" "```validation-request please\nprobe.slow\n```\n"
+        (result, _, errors) ← planRaw fixture (seeded fixture) ["--request-file", root fixture </> "request.md"]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "malformed validation-request info string"
+
+    it "ignores a validation-request example nested inside an outer fence" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "request.md" nestedExample
+        plan ← planJsonAt fixture (seeded fixture) ["--request-file", root fixture </> "request.md"]
+        selectionOf plan "probe.slow" `shouldBe` Just (Selection "optional-unrequested" False False)
+
+    it "reads a real request that follows a documentation example" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "request.md" (nestedExample ++ requestBlock ["test.harness"])
+        plan ← planJsonAt fixture (seeded fixture) ["--request-file", root fixture </> "request.md"]
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "requested" True False)
+        selectionOf plan "probe.slow" `shouldBe` Just (Selection "optional-unrequested" False False)
 
     it "rejects an all-hspec request that matches no Hspec group" $
       withFixture $ \fixture → do
@@ -206,6 +250,22 @@ spec = describe "Validation planner" $ do
         (result, _, errors) ← planRawBetween fixture (initial fixture) (initial fixture) []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "tools/validation/catalog.json does not exist"
+
+    it "refuses a catalog that is not valid UTF-8 instead of repairing it" $
+      withFixture $ \fixture → do
+        writeLatin1 (root fixture </> "fixtures/invalid.json") "{\"schema_version\": 1, \"\xff\": 1}\n"
+        (result, _, errors) ← planner' fixture
+          ["--catalog-check", "--catalog", root fixture </> "fixtures/invalid.json"]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "is not valid UTF-8"
+
+    it "refuses package metadata that is not valid UTF-8 while planning" $
+      withFixture $ \fixture → do
+        writeLatin1 (root fixture </> "packages/alpha/alpha.cabal") (alphaPackage ++ "-- \xff\n")
+        commit fixture "corrupt the package description"
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "is not valid UTF-8"
 
   describe "revisions" $ do
     it "plans against a base revision that predates the catalog and the package graph" $
@@ -317,6 +377,29 @@ requestBlock ∷ [String] → String
 requestBlock entries =
   unlines (["Some pull request prose.", "", "```validation-request"] ++ entries ++ ["```", "", "Closing prose."])
 
+-- | Write a file through a byte-preserving encoding, so a fixture can hold the
+-- invalid UTF-8 a diagnostic is expected to reject.
+writeLatin1 ∷ FilePath → String → IO ()
+writeLatin1 path contents = do
+  createDirectoryIfMissing True (takeDirectory path)
+  handle ← openFile path WriteMode
+  hSetEncoding handle latin1
+  hPutStr handle contents
+  hClose handle
+
+nestedExample ∷ String
+nestedExample =
+  unlines
+    [ "Documented like this:"
+    , ""
+    , "````markdown"
+    , "```validation-request"
+    , "probe.slow"
+    , "```"
+    , "````"
+    , ""
+    ]
+
 fixtureFiles ∷ [(FilePath, String)]
 fixtureFiles =
   [ ("cabal.project", projectFile)
@@ -401,6 +484,28 @@ fixtureCatalog =
     [ groupDocument "build.all" "\"all\"" [] "none" "build" False
     , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
     , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
+    , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/"] "hspec" "probe" True
+    ]
+
+-- | The fixture catalog with the optional group's command redefined.
+revisedOptionalCatalog ∷ String
+revisedOptionalCatalog =
+  catalogDocument
+    ["    \"build.all\""]
+    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
+    , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/", "probe/extra/"] "hspec" "probe" True
+    ]
+
+-- | The fixture catalog with a declared input retired from @test.harness@.
+retiredInputCatalog ∷ String
+retiredInputCatalog =
+  catalogDocument
+    ["    \"build.all\""]
+    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh"] "hspec" "test" False
     , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/"] "hspec" "probe" True
     ]
 
