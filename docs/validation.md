@@ -629,8 +629,9 @@ rather than allowed to re-decide an untouched head. They are separate on purpose
 decision it makes is the one `review_gate.py dismissal` is tested against. It
 checks out with full history — the replay below reads the approved head, the
 commit the update merged in, and the base's own history, none of which a shallow
-clone has — reads the pull request's current head, the pushed commits' trees, and
-the current labels, then answers with an action.
+clone has — proves the push's starting point from the pull request's comment
+feed, reads the pull request's current head, the pushed commits' trees, and the
+current labels, then answers with an action.
 
 It checks out and answers for the push's own `after`, not the head named
 elsewhere in the payload, and every decision below is refused unless the pull
@@ -649,6 +650,13 @@ The decision itself:
 
 - it refuses outright when the head has moved on, because removing approval from
   a head it never examined would invalidate someone else's newer review;
+- it keeps the label when a canonical review named the pushed head itself: that
+  approval is a new origin, and neither the push's history nor its starting
+  point has anything to say about it;
+- otherwise it requires the push's **starting point to be a proven approved
+  revision**, as decided by `review_provenance.py` below — an attached label
+  proves nothing about the head it was left on, so an unproven starting point
+  strips however the trees compare and whatever the replay says;
 - it compares the **trees** of the push's before and after commits — a re-pushed
   identical tree changes nothing a reviewer read, and an unavailable starting
   point counts as a change, because an unreadable comparison cannot establish
@@ -715,12 +723,91 @@ python3 tools/validation/review_replay.py \
 
 `dismiss-stale-approval` publishes those fields as the **provenance** of the
 review being carried, never as a review of the new tree. `approved_head` is the
-immediately preceding approval-bearing head: repeated clean updates can carry one
-review through a chain of them, so it is not necessarily the revision anybody
-read, and the summary says so alongside the plain statement that no reviewer
-examined the resulting integration tree. A `strip` records the same fields, with
+immediately preceding head: repeated clean updates carry one review through a
+chain of them, and the revision a reviewer actually read is the *proven origin*
+the next section establishes, which the summary names alongside the route the
+carry took from it and the plain statement that no reviewer examined the
+resulting integration tree. A `strip` records the same fields, with
 `not established` where the replay could not reach one, so a decision that never
 got as far as merging is distinguishable from one that never ran.
+
+### Proving the starting point
+
+The replay and the tree comparison prove that a push changed nothing a reviewer
+read. Neither proves that the *starting point* was ever entitled to the
+approval it carries, and the label cannot: a delayed dismissal for an earlier
+push refuses to touch a superseded head — correctly, since the newer head is
+someone else's to judge — and leaves `reviewed:approve` standing on a head
+nobody proved. Left there, the next push inherits it. Push B adds unreviewed
+behaviour on top of reviewed head A; before A→B's dismissal runs, push C lands
+as Git's clean merge of B with `master`, or as a new commit with exactly B's
+tree; A→B exits 3 for the superseded head; B→C sees an attached label, a clean
+replay or an identical tree, and keeps it.
+
+`tools/validation/review_provenance.py` closes that gap by proving the
+starting point from the pull request's own comment feed. A revision is a
+**proven approved revision** when it is
+
+- a head a **canonical review** named: a `pr-review:v2` marker (or the
+  drainer's own `pr-review:v1` spelling) in a comment authored by the
+  repository owner's account — the identity the Kanban coordinator and drainer
+  publish under — whose newest marker naming that exact head reads
+  `verdict=APPROVE`. The marker is bound to this repository and pull request by
+  where it was posted and to the revision by its `head=`; a later marker for
+  the same head that requests changes withdraws it, and a later approval
+  re-establishes it; or
+- a head reached from such a revision through an **unbroken chain of recorded
+  carries**: one `approval-provenance:v1` record per push, authored by this
+  repository's own workflow identity (`github-actions[bot]`), naming the
+  `before` it carried from, the `after` it carried to, and the origin the
+  decision traced the carry back to. The proof re-walks the links rather than
+  trusting that origin field.
+
+A record is written by `dismiss-stale-approval` alone — the only job in this
+repository's workflows that can — and only after the decision concluded with
+the head still current and the label confirmed attached at the pushed head. A
+`before` whose own decision was superseded, failed, cancelled, or never ran
+left no record and is unproven, and so is one whose carry the job could not
+record: a record that fails to post fails the job rather than leaving the next
+push to discover the gap. A head a canonical review named itself needs no
+record, since the marker is its proof. Nothing else counts: a green
+`review-approved` check, an observed label, a successful dismissal that found
+no label, and every success of the earlier algorithm that never wrote a record
+prove no carry. A pull request approved before this rule existed therefore
+keeps its label only until its next push, unless that push's starting point or
+its own head carries a canonical marker.
+
+The script always exits 0, for the same reason the replay does: `unproven` is
+an answer the caller removes a label on, and a feed that is missing,
+unreadable, malformed, or not a list of comments proves nothing and is
+reported as `unproven` with the reason — never inferred `proven` from tree
+equality or replay eligibility, and never turned into a failure that would
+abort the job before the removal it justifies. Its `key=value` lines are
+`provenance`, `provenance_reason`, `origin`, `chain` (every revision from the
+origin to the starting point, comma-separated), and `head_approved`. The
+superseded-head and unreadable-label refusals are unchanged and are answered
+before provenance is consulted.
+
+Run it against a feed the same way the job does:
+
+```bash
+gh api --paginate --slurp "repos/<owner>/<repo>/issues/<number>/comments?per_page=100" > comments.json
+python3 tools/validation/review_provenance.py \
+  --before <the starting point> --after <the pushed head> \
+  --comments comments.json --owner <the repository owner>
+```
+
+`dismiss-stale-approval` reads the owner's markers once more **immediately
+before removing** the label. The head-equality guard cannot see a canonical
+approval granted to this exact head while the decision was queued — the head
+did not move — and stripping it would remove a review somebody just granted to
+this very revision, so the newest marker naming the event head wins there too,
+and a marker read that fails refuses like every other unconfirmed read in that
+job. Its summary states the starting point's verdict and reason, the proven
+origin, and, for a carry, the route from that origin through every recorded
+head to the pushed one; for a strip it names the link that could not be
+proven — the starting point itself, or the revision an otherwise recorded
+chain traced back to without arriving anywhere.
 
 Review inheritance decides review, and nothing else. `review-approved` stays
 label-only and never reads `build-test`; `build-test` never reads the label. A
@@ -782,10 +869,13 @@ merges, and the contract between them is three signals and nothing else:
 | `dismiss-stale-approval` succeeded, label absent | There is no approval; the candidate needs review |
 | `dismiss-stale-approval` failed | A drainer error — the decision did not complete, and its absence is never read as either answer |
 
-That is the same contract the previous slice published, and the replay changes
-none of it: the check name, its success semantics, and the label's meaning are
-unchanged, and the job still never adds the label itself. What changed is only
-*which* pushes leave the label attached.
+That is the same contract the previous slices published, and neither the
+replay nor the provenance proof changes it: the check name, its success
+semantics, and the label's meaning are unchanged, and the job still never adds
+the label itself. What changed is only *which* pushes leave the label attached.
+The carry records are ordinary comments the drainer does not read, and the
+canonical markers the proof reads are the ones the drainer already publishes
+and verifies; nothing the proof needs is missing from the installed drainer.
 
 For a candidate GitHub reports `BEHIND`, the drainer requests a branch update
 through the `update-branch` API with the expected head, and waits for
@@ -902,7 +992,32 @@ consumes the replay is covered too: a content-changing push carried by a `keep`,
 a `keep` still reported as eligibility rather than inheritance when no label is
 attached, a `keep` surviving a before-tree that could not be read, the replay's
 own reason reaching the summary unrewritten, and an unrecognized verdict refused
-rather than guessed.
+rather than guessed. So is the composition that consumes the provenance
+verdict: an unproven starting point stripping through an identical tree and
+through a clean replay, a canonical approval of the pushed head keeping through
+a `strip`, that approval asking for no mutation when no label is attached, the
+superseded-head and unreadable-label refusals answered first, and unrecognized
+provenance and head-approval inputs refused.
+
+The provenance proof is driven against real Git histories and fixture comment
+feeds, with the shipped replay, provenance, and gate scripts composed exactly
+as the workflow composes them. It reproduces both sequences the rule exists
+for — a clean base merge of an unproven intermediate head and an identical-tree
+push on top of one, each stripping — and the delayed earlier invalidation
+refused for its superseded head before the next push strips; an earlier carry
+whose mutation failed or never ran and so recorded nothing; a feed that could
+not be read, is not valid JSON, or is not a list of comments, each stripping;
+the paged feed the workflow fetches; a review marker by anyone but the owner
+and a carry record by anyone but the workflow, each ignored; a later marker
+withdrawing an approval of the same head and a later one re-establishing it; a
+fresh canonical approval of the pushed head surviving over an unproven starting
+point, and a head approved after an earlier strip starting a new chain; an
+identical-tree re-push and a clean base merge of a proven head, and three
+successive base merges each recorded from the last, proven back to the origin
+with the chain named; a chain broken in the middle naming the link that ran
+out; a carried head's push that still carries more than the merge; and the
+failing sequence composed end to end — decision, the shipped mutation step, and
+the verdict withholding approval.
 
 The replay rule itself is proven against real Git histories in temporary
 repositories, because rename detection, conflict resolution, and reachability are
@@ -924,11 +1039,20 @@ content-changing push earns, the write that must not happen when the decision
 was to keep, a decision that was correct when made and is stopped at write time
 because the head advanced, a removal that did not take, and a label read that
 failed rather than returning nothing, and a decision that never concluded
-refused rather than confirmed. The provenance it publishes is asserted
-there too — every revision a carried approval was decided from, the credit to the
-earlier review without a claim that anyone read the new tree, eligibility
-reported instead of inheritance when no label is attached, and the fields a strip
-could not establish recorded rather than omitted.
+refused rather than confirmed. A canonical approval that arrived after the
+decision is covered there too: the removal withheld for a marker naming this
+exact head, the newest marker for that head winning, a fresh approval of some
+other head ignored, and a marker read that failed refused. So is the record it
+writes: a kept approval recorded at the head it was carried to with the link
+named exactly, no record for a head a canonical review named itself or when
+the label was gone by the time the decision was applied, and a record that
+could not be posted or has no proven origin failing the job. The provenance it
+publishes is asserted there too — every revision a carried approval was decided
+from, the proven origin and the route the carry took from it, the credit to the
+earlier review without a claim that anyone read the new tree, the link that
+could not be proven named on a strip, eligibility reported instead of
+inheritance when no label is attached, and the fields a strip could not
+establish recorded rather than omitted.
 
 Candidate identity and reuse are covered against temporary Git repositories and
 a stub `gh` answering from canned files. The identity examples assert that a

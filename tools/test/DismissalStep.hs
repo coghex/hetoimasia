@@ -10,15 +10,28 @@
 -- step's own @run@ body out of @.github/workflows/review-gate.yml@ and execute
 -- it against a stubbed @gh@, so what is asserted is the shell that actually
 -- ships rather than a restatement of it. The stub is what makes the races
--- reachable: a head that advances between the decision and the write, and a
--- label read that fails rather than coming back empty, do not occur on demand
+-- reachable: a head that advances between the decision and the write, a
+-- canonical approval granted to that head after the decision was made, and a
+-- read that fails rather than coming back empty, do not occur on demand
 -- against a real repository.
 --
--- The same step also publishes the provenance of an approval that outlived a
--- code push. That summary is the only place a reader can see which review is
--- being carried and which revisions the replay was decided from, so it is
+-- The same step also records a carried approval at the head it was carried
+-- to, which is what the next push's decision reads to prove that head, and
+-- publishes the provenance of an approval that outlived a code push. That
+-- summary is the only place a reader can see which review is being carried
+-- and how the head was reached from the revision it was granted at, so it is
 -- asserted here rather than treated as decoration.
-module DismissalStep (spec) where
+module DismissalStep
+  ( spec
+  , Repository (..)
+  , Outcome (..)
+  , settled
+  , withStep
+  , approval
+  , pushedHead
+  , approvedHead
+  , approvalMarker
+  ) where
 
 import Control.Monad (unless)
 import Data.List (isInfixOf)
@@ -40,8 +53,21 @@ approvedHead = "cccccccccccccccccccccccccccccccccccccccc"
 incorporatedBase = "dddddddddddddddddddddddddddddddddddddddd"
 replayTree = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
+-- | The revision a reviewer actually read, two carries behind the pushed head.
+originHead ∷ String
+originHead = "ffffffffffffffffffffffffffffffffffffffff"
+
 approval ∷ String
 approval = "reviewed:approve"
+
+-- | The account whose review markers are canonical in the fixture repository.
+owner ∷ String
+owner = "coghex"
+
+-- | The canonical coordinator's marker for one head, as the owner posts it.
+approvalMarker ∷ String → String → String
+approvalMarker headSha verdict =
+  "<!-- pr-review:v2 reviewers=codex models=unspecified head=" ++ headSha ++ " verdict=" ++ verdict ++ " -->"
 
 -- | How the stubbed repository and the decision before it answer this run.
 data Repository = Repository
@@ -51,12 +77,38 @@ data Repository = Repository
   , replay ∷ String
   , replayReached ∷ Bool
   , decision ∷ String
+  , -- | The owner-authored comment bodies the pre-removal marker read returns.
+    markers ∷ [String]
+  , markerReadFails ∷ Bool
+  , recordFails ∷ Bool
+  , provenance ∷ String
+  , provenanceReason ∷ String
+  , origin ∷ String
+  , chain ∷ String
+  , headApproved ∷ String
   }
 
 -- | A repository that behaves: the head is the pushed one, the removal took,
--- and the replay reached its inputs and refused to carry the approval.
+-- the replay reached its inputs and refused to carry the approval, and the
+-- starting point was a head a reviewer read.
 settled ∷ Repository
-settled = Repository pushedHead [] False "strip" True "success"
+settled =
+  Repository
+    { liveHead = pushedHead
+    , labelsAfter = []
+    , labelReadFails = False
+    , replay = "strip"
+    , replayReached = True
+    , decision = "success"
+    , markers = []
+    , markerReadFails = False
+    , recordFails = False
+    , provenance = "proven"
+    , provenanceReason = "a canonical review approved the starting point itself"
+    , origin = approvedHead
+    , chain = approvedHead
+    , headApproved = "false"
+    }
 
 -- | The outcome of running the shipped step: its own result, every `gh` call it
 -- made, and the job summary it published.
@@ -120,6 +172,96 @@ spec = describe "Stale approval mutation" $ do
     withStep settled {labelsAfter = ["ci"]} "remove" "removed" $ \outcome →
       result outcome `shouldBe` ExitSuccess
 
+  describe "a canonical approval that arrived after the decision" $ do
+    it "keeps the approval a review granted to this exact head" $
+      -- The head-equality guard cannot see this one: the head did not move, a
+      -- reviewer simply approved it while the decision was queued. Removing
+      -- now would strip a review somebody just granted to this very revision.
+      withStep
+        settled {labelsAfter = [approval], markers = [approvalMarker pushedHead "APPROVE"]}
+        "remove"
+        "removed"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          unwords (calls outcome) `shouldNotContain` "--remove-label"
+          output outcome `shouldContain` "after the decision was made"
+          summary outcome `shouldContain` "named this head itself"
+          unwords (calls outcome) `shouldNotContain` "approval-provenance:v1"
+
+    it "lets the newest marker naming the head win" $
+      -- An approval later withdrawn for the same head is not an approval.
+      withStep
+        settled
+          { markers =
+              [ approvalMarker pushedHead "APPROVE"
+              , approvalMarker pushedHead "CHANGES_REQUESTED"
+              ]
+          }
+        "remove"
+        "removed"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+
+    it "is not persuaded by a fresh approval of some other head" $
+      withStep settled {markers = [approvalMarker newerHead "APPROVE"]} "remove" "removed" $
+        \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+
+    it "fails rather than reading a failed marker lookup as no approval" $
+      withStep settled {markerReadFails = True} "remove" "removed" $ \outcome → do
+        result outcome `shouldSatisfy` (/= ExitSuccess)
+        output outcome `shouldContain` "review markers could not be read back"
+        unwords (calls outcome) `shouldNotContain` "--remove-label"
+
+  describe "the carry it records" $ do
+    it "records a kept approval at the head it was carried to" $
+      -- The record is what the next push's decision reads to prove this head,
+      -- so it names the link exactly: where the carry started, where it landed,
+      -- and the revision the review was granted at.
+      withStep settled {labelsAfter = [approval], replay = "keep"} "none" "kept" $ \outcome → do
+        result outcome `shouldBe` ExitSuccess
+        calls outcome `shouldSatisfy` any (isInfixOf "-X POST")
+        unwords (calls outcome)
+          `shouldContain` ( "<!-- approval-provenance:v1 origin=" ++ approvedHead
+                              ++ " before=" ++ approvedHead ++ " after=" ++ pushedHead ++ " -->"
+                          )
+
+    it "records nothing when a canonical review named the head itself" $
+      -- The marker is that head's own proof; a record would only restate it.
+      withStep
+        settled {labelsAfter = [approval], headApproved = "true", origin = pushedHead, chain = ""}
+        "none"
+        "kept"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+          summary outcome `shouldContain` "named this head itself"
+
+    it "records nothing when the label was gone by the time the decision was applied" $
+      -- A successful job with no label is the handshake's "no approval", and
+      -- a record here would let a later push prove a carry that never was.
+      withStep settled {replay = "keep"} "none" "kept" $ \outcome → do
+        result outcome `shouldBe` ExitSuccess
+        unwords (calls outcome) `shouldNotContain` "-X POST"
+        summary outcome `shouldContain` "no longer attached"
+
+    it "fails rather than confirming a carry it could not record" $
+      -- A carry the next push cannot see is a strip waiting to happen; better
+      -- that this job says so than that the next push discovers it.
+      withStep settled {labelsAfter = [approval], replay = "keep", recordFails = True} "none" "kept" $
+        \outcome → do
+          result outcome `shouldSatisfy` (/= ExitSuccess)
+          output outcome `shouldContain` "could not be recorded"
+
+    it "fails rather than recording a carry with no proven origin" $
+      withStep settled {labelsAfter = [approval], replay = "keep", origin = ""} "none" "kept" $
+        \outcome → do
+          result outcome `shouldSatisfy` (/= ExitSuccess)
+          output outcome `shouldContain` "without a proven origin"
+          unwords (calls outcome) `shouldNotContain` "-X POST"
+
   describe "the provenance it publishes" $ do
     it "names every revision a carried approval was decided from" $
       -- The summary is the only place a reader can see why an approval outlived
@@ -135,14 +277,51 @@ spec = describe "Stale approval mutation" $ do
           summary outcome `shouldContain` ("- Replay tree: `" ++ replayTree ++ "`")
           summary outcome `shouldContain` ("- Resulting head: `" ++ pushedHead ++ "`")
 
+    it "names the proven origin and the route the carry took from it" $
+      withStep
+        settled
+          { labelsAfter = [approval]
+          , replay = "keep"
+          , origin = originHead
+          , chain = originHead ++ "," ++ approvedHead
+          , provenanceReason = "the starting point was reached from the canonically approved origin through 1 recorded carry"
+          }
+        "none"
+        "kept"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          summary outcome `shouldContain` ("- Proven origin: `" ++ originHead ++ "`")
+          summary outcome
+            `shouldContain` ( "- Reached from the proven origin through: `" ++ take 12 originHead
+                                ++ "` → `" ++ take 12 approvedHead ++ "` → `" ++ take 12 pushedHead ++ "`"
+                            )
+          summary outcome `shouldContain` "- Starting point: proven — the starting point was reached"
+
     it "credits the earlier review without claiming the new tree was read" $
-      -- Repeated clean updates carry one review through a chain of heads, so the
-      -- approved head is not necessarily the revision anybody examined — and
-      -- nobody examined the integration tree at all.
+      -- Repeated clean updates carry one review through a chain of heads. The
+      -- origin is the revision somebody examined; nobody examined the
+      -- integration tree at all.
       withStep settled {labelsAfter = [approval], replay = "keep"} "none" "kept" $
         \outcome → do
-          summary outcome `shouldContain` "immediately preceding approval-bearing head"
+          summary outcome `shouldContain` "granted at the proven origin, the revision a reviewer read"
           summary outcome `shouldContain` "no reviewer examined the resulting integration tree"
+
+    it "states which link could not be proven when it strips" $
+      withStep
+        settled
+          { replay = "keep"
+          , provenance = "unproven"
+          , provenanceReason = "the starting point cccccccccccc has no canonical approval and no recorded carry leads into it"
+          , origin = ""
+          , chain = ""
+          }
+        "remove"
+        "removed"
+        $ \outcome → do
+          result outcome `shouldBe` ExitSuccess
+          summary outcome `shouldContain` "- Starting point: unproven — the starting point cccccccccccc has no canonical approval"
+          summary outcome `shouldContain` "- Proven origin: not established"
+          summary outcome `shouldNotContain` "no reviewer examined"
 
     it "reports a replay with no label as eligibility rather than inheritance" $
       withStep settled {replay = "keep"} "none" "absent" $ \outcome → do
@@ -173,8 +352,13 @@ withStep repository action expected assertion = do
     createDirectoryIfMissing True binPath
     writeFixtureFile directory "head" (liveHead repository ++ "\n")
     writeFixtureFile directory "labels" (unlines (labelsAfter repository))
+    writeFixtureFile directory "markers" (unlines (markers repository))
     unless (not (labelReadFails repository)) $
       writeFixtureFile directory "labels-fail" ""
+    unless (not (markerReadFails repository)) $
+      writeFixtureFile directory "markers-fail" ""
+    unless (not (recordFails repository)) $
+      writeFixtureFile directory "record-fail" ""
     writeFixtureFile directory "summary" ""
     writeFixtureFile directory "step.sh" body
     writeFixtureFile binPath "gh" (stub directory)
@@ -197,6 +381,12 @@ withStep repository action expected assertion = do
           , ("INCORPORATED_BASE", reached incorporatedBase)
           , ("REPLAY_TREE", reached replayTree)
           , ("RESULTING_HEAD", pushedHead)
+          , ("PROVENANCE", provenance repository)
+          , ("PROVENANCE_REASON", provenanceReason repository)
+          , ("ORIGIN", origin repository)
+          , ("CHAIN", chain repository)
+          , ("HEAD_APPROVED", headApproved repository)
+          , ("OWNER", owner)
           , ("LABEL", approval)
           , ("GITHUB_STEP_SUMMARY", directory </> "summary")
           ]
@@ -244,15 +434,33 @@ extractor =
     ]
 
 -- | A `gh` that records every call and answers from the fixture directory.
+--
+-- The comment feed is answered twice over: a read of the owner's marker bodies
+-- before a removal, and the record the step posts after a carry. Both are told
+-- apart by the request rather than the endpoint, since they share one.
 stub ∷ FilePath → String
 stub directory =
   unlines
     [ "#!/bin/sh"
     , "printf '%s\\n' \"$*\" >> " ++ show (directory </> "calls")
-    , "case \"$1 $2\" in"
+    , "case \"$*\" in"
+    , "  *' -X POST '*'/comments'*)"
+    , "    if [ -f " ++ show (directory </> "record-fail") ++ " ]; then"
+    , "      echo 'stub: the record could not be posted' >&2"
+    , "      exit 1"
+    , "    fi"
+    , "    echo '{}'"
+    , "    ;;"
+    , "  *'/comments'*)"
+    , "    if [ -f " ++ show (directory </> "markers-fail") ++ " ]; then"
+    , "      echo 'stub: the comments could not be read' >&2"
+    , "      exit 1"
+    , "    fi"
+    , "    cat " ++ show (directory </> "markers")
+    , "    ;;"
     , "  'api '*) cat " ++ show (directory </> "head") ++ " ;;"
-    , "  'pr edit') exit 0 ;;"
-    , "  'pr view')"
+    , "  'pr edit'*) exit 0 ;;"
+    , "  'pr view'*)"
     , "    if [ -f " ++ show (directory </> "labels-fail") ++ " ]; then"
     , "      echo 'stub: the labels could not be read' >&2"
     , "      exit 1"

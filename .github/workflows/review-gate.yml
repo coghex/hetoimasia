@@ -14,11 +14,18 @@
 # workflow and checks nothing out, so that token never reaches
 # contributor-authored code.
 #
-# A content-changing push keeps its approval in exactly one case: the push is
-# Git's own clean merge of the approved head with a commit the base already
-# contains, so the submitted tree is one the earlier review already covers.
-# `review_replay.py` proves that in the checkout; nothing here decides it from
-# the payload, and everything it cannot prove invalidates the approval.
+# A push keeps its approval only from a *proven* starting point: a head a
+# canonical review named, or one reached from it through carries this workflow
+# itself recorded. `review_provenance.py` proves that from the pull request's
+# comment feed, because an attached label proves nothing about the head it was
+# left on — a delayed dismissal refuses to touch a superseded head, and the
+# next push would otherwise inherit whatever it left standing. From a proven
+# starting point, a content-changing push keeps its approval in exactly one
+# case: the push is Git's own clean merge of that head with a commit the base
+# already contains, so the submitted tree is one the earlier review already
+# covers. `review_replay.py` proves that in the checkout; nothing here decides
+# either from the payload, and everything they cannot prove invalidates the
+# approval.
 name: review-gate
 
 on:
@@ -59,6 +66,11 @@ jobs:
       incorporated_base: ${{ steps.replay.outputs.incorporated_base }}
       replay_tree: ${{ steps.replay.outputs.replay_tree }}
       resulting_head: ${{ steps.replay.outputs.resulting_head }}
+      provenance: ${{ steps.provenance.outputs.provenance }}
+      provenance_reason: ${{ steps.provenance.outputs.provenance_reason }}
+      origin: ${{ steps.provenance.outputs.origin }}
+      chain: ${{ steps.provenance.outputs.chain }}
+      head_approved: ${{ steps.provenance.outputs.head_approved }}
     steps:
       - name: Check out the head
         uses: actions/checkout@v7
@@ -87,6 +99,34 @@ jobs:
             --after "$AFTER" \
             --base "origin/$BASE_REF" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Prove the starting point's approval
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          # The account the canonical coordinator and drainer publish their
+          # review markers under. A marker by anyone else names no approval.
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # The whole feed, paged, into a file the script reads: the proof is
+          # then exercised in tests against fixture feeds exactly as it runs
+          # here. A fetch that fails leaves no file, and the script answers
+          # `unproven` for that rather than aborting before the removal it
+          # justifies — a feed that could not be read proves nothing.
+          feed="$RUNNER_TEMP/comments.json"
+          if ! gh api --paginate --slurp "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" > "$feed"; then
+            rm -f "$feed"
+          fi
+          python3 tools/validation/review_provenance.py \
+            --before "$BEFORE" \
+            --after "$AFTER" \
+            --comments "$feed" \
+            --owner "$OWNER" | tee -a "$GITHUB_OUTPUT"
+
       - name: Decide the approval's fate
         id: decide
         env:
@@ -98,6 +138,9 @@ jobs:
           AFTER: ${{ github.event.after }}
           REPLAY: ${{ steps.replay.outputs.replay_decision }}
           REPLAY_REASON: ${{ steps.replay.outputs.replay_reason }}
+          PROVENANCE: ${{ steps.provenance.outputs.provenance }}
+          PROVENANCE_REASON: ${{ steps.provenance.outputs.provenance_reason }}
+          HEAD_APPROVED: ${{ steps.provenance.outputs.head_approved }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -129,6 +172,9 @@ jobs:
             --after-tree "$after_tree" \
             --replay-decision "$REPLAY" \
             --replay-reason "$REPLAY_REASON" \
+            --provenance "$PROVENANCE" \
+            --provenance-reason "$PROVENANCE_REASON" \
+            --head-approved "$HEAD_APPROVED" \
             --label-attached "$attached" \
             --label "$LABEL" | tee -a "$GITHUB_OUTPUT"
 
@@ -166,6 +212,12 @@ jobs:
           INCORPORATED_BASE: ${{ needs['decide-dismissal'].outputs.incorporated_base }}
           REPLAY_TREE: ${{ needs['decide-dismissal'].outputs.replay_tree }}
           RESULTING_HEAD: ${{ needs['decide-dismissal'].outputs.resulting_head }}
+          PROVENANCE: ${{ needs['decide-dismissal'].outputs.provenance }}
+          PROVENANCE_REASON: ${{ needs['decide-dismissal'].outputs.provenance_reason }}
+          ORIGIN: ${{ needs['decide-dismissal'].outputs.origin }}
+          CHAIN: ${{ needs['decide-dismissal'].outputs.chain }}
+          HEAD_APPROVED: ${{ needs['decide-dismissal'].outputs.head_approved }}
+          OWNER: ${{ github.repository_owner }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -196,6 +248,37 @@ jobs:
             exit 1
           fi
 
+          # A canonical review may have approved this exact head after the
+          # decision was made — a fresh approval for the newest push arrives
+          # whenever a reviewer is faster than a queued run — and the head
+          # check above cannot see it, since the head did not move. Read the
+          # owner's review markers again immediately before removing, and let
+          # the newest marker naming this head win. A read that fails is not
+          # an empty one: removing on it could strip an approval somebody just
+          # granted, so it is refused like every other unconfirmed read here.
+          if [ "$ACTION" = "remove" ]; then
+            owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+            if ! markers="$(gh api --paginate "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" \
+                --jq ".[] | select(((.user.login // \"\") | ascii_downcase) == \"$owner\") | .body")"; then
+              echo "::error::the review markers could not be read back, so this decision is unconfirmed"
+              exit 1
+            fi
+            newest="$(printf '%s\n' "$markers" \
+              | grep -Eo "<!-- pr-review:v(2 reviewers=[^ ]+ models=[^ ]+|1 reviewer=[^ ]+) head=$EVENT_HEAD verdict=(APPROVE|CHANGES_REQUESTED) -->" \
+              | tail -n 1 || true)"
+            case "$newest" in
+              *'verdict=APPROVE -->')
+                echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
+                ACTION=none
+                EXPECTED=kept
+                REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
+                HEAD_APPROVED=true
+                ORIGIN="$EVENT_HEAD"
+                CHAIN=""
+                ;;
+            esac
+          fi
+
           if [ "$ACTION" = "remove" ]; then
             gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
           fi
@@ -217,6 +300,33 @@ jobs:
 
           echo "$LABEL $EXPECTED: $REASON"
 
+          # A carried approval is recorded at the head it was carried to, and
+          # only now: after the decision concluded, with the head still
+          # current and the label confirmed attached. The record is what the
+          # next push's decision reads to prove *this* head, so it is written
+          # by this job alone — the only identity in this repository's
+          # workflows that can — and a record that could not be written is a
+          # carry the next push cannot see, which is reported rather than
+          # left for that push to discover. A head a canonical review named
+          # itself needs no record: the marker is its proof.
+          carried=false
+          if [ "$EXPECTED" = "kept" ] && [ "$HEAD_APPROVED" != "true" ]; then
+            if [ -z "$ORIGIN" ]; then
+              echo "::error::the decision kept $LABEL without a proven origin, so no carry can be recorded"
+              exit 1
+            fi
+            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+              record="$(printf "Carried \`%s\` from \`%s\` to \`%s\`. The review it carries was granted at \`%s\`; no reviewer examined \`%s\`.\n\n<!-- approval-provenance:v1 origin=%s before=%s after=%s -->" \
+                "$LABEL" "${BEFORE:0:12}" "${EVENT_HEAD:0:12}" "${ORIGIN:0:12}" "${EVENT_HEAD:0:12}" \
+                "$ORIGIN" "$BEFORE" "$EVENT_HEAD")"
+              if ! gh api -X POST "repos/$REPOSITORY/issues/$NUMBER/comments" -f body="$record" > /dev/null; then
+                echo "::error::the carried approval could not be recorded at $EVENT_HEAD, so this decision is unconfirmed"
+                exit 1
+              fi
+              carried=true
+            fi
+          fi
+
           # Provenance, not a review. Every field below names a revision this
           # decision was actually made from, and the closing line says plainly
           # whose review is being carried and that nobody read the integration
@@ -235,13 +345,25 @@ jobs:
             echo "- Push: \`${BEFORE:0:12}\`..\`${EVENT_HEAD:0:12}\`"
             echo "- Replay: $REPLAY — $REPLAY_REASON"
             echo "- \`$LABEL\`: $EXPECTED — $REASON"
+            echo "- Starting point: $PROVENANCE — $PROVENANCE_REASON"
+            provenance "Proven origin" "$ORIGIN"
             provenance "Approved head" "$APPROVED_HEAD"
             provenance "Incorporated base commit" "$INCORPORATED_BASE"
             provenance "Replay tree" "$REPLAY_TREE"
             provenance "Resulting head" "$RESULTING_HEAD"
-            if [ "$REPLAY" = "keep" ] && [ "$EXPECTED" = "kept" ]; then
-              echo "- The approved head is the immediately preceding approval-bearing head, which repeated clean updates may have carried the original review through; it is not necessarily the revision a reviewer read, and no reviewer examined the resulting integration tree."
-            elif [ "$REPLAY" = "keep" ]; then
+            if [ "$HEAD_APPROVED" = "true" ]; then
+              echo "- A canonical review named this head itself, so nothing is inherited."
+            elif [ "$carried" = "true" ]; then
+              route=""
+              IFS=',' read -ra hops <<< "$CHAIN"
+              for hop in "${hops[@]}" "$EVENT_HEAD"; do
+                route="${route:+$route → }\`${hop:0:12}\`"
+              done
+              echo "- Reached from the proven origin through: $route"
+              echo "- The review being carried was granted at the proven origin, the revision a reviewer read; every later head on that route was reached by a recorded carry, and no reviewer examined the resulting integration tree."
+            elif [ "$EXPECTED" = "kept" ]; then
+              echo "- The decision kept \`$LABEL\`, but it was no longer attached when this decision was applied, so no carry was recorded."
+            elif [ "$REPLAY" = "keep" ] && [ "$EXPECTED" = "absent" ]; then
               echo "- The push was replay-eligible, but \`$LABEL\` was not attached, so no review is being carried forward."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
