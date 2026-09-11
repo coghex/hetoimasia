@@ -35,6 +35,9 @@ python3 tools/validation/plan.py --catalog-check
 | `--catalog-check` | Validate the catalog and exit; takes no revisions and no request. |
 | `--json` | Emit the plan as JSON rather than prose. |
 
+`tools/validation/range.py` resolves the two revisions CI passes to `--base` and
+`--head`; see [Running validation on GitHub](#running-validation-on-github).
+
 Every planner run validates the catalog first and exits non-zero with a specific
 diagnostic naming the offending group before producing any plan.
 
@@ -237,18 +240,28 @@ The workflow's default permission is `contents: read`, and no job uses a secret.
 The first job needs Python 3 and Git alone — no GHC, no Cabal — so a
 documentation candidate never pays for a Haskell image to learn it needs one
 job. It times out in five minutes, checks out full history, and resolves the
-comparison range:
+comparison range through `tools/validation/range.py`:
 
 | Event | Base | Head |
 | --- | --- | --- |
 | `pull_request` | `git merge-base <base sha> <head sha>` | the pull request's head |
-| `push` | `git merge-base <before> <after>` | the pushed commit |
+| `push` | the event's own `before` commit | the pushed commit |
 
-A pull request's contribution is its merge-base range: upstream commits the
-branch never touched are not this candidate's work. A push whose starting point
-is unavailable — a new branch, or history replaced by a force push — has no
-honest comparison to make, so the job fails with that diagnostic rather than
-inventing a narrower range that would under-select silently.
+The two events ask different questions, and the difference is not cosmetic. A
+pull request contributes a merge-base range: upstream commits its branch never
+touched are not its work, so comparing against the fork point isolates what it
+proposes. A push contributes exactly what it moved the branch by, which is the
+range the event names.
+
+The merge base of a push's two endpoints is **not** a conservative stand-in for
+that range. When a push replaces history rather than extending it, the common
+ancestor can be older than the work being dropped, and a diff taken from there
+does not contain the removal at all: a push that reverts a source file by
+resetting onto its ancestor would look like whatever else the new tip happens to
+add, and the group consuming that source would be reported `unaffected`. So
+`before` is used as the event gives it, and a `before` that is absent or
+unresolvable — a new branch, or history no longer reachable — is a diagnostic
+that fails the job rather than a range guessed from something else.
 
 The pull-request body reaches the planner through a file written from the event
 payload's environment variable, never through shell interpolation: it is
@@ -409,7 +422,17 @@ rather than allowed to re-decide an untouched head. They are separate on purpose
 `decide-dismissal` holds only read access and checks the candidate out, so the
 decision it makes is the one `review_gate.py dismissal` is tested against. It
 reads the pull request's current head, the pushed commits' trees, and the
-current labels, then answers with an action:
+current labels, then answers with an action.
+
+Every label read in this workflow is a **tri-state**. A read can fail, and a
+failed read is not an absent label: piping `gh pr view` straight into an `if`
+condition would hide the difference, because Bash exempts a condition's failure
+from `set -e`, and a transient API error would then be read as "no approval to
+dismiss" — leaving a stale approval standing on changed code. Each read is
+captured into a variable, and a failure becomes `unknown`, which every decision
+refuses to act on.
+
+The decision itself:
 
 - it refuses outright when the head has moved on, because removing approval from
   a head it never examined would invalidate someone else's newer review;
@@ -421,15 +444,22 @@ current labels, then answers with an action:
   actually attached.
 
 `dismiss-stale-approval` holds the only write permission in this repository's
-workflows, and it checks nothing out and runs no repository script, so that
-token never reaches contributor-authored code. It re-reads the head **again,
-immediately before mutating** rather than trusting the read the decision was
-made from: the decision job's own API calls take time, and a push landing in
-that window would leave a superseded run stripping an approval that belongs to a
-head it never examined. It then applies the decision and confirms a removal by
-reading the labels back, failing if the label is still attached — the drainer
-reads this job's success together with the label, so a removal that did not take
-must not look like one that did.
+workflows. It re-reads the head **again, immediately before mutating** rather
+than trusting the read the decision was made from: the decision job's own API
+calls take time, and a push landing in that window would leave a superseded run
+stripping an approval that belongs to a head it never examined. That guard is
+`review_gate.py apply`, and `review_gate.py confirm` then checks that a removal
+took — the drainer reads this job's success together with the label, so a
+removal that did not take must not look like one that did, and an unreadable
+label state is not a confirmed one.
+
+Both guards are tested helpers rather than inline shell, which is why this job
+takes a **sparse checkout of `tools/validation` alone**, with credentials not
+persisted. The amended contract keeps the write-scoped token away from
+contributor-authored code, and that is what the sparse path preserves: the token
+never sits beside the project's build and test tooling, which is the code a
+worker would run. The alternative was an untested guard on the only mutation
+either workflow performs.
 
 This slice never keeps an approval across a content-changing push. Carrying
 review through a clean base merge is a later slice's work.
@@ -539,10 +569,18 @@ nothing it owns was selected, a plan that registers no groups or whose
 after the plan was resolved, the planner's own failure leaving no plan, an
 unfinished job's timings reported as unavailable, and every review-gate
 decision: the keep, remove, absent, and unreadable-starting-point cases, a
-delayed run refusing to touch a newer head's approval, a failed, cancelled, or
+delayed run refusing to touch a newer head's approval, a decision that was
+correct when made and is stopped at write time because the head advanced, a
+removal that did not take, a label read that failed, a failed, cancelled, or
 unexpectedly skipped invalidation, and an absent label.
 
-Two of those are regressions rather than hypotheticals. The timeout example
+It also covers the comparison range: a pull request across its merge base, a
+push from the commit it started at, a push whose starting commit is absent or
+unresolvable, and a history-replacing push — that last one asserted **both**
+ways, so it records that the merge-base range reports the reverted group
+`unaffected` while the event's own range reports it `affected`.
+
+Several of those are regressions rather than hypotheticals. The timeout example
 starts a descendant that ignores `SIGTERM` under a shell that does not, so it
 fails against any cleanup that infers the group's fate from the process it
 launched; the worker example supplies a passing receipt alongside a `failure`

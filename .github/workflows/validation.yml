@@ -69,28 +69,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            # A pull request's contribution is its merge-base range: upstream
-            # commits the branch has not touched are not this candidate's work.
             git fetch --no-tags --quiet origin "$PR_BASE_SHA" "$PR_HEAD_SHA" 2>/dev/null || true
-            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
-            head="$PR_HEAD_SHA"
+            arguments=(--event pull_request --base-sha "$PR_BASE_SHA" --head-sha "$PR_HEAD_SHA")
           else
-            # A push's range is the commits it actually added. When its starting
-            # point is unavailable — a new branch, or history replaced by a
-            # force push — there is no honest comparison to make, and inventing
-            # a narrower one would under-select silently.
-            head="$PUSH_AFTER"
-            if [ -z "${PUSH_BEFORE:-}" ] \
-              || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ] \
-              || ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-              echo "::error::the pushed range's starting commit ${PUSH_BEFORE:-<absent>} is unavailable; refusing to plan against an unknown base"
-              exit 1
-            fi
-            base="$(git merge-base "$PUSH_BEFORE" "$PUSH_AFTER")"
+            arguments=(--event push --before "${PUSH_BEFORE:-}" --after "$PUSH_AFTER")
           fi
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "planning $base..$head for $EVENT_NAME"
+          # The two events ask different questions, and getting a push's range
+          # wrong hides exactly the work a force push removed. That resolution
+          # is a tested tool rather than shell arithmetic here.
+          python3 tools/validation/range.py "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Capture the validation request
         env:

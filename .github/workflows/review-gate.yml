@@ -77,10 +77,17 @@ jobs:
           fi
           after_tree="$(gh api "repos/$REPOSITORY/commits/$AFTER" --jq '.commit.tree.sha')"
 
-          attached=false
-          if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
-            | grep -qxF "$LABEL"; then
-            attached=true
+          # Read the labels into a variable rather than piping straight into an
+          # `if` condition: Bash exempts a condition's failure from `set -e`, so
+          # a transient API error would arrive here indistinguishable from an
+          # absent label — and be read as "nothing to dismiss".
+          if labels="$(gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name')"; then
+            attached=false
+            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+              attached=true
+            fi
+          else
+            attached=unknown
           fi
 
           python3 tools/validation/review_gate.py dismissal \
@@ -102,6 +109,19 @@ jobs:
       # checks nothing out and runs no repository script.
       pull-requests: write
     steps:
+      # A sparse checkout of the gate helper alone, so the write-scoped token
+      # never sits beside the project's build and test tooling. See the review
+      # note in the pull request: the amended contract keeps this job away from
+      # contributor-authored code, and the guard below has to be a tested helper
+      # rather than untested inline shell.
+      - name: Check out the gate helper
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: tools/validation
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Apply the decision
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,23 +141,31 @@ jobs:
           # calls take time, and a push landing in that window would leave this
           # run stripping an approval that belongs to a head it never examined.
           current_head="$(gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha')"
-          if [ "$current_head" != "$EVENT_HEAD" ]; then
-            echo "::error::this run was started for head $EVENT_HEAD, but the head is now $current_head; refusing to change approval for a superseded head"
-            exit 1
+          guard="$(python3 tools/validation/review_gate.py apply \
+            --event-head "$EVENT_HEAD" \
+            --current-head "$current_head" \
+            --action "$ACTION")"
+
+          if [ "$guard" = "mutate=yes" ]; then
+            gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
           fi
 
-          if [ "$ACTION" = "remove" ]; then
-            gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
-            # Confirm from the repository rather than from the command's exit
-            # status: the drainer reads this job's success together with the
-            # label, so a removal that did not take must not look like one that
-            # did.
-            if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
-              | grep -qxF "$LABEL"; then
-              echo "::error::$LABEL is still attached after the removal"
-              exit 1
+          # Confirm from the repository rather than from the command's exit
+          # status: the drainer reads this job's success together with the
+          # label, so a removal that did not take must not look like one that
+          # did. An unreadable label state is not a confirmed one.
+          if labels="$(gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name')"; then
+            attached=false
+            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+              attached=true
             fi
+          else
+            attached=unknown
           fi
+          python3 tools/validation/review_gate.py confirm \
+            --expected "$EXPECTED" \
+            --label-attached "$attached" \
+            --label "$LABEL"
 
           echo "$LABEL $EXPECTED: $REASON"
           {
@@ -175,10 +203,13 @@ jobs:
         run: |
           set -euo pipefail
           current_head="$(gh api "repos/$REPOSITORY/pulls/$NUMBER" --jq '.head.sha')"
-          attached=false
-          if gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name' \
-            | grep -qxF "$LABEL"; then
-            attached=true
+          if labels="$(gh pr view "$NUMBER" --repo "$REPOSITORY" --json labels --jq '.labels[].name')"; then
+            attached=false
+            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+              attached=true
+            fi
+          else
+            attached=unknown
           fi
           {
             echo "## Review gate"

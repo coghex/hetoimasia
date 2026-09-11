@@ -26,6 +26,7 @@ extra-source-files:
     tools/docs_land.sh
     tools/docs_land_paths.py
     tools/validation/plan.py
+    tools/validation/range.py
     tools/validation/catalog.json
     tools/validation/receipts.py
     tools/validation/run.py

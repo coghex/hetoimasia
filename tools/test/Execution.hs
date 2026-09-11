@@ -11,7 +11,7 @@ module Execution (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Monad (void)
 import Data.Maybe (isNothing)
-import Json (Json (..), asString, field, parseJson)
+import Json (Json (..), asBool, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.Exit (ExitCode (..))
@@ -303,6 +303,65 @@ spec = describe "Validation execution" $ do
             ]
         result `shouldBe` ExitSuccess
 
+  describe "the comparison range" $ do
+    it "compares a pull request across its merge base" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        head' ← revision fixture "HEAD"
+        (result, output, _) ←
+          resolveRange fixture ["--event", "pull_request", "--base-sha", seeded fixture, "--head-sha", head']
+        result `shouldBe` ExitSuccess
+        output `shouldContain` ("base=" ++ seeded fixture)
+        output `shouldContain` ("head=" ++ head')
+
+    it "compares a push from the commit it actually started at" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        head' ← revision fixture "HEAD"
+        (result, output, _) ←
+          resolveRange fixture ["--event", "push", "--before", seeded fixture, "--after", head']
+        result `shouldBe` ExitSuccess
+        output `shouldContain` ("base=" ++ seeded fixture)
+
+    it "compares a history-replacing push against the history it replaced" $
+      withFixture $ \fixture → do
+        -- `before` changed a consumed source; `after` abandons that line and
+        -- edits prose instead. Their merge base predates both, so a range taken
+        -- from it sees only the prose and would omit the group whose input the
+        -- push reverted. The event's own `before` is what makes the removal
+        -- visible.
+        change fixture "src/note.txt" "a source change this push discards\n"
+        before ← revision fixture "HEAD"
+        void $ git (environment fixture) (root fixture) ["reset", "-q", "--hard", seeded fixture]
+        change fixture "README.md" "prose only\n"
+        after ← revision fixture "HEAD"
+        (result, output, _) ←
+          resolveRange fixture ["--event", "push", "--before", before, "--after", after]
+        result `shouldBe` ExitSuccess
+        output `shouldContain` ("base=" ++ before)
+        -- Planned from that range the discarded source counts, so the group
+        -- that consumes it is selected rather than quietly dropped.
+        plan ← planInto fixture before "divergent.json"
+        selectionOf plan "test.fail" `shouldReturn` Just (Selection "affected" True True)
+        -- Planned from the merge base instead, the same push looks like prose.
+        merged ← planInto fixture (seeded fixture) "merged.json"
+        selectionOf merged "test.fail" `shouldReturn` Just (Selection "unaffected" False False)
+
+    it "refuses a push whose starting commit is unavailable" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        head' ← revision fixture "HEAD"
+        (missing, _, absent) ←
+          resolveRange fixture ["--event", "push", "--before", "", "--after", head']
+        missing `shouldBe` ExitFailure 2
+        absent `shouldContain` "names no starting commit"
+        (unknown, _, errors) ←
+          resolveRange
+            fixture
+            ["--event", "push", "--before", "6c1f2a0d4b8e3f57a9c0d1e2b3a4f5061728394a", "--after", head']
+        unknown `shouldBe` ExitFailure 2
+        errors `shouldContain` "starting commit"
+
   describe "the planner's own failure" $
     it "produces a diagnostic and no plan when the request is invalid" $
       withFixture $ \fixture → do
@@ -324,6 +383,21 @@ spec = describe "Validation execution" $ do
             ]
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "group.absent"
+
+-- | Selection facts for one catalog group: its reason, whether it was
+-- selected, and whether its own inputs changed.
+data Selection = Selection String Bool Bool
+  deriving (Eq, Show)
+
+selectionOf ∷ FilePath → String → IO (Maybe Selection)
+selectionOf plan identifier = do
+  document ← parseJson <$> readFile plan
+  pure $ do
+    entry ← document >>= field "groups" >>= entryFor "id" identifier
+    reason ← field "reason" entry >>= asString
+    selected ← field "selected" entry >>= asBool
+    changed ← field "inputs_changed" entry >>= asBool
+    pure (Selection reason selected changed)
 
 -- | Every field a receipt must carry for a later slice to attribute it.
 requiredReceiptFields ∷ [String]
@@ -381,6 +455,14 @@ runGroup fixture group plan extra =
       ]
         ++ extra
     )
+
+resolveRange ∷ Fixture → [String] → IO (ExitCode, String, String)
+resolveRange fixture arguments =
+  run
+    (environment fixture)
+    (root fixture)
+    "python3"
+    ((tools fixture </> "range.py") : "--repo-root" : root fixture : arguments)
 
 aggregate ∷ Fixture → FilePath → [String] → IO (ExitCode, String, String)
 aggregate fixture plan extra =
