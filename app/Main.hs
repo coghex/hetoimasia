@@ -25,8 +25,10 @@ main = do
 consoleComponent ∷ Component
 consoleComponent = unsafeComponent "console"
 
+-- | @stderr@ is this process's, not the logger's: the sink borrows it, and the
+-- runtime scope holding it outlives every entry written through it.
 smoke ∷ IO ()
 smoke = do
-  let logger = handleLogger defaultLogFilter stderr
+  logger ← handleLogger defaultLogFilter stderr
   runApplication logger "hetoimasia" $
     logInfo logger consoleComponent "Hello from Hetoimasia." []

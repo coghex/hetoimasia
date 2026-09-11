@@ -11,7 +11,13 @@
 -- evaluation, timestamp, or thread lookup. Sinks are synchronous and their
 -- exceptions propagate to the caller.
 --
--- See @docs/logging.md@ for the same contract in prose.
+-- 'formatEntry' renders one entry as exactly one line of text; 'newHandleSink'
+-- writes those lines to a borrowed handle, serializing every write and flush
+-- across the loggers sharing it. The handle stays the caller's: the sink never
+-- closes it and never changes its buffering.
+--
+-- See @docs/logging.md@ for the same contract in prose, including the record
+-- layout, the quoting rules, and the ownership and failure obligations.
 module Hetoimasia.Foundation.Log
   ( -- * Severity
     LogLevel (..)
@@ -31,9 +37,17 @@ module Hetoimasia.Foundation.Log
   , LogEntry (..)
   , SourceLocation (..)
 
+    -- * Record layout
+  , FormatOptions (..)
+  , defaultFormatOptions
+  , formatEntry
+
     -- * Sinks
   , LogSink
-  , handleSink
+  , newHandleSink
+  , newHandleSinkWith
+  , callbackSink
+  , callbackSinkWith
 
     -- * Metadata providers
   , MetadataProviders (..)
@@ -49,6 +63,9 @@ module Hetoimasia.Foundation.Log
   , withFields
   , withBreadcrumb
 
+    -- * Flushing
+  , flushLogger
+
     -- * Emission
   , logEvent
   , logDebug
@@ -57,9 +74,10 @@ module Hetoimasia.Foundation.Log
   , logError
   ) where
 
-import Control.Concurrent (myThreadId)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Monad (when)
-import Data.Char (isAsciiLower, isDigit)
+import Data.Char (isAsciiLower, isControl, isDigit, isPrint, isSpace, ord)
 import Data.List (find)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -68,7 +86,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
-import Data.Time.Clock (UTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime (utctDayTime), diffTimeToPicoseconds, getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import GHC.Stack
   ( CallStack
   , HasCallStack
@@ -78,7 +97,7 @@ import GHC.Stack
   , srcLocStartLine
   , withFrozenCallStack
   )
-import System.IO (Handle)
+import System.IO (Handle, hFlush)
 
 -- | Severity, ordered from most to least detailed. The ordering is used for
 -- threshold comparisons; 'Debug' is never selected by a threshold (see
@@ -209,28 +228,170 @@ data LogEntry = LogEntry
   }
   deriving (Eq, Show)
 
--- | Where emitted entries go. Called synchronously on the emitting thread;
--- exceptions propagate to the caller. The caller owns the sink's resources and
--- any concurrency policy.
-type LogSink = LogEntry → IO ()
+-- | What a sink's records look like, and whether each one is flushed.
+--
+-- @formatFlush@ only decides whether the sink asks the handle to flush after
+-- every record; it promises nothing about what an unflushed record is or is
+-- not visible through, because the handle's buffering belongs to the caller.
+data FormatOptions = FormatOptions
+  { formatThread ∷ !Bool
+    -- ^ Whether the @thread=@ segment is emitted. There is no separate
+    -- thread-logging API; this option is the control.
+  , formatFlush ∷ !Bool
+    -- ^ Whether the sink flushes after every record.
+  }
+  deriving (Eq, Show)
 
--- | Borrow a handle, writing one line per entry. The sink neither closes the
--- handle nor changes its buffering. The layout is provisional: a message
--- containing newlines is not escaped, so it does not stay on one physical
--- line.
-handleSink ∷ Handle → LogSink
-handleSink handle = Text.hPutStrLn handle . formatEntry
+-- | Thread segment on, per-entry flush on.
+defaultFormatOptions ∷ FormatOptions
+defaultFormatOptions = FormatOptions { formatThread = True, formatFlush = True }
 
-formatEntry ∷ LogEntry → Text
-formatEntry entry =
-  "[" <> levelName (entryLevel entry) <> "] "
-    <> componentText (entryComponent entry) <> ": " <> entryMessage entry
+-- | Render one entry as exactly one line, with no terminating newline: a sink
+-- adds its own record terminator. Segments are separated by single spaces and
+-- an absent optional segment is omitted entirely.
+--
+-- > <time> <LEVEL> <component> thread=<n> [src=<file>:<line>] [crumbs=<a>><b>] msg=<message> [<key>=<value> ...]
+--
+-- The time is UTC as ISO 8601 with exactly three fractional digits, truncating
+-- finer precision, and a @Z@ suffix. @src=@ appears only for an entry carrying
+-- a source location and @crumbs=@ only when there is at least one breadcrumb.
+-- Fields follow the message, sorted by key.
+--
+-- Message, breadcrumb, field-value, source-file, and thread text is written
+-- bare when it is nonempty and holds only printable non-space characters other
+-- than the four the layout reserves:
+--
+-- > " \ = >
+--
+-- Anything else is double-quoted, with these escapes inside the quotes:
+--
+-- > \" \\ \n \r \t
+--
+-- and every other control character written as a backslash, a @u@, and four
+-- uppercase hex digits. Empty text renders as a pair of quotes. Field keys and
+-- component names are never quoted.
+formatEntry ∷ FormatOptions → LogEntry → Text
+formatEntry options entry = Text.intercalate " " (concat parts)
+  where
+    parts =
+      [ [formatTimestamp (entryTime entry)]
+      , [levelName (entryLevel entry)]
+      , [componentText (entryComponent entry)]
+      , ["thread=" <> renderText (entryThread entry) | formatThread options]
+      , foldMap (pure . sourceSegment) (entrySource entry)
+      , [crumbSegment (entryBreadcrumbs entry) | not (null (entryBreadcrumbs entry))]
+      , ["msg=" <> renderText (entryMessage entry)]
+      , [key <> "=" <> renderText value | (key, value) ← Map.toAscList (entryFields entry)]
+      ]
+
+    sourceSegment location =
+      "src=" <> renderText (sourceFile location)
+        <> ":" <> Text.pack (show (sourceLine location))
+
+    crumbSegment crumbs = "crumbs=" <> Text.intercalate ">" (map renderText crumbs)
+
+-- | UTC as ISO 8601 with millisecond precision. Sub-millisecond precision is
+-- truncated rather than rounded, so the rendering of a timestamp never depends
+-- on digits the layout does not show.
+formatTimestamp ∷ UTCTime → Text
+formatTimestamp time =
+  Text.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S" time)
+    <> "." <> Text.justifyRight 3 '0' (Text.pack (show milliseconds))
+    <> "Z"
+  where
+    milliseconds =
+      (diffTimeToPicoseconds (utctDayTime time) `mod` 1000000000000) `div` 1000000000
+
+-- | A text value as one layout segment: bare when that cannot disturb the
+-- layout, and double-quoted with escapes otherwise.
+renderText ∷ Text → Text
+renderText value
+  | not (Text.null value) && Text.all bare value = value
+  | otherwise = "\"" <> Text.concatMap escaped value <> "\""
+  where
+    bare character =
+      isPrint character
+        && not (isSpace character)
+        && character /= '"'
+        && character /= '\\'
+        && character /= '='
+        && character /= '>'
+
+escaped ∷ Char → Text
+escaped '"' = "\\\""
+escaped '\\' = "\\\\"
+escaped '\n' = "\\n"
+escaped '\r' = "\\r"
+escaped '\t' = "\\t"
+escaped character
+  | isControl character = "\\u" <> hex4 (ord character)
+  | otherwise = Text.singleton character
+
+hex4 ∷ Int → Text
+hex4 value = Text.pack (map nibble [4096, 256, 16, 1])
+  where
+    nibble place = "0123456789ABCDEF" !! ((value `div` place) `mod` 16)
 
 levelName ∷ LogLevel → Text
 levelName Debug = "DEBUG"
 levelName Info = "INFO"
 levelName Warning = "WARN"
 levelName Error = "ERROR"
+
+-- | Where emitted entries go, plus the flush that empties whatever the sink
+-- writes through. Both are called synchronously on the emitting thread and
+-- their exceptions propagate to the caller; a sink failure is never reported
+-- back through the failing sink. The caller owns the sink's resources.
+--
+-- Build one with 'newHandleSink', 'newHandleSinkWith', 'callbackSink', or
+-- 'callbackSinkWith'.
+data LogSink = LogSink
+  { sinkWrite ∷ !(LogEntry → IO ())
+  , sinkFlush ∷ !(IO ())
+  }
+
+-- | 'newHandleSinkWith' with 'defaultFormatOptions'.
+newHandleSink ∷ Handle → IO LogSink
+newHandleSink = newHandleSinkWith defaultFormatOptions
+
+-- | Borrow a handle. The sink writes each record as one whole line and never
+-- closes the handle, changes its buffering, or outlives the caller's own
+-- ownership of it; the handle stays usable after every logger sharing this
+-- sink is discarded.
+--
+-- Writes and flushes are serialized across every logger sharing this sink, so
+-- concurrent producers never interleave within a line and each producer's own
+-- order is preserved. Ordering between threads is unspecified. That guarantee
+-- is the sink value's, not the handle's: two roots sharing one handle must
+-- share one sink, and constructing two handle sinks over one handle is
+-- unsupported.
+--
+-- A failing or interrupted write releases the serialization state before the
+-- exception leaves, so the next call on any sharing logger proceeds rather
+-- than deadlocking. Such a write may leave a partial record; no transactional
+-- file write is promised.
+newHandleSinkWith ∷ FormatOptions → Handle → IO LogSink
+newHandleSinkWith options handle = do
+  ownership ← newMVar ()
+  let serialized action = withMVar ownership (const action)
+  pure LogSink
+    { sinkWrite = \entry → serialized $ do
+        Text.hPutStr handle (formatEntry options entry <> "\n")
+        when (formatFlush options) (hFlush handle)
+    , sinkFlush = serialized (hFlush handle)
+    }
+
+-- | 'callbackSinkWith' with a no-op flush, for a callback with no flushable
+-- state of its own.
+callbackSink ∷ (LogEntry → IO ()) → LogSink
+callbackSink callback = callbackSinkWith callback (pure ())
+
+-- | Wrap a caller-supplied callback and its flush action. The callback may
+-- receive concurrent calls and supplies its own synchronization; it must not
+-- emit to the same sink recursively. Exceptions from either action propagate
+-- like any other sink failure.
+callbackSinkWith ∷ (LogEntry → IO ()) → IO () → LogSink
+callbackSinkWith callback flush = LogSink { sinkWrite = callback, sinkFlush = flush }
 
 -- | The metadata an entry cannot derive from its call. Injected so tests can
 -- supply fixed values and observe that a suppressed entry calls neither.
@@ -239,12 +400,18 @@ data MetadataProviders = MetadataProviders
   , metadataThread ∷ IO Text
   }
 
--- | The real providers: the system UTC clock and this thread's identity.
+-- | The real providers: the system UTC clock and this thread's numeric GHC
+-- identity, which is what the @thread=@ segment of the layout shows.
 systemMetadata ∷ MetadataProviders
 systemMetadata = MetadataProviders
   { metadataClock = getCurrentTime
-  , metadataThread = Text.pack . show <$> myThreadId
+  , metadataThread = threadIdentity <$> myThreadId
   }
+
+-- | The number out of @ThreadId 7@, so the layout carries the identity rather
+-- than its @Show@ spelling.
+threadIdentity ∷ ThreadId → Text
+threadIdentity = Text.pack . dropWhile (not . isDigit) . show
 
 -- | An opaque logger. 'mkLoggerWith' is the only way to build one, so every
 -- logger applies a filter and owns its context; 'withFields' and
@@ -272,9 +439,12 @@ mkLoggerWith configuration providers sink = Logger
 mkLogger ∷ LogFilter → LogSink → Logger
 mkLogger configuration = mkLoggerWith configuration systemMetadata
 
--- | A production logger writing to a borrowed handle through 'handleSink'.
-handleLogger ∷ LogFilter → Handle → Logger
-handleLogger configuration = mkLogger configuration . handleSink
+-- | A production logger writing to a borrowed handle through 'newHandleSink'.
+-- Derive every other logger over that handle from this one, or share its sink
+-- explicitly: a second handle sink over the same handle serializes against
+-- nothing.
+handleLogger ∷ LogFilter → Handle → IO Logger
+handleLogger configuration handle = mkLogger configuration <$> newHandleSink handle
 
 -- | Derive a logger carrying additional immutable context fields, sharing the
 -- parent's filter, providers, and sink. These fields override fields of the
@@ -289,6 +459,12 @@ withFields fields logger =
 withBreadcrumb ∷ Text → Logger → Logger
 withBreadcrumb breadcrumb logger =
   logger { loggerBreadcrumbs = loggerBreadcrumbs logger <> [breadcrumb] }
+
+-- | Flush this logger's sink, whether or not the sink flushes every entry.
+-- Derived loggers share their root's sink, so flushing any one of them flushes
+-- what all of them wrote. Failures propagate like any other sink failure.
+flushLogger ∷ Logger → IO ()
+flushLogger = sinkFlush . loggerSink
 
 -- | The single emission path. The filter decides before @message@ or @fields@
 -- are forced and before either metadata provider runs. Event fields override
@@ -311,7 +487,7 @@ logEvent logger level component message fields =
           , entrySource =
               if filterSource (loggerFilter logger) then callSite callStack else Nothing
           }
-    loggerSink logger entry
+    sinkWrite (loggerSink logger) entry
 
 -- | Emit at 'Debug' through 'logEvent'.
 logDebug ∷ HasCallStack ⇒ Logger → Component → Text → [(Text, Text)] → IO ()
