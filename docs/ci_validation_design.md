@@ -22,14 +22,15 @@ concrete precondition
 
 ## Processing status
 
-- [#8] EPIC. Establish effective, selective CI and validation reuse
-- [#10] CI-1. Define the shared catalog and explainable test selection
-- [#11] CI-2. Run selected validation through stable, parallel GitHub checks
-- [#12] CI-3. Preserve valid CI evidence across documentation changes
-- [ ] CI-4. Carry review approval through clean base merges independently of CI
-- [deferred] CI-5. Integrate `test` and `autotest` with the shared testing contract
+- [x] EPIC. Establish effective, selective CI and validation reuse — [#8]
+- [x] CI-1. Define the shared catalog and explainable test selection — [#10]
+- [x] CI-2. Run selected validation through stable, parallel GitHub checks — [#11]
+- [x] CI-3. Preserve valid CI evidence across documentation changes — [#12]
+- [x] CI-4. Carry review approval through clean base merges independently of CI — [#13]
+- [ ] CI-5. Integrate `test` and `autotest` with the shared testing contract — [deferred]: the owner explicitly requests `test`/`autotest` integration
 
 These delivery boundaries are ready for issue processing and mirrored below.
+Umbrella epic #8 tracks this arc; children are filed one per processing run.
 CI-1 and CI-2 have landed; the behaviour they established is described in
 [validation.md](validation.md) rather than here, because this document records
 the design rather than the shipped system.
@@ -49,7 +50,7 @@ actual interfaces then before choosing adapter or scheduler changes.
   prerequisite for completing the initial CI arc.
 - **Users and operators:** the solo owner, implementation/review agents, Kanban's
   controllers, and testing skills using Hetoimasia's testing framework.
-- **Arc label:** `ci` proposed; no tracker artifact created by this document.
+- **Arc label:** `ci` (created 2026-09-10); umbrella epic #8.
 
 ## Current state and evidence
 

@@ -131,11 +131,16 @@ not a verdict that Synarchy's design should be discarded.
   into tracker artifacts.
 - On 2026-09-10 the owner requested review and readiness of both discussed
   designs. [Logging](docs/logging_design.md) has three slices;
-  [resource ownership](docs/resource_ownership_design.md) has four. Both are
-  `ready for issue processing`, with no implementation delivered. The owner
-  requested their publication to `master` on 2026-09-10. The original resource
-  proposal path is now a navigation stub.
-- Process logging first; LOG-3 merging is the resource implementation gate.
+  [resource ownership](docs/resource_ownership_design.md) has four. Both were
+  published to `master` on 2026-09-10 as `ready for issue processing`. Logging
+  is now implemented (#1 through #4). On 2026-09-11 the owner accepted a review
+  of the resource design and re-granted readiness: it records the satisfied
+  logging gate, the catalog and test-grouping obligations, and D-6 through D-9
+  (uninterruptible bounded release, exception-annotation evidence with rethrow
+  rules, bracket argument order with `withScoped` as the only runner, and a
+  staged composite constructor). No `smoke.resource` catalog group. The
+  original resource proposal path is now a navigation stub.
+- The logging-first gate is satisfied: LOG-3 (#4) merged in `cb2a25d`.
   Resource primitives themselves remain independent of the logging module.
 - Accepted resource failure policy: retain the original action/cancellation
   failure, preserve secondary cleanup failures independently of logging, and

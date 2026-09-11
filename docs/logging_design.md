@@ -16,10 +16,10 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish reusable logging and module conventions
-- [ ] LOG-1. Establish structured logging, filtering, and scoped context
-- [ ] LOG-2. Implement deterministic output and safe sink ownership
-- [ ] LOG-3. Integrate startup configuration and the module authoring guide
+- [x] EPIC. Establish reusable logging and module conventions — [#1]
+- [x] LOG-1. Establish structured logging, filtering, and scoped context — [#2]
+- [x] LOG-2. Implement deterministic output and safe sink ownership — [#3]
+- [x] LOG-3. Integrate startup configuration and the module authoring guide — [#4]
 
 ## Epic contract
 
