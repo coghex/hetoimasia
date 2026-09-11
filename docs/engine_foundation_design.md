@@ -102,9 +102,10 @@ arbitrary mutable references. Concurrency is introduced for measured needs.
 The initial Logger uses an injectable sink and no global state. The runtime
 runner logs start and successful completion, returns the action's result, and
 propagates exceptions. It owns no resource scope yet. Standard IO is sufficient
-for this baseline; a CPS/continuation abstraction remains a proposal.
-See [resource ownership](resource_ownership.md) for the proposed CPU scopes,
-subsystem boundaries, GPU retirement model, and the Synarchy decisions to retain.
+for this baseline. A scoped continuation facade is selected for later resource
+implementation in [the resource design](resource_ownership_design.md); the
+application-wide monad remains undecided. That document also preserves subsystem
+boundaries, future GPU lifetimes, and the Synarchy decisions to retain.
 
 ## Decisions
 
@@ -141,6 +142,17 @@ The owner selected the public repository `coghex/hetoimasia`, requested remote
 setup and an initial commit, and specified `master`. The owner corrected the
 original repository-name typo during setup; local/package names already match.
 
+### D-7. Process the dedicated logging and resource designs
+
+On 2026-09-10 the owner requested readiness of the reviewed
+[logging](logging_design.md) and [resource](resource_ownership_design.md) designs.
+They provide three LOG slices and four RES slices. The resource design's D-1
+records the explicitly approved failure policy; its scoped continuation facade
+keeps allocation convenience independent of an application environment.
+Logging LOG-3 is the resource implementation gate. FND-1 delegates to the RES
+arc; reuse its tracker artifacts rather than create duplicate implementation.
+This broader rendering/Lua design remains exploring because Q-3 is still open.
+
 ## Proposals
 
 - Use the current console/services scaffold as the first runnable checkpoint.
@@ -162,9 +174,9 @@ is settled in D-6. Recheck tracker overlap before readiness is granted.
 
 ### Q-2. Resource scope and continuation model
 
-What concrete requirement benefits from a custom CPS monad? FND-1 compares
-ordinary bracketed IO with a narrowly scoped abstraction. Do not recreate
-Synarchy's fixed application-wide EngineEnv through the new type.
+Resolved for FND-1 by D-7 and the dedicated resource design: a small scoped CPS
+facade composes resource lifetimes over the failure-safe primitive. An
+application-wide monad remains a separate future choice.
 
 ### Q-3. First Vulkan scene and platform baseline
 
@@ -190,13 +202,17 @@ an explicit source and asset plan. No production art is currently required.
 ### FND-1. Establish scoped runtime resource ownership
 
 - **Outcome:** a resource-owning service cleans up on success and failure.
-- **Scope:** lifecycle interface, a small consumer, failure evidence, owner docs.
-- **Phase:** runtime; **Depends on:** none; **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-3.
+- **Scope:** supplied by RES-1 through RES-4 in
+  [resource_ownership_design.md](resource_ownership_design.md). Process that
+  document first; link/reuse its epic here rather than draft another resource
+  implementation. This entry remains unprocessed until its tracker link exists.
+- **Phase:** foundation/runtime; **Depends on:** none; **Ordering:** critical path.
+- **External implementation gate:** logging LOG-3 merged.
+- **Relevant decisions:** D-1, D-3, D-7.
 - **Acceptance signals:** initialization/action failures preserve cleanup and
   exceptions; lower services cannot access unrelated application state.
 - **Out of scope:** Vulkan, job systems, a global environment.
-- **Open questions:** Q-2.
+- **Open questions:** none; Q-2 is resolved by D-7.
 
 ### FND-2. Initialize and dispose a Vulkan device in a console probe
 

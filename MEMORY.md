@@ -87,10 +87,23 @@ not a verdict that Synarchy's design should be discarded.
 - CI and Kanban per-repository services remain unset. The selected GitHub repo
   was verified empty with zero issues and PRs before the initial publication on
   2026-09-10; repeat deduplication when turning designs into tracker artifacts.
-- The custom continuation monad is undecided. Start with explicit dependencies
-  and scoped resource ownership; introduce a monad only for a concrete benefit.
-  [Resource ownership](docs/resource_ownership.md) proposes CPU scopes, private
-  subsystem owners, and GPU completion-aware retirement. It is not implemented.
+- On 2026-09-10 the owner requested review and readiness of both discussed
+  designs. [Logging](docs/logging_design.md) has three slices;
+  [resource ownership](docs/resource_ownership_design.md) has four. Both are
+  `ready for issue processing`, with no implementation delivered. The owner
+  requested their publication to `master` on 2026-09-10. The original resource
+  proposal path is now a navigation stub.
+- Process logging first; LOG-3 merging is the resource implementation gate.
+  Resource primitives themselves remain independent of the logging module.
+- Accepted resource failure policy: retain the original action/cancellation
+  failure, preserve secondary cleanup failures independently of logging, and
+  attempt remaining eligible cleanup. Cleanup-only failure fails the operation.
+  Preserve typed catch behavior and inspectable structured evidence.
+- The resource design selects a small scoped continuation facade for
+  `allocResource`/`locally`, over safe CPU ownership and composite constructors.
+  An application-wide monad remains undecided. Dynamic ownership transfer and
+  GPU retirement are later work. FND-1 reuses the resource epic and its children;
+  do not create a second implementation from the broader foundation plan.
 - Unicode type syntax is retained; standard Prelude is the bootstrap choice.
   A broader custom operator/prelude policy is undecided.
 - First rendering milestone, threading needs, Vulkan baseline, window library,

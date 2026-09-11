@@ -13,7 +13,8 @@ are explicitly marked and are not included in the Cabal package list.
 - [Working agreements](AGENTS.md)
 - [Project memory and decisions](MEMORY.md)
 - [Foundation design and dependency diagram](docs/engine_foundation_design.md)
-- [Proposed resource ownership model](docs/resource_ownership.md)
+- [Logging design — ready for processing](docs/logging_design.md)
+- [Resource ownership design — ready for processing](docs/resource_ownership_design.md)
 - [Kanban development workflow](docs/workflow.md)
 
 ## Build and run

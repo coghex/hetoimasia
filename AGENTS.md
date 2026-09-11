@@ -21,8 +21,9 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   CPU scope exit.
 - Publish coherent data across thread boundaries. Add concurrency for a
   concrete need and establish queue/snapshot ownership and cancellation first.
-- Use explicit `IO` or a small local context initially. A continuation monad
-  is an open design choice; it must not reintroduce application-wide state.
+- Use explicit `IO` or a small local context initially. The resource design
+  selects a scoped continuation facade; an application-wide monad remains an
+  open choice and must not reintroduce application-wide state.
 - Keep pure algorithms separate from resource effects. Strict fields and
   packed/mutable arrays are appropriate where measured costs justify them.
 - Reuse Synarchy's lessons and isolated code deliberately. Do not copy its
