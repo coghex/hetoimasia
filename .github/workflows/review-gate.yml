@@ -129,7 +129,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Check out the head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 

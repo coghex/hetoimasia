@@ -52,7 +52,7 @@ jobs:
       candidate: ${{ github.sha }}
     steps:
       - name: Check out the candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The planner compares two commits, so it needs their history rather
           # than a shallow tip.
@@ -160,7 +160,7 @@ jobs:
           PY
 
       - name: Upload the plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: validation-plan
           path: plan.json
@@ -177,7 +177,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Confirm the pinned candidate
         env:
@@ -191,12 +191,12 @@ jobs:
           fi
 
       - name: Download the plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: validation-plan
 
       - name: Restore the toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.ghcup
           # The toolchain depends on the compiler and Cabal versions and on
@@ -212,7 +212,7 @@ jobs:
           cabal-update: true
 
       - name: Restore the package store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           # `cabal.project` carries the pinned Hackage index state, and the
@@ -223,7 +223,7 @@ jobs:
             cabal-store-${{ runner.os }}-ghc-9.12.2-
 
       - name: Restore the build tree
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: dist-newstyle
           key: dist-newstyle-engine-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload the receipts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: validation-receipts-haskell-engine
           path: receipts/
@@ -273,7 +273,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Confirm the pinned candidate
         env:
@@ -287,12 +287,12 @@ jobs:
           fi
 
       - name: Download the plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: validation-plan
 
       - name: Restore the toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.ghcup
           key: ghcup-${{ runner.os }}-ghc-9.12.2-cabal-3.16.1.0
@@ -306,7 +306,7 @@ jobs:
           cabal-update: true
 
       - name: Restore the package store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: cabal-store-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}
@@ -314,7 +314,7 @@ jobs:
             cabal-store-${{ runner.os }}-ghc-9.12.2-
 
       - name: Restore the build tree
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: dist-newstyle
           key: dist-newstyle-workflow-${{ runner.os }}-ghc-9.12.2-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
@@ -344,7 +344,7 @@ jobs:
 
       - name: Upload the receipts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: validation-receipts-haskell-workflow
           path: receipts/
@@ -373,17 +373,17 @@ jobs:
           exit 1
 
       - name: Check out the candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download the plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: validation-plan
 
       - name: Download the receipts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: validation-receipts-*
           path: receipts
