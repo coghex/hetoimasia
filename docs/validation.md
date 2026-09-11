@@ -627,8 +627,15 @@ rather than allowed to re-decide an untouched head. They are separate on purpose
 
 `decide-dismissal` holds only read access and checks the candidate out, so the
 decision it makes is the one `review_gate.py dismissal` is tested against. It
-reads the pull request's current head, the pushed commits' trees, and the
-current labels, then answers with an action.
+checks out with full history — the replay below reads the approved head, the
+commit the update merged in, and the base's own history, none of which a shallow
+clone has — reads the pull request's current head, the pushed commits' trees, and
+the current labels, then answers with an action.
+
+It checks out and answers for the push's own `after`, not the head named
+elsewhere in the payload, and every decision below is refused unless the pull
+request still has that head. A run delayed behind a newer push must not represent
+its replay as approval of a head it never examined.
 
 Every label read in this workflow is a **tri-state**. A read can fail, and a
 failed read is not an absent label: piping `gh pr view` straight into an `if`
@@ -646,10 +653,92 @@ The decision itself:
   identical tree changes nothing a reviewer read, and an unavailable starting
   point counts as a change, because an unreadable comparison cannot establish
   that nothing moved;
-- it asks for removal only when the push changed tracked files and the label is
-  actually attached.
+- it takes the replay verdict described below for a push that did change the
+  tree, and carries the approval when that verdict is `keep`;
+- it asks for removal only when neither of those holds and the label is actually
+  attached.
 
-`dismiss-stale-approval` holds the only write permission in this repository's
+An absent label is not a third outcome. When nothing is attached there is nothing
+to carry, so a replay that would have qualified is reported as *eligibility* and
+the summary claims no inheritance.
+
+### Carrying a review through a base update
+
+A branch that falls behind `master` has to be updated before it can merge, and
+the drainer asks for exactly that update. Invalidating the approval every time
+would charge a full review for a merge nobody authored, so a content-changing
+push keeps its approval in one case, proven by
+`tools/validation/review_replay.py`:
+
+```text
+after is a two-parent merge whose first parent is the approved head,
+its second parent is contained in the base,
+replaying the approved head onto that second parent merges cleanly,
+and the replay's tree is the tree that was actually pushed
+=> keep
+```
+
+The last line is what makes it a proof rather than a heuristic. Git itself
+produces the replay tree with `git merge-tree --write-tree`, including its own
+rename detection, so a `keep` means the submitted tree is byte-for-byte the one
+that already-reviewed work merges to. An edit amended onto the merge, a conflict
+someone resolved by hand, an authored revert, or a rename Git could not carry all
+move the tree away from that replay and strip the approval. Path overlap is not
+consulted at all: two disjoint edits can still break one test, and no set of
+paths proves a tree.
+
+Containment, not equality, decides the second parent. The base tip moves on while
+a check runs, and the commit the update actually incorporated stays the one to
+judge; requiring the current tip would invalidate an approval nothing about the
+candidate changed.
+
+No commit message is read and no revert is detected semantically. A base commit
+that itself reverts code is ordinary base history, and inheriting through it is
+the rule working. What the rule excludes is a revert or edit authored *into the
+update*, which is exactly what the tree comparison catches.
+
+**Every outcome the script can reach is an answer, so it always exits 0.** The
+caller removes a label on `strip`, and an unreadable object or a failed Git read
+has to produce a conservative `strip`; failing instead would abort the job before
+it reached the removal and leave a stale approval standing on precisely the
+histories that are least trustworthy. Only a usage error fails. Its decision and
+provenance are `key=value` lines appended to `$GITHUB_OUTPUT`:
+`replay_decision`, `replay_reason`, `approved_head`, `incorporated_base`,
+`replay_tree`, and `resulting_head`.
+
+Run it against a local history the same way the job does:
+
+```bash
+python3 tools/validation/review_replay.py \
+  --before <the approved head> --after <the merge> --base master
+```
+
+`dismiss-stale-approval` publishes those fields as the **provenance** of the
+review being carried, never as a review of the new tree. `approved_head` is the
+immediately preceding approval-bearing head: repeated clean updates can carry one
+review through a chain of them, so it is not necessarily the revision anybody
+read, and the summary says so alongside the plain statement that no reviewer
+examined the resulting integration tree. A `strip` records the same fields, with
+`not established` where the replay could not reach one, so a decision that never
+got as far as merging is distinguishable from one that never ran.
+
+Review inheritance decides review, and nothing else. `review-approved` stays
+label-only and never reads `build-test`; `build-test` never reads the label. A
+clean-merge update that changes code keeps its approval *while* the validation
+workflow executes the affected groups on the integrated head, and the drainer
+waits for `build-test` before merging — approval alone cannot make integrated
+code green.
+
+`dismiss-stale-approval` runs on `always()`, so a push always leaves this check
+with a verdict. Without that, a decision job that failed would leave it *skipped*
+— and the drainer reads its success together with the label, where a skip is
+neither the success that carries an approval nor the failure that is a drainer
+error. Running unconditionally costs one explicit guard: a decision that did not
+conclude fails this job rather than confirming a verdict from the empty outputs
+it would otherwise act on. A label event still skips it, which is the expected
+result there.
+
+It holds the only write permission in this repository's
 workflows, and it **checks nothing out and runs no repository code** — not even
 `review_gate.py`. A helper taken from the pull request's own head would be
 executing beside a token that can mutate pull requests, and neither a sparse
@@ -672,9 +761,6 @@ restatement of it. The stub is also what makes the races reachable: a head that
 advances between the decision and the write, and a label read that fails rather
 than returning nothing, do not happen on demand against a real repository.
 
-This slice never keeps an approval across a content-changing push. Carrying
-review through a clean base merge is a later slice's work.
-
 `review-approved` waits for that decision on every event and then answers from
 current state through `review_gate.py verdict`, which refuses to
 publish when the head has been superseded (exit 3) or when a push's invalidation
@@ -684,6 +770,36 @@ verdict is never read from the event payload: a `synchronize` run exists because
 the head moved, and the same push starts the decision that may be about to
 remove the label, so answering from the payload would report the label state
 from before that decision.
+
+### The drainer handshake
+
+The installed Kanban drainer, not this repository, decides when a candidate
+merges, and the contract between them is three signals and nothing else:
+
+| What the drainer reads | What it means |
+| --- | --- |
+| `dismiss-stale-approval` succeeded, `reviewed:approve` attached | The approval stands for this head; the update may be carried forward |
+| `dismiss-stale-approval` succeeded, label absent | There is no approval; the candidate needs review |
+| `dismiss-stale-approval` failed | A drainer error — the decision did not complete, and its absence is never read as either answer |
+
+That is the same contract the previous slice published, and the replay changes
+none of it: the check name, its success semantics, and the label's meaning are
+unchanged, and the job still never adds the label itself. What changed is only
+*which* pushes leave the label attached.
+
+For a candidate GitHub reports `BEHIND`, the drainer requests a branch update
+through the `update-branch` API with the expected head, and waits for
+`dismiss-stale-approval` on the new head. GitHub's update produces exactly the
+two-parent merge the replay recognizes — the approved head first, the base
+commit second — so the label survives, `build-test` reruns on the integrated
+head, and the drainer waits for it.
+
+If an update ever arrives that the drainer's own handshake cannot express — a
+second parent that is not the base tip it recorded, for instance — that is a
+Kanban prerequisite with its own owner. Do not edit the installed scripts and do
+not reattach the label by hand; a label the workflow did not decide on is
+indistinguishable from one it did, which is the confusion this whole gate exists
+to prevent.
 
 ## Branch protection
 
@@ -781,13 +897,38 @@ after the plan was resolved, the planner's own failure leaving no plan, an
 unfinished job's timings reported as unavailable, and every review-gate
 decision: the keep, remove, absent, and unreadable-starting-point cases, a
 delayed run refusing to touch a newer head's approval, a failed, cancelled, or
-unexpectedly skipped invalidation, and an absent label.
+unexpectedly skipped invalidation, and an absent label. The composition that
+consumes the replay is covered too: a content-changing push carried by a `keep`,
+a `keep` still reported as eligibility rather than inheritance when no label is
+attached, a `keep` surviving a before-tree that could not be read, the replay's
+own reason reaching the summary unrewritten, and an unrecognized verdict refused
+rather than guessed.
+
+The replay rule itself is proven against real Git histories in temporary
+repositories, because rename detection, conflict resolution, and reachability are
+not things a restatement of the rule can assert. It covers the branch update
+GitHub's own `update-branch` performs, two additions to one manifest that merge
+cleanly, and a base rename Git carries into the approved work; a merge carrying
+an edit the replay does not produce, a conflict someone resolved by hand, a
+rename Git cannot carry, an ordinary commit pushed on top, a revert, an octopus
+merge, a merge made from the base's side, and a second parent the base does not
+contain; an incorporated commit the base tip has since moved past, and a base
+commit that itself reverts code, both of which keep; and the three ways Git
+cannot answer at all — an approved head a force-push left unreachable, an
+unreadable pushed head, and a base ref a partial fetch never created. Every one
+of those strips exits zero, because the caller has a label to remove and a
+failure would abort the job before it got there.
 
 The mutation itself is covered by running the shipped step body: the removal a
 content-changing push earns, the write that must not happen when the decision
 was to keep, a decision that was correct when made and is stopped at write time
 because the head advanced, a removal that did not take, and a label read that
-failed rather than returning nothing.
+failed rather than returning nothing, and a decision that never concluded
+refused rather than confirmed. The provenance it publishes is asserted
+there too — every revision a carried approval was decided from, the credit to the
+earlier review without a claim that anyone read the new tree, eligibility
+reported instead of inheritance when no label is attached, and the fields a strip
+could not establish recorded rather than omitted.
 
 Candidate identity and reuse are covered against temporary Git repositories and
 a stub `gh` answering from canned files. The identity examples assert that a

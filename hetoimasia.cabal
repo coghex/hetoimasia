@@ -32,6 +32,7 @@ extra-source-files:
     tools/validation/run.py
     tools/validation/aggregate.py
     tools/validation/review_gate.py
+    tools/validation/review_replay.py
     tools/validation/timings.py
 
 source-repository head
@@ -65,6 +66,7 @@ test-suite workflow-tests
         Json
         Reuse
         ReviewGate
+        ReviewReplay
         Sandbox
         Timings
         Validation

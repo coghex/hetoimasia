@@ -2,11 +2,16 @@
 --
 -- The workflow reads the pull request's head, the pushed commits' trees, its
 -- labels, and the stale-approval job's result from GitHub, and hands them to
--- @tools/validation/review_gate.py@. These examples drive that tool directly,
--- which is where the composition that actually decides a mutation or a
--- publication lives: a superseded head, an invalidation that never completed,
--- and an absent label each have to keep a green check from appearing, and a
--- delayed run must not strip an approval belonging to a newer head.
+-- @tools/validation/review_gate.py@, together with the replay verdict
+-- @review_replay.py@ reached in the checkout. These examples drive that tool
+-- directly, which is where the composition that actually decides a mutation or
+-- a publication lives: a superseded head, an invalidation that never completed,
+-- and an absent label each have to keep a green check from appearing; a delayed
+-- run must not strip an approval belonging to a newer head; and a replay that
+-- came back @keep@ has to survive a push that did change tracked files, which
+-- is the whole point of the rule. What the replay verdict *means* about a
+-- history is proven against real repositories in "ReviewReplay"; what is proven
+-- here is that this composition consumes it.
 module ReviewGate (spec) where
 
 import Sandbox (run, sanitizedEnvironment)
@@ -24,34 +29,66 @@ spec ∷ Spec
 spec = describe "Review gate" $ do
   describe "the stale-approval decision" $ do
     it "removes an attached approval when the push changed tracked files" $ do
-      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "true"
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "strip" "true"
       result `shouldBe` ExitSuccess
       output `shouldContain` "action=remove"
       output `shouldContain` "expected=removed"
 
     it "keeps an approval when the push left every tree identical" $ do
-      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-one" "true"
+      -- Independent of the replay: a re-pushed identical tree changes nothing a
+      -- reviewer read, whatever its topology says.
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-one" "strip" "true"
       result `shouldBe` ExitSuccess
       output `shouldContain` "action=none"
       output `shouldContain` "expected=kept"
 
+    it "keeps an approval a content-changing push replayed onto the base" $ do
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "keep" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=none"
+      output `shouldContain` "expected=kept"
+
+    it "repeats the replay's own reason rather than inventing one" $ do
+      -- The job summary is built out of this line, and a decision explained in
+      -- the gate's words would describe a rule the gate did not apply.
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "keep" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` ("reason=" ++ replayReason)
+
     it "treats an unreadable starting point as a change" $ do
       -- An absent before-tree cannot establish that nothing moved, so the
       -- conservative answer is the one that invalidates the approval.
-      (result, output, _) ← dismissal reviewedHead reviewedHead "" "tree-two" "true"
+      (result, output, _) ← dismissal reviewedHead reviewedHead "" "tree-two" "strip" "true"
       result `shouldBe` ExitSuccess
       output `shouldContain` "action=remove"
 
+    it "still carries an approval when an unreadable starting point replayed" $ do
+      -- The tree comparison and the replay are independent proofs. A missing
+      -- before-tree only means the cheap one could not answer.
+      (result, output, _) ← dismissal reviewedHead reviewedHead "" "tree-two" "keep" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=none"
+      output `shouldContain` "expected=kept"
+
     it "asks for no mutation when the label was not attached" $ do
-      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "false"
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "strip" "false"
       result `shouldBe` ExitSuccess
       output `shouldContain` "action=none"
       output `shouldContain` "expected=absent"
 
+    it "claims no inheritance for a replay with no approval to inherit" $ do
+      -- Eligibility is not approval. Reporting `kept` here would let a summary
+      -- describe a review that was never granted.
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "keep" "false"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=none"
+      output `shouldContain` "expected=absent"
+      output `shouldContain` "was not attached"
+
     it "refuses to touch an approval belonging to a newer head" $ do
       -- A delayed synchronize run whose push has already been superseded would
       -- otherwise strip approval from a head it never examined.
-      (result, output, errors) ← dismissal reviewedHead newerHead "tree-one" "tree-two" "true"
+      (result, output, errors) ← dismissal reviewedHead newerHead "tree-one" "tree-two" "strip" "true"
       result `shouldBe` ExitFailure 3
       errors `shouldContain` "superseded head"
       output `shouldBe` ""
@@ -59,10 +96,18 @@ spec = describe "Review gate" $ do
     it "refuses to decide when the label state could not be read" $ do
       -- A failed read is not an absent label. Folding the two together would
       -- dismiss a content-changing push as harmless and leave approval standing.
-      (result, output, errors) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "unknown"
+      (result, output, errors) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "strip" "unknown"
       result `shouldBe` ExitFailure 5
       errors `shouldContain` "unreadable label state is not an absent one"
       output `shouldBe` ""
+
+    it "refuses a replay verdict it does not recognize" $ do
+      -- The verdict arrives as a job output. An empty or misspelled one is a
+      -- broken wiring, and guessing which way it meant would guess about an
+      -- approval.
+      (result, _, errors) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "" "true"
+      result `shouldBe` ExitFailure 2
+      errors `shouldContain` "--replay-decision"
 
   it "publishes approval when the label is attached at the current head" $ do
     (result, output, _) ← verdict "synchronize" reviewedHead reviewedHead "success" "true"
@@ -110,8 +155,13 @@ spec = describe "Review gate" $ do
     result `shouldBe` ExitFailure 4
     errors `shouldContain` "expected to be skipped"
 
-dismissal ∷ String → String → String → String → String → IO (ExitCode, String, String)
-dismissal eventHead currentHead beforeTree afterTree attached =
+-- | What `review_replay.py` said, quoted verbatim into the gate's own reason.
+replayReason ∷ String
+replayReason = "the push is exactly Git's clean merge of the approved head with the base"
+
+dismissal
+  ∷ String → String → String → String → String → String → IO (ExitCode, String, String)
+dismissal eventHead currentHead beforeTree afterTree replay attached =
   gate
     [ "dismissal"
     , "--event-head"
@@ -122,6 +172,10 @@ dismissal eventHead currentHead beforeTree afterTree attached =
     , beforeTree
     , "--after-tree"
     , afterTree
+    , "--replay-decision"
+    , replay
+    , "--replay-reason"
+    , replayReason
     , "--label-attached"
     , attached
     ]

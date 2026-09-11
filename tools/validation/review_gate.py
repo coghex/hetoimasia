@@ -13,6 +13,13 @@ request no longer proposes.
 ``dismissal`` decides what should happen to the approval label after a push.
 ``verdict`` decides whether ``review-approved`` may report success.
 
+``dismissal`` does not judge the push's history itself: ``review_replay.py``
+does that, in the checkout, and hands its ``keep``/``strip`` here. What lives
+here is the composition — the two independent ways a push can leave an approval
+standing (it moved no tracked file at all, or it is exactly the clean replay of
+the approved work onto the base it incorporated), and the states in which no
+answer may be given at all.
+
 Both run in read-only jobs. The job that actually mutates the label holds the
 only write token in this repository's workflows and therefore runs no repository
 code at all — not this file either — so its own guard is inline shell in
@@ -48,6 +55,10 @@ UNKNOWN = "unknown"
 # action leaves the head alone, so that job is deliberately skipped and its
 # skipped result is the expected one rather than a missing decision.
 SYNCHRONIZE = "synchronize"
+
+# What `review_replay.py` decided about this push's history.
+KEEP = "keep"
+STRIP = "strip"
 
 
 def label_state(value: str) -> str:
@@ -89,10 +100,23 @@ def report_superseded(event_head: str, current_head: str, doing: str) -> int:
 def dismissal(arguments: argparse.Namespace) -> int:
     """What a push should do to the approval label.
 
-    Whether the push changed anything is a question about *trees*, not commits:
-    a re-pushed identical tree changes nothing a reviewer read. A starting point
-    that could not be resolved counts as a change, because an unreadable
-    comparison cannot establish that nothing moved.
+    Two independent things can leave an approval standing, and neither one lets
+    unreviewed code inherit it.
+
+    The first is a push that moved nothing. That is a question about *trees*,
+    not commits: a re-pushed identical tree changes nothing a reviewer read. A
+    starting point that could not be resolved counts as a change, because an
+    unreadable comparison cannot establish that nothing moved.
+
+    The second is the replay rule, decided in the checkout by
+    ``review_replay.py`` and arriving here as ``keep`` or ``strip``. A ``keep``
+    means the pushed tree is the one Git itself produces by merging the approved
+    head with a commit the base already contains, so the earlier review still
+    covers every line of it.
+
+    An absent label is not a third outcome. When nothing is attached there is
+    nothing to carry, so the replay's verdict is reported as eligibility and no
+    inheritance is claimed.
     """
     if superseded(arguments.event_head, arguments.current_head):
         return report_superseded(arguments.event_head, arguments.current_head, "change approval")
@@ -101,19 +125,19 @@ def dismissal(arguments: argparse.Namespace) -> int:
 
     changed = not arguments.before_tree or arguments.before_tree != arguments.after_tree
     if not changed:
-        action, expected, reason = "none", "kept", "the push changed no tracked file"
-    elif arguments.label_attached == ABSENT:
-        action, expected, reason = (
-            "none",
-            "absent",
-            f"the push changed tracked files, and {arguments.label} was not attached",
-        )
+        carries, reason = True, "the push changed no tracked file"
+    elif arguments.replay_decision == KEEP:
+        carries, reason = True, arguments.replay_reason or "the push replays the approved work"
     else:
-        action, expected, reason = (
-            "remove",
-            "removed",
-            "the push changed tracked files",
-        )
+        carries, reason = False, arguments.replay_reason or "the push changed tracked files"
+
+    if arguments.label_attached == ABSENT:
+        action, expected = "none", "absent"
+        reason = f"{reason}, and {arguments.label} was not attached"
+    elif carries:
+        action, expected = "none", "kept"
+    else:
+        action, expected = "remove", "removed"
     print(f"action={action}")
     print(f"expected={expected}")
     print(f"reason={reason}")
@@ -179,6 +203,17 @@ def main(argv: list[str]) -> int:
         if name == "dismissal":
             command.add_argument("--before-tree", default="", help="the tree the push started from")
             command.add_argument("--after-tree", required=True, help="the tree the push landed on")
+            command.add_argument(
+                "--replay-decision",
+                required=True,
+                choices=(KEEP, STRIP),
+                help="what review_replay.py decided about this push's history",
+            )
+            command.add_argument(
+                "--replay-reason",
+                default="",
+                help="the one-line reason review_replay.py gave for that decision",
+            )
         else:
             command.add_argument(
                 "--event-action", required=True, help="the pull_request action that started this run"

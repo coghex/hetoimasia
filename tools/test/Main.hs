@@ -11,6 +11,7 @@ import qualified DismissalStep
 import qualified Execution
 import qualified Reuse
 import qualified ReviewGate
+import qualified ReviewReplay
 import qualified Timings
 import qualified Validation
 
@@ -72,6 +73,7 @@ main = hspec $ do
   Reuse.spec
   Timings.spec
   ReviewGate.spec
+  ReviewReplay.spec
   DismissalStep.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a
