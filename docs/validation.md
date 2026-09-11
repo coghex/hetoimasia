@@ -796,10 +796,11 @@ a canonical marker.
 The script always exits 0, for the same reason the replay does: `unproven` is
 an answer the caller removes a label on, and a feed that is missing,
 unreadable, malformed, not a list of comments, or **incomplete** — any comment
-without a usable `id`, `created_at`, `user.login`, or `body`, since a marker
-that cannot be ordered could be taken for older than the verdict it withdrew
-and one that cannot be attributed could be taken for the owner's — proves
-nothing and is reported as `unproven` with the reason — never inferred
+without a usable `id` (a positive integer), `created_at` (exactly GitHub's
+`YYYY-MM-DDTHH:MM:SSZ`, the shape whose string order is chronological),
+`user.login` (non-blank), or `body`, since a marker that cannot be ordered
+could be taken for older than the verdict it withdrew and one that cannot be
+attributed could be taken for the owner's — proves nothing and is reported as `unproven` with the reason — never inferred
 `proven` from tree equality or replay eligibility, and never turned into a
 failure that would abort the job before the removal it justifies. Its `key=value` lines are
 `provenance`, `provenance_reason`, `origin`, `chain` (every revision from the
@@ -1044,8 +1045,10 @@ refused for its superseded head before the next push strips; an earlier carry
 whose mutation failed or never ran and so recorded nothing; a feed that could
 not be read, is not valid JSON, or is not a list of comments, each stripping;
 the paged feed the workflow fetches; a comment that cannot be ordered — the
-withdrawal without a timestamp that would otherwise sort before the approval
-it withdrew — and one that cannot be attributed, each stripping; a review
+withdrawal without a timestamp, or with an empty or differently written one,
+that would otherwise sort before the approval it withdrew — one whose
+identifier is zero, negative, boolean, or a string, and one that cannot be
+attributed or whose author is blank, each stripping; a review
 marker by anyone but the owner
 and a carry record by anyone but the workflow, each ignored; a later marker
 withdrawing an approval of the same head and a later one re-establishing it; a

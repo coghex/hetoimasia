@@ -118,17 +118,26 @@ def render(verdict: str, reason: str, origin: str, chain: list[str], head_verdic
 # which decides whether it may say anything at all; and its body.
 COMMENT_FIELDS = ("id", "created_at", "user", "body")
 
+# The one timestamp shape GitHub writes. Requiring it exactly is what makes
+# the string comparison in `ordered` a chronological one: an empty or
+# differently written timestamp would sort somewhere it does not belong.
+TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
 
 def incomplete(comment: dict) -> str:
-    """Which required field a comment lacks, or empty when it carries them all."""
+    """Which required field a comment lacks or cannot be used, or empty."""
     for name in COMMENT_FIELDS:
         if name not in comment:
             return name
-    if not isinstance(comment["id"], int):
+    identifier = comment["id"]
+    # A boolean is an int to Python and an identifier to nobody.
+    if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
         return "id"
-    if not isinstance(comment["created_at"], str):
+    if not isinstance(comment["created_at"], str) or not TIMESTAMP.match(comment["created_at"]):
         return "created_at"
-    if not isinstance(comment["user"], dict) or not isinstance(comment["user"].get("login"), str):
+    user = comment["user"]
+    login = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(login, str) or not login.strip():
         return "user.login"
     if not isinstance(comment["body"], str):
         return "body"

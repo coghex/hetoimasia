@@ -170,6 +170,41 @@ spec = describe "Approval provenance" $ do
         field "head_verdict" (provenanceOutput decision) `shouldBe` Just "none"
         shouldRemove decision
 
+    it "strips when a comment's timestamp is empty or not GitHub's shape" $
+      -- The same withdrawal with a timestamp that is present but useless:
+      -- empty, or written in a form that would not sort chronologically.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        let withStamp stamp =
+              "[" ++ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker reviewed "APPROVE")
+                ++ ", " ++ feedEntry 2 (Just stamp) owner (approvalMarker reviewed "CHANGES_REQUESTED") ++ "]"
+        mapM_
+          ( \stamp → do
+              writeFixtureFile (root fixture) "feed.json" (withStamp stamp)
+              decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
+              value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable created_at"
+              shouldRemove decision
+          )
+          ["", "yesterday", "2026-09-11 00:00:02", "2026-09-11T00:00:02+00:00"]
+
+    it "strips when a comment's identifier is not one" $
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        let withId identifier =
+              "[" ++ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker reviewed "APPROVE")
+                ++ ", {\"id\": " ++ identifier ++ ", \"created_at\": \"2026-09-11T00:00:02Z\", \"user\": {\"login\": "
+                ++ quoted owner ++ "}, \"body\": " ++ quoted (approvalMarker reviewed "CHANGES_REQUESTED") ++ "}]"
+        mapM_
+          ( \identifier → do
+              writeFixtureFile (root fixture) "feed.json" (withId identifier)
+              decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
+              value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable id"
+              shouldRemove decision
+          )
+          ["0", "-2", "true", "\"2\""]
+
     it "strips when a comment cannot be attributed" $
       withFixture $ \fixture → do
         reviewed ← approvedWork fixture
@@ -183,6 +218,26 @@ spec = describe "Approval provenance" $ do
         decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
         value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable user.login"
         shouldRemove decision
+
+    it "strips when a comment's author is blank" $
+      -- A blank login is nobody's; a withdrawal posted under it would vanish
+      -- while the older approval stayed authoritative.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        mapM_
+          ( \login → do
+              writeFixtureFile
+                (root fixture)
+                "feed.json"
+                ( "[" ++ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker reviewed "APPROVE")
+                    ++ ", " ++ feedEntry 2 (Just "2026-09-11T00:00:02Z") login (approvalMarker reviewed "CHANGES_REQUESTED") ++ "]"
+                )
+              decision ← decideFrom fixture (root fixture </> "feed.json") reviewed repushed repushed
+              value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable user.login"
+              shouldRemove decision
+          )
+          ["", "   "]
 
     it "accepts the paged feed the workflow fetches" $
       -- `gh api --paginate --slurp` writes a list of pages, not of comments.
