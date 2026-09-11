@@ -425,6 +425,16 @@ failures, and serialization state released after both a failed write and an
 interruption mid-write. They coordinate with `MVar`s and use timeouts only to
 bound a stuck test.
 
+The `Worker reporting boundary` group runs the guide's own worker body from
+[Usage](#usage) against substituted work and sinks: a success diagnostic, a
+single error diagnostic for an ordinary failure, an escaping cancellation
+delivered to blocked work with no diagnostic at all, a synchronous reporting
+failure that preserves the work's exception after one reporting attempt, a
+cancellation delivered while the reporting sink is blocked, and a failing
+success diagnostic that still propagates. Its two cancellation cases signal
+entry through an `MVar` and then block on one the test never fills, so
+`killThread` lands at an interruptible point without a sleep.
+
 The startup cases inject a lookup rather than an environment: a recording lookup
 shows all three variables consulted exactly once and in order, before any value
 is parsed and with nothing consulted afterwards, and the same injection covers
@@ -532,17 +542,73 @@ startRenderer logger device = do
 
 A worker gets its own derived logger rather than sharing one mutable context, so
 two workers cannot observe each other's fields while their records still reach
-the one sink in each worker's own order:
+the one sink in each worker's own order. Its handling is a named action with the
+work injected rather than a lambda inside `forkIO`, so the body a reader sees
+here is the body the suite runs:
+
+```haskell
+uploadComponent ∷ Component
+uploadComponent = unsafeComponent "upload"
+
+-- The terminal reporting boundary for one uploader.
+uploaderWorker ∷ Logger → Int → (Logger → IO Int) → IO ()
+uploaderWorker logger worker work = do
+  let scoped = withFields [("worker", Text.pack (show worker))] logger
+  outcome ← try (work scoped)
+  case outcome of
+    Right uploaded →
+      logInfo scoped uploadComponent "Uploads drained"
+        [("uploaded", Text.pack (show uploaded))]
+    Left failure
+      | isCancellation failure → throwIO failure
+      | otherwise → reportAbandoned scoped failure
+
+-- One reporting attempt, and never a second one through the same sink.
+reportAbandoned ∷ Logger → SomeException → IO ()
+reportAbandoned scoped failure = do
+  reported ← try (logError scoped uploadComponent "Uploads abandoned"
+                    [("reason", Text.pack (show failure))])
+  case reported of
+    Right () → pure ()
+    Left reportingFailure
+      | isCancellation reportingFailure → throwIO reportingFailure
+      | otherwise → throwIO failure
+
+-- Anything thrown as asynchronous is cancellation, so ThreadKilled,
+-- UserInterrupt, and the exception a timeout delivers are classified alike.
+isCancellation ∷ SomeException → Bool
+isCancellation failure = isJust (fromException failure ∷ Maybe SomeAsyncException)
+```
+
+The spawn site supplies the work and nothing else:
 
 ```haskell
 spawnUploader ∷ Logger → Int → IO ThreadId
-spawnUploader logger worker = forkIO $ do
-  let scoped = withFields [("worker", Text.pack (show worker))] logger
-  outcome ← try (drainUploadQueue scoped)
-  case outcome of
-    Right uploaded → logInfo scoped renderComponent "Uploads drained"
-                       [("uploaded", Text.pack (show uploaded))]
-    -- The boundary that decides what the failure means reports it, once.
-    Left failure → logError scoped renderComponent "Uploads abandoned"
-                     [("reason", Text.pack (show (failure ∷ SomeException)))]
+spawnUploader logger worker =
+  forkIO (uploaderWorker logger worker drainUploadQueue)
 ```
+
+`uploaderWorker` is a terminal reporting boundary: the point where an ordinary
+failure stops being propagated and becomes a diagnostic instead. With a working
+sink such a failure produces exactly one `Error` record and the worker ends —
+nothing rethrows it, because no caller is left to interpret it.
+
+Cancellation never reaches that boundary. An asynchronous exception from the
+work escapes unchanged and unreported — no `Error`, no `Info` — because a
+diagnostic emitted while cancelling is one more place the cancellation could be
+lost, which [Ownership and failures](#ownership-and-failures) forbids. For a
+`forkIO`-spawned worker, escaping means escaping the worker action: with no
+supervisor in scope it reaches GHC's uncaught-exception handler, and giving the
+spawner a way to observe it belongs to
+[the resource ownership design](resource_ownership_design.md), not here.
+
+The reporting attempt is guarded, and only it. A synchronous failure from
+`logError` is discarded in favour of the work's own exception, which is rethrown
+with its type and payload intact: a sink failure is never reported back through
+the failing sink, and the boundary keeps its primary failure. A cancellation
+arriving during that same attempt escapes as itself rather than being displaced
+by the earlier work failure. The success path is deliberately unguarded — a
+failing `Info` propagates its sink exception like any other logging call.
+
+The `Worker reporting boundary` group in [`test/Main.hs`](../test/Main.hs) runs
+this body verbatim for each of those outcomes.
