@@ -180,7 +180,7 @@ withStep repository action expected assertion = do
     writeFixtureFile binPath "gh" (stub directory)
     _ ← run inherited directory "chmod" ["+x", binPath </> "gh"]
     let reached value = if replayReached repository then value else ""
-        settings =
+        overrides =
           [ ("PATH", binPath ++ ":/usr/bin:/bin:/usr/sbin:/sbin")
           , ("GH_TOKEN", "stub-token")
           , ("REPOSITORY", "coghex/hetoimasia")
@@ -200,7 +200,13 @@ withStep repository action expected assertion = do
           , ("LABEL", approval)
           , ("GITHUB_STEP_SUMMARY", directory </> "summary")
           ]
-              ++ filter (\(name, _) → name `notElem` ["PATH", "GH_TOKEN"]) inherited
+        -- Every one of those has to *replace* the inherited entry rather than
+        -- sit in front of it: Bash resolves a duplicate environment entry to the
+        -- later one, so an inherited copy left behind would win. That is not
+        -- hypothetical for `GITHUB_STEP_SUMMARY` — the runner sets it, so these
+        -- examples would write the fixture's summary into the real job summary
+        -- and then assert against an empty file, failing only on CI.
+        settings = overrides ++ filter (\(name, _) → name `notElem` map fst overrides) inherited
     (status, stdout', _) ← run settings directory "bash" [directory </> "step.sh"]
     logged ← doesFileExist (directory </> "calls")
     recorded ← if logged then lines <$> readFile (directory </> "calls") else pure []
