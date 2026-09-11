@@ -60,9 +60,14 @@ not a verdict that Synarchy's design should be discarded.
 
 - Three Cabal packages: root console/tests, `hetoimasia-foundation` logging,
   and `hetoimasia-runtime` application entry point. Separate source roots.
-- Logger accepts an injected sink, filters by level, and borrows output handles.
-  It is synchronous. Runtime invokes a supplied action and propagates failures.
-  Both were written from scratch; no Synarchy implementation was copied.
+- Logger accepts an injected sink and injectable clock/thread metadata, applies
+  a pure filter (master switch, global and per-component thresholds, independent
+  Debug selection, source switch), carries immutable derived fields and
+  breadcrumbs, validates dotted component names, and borrows output handles.
+  It is synchronous; see [docs/logging.md](docs/logging.md). LOG-2 still owns the
+  final record layout, serialization, and flushing. Runtime invokes a supplied
+  action and propagates failures. Both were written from scratch; no Synarchy
+  implementation was copied.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

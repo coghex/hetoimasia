@@ -2,14 +2,18 @@
 module Hetoimasia.Runtime (runApplication) where
 
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log (Logger, LogLevel (Info), logMessage)
+import Hetoimasia.Foundation.Log (Component, Logger, logInfo, unsafeComponent)
+
+-- | The component every entry from this module uses.
+runtimeComponent ∷ Component
+runtimeComponent = unsafeComponent "runtime"
 
 -- | Log entry and successful completion, preserving the action's result.
 -- Exceptions propagate; failure must not produce a successful completion entry.
 -- This function currently acquires no resources and starts no worker threads.
 runApplication ∷ Logger → Text → IO a → IO a
 runApplication logger name action = do
-  logMessage logger Info "runtime" ("Starting " <> name)
+  logInfo logger runtimeComponent ("Starting " <> name) []
   result ← action
-  logMessage logger Info "runtime" ("Completed " <> name)
+  logInfo logger runtimeComponent ("Completed " <> name) []
   pure result
