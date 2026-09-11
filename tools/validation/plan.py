@@ -6,6 +6,11 @@ default), derives each group's inputs from the local Cabal package graph plus
 the group's explicitly declared non-Haskell inputs, compares two revisions, and
 emits a plan naming every catalog group with a selection reason.
 
+It also fingerprints the integration candidate's own tree, as an ``input_identity``
+and a ``policy_version``. Selection answers what a contribution touches; those
+digests answer the different question of whether this candidate's content is
+content an earlier execution already proved, which a two-endpoint diff cannot.
+
 It depends on Python 3 and Git alone: no GHC, no Cabal, no ``dist-newstyle/``.
 
 See ``docs/validation.md`` for the catalog schema, the selection policy, the

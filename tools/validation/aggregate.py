@@ -321,7 +321,9 @@ def read_applicability(
     document = receipts.load_applicability(path)
     problems = receipts.applicability_problems(document, plan, identity)
     if problems:
-        return {}, list(document["rejected"]), problems
+        # A stale document's refusals describe another candidate's evidence, so
+        # they are dropped rather than reported against this one.
+        return {}, [], problems
     selected = set(plan["selected"])
     applicable: dict[str, dict] = {}
     for record in document["reused"]:
@@ -373,6 +375,13 @@ def main(argv: list[str]) -> int:
         print(
             f"  {finding.group.ljust(width)}  {finding.reason.ljust(reason_width)}  "
             f"{finding.outcome:<10} {finding.detail}"
+        )
+    for record in rejected:
+        # A known failure for these very inputs stays in the log as well as in
+        # the summary, beside the execution it forced.
+        print(
+            f"  refused:  {record['group']} executed instead of reusing "
+            f"{record['source_run_url'] or 'an unattributed run'}: {record['reason']}"
         )
     for problem in problems:
         print(f"  obstacle: {problem}")
