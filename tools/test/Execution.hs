@@ -83,6 +83,20 @@ spec = describe "Validation execution" $ do
         child ← readFile (root fixture </> "child.pid")
         reaped fixture (takeWhile (/= '\n') child) 50 `shouldReturn` True
 
+    it "kills a descendant that ignores the termination signal" $
+      withFixture $ \fixture → do
+        change fixture "stubborn/note.txt" "revised stubborn input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (result, _, _) ← runGroup fixture "smoke.stubborn" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "smoke.stubborn"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        -- The shell exits on SIGTERM while the child it started ignores the
+        -- signal entirely, so the leader's exit says nothing about the group.
+        -- Only a kill aimed at the group reaches this process.
+        child ← readFile (root fixture </> "child.pid")
+        reaped fixture (takeWhile (/= '\n') child) 50 `shouldReturn` True
+
     it "refuses a group the plan explained away, leaving no receipt behind" $
       withFixture $ \fixture → do
         change fixture "README.md" "revised prose\n"
@@ -162,6 +176,33 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 1
         output `shouldContain` "malformed"
 
+    it "refuses a plan that registers no groups" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "empty.json" emptyPlan
+        (result, _, errors) ← aggregate fixture (root fixture </> "empty.json") []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "registers no groups"
+
+    it "refuses a plan whose selected list omits a group it flagged" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        -- Dropping the floor from `selected` while its own flag stays true
+        -- would let every worker skip it and the aggregate excuse it.
+        patchPlan fixture plan "selected" "[]"
+        (result, _, errors) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "does not match the groups it flags as selected"
+
+    it "refuses a plan that names a selected group twice" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        patchPlan fixture plan "selected" "[\"build.pass\", \"build.pass\"]"
+        (result, _, errors) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "more than once"
+
     it "reports a malformed plan as a diagnostic rather than a verdict" $
       withFixture $ \fixture → do
         writeFixtureFile (root fixture) "broken.json" "{ not a plan\n"
@@ -178,6 +219,18 @@ spec = describe "Validation execution" $ do
         (result, output, _) ← aggregate fixture plan ["--worker", "floor=cancelled:build.pass"]
         result `shouldBe` ExitFailure 1
         output `shouldContain` "worker floor was cancelled"
+
+    it "fails a worker that concluded failure even with every receipt passing" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, _) ← runGroup fixture "build.pass" plan []
+        executed `shouldBe` ExitSuccess
+        -- A job can fail after its groups passed, so a passing receipt in an
+        -- artifact cannot vouch for the job that produced it.
+        (result, output, _) ← aggregate fixture plan ["--worker", "floor=failure:build.pass"]
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "worker floor was failure"
 
     it "fails a worker that was skipped while its groups were selected" $
       withFixture $ \fixture → do
@@ -385,6 +438,43 @@ patchReceipt fixture group name value = do
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
 
+-- | Replace one top-level field of a plan with a literal JSON document, so an
+-- otherwise genuine plan can contradict itself.
+patchPlan ∷ Fixture → FilePath → String → String → IO ()
+patchPlan fixture plan name value = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json,sys\n\
+        \path, key, value = sys.argv[1:4]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \document[key] = json.loads(value)\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , plan
+      , name
+      , value
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+-- | A structurally valid plan that registers nothing. Every worker would skip
+-- and every group would be vacuously accounted for.
+emptyPlan ∷ String
+emptyPlan =
+  unlines
+    [ "{"
+    , "  \"schema_version\": 1,"
+    , "  \"policy_version\": 1,"
+    , "  \"base\": {\"commit\": \"aaaa\", \"tree\": \"bbbb\"},"
+    , "  \"head\": {\"commit\": \"cccc\", \"tree\": \"dddd\"},"
+    , "  \"request\": {\"ids\": [], \"all_hspec\": false, \"resolved\": []},"
+    , "  \"groups\": [],"
+    , "  \"selected\": []"
+    , "}"
+    ]
+
 -- | Whether a process identifier has stopped existing, polled within a bound.
 reaped ∷ Fixture → String → Int → IO Bool
 reaped _ _ 0 = pure False
@@ -437,6 +527,7 @@ fixtureFiles =
   , ("app/Main.hs", "module Main (main) where\nmain :: IO ()\nmain = pure ()\n")
   , ("src/note.txt", "a source the failing group consumes\n")
   , ("slow/note.txt", "an input the slow group consumes\n")
+  , ("stubborn/note.txt", "an input the stubborn group consumes\n")
   , ("probe/note.txt", "an input the optional group consumes\n")
   , ("tools/validation/catalog.json", fixtureCatalog)
   ]
@@ -472,6 +563,7 @@ fixtureCatalog =
     , groupDocument "build.pass" "[\"true\"]" "[]" "none" "build" "60" "false" ++ ","
     , groupDocument "test.fail" "[\"false\"]" "[\"src/\"]" "hspec" "test" "60" "false" ++ ","
     , groupDocument "smoke.slow" slowCommand "[\"slow/\"]" "none" "smoke" "1" "false" ++ ","
+    , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true"
     , "  ]"
     , "}"
@@ -481,6 +573,12 @@ fixtureCatalog =
 -- whether the timeout reached the descendant rather than only the shell.
 slowCommand ∷ String
 slowCommand = "[\"sh\", \"-c\", \"sleep 300 & echo $! > child.pid; wait\"]"
+
+-- | A shell that exits on SIGTERM while the child it started ignores it, so an
+-- example can tell a group-wide kill apart from one aimed at the leader.
+stubbornCommand ∷ String
+stubbornCommand =
+  "[\"sh\", \"-c\", \"(trap '' TERM; sleep 300) & echo $! > child.pid; wait\"]"
 
 groupDocument ∷ String → String → String → String → String → String → String → String
 groupDocument identifier command inputs framework category timeout optional =

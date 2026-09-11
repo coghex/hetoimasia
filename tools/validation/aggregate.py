@@ -6,9 +6,9 @@ so it is deliberately suspicious of its own inputs. A selected group passes
 only when a well-formed receipt says it passed, names this plan's identity, and
 names this plan's head commit. A group the plan explained away needs no
 receipt. Nothing else is a pass: a missing receipt, a failed or timed-out one,
-a malformed one, one that belongs to another plan or head, and a worker that
-was cancelled or unexpectedly skipped while its groups were selected all fail,
-because a selected gate that nothing executed has not been satisfied.
+a malformed one, one that belongs to another plan or head, and any worker that
+did not conclude ``success`` while its groups were selected all fail, because a
+selected gate nothing vouched for has not been satisfied.
 
 ``--expect-head``, ``--expect-base``, and ``--expect-request-file`` add the
 freshness question a published verdict depends on: does this plan still
@@ -29,10 +29,12 @@ import receipts
 from plan import PlannerError, parse_request
 from receipts import EvidenceError
 
-# Worker results GitHub reports for a job that actually reached a conclusion.
-# Every other result — ``cancelled``, ``skipped`` — means the work the plan
-# selected did not run, however green the rest of the run looks.
-CONCLUSIVE_RESULTS = ("success", "failure")
+# The only worker result that accounts for the groups a worker owns. Every
+# other result — ``failure``, ``cancelled``, ``skipped`` — leaves selected work
+# unvouched for, and receipts in a sibling artifact cannot stand in for it: a
+# job can fail after its groups passed, or fail before it wrote a receipt at
+# all, so passing evidence elsewhere says nothing about what this job did.
+SATISFYING_RESULT = "success"
 
 
 class Worker:
@@ -129,7 +131,7 @@ def worker_problems(plan: dict, workers: list[Worker]) -> list[str]:
         owned = [identifier for identifier in worker.groups if identifier in selected]
         if not owned:
             continue
-        if worker.result not in CONCLUSIVE_RESULTS:
+        if worker.result != SATISFYING_RESULT:
             problems.append(
                 f"worker {worker.name} was {worker.result} while the plan selected "
                 + ", ".join(owned)

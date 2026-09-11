@@ -321,9 +321,24 @@ the head itself ran.
 exhausted budget and a disagreeing test are different obstacles. The runner
 gives the command its own process group and reaps that whole group on timeout,
 so a backgrounded build server or test child cannot outlive the budget it was
-launched under. The runner exits `0` when the group passed, `1` when it failed
+launched under. Liveness is probed on the *group*, never inferred from the
+process the runner launched: a descendant that ignores `SIGTERM` keeps running
+under the same group identifier after the shell that started it has gone, so
+anything still there once the grace period expires is killed outright. The runner exits `0` when the group passed, `1` when it failed
 or timed out — the receipt is still written — and `2` for a diagnostic that
 prevented any execution.
+
+A plan is rejected outright, before any verdict, when it could not honestly
+have produced one: an unreadable or non-object document, a schema version this
+tool does not read, a missing or mistyped field, a group registered twice, a
+non-positive timeout, **no groups at all**, a `selected` list naming a group the
+plan does not register or naming one twice, or a `selected` list that disagrees
+with the groups' own `selected` flags. The last three matter because a plan
+states its decision twice and the workers read one statement while the aggregate
+reads the other: a plan that contradicts itself could dispatch a group and then
+excuse it, or excuse one and never notice it missing. An empty plan is the same
+hazard in its purest form — every worker skips, every group is vacuously
+accounted for, and a candidate that ran nothing reports success.
 
 **Plan identity** is a SHA-256 over everything that decides what must run and
 how: the plan and policy revisions, both endpoints' commits and trees, the
@@ -357,11 +372,16 @@ this plan's identity, names this plan's head, and records the command the plan
 selected. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
 than a failure. Everything else fails: a missing receipt, a failed or timed-out
-one, a malformed one, one belonging to another plan or head, and a worker that
-was **cancelled or skipped while its groups were selected**. A selected gate
-that nothing executed has not been satisfied, however green the rest of the run
-looks. A worker that reported `failure` is left to its receipts, which say which
-group failed and leave a gap where one never ran.
+one, a malformed one, one belonging to another plan or head, and **any worker
+that did not conclude `success` while its groups were selected**. A selected
+gate nothing vouched for has not been satisfied, however green the rest of the
+run looks.
+
+`failure` is not excused by receipts, and deliberately so. A job can fail after
+its groups passed, or fail before it wrote a receipt at all, so passing evidence
+in a sibling artifact says nothing about what that job did. Only `success`
+accounts for the groups a worker owns; the receipts then say which of them
+failed and where a gap was left.
 
 The `--expect-*` options add the freshness question a published verdict depends
 on: does this plan still describe the pull request as it stands now? Matching
@@ -383,27 +403,39 @@ There is deliberately no concurrency group: queueing these runs would let GitHub
 cancel a pending invalidation, and a cancelled decision is indistinguishable
 from one that never reached a verdict.
 
-`dismiss-stale-approval` runs on `synchronize` alone; the copies a label event
-starts are skipped rather than allowed to re-decide an untouched head. It holds
-the only write permission in either workflow, and it checks nothing out and runs
-no repository script, so that token never reaches contributor-authored code. It:
+Two jobs run on `synchronize` alone; the copies a label event starts are skipped
+rather than allowed to re-decide an untouched head. They are separate on purpose.
 
-1. re-reads the pull request's head and refuses to act if the head has moved on,
-   since removing approval from a head it never examined would invalidate
-   someone else's newer review;
-2. compares the **trees** of the push's before and after commits — a re-pushed
-   identical tree changes nothing a reviewer read, and an unavailable starting
-   point is treated as a change because an unreadable comparison cannot
-   establish that nothing moved;
-3. removes `reviewed:approve` when the push changed tracked files, then confirms
-   the removal by reading the labels back and fails if the label is still
-   attached.
+`decide-dismissal` holds only read access and checks the candidate out, so the
+decision it makes is the one `review_gate.py dismissal` is tested against. It
+reads the pull request's current head, the pushed commits' trees, and the
+current labels, then answers with an action:
+
+- it refuses outright when the head has moved on, because removing approval from
+  a head it never examined would invalidate someone else's newer review;
+- it compares the **trees** of the push's before and after commits — a re-pushed
+  identical tree changes nothing a reviewer read, and an unavailable starting
+  point counts as a change, because an unreadable comparison cannot establish
+  that nothing moved;
+- it asks for removal only when the push changed tracked files and the label is
+  actually attached.
+
+`dismiss-stale-approval` holds the only write permission in this repository's
+workflows, and it checks nothing out and runs no repository script, so that
+token never reaches contributor-authored code. It re-reads the head **again,
+immediately before mutating** rather than trusting the read the decision was
+made from: the decision job's own API calls take time, and a push landing in
+that window would leave a superseded run stripping an approval that belongs to a
+head it never examined. It then applies the decision and confirms a removal by
+reading the labels back, failing if the label is still attached — the drainer
+reads this job's success together with the label, so a removal that did not take
+must not look like one that did.
 
 This slice never keeps an approval across a content-changing push. Carrying
 review through a clean base merge is a later slice's work.
 
 `review-approved` waits for that decision on every event and then answers from
-current state through `tools/validation/review_gate.py`, which refuses to
+current state through `review_gate.py verdict`, which refuses to
 publish when the head has been superseded (exit 3) or when a push's invalidation
 did not succeed (exit 4), withholds approval when the label is absent (exit 1),
 and publishes it when the label is attached at the current head (exit 0). The
@@ -500,11 +532,21 @@ separately, a selected group with no receipt, receipts belonging to another plan
 or another head, malformed receipts and malformed plans, omitted `unaffected`
 and `optional-unrequested` groups passing without receipts, one failing group
 failing the verdict while others passed, a worker cancelled or unexpectedly
-skipped while its groups were selected, a worker legitimately skipped because
-nothing it owns was selected, a request edited or a head advanced after the plan
-was resolved, the planner's own failure leaving no plan, an unfinished job's
-timings reported as unavailable, and every review-gate refusal: a superseded
-head, a failed, cancelled, or unexpectedly skipped invalidation, and an absent
-label.
+skipped while its groups were selected, a worker that concluded `failure` while
+every receipt it left behind passed, a worker legitimately skipped because
+nothing it owns was selected, a plan that registers no groups or whose
+`selected` list contradicts its own flags, a request edited or a head advanced
+after the plan was resolved, the planner's own failure leaving no plan, an
+unfinished job's timings reported as unavailable, and every review-gate
+decision: the keep, remove, absent, and unreadable-starting-point cases, a
+delayed run refusing to touch a newer head's approval, a failed, cancelled, or
+unexpectedly skipped invalidation, and an absent label.
+
+Two of those are regressions rather than hypotheticals. The timeout example
+starts a descendant that ignores `SIGTERM` under a shell that does not, so it
+fails against any cleanup that infers the group's fate from the process it
+launched; the worker example supplies a passing receipt alongside a `failure`
+result, so it fails against any aggregate that lets receipts vouch for the job
+that wrote them.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

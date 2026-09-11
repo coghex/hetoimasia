@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Decide the ``review-approved`` verdict from current GitHub state.
+"""Decide the review gate's two verdicts from current GitHub state.
 
-The verdict is never read from the event payload that started the run. A
-``synchronize`` run exists precisely because the head moved, and the same push
-starts the stale-approval job that may be about to remove ``reviewed:approve``;
-publishing from the payload would report the label state from before that
-decision. So this tool is given three things read from GitHub *now* — the head
-the pull request currently has, whether the approval label is currently
-attached, and how the stale-approval job concluded — and refuses to publish a
-success unless all three agree that the head this run is about to answer for is
-still the current one and is genuinely approved.
+Neither verdict is read from the event payload. A ``synchronize`` run exists
+precisely because the head moved, and the same push starts the stale-approval
+decision that may be about to remove ``reviewed:approve``; answering from the
+payload would report the state from before that decision. So both subcommands
+are given what was read from GitHub *now* and refuse to answer at all for a head
+the pull request has already moved past — a delayed run must not strip an
+approval that belongs to a newer head, nor publish a success for code the pull
+request no longer proposes.
 
-Exit status: ``0`` approved, ``1`` not approved, ``2`` a usage diagnostic,
-``3`` the head moved while this run was working, ``4`` the required
-stale-approval decision did not complete successfully.
+``dismissal`` decides what should happen to the approval label after a push.
+``verdict`` decides whether ``review-approved`` may report success.
+
+Exit status: ``0`` decided, ``1`` not approved (``verdict`` only), ``2`` a usage
+diagnostic, ``3`` the head moved while this run was working, ``4`` the required
+stale-approval decision did not complete successfully (``verdict`` only).
 """
 
 from __future__ import annotations
@@ -39,39 +41,57 @@ def boolean(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"expected true or false, not {value!r}")
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="review_gate.py",
-        description="Decide the review-approved verdict from current repository state.",
-    )
-    parser.add_argument("--event-action", required=True, help="the pull_request action that started this run")
-    parser.add_argument("--event-head", required=True, help="the head commit this run was started for")
-    parser.add_argument("--current-head", required=True, help="the head commit the pull request has now")
-    parser.add_argument(
-        "--dismissal-result",
-        required=True,
-        help="how the stale-approval job concluded: success, failure, cancelled, or skipped",
-    )
-    parser.add_argument(
-        "--label-attached",
-        required=True,
-        type=boolean,
-        help="whether the approval label is currently attached",
-    )
-    parser.add_argument("--label", default="reviewed:approve", help="the approval label's name")
-    arguments = parser.parse_args(argv)
+def superseded(event_head: str, current_head: str) -> bool:
+    return event_head != current_head
 
-    if arguments.event_head != arguments.current_head:
-        # A delayed run answering for an older head would publish a verdict
-        # about code the pull request no longer proposes. The run started for
-        # the newer head is the one entitled to answer.
-        print(
-            f"error: this run was started for head {arguments.event_head[:12]}, "
-            f"but the pull request's head is now {arguments.current_head[:12]}; "
-            "refusing to publish a verdict for a superseded head",
-            file=sys.stderr,
+
+def report_superseded(event_head: str, current_head: str, doing: str) -> int:
+    print(
+        f"error: this run was started for head {event_head[:12]}, but the pull "
+        f"request's head is now {current_head[:12]}; refusing to {doing} for a "
+        "superseded head",
+        file=sys.stderr,
+    )
+    return STALE_HEAD
+
+
+def dismissal(arguments: argparse.Namespace) -> int:
+    """What a push should do to the approval label.
+
+    Whether the push changed anything is a question about *trees*, not commits:
+    a re-pushed identical tree changes nothing a reviewer read. A starting point
+    that could not be resolved counts as a change, because an unreadable
+    comparison cannot establish that nothing moved.
+    """
+    if superseded(arguments.event_head, arguments.current_head):
+        return report_superseded(arguments.event_head, arguments.current_head, "change approval")
+
+    changed = not arguments.before_tree or arguments.before_tree != arguments.after_tree
+    if not changed:
+        action, expected, reason = "none", "kept", "the push changed no tracked file"
+    elif not arguments.label_attached:
+        action, expected, reason = (
+            "none",
+            "absent",
+            f"the push changed tracked files, and {arguments.label} was not attached",
         )
-        return STALE_HEAD
+    else:
+        action, expected, reason = (
+            "remove",
+            "removed",
+            "the push changed tracked files",
+        )
+    print(f"action={action}")
+    print(f"expected={expected}")
+    print(f"reason={reason}")
+    return 0
+
+
+def verdict(arguments: argparse.Namespace) -> int:
+    if superseded(arguments.event_head, arguments.current_head):
+        return report_superseded(
+            arguments.event_head, arguments.current_head, "publish a verdict"
+        )
 
     if arguments.event_action == SYNCHRONIZE:
         if arguments.dismissal_result != "success":
@@ -101,6 +121,44 @@ def main(argv: list[str]) -> int:
         "the review gate is satisfied"
     )
     return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="review_gate.py",
+        description="Decide the review gate's verdicts from current repository state.",
+    )
+    parser.add_argument("--label", default="reviewed:approve", help="the approval label's name")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("dismissal", "verdict"):
+        command = commands.add_parser(name)
+        command.add_argument("--event-head", required=True, help="the head this run was started for")
+        command.add_argument("--current-head", required=True, help="the head the pull request has now")
+        command.add_argument(
+            "--label-attached",
+            required=True,
+            type=boolean,
+            help="whether the approval label is currently attached",
+        )
+        command.add_argument("--label", default=None, help="the approval label's name")
+        if name == "dismissal":
+            command.add_argument("--before-tree", default="", help="the tree the push started from")
+            command.add_argument("--after-tree", required=True, help="the tree the push landed on")
+        else:
+            command.add_argument(
+                "--event-action", required=True, help="the pull_request action that started this run"
+            )
+            command.add_argument(
+                "--dismissal-result",
+                required=True,
+                help="how the stale-approval job concluded: success, failure, cancelled, or skipped",
+            )
+
+    arguments = parser.parse_args(argv)
+    if arguments.label is None:
+        arguments.label = "reviewed:approve"
+    return dismissal(arguments) if arguments.command == "dismissal" else verdict(arguments)
 
 
 if __name__ == "__main__":

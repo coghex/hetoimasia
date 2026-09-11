@@ -140,7 +140,13 @@ def load_plan(path: str) -> dict:
     require_bool(request, "all_hspec", "plan request")
     require_str_list(request, "resolved", "plan request")
     groups = require_list(document, "groups", "plan")
+    if not groups:
+        # A plan that registers nothing selects nothing, so every worker skips
+        # and every group is vacuously accounted for. That is a verdict about
+        # no work at all, which must never read as a candidate having passed.
+        raise EvidenceError("plan registers no groups")
     registered: set[str] = set()
+    flagged: list[str] = []
     for entry in groups:
         if not isinstance(entry, dict):
             raise EvidenceError("plan field 'groups' contains a non-object entry")
@@ -149,17 +155,30 @@ def load_plan(path: str) -> dict:
             raise EvidenceError(f"plan registers group {identifier!r} more than once")
         registered.add(identifier)
         description = f"plan group {identifier}"
-        require_bool(entry, "selected", description)
+        if require_bool(entry, "selected", description):
+            flagged.append(identifier)
         require_str(entry, "reason", description)
         require_str_list(entry, "command", description)
         timeout = require_int(entry, "timeout_seconds", description)
         if timeout <= 0:
             raise EvidenceError(f"{description} declares a non-positive timeout")
+
     selected = require_str_list(document, "selected", "plan")
     unregistered = [identifier for identifier in selected if identifier not in registered]
     if unregistered:
         raise EvidenceError(
             "plan selects groups it does not register: " + ", ".join(sorted(unregistered))
+        )
+    if len(set(selected)) != len(selected):
+        raise EvidenceError("plan names a group more than once in 'selected'")
+    # The selected list and the per-group flags are two statements of the same
+    # decision, and the workers read one while the aggregate reads the other. A
+    # plan that disagrees with itself would let a group be dispatched and then
+    # excused, or excused and then never noticed as missing.
+    if selected != flagged:
+        raise EvidenceError(
+            "plan's 'selected' list does not match the groups it flags as selected: "
+            f"{selected} against {flagged}"
         )
     return document
 

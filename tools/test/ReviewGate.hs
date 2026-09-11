@@ -1,11 +1,12 @@
--- | Hspec coverage for the @review-approved@ verdict.
+-- | Hspec coverage for the review gate's two decisions.
 --
--- The workflow reads the pull request's head, its labels, and the
--- stale-approval job's result from GitHub and hands all three to
+-- The workflow reads the pull request's head, the pushed commits' trees, its
+-- labels, and the stale-approval job's result from GitHub, and hands them to
 -- @tools/validation/review_gate.py@. These examples drive that tool directly,
--- which is where the composition that actually decides publication lives: a
--- superseded head, an invalidation decision that never completed, and an
--- absent label each have to keep a green check from appearing.
+-- which is where the composition that actually decides a mutation or a
+-- publication lives: a superseded head, an invalidation that never completed,
+-- and an absent label each have to keep a green check from appearing, and a
+-- delayed run must not strip an approval belonging to a newer head.
 module ReviewGate (spec) where
 
 import Sandbox (run, sanitizedEnvironment)
@@ -21,6 +22,40 @@ newerHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 spec ∷ Spec
 spec = describe "Review gate" $ do
+  describe "the stale-approval decision" $ do
+    it "removes an attached approval when the push changed tracked files" $ do
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=remove"
+      output `shouldContain` "expected=removed"
+
+    it "keeps an approval when the push left every tree identical" $ do
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-one" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=none"
+      output `shouldContain` "expected=kept"
+
+    it "treats an unreadable starting point as a change" $ do
+      -- An absent before-tree cannot establish that nothing moved, so the
+      -- conservative answer is the one that invalidates the approval.
+      (result, output, _) ← dismissal reviewedHead reviewedHead "" "tree-two" "true"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=remove"
+
+    it "asks for no mutation when the label was not attached" $ do
+      (result, output, _) ← dismissal reviewedHead reviewedHead "tree-one" "tree-two" "false"
+      result `shouldBe` ExitSuccess
+      output `shouldContain` "action=none"
+      output `shouldContain` "expected=absent"
+
+    it "refuses to touch an approval belonging to a newer head" $ do
+      -- A delayed synchronize run whose push has already been superseded would
+      -- otherwise strip approval from a head it never examined.
+      (result, output, errors) ← dismissal reviewedHead newerHead "tree-one" "tree-two" "true"
+      result `shouldBe` ExitFailure 3
+      errors `shouldContain` "superseded head"
+      output `shouldBe` ""
+
   it "publishes approval when the label is attached at the current head" $ do
     (result, output, _) ← verdict "synchronize" reviewedHead reviewedHead "success" "true"
     result `shouldBe` ExitSuccess
@@ -62,15 +97,26 @@ spec = describe "Review gate" $ do
     result `shouldBe` ExitFailure 4
     errors `shouldContain` "expected to be skipped"
 
+dismissal ∷ String → String → String → String → String → IO (ExitCode, String, String)
+dismissal eventHead currentHead beforeTree afterTree attached =
+  gate
+    [ "dismissal"
+    , "--event-head"
+    , eventHead
+    , "--current-head"
+    , currentHead
+    , "--before-tree"
+    , beforeTree
+    , "--after-tree"
+    , afterTree
+    , "--label-attached"
+    , attached
+    ]
+
 verdict ∷ String → String → String → String → String → IO (ExitCode, String, String)
-verdict action eventHead currentHead dismissal attached = do
-  checkout ← getCurrentDirectory
-  settings ← sanitizedEnvironment
-  run
-    settings
-    checkout
-    "python3"
-    [ checkout </> "tools/validation/review_gate.py"
+verdict action eventHead currentHead decision attached =
+  gate
+    [ "verdict"
     , "--event-action"
     , action
     , "--event-head"
@@ -78,7 +124,13 @@ verdict action eventHead currentHead dismissal attached = do
     , "--current-head"
     , currentHead
     , "--dismissal-result"
-    , dismissal
+    , decision
     , "--label-attached"
     , attached
     ]
+
+gate ∷ [String] → IO (ExitCode, String, String)
+gate arguments = do
+  checkout ← getCurrentDirectory
+  settings ← sanitizedEnvironment
+  run settings checkout "python3" ((checkout </> "tools/validation/review_gate.py") : arguments)

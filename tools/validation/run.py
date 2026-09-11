@@ -33,9 +33,7 @@ import receipts
 from receipts import EvidenceError
 
 # How long a timed-out process group is given to exit on SIGTERM before it is
-# killed outright. The runner always reaps the whole group: a command that
-# leaves a build server or a test child behind would otherwise keep holding the
-# runner's CPU and scratch space after its budget expired.
+# killed outright.
 TERMINATION_GRACE_SECONDS = 10
 
 
@@ -63,28 +61,60 @@ def parse_toolchain(entries: list[str]) -> dict[str, str]:
     return toolchain
 
 
+def group_alive(group: int | None) -> bool:
+    """Whether any process still belongs to the command's process group."""
+    if group is None:
+        return False
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # The group exists but this process may not signal it. Alive is the
+        # conservative answer: a survivor must not be reported as reaped.
+        return True
+    return True
+
+
+def signal_group(process: subprocess.Popen, group: int | None, number: int) -> None:
+    try:
+        if group is None:
+            process.send_signal(number)
+        else:
+            os.killpg(group, number)
+    except (OSError, ValueError):
+        pass
+
+
+def reaped(process: subprocess.Popen, seconds: int) -> bool:
+    try:
+        process.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def terminate_group(process: subprocess.Popen) -> None:
-    """End the command and every descendant it started."""
+    """End the command and every descendant it started.
+
+    The launched process exiting is not the same as the group ending. A
+    descendant that ignores SIGTERM keeps running under the same group
+    identifier long after the shell that started it has gone, so liveness is
+    probed on the *group* rather than inferred from the process this runner
+    happens to hold a handle to. Anything still there after the grace period is
+    killed outright: the budget has already expired, and a survivor would keep
+    holding the runner's CPU and scratch space.
+    """
     try:
         group = os.getpgid(process.pid)
     except OSError:
         group = None
-    for attempt in (signal.SIGTERM, signal.SIGKILL):
-        if process.poll() is not None and attempt is signal.SIGKILL:
-            break
-        try:
-            if group is not None:
-                os.killpg(group, attempt)
-            else:
-                process.send_signal(attempt)
-        except OSError:
-            break
-        try:
-            process.wait(timeout=TERMINATION_GRACE_SECONDS)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    if process.poll() is None:
+    signal_group(process, group, signal.SIGTERM)
+    leader_exited = reaped(process, TERMINATION_GRACE_SECONDS)
+    if not leader_exited or group_alive(group):
+        signal_group(process, group, signal.SIGKILL)
+    if not reaped(process, TERMINATION_GRACE_SECONDS):
+        process.kill()
         process.wait()
 
 
