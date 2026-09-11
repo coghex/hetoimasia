@@ -1,9 +1,13 @@
 {
   "schema_version": 1,
-  "policy_version": 1,
+  "policy_version": 2,
   "policy_inputs": [
     "tools/validation/plan.py",
-    "tools/validation/catalog.json"
+    "tools/validation/catalog.json",
+    "tools/validation/receipts.py",
+    "tools/validation/run.py",
+    "tools/validation/aggregate.py",
+    ".github/workflows/"
   ],
   "non_affecting_paths": [
     "*.md",

@@ -114,16 +114,20 @@ not a verdict that Synarchy's design should be discarded.
   issue-approval and PR-drainer jobs for `coghex/hetoimasia` using Kanban's
   installer/controller. Both are loaded in launchd and have not been started;
   the approval controller has no run-status document yet. Board keys `a` and
-  `d` control them. CI remains unconfigured.
+  `d` control them.
 - The owner explicitly approved publishing this tested tooling setup directly
   to `master` as a bootstrap exception. Subsequent implementation still follows
   the normal PR lane. The ready designs were separately published in `0d9be37`.
 
 ## Open choices and next work
 
-- CI remains unset. The selected GitHub repo
-  was verified empty with zero issues and PRs before the initial publication on
-  2026-09-10; repeat deduplication when turning designs into tracker artifacts.
+- CI runs the validation pipeline and the review gate described in
+  [validation.md](docs/validation.md). `build-test` and `review-approved` are
+  the checks the installed drainer reads. Evidence reuse across prose-only
+  updates and clean-merge review inheritance are still unimplemented. The
+  selected GitHub repo was verified empty with zero issues and PRs before the
+  initial publication on 2026-09-10; repeat deduplication when turning designs
+  into tracker artifacts.
 - On 2026-09-10 the owner requested review and readiness of both discussed
   designs. [Logging](docs/logging_design.md) has three slices;
   [resource ownership](docs/resource_ownership_design.md) has four. Both are
