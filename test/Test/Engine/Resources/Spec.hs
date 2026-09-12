@@ -1,9 +1,15 @@
 -- | Examples for 'Hetoimasia.Foundation.Resource'.
 --
 -- The scope's whole contract is observable through its public API, so every
--- example below drives 'withResource' or 'withResourceLabelled' and inspects
--- what a caller can see: the value returned, the exception that propagated,
--- and the cleanup failures 'cleanupFailures' reports.
+-- example below drives 'withResource', 'withResourceLabelled', 'withComposite',
+-- or the continuation facade and inspects what a caller can see: the value
+-- returned, the exception that propagated, and the cleanup failures
+-- 'cleanupFailures' reports.
+--
+-- The facade examples keep every borrowed value inside its own scope and
+-- return only ordinary results, as the public contract requires. 'withScoped'
+-- is run with 'pure' as its continuation only where the scope's result is an
+-- ordinary value; a borrowed handle is never returned that way.
 --
 -- Concurrency is coordinated with 'MVar's and with 'threadStatus', never with
 -- a sleep. 'boundedExample' only stops an example that has already hung.
@@ -40,6 +46,7 @@ import Control.Exception
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (void)
+import Control.Monad.IO.Class (liftIO)
 import Data.Text (Text)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Hetoimasia.Foundation.Resource
@@ -47,16 +54,20 @@ import Hetoimasia.Foundation.Resource
   , CleanupFailure
   , ReleaseRank
   , acquirePart
+  , allocComposite
+  , allocResource
   , cleanupFailureException
   , cleanupFailureLabel
   , cleanupFailures
   , cleanupFailuresInContext
   , displayCleanupFailure
+  , locally
   , releaseRank
   , restoredStep
   , withComposite
   , withResource
   , withResourceLabelled
+  , withScoped
   )
 import Test.Engine.Resources.Buffer
   ( Buffer (..)
@@ -188,6 +199,38 @@ spec = describe "Resources" $ do
       testFinalReleasesFail
     it "keeps the body's failure primary when the final releases also fail"
       testBodyFailureStaysPrimary
+
+  describe "Continuation facade" $ do
+    it "keeps an allocation live in the final callback and releases it when that callback exits"
+      testAllocationLiveInFinalCallback
+    it "releases a scope's allocations in reverse allocation order on success"
+      testFacadeReverseOrderOnSuccess
+    it "releases a scope's allocations in reverse allocation order when the scope fails"
+      testFacadeReverseOrderOnFailure
+    it "releases a scope's allocations in reverse allocation order on cancellation"
+      (boundedExample testFacadeReverseOrderOnCancellation)
+    it "runs no later acquisition after an earlier action fails"
+      testFacadeEarlierFailureStopsAcquisition
+    it "runs ordinary actions inside a scope through MonadIO"
+      testFacadeMonadIOPath
+    it "composes allocations through fmap and <*>"
+      testFacadeFunctorApplicative
+
+  describe "Continuation facade agreement with the direct path" $ do
+    it "produces the same primary and secondary failures for one resource"
+      testDirectAndFacadeAgree
+    it "produces the same primary and secondary failures for nested resources"
+      testDirectAndFacadeAgreeNested
+
+  describe "Continuation facade nested scopes" $ do
+    it "releases everything locally allocated before the outer scope resumes"
+      testLocallyReleasesBeforeOuterResumes
+    it "carries a locally cleanup failure into the outer scope's evidence"
+      testLocallyCleanupFailureReachesOuterScope
+
+  describe "Continuation facade composite allocation" $ do
+    it "keeps each composite's declared order while the scope unwinds in reverse"
+      testCompositeThroughFacade
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -1184,3 +1227,297 @@ testCancellationPendingWhenAcquisitionReturns = do
       occurrences "first" performed `shouldBe` 1
       trail bodies `shouldReturn` []
       length (cleanupFailures propagated) `shouldBe` 0
+
+-- Continuation facade -------------------------------------------------------
+
+-- | The cleanup point: a resource allocated in a scope is still live in the
+-- final callback, after the @do@ block that allocated it has yielded, and is
+-- released when that callback exits rather than at the end of that block.
+testAllocationLiveInFinalCallback ∷ Expectation
+testAllocationLiveInFinalCallback = do
+  steps ← newTrail
+  -- The example owns this cell, so it can still read it after the release that
+  -- marks the resource closed has run. The scope owns only the marking.
+  open ← newMVar True
+  liveInCallback ←
+    withScoped
+      ( do
+          resource ←
+            allocResource
+              (pure open)
+              (\slot → modifyMVar_ slot (const (pure False)) *> record steps "release")
+          liftIO (record steps "allocated")
+          pure resource
+      )
+      ( \resource → do
+          -- The allocating block has yielded and this is the scope's final
+          -- callback, so an implementation that released at the end of that
+          -- block would have closed the resource before now.
+          stillLive ← readMVar resource
+          record steps "callback"
+          pure stillLive
+      )
+  liveInCallback `shouldBe` True
+  readMVar open `shouldReturn` False
+  trail steps `shouldReturn` ["allocated", "callback", "release"]
+
+testFacadeReverseOrderOnSuccess ∷ Expectation
+testFacadeReverseOrderOnSuccess = do
+  releases ← newTrail
+  total ←
+    withScoped
+      ( do
+          first ← allocResource (pure (1 ∷ Int)) (\_ → record releases "first")
+          second ← allocResource (pure (2 ∷ Int)) (\_ → record releases "second")
+          third ← allocResource (pure (4 ∷ Int)) (\_ → record releases "third")
+          pure (first + second + third)
+      )
+      pure
+  total `shouldBe` 7
+  trail releases `shouldReturn` ["third", "second", "first"]
+
+testFacadeReverseOrderOnFailure ∷ Expectation
+testFacadeReverseOrderOnFailure = do
+  releases ← newTrail
+  propagated ←
+    expectFailure $
+      withScoped
+        ( do
+            _ ← allocResource (pure ()) (\_ → record releases "first")
+            _ ← allocResource (pure ()) (\_ → record releases "second")
+            liftIO (throwIO (ErrorCall "scope failed") ∷ IO ())
+        )
+        pure
+  errorCallMessage propagated `shouldBe` Just "scope failed"
+  trail releases `shouldReturn` ["second", "first"]
+
+testFacadeReverseOrderOnCancellation ∷ Expectation
+testFacadeReverseOrderOnCancellation = do
+  releases ← newTrail
+  entered ← newEmptyMVar
+  blocker ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    captured ←
+      try $
+        withScoped
+          ( do
+              _ ← allocResource (pure ()) (\_ → record releases "first")
+              _ ← allocResource (pure ()) (\_ → record releases "second")
+              liftIO (putMVar entered () *> takeMVar blocker)
+          )
+          pure
+    putMVar outcome (captured ∷ Either SomeException ())
+  takeMVar entered
+  killThread runner
+  captured ← takeMVar outcome
+  case captured of
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      asyncException propagated `shouldBe` Just ThreadKilled
+      trail releases `shouldReturn` ["second", "first"]
+
+testFacadeEarlierFailureStopsAcquisition ∷ Expectation
+testFacadeEarlierFailureStopsAcquisition = do
+  steps ← newTrail
+  propagated ←
+    expectFailure $
+      withScoped
+        ( do
+            _ ←
+              allocResource
+                (record steps "acquire first")
+                (\_ → record steps "release first")
+            liftIO (throwIO (ErrorCall "earlier action failed") ∷ IO ())
+            _ ←
+              allocResource
+                (record steps "acquire second")
+                (\_ → record steps "release second")
+            pure ()
+        )
+        pure
+  errorCallMessage propagated `shouldBe` Just "earlier action failed"
+  -- The second acquisition is inside the failed action's continuation, so it
+  -- never runs and has nothing to release.
+  trail steps `shouldReturn` ["acquire first", "release first"]
+
+testFacadeMonadIOPath ∷ Expectation
+testFacadeMonadIOPath = do
+  steps ← newTrail
+  doubled ←
+    withScoped
+      ( do
+          liftIO (record steps "before")
+          size ← liftIO (pure (5 ∷ Int))
+          value ←
+            allocResource
+              (record steps "acquire" *> pure size)
+              (\_ → record steps "release")
+          liftIO (record steps "after")
+          pure (value * 2)
+      )
+      pure
+  doubled `shouldBe` 10
+  trail steps `shouldReturn` ["before", "acquire", "after", "release"]
+
+testFacadeFunctorApplicative ∷ Expectation
+testFacadeFunctorApplicative = do
+  releases ← newTrail
+  total ←
+    withScoped
+      ( (+)
+          <$> fmap (* 2) (allocResource (pure (3 ∷ Int)) (\_ → record releases "first"))
+          <*> allocResource (pure (4 ∷ Int)) (\_ → record releases "second")
+      )
+      pure
+  total `shouldBe` 10
+  trail releases `shouldReturn` ["second", "first"]
+
+-- Continuation facade agreement with the direct path -------------------------
+
+-- | The same injected outcomes through 'withResource' and through
+-- 'allocResource' under 'withScoped'.
+testDirectAndFacadeAgree ∷ Expectation
+testDirectAndFacadeAgree = do
+  directReleases ← newTrail
+  facadeReleases ← newTrail
+  direct ←
+    expectFailure $
+      withResource
+        (pure ())
+        (\_ → record directReleases "release" *> throwIO (userError "cleanup failed"))
+        (\_ → throwIO (ErrorCall "body failed"))
+  facade ←
+    expectFailure $
+      withScoped
+        ( allocResource
+            (pure ())
+            (\_ → record facadeReleases "release" *> throwIO (userError "cleanup failed"))
+        )
+        (\_ → throwIO (ErrorCall "body failed"))
+  errorCallMessage facade `shouldBe` errorCallMessage direct
+  errorCallMessage facade `shouldBe` Just "body failed"
+  labelsOf (cleanupFailures facade) `shouldBe` labelsOf (cleanupFailures direct)
+  ioMessagesOf (cleanupFailures facade) `shouldBe` ioMessagesOf (cleanupFailures direct)
+  ioMessagesOf (cleanupFailures facade) `shouldBe` [Just "cleanup failed"]
+  trail facadeReleases `shouldReturn` ["release"]
+  trail directReleases `shouldReturn` ["release"]
+
+testDirectAndFacadeAgreeNested ∷ Expectation
+testDirectAndFacadeAgreeNested = do
+  direct ←
+    expectFailure $
+      withResource
+        (pure ())
+        (\_ → throwIO (userError "outer cleanup failed"))
+        ( \_ →
+            withResource
+              (pure ())
+              (\_ → throwIO (userError "inner cleanup failed"))
+              (\_ → throwIO (ErrorCall "body failed"))
+        )
+  facade ←
+    expectFailure $
+      withScoped
+        ( do
+            _ ← allocResource (pure ()) (\_ → throwIO (userError "outer cleanup failed"))
+            _ ← allocResource (pure ()) (\_ → throwIO (userError "inner cleanup failed"))
+            liftIO (throwIO (ErrorCall "body failed") ∷ IO ())
+        )
+        pure
+  errorCallMessage facade `shouldBe` errorCallMessage direct
+  errorCallMessage facade `shouldBe` Just "body failed"
+  labelsOf (cleanupFailures facade) `shouldBe` labelsOf (cleanupFailures direct)
+  ioMessagesOf (cleanupFailures facade) `shouldBe` ioMessagesOf (cleanupFailures direct)
+  ioMessagesOf (cleanupFailures facade)
+    `shouldBe` [Just "inner cleanup failed", Just "outer cleanup failed"]
+
+-- Continuation facade nested scopes ------------------------------------------
+
+-- | 'locally' is a lifetime boundary: everything the inner scope allocated is
+-- released before the outer scope resumes, and its ordinary result survives.
+testLocallyReleasesBeforeOuterResumes ∷ Expectation
+testLocallyReleasesBeforeOuterResumes = do
+  steps ← newTrail
+  result ←
+    withScoped
+      ( do
+          _ ← allocResource (pure ()) (\_ → record steps "outer release")
+          staged ← locally $ do
+            _ ← allocResource (pure ()) (\_ → record steps "inner release")
+            liftIO (record steps "inner work")
+            pure (21 ∷ Int)
+          liftIO (record steps "after locally")
+          pure (staged * 2)
+      )
+      pure
+  result `shouldBe` 42
+  trail steps
+    `shouldReturn` ["inner work", "inner release", "after locally", "outer release"]
+
+testLocallyCleanupFailureReachesOuterScope ∷ Expectation
+testLocallyCleanupFailureReachesOuterScope = do
+  steps ← newTrail
+  propagated ←
+    expectFailure $
+      withScoped
+        ( do
+            _ ←
+              allocResource
+                (pure ())
+                (\_ → record steps "outer release" *> throwIO (userError "outer cleanup failed"))
+            _ ← locally $ do
+              _ ←
+                allocResource
+                  (pure ())
+                  (\_ → record steps "inner release" *> throwIO (userError "inner cleanup failed"))
+              pure (1 ∷ Int)
+            liftIO (record steps "after locally")
+        )
+        pure
+  -- The inner scope's body succeeded and only its release failed, so that
+  -- release's exception is primary, and it reaches the outer scope, where the
+  -- outer release's own failure is retained beside it.
+  ioErrorMessage propagated `shouldBe` Just "inner cleanup failed"
+  ioMessagesOf (cleanupFailures propagated)
+    `shouldBe` [Just "inner cleanup failed", Just "outer cleanup failed"]
+  trail steps `shouldReturn` ["inner release", "outer release"]
+
+-- Continuation facade composite allocation -----------------------------------
+
+-- | Reverse allocation order is a property of one scope's own allocations. A
+-- composite allocated inside that scope keeps the order its constructor
+-- declared, which for this buffer is acquisition order.
+testCompositeThroughFacade ∷ Expectation
+testCompositeThroughFacade = do
+  device ← newDevice
+  steps ← newTrail
+  distinct ←
+    withScoped
+      ( do
+          _ ← allocResource (pure ()) (\_ → record steps "surrounding release")
+          first ← allocComposite (bufferAssembly device workingDevice)
+          second ← allocComposite (bufferAssembly device workingDevice)
+          liftIO (record steps "body")
+          pure (bufferHandle first /= bufferHandle second)
+      )
+      pure
+  distinct `shouldBe` True
+  deviceTrail device
+    `shouldReturn` [ "create buffer"
+                   , "query requirements 1"
+                   , "allocate memory 64"
+                   , "bind 1 to 2"
+                   , "create buffer"
+                   , "query requirements 3"
+                   , "allocate memory 192"
+                   , "bind 3 to 4"
+                   , -- The second composite is released first, because the two
+                     -- allocations belong to one scope; each composite still
+                     -- destroys its buffer before freeing that buffer's memory.
+                     "destroy buffer 3"
+                   , "free memory 4"
+                   , "destroy buffer 1"
+                   , "free memory 2"
+                   ]
+  trail steps `shouldReturn` ["body", "surrounding release"]
