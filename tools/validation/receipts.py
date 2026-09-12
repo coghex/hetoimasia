@@ -180,6 +180,19 @@ def load_plan(path: str) -> dict:
         revision = require_dict(document, endpoint, "plan")
         require_str(revision, "commit", f"plan {endpoint}")
         require_str(revision, "tree", f"plan {endpoint}")
+    catalog = require_dict(document, "catalog", "plan")
+    require_str(catalog, "source", "plan catalog")
+    # A plan resolved against a fixture catalog names it here, because the
+    # runner has to read that same document to reproduce the classification the
+    # plan was built from. ``None`` is the ordinary case: the candidate's own.
+    if "override" not in catalog:
+        raise EvidenceError("plan catalog is missing 'override'")
+    if catalog["override"] is not None and not isinstance(catalog["override"], str):
+        raise EvidenceError("plan catalog field 'override' is neither a string nor null")
+    # Naming a mutable path binds nothing on its own, so the plan also records
+    # what that catalog said. The runner refuses a catalog that no longer
+    # digests to this.
+    require_str(catalog, "candidate_digest", "plan catalog")
     request = require_dict(document, "request", "plan")
     require_str_list(request, "ids", "plan request")
     require_bool(request, "all_hspec", "plan request")
@@ -232,16 +245,23 @@ def plan_identity(plan: dict) -> str:
     """The fingerprint a receipt names so evidence cannot cross plans.
 
     It covers everything that decides what must run and how: the plan and
-    policy revisions, the candidate's input identity and pinned toolchain, all
-    three revisions, the normalized request, and every group's selection and
-    exact execution definition. It deliberately omits the catalog and request
-    *paths*, which are run-local filenames rather than contract, and the
-    changed-path listing, which explains a selection without being able to
-    alter it.
+    policy revisions, the digest of the catalog that classified the candidate,
+    the candidate's input identity and pinned toolchain, all three revisions,
+    the normalized request, and every group's selection and exact execution
+    definition. It deliberately omits the catalog and request *paths*, which are
+    run-local filenames rather than contract, and the changed-path listing,
+    which explains a selection without being able to alter it.
+
+    The catalog digest is in it because the runner's own check against that
+    digest is only self-consistent: a worker holding a rewritten catalog and a
+    copy of the plan updated to match would satisfy itself and still produce a
+    receipt the original plan accepted. Binding the digest here is what makes
+    such a receipt name a different plan.
     """
     payload = {
         "plan_schema_version": plan["schema_version"],
         "policy_version": plan["policy_version"],
+        "catalog_digest": plan["catalog"]["candidate_digest"],
         "catalog_policy_version": plan["catalog_policy_version"],
         "input_identity": plan["input_identity"],
         "toolchain": dict(plan["toolchain"]),

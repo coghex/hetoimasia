@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 3,
+  "policy_version": 4,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -12,6 +12,20 @@
     "LICENSE",
     "tools/KANBAN-LICENSE"
   ],
+  "generated_paths": [
+    "dist-newstyle/",
+    "dist-dev/",
+    ".worktrees/",
+    "captures/",
+    "plan.json",
+    "plan.err",
+    "applicability.json",
+    "request.txt",
+    "reuse.out",
+    "receipts/",
+    "*.pyc",
+    "*.DS_Store"
+  ],
   "floor": [
     "build.all",
     "test.engine",
@@ -21,7 +35,11 @@
     {
       "id": "build.all",
       "description": "Compile every local component warning-clean.",
-      "command": ["cabal", "build", "all"],
+      "command": [
+        "cabal",
+        "build",
+        "all"
+      ],
       "component": "all",
       "inputs": [],
       "framework": "none",
@@ -33,7 +51,12 @@
     {
       "id": "test.engine",
       "description": "Focused Hspec examples for the logger, sinks, configuration, runtime, and console startup.",
-      "command": ["cabal", "test", "hetoimasia-tests", "--test-show-details=direct"],
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-tests",
+        "--test-show-details=direct"
+      ],
       "component": "hetoimasia:test:hetoimasia-tests",
       "inputs": [],
       "framework": "hspec",
@@ -45,7 +68,13 @@
     {
       "id": "smoke.console",
       "description": "Run the console executable's smoke mode end to end.",
-      "command": ["cabal", "run", "exe:hetoimasia", "--", "--smoke"],
+      "command": [
+        "cabal",
+        "run",
+        "exe:hetoimasia",
+        "--",
+        "--smoke"
+      ],
       "component": "hetoimasia:exe:hetoimasia",
       "inputs": [],
       "framework": "none",
@@ -57,7 +86,12 @@
     {
       "id": "test.workflow",
       "description": "Hspec examples driving the documentation landing helper and this planner against temporary Git repositories.",
-      "command": ["cabal", "test", "workflow-tests", "--test-show-details=direct"],
+      "command": [
+        "cabal",
+        "test",
+        "workflow-tests",
+        "--test-show-details=direct"
+      ],
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
         "tools/docs_land.sh",

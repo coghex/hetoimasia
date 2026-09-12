@@ -3,12 +3,20 @@
 
 The aggregate is the only thing that turns execution into a published status,
 so it is deliberately suspicious of its own inputs. A selected group passes
-only when a well-formed receipt says it passed, names this plan's identity, and
-names this plan's head commit. A group the plan explained away needs no
-receipt. Nothing else is a pass: a missing receipt, a failed or timed-out one,
-a malformed one, one that belongs to another plan or head, and any worker that
-did not conclude ``success`` while its groups were selected all fail, because a
-selected gate nothing vouched for has not been satisfied.
+only when a well-formed receipt says it passed, names this plan's identity and
+head commit, records an execution *of this plan's candidate*, and agrees with
+the candidate on every compatibility field a reused execution is already held
+to. A group the plan explained away needs no receipt. Nothing else is a pass: a
+missing receipt, a failed or timed-out one, a malformed one, one that belongs to
+another plan, head, or candidate, and any worker that did not conclude
+``success`` while its groups were selected all fail, because a selected gate
+nothing vouched for has not been satisfied.
+
+The candidate and compatibility questions are asked here as well as by the
+runner deliberately. The runner refuses to execute from the wrong checkout, but
+a verdict rests on the receipt in front of it rather than on the run that is
+supposed to have produced it, so a document claiming an execution this plan did
+not describe is refused on its own terms.
 
 ``--applicability`` adds the second way a selected group can be satisfied: an
 earlier execution of byte-identical inputs, recorded by ``reuse.py``. A reused
@@ -29,6 +37,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+# A one-shot tool must not write into the checkout it is validating. Importing a
+# sibling module would leave a ``__pycache__`` beside it — a file the candidate
+# does not carry, which the runner is right to refuse — so bytecode writing is
+# turned off before the imports that would create it.
+sys.dont_write_bytecode = True
 
 import receipts
 from plan import PlannerError, parse_request
@@ -243,6 +257,26 @@ def inspect_group(
             "the receipt records a different command from the one the plan selected",
             False,
         )
+    # A fresh execution is of the candidate itself, so its provenance and its
+    # compatibility fields are both the plan's. A reused execution is judged
+    # differently, in `reuse_finding`, because it belongs to an earlier run.
+    problems: list[str] = []
+    candidate = plan["candidate"]
+    if receipt["executed_commit"] != candidate["commit"]:
+        problems.append(
+            f"the receipt records an execution at {receipt['executed_commit'][:12]}, "
+            f"not the plan's candidate {candidate['commit'][:12]}"
+        )
+    if receipt["executed_tree"] != candidate["tree"]:
+        problems.append(
+            f"the receipt records the tree {receipt['executed_tree'][:12]}, "
+            f"not the candidate's {candidate['tree'][:12]}"
+        )
+    problems += receipts.compatibility_problems(
+        receipts.candidate_identity(plan), receipt, "the receipt"
+    )
+    if problems:
+        return Finding(identifier, reason, "mismatched", "; ".join(problems), False)
     if receipt["outcome"] == "timeout":
         return Finding(
             identifier,

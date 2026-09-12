@@ -5,6 +5,8 @@ module Sandbox
   , run
   , git
   , writeFixtureFile
+  , fixtureIgnore
+  , fixtureGenerated
   ) where
 
 import Data.List (isPrefixOf)
@@ -55,3 +57,36 @@ writeFixtureFile root relative contents = do
   let target = root </> relative
   createDirectoryIfMissing True (takeDirectory target)
   writeFile target contents
+
+-- | The operational artifacts a fixture repository's own examples write beside
+-- the tree they validate: plans, applicability documents, request bodies,
+-- receipts, and the stub GitHub these examples answer from.
+--
+-- Declaring them keeps an example's own `git add -A` from committing a plan or
+-- a receipt into the tree it is about, the way a real repository keeps its
+-- generated files out of one. It is deliberately not what makes the runner
+-- tolerate them: the runner consults no ignore rule at all, and answers for an
+-- untracked file by asking whether the candidate's own classification says some
+-- group would read it.
+fixtureIgnore ∷ String
+fixtureIgnore =
+  unlines
+    [ "/*.json"
+    , "/*.txt"
+    , "/receipt-*"
+    , "/child.pid"
+    , "/receipts/"
+    , "/gh-stub/"
+    ]
+
+-- | The same layout, as the catalog declaration the runner actually consults.
+--
+-- A fixture repository's examples write their plans, receipts, request bodies,
+-- and stub GitHub beside the tree they validate, exactly as a real run writes
+-- its plan and receipts into the checkout it is validating. The runner exempts
+-- what the candidate's catalog declares here and nothing else, so this is what
+-- keeps an ordinary example running — deliberately not the `.gitignore` beside
+-- it, which Git reads and the runner does not.
+fixtureGenerated ∷ String
+fixtureGenerated =
+  "[\"*.json\", \"receipts/\", \"gh-stub/\", \"fixtures/\", \"body.txt\", \"child.pid\", \"receipt-*\"]"

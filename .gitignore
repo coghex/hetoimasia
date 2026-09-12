@@ -20,3 +20,16 @@ config/*.local.yaml
 .env.local
 /.worktrees/
 /captures/
+
+# Validation artifacts a run writes into the checkout it is validating: the plan
+# it is handed, the applicability document beside it, and the receipts it
+# produces. This keeps them out of `git status` and out of an accidental commit.
+# It is not what makes the runner tolerate them — the runner reads no ignore
+# rule at all, and answers for an untracked file by asking whether the
+# candidate's own classification says any group would read it.
+/plan.json
+/plan.err
+/applicability.json
+/request.txt
+/reuse.out
+/receipts/

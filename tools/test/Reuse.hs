@@ -11,7 +11,14 @@ module Reuse (spec) where
 import Control.Monad (forM_, void)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Json (Json, asArray, asBool, asString, entryFor, field, parseJson)
-import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
+import Sandbox
+  ( fixtureGenerated
+  , fixtureIgnore
+  , git
+  , run
+  , sanitizedEnvironment
+  , writeFixtureFile
+  )
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
@@ -437,7 +444,8 @@ runGroup fixture plan group extra =
     (environment fixture)
     (root fixture)
     "python3"
-    ( [ tools fixture </> "run.py"
+    ( [ "-I"
+      , tools fixture </> "run.py"
       , group
       , "--plan", plan
       , "--receipts", receiptsDirectory fixture
@@ -788,7 +796,8 @@ change fixture path contents = do
 
 fixtureFiles ∷ [(FilePath, String)]
 fixtureFiles =
-  [ ("cabal.project", "packages:\n  .\n")
+  [ (".gitignore", fixtureIgnore)
+  , ("cabal.project", "packages:\n  .\n")
   , ("demo.cabal", demoPackage)
   , ("app/Main.hs", "module Main (main) where\nmain :: IO ()\nmain = pure ()\n")
   , ("src/note.txt", "a fixture the failing group consumes\n")
@@ -829,6 +838,7 @@ fixtureCatalogWith policy inputs =
     , "  \"policy_version\": " ++ show policy ++ ","
     , "  \"policy_inputs\": " ++ inputs ++ ","
     , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
+    , "  \"generated_paths\": " ++ fixtureGenerated ++ ","
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["
     , "    {"

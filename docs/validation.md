@@ -57,7 +57,8 @@ reported, never quietly accepted.
 
 ## Catalog schema
 
-The catalog is a JSON object. Keys are fixed; an unknown key is an error.
+The catalog is a JSON object. Keys are fixed; an unknown key is an error, and
+every key below is required except where the table says otherwise.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
@@ -65,6 +66,7 @@ The catalog is a JSON object. Keys are fixed; an unknown key is an error.
 | `policy_version` | integer | The selection policy revision a person reads, recorded in every plan as `catalog_policy_version`. The plan's own `policy_version` is the digest reuse compares. |
 | `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are an input of *every* group, so a planner, catalog, runner, aggregate, or workflow edit widens non-optional coverage conservatively and still marks an optional group's inputs changed when its own definition moved — without ever selecting an optional group, since selection reaches those only through a request. |
 | `non_affecting_paths` | array of strings | Declared harmless classes (see below). |
+| `generated_paths` | array of strings, optional | Paths a run leaves in a checkout that no execution reads as input: build trees, a run's own plan, applicability document, and receipts, interpreter and editor debris. The [runner's provenance check](#execution-provenance) exempts these and nothing else when deciding whether a checkout is still its candidate; nothing else consults them, so they classify no committed path and can never excuse one. An entry ending in `/` is a directory prefix, an entry with `*` is a class matched the way `non_affecting_paths` are, and any other entry is an exact path. A declaration never outranks an input: a path some group consumes, or that packaging makes an input, is classified normally however it is declared here. Omitting the key exempts nothing. |
 | `floor` | array of strings | The mandatory floor. Every entry must name a registered, non-optional group. |
 | `groups` | array of objects | The registered groups, in canonical order. |
 
@@ -290,7 +292,7 @@ planner reads the text from `--request-file`.
 | `catalog_policy_version` | The catalog's declared policy revision, as an integer. |
 | `input_identity` | The candidate's input identity digest. |
 | `toolchain`, `runner_os` | The pinned platform the identity covers and a reusable receipt must match. |
-| `catalog` | The resolved catalog source and its group count. |
+| `catalog` | The resolved catalog `source` and its group count, plus the classification the runner must reproduce: `override` — the `--catalog` path when a fixture supplied one, `null` otherwise — and `candidate_digest`, a digest of the candidate's catalog document, which binds its contents rather than only its path. |
 | `base`, `head`, `candidate` | Each revision's name with its resolved `commit` and `tree`. |
 | `base_package_metadata` | `present` or `absent`. |
 | `base_catalog` | `present`, `absent`, or `not-applicable` when `--catalog` overrode it. |
@@ -405,16 +407,22 @@ A cache miss costs time and can never change a result.
 its receipts directory. The resolved plan is its only authority:
 
 ```bash
-python3 tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
+python3 -I tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
 ```
+
+`-I` is required, not a nicety: the runner refuses to start without it. See
+[Execution provenance](#execution-provenance).
 
 | Option | Meaning |
 | --- | --- |
 | `--plan` | The resolved plan this execution belongs to. Required: a group's command, its timeout, and the plan identity its receipt must name all come from here, so a runner never infers a request-dependent selection from an ID and a checkout. |
 | `--receipts` | The directory the receipt is written to. |
 | `--repo-root` | The checkout to execute in. Defaults to the working directory. |
-| `--executed-commit`, `--executed-tree` | Override the executed revision recorded in the receipt. Defaults to the checkout's `HEAD`. |
 | `--toolchain NAME=VERSION` | A toolchain version to record. Repeatable; the runner always records its own Python version. |
+
+There is **no option that sets the executed revision**. The runner reads it from
+the checkout and refuses to run at all unless that checkout is the plan's
+candidate; see [Execution provenance](#execution-provenance) below.
 
 Fixture catalogs reach the runner through the plan: resolve one with
 `plan.py --catalog <fixture>`, then run against that plan. A group the plan
@@ -428,6 +436,197 @@ architecture, the toolchain versions, and the run it can be read back from. The
 head and the executed revision are recorded separately because a pull request is
 validated on an integration candidate that is neither endpoint; a receipt must
 not imply that the head itself ran.
+
+#### Execution provenance
+
+A receipt names the plan's identity and copies the candidate's input identity,
+so the tree that executed has to *be* the candidate. Before anything runs, the
+runner checks three things against `plan.candidate` and refuses with exit `2`,
+leaving no receipt, when any of them does not hold:
+
+| Check | Why it is a refusal |
+| --- | --- |
+| `HEAD` is the candidate commit | A receipt records the commit it read. Two commits can share a tree, and an execution of the later one would misdescribe what was validated even where the bytes agreed — so the commit is compared, not only the tree. |
+| `HEAD`'s tree is the candidate's tree | The digests the receipt carries are of that tree. |
+| No uncommitted change to a relevant input | A working tree the candidate does not contain is not that candidate, whatever `HEAD` says. |
+
+The comparison is against the **candidate**, not the head. A plan resolved with
+a `--candidate` that differs from its head still runs from a checkout of that
+candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
+
+**The candidate's own code is checked before any of it runs.** `plan.py` decides
+what counts as harmless prose and `receipts.py` supplies the plan contract and
+writes the receipt — and both live under `tools/validation/`, so both are
+mandatory policy inputs of the candidate this run has not yet confirmed it is
+standing in. Importing either first would execute code out of the mutable
+checkout: an edited classifier could excuse its own edit, and an edited contract
+could forge a receipt while its own path was still unexamined.
+
+The same is true of the standard library it reaches for, and of the interpreter
+itself. `python3 tools/validation/run.py` puts that directory first on
+`sys.path`, and an inherited `PYTHONPATH` puts the checkout root there too, so a
+file dropped at either — a `platform.py`, a `json.py` — would be imported in
+place of the standard library module of that name. Worse, Python runs
+`sitecustomize` and `usercustomize` *during startup*, searching that same path
+for them, so a hook in the checkout executes before the runner's first
+instruction — early enough to delete itself, rewrite the environment, or patch
+the runner before anything has looked at its path.
+
+Nothing the script does can undo that, so **the runner refuses to start unless
+its interpreter was isolated**: every caller passes `-I` — the workflow's worker
+steps, the documented command, and the workflow tests. That ignores the
+environment, skips user site directories, and prepends neither the script's
+directory nor the working directory, so the standard library is all that is left
+to import from. The runner then reaches its own siblings by path rather than by
+putting any directory back.
+
+So the runner reads the plan's candidate for itself, with the standard library
+alone, proves the checkout with its own code and Git plumbing, and refuses
+**any** difference under a mandatory policy root — `tools/validation/` or
+`.github/workflows/` — outright, with no classification at all. Only then are
+`receipts` and `plan` imported, which is the first moment this run knows the
+copies on disk are the candidate's. Those two roots are restated in the runner
+rather than read from the catalog or the planner, because both of those live
+under them.
+
+The floor this cannot reach past is `run.py` itself: a checkout that has edited
+the runner is not running the runner. The hosted workers check the candidate out
+fresh and confirm its commit before running anything, which is what makes that
+floor a real one rather than an assumption.
+
+Relevance for the third check is **the classification that produced the plan**,
+never the working tree's: the candidate commit's package graph, and the catalog
+that plan was resolved with — the fixture when `--catalog` supplied one, and the
+candidate's own otherwise. An edit must not be able to reclassify itself as
+prose on the way past, and a rewritten catalog in the working tree is exactly
+the change this notices. The plan records which catalog it used **and what that
+catalog said**, so a fixture plan is judged by its fixture's rules rather than
+by the candidate's default catalog — and naming the path is not enough on its
+own, because a fixture lives on the mutable filesystem and could be rewritten
+between planning and execution into one that stops consuming the very path an
+edit is about. The runner digests the catalog it reads and refuses a document
+that no longer matches the plan's `catalog.candidate_digest`: a classification
+the plan was not built from cannot say what a checkout holds.
+
+Staged and unstaged changes are both asked about, because neither implies the
+other — a mode change can live only in the index — and additions, deletions,
+renames, and mode changes all count. The diagnostic names the paths.
+
+Tracked and added paths are held to the **same** conservative rule: a path is
+relevant unless it is [harmless prose](#harmless-prose), the complement
+`input_identity` covers. A Markdown file some group declares as an input, a
+mandatory policy input, `cabal.project`, or any `.cabal` file is relevant
+however it is spelled — and so is a file no group declares at all. A
+`cabal.project.local` is the case that makes the point: nothing declares it, and
+every Cabal command reads it, so a checkout carrying one is running under flags
+the candidate does not describe.
+
+The single exemption is what the candidate's catalog declares in
+`generated_paths`: paths a run leaves behind that no execution reads as input —
+build trees, a run's own plan, applicability document, and receipts, and
+interpreter and editor debris. Entries say what they look like: a trailing `/`
+is a directory prefix, an entry containing `*` is one of the basename classes
+`non_affecting_paths` already uses, and anything else is an exact
+repository-relative path. The field is optional and a catalog that declares none
+exempts nothing.
+
+**A declaration never outranks an input.** A path some group consumes, or that
+packaging makes an input whatever a catalog says, is answered for by the
+ordinary classification even where a `generated_paths` entry would have matched
+it. Declaring `plan.json` exempts the plan a run is handed at the repository
+root; it does not exempt a `tools/validation/plan.json` inside a mandatory
+policy root, and `*.pyc` does not exempt a `__pycache__` there either. The
+exemption is for a run's own output, not a way to write into what a group reads.
+
+That declaration is deliberately **catalog data rather than an ignore rule**. No
+ignore rule is consulted at all — not the repository's `.gitignore`, not
+`.git/info/exclude`, not a machine's global excludes. Any of them could hide a
+newly added source, consumed document, or package description from the question
+entirely, and two of the three are not part of the candidate. `generated_paths`
+lives in the catalog, which sits under a mandatory policy root, so widening it
+moves the policy identity and is reviewed alongside the change that widened it.
+The repository still ignores the validation artifacts in `.gitignore`, but only
+to keep `git status` legible; that grants them nothing here.
+
+For the same reason the validation tools set `sys.dont_write_bytecode`: a
+`__pycache__` left beside them sits inside a declared policy input, and a tool
+must not create the very file the runner would refuse.
+
+**Nor is the checkout's own index, attributes, or configuration trusted.** A
+repository can be told to stop noticing a file (`git update-index
+--assume-unchanged`), to stop noticing modes (`core.fileMode=false`), to rewrite
+a file's content on the way into Git (a `clean` filter declared in
+`.git/info/attributes`, which can simply emit the committed bytes), and to stop
+distinguishing a symlink from a regular file (`core.symlinks=false`). Each of
+those empties an ordinary `git diff` while the command still reads what is
+actually on disk.
+
+So the comparison asks Git for nothing but the recorded trees. All three
+questions are answered by comparing modes and object ids directly:
+
+- **the index** against the candidate, path by path, since an unmerged or
+  staged entry is what a commit from here would carry;
+- **the working tree** against the candidate, by reading each tracked path's raw
+  bytes and `lstat` and computing its Git object id here. A symlink hashes its
+  target, a regular file its contents, and a directory or device holds no blob
+  at all — so a type change is a change, a mode change is a change, and no
+  filter sits between the file and the answer. The executable bit compared is
+  the **owner's**, as Git's own model has it: a file at `0455` keeps group and
+  other execution while Git records it as no longer executable, and a comparison
+  that disagreed would miss exactly that change; and
+- **every addition** — found by walking the filesystem under the root the
+  command will run in, rather than by asking Git. `git ls-files --others`
+  answers for whichever working tree Git has been pointed at, and a
+  repository-local `core.worktree` or an inherited `GIT_WORK_TREE` can make that
+  a different directory entirely. A **directory** counts as an addition too,
+  because Git records no empty ones: a directory the candidate's own paths do
+  not put in the tree is content the candidate does not have, and a command can
+  read it — a check for an empty directory under a declared input, say. Such a
+  directory is named *and* descended into, so that what lives inside it is
+  classified on its own terms: a catalog that calls a directory generated is
+  saying its own output goes there, not that anything dropped inside it stops
+  being an input. A directory carrying its own `.git` is another repository,
+  which this one cannot look inside, and a **symlink** standing where a
+  directory would be may leave the checkout entirely; neither can be walked, so
+  both are reported as plain differences rather than additions. A declaration
+  cannot honestly exempt content nothing here has read — a `generated_paths`
+  prefix matching a link must not excuse what a group declares on the far side
+  of it.
+
+Git is asked in an environment stripped of the variables that redirect it —
+`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and their kin — and with
+`GIT_NO_REPLACE_OBJECTS` set. A `refs/replace` entry would otherwise substitute
+one object for another everywhere Git looked: replacing the candidate's tree
+leaves `rev-parse HEAD` and `rev-parse HEAD^{tree}` reporting the planned
+identifiers while every listing and checked-out file describes some other tree,
+and replacing a package description's blob leaves `ls-tree` naming the committed
+object while `git show` hands out different metadata — enough to drop a source
+directory from the package graph and make a dirty document there look harmless.
+
+That sanitation is applied to the runner's **own environment**, not passed to
+chosen calls, because the candidate's classifier shells out to Git as well, to
+read its catalog and its package graph. A query the runner does not make itself
+is exactly the one that would otherwise go unsanitized. Everything started from
+here inherits it, the group's own command included.
+
+A **submodule** gets all three asked of it too, recursively — once the path is
+confirmed to be a real directory. A symlink there would be followed, and
+whatever clean checkout sat at the other end reported as this submodule, while
+the commands read that tree or the link itself. A gitlink records one commit and
+says nothing about the tree beside it, so a submodule sitting at
+exactly the commit the candidate names can still carry staged, unstaged, or
+untracked changes — and neither the superproject's index nor its untracked
+listing reaches inside, while the commands read that content. Paths found there
+are named from the superproject. A submodule this checkout cannot read at all is
+a difference in its own right: it is not the tree the candidate named.
+
+A checkout whose filesystem cannot carry an executable bit is likewise refused,
+by the mode comparison. That is the right direction for a gate: such a checkout
+cannot faithfully hold the candidate either.
+
+This refusal is the whole of the policy. Validating uncommitted work with honest
+attribution of its own is not supported: commit it, or plan and run from the
+commit you have.
 
 The identity fields are **copied from the plan**, never recomputed: the receipt
 has to name the identity the candidate was planned under, and a runner that
@@ -462,11 +661,18 @@ hazard in its purest form — every worker skips, every group is vacuously
 accounted for, and a candidate that ran nothing reports success.
 
 **Plan identity** is a SHA-256 over everything that decides what must run and
-how: the plan and policy revisions, both endpoints' commits and trees, the
-normalized request, and every group's selection, reason, command, and timeout.
-It deliberately omits the catalog and request *paths*, which are run-local
-filenames rather than contract, and the changed-path listing, which explains a
-selection without being able to alter it.
+how: the plan and policy revisions, the digest of the catalog that classified
+the candidate, both endpoints' commits and trees, the normalized request, and
+every group's selection, reason, command, and timeout. It deliberately omits the
+catalog and request *paths*, which are run-local filenames rather than contract,
+and the changed-path listing, which explains a selection without being able to
+alter it.
+
+The catalog digest is in it because the runner's own check against that digest
+is only self-consistent. A worker holding a rewritten override catalog *and* a
+copy of the plan updated to match would satisfy itself and still produce a
+receipt the original plan accepted. Binding the digest into the identity is what
+makes such a receipt name a different plan, so the aggregate refuses it.
 
 ### Reusing an earlier execution
 
@@ -569,14 +775,25 @@ python3 tools/validation/aggregate.py --plan plan.json --receipts <dir>
 | `--summary` | A Markdown file the verdict table is appended to. |
 
 A selected group passes only when a well-formed receipt says it passed, names
-this plan's identity, names this plan's head, and records the command the plan
-selected. A group the plan explained away as `unaffected` or
+this plan's identity, names this plan's head, records the command the plan
+selected, records an execution of **this plan's candidate** commit and tree, and
+agrees with the candidate on every compatibility field — `input_identity`,
+`policy_version`, `toolchain`, and `runner_os` — that a reused execution is
+already held to. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
 than a failure. Everything else fails: a missing receipt, a failed or timed-out
-one, a malformed one, one belonging to another plan or head, and **any worker
+one, a malformed one, one belonging to another plan, head, or candidate, one
+recording inputs or a platform this plan was not resolved for, and **any worker
 that did not conclude `success` while its groups were asked to execute**. A
 selected gate nothing vouched for has not been satisfied, however green the rest
 of the run looks.
+
+The candidate and compatibility questions are asked here as well as by the
+runner, and deliberately so. The runner refuses to execute from the wrong
+checkout, but a verdict rests on the document in front of it rather than on the
+run that is supposed to have produced it, so a receipt claiming an execution
+this plan does not describe is refused on its own terms. The diagnostic names
+the field that disagreed.
 
 A selected group with no receipt at all is satisfied instead by an applicability
 record, and only then. The receipt that record carries is read through the same
@@ -1031,9 +1248,10 @@ output.
 The same suite drives the real runner, aggregate, timing report, and review
 gate against fixture catalogs, plans, and receipt directories. It covers a
 failing command's non-zero receipt, the enforced catalog timeout and the reaping
-of the command's descendants, the head and executed revision being recorded
-separately, a selected group with no receipt, receipts belonging to another plan
-or another head, malformed receipts and malformed plans, omitted `unaffected`
+of the command's descendants, a plan whose candidate is not its head executing
+from a checkout of that candidate and recording both separately, a selected
+group with no receipt, receipts belonging to another plan or another head,
+malformed receipts and malformed plans, omitted `unaffected`
 and `optional-unrequested` groups passing without receipts, one failing group
 failing the verdict while others passed, a worker cancelled or unexpectedly
 skipped while its groups were selected, a worker that concluded `failure` while
@@ -1056,6 +1274,47 @@ a `strip`, a canonical denial of it stripping through a proven starting point
 and an identical tree, that approval asking for no mutation when no label is
 attached, the superseded-head and unreadable-label refusals answered first, and
 unrecognized provenance and head-verdict inputs refused.
+
+Execution provenance has its own examples, built on the same fixtures. They
+reproduce the regression the contract exists for — a plan whose candidate fails,
+executed again from the commit that replaced it — and require the runner to
+refuse it and the aggregate to withhold the verdict. They also cover a different
+commit that happens to carry the candidate's tree; the absence of any override
+that could record a revision the runner did not execute; uncommitted edits,
+additions staged and untracked, deletions, renames, mode changes, an edit to
+Markdown a group declares as an input, and an edit to the catalog that
+classifies the candidate, each refused by name; ordinary execution with prose no
+group consumes and with the plan, applicability document, and receipts a run
+writes beside itself; a fresh receipt recording an execution of another revision
+or another tree; and a fresh receipt disagreeing about each of `input_identity`,
+`policy_version`, `toolchain`, and `runner_os` in turn. Three of them are about
+the classification itself: a dirty path judged by the fixture catalog its plan
+was resolved with rather than the candidate's own; that fixture rewritten after
+planning so that it no longer describes the plan it produced; and a worker that
+rewrites both the catalog and its own copy of the plan's digest, whose receipt
+the originally resolved plan then refuses as another plan's. Six more are
+about what a checkout can be told not to report: an addition no group declares
+and no catalog calls generated, an edit hidden by
+`git update-index --assume-unchanged`, an unstaged mode change hidden by
+`core.fileMode=false`, an owner-execute bit dropped while group and other
+execution remain set, an edit a `clean` filter reports as the committed bytes,
+a tracked symlink replaced by a regular file of the same text under
+`core.symlinks=false`, a declared-generated basename sitting under a
+consumed input or a mandatory policy root, and a submodule resting at exactly
+the candidate's commit while carrying an edited input, a classifier the checkout
+has edited to call every path harmless, a receipt contract edited the same way
+and refused without being imported, a module dropped beside the runner to shadow
+a standard library one and refused without running, an addition a redirected `core.worktree`
+keeps out of Git's own listing, an added directory the candidate cannot contain,
+a tree substituted for the candidate's by a `refs/replace` entry, an input a
+group declares dropped inside a directory the catalog calls generated, a
+symlink to a clean checkout standing in for a submodule at the very same commit,
+a link out of the checkout wearing a generated directory's name, a dirty
+document a replaced package description would have excused, a shadow module
+an inherited `PYTHONPATH` would have reached, and a `sitecustomize` hook the
+checkout supplies, which is refused without ever running — each refused by name.
+One more asks the contract of the runner itself: started without `-I`, it
+refuses rather than proceeding.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

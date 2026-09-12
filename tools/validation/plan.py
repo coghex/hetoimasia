@@ -28,6 +28,12 @@ import re
 import subprocess
 import sys
 
+# A one-shot tool must not write into the checkout it is validating. Importing a
+# sibling module would leave a ``__pycache__`` beside it — a file the candidate
+# does not carry, which the runner is right to refuse — so bytecode writing is
+# turned off before the imports that would create it.
+sys.dont_write_bytecode = True
+
 import receipts
 
 # The catalog's schema and the plan's are separate contracts: the plan gained
@@ -492,6 +498,16 @@ TOP_LEVEL_KEYS = {
     "groups": list,
 }
 
+# Paths a run leaves in a checkout that no execution reads as input: build
+# trees, a run's own plan and receipts, editor and interpreter debris. The
+# runner exempts them when deciding whether a checkout is still its candidate,
+# and nothing else consults them — they classify no committed path, so they
+# cannot excuse one. Optional because exempting nothing is the safe default for
+# a catalog that has not thought about it.
+OPTIONAL_TOP_LEVEL_KEYS = {
+    "generated_paths": list,
+}
+
 GROUP_KEYS = {
     "id": str,
     "description": str,
@@ -515,8 +531,13 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             problems.append(f"{path}: missing required key {key!r}")
         elif not isinstance(document[key], expected) or isinstance(document[key], bool):
             problems.append(f"{path}: key {key!r} must be a {expected.__name__}")
+    for key, expected in OPTIONAL_TOP_LEVEL_KEYS.items():
+        if key in document and (
+            not isinstance(document[key], expected) or isinstance(document[key], bool)
+        ):
+            problems.append(f"{path}: key {key!r} must be a {expected.__name__}")
     for key in document:
-        if key not in TOP_LEVEL_KEYS:
+        if key not in TOP_LEVEL_KEYS and key not in OPTIONAL_TOP_LEVEL_KEYS:
             problems.append(f"{path}: unknown top-level key {key!r}")
     if problems:
         return problems
@@ -532,6 +553,11 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
         for entry in document[key]:
             if not isinstance(entry, str) or not entry:
                 problems.append(f"{path}: every {key} entry must be a non-empty string")
+    # An empty entry would match every path, exempting the whole checkout from
+    # the question the runner asks.
+    for entry in document.get("generated_paths", []):
+        if not isinstance(entry, str) or not entry:
+            problems.append(f"{path}: every generated_paths entry must be a non-empty string")
     if not document["groups"]:
         problems.append(f"{path}: the catalog registers no groups")
 
@@ -850,6 +876,8 @@ def build_plan(
     head_packages: dict[str, Package],
     base_catalog: dict | None,
     base_catalog_state: str,
+    catalog_override: str | None,
+    candidate_catalog: dict,
 ) -> dict:
     groups = catalog["groups"]
     groups_by_id = {group["id"]: group for group in groups}
@@ -968,7 +996,20 @@ def build_plan(
         # The platform an execution's result is a claim about. A receipt from
         # another operating system describes another machine's behaviour.
         "runner_os": identity["runner_os"],
-        "catalog": {"source": catalog_source, "groups": len(groups)},
+        # `override` and `candidate_digest` describe the classification the
+        # runner has to reproduce before it can judge its own checkout: which
+        # catalog decided this candidate's inputs, and exactly what that catalog
+        # said. A fixture catalog lives on the mutable filesystem rather than in
+        # the candidate's tree, so naming the path alone would let it be
+        # rewritten between planning and execution; the digest is what binds its
+        # contents. The path itself stays out of `plan_identity`, which
+        # deliberately omits run-local filenames.
+        "catalog": {
+            "source": catalog_source,
+            "override": catalog_override,
+            "candidate_digest": digest(candidate_catalog),
+            "groups": len(groups),
+        },
         "base": {"revision": base.revision, "commit": base.commit, "tree": base.tree},
         "head": {"revision": head.revision, "commit": head.commit, "tree": head.tree},
         # Selection compares the contribution; execution happens on the
@@ -1236,6 +1277,8 @@ def main(argv: list[str]) -> int:
         head_packages,
         base_catalog,
         base_catalog_state,
+        arguments.catalog,
+        candidate_catalog,
     )
     if arguments.as_json:
         print(json.dumps(plan, indent=2, sort_keys=False))
