@@ -26,11 +26,11 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish safe resource ownership and scoped composition
-- [ ] RES-1. Implement failure-preserving CPU resource scopes
-- [ ] RES-2. Protect composite resource construction and cleanup ordering
-- [ ] RES-3. Add allocResource and nested continuation scopes
-- [ ] RES-4. Exercise owned resources through the console runtime
+- [x] EPIC. Establish safe resource ownership and scoped composition — [#22]
+- [x] RES-1. Implement failure-preserving CPU resource scopes — [#25]
+- [x] RES-2. Protect composite resource construction and cleanup ordering — [#28]
+- [x] RES-3. Add allocResource and nested continuation scopes — [#29]
+- [x] RES-4. Exercise owned resources through the console runtime — [#30]
 
 ## Epic contract
 

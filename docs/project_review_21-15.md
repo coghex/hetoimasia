@@ -17,14 +17,14 @@ Status legend: `[ ]` unprocessed · `[#N]` filed as issue N · `[no-issue]` revi
 
 ## Status
 
-- [ ] PRR-1. Bind inherited approval to a proven approved revision across successive pushes
-- [ ] PRR-2. Verify the executed candidate before certifying a plan
-- [ ] PRR-3. Keep timing collection failures out of the required validation verdict
-- [ ] PRR-4. Include workflow test dependencies in the source distribution
+- [x] PRR-1. Bind inherited approval to a proven approved revision across successive pushes — [#23]
+- [x] PRR-2. Verify the executed candidate before certifying a plan — [#24]
+- [x] PRR-3. Keep timing collection failures out of the required validation verdict — [#26]
+- [x] PRR-4. Include workflow test dependencies in the source distribution — [#27]
 
 ## 1. Approval provenance
 
-### PRR-1. Bind inherited approval to a proven approved revision across successive pushes
+### [#23] PRR-1. Bind inherited approval to a proven approved revision across successive pushes
 
 > **Captured note:** P1. The review gate treats an event's `before` commit as
 > approved merely because the PR still has its label. A delayed dismissal of
@@ -95,7 +95,7 @@ the identical-tree case works even when replay itself returns `strip`.
 
 ## 2. Execution evidence
 
-### PRR-2. Verify the executed candidate before certifying a plan
+### [#24] PRR-2. Verify the executed candidate before certifying a plan
 
 > **Captured note:** P2. `run.py` can execute a different checkout from the
 > plan's candidate while copying the plan's identity into its receipt, and
@@ -163,7 +163,7 @@ the checkout, and `--worker worker=success:test.flag` for aggregation.
 
 ## 3. Required-check availability
 
-### PRR-3. Keep timing collection failures out of the required validation verdict
+### [#26] PRR-3. Keep timing collection failures out of the required validation verdict
 
 > **Captured note:** P2. PR #16 makes a failure of the timings API prevent the
 > aggregate from running, even when all validation evidence is available.
@@ -203,7 +203,7 @@ the default success condition, so Actions skips it and `build-test` fails.
 
 ## 4. Source distribution completeness
 
-### PRR-4. Include workflow test dependencies in the source distribution
+### [#27] PRR-4. Include workflow test dependencies in the source distribution
 
 > **Captured note:** P2. `hetoimasia.cabal` omits runtime files required by the
 > workflow test suite: `tools/validation/reuse.py` added in PR #20, and

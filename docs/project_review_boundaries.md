@@ -30,7 +30,15 @@ the next sweep instead of being ignored.
           15,
           16,
           20,
-          21
+          21,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38
         ]
       }
     }
