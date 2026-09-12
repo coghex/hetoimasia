@@ -498,6 +498,16 @@ TOP_LEVEL_KEYS = {
     "groups": list,
 }
 
+# Paths a run leaves in a checkout that no execution reads as input: build
+# trees, a run's own plan and receipts, editor and interpreter debris. The
+# runner exempts them when deciding whether a checkout is still its candidate,
+# and nothing else consults them — they classify no committed path, so they
+# cannot excuse one. Optional because exempting nothing is the safe default for
+# a catalog that has not thought about it.
+OPTIONAL_TOP_LEVEL_KEYS = {
+    "generated_paths": list,
+}
+
 GROUP_KEYS = {
     "id": str,
     "description": str,
@@ -521,8 +531,13 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             problems.append(f"{path}: missing required key {key!r}")
         elif not isinstance(document[key], expected) or isinstance(document[key], bool):
             problems.append(f"{path}: key {key!r} must be a {expected.__name__}")
+    for key, expected in OPTIONAL_TOP_LEVEL_KEYS.items():
+        if key in document and (
+            not isinstance(document[key], expected) or isinstance(document[key], bool)
+        ):
+            problems.append(f"{path}: key {key!r} must be a {expected.__name__}")
     for key in document:
-        if key not in TOP_LEVEL_KEYS:
+        if key not in TOP_LEVEL_KEYS and key not in OPTIONAL_TOP_LEVEL_KEYS:
             problems.append(f"{path}: unknown top-level key {key!r}")
     if problems:
         return problems
@@ -538,6 +553,11 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
         for entry in document[key]:
             if not isinstance(entry, str) or not entry:
                 problems.append(f"{path}: every {key} entry must be a non-empty string")
+    # An empty entry would match every path, exempting the whole checkout from
+    # the question the runner asks.
+    for entry in document.get("generated_paths", []):
+        if not isinstance(entry, str) or not entry:
+            problems.append(f"{path}: every generated_paths entry must be a non-empty string")
     if not document["groups"]:
         problems.append(f"{path}: the catalog registers no groups")
 

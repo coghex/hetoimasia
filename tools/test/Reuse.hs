@@ -11,7 +11,14 @@ module Reuse (spec) where
 import Control.Monad (forM_, void)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Json (Json, asArray, asBool, asString, entryFor, field, parseJson)
-import Sandbox (fixtureIgnore, git, run, sanitizedEnvironment, writeFixtureFile)
+import Sandbox
+  ( fixtureGenerated
+  , fixtureIgnore
+  , git
+  , run
+  , sanitizedEnvironment
+  , writeFixtureFile
+  )
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
@@ -830,6 +837,7 @@ fixtureCatalogWith policy inputs =
     , "  \"policy_version\": " ++ show policy ++ ","
     , "  \"policy_inputs\": " ++ inputs ++ ","
     , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
+    , "  \"generated_paths\": " ++ fixtureGenerated ++ ","
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["
     , "    {"

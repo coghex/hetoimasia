@@ -6,6 +6,7 @@ module Sandbox
   , git
   , writeFixtureFile
   , fixtureIgnore
+  , fixtureGenerated
   ) where
 
 import Data.List (isPrefixOf)
@@ -77,3 +78,15 @@ fixtureIgnore =
     , "/receipts/"
     , "/gh-stub/"
     ]
+
+-- | The same layout, as the catalog declaration the runner actually consults.
+--
+-- A fixture repository's examples write their plans, receipts, request bodies,
+-- and stub GitHub beside the tree they validate, exactly as a real run writes
+-- its plan and receipts into the checkout it is validating. The runner exempts
+-- what the candidate's catalog declares here and nothing else, so this is what
+-- keeps an ordinary example running — deliberately not the `.gitignore` beside
+-- it, which Git reads and the runner does not.
+fixtureGenerated ∷ String
+fixtureGenerated =
+  "[\"*.json\", \"receipts/\", \"gh-stub/\", \"fixtures/\", \"body.txt\", \"child.pid\", \"receipt-*\"]"

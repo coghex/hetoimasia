@@ -57,7 +57,8 @@ reported, never quietly accepted.
 
 ## Catalog schema
 
-The catalog is a JSON object. Keys are fixed; an unknown key is an error.
+The catalog is a JSON object. Keys are fixed; an unknown key is an error, and
+every key below is required except where the table says otherwise.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
@@ -65,6 +66,7 @@ The catalog is a JSON object. Keys are fixed; an unknown key is an error.
 | `policy_version` | integer | The selection policy revision a person reads, recorded in every plan as `catalog_policy_version`. The plan's own `policy_version` is the digest reuse compares. |
 | `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are an input of *every* group, so a planner, catalog, runner, aggregate, or workflow edit widens non-optional coverage conservatively and still marks an optional group's inputs changed when its own definition moved — without ever selecting an optional group, since selection reaches those only through a request. |
 | `non_affecting_paths` | array of strings | Declared harmless classes (see below). |
+| `generated_paths` | array of strings, optional | Paths a run leaves in a checkout that no execution reads as input: build trees, a run's own plan, applicability document, and receipts, interpreter and editor debris. The [runner's provenance check](#execution-provenance) exempts these and nothing else when deciding whether a checkout is still its candidate; nothing else consults them, so they classify no committed path and can never excuse one. An entry ending in `/` is a directory prefix, an entry with `*` is a class matched the way `non_affecting_paths` are, and any other entry is an exact path. Omitting the key exempts nothing. |
 | `floor` | array of strings | The mandatory floor. Every entry must name a registered, non-optional group. |
 | `groups` | array of objects | The registered groups, in canonical order. |
 
@@ -467,28 +469,49 @@ Staged and unstaged changes are both asked about, because neither implies the
 other — a mode change can live only in the index — and additions, deletions,
 renames, and mode changes all count. The diagnostic names the paths.
 
-A **tracked** path is relevant unless it is [harmless prose](#harmless-prose),
-which is the same complement `input_identity` covers: a Markdown file some group
-declares as an input, a mandatory policy input, `cabal.project`, or any `.cabal`
-file is relevant however it is spelled.
+Tracked and added paths are held to the **same** conservative rule: a path is
+relevant unless it is [harmless prose](#harmless-prose), the complement
+`input_identity` covers. A Markdown file some group declares as an input, a
+mandatory policy input, `cabal.project`, or any `.cabal` file is relevant
+however it is spelled — and so is a file no group declares at all. A
+`cabal.project.local` is the case that makes the point: nothing declares it, and
+every Cabal command reads it, so a checkout carrying one is running under flags
+the candidate does not describe.
 
-An **added** file — one no commit of this checkout carries — is relevant when it
-could reach an execution: it falls under a declared input, a component's own
-sources, or a mandatory policy root, or it is packaging. That is the narrower
-question its absence from every tree makes the right one, and it is what leaves
-a build tree, a capture, a local configuration file, and a run's own plan,
-applicability document, and receipts irrelevant without exempting anything.
+The single exemption is what the candidate's catalog declares in
+`generated_paths`: paths a run leaves behind that no execution reads as input —
+build trees, a run's own plan, applicability document, and receipts, and
+interpreter and editor debris. Entries read as input prefixes, where a trailing
+`/` names a directory, or as the basename classes `non_affecting_paths` already
+uses, so both `dist-newstyle/` and `*.pyc` say what they look like. The field is
+optional and a catalog that declares none exempts nothing.
 
-**No ignore rule is consulted.** Not the repository's `.gitignore`, not
-`.git/info/exclude`, not a machine's global excludes — two of those three are
-not even part of the candidate, and any of them could otherwise hide a newly
-added source, consumed document, or package description from the question
-entirely. The repository still ignores the generated validation artifacts, but
-only to keep `git status` legible; it grants them nothing here. For the same
-reason the validation tools set `sys.dont_write_bytecode`: a `__pycache__` left
-beside them sits inside a declared policy input, and a tool must not create the
-very file the runner would refuse. A stale one from an older checkout is named
-in the diagnostic and should be removed.
+That declaration is deliberately **catalog data rather than an ignore rule**. No
+ignore rule is consulted at all — not the repository's `.gitignore`, not
+`.git/info/exclude`, not a machine's global excludes. Any of them could hide a
+newly added source, consumed document, or package description from the question
+entirely, and two of the three are not part of the candidate. `generated_paths`
+lives in the catalog, which sits under a mandatory policy root, so widening it
+moves the policy identity and is reviewed alongside the change that widened it.
+The repository still ignores the validation artifacts in `.gitignore`, but only
+to keep `git status` legible; that grants them nothing here.
+
+For the same reason the validation tools set `sys.dont_write_bytecode`: a
+`__pycache__` left beside them sits inside a declared policy input, and a tool
+must not create the very file the runner would refuse.
+
+**Nor is the checkout's own index or configuration trusted.** A repository can
+be told to stop noticing a file — `git update-index --assume-unchanged` — and to
+stop noticing modes — `core.fileMode=false` — and either would empty an ordinary
+diff while the command still read the edited content. The working tree is
+therefore compared against `HEAD` through a *temporary* index built from `HEAD`,
+which carries neither flag nor any cached stat, so Git has to read and hash
+every tracked file to answer, with `core.fileMode=true` forced so a mode is
+compared rather than assumed. The checkout's real index is compared too, since a
+staged change and a working-tree change are different facts. A checkout whose
+filesystem cannot carry an executable bit is refused by that comparison, which
+is the right direction for a gate: such a checkout cannot faithfully hold the
+candidate either.
 
 This refusal is the whole of the policy. Validating uncommitted work with honest
 attribution of its own is not supported: commit it, or plan and run from the
@@ -1158,7 +1181,11 @@ the classification itself: a dirty path judged by the fixture catalog its plan
 was resolved with rather than the candidate's own; that fixture rewritten after
 planning so that it no longer describes the plan it produced; and a worker that
 rewrites both the catalog and its own copy of the plan's digest, whose receipt
-the originally resolved plan then refuses as another plan's.
+the originally resolved plan then refuses as another plan's. Three more are
+about what a checkout can be told not to report: an addition no group declares
+and no catalog calls generated, an edit hidden by
+`git update-index --assume-unchanged`, and an unstaged mode change hidden by
+`core.fileMode=false`, each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

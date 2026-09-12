@@ -12,13 +12,23 @@ import Control.Concurrent (threadDelay)
 import Control.Monad (void)
 import Data.Maybe (isNothing)
 import Json (Json (..), asBool, asString, entryFor, field, parseJson)
-import Sandbox (fixtureIgnore, git, run, sanitizedEnvironment, writeFixtureFile)
+import Sandbox
+  ( fixtureGenerated
+  , fixtureIgnore
+  , git
+  , run
+  , sanitizedEnvironment
+  , writeFixtureFile
+  )
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
   , doesFileExist
   , getCurrentDirectory
+  , getPermissions
   , removeFile
+  , setOwnerExecutable
+  , setPermissions
   )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -214,6 +224,35 @@ spec = describe "Validation execution" $ do
           "tools/validation/catalog.json"
           (fixtureCatalogWith "[\"*.md\", \"*.txt\", \".gitignore\", \"LICENSE\"]")
         refusesDirty fixture plan ["tools/validation/catalog.json"]
+
+    it "refuses an addition no group declares and no catalog calls generated" $
+      withDirtyFixture $ \fixture plan → do
+        -- Every Cabal command reads `cabal.project.local`, and no catalog can
+        -- have declared it as an input. A checkout carrying one is running with
+        -- flags the candidate does not describe, so relevance is the same
+        -- conservative complement of harmless prose a tracked path is held to.
+        writeFixtureFile (root fixture) "cabal.project.local" "package demo\n"
+        refusesDirty fixture plan ["cabal.project.local"]
+
+    it "refuses an edit the index was told to stop noticing" $
+      withDirtyFixture $ \fixture plan → do
+        -- `--assume-unchanged` empties every ordinary diff while the command
+        -- still reads the edited file.
+        void $ gitIn fixture ["update-index", "--assume-unchanged", "--", "src/note.txt"]
+        writeFixtureFile (root fixture) "src/note.txt" "an edit no diff reports\n"
+        void $ gitIn fixture ["diff", "--name-only", "HEAD"] >>= \reported →
+          reported `shouldBe` ""
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses an unstaged mode change a configuration hid" $
+      withDirtyFixture $ \fixture plan → do
+        -- `core.fileMode=false` tells this checkout not to compare modes.
+        void $ gitIn fixture ["config", "core.fileMode", "false"]
+        permissions ← getPermissions (root fixture </> "src/note.txt")
+        setPermissions (root fixture </> "src/note.txt") (setOwnerExecutable True permissions)
+        void $ gitIn fixture ["diff", "--name-only", "HEAD"] >>= \reported →
+          reported `shouldBe` ""
+        refusesDirty fixture plan ["src/note.txt"]
 
     it "refuses a relevant addition that the repository's own ignore rules hide" $
       withDirtyFixture $ \fixture plan → do
@@ -957,6 +996,7 @@ fixtureCatalogWith nonAffecting =
     , "  \"policy_version\": 1,"
     , "  \"policy_inputs\": [\"tools/validation/catalog.json\"],"
     , "  \"non_affecting_paths\": " ++ nonAffecting ++ ","
+    , "  \"generated_paths\": " ++ fixtureGenerated ++ ","
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["
     , groupDocument "build.pass" "[\"true\"]" "[]" "none" "build" "60" "false" ++ ","
@@ -979,6 +1019,7 @@ alternateCatalog =
     , "  \"policy_version\": 1,"
     , "  \"policy_inputs\": [\"tools/validation/catalog.json\"],"
     , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
+    , "  \"generated_paths\": " ++ fixtureGenerated ++ ","
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["
     , groupDocument "build.pass" "[\"true\"]" "[\"docs/alternate.md\"]" "none" "build" "60" "false"

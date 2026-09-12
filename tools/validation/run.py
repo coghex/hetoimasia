@@ -34,6 +34,7 @@ import platform
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -67,7 +68,7 @@ def git_output(root: str, *arguments: str) -> str:
     return process.stdout.decode("utf-8", errors="replace").strip()
 
 
-def git_records(root: str, *arguments: str) -> list[str]:
+def git_records(root: str, *arguments: str, environment: dict | None = None) -> list[str]:
     """Run a NUL-separated Git query, keeping every byte of every field.
 
     ``git_output`` strips its result, which is right for a revision but wrong
@@ -75,7 +76,7 @@ def git_records(root: str, *arguments: str) -> list[str]:
     a stripped field would name a file that does not exist.
     """
     process = subprocess.run(
-        ("git", "-C", root) + arguments, capture_output=True, check=False
+        ("git", "-C", root) + arguments, capture_output=True, check=False, env=environment
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
@@ -84,31 +85,69 @@ def git_records(root: str, *arguments: str) -> list[str]:
     return [field for field in output.split("\0") if field]
 
 
+def name_status(fields: list[str]) -> set[str]:
+    """Every path a ``--name-status -z`` listing names, renames included."""
+    paths: set[str] = set()
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        # A rename or a copy names both endpoints, and both of them differ from
+        # the candidate: the source is gone and the target is new.
+        needed = 2 if status[0] in ("R", "C") else 1
+        if index + needed > len(fields):
+            raise EvidenceError(f"git reported status {status!r} with no path")
+        paths.update(fields[index : index + needed])
+        index += needed
+    return paths
+
+
+def working_tree_changes(root: str) -> set[str]:
+    """Tracked paths whose working-tree content, type, or mode is not HEAD's.
+
+    Read through a temporary index built from HEAD rather than through the
+    checkout's own, because a checkout can be configured to stop noticing its
+    own differences. ``git update-index --assume-unchanged`` makes a file's
+    edits invisible to every ordinary diff, and ``core.fileMode=false`` does the
+    same for a mode; either would let a command read content the candidate does
+    not carry while the receipt claimed it did. A fresh index holds neither flag
+    nor any cached stat, so Git has to read and hash every tracked file to
+    answer, and ``core.fileMode=true`` is forced so a mode is compared rather
+    than assumed. A checkout whose filesystem cannot carry an executable bit
+    will be refused by that comparison, which is the right direction for a gate:
+    such a checkout cannot faithfully hold the candidate either.
+    """
+    with tempfile.TemporaryDirectory(prefix="validation-index-") as scratch:
+        environment = {**os.environ, "GIT_INDEX_FILE": os.path.join(scratch, "index")}
+        git_records(root, "read-tree", "HEAD", environment=environment)
+        # `diff` rather than `diff-index`: the porcelain refreshes the index it
+        # was given first, and an index this new carries no stat for anything,
+        # so the plumbing would report every tracked file as differing. The
+        # refresh is where each file is actually read and hashed.
+        return name_status(
+            git_records(
+                root,
+                "-c",
+                "core.fileMode=true",
+                "diff",
+                "--name-status",
+                "-z",
+                "HEAD",
+                environment=environment,
+            )
+        )
+
+
 def tracked_changes(root: str) -> set[str]:
     """Every tracked path this checkout holds differently from its HEAD commit.
 
-    Staged and unstaged edits are asked about separately, because neither
-    implies the other: a working-tree diff misses a mode change that lives only
-    in the index, and an index diff misses an edit that was never added. Both
-    report deletions and both endpoints of a rename.
+    The working tree is what a command reads, and the index is what a commit
+    would carry; neither implies the other, so both are asked. The index
+    comparison needs no hardening — it reads two recorded trees rather than the
+    filesystem, and nothing can suppress it.
     """
-    paths: set[str] = set()
-    for staged in (("--cached",), ()):
-        fields = git_records(root, "diff", "--name-status", "-z", *staged, "HEAD")
-        index = 0
-        while index < len(fields):
-            status = fields[index]
-            index += 1
-            # A rename or a copy names both endpoints, and both of them differ
-            # from the candidate: the source is gone and the target is new.
-            needed = 2 if status[0] in ("R", "C") else 1
-            if index + needed > len(fields):
-                raise EvidenceError(
-                    f"git diff --name-status reported status {status!r} with no path"
-                )
-            paths.update(fields[index : index + needed])
-            index += needed
-    return paths
+    staged = name_status(git_records(root, "diff", "--name-status", "-z", "--cached", "HEAD"))
+    return staged | working_tree_changes(root)
 
 
 def untracked_files(root: str) -> set[str]:
@@ -125,20 +164,23 @@ def untracked_files(root: str) -> set[str]:
     return set(git_records(root, "ls-files", "--others", "-z"))
 
 
-def reaches_an_execution(path: str, consumed: set[str]) -> bool:
-    """Whether an added file could reach an execution of this candidate.
+def generated(path: str, catalog: dict) -> bool:
+    """Whether the candidate's catalog declares this path as a run's own output.
 
-    A file the candidate's tree does not carry matters when some registered
-    group would read it: it falls under a declared input, a component's own
-    sources, or one of the mandatory policy roots. Packaging is always in, on
-    the same grounds the identity refuses to treat it as prose — it decides what
-    is compiled however a catalog classifies it. Everything else — a build
-    tree, a capture, a local configuration file, a run's own plan and receipts —
-    is output or scratch that no command the plan selected reads as input.
+    The declaration is deliberately catalog data rather than an ignore rule. A
+    `.gitignore`, a `.git/info/exclude`, and a machine's global excludes can all
+    be made to hide a source file, and two of the three are not even part of the
+    candidate; `generated_paths` is in the catalog, which lives under a mandatory
+    policy root, so widening it moves the policy identity and is reviewed with
+    the change that widened it. Entries read as input prefixes — a trailing
+    ``/`` names a directory — or as the basename classes `non_affecting_paths`
+    already uses, so both ``dist-newstyle/`` and ``*.pyc`` say what they look
+    like. A catalog that declares none exempts nothing.
     """
-    if path in planner.NEVER_HARMLESS_PATHS or path.endswith(planner.NEVER_HARMLESS_SUFFIXES):
-        return True
-    return any(planner.matches_input(path, entry) for entry in consumed)
+    return any(
+        planner.matches_input(path, entry) or planner.matches_class(path, entry)
+        for entry in catalog.get("generated_paths", ())
+    )
 
 
 def relevant_uncommitted(root: str, plan: dict) -> list[str]:
@@ -151,19 +193,20 @@ def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     able to reclassify itself as prose on the way past, and a rewritten catalog
     in the working tree is exactly the change this refusal exists to notice.
 
-    A tracked path is relevant unless it is harmless prose, which is the same
-    complement the candidate's `input_identity` already covers: consumed
-    Markdown and a mandatory policy input are never harmless however they are
-    spelled. An added path is relevant when it could reach an execution, which
-    is the narrower question its absence from every tree makes the right one.
+    Tracked and added paths are held to the same conservative rule: everything
+    is relevant unless it is harmless prose, the complement the candidate's
+    `input_identity` already covers. Consumed Markdown, a mandatory policy
+    input, `cabal.project`, and any `.cabal` file are never harmless however
+    they are spelled — and neither is a file no group declares at all, such as a
+    `cabal.project.local` that every Cabal command would read. The one exemption
+    is what the candidate's catalog declares as a run's own output.
     """
     catalog, packages = candidate_classification(root, plan)
     consumed = planner.consumed_entries(catalog, packages)
-    tracked = tracked_changes(root)
-    untracked = untracked_files(root)
-    relevant = {path for path in tracked if not planner.harmless_prose(path, consumed, catalog)}
-    relevant |= {path for path in untracked if reaches_an_execution(path, consumed)}
-    return sorted(relevant)
+    changed = tracked_changes(root) | {
+        path for path in untracked_files(root) if not generated(path, catalog)
+    }
+    return sorted(path for path in changed if not planner.harmless_prose(path, consumed, catalog))
 
 
 def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
