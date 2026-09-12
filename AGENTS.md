@@ -28,6 +28,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Use explicit `IO` or a small local context initially. The resource design
   selects a scoped continuation facade; an application-wide monad remains an
   open choice and must not reintroduce application-wide state.
+- Own CPU resources through `withResource`. The
+  [resource contract](docs/resources.md) fixes the argument order, the failure
+  table, the mask discipline a release must respect, and how a caller inspects
+  or discards the cleanup failures a scope retains. Do not hand-roll an
+  acquire/release pair that drops one of two failures.
 - Keep pure algorithms separate from resource effects. Strict fields and
   packed/mutable arrays are appropriate where measured costs justify them.
 - Reuse Synarchy's lessons and isolated code deliberately. Do not copy its
