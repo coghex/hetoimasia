@@ -35,6 +35,7 @@ import Control.Exception
   , toException
   , try
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
@@ -42,14 +43,29 @@ import Control.Monad (void)
 import Data.Text (Text)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Hetoimasia.Foundation.Resource
-  ( CleanupFailure
+  ( Assembly
+  , CleanupFailure
+  , ReleaseRank
+  , acquirePart
   , cleanupFailureException
   , cleanupFailureLabel
   , cleanupFailures
   , cleanupFailuresInContext
   , displayCleanupFailure
+  , releaseRank
+  , restoredStep
+  , withComposite
   , withResource
   , withResourceLabelled
+  )
+import Test.Engine.Resources.Buffer
+  ( Buffer (..)
+  , Outcomes (..)
+  , bufferAssembly
+  , bufferLabels
+  , deviceTrail
+  , newDevice
+  , workingDevice
   )
 import System.IO
   ( Handle
@@ -134,6 +150,44 @@ spec = describe "Resources" $ do
   describe "Resource scope owned handles" $ do
     it "closes a temporary file handle the scope owns"
       testOwnedTemporaryHandle
+
+  describe "Composite construction" $ do
+    it "releases nothing when the first acquisition fails"
+      testFirstAcquisitionFails
+    it "releases the part acquired so far when a restored step fails"
+      testRestoredStepFails
+    it "releases the part acquired so far when the second acquisition fails"
+      testSecondAcquisitionFails
+    it "releases both parts in the declared order when the binding step fails"
+      testBindingStepFails
+    it "lends the finished value and releases it in the declared order"
+      testCompositeNormalPath
+    it "declares an order that is acquisition order for a buffer and its memory"
+      testDeclaredOrderIsAcquisitionOrder
+    it "declares an order that is not acquisition order when the constructor says so"
+      testDeclaredOrderDiffersFromAcquisition
+    it "attempts the remaining releases after a rollback release throws"
+      testRollbackReleaseThrows
+    it "releases each part once and lets no finished value reach the caller"
+      testNoDoubleReleaseOrLeakedValue
+
+  describe "Composite construction cancellation" $ do
+    it "rolls back the parts acquired so far when cancelled in a restored step"
+      (boundedExample testCancelledInRestoredStep)
+    it "rolls back the parts acquired so far when cancelled inside an acquisition"
+      (boundedExample testCancelledInAcquisition)
+    it "rolls back a part acquired with a cancellation already pending"
+      (boundedExample testCancellationPendingWhenAcquisitionReturns)
+    it "defers a cancellation aimed at a rollback until every release has run"
+      (boundedExample testCancellationDeferredDuringRollback)
+
+  describe "Composite construction inside a scope" $ do
+    it "lets the enclosing scope observe the composite's primary and retained failures"
+      testCompositeInsideScope
+    it "fails with the first cleanup exception when the final releases fail"
+      testFinalReleasesFail
+    it "keeps the body's failure primary when the final releases also fail"
+      testBodyFailureStaysPrimary
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -692,3 +746,441 @@ testOwnedTemporaryHandle = withSystemTempDirectory "hetoimasia-resource" $ \dire
   openAfterwards `shouldBe` False
   contents ← readFile path
   contents `shouldBe` "owned line\n"
+
+-- Composite construction ------------------------------------------------------
+
+-- | Two parts acquired in that order, released under the ranks the caller
+-- declares. Nothing here depends on a graphics API: it exists to show that the
+-- release order is a declaration rather than a consequence of acquisition.
+pairAssembly ∷ Trail → ReleaseRank → ReleaseRank → Assembly ()
+pairAssembly releases firstRank secondRank = do
+  acquirePart
+    "first"
+    firstRank
+    (record releases "acquire first")
+    (\_ → record releases "first")
+  acquirePart
+    "second"
+    secondRank
+    (record releases "acquire second")
+    (\_ → record releases "second")
+
+occurrences ∷ Text → [Text] → Int
+occurrences entry = length . filter (== entry)
+
+testFirstAcquisitionFails ∷ Expectation
+testFirstAcquisitionFails = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (bufferAssembly device workingDevice {onCreateBuffer = Just "create failed"})
+        (\_ → record bodies "body")
+  ioErrorMessage propagated `shouldBe` Just "create failed"
+  -- Nothing was acquired, so nothing was released and nothing is retained.
+  length (cleanupFailures propagated) `shouldBe` 0
+  deviceTrail device `shouldReturn` ["create buffer"]
+  trail bodies `shouldReturn` []
+
+testRestoredStepFails ∷ Expectation
+testRestoredStepFails = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (bufferAssembly device workingDevice {onQueryRequirements = Just "query failed"})
+        (\_ → record bodies "body")
+  ioErrorMessage propagated `shouldBe` Just "query failed"
+  length (cleanupFailures propagated) `shouldBe` 0
+  -- Exactly the one part acquired so far was released.
+  deviceTrail device
+    `shouldReturn` ["create buffer", "query requirements 1", "destroy buffer 1"]
+  trail bodies `shouldReturn` []
+
+testSecondAcquisitionFails ∷ Expectation
+testSecondAcquisitionFails = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (bufferAssembly device workingDevice {onAllocateMemory = Just "allocate failed"})
+        (\_ → record bodies "body")
+  ioErrorMessage propagated `shouldBe` Just "allocate failed"
+  deviceTrail device
+    `shouldReturn`
+      [ "create buffer"
+      , "query requirements 1"
+      , "allocate memory 64"
+      , "destroy buffer 1"
+      ]
+  trail bodies `shouldReturn` []
+
+testBindingStepFails ∷ Expectation
+testBindingStepFails = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (bufferAssembly device workingDevice {onBindMemory = Just "bind failed"})
+        (\_ → record bodies "body")
+  ioErrorMessage propagated `shouldBe` Just "bind failed"
+  -- Both parts existed by the binding step, and both were released in the
+  -- declared order.
+  deviceTrail device
+    `shouldReturn`
+      [ "create buffer"
+      , "query requirements 1"
+      , "allocate memory 64"
+      , "bind 1 to 2"
+      , "destroy buffer 1"
+      , "free memory 2"
+      ]
+  trail bodies `shouldReturn` []
+
+testCompositeNormalPath ∷ Expectation
+testCompositeNormalPath = do
+  device ← newDevice
+  bodies ← newTrail
+  observed ←
+    withComposite (bufferAssembly device workingDevice) $ \buffer → do
+      record bodies "body"
+      pure (show (bufferHandle buffer), show (bufferMemory buffer))
+  -- The body borrowed a finished value whose parts were bound together.
+  observed `shouldBe` ("BufferHandle 1", "MemoryHandle 2")
+  trail bodies `shouldReturn` ["body"]
+  deviceTrail device
+    `shouldReturn`
+      [ "create buffer"
+      , "query requirements 1"
+      , "allocate memory 64"
+      , "bind 1 to 2"
+      , "destroy buffer 1"
+      , "free memory 2"
+      ]
+
+testDeclaredOrderIsAcquisitionOrder ∷ Expectation
+testDeclaredOrderIsAcquisitionOrder = do
+  device ← newDevice
+  withComposite (bufferAssembly device workingDevice) (\_ → pure ())
+  performed ← deviceTrail device
+  let acquisitions = filter (`elem` ["create buffer", "allocate memory 64"]) performed
+      releases = filter (`elem` ["destroy buffer 1", "free memory 2"]) performed
+  acquisitions `shouldBe` ["create buffer", "allocate memory 64"]
+  -- The buffer is created first and destroyed first, so the declared order is
+  -- acquisition order. Reversing acquisition would free the memory while the
+  -- buffer still referred to it.
+  releases `shouldBe` ["destroy buffer 1", "free memory 2"]
+
+testDeclaredOrderDiffersFromAcquisition ∷ Expectation
+testDeclaredOrderDiffersFromAcquisition = do
+  acquisitionOrder ← newTrail
+  withComposite (pairAssembly acquisitionOrder (releaseRank 0) (releaseRank 1)) (\_ → pure ())
+  trail acquisitionOrder
+    `shouldReturn` ["acquire first", "acquire second", "first", "second"]
+  -- The same two stages, in the same acquisition order, with the opposite
+  -- release order declared.
+  declaredOrder ← newTrail
+  withComposite (pairAssembly declaredOrder (releaseRank 1) (releaseRank 0)) (\_ → pure ())
+  trail declaredOrder
+    `shouldReturn` ["acquire first", "acquire second", "second", "first"]
+
+testRollbackReleaseThrows ∷ Expectation
+testRollbackReleaseThrows = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        ( bufferAssembly
+            device
+            workingDevice
+              { onBindMemory = Just "bind failed"
+              , onDestroyBuffer = Just "destroy failed"
+              }
+        )
+        (\_ → record bodies "body")
+  -- The failure that triggered the rollback stays primary.
+  ioErrorMessage propagated `shouldBe` Just "bind failed"
+  let retained = cleanupFailures propagated
+  labelsOf retained `shouldBe` ["buffer"]
+  ioMessagesOf retained `shouldBe` [Just "destroy failed"]
+  -- The throwing release did not stop the remaining one from being attempted.
+  performed ← deviceTrail device
+  occurrences "destroy buffer 1" performed `shouldBe` 1
+  occurrences "free memory 2" performed `shouldBe` 1
+  trail bodies `shouldReturn` []
+
+testNoDoubleReleaseOrLeakedValue ∷ Expectation
+testNoDoubleReleaseOrLeakedValue = do
+  device ← newDevice
+  escaped ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (bufferAssembly device workingDevice {onBindMemory = Just "bind failed"})
+        (\buffer → record escaped "body" *> pure buffer)
+  ioErrorMessage propagated `shouldBe` Just "bind failed"
+  performed ← deviceTrail device
+  occurrences "destroy buffer 1" performed `shouldBe` 1
+  occurrences "free memory 2" performed `shouldBe` 1
+  -- The body never ran, so no finished value was observable by the caller.
+  trail escaped `shouldReturn` []
+
+-- Composite construction cancellation -----------------------------------------
+
+testCancelledInRestoredStep ∷ Expectation
+testCancelledInRestoredStep = do
+  releases ← newTrail
+  reached ← newEmptyMVar
+  blocker ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    captured ←
+      try $
+        withComposite
+          ( do
+              acquirePart
+                "first"
+                (releaseRank 0)
+                (record releases "acquire first")
+                (\_ → record releases "first")
+              restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+              acquirePart
+                "second"
+                (releaseRank 1)
+                (record releases "acquire second")
+                (\_ → record releases "second")
+          )
+          (\_ → record releases "body")
+    putMVar outcome (captured ∷ Either SomeException ())
+  takeMVar reached
+  killThread runner
+  captured ← takeMVar outcome
+  case captured of
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      asyncException propagated `shouldBe` Just ThreadKilled
+      -- Only the part acquired before the restored step was rolled back.
+      trail releases `shouldReturn` ["acquire first", "first"]
+      length (cleanupFailures propagated) `shouldBe` 0
+
+testCancelledInAcquisition ∷ Expectation
+testCancelledInAcquisition = do
+  releases ← newTrail
+  reached ← newEmptyMVar
+  blocker ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    captured ←
+      try $
+        withComposite
+          ( do
+              acquirePart
+                "first"
+                (releaseRank 0)
+                (record releases "acquire first")
+                (\_ → record releases "first")
+              acquirePart
+                "second"
+                (releaseRank 1)
+                (putMVar reached () *> takeMVar blocker ∷ IO ())
+                (\_ → record releases "second")
+          )
+          (\_ → record releases "body")
+    putMVar outcome (captured ∷ Either SomeException ())
+  takeMVar reached
+  killThread runner
+  captured ← takeMVar outcome
+  case captured of
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      asyncException propagated `shouldBe` Just ThreadKilled
+      -- The second part was never acquired, so its release never ran, and the
+      -- first was not stranded.
+      trail releases `shouldReturn` ["acquire first", "first"]
+
+-- | A cancellation aimed at a thread that is already rolling a composite back
+-- waits for every release of that rollback, in the declared order.
+testCancellationDeferredDuringRollback ∷ Expectation
+testCancellationDeferredDuringRollback = do
+  releases ← newTrail
+  insideRelease ← newEmptyMVar
+  killerSlot ← newEmptyMVar
+  killerStatus ← newEmptyMVar
+  killerDone ← newEmptyMVar
+  runner ← forkIO $
+    void . try @SomeException $
+      withComposite
+        ( do
+            acquirePart "first" (releaseRank 0) (record releases "acquire first") $ \_ → do
+              record releases "first start"
+              putMVar insideRelease ()
+              killer ← readMVar killerSlot
+              status ← awaitPendingThrow killer
+              putMVar killerStatus status
+              record releases "first end"
+            acquirePart
+              "second"
+              (releaseRank 1)
+              (record releases "acquire second")
+              (\_ → record releases "second")
+            restoredStep (throwIO (ErrorCall "stage failed"))
+        )
+        (\_ → record releases "body")
+  -- The rollback has started, so the thread is uninterruptibly masked.
+  takeMVar insideRelease
+  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
+  putMVar killerSlot killer
+  takeMVar killerDone
+  observed ← takeMVar killerStatus
+  observed `shouldBe` ThreadBlocked BlockedOnException
+  trail releases
+    `shouldReturn`
+      ["acquire first", "acquire second", "first start", "first end", "second"]
+
+-- Composite construction inside a scope ---------------------------------------
+
+testCompositeInsideScope ∷ Expectation
+testCompositeInsideScope = do
+  device ← newDevice
+  releases ← newTrail
+  propagated ←
+    expectFailure $
+      withResourceLabelled
+        "outer"
+        (pure ())
+        (\_ → record releases "outer" *> throwIO (userError "outer released"))
+        $ \_ →
+          withComposite
+            ( bufferAssembly
+                device
+                workingDevice
+                  { onBindMemory = Just "bind failed"
+                  , onDestroyBuffer = Just "destroy failed"
+                  }
+            )
+            (\_ → pure ())
+  -- The composite's own primary failure reaches the enclosing scope, and the
+  -- evidence from both levels arrives in observation order.
+  ioErrorMessage propagated `shouldBe` Just "bind failed"
+  let retained = cleanupFailures propagated
+  labelsOf retained `shouldBe` ["buffer", "outer"]
+  ioMessagesOf retained `shouldBe` [Just "destroy failed", Just "outer released"]
+  trail releases `shouldReturn` ["outer"]
+
+testFinalReleasesFail ∷ Expectation
+testFinalReleasesFail = do
+  device ← newDevice
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withResourceLabelled "outer" (pure ()) (\_ → pure ()) $ \_ →
+        withComposite
+          ( bufferAssembly
+              device
+              workingDevice
+                { onDestroyBuffer = Just "destroy failed"
+                , onFreeMemory = Just "free failed"
+                }
+          )
+          (\_ → record bodies "body" *> pure (1 ∷ Int))
+  trail bodies `shouldReturn` ["body"]
+  -- The first cleanup exception becomes the failure and the result is dropped.
+  ioErrorMessage propagated `shouldBe` Just "destroy failed"
+  let retained = cleanupFailures propagated
+  -- Both entries survive the trip through the enclosing scope exactly once.
+  labelsOf retained `shouldBe` bufferLabels
+  ioMessagesOf retained `shouldBe` [Just "destroy failed", Just "free failed"]
+  performed ← deviceTrail device
+  occurrences "destroy buffer 1" performed `shouldBe` 1
+  occurrences "free memory 2" performed `shouldBe` 1
+
+testBodyFailureStaysPrimary ∷ Expectation
+testBodyFailureStaysPrimary = do
+  device ← newDevice
+  propagated ←
+    expectFailure $
+      withResourceLabelled "outer" (pure ()) (\_ → pure ()) $ \_ →
+        withComposite
+          ( bufferAssembly
+              device
+              workingDevice
+                { onDestroyBuffer = Just "destroy failed"
+                , onFreeMemory = Just "free failed"
+                }
+          )
+          (\_ → throwIO (ErrorCall "body failed"))
+  errorCallMessage propagated `shouldBe` Just "body failed"
+  let retained = cleanupFailures propagated
+  labelsOf retained `shouldBe` bufferLabels
+  ioMessagesOf retained `shouldBe` [Just "destroy failed", Just "free failed"]
+
+-- | A cancellation that is already pending when an acquisition *returns* must
+-- not strand the part that acquisition produced.
+--
+-- The acquisition below masks itself uninterruptibly, waits until the killer's
+-- 'throwTo' is blocked on the constructing thread, and only then returns. The
+-- pending exception can therefore be delivered no earlier than the next
+-- interruptible operation, which is the blocked restored step after
+-- 'acquirePart' has installed the rollback — so the part is released.
+--
+-- This is the case the masked handoff exists for, and it separates that
+-- handoff from an implementation that restores the caller's masking state
+-- around an acquisition: such an implementation would deliver the moment this
+-- acquisition's own mask ended, before any rollback existed, and the part
+-- would never be released at all.
+testCancellationPendingWhenAcquisitionReturns ∷ Expectation
+testCancellationPendingWhenAcquisitionReturns = do
+  releases ← newTrail
+  bodies ← newTrail
+  acquiring ← newEmptyMVar
+  killerSlot ← newEmptyMVar
+  killerDone ← newEmptyMVar
+  neverFilled ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    captured ←
+      try $
+        withComposite
+          ( do
+              acquirePart
+                "first"
+                (releaseRank 0)
+                ( uninterruptibleMask_ $ do
+                    record releases "acquire first"
+                    putMVar acquiring ()
+                    killer ← readMVar killerSlot
+                    void (awaitPendingThrow killer)
+                )
+                (\_ → record releases "first")
+              -- The first interruptible operation after the rollback exists.
+              restoredStep (takeMVar neverFilled ∷ IO ())
+              acquirePart
+                "second"
+                (releaseRank 1)
+                (record releases "acquire second")
+                (\_ → record releases "second")
+          )
+          (\_ → record bodies "body")
+    putMVar outcome (captured ∷ Either SomeException ())
+  takeMVar acquiring
+  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
+  putMVar killerSlot killer
+  -- The cancellation was delivered, so the construction has unwound.
+  takeMVar killerDone
+  captured ← takeMVar outcome
+  case captured of
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      asyncException propagated `shouldBe` Just ThreadKilled
+      performed ← trail releases
+      -- The part acquired with the cancellation already pending was rolled
+      -- back; no later stage ran, so nothing else was acquired.
+      performed `shouldBe` ["acquire first", "first"]
+      occurrences "first" performed `shouldBe` 1
+      trail bodies `shouldReturn` []
+      length (cleanupFailures propagated) `shouldBe` 0

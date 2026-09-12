@@ -6,7 +6,8 @@ Owns small independent services. Currently provides an abstract `Logger` with
 validated component names, pure filter configuration, immutable scoped context,
 injectable clock and thread metadata, a deterministic one-line record layout,
 and two sinks: a borrowed handle and a caller-supplied callback; and a CPU
-resource scope that pairs an acquisition with a protected release.
+resource scope that pairs an acquisition with a protected release, including a
+staged constructor for an owner assembled from several parts.
 
 Configuration is resolved once and never reconfigured in place. The pure parsers
 `parseLogLevel`, `parseComponentLevels`, and `parseDebugSelection` validate the
@@ -37,9 +38,16 @@ every cleanup failure beside it as ordered, structured evidence that
 uninterruptibly, and a release must therefore have a controlled blocking
 duration. The module imports no logger and no other module in this package.
 
+`withComposite` is the same scope for an owner assembled from several parts. Its
+`Assembly` acquires each part and installs that part's rollback as one protected
+step, so exactly one authoritative release always covers every part acquired so
+far and a failure at any stage releases exactly those. The order that release
+runs in is declared with `releaseRank`, because the correct order is a property
+of the API the parts come from rather than the reverse of acquisition.
+
 See [docs/resources.md](../../docs/resources.md) for the failure table, the
-ownership and borrowing rules, the mask discipline and its limits, and the
-caller patterns that discard retained evidence.
+ownership and borrowing rules, the mask discipline and its limits, the staged
+construction contract, and the caller patterns that discard retained evidence.
 
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
