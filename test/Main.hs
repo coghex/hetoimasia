@@ -71,6 +71,7 @@ import System.Process
   , readCreateProcessWithExitCode
   )
 import System.Timeout (timeout)
+import qualified Test.Engine.Resources.Spec as Resources
 import Test.Hspec
   ( Expectation
   , anyIOException
@@ -160,6 +161,7 @@ main = hspec $ do
     it "fails before any entry for each invalid variable" testConsoleInvalid
     it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
     it "keeps help visible and validates configuration on that path" testConsoleHelp
+  Resources.spec
 
 -- Fixtures -------------------------------------------------------------------
 

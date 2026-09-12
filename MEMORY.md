@@ -79,6 +79,16 @@ not a verdict that Synarchy's design should be discarded.
   startup, failing non-zero on an invalid value before any entry. The master and
   source switches stay programmatic. `docs/logging.md` now carries the startup
   contract and the module authoring guide AGENTS.md points new subsystems to.
+- RES-1 added `Hetoimasia.Foundation.Resource`: `withResource` acquires under
+  `mask`, lends the value to a body running with the caller's masking state,
+  and attempts one release under `uninterruptibleMask_`. It implements the
+  accepted failure policy rather than aliasing `bracket` — the body's failure
+  stays primary, a cleanup-only failure becomes primary and is retained as
+  evidence too, and every cleanup failure is kept as an ordered, labelled
+  `CleanupFailure` that `cleanupFailures` reads back, including through a
+  caller's `WhileHandling` nesting. Every internal rethrow uses `rethrowIO`
+  with the primary's own context. `docs/resources.md` carries the contract.
+  RES-2 through RES-4 are unimplemented.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

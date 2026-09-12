@@ -5,7 +5,8 @@ Buildable package: `hetoimasia-foundation`.
 Owns small independent services. Currently provides an abstract `Logger` with
 validated component names, pure filter configuration, immutable scoped context,
 injectable clock and thread metadata, a deterministic one-line record layout,
-and two sinks: a borrowed handle and a caller-supplied callback.
+and two sinks: a borrowed handle and a caller-supplied callback; and a CPU
+resource scope that pairs an acquisition with a protected release.
 
 Configuration is resolved once and never reconfigured in place. The pure parsers
 `parseLogLevel`, `parseComponentLevels`, and `parseDebugSelection` validate the
@@ -26,6 +27,19 @@ rather than stranding the loggers sharing it.
 See [docs/logging.md](../../docs/logging.md) for the record layout, the quoting
 rules, the startup configuration contract, the full ownership and failure
 contract, and the module authoring guide new subsystems follow.
+
+`Hetoimasia.Foundation.Resource` provides `withResource`, which acquires a
+value, lends it to a body, and releases it. It takes the acquisition first and
+the release second, as `bracket` does, but it is not an alias for it: when the
+body and the release both fail it preserves the body's failure and retains
+every cleanup failure beside it as ordered, structured evidence that
+`cleanupFailures` reads back. Acquisition is cancellable, each release runs
+uninterruptibly, and a release must therefore have a controlled blocking
+duration. The module imports no logger and no other module in this package.
+
+See [docs/resources.md](../../docs/resources.md) for the failure table, the
+ownership and borrowing rules, the mask discipline and its limits, and the
+caller patterns that discard retained evidence.
 
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
