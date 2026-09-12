@@ -413,8 +413,11 @@ python3 tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
 | `--plan` | The resolved plan this execution belongs to. Required: a group's command, its timeout, and the plan identity its receipt must name all come from here, so a runner never infers a request-dependent selection from an ID and a checkout. |
 | `--receipts` | The directory the receipt is written to. |
 | `--repo-root` | The checkout to execute in. Defaults to the working directory. |
-| `--executed-commit`, `--executed-tree` | Override the executed revision recorded in the receipt. Defaults to the checkout's `HEAD`. |
 | `--toolchain NAME=VERSION` | A toolchain version to record. Repeatable; the runner always records its own Python version. |
+
+There is **no option that sets the executed revision**. The runner reads it from
+the checkout and refuses to run at all unless that checkout is the plan's
+candidate; see [Execution provenance](#execution-provenance) below.
 
 Fixture catalogs reach the runner through the plan: resolve one with
 `plan.py --catalog <fixture>`, then run against that plan. A group the plan
@@ -428,6 +431,45 @@ architecture, the toolchain versions, and the run it can be read back from. The
 head and the executed revision are recorded separately because a pull request is
 validated on an integration candidate that is neither endpoint; a receipt must
 not imply that the head itself ran.
+
+#### Execution provenance
+
+A receipt names the plan's identity and copies the candidate's input identity,
+so the tree that executed has to *be* the candidate. Before anything runs, the
+runner checks three things against `plan.candidate` and refuses with exit `2`,
+leaving no receipt, when any of them does not hold:
+
+| Check | Why it is a refusal |
+| --- | --- |
+| `HEAD` is the candidate commit | A receipt records the commit it read. Two commits can share a tree, and an execution of the later one would misdescribe what was validated even where the bytes agreed — so the commit is compared, not only the tree. |
+| `HEAD`'s tree is the candidate's tree | The digests the receipt carries are of that tree. |
+| No uncommitted change to a relevant input | A working tree the candidate does not contain is not that candidate, whatever `HEAD` says. |
+
+The comparison is against the **candidate**, not the head. A plan resolved with
+a `--candidate` that differs from its head still runs from a checkout of that
+candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
+
+Relevance for the third check is the candidate's own classification, read from
+the candidate commit's catalog and package graph rather than from the working
+tree's — an edit must not be able to reclassify itself as prose on the way past,
+and rewriting the catalog in the working tree is exactly the change this notices.
+What counts is the complement of [harmless prose](#harmless-prose): a Markdown
+file some group declares as an input, a mandatory policy input, `cabal.project`,
+or any `.cabal` file is relevant however it is spelled. Staged and unstaged
+changes are both asked about, because neither implies the other, and additions,
+deletions, renames, and mode changes all count. The diagnostic names the paths.
+
+Untracked files count as additions, with one exception: paths Git already
+ignores. That is how a run's own operational artifacts stay out of the way — the
+repository's `.gitignore` declares `plan.json`, `applicability.json`, and
+`receipts/`, which is the layout the hosted workers use when they download the
+plan into the checkout and write receipts beside it. Generated validation
+artifacts belong on that list or outside the checkout; anything else in the
+working tree is a change to the candidate and is refused by name.
+
+This refusal is the whole of the policy. Validating uncommitted work with honest
+attribution of its own is not supported: commit it, or plan and run from the
+commit you have.
 
 The identity fields are **copied from the plan**, never recomputed: the receipt
 has to name the identity the candidate was planned under, and a runner that
@@ -569,14 +611,25 @@ python3 tools/validation/aggregate.py --plan plan.json --receipts <dir>
 | `--summary` | A Markdown file the verdict table is appended to. |
 
 A selected group passes only when a well-formed receipt says it passed, names
-this plan's identity, names this plan's head, and records the command the plan
-selected. A group the plan explained away as `unaffected` or
+this plan's identity, names this plan's head, records the command the plan
+selected, records an execution of **this plan's candidate** commit and tree, and
+agrees with the candidate on every compatibility field — `input_identity`,
+`policy_version`, `toolchain`, and `runner_os` — that a reused execution is
+already held to. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
 than a failure. Everything else fails: a missing receipt, a failed or timed-out
-one, a malformed one, one belonging to another plan or head, and **any worker
+one, a malformed one, one belonging to another plan, head, or candidate, one
+recording inputs or a platform this plan was not resolved for, and **any worker
 that did not conclude `success` while its groups were asked to execute**. A
 selected gate nothing vouched for has not been satisfied, however green the rest
 of the run looks.
+
+The candidate and compatibility questions are asked here as well as by the
+runner, and deliberately so. The runner refuses to execute from the wrong
+checkout, but a verdict rests on the document in front of it rather than on the
+run that is supposed to have produced it, so a receipt claiming an execution
+this plan does not describe is refused on its own terms. The diagnostic names
+the field that disagreed.
 
 A selected group with no receipt at all is satisfied instead by an applicability
 record, and only then. The receipt that record carries is read through the same
@@ -1031,9 +1084,10 @@ output.
 The same suite drives the real runner, aggregate, timing report, and review
 gate against fixture catalogs, plans, and receipt directories. It covers a
 failing command's non-zero receipt, the enforced catalog timeout and the reaping
-of the command's descendants, the head and executed revision being recorded
-separately, a selected group with no receipt, receipts belonging to another plan
-or another head, malformed receipts and malformed plans, omitted `unaffected`
+of the command's descendants, a plan whose candidate is not its head executing
+from a checkout of that candidate and recording both separately, a selected
+group with no receipt, receipts belonging to another plan or another head,
+malformed receipts and malformed plans, omitted `unaffected`
 and `optional-unrequested` groups passing without receipts, one failing group
 failing the verdict while others passed, a worker cancelled or unexpectedly
 skipped while its groups were selected, a worker that concluded `failure` while
@@ -1056,6 +1110,20 @@ a `strip`, a canonical denial of it stripping through a proven starting point
 and an identical tree, that approval asking for no mutation when no label is
 attached, the superseded-head and unreadable-label refusals answered first, and
 unrecognized provenance and head-verdict inputs refused.
+
+Execution provenance has its own examples, built on the same fixtures. They
+reproduce the regression the contract exists for — a plan whose candidate fails,
+executed again from the commit that replaced it — and require the runner to
+refuse it and the aggregate to withhold the verdict. They also cover a different
+commit that happens to carry the candidate's tree; the absence of any override
+that could record a revision the runner did not execute; uncommitted edits,
+additions staged and untracked, deletions, renames, mode changes, an edit to
+Markdown a group declares as an input, and an edit to the catalog that
+classifies the candidate, each refused by name; ordinary execution with prose no
+group consumes and with the plan, applicability document, and receipts a run
+writes beside itself; a fresh receipt recording an execution of another revision
+or another tree; and a fresh receipt disagreeing about each of `input_identity`,
+`policy_version`, `toolchain`, and `runner_os` in turn.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

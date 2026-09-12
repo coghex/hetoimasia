@@ -5,6 +5,7 @@ module Sandbox
   , run
   , git
   , writeFixtureFile
+  , fixtureIgnore
   ) where
 
 import Data.List (isPrefixOf)
@@ -55,3 +56,23 @@ writeFixtureFile root relative contents = do
   let target = root </> relative
   createDirectoryIfMissing True (takeDirectory target)
   writeFile target contents
+
+-- | The operational artifacts a fixture repository's own examples write beside
+-- the tree they validate: plans, applicability documents, request bodies,
+-- receipts, and the stub GitHub these examples answer from.
+--
+-- The runner refuses to execute from a checkout carrying anything the candidate
+-- classifies as an input, and an untracked scratch file is such a thing unless
+-- the repository says otherwise. Declaring them here is what a real repository
+-- does with the same files, so the fixtures exercise the supported layout
+-- rather than an exemption invented for tests.
+fixtureIgnore ∷ String
+fixtureIgnore =
+  unlines
+    [ "/*.json"
+    , "/*.txt"
+    , "/receipt-*"
+    , "/child.pid"
+    , "/receipts/"
+    , "/gh-stub/"
+    ]

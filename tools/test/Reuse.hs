@@ -11,7 +11,7 @@ module Reuse (spec) where
 import Control.Monad (forM_, void)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Json (Json, asArray, asBool, asString, entryFor, field, parseJson)
-import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
+import Sandbox (fixtureIgnore, git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
@@ -788,7 +788,8 @@ change fixture path contents = do
 
 fixtureFiles ∷ [(FilePath, String)]
 fixtureFiles =
-  [ ("cabal.project", "packages:\n  .\n")
+  [ (".gitignore", fixtureIgnore)
+  , ("cabal.project", "packages:\n  .\n")
   , ("demo.cabal", demoPackage)
   , ("app/Main.hs", "module Main (main) where\nmain :: IO ()\nmain = pure ()\n")
   , ("src/note.txt", "a fixture the failing group consumes\n")

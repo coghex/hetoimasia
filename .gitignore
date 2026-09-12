@@ -20,3 +20,15 @@ config/*.local.yaml
 .env.local
 /.worktrees/
 /captures/
+
+# Validation artifacts a run writes into the checkout it is validating. The
+# runner refuses to execute from a checkout that carries anything the candidate
+# counts as an input, so the plan it is handed, the applicability document
+# beside it, and the receipts it produces are declared here as the operational
+# files they are.
+/plan.json
+/plan.err
+/applicability.json
+/request.txt
+/reuse.out
+/receipts/

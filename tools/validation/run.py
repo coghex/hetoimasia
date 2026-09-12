@@ -13,6 +13,14 @@ where it ran, and how it ended — including a timeout as an outcome distinct
 from a failure, because an exhausted budget and a disagreeing test are
 different obstacles.
 
+Before anything executes, the checkout is held to being the plan's *candidate*:
+the commit, the tree, and the absence of uncommitted changes to anything that
+candidate's own classification counts as an input. A receipt names the plan's
+identity and copies the candidate's input identity, so an execution from any
+other tree would hand this run's result to a revision it never read. That is a
+refusal rather than a recorded mismatch, because a run that cannot describe the
+candidate has no evidence to offer about it.
+
 Exit status: ``0`` when the group passed, ``1`` when it failed or timed out
 (its receipt is still written), and ``2`` for a diagnostic that prevented any
 execution at all.
@@ -29,7 +37,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import plan as planner
 import receipts
+from plan import PlannerError
 from receipts import EvidenceError
 
 # How long a timed-out process group is given to exit on SIGTERM before it is
@@ -49,6 +59,117 @@ def git_output(root: str, *arguments: str) -> str:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
         raise EvidenceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
     return process.stdout.decode("utf-8", errors="replace").strip()
+
+
+def git_records(root: str, *arguments: str) -> list[str]:
+    """Run a NUL-separated Git query, keeping every byte of every field.
+
+    ``git_output`` strips its result, which is right for a revision but wrong
+    for a path listing: a path may legitimately begin or end with a space, and
+    a stripped field would name a file that does not exist.
+    """
+    process = subprocess.run(
+        ("git", "-C", root) + arguments, capture_output=True, check=False
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.decode("utf-8", errors="replace").strip()
+        raise EvidenceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
+    output = process.stdout.decode("utf-8", errors="replace")
+    return [field for field in output.split("\0") if field]
+
+
+def uncommitted_paths(root: str) -> list[str]:
+    """Every path this checkout holds differently from its own HEAD commit.
+
+    Staged and unstaged edits are asked about separately, because neither
+    implies the other: a working-tree diff misses a mode change that lives only
+    in the index, and an index diff misses an edit that was never added. Both
+    report deletions and both endpoints of a rename. An untracked file is the
+    unstaged form of an addition and is a third question. ``--exclude-standard``
+    is what keeps a run's own operational artifacts out of the answer: the plan
+    it was handed, the applicability document beside it, and the receipts it
+    writes are all ignored paths, which is the repository stating that no tree
+    of its own contains them.
+    """
+    paths: set[str] = set()
+    for staged in (("--cached",), ()):
+        fields = git_records(root, "diff", "--name-status", "-z", *staged, "HEAD")
+        index = 0
+        while index < len(fields):
+            status = fields[index]
+            index += 1
+            # A rename or a copy names both endpoints, and both of them differ
+            # from the candidate: the source is gone and the target is new.
+            needed = 2 if status[0] in ("R", "C") else 1
+            if index + needed > len(fields):
+                raise EvidenceError(
+                    f"git diff --name-status reported status {status!r} with no path"
+                )
+            paths.update(fields[index : index + needed])
+            index += needed
+    paths.update(git_records(root, "ls-files", "--others", "--exclude-standard", "-z"))
+    return sorted(paths)
+
+
+def relevant_uncommitted(root: str, plan: dict) -> list[str]:
+    """The uncommitted paths the candidate's own classification counts as input.
+
+    Relevance is read from the candidate's catalog and package graph rather than
+    from the working tree's, so an edit cannot reclassify itself as prose on the
+    way past — a catalog rewritten in the working tree is exactly the change
+    this refusal exists to notice. What remains relevant is the complement of
+    the harmless prose the candidate's input identity already omits, so a
+    consumed Markdown file or a mandatory policy input is never harmless here
+    however it is spelled.
+    """
+    uncommitted = uncommitted_paths(root)
+    if not uncommitted:
+        return []
+    try:
+        candidate = planner.GitTree(root, plan["candidate"]["commit"])
+        catalog, _ = planner.read_catalog(candidate, None, root)
+        packages = planner.load_packages(candidate, required=True)
+    except PlannerError as failure:
+        raise EvidenceError(
+            "cannot classify this checkout's uncommitted changes against the "
+            f"candidate: {failure}"
+        ) from failure
+    consumed = planner.consumed_entries(catalog, packages)
+    return [path for path in uncommitted if not planner.harmless_prose(path, consumed, catalog)]
+
+
+def confirm_candidate(root: str, plan: dict) -> tuple[str, str]:
+    """Refuse to execute unless this checkout is the plan's candidate.
+
+    The commit is compared as well as the tree because two commits can share a
+    tree, and a receipt naming the wrong one would misdescribe what was
+    validated even where the bytes agreed. The candidate is the comparison, not
+    the head: a pull request is validated on an integration revision that is
+    neither endpoint, and a plan resolved for one still executes from a checkout
+    of it.
+    """
+    candidate = plan["candidate"]
+    executed_commit = git_output(root, "rev-parse", "HEAD")
+    executed_tree = git_output(root, "rev-parse", "HEAD^{tree}")
+    if executed_commit != candidate["commit"]:
+        raise EvidenceError(
+            f"this checkout is at {executed_commit}, which is not the plan's candidate "
+            f"{candidate['commit']}; an execution here would be recorded against a "
+            "revision it never read"
+        )
+    if executed_tree != candidate["tree"]:
+        raise EvidenceError(
+            f"this checkout's tree is {executed_tree}, which is not the candidate "
+            f"{candidate['commit']}'s tree {candidate['tree']}"
+        )
+    relevant = relevant_uncommitted(root, plan)
+    if relevant:
+        raise EvidenceError(
+            "this checkout carries uncommitted changes to inputs the candidate "
+            f"{candidate['commit']} classifies as relevant, so an execution here would "
+            "not be of that candidate: " + ", ".join(relevant)
+        )
+    return executed_commit, executed_tree
 
 
 def source_run_url() -> str:
@@ -149,8 +270,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--plan", required=True, help="the resolved plan this execution belongs to")
     parser.add_argument("--receipts", required=True, help="directory the receipt is written to")
     parser.add_argument("--repo-root", help="the checkout to execute in (default: the working directory)")
-    parser.add_argument("--executed-commit", help="override the executed commit recorded in the receipt")
-    parser.add_argument("--executed-tree", help="override the executed tree recorded in the receipt")
     parser.add_argument(
         "--toolchain",
         action="append",
@@ -174,13 +293,15 @@ def main(argv: list[str]) -> int:
             "an omitted group has no execution to record"
         )
 
+    # Nothing runs until this checkout is the candidate the plan describes.
+    # There is no override: a revision the receipt would have to be told about
+    # is precisely the one no execution here can vouch for.
+    executed_commit, executed_tree = confirm_candidate(root, plan)
+
     # The declared toolchain is exactly what reuse compares against the
     # candidate's pinned versions, so the interpreter this runner happens to
     # be is recorded beside it rather than inside it.
     toolchain = receipts.parse_toolchain(arguments.toolchain)
-
-    executed_commit = arguments.executed_commit or git_output(root, "rev-parse", "HEAD")
-    executed_tree = arguments.executed_tree or git_output(root, "rev-parse", "HEAD^{tree}")
 
     command = list(group["command"])
     timeout_seconds = group["timeout_seconds"]

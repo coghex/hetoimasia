@@ -12,8 +12,13 @@ import Control.Concurrent (threadDelay)
 import Control.Monad (void)
 import Data.Maybe (isNothing)
 import Json (Json (..), asBool, asString, entryFor, field, parseJson)
-import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
+import Sandbox (fixtureIgnore, git, run, sanitizedEnvironment, writeFixtureFile)
+import System.Directory
+  ( createDirectoryIfMissing
+  , doesFileExist
+  , getCurrentDirectory
+  , removeFile
+  )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -50,23 +55,29 @@ spec = describe "Validation execution" $ do
 
     it "distinguishes the pull request's head from the commit that executed" $
       withFixture $ \fixture → do
-        change fixture "README.md" "revised prose\n"
-        head' ← revision fixture "HEAD"
-        plan ← planAgainst fixture (seeded fixture)
         -- A pull request is validated on an integration candidate that is
         -- neither endpoint, so the receipt records both rather than implying
-        -- that the head itself ran.
-        (result, _, _) ←
-          runGroup
-            fixture
-            "build.pass"
-            plan
-            ["--executed-commit", integrationCommit, "--executed-tree", integrationTree]
-        result `shouldBe` ExitSuccess
+        -- that the head itself ran. The candidate is a real commit, and this
+        -- checkout is of it: that is the only way an execution earns the right
+        -- to name one.
+        change fixture "README.md" "the pull request's own prose\n"
+        head' ← revision fixture "HEAD"
+        change fixture "README.md" "the integration candidate's prose\n"
+        candidate ← revision fixture "HEAD"
+        head' `shouldSatisfy` (/= candidate)
+        plan ← planCandidateInto fixture (seeded fixture) head' candidate "candidate.json"
+        (result, _, errors) ← runGroup fixture "build.pass" plan []
+        (result, errors) `shouldBe` (ExitSuccess, "")
         receipt ← readReceipt fixture "build.pass"
         stringField receipt "head_commit" `shouldBe` Just head'
-        stringField receipt "executed_commit" `shouldBe` Just integrationCommit
-        stringField receipt "executed_tree" `shouldBe` Just integrationTree
+        stringField receipt "executed_commit" `shouldBe` Just candidate
+        candidateTree ← revision fixture "HEAD^{tree}"
+        stringField receipt "executed_tree" `shouldBe` Just candidateTree
+        -- The verdict accepts it: a candidate that is not the head is the
+        -- ordinary hosted shape, not an irregularity.
+        (verdict, output, _) ← aggregate fixture plan []
+        verdict `shouldBe` ExitSuccess
+        output `shouldContain` "verdict: passed"
 
     it "enforces the catalog timeout and reaps the command's descendants" $
       withFixture $ \fixture → do
@@ -105,6 +116,116 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "did not select"
         doesFileExist (receiptPath fixture "test.fail") `shouldReturn` False
+
+  describe "execution provenance" $ do
+    it "refuses a stale plan executed from a commit that replaced its candidate" $
+      withFixture $ \fixture → do
+        -- The candidate genuinely fails, which is the verdict a later commit
+        -- must not be able to stand in for. Both revisions are committed and
+        -- no receipt is touched: nothing here is a tampered document.
+        change fixture "flag/value" "bad\n"
+        candidate ← revision fixture "HEAD"
+        plan ← planAgainst fixture (seeded fixture)
+        (atCandidate, _, _) ← runGroup fixture "test.flag" plan []
+        atCandidate `shouldBe` ExitFailure 1
+        removeFile (receiptPath fixture "test.flag")
+        change fixture "flag/value" "good\n"
+        executed ← revision fixture "HEAD"
+        (result, _, errors) ← runGroup fixture "test.flag" plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` candidate
+        errors `shouldContain` executed
+        doesFileExist (receiptPath fixture "test.flag") `shouldReturn` False
+        -- The aggregate agrees rather than certifying the candidate from the
+        -- run that was refused.
+        (verdict, output, _) ← aggregate fixture plan []
+        verdict `shouldBe` ExitFailure 1
+        output `shouldContain` "test.flag"
+        output `shouldContain` "verdict: failed"
+
+    it "refuses a commit that only happens to carry the candidate's tree" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        candidate ← revision fixture "HEAD"
+        candidateTree ← revision fixture "HEAD^{tree}"
+        plan ← planAgainst fixture (seeded fixture)
+        -- Reuse may cross commits whose inputs agree; a fresh execution may
+        -- not, because its receipt names the commit it read.
+        void $ gitIn fixture ["commit", "-q", "--allow-empty", "-m", "Add no content"]
+        executed ← revision fixture "HEAD"
+        executed `shouldSatisfy` (/= candidate)
+        revision fixture "HEAD^{tree}" `shouldReturn` candidateTree
+        (result, _, errors) ← runGroup fixture "build.pass" plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` candidate
+        errors `shouldContain` executed
+
+    it "offers no override that could record a revision it did not execute" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (result, _, errors) ←
+          runGroup fixture "build.pass" plan ["--executed-commit", integrationCommit]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "unrecognized arguments"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "refuses an uncommitted edit to a source a group consumes" $
+      withDirtyFixture $ \fixture plan → do
+        writeFixtureFile (root fixture) "src/note.txt" "an edit no commit carries\n"
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses a staged addition as readily as an untracked one" $
+      withDirtyFixture $ \fixture plan → do
+        writeFixtureFile (root fixture) "src/extra.txt" "a source no commit carries\n"
+        refusesDirty fixture plan ["src/extra.txt"]
+        void $ gitIn fixture ["add", "--", "src/extra.txt"]
+        refusesDirty fixture plan ["src/extra.txt"]
+
+    it "refuses an uncommitted deletion" $
+      withDirtyFixture $ \fixture plan → do
+        removeFile (root fixture </> "src/note.txt")
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses an uncommitted rename, naming both of its endpoints" $
+      withDirtyFixture $ \fixture plan → do
+        void $ gitIn fixture ["mv", "src/note.txt", "src/moved.txt"]
+        refusesDirty fixture plan ["src/note.txt", "src/moved.txt"]
+
+    it "refuses an uncommitted mode change" $
+      withDirtyFixture $ \fixture plan → do
+        void $ gitIn fixture ["update-index", "--chmod=+x", "--", "src/note.txt"]
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses an uncommitted edit to Markdown a group declares as an input" $
+      withDirtyFixture $ \fixture plan → do
+        -- Prose is harmless only while nothing consumes it. A declared input
+        -- outranks the extension, so this edit cannot call itself harmless.
+        writeFixtureFile (root fixture) "docs/consumed.md" "an edit no commit carries\n"
+        refusesDirty fixture plan ["docs/consumed.md"]
+
+    it "refuses an uncommitted edit to the policy that classifies the candidate" $
+      withDirtyFixture $ \fixture plan → do
+        -- Exempting the edit would mean reading the classification from the
+        -- very file the edit rewrote.
+        writeFixtureFile
+          (root fixture)
+          "tools/validation/catalog.json"
+          (fixtureCatalogWith "[\"*.md\", \"*.txt\", \".gitignore\", \"LICENSE\"]")
+        refusesDirty fixture plan ["tools/validation/catalog.json"]
+
+    it "executes with prose no group consumes and the artifacts a run writes" $
+      withDirtyFixture $ \fixture plan → do
+        -- The hosted layout: the plan and the applicability document are
+        -- downloaded into the checkout, and the receipts are written beside
+        -- them. None of that is a change to the candidate.
+        writeFixtureFile (root fixture) "NOTES.md" "prose no group declares\n"
+        writeFixtureFile (root fixture) "applicability.json" "{}\n"
+        (result, _, errors) ← runGroup fixture "build.pass" plan []
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        receipt ← readReceipt fixture "build.pass"
+        candidate ← revision fixture "HEAD"
+        stringField receipt "executed_commit" `shouldBe` Just candidate
 
   describe "the aggregate" $ do
     it "fails a selected group that produced no receipt" $
@@ -165,6 +286,35 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 1
         output `shouldContain` "names head"
 
+    it "refuses a fresh receipt recording an execution of another revision" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, _) ← runGroup fixture "build.pass" plan []
+        executed `shouldBe` ExitSuccess
+        patchReceipt fixture "build.pass" "executed_commit" (initial fixture)
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "not the plan's candidate"
+
+    it "refuses a fresh receipt recording another tree for the candidate" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, _) ← runGroup fixture "build.pass" plan []
+        executed `shouldBe` ExitSuccess
+        patchReceipt fixture "build.pass" "executed_tree" integrationTree
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "not the candidate's"
+
+    -- Each compatibility field is asked about on its own, because a check that
+    -- only ever fired for one of them would look identical from the outside.
+    disagreesAbout "input_identity" "\"0000000000000000000000000000000000000000\""
+    disagreesAbout "policy_version" "\"1111111111111111111111111111111111111111\""
+    disagreesAbout "toolchain" "{\"ghc\": \"0.0.0\"}"
+    disagreesAbout "runner_os" "\"Plan9\""
+
     it "refuses a malformed receipt rather than reading past it" $
       withFixture $ \fixture → do
         change fixture "README.md" "revised prose\n"
@@ -189,7 +339,7 @@ spec = describe "Validation execution" $ do
         plan ← planAgainst fixture (seeded fixture)
         -- Dropping the floor from `selected` while its own flag stays true
         -- would let every worker skip it and the aggregate excuse it.
-        patchPlan fixture plan "selected" "[]"
+        patchDocument fixture plan "selected" "[]"
         (result, _, errors) ← aggregate fixture plan []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "does not match the groups it flags as selected"
@@ -198,7 +348,7 @@ spec = describe "Validation execution" $ do
       withFixture $ \fixture → do
         change fixture "README.md" "revised prose\n"
         plan ← planAgainst fixture (seeded fixture)
-        patchPlan fixture plan "selected" "[\"build.pass\", \"build.pass\"]"
+        patchDocument fixture plan "selected" "[\"build.pass\", \"build.pass\"]"
         (result, _, errors) ← aggregate fixture plan []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "more than once"
@@ -384,6 +534,39 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "group.absent"
 
+-- | A fresh receipt that agrees with its plan about everything but one
+-- compatibility field is still evidence about another candidate.
+disagreesAbout ∷ String → String → Spec
+disagreesAbout name value =
+  it ("refuses a fresh receipt recording a different " ++ name) $
+    withFixture $ \fixture → do
+      change fixture "README.md" "revised prose\n"
+      plan ← planAgainst fixture (seeded fixture)
+      (executed, _, _) ← runGroup fixture "build.pass" plan []
+      executed `shouldBe` ExitSuccess
+      patchDocument fixture (receiptPath fixture "build.pass") name value
+      (result, output, _) ← aggregate fixture plan []
+      result `shouldBe` ExitFailure 1
+      output `shouldContain` ("different " ++ name)
+
+-- | A fixture whose plan is resolved and whose checkout is that plan's
+-- candidate, so a dirty-checkout example only has to make its own edit.
+withDirtyFixture ∷ (Fixture → FilePath → IO a) → IO a
+withDirtyFixture action = withFixture $ \fixture → do
+  change fixture "README.md" "revised prose\n"
+  plan ← planAgainst fixture (seeded fixture)
+  action fixture plan
+
+-- | Execute the floor group and require a refusal that names every path given
+-- and leaves no receipt behind.
+refusesDirty ∷ Fixture → FilePath → [String] → IO ()
+refusesDirty fixture plan paths = do
+  (result, _, errors) ← runGroup fixture "build.pass" plan []
+  result `shouldBe` ExitFailure 2
+  errors `shouldContain` "uncommitted changes"
+  mapM_ (shouldContain errors) paths
+  doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
 -- | Selection facts for one catalog group: its reason, whether it was
 -- selected, and whether its own inputs changed.
 data Selection = Selection String Bool Bool
@@ -417,7 +600,8 @@ requiredReceiptFields =
   , "source_run_url"
   ]
 
--- | Stand-ins for a merge candidate that is neither endpoint of the plan.
+-- | Stand-ins for a revision this checkout never was, so an example can offer
+-- a provenance no execution here could have produced.
 integrationCommit, integrationTree ∷ String
 integrationCommit = "1111111111111111111111111111111111111111"
 integrationTree = "2222222222222222222222222222222222222222"
@@ -431,13 +615,22 @@ planAgainst fixture base = planInto fixture base "plan.json"
 -- | Resolve a plan with the real planner and keep it where the runner and the
 -- aggregate both read it from.
 planInto ∷ Fixture → String → FilePath → IO FilePath
-planInto fixture base name = do
+planInto fixture base = planCandidateInto fixture base "HEAD" "HEAD"
+
+-- | The same, for a plan whose integration candidate is not its head.
+planCandidateInto ∷ Fixture → String → String → String → FilePath → IO FilePath
+planCandidateInto fixture base head' candidate name = do
   (result, output, errors) ←
     run
       (environment fixture)
       (root fixture)
       "python3"
-      [tools fixture </> "plan.py", "--base", base, "--head", "HEAD", "--json"]
+      [ tools fixture </> "plan.py"
+      , "--base", base
+      , "--head", head'
+      , "--candidate", candidate
+      , "--json"
+      ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   let target = root fixture </> name
   writeFile target output
@@ -523,10 +716,10 @@ patchReceipt fixture group name value = do
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
 
--- | Replace one top-level field of a plan with a literal JSON document, so an
--- otherwise genuine plan can contradict itself.
-patchPlan ∷ Fixture → FilePath → String → String → IO ()
-patchPlan fixture plan name value = do
+-- | Replace one top-level field of a JSON document with a literal value, so an
+-- otherwise genuine plan or receipt can contradict itself.
+patchDocument ∷ Fixture → FilePath → String → String → IO ()
+patchDocument fixture plan name value = do
   (result, _, errors) ←
     run
       (environment fixture)
@@ -596,15 +789,17 @@ withFixture action = do
     createDirectoryIfMissing True (directory </> "receipts")
     action fixture {seeded = secondCommit, initial = firstCommit}
 
+gitIn ∷ Fixture → [String] → IO String
+gitIn fixture = git (environment fixture) (root fixture)
+
 revision ∷ Fixture → String → IO String
-revision fixture name =
-  takeWhile (/= '\n') <$> git (environment fixture) (root fixture) ["rev-parse", name]
+revision fixture name = takeWhile (/= '\n') <$> gitIn fixture ["rev-parse", name]
 
 change ∷ Fixture → FilePath → String → IO ()
 change fixture path contents = do
   writeFixtureFile (root fixture) path contents
-  void $ git (environment fixture) (root fixture) ["add", "-A", "."]
-  void $ git (environment fixture) (root fixture) ["commit", "-q", "-m", "Change " ++ path]
+  void $ gitIn fixture ["add", "-A", "."]
+  void $ gitIn fixture ["commit", "-q", "-m", "Change " ++ path]
 
 requestBlock ∷ [String] → String
 requestBlock entries =
@@ -612,13 +807,16 @@ requestBlock entries =
 
 fixtureFiles ∷ [(FilePath, String)]
 fixtureFiles =
-  [ ("cabal.project", "packages:\n  .\n")
+  [ (".gitignore", fixtureIgnore)
+  , ("cabal.project", "packages:\n  .\n")
   , ("demo.cabal", demoPackage)
   , ("app/Main.hs", "module Main (main) where\nmain :: IO ()\nmain = pure ()\n")
   , ("src/note.txt", "a source the failing group consumes\n")
   , ("slow/note.txt", "an input the slow group consumes\n")
   , ("stubborn/note.txt", "an input the stubborn group consumes\n")
   , ("probe/note.txt", "an input the optional group consumes\n")
+  , ("flag/value", "good\n")
+  , ("docs/consumed.md", "a document the flag group consumes\n")
   , ("tools/validation/catalog.json", fixtureCatalog)
   ]
 
@@ -641,23 +839,39 @@ demoPackage =
 -- | A catalog whose commands decide their own outcome, so an example can
 -- exercise a pass, a failure, and an exhausted budget without a compiler.
 fixtureCatalog ∷ String
-fixtureCatalog =
+fixtureCatalog = fixtureCatalogWith "[\"*.md\", \".gitignore\", \"LICENSE\"]"
+
+-- | The same catalog with whichever non-affecting classes an example needs, so
+-- one can widen them and still be refused for editing the catalog itself.
+fixtureCatalogWith ∷ String → String
+fixtureCatalogWith nonAffecting =
   unlines
     [ "{"
     , "  \"schema_version\": 1,"
     , "  \"policy_version\": 1,"
     , "  \"policy_inputs\": [\"tools/validation/catalog.json\"],"
-    , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
+    , "  \"non_affecting_paths\": " ++ nonAffecting ++ ","
     , "  \"floor\": [\"build.pass\"],"
     , "  \"groups\": ["
     , groupDocument "build.pass" "[\"true\"]" "[]" "none" "build" "60" "false" ++ ","
     , groupDocument "test.fail" "[\"false\"]" "[\"src/\"]" "hspec" "test" "60" "false" ++ ","
+    , groupDocument "test.flag" flagCommand flagInputs "hspec" "test" "60" "false" ++ ","
     , groupDocument "smoke.slow" slowCommand "[\"slow/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true"
     , "  ]"
     , "}"
     ]
+
+-- | A group whose outcome is decided by the tree it reads rather than by the
+-- catalog, so an example can tell one committed revision's verdict from
+-- another's. Its declared Markdown input is what proves a consumed document is
+-- never harmless prose.
+flagCommand ∷ String
+flagCommand = "[\"sh\", \"-c\", \"test \\\"$(cat flag/value)\\\" = good\"]"
+
+flagInputs ∷ String
+flagInputs = "[\"flag/\", \"docs/consumed.md\"]"
 
 -- | A shell that backgrounds a long sleep and records it, so an example can ask
 -- whether the timeout reached the descendant rather than only the shell.
