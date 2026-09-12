@@ -92,10 +92,13 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Resources.Buffer
+        Test.Engine.Resources.Cost
         Test.Engine.Resources.Opacity
         Test.Engine.Resources.Smoke
         Test.Engine.Resources.Spec
-    ghc-options: -threaded -rtsopts
+    -- -T keeps the runtime's allocation statistics available, which the
+    -- cleanup-evidence inspection cost examples read.
+    ghc-options: -threaded -rtsopts -with-rtsopts=-T
     build-tool-depends: hetoimasia:hetoimasia
     build-depends:
         base >=4.21 && <4.22,

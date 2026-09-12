@@ -431,6 +431,31 @@ identically stay distinct. Evidence nested inside a `WhileHandling` annotation
 is found as well, and so is evidence a release carried out of a scope of its
 own.
 
+### What inspection costs
+
+Inspection runs on a failure path, where a caller is already recovering and has
+the least room to absorb a surprise, so what it costs is part of this contract
+rather than an implementation detail.
+
+Each distinct `CleanupFailure`'s own carried context is expanded once per
+inspection, however many routes reach it. Nested releases that each carry the
+cleanup context below them offer exponentially many such routes to the same
+evidence; expanding each retained failure once is what keeps the cost
+proportional to the evidence retained instead of to the number of routes.
+
+What a caller pays beyond that is a scan of the annotations on each expanded
+context — every annotation on it is examined, not only the cleanup failures —
+together with the work of ordering the result by identity. A `WhileHandling`
+annotation carries no identity of its own, so the contexts below one are
+followed whenever they are reached rather than being expanded once; a caller
+that nests handlers deeply pays for that scanning. Inspection is therefore
+bounded by the retained evidence and the annotations sitting beside it, not by
+the number of returned failures alone.
+
+Recognizing a repeated failure skips that one entry, never the context holding
+it: evidence standing beside an entry already reached, directly or below a
+handler, is still reported.
+
 ```haskell
 outcome ← try (withResourceLabelled "index buffer" acquire release body)
 case outcome of
@@ -705,6 +730,22 @@ outer scope resumes while its ordinary result survives, a `locally` cleanup
 failure reaching the outer scope's evidence, and two composites allocated
 through the facade keeping their declared order while the scope unwinds in
 reverse.
+
+The `Resource evidence inspection cost` examples in
+`test/Test/Engine/Resources/Cost.hs` cover
+[What inspection costs](#what-inspection-costs). They build twenty and then
+forty nested scopes whose releases each run the next scope, with the innermost
+release throwing, and hold each of `cleanupFailures` and
+`cleanupFailuresInContext` to a fixed allocation budget — 128 MiB at the
+shallower depth and 512 MiB at the deeper one — measured with `GHC.Stats`
+across garbage collections, with the fixture built before the interval opens
+and the returned failures and their order asserted after it closes. Two depths
+are what separate a changed growth rate from a constant factor. The suite is
+built with `-with-rtsopts=-T` so those statistics exist; an example that finds
+them missing fails rather than reporting a budget as met. A measured inspection
+that overruns a much larger reporting bound is abandoned and named as such, so
+an unbounded traversal fails these examples in seconds instead of running for
+hours.
 
 The `Console resource smoke` examples in
 `test/Test/Engine/Resources/Smoke.hs` cover

@@ -118,6 +118,8 @@ import Control.Exception.Context
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (sortOn)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import System.IO.Unsafe (unsafePerformIO)
@@ -262,36 +264,64 @@ retainCleanupFailure failure (ExceptionWithContext context exception) =
 -- found the same way. A caller that discards the context entirely — a bare
 -- typed @try@, or a @try@ followed by a plain @throwIO@ — has nothing left to
 -- inspect; @docs\/resources.md@ names the preserving path.
+--
+-- Inspection runs on a failure path, so its cost is part of the contract: each
+-- distinct failure's own carried context is expanded once per inspection,
+-- however many routes reach it. What a caller pays is a scan of the
+-- annotations on each expanded context plus the ordering of the result by
+-- identity, not a re-expansion per route.
 cleanupFailures ∷ SomeException → [CleanupFailure]
 cleanupFailures = cleanupFailuresInContext . someExceptionContext
 
 -- | 'cleanupFailures' for a caller holding an exception's context directly,
 -- such as one from 'tryWithContext' or 'Control.Exception.catchNoPropagate'.
 cleanupFailuresInContext ∷ ExceptionContext → [CleanupFailure]
-cleanupFailuresInContext = dropRepeatedFailures . sortOn cleanupFailureId . gatherFailures
+cleanupFailuresInContext context = Map.elems (gatherFailures [context] Map.empty)
 
 -- | Collect every reachable cleanup failure, following the two ways evidence
 -- can sit below the context being inspected.
-gatherFailures ∷ ExceptionContext → [CleanupFailure]
-gatherFailures context =
-  direct
-    <> concatMap belowHandled (getExceptionAnnotations context)
-    <> concatMap belowFailure direct
+--
+-- The accumulator is keyed by 'CleanupFailureId', so it is at once the record
+-- of which failures have already been expanded and the deduplicated result:
+-- 'Map.elems' returns entries in increasing key order, which is the order the
+-- failures were observed. Expanding each distinct failure's own context at
+-- most once is what keeps the cost proportional to the evidence retained
+-- rather than to the number of routes that reach it; nested releases each
+-- carrying the prior cleanup context offer exponentially many such routes.
+--
+-- The traversal is a worklist rather than a recursion so that the record of
+-- expanded failures is shared by every branch instead of being rebuilt per
+-- route. Pending contexts are expanded in no particular order, which the
+-- ordering by identity above makes irrelevant to the result.
+gatherFailures
+  ∷ [ExceptionContext]
+  → Map CleanupFailureId CleanupFailure
+  → Map CleanupFailureId CleanupFailure
+gatherFailures [] found = found
+gatherFailures (context : pending) found =
+  gatherFailures (handled <> below <> pending) found'
   where
-    direct = getExceptionAnnotations context
+    -- Both kinds of nesting below this context are followed even when every
+    -- failure attached to it has been seen already: one repeated identity
+    -- must not hide the new evidence standing beside it.
+    handled =
+      [ someExceptionContext handled'
+      | WhileHandling handled' ← getExceptionAnnotations context
+      ]
 
-    belowHandled (WhileHandling handled) = gatherFailures (someExceptionContext handled)
+    (found', below) = foldl' expandOnce (found, []) (getExceptionAnnotations context)
 
-    belowFailure failure = case cleanupFailureException failure of
-      ExceptionWithContext failureContext _ → gatherFailures failureContext
+    expandOnce (seen, contexts) failure
+      | Map.member identifier seen = (seen, contexts)
+      | otherwise =
+          ( Map.insert identifier failure seen
+          , failureContext failure : contexts
+          )
+      where
+        identifier = cleanupFailureId failure
 
--- | Drop repeats of a failure reached by more than one route. The input is
--- sorted by identity, so repeats are adjacent.
-dropRepeatedFailures ∷ [CleanupFailure] → [CleanupFailure]
-dropRepeatedFailures (earlier : later : rest)
-  | cleanupFailureId earlier == cleanupFailureId later = dropRepeatedFailures (earlier : rest)
-  | otherwise = earlier : dropRepeatedFailures (later : rest)
-dropRepeatedFailures failures = failures
+    failureContext failure = case cleanupFailureException failure of
+      ExceptionWithContext carried _ → carried
 
 -- | Where one part falls in the composite's declared final release order.
 --
