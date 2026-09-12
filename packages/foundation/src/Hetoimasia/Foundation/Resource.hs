@@ -37,7 +37,11 @@
 -- authoritative release covers every part acquired so far; a failure at any
 -- stage releases exactly those and no more. The order that release runs in is
 -- declared with 'releaseRank', because the correct order is a property of the
--- API the parts come from rather than the reverse of acquisition.
+-- API the parts come from rather than the reverse of acquisition. A part's
+-- declared label and rank are evaluated before its acquisition runs, so the
+-- release covering an acquired part can always be ordered and labelled, and a
+-- faulting label or rank is a construction failure at its own stage rather
+-- than a failure of the rollback.
 --
 -- 'Scoped' is the continuation facade over these scopes. 'allocResource' pairs
 -- an acquisition with a release and yields a scope value that composes in @do@
@@ -98,6 +102,7 @@ import Control.Exception
   , SomeException
   , WhileHandling (WhileHandling)
   , displayException
+  , evaluate
   , mask
   , rethrowIO
   , someExceptionContext
@@ -304,6 +309,10 @@ releaseRank = ReleaseRank
 
 -- | One acquired part, together with the release that covers it and the label
 -- a failure of that release is retained under.
+--
+-- Both metadata fields are already evaluated when 'acquirePart' builds this,
+-- so the ordering and the labelling the release needs cannot fail while the
+-- construction is being rolled back or the scope is exiting.
 data Part = Part
   { partRank ∷ !ReleaseRank
   , partLabel ∷ !Text
@@ -370,11 +379,25 @@ runAssembly (Assembly stages) = stages
 -- acquired so far, this one included. Nothing is unregistered to achieve that,
 -- and no part is released twice: the accumulated release is taken out of the
 -- construction when it runs.
+--
+-- The label and the rank are evaluated before the acquisition runs, because
+-- the release the rollback performs needs both and must not be able to fail on
+-- either. A label or rank that throws is therefore an ordinary construction
+-- failure raised at this stage: it acquires nothing, the stages after it and
+-- the body do not run, and the parts acquired before it are rolled back
+-- exactly as any other failure here rolls them back. Deferring that evaluation
+-- to the release instead would let a faulting thunk raise its exception after
+-- the authoritative release had been taken out of the construction, which
+-- abandons every acquired part and displaces the failure being unwound.
 acquirePart ∷ Text → ReleaseRank → IO p → (p → IO ()) → Assembly p
 acquirePart label rank acquire release = Assembly $ \assembling → do
+  -- Both are forced exactly as far as 'Part' forces them, so a total label and
+  -- rank reach the slot unchanged and a faulting one cannot reach it at all.
+  declaredLabel ← evaluate label
+  declaredRank ← evaluate rank
   part ← acquire
   atomicModifyIORef' (assemblingParts assembling) $ \parts →
-    (Part rank label (release part) : parts, ())
+    (Part declaredRank declaredLabel (release part) : parts, ())
   pure part
 
 -- | Run one step of the construction that acquires nothing — querying what an
@@ -399,12 +422,13 @@ restoredStep step = Assembly (\assembling → assemblingRestore assembling step)
 --
 -- This is 'withResource' for an owner with several parts, and it keeps the
 -- same contract. A failure before the first acquisition releases nothing. A
--- failure at any later stage — inside an acquisition, inside a restored step,
--- or at the final binding or publication step — releases exactly the parts
--- acquired so far, each exactly once, and propagates the triggering failure as
--- primary, so no finished value ever reaches the body. Cleanup failures are
--- retained under each part's own label as ordered, structured evidence that
--- 'cleanupFailures' reads back.
+-- failure at any later stage — while evaluating a part's declared label or
+-- rank, inside an acquisition, inside a restored step, or at the final binding
+-- or publication step — releases exactly the parts acquired so far, each
+-- exactly once, and propagates the triggering failure as primary, so no
+-- finished value ever reaches the body. Cleanup failures are retained under
+-- each part's own label as ordered, structured evidence that 'cleanupFailures'
+-- reads back.
 --
 -- On success the body borrows the finished value under the borrowing rules of
 -- 'withResource', and the release that runs when the body returns or throws is
@@ -457,6 +481,9 @@ releaseAcquired slot = uninterruptibleMask_ $ do
 -- | The declared final release order of the parts acquired so far. The slot
 -- holds them newest first, so reversing recovers acquisition order, and the
 -- stable sort below leaves parts of equal rank in it.
+--
+-- Sorting demands every part's rank, which 'acquirePart' evaluated before that
+-- part was acquired, so ordering the release of an acquired part cannot fail.
 declaredOrder ∷ [Part] → [Part]
 declaredOrder = sortOn partRank . reverse
 

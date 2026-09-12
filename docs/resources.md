@@ -180,10 +180,11 @@ is unregistered to make room for the extension, and the accumulated release is
 taken out of the construction when it runs, so no part is released twice.
 
 A failure before the first acquisition releases nothing. A failure at any later
-stage — inside an acquisition, inside a restored step, or at the final binding
-or publication step — releases exactly the parts acquired so far, each exactly
-once, and propagates the triggering failure as primary. The body never runs on
-that path, so no half-built value is ever observable.
+stage — while evaluating a part's declared label or rank, inside an
+acquisition, inside a restored step, or at the final binding or publication
+step — releases exactly the parts acquired so far, each exactly once, and
+propagates the triggering failure as primary. The body never runs on that path,
+so no half-built value is ever observable.
 
 ### The staged-protection guarantee
 
@@ -205,12 +206,47 @@ inside such a step rolls exactly those parts back. It inherits the caller's
 state rather than forcing an unmasked one, so a caller that was already masked
 stays masked. A step that acquires something belongs in `acquirePart`.
 
+### When part metadata is evaluated
+
+`acquirePart` takes the part's label and its rank as ordinary arguments, so
+either can be a thunk — a rank read out of a table, a label built from a name
+the caller assembled. Both are evaluated at the start of that stage, **before**
+its acquisition runs, because the authoritative release needs both to order and
+to label what it releases and must not be able to fail on either.
+
+A label or rank that throws is therefore an ordinary construction failure at
+its own stage, and it behaves exactly like one:
+
+- That stage acquires nothing, so it owns nothing to release and contributes no
+  cleanup entry. A rejected stage never needs a fabricated label.
+- The stages after it and the body do not run.
+- The parts acquired before it are released in the declared order, each exactly
+  once, and a throwing release among them does not stop the remaining ones.
+  Those failures are retained under their own parts' valid labels.
+- The fault is primary because it was raised first, not because it displaced
+  anything. A failure already being unwound stays primary: when an enclosing
+  scope's body has failed and its release constructs a composite whose metadata
+  faults, the body's failure remains primary and the fault arrives as that
+  scope's own cleanup failure, with the composite's labelled evidence still
+  reachable below it. A stage that fails *before* a later part's metadata would
+  have thrown stays primary too, because the stage declaring that metadata
+  never runs.
+
+Both are forced exactly as far as the `Part` record forces them, so a total
+label and rank behave as they always did and nothing is deep-forced. Evaluating
+them at release time instead is the defect this rule exists to prevent: a thunk
+that throws once the authoritative release has been taken out of the
+construction abandons every acquired part without a release attempt and
+replaces the failure being unwound with its own.
+
 ### The declared release order
 
 The constructor declares the final release order with `releaseRank`. Lower
 ranks are released first, and parts sharing a rank are released in acquisition
 order. Both the rollback of a failed construction and the release at the end of
-a successful body use that declared order.
+a successful body use that declared order. Computing that order demands every
+acquired part's rank, and every one of them was evaluated before that part was
+acquired, so ordering the release of an acquired part cannot fail.
 
 The order is a property of the API the parts come from, not of when they were
 acquired. A buffer is created before the memory behind it, and the correct
@@ -629,7 +665,15 @@ above. The composite examples in the same file add a failure injected before
 and after each acquisition and at the binding step, the declared release order
 in both its acquisition-order and its reordered form, a throwing rollback
 release, the cancellation cases above, and the whole construction nested inside
-`withResource`. They drive it through the fake buffer of
+`withResource`. The `Composite part metadata` group adds a throwing rank and a
+throwing label at a later stage, each asserting which parts were acquired and
+which were released: alone, ahead of a later stage that would itself have
+failed, with an earlier part's release throwing while the remaining one is
+still attempted, and beneath an enclosing scope whose body has already failed.
+One further example owns two real file handles and asserts both are closed and
+the rejected stage's file was never opened, and one asserts that an earlier
+stage's failure stays primary when a later part's metadata would have thrown.
+They drive it through the fake buffer of
 `test/Test/Engine/Resources/Buffer.hs`, which models exactly the four steps
 this contract needs and ships in no library.
 
