@@ -35,6 +35,7 @@ import Control.Exception
   , toException
   , try
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
@@ -175,6 +176,8 @@ spec = describe "Resources" $ do
       (boundedExample testCancelledInRestoredStep)
     it "rolls back the parts acquired so far when cancelled inside an acquisition"
       (boundedExample testCancelledInAcquisition)
+    it "rolls back a part acquired with a cancellation already pending"
+      (boundedExample testCancellationPendingWhenAcquisitionReturns)
     it "defers a cancellation aimed at a rollback until every release has run"
       (boundedExample testCancellationDeferredDuringRollback)
 
@@ -1115,3 +1118,69 @@ testBodyFailureStaysPrimary = do
   let retained = cleanupFailures propagated
   labelsOf retained `shouldBe` bufferLabels
   ioMessagesOf retained `shouldBe` [Just "destroy failed", Just "free failed"]
+
+-- | A cancellation that is already pending when an acquisition *returns* must
+-- not strand the part that acquisition produced.
+--
+-- The acquisition below masks itself uninterruptibly, waits until the killer's
+-- 'throwTo' is blocked on the constructing thread, and only then returns. The
+-- pending exception can therefore be delivered no earlier than the next
+-- interruptible operation, which is the blocked restored step after
+-- 'acquirePart' has installed the rollback — so the part is released.
+--
+-- This is the case the masked handoff exists for, and it separates that
+-- handoff from an implementation that restores the caller's masking state
+-- around an acquisition: such an implementation would deliver the moment this
+-- acquisition's own mask ended, before any rollback existed, and the part
+-- would never be released at all.
+testCancellationPendingWhenAcquisitionReturns ∷ Expectation
+testCancellationPendingWhenAcquisitionReturns = do
+  releases ← newTrail
+  bodies ← newTrail
+  acquiring ← newEmptyMVar
+  killerSlot ← newEmptyMVar
+  killerDone ← newEmptyMVar
+  neverFilled ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    captured ←
+      try $
+        withComposite
+          ( do
+              acquirePart
+                "first"
+                (releaseRank 0)
+                ( uninterruptibleMask_ $ do
+                    record releases "acquire first"
+                    putMVar acquiring ()
+                    killer ← readMVar killerSlot
+                    void (awaitPendingThrow killer)
+                )
+                (\_ → record releases "first")
+              -- The first interruptible operation after the rollback exists.
+              restoredStep (takeMVar neverFilled ∷ IO ())
+              acquirePart
+                "second"
+                (releaseRank 1)
+                (record releases "acquire second")
+                (\_ → record releases "second")
+          )
+          (\_ → record bodies "body")
+    putMVar outcome (captured ∷ Either SomeException ())
+  takeMVar acquiring
+  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
+  putMVar killerSlot killer
+  -- The cancellation was delivered, so the construction has unwound.
+  takeMVar killerDone
+  captured ← takeMVar outcome
+  case captured of
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      asyncException propagated `shouldBe` Just ThreadKilled
+      performed ← trail releases
+      -- The part acquired with the cancellation already pending was rolled
+      -- back; no later stage ran, so nothing else was acquired.
+      performed `shouldBe` ["acquire first", "first"]
+      occurrences "first" performed `shouldBe` 1
+      trail bodies `shouldReturn` []
+      length (cleanupFailures propagated) `shouldBe` 0
