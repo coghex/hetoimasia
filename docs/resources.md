@@ -786,11 +786,11 @@ continuation through record update and one that names the constructor; for
 retained evidence, one for each of `cleanupFailureId`, `cleanupFailureLabel`,
 and `cleanupFailureException` that imports the reader by name and then tries to
 replace it through record update, and one that names the `CleanupFailure`
-constructor. The first five of those six are rejected because no field label
-exists to write through, and the sixth because the type is exported without its
-children; each example asserts the diagnostic that names its own cause and
-refuses to count a missing package, an absent compiler, or an unrelated error
-as the guarantee holding. Two must be accepted, linked, and run: one using only
+constructor. The four record-update cases are rejected because no field label
+exists to write through, and the two that name a constructor because their
+types are exported without their children; each example asserts the diagnostic
+that names its own cause and refuses to count a missing package, an absent
+compiler, or an unrelated error as the guarantee holding. Two must be accepted, linked, and run: one using only
 the runner and the allocators, and one using only the three readers, both
 inspection entry points, `displayCleanupFailure`, and reattachment through
 `addExceptionAnnotation`, which asserts observation order across a scope that
