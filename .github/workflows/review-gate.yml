@@ -14,11 +14,18 @@
 # workflow and checks nothing out, so that token never reaches
 # contributor-authored code.
 #
-# A content-changing push keeps its approval in exactly one case: the push is
-# Git's own clean merge of the approved head with a commit the base already
-# contains, so the submitted tree is one the earlier review already covers.
-# `review_replay.py` proves that in the checkout; nothing here decides it from
-# the payload, and everything it cannot prove invalidates the approval.
+# A push keeps its approval only from a *proven* starting point: a head a
+# canonical review named, or one reached from it through carries this workflow
+# itself recorded. `review_provenance.py` proves that from the pull request's
+# comment feed, because an attached label proves nothing about the head it was
+# left on — a delayed dismissal refuses to touch a superseded head, and the
+# next push would otherwise inherit whatever it left standing. From a proven
+# starting point, a content-changing push keeps its approval in exactly one
+# case: the push is Git's own clean merge of that head with a commit the base
+# already contains, so the submitted tree is one the earlier review already
+# covers. `review_replay.py` proves that in the checkout; nothing here decides
+# either from the payload, and everything they cannot prove invalidates the
+# approval.
 name: review-gate
 
 on:
@@ -49,6 +56,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # The provenance proof reads the jobs of the runs that wrote each carry
+      # record, to verify the recording job actually concluded successfully.
+      actions: read
     outputs:
       action: ${{ steps.decide.outputs.action }}
       expected: ${{ steps.decide.outputs.expected }}
@@ -59,6 +69,11 @@ jobs:
       incorporated_base: ${{ steps.replay.outputs.incorporated_base }}
       replay_tree: ${{ steps.replay.outputs.replay_tree }}
       resulting_head: ${{ steps.replay.outputs.resulting_head }}
+      provenance: ${{ steps.provenance.outputs.provenance }}
+      provenance_reason: ${{ steps.provenance.outputs.provenance_reason }}
+      origin: ${{ steps.provenance.outputs.origin }}
+      chain: ${{ steps.provenance.outputs.chain }}
+      head_verdict: ${{ steps.provenance.outputs.head_verdict }}
     steps:
       - name: Check out the head
         uses: actions/checkout@v7
@@ -87,6 +102,48 @@ jobs:
             --after "$AFTER" \
             --base "origin/$BASE_REF" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Prove the starting point's approval
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          # The account the canonical coordinator and drainer publish their
+          # review markers under. A marker by anyone else names no approval.
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # The whole feed, paged, into a file the script reads: the proof is
+          # then exercised in tests against fixture feeds exactly as it runs
+          # here. A fetch that fails leaves no file, and the script answers
+          # `unproven` for that rather than aborting before the removal it
+          # justifies — a feed that could not be read proves nothing.
+          feed="$RUNNER_TEMP/comments.json"
+          if ! gh api --paginate --slurp "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" > "$feed"; then
+            rm -f "$feed"
+          fi
+          # A carry record is posted while the job that writes it is still
+          # running, so each one is only as good as that job's conclusion.
+          # Fetch the jobs of every run attempt the records name; a listing
+          # that cannot be fetched is left missing, and the record it would
+          # have vouched for proves nothing.
+          runs="$RUNNER_TEMP/runs"
+          mkdir -p "$runs"
+          while read -r run attempt; do
+            [ -n "$run" ] || continue
+            if ! gh api "repos/$REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" > "$runs/$run-$attempt.json"; then
+              rm -f "$runs/$run-$attempt.json"
+            fi
+          done < <(python3 tools/validation/review_provenance.py --list-runs --comments "$feed")
+          python3 tools/validation/review_provenance.py \
+            --before "$BEFORE" \
+            --after "$AFTER" \
+            --comments "$feed" \
+            --runs "$runs" \
+            --owner "$OWNER" | tee -a "$GITHUB_OUTPUT"
+
       - name: Decide the approval's fate
         id: decide
         env:
@@ -98,6 +155,9 @@ jobs:
           AFTER: ${{ github.event.after }}
           REPLAY: ${{ steps.replay.outputs.replay_decision }}
           REPLAY_REASON: ${{ steps.replay.outputs.replay_reason }}
+          PROVENANCE: ${{ steps.provenance.outputs.provenance }}
+          PROVENANCE_REASON: ${{ steps.provenance.outputs.provenance_reason }}
+          HEAD_VERDICT: ${{ steps.provenance.outputs.head_verdict }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -129,6 +189,9 @@ jobs:
             --after-tree "$after_tree" \
             --replay-decision "$REPLAY" \
             --replay-reason "$REPLAY_REASON" \
+            --provenance "$PROVENANCE" \
+            --provenance-reason "$PROVENANCE_REASON" \
+            --head-verdict "$HEAD_VERDICT" \
             --label-attached "$attached" \
             --label "$LABEL" | tee -a "$GITHUB_OUTPUT"
 
@@ -166,6 +229,12 @@ jobs:
           INCORPORATED_BASE: ${{ needs['decide-dismissal'].outputs.incorporated_base }}
           REPLAY_TREE: ${{ needs['decide-dismissal'].outputs.replay_tree }}
           RESULTING_HEAD: ${{ needs['decide-dismissal'].outputs.resulting_head }}
+          PROVENANCE: ${{ needs['decide-dismissal'].outputs.provenance }}
+          PROVENANCE_REASON: ${{ needs['decide-dismissal'].outputs.provenance_reason }}
+          ORIGIN: ${{ needs['decide-dismissal'].outputs.origin }}
+          CHAIN: ${{ needs['decide-dismissal'].outputs.chain }}
+          HEAD_VERDICT: ${{ needs['decide-dismissal'].outputs.head_verdict }}
+          OWNER: ${{ github.repository_owner }}
           LABEL: reviewed:approve
         run: |
           set -euo pipefail
@@ -196,6 +265,116 @@ jobs:
             exit 1
           fi
 
+          # A canonical review may have judged this exact head after the
+          # decision was made — a verdict for the newest push arrives whenever
+          # a reviewer is faster than a queued run — and the head check above
+          # cannot see it, since the head did not move. Read the whole feed
+          # again immediately before acting on either verdict, and let the
+          # newest marker naming this head win: an approval keeps a label the
+          # decision would have removed, and a denial removes one the
+          # decision would have kept. The verdict is applied to the
+          # provenance whether or not it changes the action: a head approved
+          # in its own right is a new origin even when the decision was
+          # already keeping, so no carry is recorded for it, and a denial is
+          # reported even when the removal was already planned.
+          #
+          # This job runs no repository code, so the rules review_provenance.py
+          # applies are applied here in the runner's own jq: every comment
+          # has to carry a usable id, a real timestamp, an author, and a body,
+          # every owner comment that opens like a marker, in any case, has to
+          # be exactly one canonical marker in the grammar review_provenance.py
+          # accepts, and only then does the newest marker for this head
+          # decide. A feed that fails those rules proves nothing:
+          # it never reverses a planned removal, and it turns a planned keep
+          # into a removal rather than confirm an approval it cannot read. A
+          # read that fails outright is not an empty one: acting on it could
+          # strip an approval somebody just granted or confirm one somebody
+          # just refused, so it is refused like every other unconfirmed read.
+          evidence=valid
+          if [ "$ACTION" = "remove" ] || [ "$EXPECTED" = "kept" ]; then
+            owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+            head="$(printf '%s' "$EVENT_HEAD" | tr '[:upper:]' '[:lower:]')"
+            feed="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/comments-$NUMBER.json"
+            if ! gh api --paginate --slurp "repos/$REPOSITORY/issues/$NUMBER/comments?per_page=100" > "$feed"; then
+              echo "::error::the comment feed could not be read back, so this decision is unconfirmed"
+              exit 1
+            fi
+            filter='
+              def usable:
+                type == "object"
+                and (.id | type == "number" and . > 0 and . == floor)
+                and (.created_at | type == "string"
+                     and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+                     and ((try (fromdateiso8601 | todateiso8601) catch "") == .))
+                and (.user | type == "object" and (.login | type == "string" and test("\\S")))
+                and (.body | type == "string");
+              def canonical:
+                "<!--\\s*pr-review:v(?:2\\s+reviewers=(?:claude|codex)(?:,(?:claude|codex))*\\s+models=\\S+|1\\s+reviewer=(?:claude|codex))\\s+"
+                + "head=(?<head>[0-9a-fA-F]{40})\\s+verdict=(?<verdict>APPROVE|CHANGES_REQUESTED)\\s*-->";
+              def openings: [scan("<!--\\s*pr-review:v"; "i")] | length;
+              def markers: [match(canonical; "g")];
+              [.[][]]
+              | if any(.[]; usable | not) then "malformed"
+                else [ .[] | select((.user.login | ascii_downcase) == "__OWNER__") ] | sort_by(.created_at, .id)
+                | if any(.[]; .body | (openings != (markers | length)) or ((markers | length) > 1)) then "malformed"
+                  else [ .[] | .body | markers[] | .captures | map(select(.name != null) | {(.name): .string}) | add
+                         | select((.head | ascii_downcase) == "__HEAD__") | .verdict ]
+                    | if length == 0 then "none" else last end
+                  end
+                end
+            '
+            filter="${filter//__OWNER__/$owner}"
+            filter="${filter//__HEAD__/$head}"
+            if ! verdict="$(jq -r "$filter" "$feed")"; then
+              echo "::error::the comment feed could not be validated, so this decision is unconfirmed"
+              exit 1
+            fi
+            case "$verdict" in
+              APPROVE)
+                if [ "$HEAD_VERDICT" != "approved" ]; then
+                  echo "a canonical review approved head $EVENT_HEAD after the decision was made; keeping $LABEL"
+                  REASON="a canonical review approved head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
+                fi
+                # A head approved in its own right is its own origin, whether
+                # the decision already knew that or not.
+                HEAD_VERDICT=approved
+                ORIGIN="$EVENT_HEAD"
+                CHAIN=""
+                if [ "$ACTION" = "remove" ]; then
+                  ACTION=none
+                  EXPECTED=kept
+                fi
+                ;;
+              CHANGES_REQUESTED)
+                if [ "$HEAD_VERDICT" != "denied" ]; then
+                  echo "a canonical review requested changes on head $EVENT_HEAD after the decision was made; removing $LABEL"
+                  REASON="a canonical review requested changes on head ${EVENT_HEAD:0:12} itself, after this push's decision was made"
+                fi
+                HEAD_VERDICT=denied
+                ORIGIN=""
+                CHAIN=""
+                if [ "$ACTION" != "remove" ]; then
+                  ACTION=remove
+                  EXPECTED=removed
+                fi
+                ;;
+              none)
+                ;;
+              *)
+                echo "the comment feed is malformed or incomplete, so no approval can be confirmed on head $EVENT_HEAD; removing $LABEL"
+                REASON="the comment feed read before acting was malformed or incomplete, so no approval could be confirmed on head ${EVENT_HEAD:0:12}"
+                evidence=malformed
+                HEAD_VERDICT=none
+                ORIGIN=""
+                CHAIN=""
+                if [ "$ACTION" != "remove" ]; then
+                  ACTION=remove
+                  EXPECTED=removed
+                fi
+                ;;
+            esac
+          fi
+
           if [ "$ACTION" = "remove" ]; then
             gh pr edit "$NUMBER" --repo "$REPOSITORY" --remove-label "$LABEL"
           fi
@@ -217,6 +396,37 @@ jobs:
 
           echo "$LABEL $EXPECTED: $REASON"
 
+          # A carried approval is recorded at the head it was carried to, and
+          # only now: after the decision concluded, with the head still
+          # current and the label confirmed attached. The record is what the
+          # next push's decision reads to prove *this* head, so it is written
+          # by this job alone — the only identity in this repository's
+          # workflows that can — and a record that could not be written is a
+          # carry the next push cannot see, which is reported rather than
+          # left for that push to discover. It names this run and attempt,
+          # because it is posted before this job has concluded: the proof
+          # that reads it verifies that this job went on to succeed, so a
+          # failure or cancellation after this point leaves a record that
+          # proves nothing. A head a canonical review named itself needs no
+          # record: the marker is its proof.
+          carried=false
+          if [ "$EXPECTED" = "kept" ] && [ "$HEAD_VERDICT" != "approved" ]; then
+            if [ -z "$ORIGIN" ]; then
+              echo "::error::the decision kept $LABEL without a proven origin, so no carry can be recorded"
+              exit 1
+            fi
+            if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+              record="$(printf "Carried \`%s\` from \`%s\` to \`%s\`. The review it carries was granted at \`%s\`; no reviewer examined \`%s\`. This record proves the carry only if run %s attempt %s concluded successfully.\n\n<!-- approval-provenance:v1 origin=%s before=%s after=%s run=%s attempt=%s -->" \
+                "$LABEL" "${BEFORE:0:12}" "${EVENT_HEAD:0:12}" "${ORIGIN:0:12}" "${EVENT_HEAD:0:12}" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+                "$ORIGIN" "$BEFORE" "$EVENT_HEAD" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")"
+              if ! gh api -X POST "repos/$REPOSITORY/issues/$NUMBER/comments" -f body="$record" > /dev/null; then
+                echo "::error::the carried approval could not be recorded at $EVENT_HEAD, so this decision is unconfirmed"
+                exit 1
+              fi
+              carried=true
+            fi
+          fi
+
           # Provenance, not a review. Every field below names a revision this
           # decision was actually made from, and the closing line says plainly
           # whose review is being carried and that nobody read the integration
@@ -235,13 +445,29 @@ jobs:
             echo "- Push: \`${BEFORE:0:12}\`..\`${EVENT_HEAD:0:12}\`"
             echo "- Replay: $REPLAY — $REPLAY_REASON"
             echo "- \`$LABEL\`: $EXPECTED — $REASON"
+            echo "- Starting point: $PROVENANCE — $PROVENANCE_REASON"
+            provenance "Proven origin" "$ORIGIN"
             provenance "Approved head" "$APPROVED_HEAD"
             provenance "Incorporated base commit" "$INCORPORATED_BASE"
             provenance "Replay tree" "$REPLAY_TREE"
             provenance "Resulting head" "$RESULTING_HEAD"
-            if [ "$REPLAY" = "keep" ] && [ "$EXPECTED" = "kept" ]; then
-              echo "- The approved head is the immediately preceding approval-bearing head, which repeated clean updates may have carried the original review through; it is not necessarily the revision a reviewer read, and no reviewer examined the resulting integration tree."
-            elif [ "$REPLAY" = "keep" ]; then
+            if [ "$evidence" = "malformed" ]; then
+              echo "- The comment feed read before acting was malformed or incomplete, so no approval could be confirmed on this head."
+            elif [ "$HEAD_VERDICT" = "approved" ]; then
+              echo "- A canonical review named this head itself, so nothing is inherited."
+            elif [ "$HEAD_VERDICT" = "denied" ]; then
+              echo "- A canonical review requested changes on this head itself, so no approval stands on it whatever its starting point proved."
+            elif [ "$carried" = "true" ]; then
+              route=""
+              IFS=',' read -ra hops <<< "$CHAIN"
+              for hop in "${hops[@]}" "$EVENT_HEAD"; do
+                route="${route:+$route → }\`${hop:0:12}\`"
+              done
+              echo "- Reached from the proven origin through: $route"
+              echo "- The review being carried was granted at the proven origin, the revision a reviewer read; every later head on that route was reached by a recorded carry, and no reviewer examined the resulting integration tree."
+            elif [ "$EXPECTED" = "kept" ]; then
+              echo "- The decision kept \`$LABEL\`, but it was no longer attached when this decision was applied, so no carry was recorded."
+            elif [ "$REPLAY" = "keep" ] && [ "$EXPECTED" = "absent" ]; then
               echo "- The push was replay-eligible, but \`$LABEL\` was not attached, so no review is being carried forward."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -14,11 +14,16 @@ request no longer proposes.
 ``verdict`` decides whether ``review-approved`` may report success.
 
 ``dismissal`` does not judge the push's history itself: ``review_replay.py``
-does that, in the checkout, and hands its ``keep``/``strip`` here. What lives
-here is the composition — the two independent ways a push can leave an approval
-standing (it moved no tracked file at all, or it is exactly the clean replay of
-the approved work onto the base it incorporated), and the states in which no
-answer may be given at all.
+does that, in the checkout, and hands its ``keep``/``strip`` here;
+``review_provenance.py`` decides whether the push's starting point was ever
+proven approved, and hands its ``proven``/``unproven`` here. What lives here is
+the composition — an approval is carried only from a proven starting point, and
+then by either of two independent proofs that the push itself changed nothing a
+reviewer read (it moved no tracked file at all, or it is exactly the clean
+replay of the approved work onto the base it incorporated); a canonical review
+naming the pushed head itself settles it before either — an approval is a new
+origin that needs neither, a denial strips whatever they prove — and the
+states in which no answer may be given at all.
 
 Both run in read-only jobs. The job that actually mutates the label holds the
 only write token in this repository's workflows and therefore runs no repository
@@ -60,6 +65,16 @@ SYNCHRONIZE = "synchronize"
 KEEP = "keep"
 STRIP = "strip"
 
+# What `review_provenance.py` decided about this push's starting point.
+PROVEN = "proven"
+UNPROVEN = "unproven"
+
+# What the newest canonical review of the pushed head itself said, from the
+# same tool. Tri-state on purpose: a denial is not the absence of an approval.
+APPROVED = "approved"
+DENIED = "denied"
+NO_VERDICT = "none"
+
 
 def label_state(value: str) -> str:
     lowered = value.strip().lower()
@@ -100,8 +115,25 @@ def report_superseded(event_head: str, current_head: str, doing: str) -> int:
 def dismissal(arguments: argparse.Namespace) -> int:
     """What a push should do to the approval label.
 
-    Two independent things can leave an approval standing, and neither one lets
-    unreviewed code inherit it.
+    A canonical review that named the pushed head itself settles the question
+    first, whatever the push that reached it looked like. An approval means
+    the label belongs to this head: that is what lets a fresh approval survive
+    a decision that was still queued when it was granted, and what lets a head
+    approved after an earlier strip start a new chain. A denial means no
+    approval may stand on it, however proven its starting point and however
+    clean the push: an inherited approval must not outlive a reviewer's
+    refusal of the very revision it stands on.
+
+    Otherwise the starting point has to be a proven approved revision, decided
+    by ``review_provenance.py`` and arriving here as ``proven`` or ``unproven``.
+    An attached label proves nothing about it: a delayed dismissal for an
+    earlier push refuses to touch a superseded head, and the label it left
+    standing there was never earned. Tree equality and a clean replay only say
+    that *this* push changed nothing a reviewer read; they cannot say that
+    anyone read the starting point, so an unproven one strips.
+
+    From a proven starting point, two independent things can leave an approval
+    standing, and neither one lets unreviewed code inherit it.
 
     The first is a push that moved nothing. That is a question about *trees*,
     not commits: a re-pushed identical tree changes nothing a reviewer read. A
@@ -124,7 +156,16 @@ def dismissal(arguments: argparse.Namespace) -> int:
         return report_unreadable(arguments.label, "decide this push's effect on approval")
 
     changed = not arguments.before_tree or arguments.before_tree != arguments.after_tree
-    if not changed:
+    if arguments.head_verdict == DENIED:
+        carries = False
+        reason = f"a canonical review requested changes on head {arguments.event_head[:12]} itself"
+    elif arguments.head_verdict == APPROVED:
+        carries = True
+        reason = f"a canonical review approved head {arguments.event_head[:12]} itself"
+    elif arguments.provenance != PROVEN:
+        carries = False
+        reason = arguments.provenance_reason or "the push's starting point is not a proven approved revision"
+    elif not changed:
         carries, reason = True, "the push changed no tracked file"
     elif arguments.replay_decision == KEEP:
         carries, reason = True, arguments.replay_reason or "the push replays the approved work"
@@ -213,6 +254,23 @@ def main(argv: list[str]) -> int:
                 "--replay-reason",
                 default="",
                 help="the one-line reason review_replay.py gave for that decision",
+            )
+            command.add_argument(
+                "--provenance",
+                required=True,
+                choices=(PROVEN, UNPROVEN),
+                help="what review_provenance.py decided about the push's starting point",
+            )
+            command.add_argument(
+                "--provenance-reason",
+                default="",
+                help="the one-line reason review_provenance.py gave for that decision",
+            )
+            command.add_argument(
+                "--head-verdict",
+                required=True,
+                choices=(APPROVED, DENIED, NO_VERDICT),
+                help="what the newest canonical review of the pushed head itself said",
             )
         else:
             command.add_argument(
