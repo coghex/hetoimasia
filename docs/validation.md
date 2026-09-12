@@ -788,6 +788,23 @@ that did not conclude `success` while its groups were asked to execute**. A
 selected gate nothing vouched for has not been satisfied, however green the rest
 of the run looks.
 
+**Timings are ancillary and cannot change the verdict.** The step that collects
+them runs immediately before the one that decides, but nothing downstream reads
+what it produces: `tools/validation/timings.py` renders a report and says so
+itself. A failed API call listing the run's jobs, or a response the report
+cannot read, is therefore a reporting gap rather than a result. The step names
+that gap — as a `::warning::` in the log, and as an `Unavailable:` note under
+**Run timings** in the job summary in place of the table — and concludes
+successfully, leaving `build-test` to conclude from the aggregate's own exit
+status.
+
+That tolerance belongs to the timing step alone. Every step the verdict depends
+on stays required: a failed plan job, a failed read of the pull request's
+current state, a failed or cancelled worker whose groups were selected, and any
+obstacle the aggregate reports still fail `build-test` exactly as before. The
+step that decides the verdict keeps its own default success condition, so it is
+still skipped when one of those fails.
+
 The candidate and compatibility questions are asked here as well as by the
 runner, and deliberately so. The runner refuses to execute from the wrong
 checkout, but a verdict rests on the document in front of it rather than on the
@@ -1274,6 +1291,17 @@ a `strip`, a canonical denial of it stripping through a proven starting point
 and an identical tree, that approval asking for no mutation when no label is
 attached, the superseded-head and unreadable-label refusals answered first, and
 unrecognized provenance and head-verdict inputs refused.
+
+The timing step has its own examples, which extract its shipped `run` body from
+`.github/workflows/validation.yml` and drive it against a stubbed `gh` — the
+only way to reach an API that answers with an error and one that answers with
+something no report can read. They cover a refused job listing, a malformed one,
+and an empty one, and in each case run the real aggregate afterwards, in the
+same working directory and against the same job summary, with passing evidence
+and then with a failing receipt: the gap reaches the log and the summary, and
+the verdict is still decided by the receipts alone. One further example holds
+the shape that makes this safe, requiring the verdict step to keep its own
+default condition and the pull request's current state to stay a required read.
 
 Execution provenance has its own examples, built on the same fixtures. They
 reproduce the regression the contract exists for — a plan whose candidate fails,

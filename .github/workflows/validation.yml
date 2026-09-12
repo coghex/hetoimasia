@@ -534,14 +534,50 @@ jobs:
           git merge-base "$(cat current-base.txt)" "$(cat current-head.txt)" > current-merge-base.txt
 
       - name: Record the run timings
+        # Timings are a report, never a result: `tools/validation/timings.py`
+        # says as much itself, and nothing downstream reads what this step
+        # produces. So an API error, or a job listing the report cannot read,
+        # is a reporting gap — and failing here would suppress a verdict the
+        # plan, the receipts, and the freshness inputs were all present to
+        # decide, because the step that decides it carries the default success
+        # condition. This step therefore names the gap in the log and in the
+        # job summary and concludes successfully.
+        #
+        # It weakens no gate above it. The plan requirement and the read of the
+        # pull request's current state remain required steps whose failure
+        # skips the verdict exactly as before, and the verdict step keeps its
+        # own default condition so that stays true.
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          set -euo pipefail
-          gh api "repos/$REPOSITORY/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" > jobs.json
+          set -uo pipefail
+          unavailable() {
+            echo "::warning::run timings are unavailable: $1"
+            {
+              echo "## Run timings"
+              echo
+              echo "Unavailable: $1."
+              echo
+              echo "Timings are ancillary: they never decide a verdict, so this"
+              echo "gap does not affect the one \`build-test\` reports."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" > jobs.json
+          listed=$?
+          if [ "$listed" -ne 0 ]; then
+            unavailable "the API call listing this run's jobs exited $listed"
+          fi
           python3 tools/validation/timings.py --jobs jobs.json --summary "$GITHUB_STEP_SUMMARY"
+          rendered=$?
+          if [ "$rendered" -ne 0 ]; then
+            unavailable "tools/validation/timings.py exited $rendered reading the job listing"
+          fi
 
       - name: Decide the verdict
         run: |
