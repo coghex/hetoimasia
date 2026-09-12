@@ -92,6 +92,7 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Resources.Buffer
+        Test.Engine.Resources.Opacity
         Test.Engine.Resources.Smoke
         Test.Engine.Resources.Spec
     ghc-options: -threaded -rtsopts
