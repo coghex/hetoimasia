@@ -507,22 +507,37 @@ retainCleanupFailures failures primary = foldl' retain primary failures
 -- callback indentation, and the lifetimes are exactly the ones the nested
 -- callbacks would have given.
 --
--- The constructor is private and 'withScoped' is the only runner. There is no
--- way to resume a scope's continuation, to take a scope apart, or to install
+-- The representation is closed: the constructor is not exported, and the
+-- continuation is not a record field, so no field label reaches a client
+-- either. A module importing this one cannot build a 'Scoped' from a
+-- continuation of its own and cannot rewrite the continuation of one it was
+-- given, because record construction and record-update syntax both need a
+-- field label in scope and this type declares none. There is therefore no way
+-- to resume a scope's continuation, to take a scope apart, or to install
 -- cleanup for a resource acquired elsewhere; a scope is built with
 -- 'allocResource', 'allocComposite', 'locally', 'pure', 'liftIO', and the
--- instances below, and it is consumed by running it.
-newtype Scoped a = Scoped
-  { withScoped ∷ ∀ r. (a → IO r) → IO r
-    -- ^ Enter the scope, run the continuation with what it allocated, and
-    -- release everything it allocated when that continuation returns or
-    -- throws.
-    --
-    -- The continuation borrows the values under the borrowing rules of
-    -- 'withResource'. Running a scope with 'pure' as the continuation is the
-    -- documented misuse: it returns a handle whose cleanup has already run.
-    -- Return ordinary, fully evaluated results instead.
-  }
+-- instances below, and it is consumed by running it with 'withScoped', the
+-- only runner.
+--
+-- Nothing here counts entries or rejects a second one at run time. The
+-- guarantee is the absence of a way to express the rewrite, checked when the
+-- client is compiled.
+newtype Scoped a = Scoped (∀ r. (a → IO r) → IO r)
+
+-- | Enter the scope, run the continuation with what it allocated, and release
+-- everything it allocated when that continuation returns or throws.
+--
+-- This is an ordinary function over the closed representation rather than a
+-- field selector, so it reads a scope without also giving a client a way to
+-- write one. Its name and type are unchanged by that: it is still applied to a
+-- scope and a continuation, and still the only runner.
+--
+-- The continuation borrows the values under the borrowing rules of
+-- 'withResource'. Running a scope with 'pure' as the continuation is the
+-- documented misuse: it returns a handle whose cleanup has already run. Return
+-- ordinary, fully evaluated results instead.
+withScoped ∷ Scoped a → ∀ r. (a → IO r) → IO r
+withScoped (Scoped enter) = enter
 
 instance Functor Scoped where
   fmap change scope = Scoped (\continue → withScoped scope (continue . change))

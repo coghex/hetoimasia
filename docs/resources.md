@@ -330,6 +330,25 @@ resource acquired elsewhere. A scope is built with `allocResource`,
 `allocComposite`, `locally`, `pure`, `liftIO`, and the instances above, and is
 consumed by running it.
 
+That opacity rests on the representation being closed, not on a check made
+while a scope runs. `Scoped` wraps its continuation in an unexported
+constructor with no record field, so a client outside the package has no name
+for the continuation: it cannot write one of its own into a `Scoped`, and it
+cannot rewrite the one a scope it was handed already carries. Record
+construction and record-update syntax both need a field label in scope, and a
+field label is in scope wherever it is exported — which is why the continuation
+is not a field and `withScoped` is an ordinary function over the closed type
+rather than its selector. `withScoped`'s name and type are unaffected by that:
+it is still applied to a scope and a continuation.
+
+Nothing counts entries or refuses a second one at run time; the guarantee is
+that the rewrite cannot be expressed, and it is checked when the client is
+compiled. `test/Test/Engine/Resources/Opacity.hs` holds it there, compiling
+clients against the built package: a client that replaces the continuation and
+a client that names the constructor must both be rejected for exactly that
+reason, while a client using only the runner and the allocators compiles,
+links, and runs.
+
 `allocComposite` allocates; it is not a second runner. Composite construction
 is still written with `acquirePart` and `restoredStep`, and `withComposite`
 remains the way to enter such a scope directly.

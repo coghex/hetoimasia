@@ -69,6 +69,7 @@ import Hetoimasia.Foundation.Resource
   , withResourceLabelled
   , withScoped
   )
+import qualified Test.Engine.Resources.Opacity as Opacity
 import qualified Test.Engine.Resources.Smoke as Smoke
 import Test.Engine.Resources.Buffer
   ( Buffer (..)
@@ -255,6 +256,10 @@ spec = describe "Resources" $ do
   describe "Continuation facade composite allocation" $ do
     it "keeps each composite's declared order while the scope unwinds in reverse"
       testCompositeThroughFacade
+
+  -- The facade's opacity is a property of what the package exports rather than
+  -- of a value, so it is asserted by compiling clients outside the package.
+  Opacity.spec
 
   -- The runtime's console demonstration composes these scopes with the logging
   -- contract. Its examples group here, beside the primitives they use.

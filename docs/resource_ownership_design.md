@@ -325,9 +325,13 @@ implementation detail constrained by D-1/D-3 and D-8:
 -- RES-1: the lower primitive. Argument order follows 'bracket'.
 withResource ∷ IO a → (a → IO ()) → (a → IO r) → IO r
 
--- RES-3: the facade over it.
-newtype Scoped a = Scoped
-  { withScoped ∷ forall r. (a → IO r) → IO r }
+-- RES-3: the facade over it. The continuation is not a record field, because
+-- an exported field label would let a client rewrite it with record-update
+-- syntax even while the constructor stays hidden.
+newtype Scoped a = Scoped (forall r. (a → IO r) → IO r)
+
+withScoped ∷ Scoped a → forall r. (a → IO r) → IO r
+withScoped (Scoped enter) = enter
 
 allocResource ∷ IO a → (a → IO ()) → Scoped a
 allocResource acquire release = Scoped (withResource acquire release)
@@ -340,8 +344,9 @@ Here `withResource` is the lower primitive to implement in RES-1, including
 acquisition/release exception protection under D-6 and D-7. It is not an alias
 for plain `bracket`. `Scoped` gets `Functor`, `Applicative`, `Monad`, and
 `MonadIO` instances so allocation composes in `do` notation; neither the lower
-primitive nor this wrapper needs EngineEnv or Logger. Hide the constructor and
-provide no arbitrary continuation resumption API; `withScoped` is the only
+primitive nor this wrapper needs EngineEnv or Logger. Hide the constructor,
+keep the continuation out of a record field so no field label escapes with it,
+and provide no arbitrary continuation resumption API; `withScoped` is the only
 runner. The code above describes the planned layering, not an implemented module.
 
 Facade contract, documented with RES-3:
