@@ -10,6 +10,7 @@ import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
 import qualified ApprovalProvenance
 import qualified DismissalStep
 import qualified Execution
+import qualified Packaging
 import qualified Reuse
 import qualified ReviewGate
 import qualified ReviewReplay
@@ -79,6 +80,7 @@ main = hspec $ do
   ReviewReplay.spec
   DismissalStep.spec
   ApprovalProvenance.spec
+  Packaging.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a
 withRepository alias action = do

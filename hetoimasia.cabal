@@ -23,15 +23,19 @@ extra-doc-files:
     tools/README.md
     tools/KANBAN-LICENSE
 extra-source-files:
+    .github/workflows/review-gate.yml
+    .github/workflows/validation.yml
     tools/docs_land.sh
     tools/docs_land_paths.py
     tools/validation/plan.py
     tools/validation/range.py
     tools/validation/catalog.json
     tools/validation/receipts.py
+    tools/validation/reuse.py
     tools/validation/run.py
     tools/validation/aggregate.py
     tools/validation/review_gate.py
+    tools/validation/review_provenance.py
     tools/validation/review_replay.py
     tools/validation/timings.py
 
@@ -65,6 +69,7 @@ test-suite workflow-tests
         DismissalStep
         Execution
         Json
+        Packaging
         Reuse
         ReviewGate
         ReviewReplay
