@@ -37,7 +37,7 @@ module DismissalStep
 
 import Control.Monad (unless)
 import Data.List (isInfixOf)
-import Sandbox (run, sanitizedEnvironment, writeFixtureFile)
+import Sandbox (run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -530,7 +530,7 @@ withStep ∷ Repository → String → String → (Outcome → IO a) → IO a
 withStep repository action expected assertion = do
   checkout ← getCurrentDirectory
   inherited ← sanitizedEnvironment
-  body ← stepBody checkout "Apply the decision"
+  body ← workflowStepBody checkout ".github/workflows/review-gate.yml" "Apply the decision"
   withSystemTempDirectory "hetoimasia-dismissal" $ \directory → do
     let binPath = directory </> "bin"
     createDirectoryIfMissing True binPath
@@ -589,36 +589,6 @@ withStep repository action expected assertion = do
     recorded ← if logged then lines <$> readFile (directory </> "calls") else pure []
     published ← readFile (directory </> "summary")
     assertion (Outcome status stdout' recorded published)
-
--- | The literal @run@ block of one named step, read from the workflow itself.
---
--- Deliberately dependency-free: the point is to assert against the file the
--- pipeline actually loads, and a test that needed a YAML library installed to
--- do so would be skipped exactly when it mattered.
-stepBody ∷ FilePath → String → IO String
-stepBody checkout name = do
-  (status, stdout', errors) ←
-    run [] checkout "python3" ["-c", extractor, ".github/workflows/review-gate.yml", name]
-  (status, errors) `shouldBe` (ExitSuccess, "")
-  pure stdout'
-
-extractor ∷ String
-extractor =
-  unlines
-    [ "import sys"
-    , "path, wanted = sys.argv[1], sys.argv[2]"
-    , "lines = open(path, encoding='utf-8').read().splitlines()"
-    , "start = next((i for i, l in enumerate(lines) if l.strip() == '- name: ' + wanted), None)"
-    , "if start is None: raise SystemExit('no step named %r in %s' % (wanted, path))"
-    , "run = next((i for i in range(start, len(lines)) if lines[i].strip() == 'run: |'), None)"
-    , "if run is None: raise SystemExit('step %r has no run block' % wanted)"
-    , "indent = len(lines[run]) - len(lines[run].lstrip()) + 2"
-    , "body = []"
-    , "for line in lines[run + 1:]:"
-    , "    if line.strip() and len(line) - len(line.lstrip()) < indent: break"
-    , "    body.append(line[indent:] if len(line) >= indent else line)"
-    , "sys.stdout.write('\\n'.join(body).rstrip() + '\\n')"
-    ]
 
 commaSeparated ∷ [String] → String
 commaSeparated = foldr (\item rest → if null rest then item else item ++ ", " ++ rest) ""

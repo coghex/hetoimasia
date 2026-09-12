@@ -5,6 +5,7 @@ module Sandbox
   , run
   , git
   , writeFixtureFile
+  , workflowStepBody
   , fixtureIgnore
   , fixtureGenerated
   ) where
@@ -15,7 +16,7 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.Process (CreateProcess (..), proc, readCreateProcessWithExitCode)
-import Test.Hspec (expectationFailure)
+import Test.Hspec (expectationFailure, shouldBe)
 
 -- | An environment with the caller's Git and locale configuration removed, so a
 -- temporary repository behaves identically on every machine.
@@ -57,6 +58,43 @@ writeFixtureFile root relative contents = do
   let target = root </> relative
   createDirectoryIfMissing True (takeDirectory target)
   writeFile target contents
+
+-- | The literal @run@ block of one named step, read from the workflow itself.
+--
+-- Extracting the shipped shell is what lets an example assert against the file
+-- the pipeline actually loads rather than a restatement of it, and it is the
+-- only way to reach the boundaries a hosted step meets — an API that does not
+-- answer, a response nothing can read — which do not occur on demand against a
+-- real repository.
+--
+-- Deliberately dependency-free: a test that needed a YAML library installed to
+-- read a workflow would be skipped exactly when it mattered. The cost is that
+-- the extracted body is run as plain Bash, so a step this is used on must take
+-- its @${{ }}@ values through @env:@ rather than interpolating them into the
+-- shell, which Bash reads as a bad substitution.
+workflowStepBody ∷ FilePath → FilePath → String → IO String
+workflowStepBody checkout workflow name = do
+  (status, stdout', errors) ← run [] checkout "python3" ["-c", stepExtractor, workflow, name]
+  (status, errors) `shouldBe` (ExitSuccess, "")
+  pure stdout'
+
+stepExtractor ∷ String
+stepExtractor =
+  unlines
+    [ "import sys"
+    , "path, wanted = sys.argv[1], sys.argv[2]"
+    , "lines = open(path, encoding='utf-8').read().splitlines()"
+    , "start = next((i for i, l in enumerate(lines) if l.strip() == '- name: ' + wanted), None)"
+    , "if start is None: raise SystemExit('no step named %r in %s' % (wanted, path))"
+    , "run = next((i for i in range(start, len(lines)) if lines[i].strip() == 'run: |'), None)"
+    , "if run is None: raise SystemExit('step %r has no run block' % wanted)"
+    , "indent = len(lines[run]) - len(lines[run].lstrip()) + 2"
+    , "body = []"
+    , "for line in lines[run + 1:]:"
+    , "    if line.strip() and len(line) - len(line.lstrip()) < indent: break"
+    , "    body.append(line[indent:] if len(line) >= indent else line)"
+    , "sys.stdout.write('\\n'.join(body).rstrip() + '\\n')"
+    ]
 
 -- | The operational artifacts a fixture repository's own examples write beside
 -- the tree they validate: plans, applicability documents, request bodies,

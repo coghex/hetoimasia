@@ -14,6 +14,7 @@ import qualified Reuse
 import qualified ReviewGate
 import qualified ReviewReplay
 import qualified Timings
+import qualified TimingStep
 import qualified Validation
 
 data Repository = Repository
@@ -73,6 +74,7 @@ main = hspec $ do
   Execution.spec
   Reuse.spec
   Timings.spec
+  TimingStep.spec
   ReviewGate.spec
   ReviewReplay.spec
   DismissalStep.spec
