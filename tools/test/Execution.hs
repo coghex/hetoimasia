@@ -14,7 +14,8 @@ import Data.Maybe (isNothing)
 import Json (Json (..), asBool, asString, entryFor, field, parseJson)
 import Sandbox (fixtureIgnore, git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory
-  ( createDirectoryIfMissing
+  ( copyFile
+  , createDirectoryIfMissing
   , doesFileExist
   , getCurrentDirectory
   , removeFile
@@ -268,6 +269,32 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "not the one this plan was resolved with"
         doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "refuses a receipt produced under a classification the plan never had" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        writeFixtureFile (root fixture) "fixtures/alternate.json" alternateCatalog
+        let arguments =
+              [ "--base", seeded fixture
+              , "--head", "HEAD"
+              , "--catalog", root fixture </> "fixtures/alternate.json"
+              ]
+        plan ← planWith fixture arguments "alternate-plan.json"
+        -- A worker that rewrites the catalog to stop consuming the document and
+        -- updates its own copy of the plan to match satisfies the runner's own
+        -- digest check, so the execution succeeds and the dirty edit passes.
+        copyFile plan (root fixture </> "worker-plan.json")
+        writeFixtureFile (root fixture) "fixtures/alternate.json" fixtureCatalog
+        rewritten ← planWith fixture arguments "rewritten-plan.json"
+        copyCatalogDigest fixture rewritten (root fixture </> "worker-plan.json")
+        writeFixtureFile (root fixture) "docs/alternate.md" "an edit no commit carries\n"
+        (executed, _, errors) ← runGroup fixture "build.pass" (root fixture </> "worker-plan.json") []
+        (executed, errors) `shouldBe` (ExitSuccess, "")
+        -- The verdict is decided against the plan that was actually resolved,
+        -- and the classification is part of what that plan's identity names.
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "names plan"
 
     it "executes with prose no group consumes and the artifacts a run writes" $
       withDirtyFixture $ \fixture plan → do
@@ -768,6 +795,27 @@ patchReceipt fixture group name value = do
       , receiptPath fixture group
       , name
       , value
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+-- | Copy one document's recorded catalog digest into another, so a doctored
+-- plan can carry a digest matching the catalog beside it.
+copyCatalogDigest ∷ Fixture → FilePath → FilePath → IO ()
+copyCatalogDigest fixture source target = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json,sys\n\
+        \source, target = sys.argv[1:3]\n\
+        \recorded = json.load(open(source, encoding='utf-8'))\n\
+        \document = json.load(open(target, encoding='utf-8'))\n\
+        \document['catalog']['candidate_digest'] = recorded['catalog']['candidate_digest']\n\
+        \json.dump(document, open(target, 'w', encoding='utf-8'))\n"
+      , source
+      , target
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
 

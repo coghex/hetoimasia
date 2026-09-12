@@ -245,16 +245,23 @@ def plan_identity(plan: dict) -> str:
     """The fingerprint a receipt names so evidence cannot cross plans.
 
     It covers everything that decides what must run and how: the plan and
-    policy revisions, the candidate's input identity and pinned toolchain, all
-    three revisions, the normalized request, and every group's selection and
-    exact execution definition. It deliberately omits the catalog and request
-    *paths*, which are run-local filenames rather than contract, and the
-    changed-path listing, which explains a selection without being able to
-    alter it.
+    policy revisions, the digest of the catalog that classified the candidate,
+    the candidate's input identity and pinned toolchain, all three revisions,
+    the normalized request, and every group's selection and exact execution
+    definition. It deliberately omits the catalog and request *paths*, which are
+    run-local filenames rather than contract, and the changed-path listing,
+    which explains a selection without being able to alter it.
+
+    The catalog digest is in it because the runner's own check against that
+    digest is only self-consistent: a worker holding a rewritten catalog and a
+    copy of the plan updated to match would satisfy itself and still produce a
+    receipt the original plan accepted. Binding the digest here is what makes
+    such a receipt name a different plan.
     """
     payload = {
         "plan_schema_version": plan["schema_version"],
         "policy_version": plan["policy_version"],
+        "catalog_digest": plan["catalog"]["candidate_digest"],
         "catalog_policy_version": plan["catalog_policy_version"],
         "input_identity": plan["input_identity"],
         "toolchain": dict(plan["toolchain"]),

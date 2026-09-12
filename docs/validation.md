@@ -527,11 +527,18 @@ hazard in its purest form — every worker skips, every group is vacuously
 accounted for, and a candidate that ran nothing reports success.
 
 **Plan identity** is a SHA-256 over everything that decides what must run and
-how: the plan and policy revisions, both endpoints' commits and trees, the
-normalized request, and every group's selection, reason, command, and timeout.
-It deliberately omits the catalog and request *paths*, which are run-local
-filenames rather than contract, and the changed-path listing, which explains a
-selection without being able to alter it.
+how: the plan and policy revisions, the digest of the catalog that classified
+the candidate, both endpoints' commits and trees, the normalized request, and
+every group's selection, reason, command, and timeout. It deliberately omits the
+catalog and request *paths*, which are run-local filenames rather than contract,
+and the changed-path listing, which explains a selection without being able to
+alter it.
+
+The catalog digest is in it because the runner's own check against that digest
+is only self-consistent. A worker holding a rewritten override catalog *and* a
+copy of the plan updated to match would satisfy itself and still produce a
+receipt the original plan accepted. Binding the digest into the identity is what
+makes such a receipt name a different plan, so the aggregate refuses it.
 
 ### Reusing an earlier execution
 
@@ -1146,10 +1153,12 @@ classifies the candidate, each refused by name; ordinary execution with prose no
 group consumes and with the plan, applicability document, and receipts a run
 writes beside itself; a fresh receipt recording an execution of another revision
 or another tree; and a fresh receipt disagreeing about each of `input_identity`,
-`policy_version`, `toolchain`, and `runner_os` in turn. Two of them are about
+`policy_version`, `toolchain`, and `runner_os` in turn. Three of them are about
 the classification itself: a dirty path judged by the fixture catalog its plan
-was resolved with rather than the candidate's own, and that fixture rewritten
-after planning so that it no longer describes the plan it produced.
+was resolved with rather than the candidate's own; that fixture rewritten after
+planning so that it no longer describes the plan it produced; and a worker that
+rewrites both the catalog and its own copy of the plan's digest, whose receipt
+the originally resolved plan then refuses as another plan's.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly
