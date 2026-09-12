@@ -65,6 +65,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROVEN = "proven"
@@ -76,9 +77,15 @@ WORKFLOW_IDENTITY = "github-actions[bot]"
 
 # The canonical coordinator's marker, and the drainer's own single-reviewer
 # spelling that the same publisher may post in its place. Both name the exact
-# head the verdict was reached for; neither is taken from any other author.
+# head the verdict was reached for and a reviewer brand this pipeline knows;
+# neither is taken from any other author. Anything the owner posts that opens
+# like one of these and is not one is malformed evidence, which the proof
+# refuses rather than reads past: a truncated withdrawal must not leave the
+# approval it withdrew standing.
+REVIEW_OPENING = re.compile(r"<!--\s*pr-review:v")
 REVIEW_MARKER = re.compile(
-    r"<!--\s*pr-review:v(?:2\s+reviewers=\S+\s+models=\S+|1\s+reviewer=\S+)\s+"
+    r"<!--\s*pr-review:v(?:2\s+reviewers=(?:claude|codex)(?:,(?:claude|codex))*\s+models=\S+"
+    r"|1\s+reviewer=(?:claude|codex))\s+"
     r"head=(?P<head>[0-9a-fA-F]{40})\s+verdict=(?P<verdict>APPROVE|CHANGES_REQUESTED)\s*-->"
 )
 
@@ -87,6 +94,7 @@ REVIEW_MARKER = re.compile(
 # wrote it. Its `origin` is the canonically approved revision that decision
 # traced the carry back to; the proof below re-walks the links rather than
 # trusting that field.
+RECORD_OPENING = re.compile(r"<!--\s*approval-provenance:")
 CARRY_RECORD = re.compile(
     r"<!--\s*approval-provenance:v1\s+origin=(?P<origin>[0-9a-fA-F]{40})\s+"
     r"before=(?P<before>[0-9a-fA-F]{40})\s+after=(?P<after>[0-9a-fA-F]{40})\s+"
@@ -124,8 +132,19 @@ COMMENT_FIELDS = ("id", "created_at", "user", "body")
 
 # The one timestamp shape GitHub writes. Requiring it exactly is what makes
 # the string comparison in `ordered` a chronological one: an empty or
-# differently written timestamp would sort somewhere it does not belong.
-TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+# differently written timestamp would sort somewhere it does not belong, and
+# so would a well-shaped one naming no real instant, which is why the value
+# also has to parse and print back unchanged.
+TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def real_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.strptime(value, TIMESTAMP).strftime(TIMESTAMP) == value
+    except ValueError:
+        return False
 
 
 def incomplete(comment: dict) -> str:
@@ -137,7 +156,7 @@ def incomplete(comment: dict) -> str:
     # A boolean is an int to Python and an identifier to nobody.
     if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
         return "id"
-    if not isinstance(comment["created_at"], str) or not TIMESTAMP.match(comment["created_at"]):
+    if not real_timestamp(comment["created_at"]):
         return "created_at"
     user = comment["user"]
     login = user.get("login") if isinstance(user, dict) else None
@@ -196,6 +215,32 @@ def ordered(comments: list[dict]) -> list[dict]:
     Every comment carries both keys: ``load_feed`` refused the feed otherwise.
     """
     return sorted(comments, key=lambda comment: (comment["created_at"], comment["id"]))
+
+
+def malformed_evidence(comments: list[dict], owner: str, recorder: str) -> str:
+    """Why the feed's evidence cannot be read at all, or empty when it can.
+
+    Every comment the owner posts that opens like a review marker has to be
+    exactly one canonical marker, and every comment the workflow posts that
+    opens like a carry record has to be exactly one canonical record. One that
+    is truncated, misspelled, names a reviewer this pipeline does not know, or
+    carries two of them is not skipped: skipping a malformed withdrawal would
+    leave the approval it withdrew authoritative. Prose that merely mentions a
+    marker's name opens nothing and is not evidence either way.
+    """
+    for comment in comments:
+        author, body = author_of(comment), comment["body"]
+        if author == owner.casefold():
+            openings = len(REVIEW_OPENING.findall(body))
+            markers = len(REVIEW_MARKER.findall(body))
+            if openings != markers or markers > 1:
+                return f"comment {comment['id']} by the owner carries a malformed or duplicated review marker"
+        if author == recorder.casefold():
+            openings = len(RECORD_OPENING.findall(body))
+            records = len(CARRY_RECORD.findall(body))
+            if openings != records or records > 1:
+                return f"comment {comment['id']} by the workflow carries a malformed or duplicated carry record"
+    return ""
 
 
 def canonical_verdicts(comments: list[dict], owner: str) -> dict[str, str]:
@@ -332,7 +377,7 @@ def explain(revision: str, before: str, verdicts: dict[str, str], unusable: dict
 
 def list_runs(feed: str, recorder: str) -> int:
     comments, failure = load_feed(feed)
-    if failure:
+    if failure or malformed_evidence(comments, "", recorder):
         return 0
     seen: set[tuple[str, str]] = set()
     for record in records_by(comments, recorder):
@@ -345,6 +390,10 @@ def list_runs(feed: str, recorder: str) -> int:
 
 def decide(before: str, after: str, feed: str, runs: str, owner: str, recorder: str) -> int:
     comments, failure = load_feed(feed)
+    if failure:
+        return render(UNPROVEN, f"{failure}, so no starting point can be proven approved", "", [], "none")
+
+    failure = malformed_evidence(comments, owner, recorder)
     if failure:
         return render(UNPROVEN, f"{failure}, so no starting point can be proven approved", "", [], "none")
 

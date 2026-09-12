@@ -31,6 +31,8 @@ module DismissalStep
   , pushedHead
   , approvedHead
   , approvalMarker
+  , feedEntry
+  , quoted
   ) where
 
 import Control.Monad (unless)
@@ -74,6 +76,30 @@ approvalMarker ∷ String → String → String
 approvalMarker headSha verdict =
   "<!-- pr-review:v2 reviewers=codex models=unspecified head=" ++ headSha ++ " verdict=" ++ verdict ++ " -->"
 
+-- | One comment object as GitHub returns it, with or without the timestamp
+-- that orders it.
+feedEntry ∷ Int → Maybe String → String → String → String
+feedEntry number created login text =
+  "{\"id\": " ++ show number
+    ++ maybe "" (\stamp → ", \"created_at\": " ++ quoted stamp) created
+    ++ ", \"user\": {\"login\": " ++ quoted login ++ ", \"type\": \"User\"}"
+    ++ ", \"body\": " ++ quoted text ++ "}"
+
+quoted ∷ String → String
+quoted text = "\"" ++ concatMap escape text ++ "\""
+  where
+    escape '"' = "\\\""
+    escape '\\' = "\\\\"
+    escape '\n' = "\\n"
+    escape character = [character]
+
+-- | The owner's comments, in posting order, as one page of the feed.
+posted ∷ [String] → [String]
+posted = zipWith entry [1 ..]
+  where
+    entry number text = feedEntry number (Just ("2026-09-11T00:00:" ++ pad number ++ "Z")) owner text
+    pad number = let text = show number in replicate (2 - length text) '0' ++ text
+
 -- | How the stubbed repository and the decision before it answer this run.
 data Repository = Repository
   { liveHead ∷ String
@@ -82,7 +108,7 @@ data Repository = Repository
   , replay ∷ String
   , replayReached ∷ Bool
   , decision ∷ String
-  , -- | The owner-authored comment bodies the pre-removal marker read returns.
+  , -- | The comment objects the feed read before acting returns, as one page.
     markers ∷ [String]
   , markerReadFails ∷ Bool
   , recordFails ∷ Bool
@@ -183,7 +209,7 @@ spec = describe "Stale approval mutation" $ do
       -- reviewer simply approved it while the decision was queued. Removing
       -- now would strip a review somebody just granted to this very revision.
       withStep
-        settled {labelsAfter = [approval], markers = [approvalMarker pushedHead "APPROVE"]}
+        settled {labelsAfter = [approval], markers = posted [approvalMarker pushedHead "APPROVE"]}
         "remove"
         "removed"
         $ \outcome → do
@@ -199,7 +225,7 @@ spec = describe "Stale approval mutation" $ do
       -- before every keep is confirmed, not only before a removal, so the
       -- denial strips instead of being recorded as a carry.
       withStep
-        settled {replay = "keep", markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]}
+        settled {replay = "keep", markers = posted [approvalMarker pushedHead "CHANGES_REQUESTED"]}
         "none"
         "kept"
         $ \outcome → do
@@ -215,7 +241,7 @@ spec = describe "Stale approval mutation" $ do
       -- in its own right is a new origin, so no carry is recorded for it and
       -- the summary does not claim nobody read it.
       withStep
-        settled {labelsAfter = [approval], replay = "keep", markers = [approvalMarker pushedHead "APPROVE"]}
+        settled {labelsAfter = [approval], replay = "keep", markers = posted [approvalMarker pushedHead "APPROVE"]}
         "none"
         "kept"
         $ \outcome → do
@@ -236,7 +262,7 @@ spec = describe "Stale approval mutation" $ do
           , headVerdict = "approved"
           , origin = approvedHead
           , chain = approvedHead
-          , markers = [approvalMarker pushedHead "APPROVE"]
+          , markers = posted [approvalMarker pushedHead "APPROVE"]
           }
         "none"
         "kept"
@@ -247,7 +273,7 @@ spec = describe "Stale approval mutation" $ do
           summary outcome `shouldContain` "named this head itself"
 
     it "reports a late denial even when the removal was already planned" $
-      withStep settled {markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]} "remove" "removed" $
+      withStep settled {markers = posted [approvalMarker pushedHead "CHANGES_REQUESTED"]} "remove" "removed" $
         \outcome → do
           result outcome `shouldBe` ExitSuccess
           calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
@@ -258,7 +284,7 @@ spec = describe "Stale approval mutation" $ do
       withStep settled {labelsAfter = [approval], replay = "keep", markerReadFails = True} "none" "kept" $
         \outcome → do
           result outcome `shouldSatisfy` (/= ExitSuccess)
-          output outcome `shouldContain` "review markers could not be read back"
+          output outcome `shouldContain` "comment feed could not be read back"
           unwords (calls outcome) `shouldNotContain` "-X POST"
 
     it "lets the newest marker naming the head win" $
@@ -266,9 +292,10 @@ spec = describe "Stale approval mutation" $ do
       withStep
         settled
           { markers =
-              [ approvalMarker pushedHead "APPROVE"
-              , approvalMarker pushedHead "CHANGES_REQUESTED"
-              ]
+              posted
+                [ approvalMarker pushedHead "APPROVE"
+                , approvalMarker pushedHead "CHANGES_REQUESTED"
+                ]
           }
         "remove"
         "removed"
@@ -277,15 +304,64 @@ spec = describe "Stale approval mutation" $ do
           calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
 
     it "is not persuaded by a fresh approval of some other head" $
-      withStep settled {markers = [approvalMarker newerHead "APPROVE"]} "remove" "removed" $
+      withStep settled {markers = posted [approvalMarker newerHead "APPROVE"]} "remove" "removed" $
         \outcome → do
           result outcome `shouldBe` ExitSuccess
           calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
 
-    it "fails rather than reading a failed marker lookup as no approval" $
+    describe "evidence it cannot read" $ do
+      let truncated = "<!-- pr-review:v2 reviewers=codex head=" ++ pushedHead ++ " verdict=CHANGES_REQUESTED -->"
+      it "lets a truncated newer denial stand in the way of an older approval reversing a removal" $
+        -- The older approval is well-formed and the newer withdrawal is not.
+        -- Skipping the withdrawal would let the approval reverse the removal;
+        -- refusing to read the feed at all keeps the removal.
+        withStep settled {markers = posted [approvalMarker pushedHead "APPROVE", truncated]} "remove" "removed" $
+          \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+            output outcome `shouldContain` "malformed or incomplete"
+            summary outcome `shouldContain` "malformed or incomplete"
+
+      it "turns a planned keep into a removal rather than confirm it from a feed it cannot read" $
+        withStep settled {replay = "keep", markers = posted [approvalMarker pushedHead "APPROVE", truncated]} "none" "kept" $
+          \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+            unwords (calls outcome) `shouldNotContain` "-X POST"
+            summary outcome `shouldContain` "- `reviewed:approve`: removed"
+
+      it "treats a well-shaped but unreal timestamp the same way" $
+        withStep
+          settled
+            { markers =
+                [ feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker pushedHead "APPROVE")
+                , feedEntry 2 (Just "0000-00-00T00:00:00Z") owner (approvalMarker pushedHead "CHANGES_REQUESTED")
+                ]
+            }
+          "remove"
+          "removed"
+          $ \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+            output outcome `shouldContain` "malformed or incomplete"
+
+      it "leaves prose that merely mentions the marker's name alone" $
+        withStep
+          settled
+            { labelsAfter = [approval]
+            , markers = posted ["The pr-review:v2 marker below approves this head.\n\n" ++ approvalMarker pushedHead "APPROVE"]
+            }
+          "remove"
+          "removed"
+          $ \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            unwords (calls outcome) `shouldNotContain` "--remove-label"
+            summary outcome `shouldContain` "named this head itself"
+
+    it "fails rather than reading a failed feed lookup as no approval" $
       withStep settled {markerReadFails = True} "remove" "removed" $ \outcome → do
         result outcome `shouldSatisfy` (/= ExitSuccess)
-        output outcome `shouldContain` "review markers could not be read back"
+        output outcome `shouldContain` "comment feed could not be read back"
         unwords (calls outcome) `shouldNotContain` "--remove-label"
 
   describe "the carry it records" $ do
@@ -428,7 +504,7 @@ withStep repository action expected assertion = do
     createDirectoryIfMissing True binPath
     writeFixtureFile directory "head" (liveHead repository ++ "\n")
     writeFixtureFile directory "labels" (unlines (labelsAfter repository))
-    writeFixtureFile directory "markers" (unlines (markers repository))
+    writeFixtureFile directory "markers" ("[[" ++ commaSeparated (markers repository) ++ "]]\n")
     unless (not (labelReadFails repository)) $
       writeFixtureFile directory "labels-fail" ""
     unless (not (markerReadFails repository)) $
@@ -466,6 +542,7 @@ withStep repository action expected assertion = do
           , ("LABEL", approval)
           , ("GITHUB_RUN_ID", recordingRun)
           , ("GITHUB_RUN_ATTEMPT", "2")
+          , ("RUNNER_TEMP", directory)
           , ("GITHUB_STEP_SUMMARY", directory </> "summary")
           ]
         -- Every one of those has to *replace* the inherited entry rather than
@@ -511,11 +588,15 @@ extractor =
     , "sys.stdout.write('\\n'.join(body).rstrip() + '\\n')"
     ]
 
+commaSeparated ∷ [String] → String
+commaSeparated = foldr (\item rest → if null rest then item else item ++ ", " ++ rest) ""
+
 -- | A `gh` that records every call and answers from the fixture directory.
 --
--- The comment feed is answered twice over: a read of the owner's marker bodies
--- before a removal, and the record the step posts after a carry. Both are told
--- apart by the request rather than the endpoint, since they share one.
+-- The comment feed is answered twice over: the paged read of the whole feed
+-- before acting, which the step then validates with the real `jq`, and the
+-- record the step posts after a carry. Both are told apart by the request
+-- rather than the endpoint, since they share one.
 stub ∷ FilePath → String
 stub directory =
   unlines

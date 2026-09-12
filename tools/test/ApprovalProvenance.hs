@@ -20,7 +20,7 @@ module ApprovalProvenance (spec) where
 import Control.Monad (void)
 import Data.List (isInfixOf)
 import Data.Maybe (fromMaybe)
-import DismissalStep (Outcome (..), Repository (..), approval, approvalMarker, pushedHead, settled, withStep)
+import DismissalStep (Outcome (..), Repository (..), approval, approvalMarker, feedEntry, pushedHead, quoted, settled, withStep)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory (getCurrentDirectory)
 import System.Exit (ExitCode (..))
@@ -186,7 +186,56 @@ spec = describe "Approval provenance" $ do
               value "provenance_reason" (provenanceOutput decision) `shouldContain` "without a usable created_at"
               shouldRemove decision
           )
-          ["", "yesterday", "2026-09-11 00:00:02", "2026-09-11T00:00:02+00:00"]
+          ["", "yesterday", "2026-09-11 00:00:02", "2026-09-11T00:00:02+00:00", "0000-00-00T00:00:00Z", "2026-02-30T00:00:00Z"]
+
+    it "strips when an owner comment opens like a marker but is not one" $
+      -- An older approval followed by a truncated withdrawal. Skipping the
+      -- withdrawal would leave the approval authoritative, so the feed is
+      -- refused as a whole instead.
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        mapM_
+          ( \broken → do
+              decision ← decide fixture [approvedBy owner reviewed, Comment owner broken] reviewed repushed
+              value "provenance_reason" (provenanceOutput decision) `shouldContain` "malformed or duplicated review marker"
+              field "head_verdict" (provenanceOutput decision) `shouldBe` Just "none"
+              shouldRemove decision
+          )
+          [ "<!-- pr-review:v2 reviewers=codex head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
+          , "<!-- pr-review:v2 reviewers=somebody models=x head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
+          , "<!-- pr-review:v3 reviewers=codex models=x head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
+          , "<!-- pr-review:v2 reviewers=codex models=x head=" ++ take 12 reviewed ++ " verdict=CHANGES_REQUESTED -->"
+          , approvalMarker reviewed "CHANGES_REQUESTED" ++ " " ++ approvalMarker reviewed "CHANGES_REQUESTED"
+          ]
+
+    it "strips when a workflow comment opens like a carry record but is not one" $
+      withFixture $ \fixture → do
+        (reviewed, first, second) ← twoUpdates fixture
+        recordedRun fixture 1 (Just "success") first
+        decision ←
+          decide
+            fixture
+            [ approvedBy owner reviewed
+            , carriedBy workflow 1 reviewed reviewed first
+            , Comment workflow ("<!-- approval-provenance:v1 origin=" ++ reviewed ++ " before=" ++ reviewed ++ " after=" ++ first ++ " -->")
+            ]
+            first
+            second
+        value "provenance_reason" (provenanceOutput decision) `shouldContain` "malformed or duplicated carry record"
+        shouldRemove decision
+
+    it "reads past prose that merely mentions the marker's name" $
+      withFixture $ \fixture → do
+        reviewed ← approvedWork fixture
+        repushed ← emptyCommit fixture "Re-push the reviewed tree"
+        decision ←
+          decide
+            fixture
+            [Comment owner ("The pr-review:v2 marker below approves this head.\n\n" ++ approvalMarker reviewed "APPROVE")]
+            reviewed
+            repushed
+        shouldKeepFrom reviewed decision
 
     it "strips when a comment's identifier is not one" $
       withFixture $ \fixture → do
@@ -438,7 +487,7 @@ spec = describe "Approval provenance" $ do
                 , replay = value "replay_decision" (replayOutput decision)
                 , -- The step answers for the harness's own event head, so the
                   -- denial has to name that head rather than the Git fixture's.
-                  markers = [approvalMarker pushedHead "CHANGES_REQUESTED"]
+                  markers = [feedEntry 1 (Just "2026-09-11T00:00:01Z") owner (approvalMarker pushedHead "CHANGES_REQUESTED")]
                 , provenance = proven "provenance"
                 , provenanceReason = proven "provenance_reason"
                 , origin = proven "origin"
@@ -792,21 +841,6 @@ feed comments = "[" ++ commaSeparated (zipWith render [1 ..] comments) ++ "]"
     pad number = let text = show number in replicate (2 - length text) '0' ++ text
     commaSeparated = foldr (\item rest → if null rest then item else item ++ ", " ++ rest) ""
 
--- | One comment object, with or without the timestamp that orders it.
-feedEntry ∷ Int → Maybe String → String → String → String
-feedEntry number created login text =
-  "{\"id\": " ++ show number
-    ++ maybe "" (\stamp → ", \"created_at\": " ++ quoted stamp) created
-    ++ ", \"user\": {\"login\": " ++ quoted login ++ ", \"type\": \"User\"}"
-    ++ ", \"body\": " ++ quoted text ++ "}"
-
-quoted ∷ String → String
-quoted text = "\"" ++ concatMap escape text ++ "\""
-  where
-    escape '"' = "\\\""
-    escape '\\' = "\\\\"
-    escape '\n' = "\\n"
-    escape character = [character]
 
 -- ---------------------------------------------------------------------------
 -- Building a history to ask about

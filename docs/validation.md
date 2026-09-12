@@ -751,13 +751,20 @@ starting point from the pull request's own comment feed. A revision is a
 **proven approved revision** when it is
 
 - a head a **canonical review** named: a `pr-review:v2` marker (or the
-  drainer's own `pr-review:v1` spelling) in a comment authored by the
-  repository owner's account — the identity the Kanban coordinator and drainer
-  publish under — whose newest marker naming that exact head reads
-  `verdict=APPROVE`. The marker is bound to this repository and pull request by
-  where it was posted and to the revision by its `head=`; a later marker for
-  the same head that requests changes withdraws it, and a later approval
-  re-establishes it; or
+  drainer's own `pr-review:v1` spelling), naming a reviewer brand this
+  pipeline knows, in a comment authored by the repository owner's account —
+  the identity the Kanban coordinator and drainer publish under — whose newest
+  marker naming that exact head reads `verdict=APPROVE`. The marker is bound
+  to this repository and pull request by where it was posted and to the
+  revision by its `head=`; a later marker for the same head that requests
+  changes withdraws it, and a later approval re-establishes it. Every owner
+  comment that opens like a marker (`<!-- pr-review:v`) has to be exactly one
+  canonical marker, and every workflow comment that opens like a carry record
+  exactly one canonical record: one that is truncated, misspelled, names an
+  unknown reviewer, or is duplicated is **malformed evidence**, and the whole
+  feed then proves nothing, because skipping a malformed withdrawal would
+  leave the approval it withdrew authoritative. Prose that merely mentions a
+  marker's name opens nothing; or
 - a head reached from such a revision through an **unbroken chain of recorded
   carries**: one `approval-provenance:v1` record per push, authored by this
   repository's own workflow identity (`github-actions[bot]`), naming the
@@ -797,8 +804,10 @@ The script always exits 0, for the same reason the replay does: `unproven` is
 an answer the caller removes a label on, and a feed that is missing,
 unreadable, malformed, not a list of comments, or **incomplete** — any comment
 without a usable `id` (a positive integer), `created_at` (exactly GitHub's
-`YYYY-MM-DDTHH:MM:SSZ`, the shape whose string order is chronological),
-`user.login` (non-blank), or `body`, since a marker that cannot be ordered
+`YYYY-MM-DDTHH:MM:SSZ`, the shape whose string order is chronological, and a
+real instant that parses and prints back unchanged), `user.login`
+(non-blank), or `body`, or with malformed marker or record evidence as
+above, since a marker that cannot be ordered
 could be taken for older than the verdict it withdrew and one that cannot be
 attributed could be taken for the owner's — proves nothing and is reported as `unproven` with the reason — never inferred
 `proven` from tree equality or replay eligibility, and never turned into a
@@ -830,19 +839,24 @@ python3 tools/validation/review_provenance.py \
   --comments comments.json --runs runs --owner <the repository owner>
 ```
 
-`dismiss-stale-approval` reads the owner's markers once more **immediately
+`dismiss-stale-approval` reads the whole comment feed once more **immediately
 before acting on either verdict** — before a removal, and before confirming a
 keep. The head-equality guard cannot see a canonical verdict reached for this
 exact head while the decision was queued, since the head did not move:
 stripping past a fresh approval would remove a review somebody just granted to
 this very revision, and confirming a keep past a fresh denial would record a
-carry a reviewer just refused. So the newest marker naming the event head wins
-there too, in both directions, and it is applied to the provenance the job
-publishes whether or not it changes the action: a head approved in its own
-right is a new origin even when the decision was already keeping, so no carry
-is recorded for it, and a denial is reported even when the removal was already
-planned. A marker read that fails refuses like every other unconfirmed read in
-that job. Its summary states the starting point's
+carry a reviewer just refused. That job runs no repository code, so the same
+rules are applied inline through the runner's own `jq`: every comment has to
+carry the usable fields above, every owner comment that opens like a marker
+has to be exactly one canonical marker, and only then does the newest marker
+naming the event head decide, in both directions. It is applied to the
+provenance the job publishes whether or not it changes the action: a head
+approved in its own right is a new origin even when the decision was already
+keeping, so no carry is recorded for it, and a denial is reported even when
+the removal was already planned. A feed that fails those rules proves nothing
+there either: it never reverses a planned removal, and it turns a planned keep
+into a removal rather than confirming an approval it cannot read. A read that
+fails outright refuses like every other unconfirmed read in that job. Its summary states the starting point's
 verdict and reason, the proven origin, and, for a carry, the route from that
 origin through every recorded head to the pushed one; for a strip it names the
 link that could not be proven — the starting point itself, or the revision an
@@ -1049,10 +1063,13 @@ refused for its superseded head before the next push strips; an earlier carry
 whose mutation failed or never ran and so recorded nothing; a feed that could
 not be read, is not valid JSON, or is not a list of comments, each stripping;
 the paged feed the workflow fetches; a comment that cannot be ordered — the
-withdrawal without a timestamp, or with an empty or differently written one,
-that would otherwise sort before the approval it withdrew — one whose
-identifier is zero, negative, boolean, or a string, and one that cannot be
-attributed or whose author is blank, each stripping; a review
+withdrawal without a timestamp, or with an empty, differently written, or
+well-shaped but unreal one, that would otherwise sort before the approval it
+withdrew — one whose identifier is zero, negative, boolean, or a string, one
+that cannot be attributed or whose author is blank, an owner comment whose
+marker opening is truncated, names an unknown reviewer, or is duplicated, and
+a workflow comment whose record opening is malformed, each stripping, while
+prose that merely mentions the marker's name is not evidence; a review
 marker by anyone but the owner
 and a carry record by anyone but the workflow, each ignored; a later marker
 withdrawing an approval of the same head and a later one re-establishing it; a
@@ -1101,8 +1118,12 @@ approval taken as the origin of a keep the decision had already reached, an
 approval the decision already saw normalised to this head as the origin, and a
 late denial reported on a removal already planned, the newest marker for that
 head winning, a fresh approval of some other head
-ignored, and a marker read that failed refused before a removal and before a
-keep alike. So is the record it
+ignored, a feed read that failed refused before a removal and before a keep
+alike, and the inline feed validation: an older approval of this head followed
+by a truncated denial neither reverses a planned removal nor confirms a
+planned keep, a comment whose timestamp is well-shaped but unreal treated the
+same way, and prose mentioning the marker's name left alone. So is the record
+it
 writes: a kept approval recorded at the head it was carried to with the link
 and the recording run attempt named exactly, no record for a head a canonical
 review named itself or when
