@@ -305,7 +305,7 @@ jobs:
                 continue
                 ;;
             esac
-            python3 tools/validation/run.py "$group" \
+            python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
               --toolchain "ghc=$(ghc --numeric-version)" \
@@ -443,7 +443,7 @@ jobs:
                 continue
                 ;;
             esac
-            python3 tools/validation/run.py "$group" \
+            python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
               --toolchain "ghc=$(ghc --numeric-version)" \

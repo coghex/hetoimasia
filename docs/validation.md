@@ -407,8 +407,11 @@ A cache miss costs time and can never change a result.
 its receipts directory. The resolved plan is its only authority:
 
 ```bash
-python3 tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
+python3 -I tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
 ```
+
+`-I` is required, not a nicety: the runner refuses to start without it. See
+[Execution provenance](#execution-provenance).
 
 | Option | Meaning |
 | --- | --- |
@@ -459,17 +462,23 @@ standing in. Importing either first would execute code out of the mutable
 checkout: an edited classifier could excuse its own edit, and an edited contract
 could forge a receipt while its own path was still unexamined.
 
-The same is true of the standard library it reaches for. `python3
-tools/validation/run.py` puts that directory first on `sys.path`, and an
-inherited `PYTHONPATH` can put the checkout root there too, so a file dropped at
-either — a `platform.py`, a `json.py` — would be imported in place of the
-standard library module of that name and would run at the top of the file,
-before any check existed to notice it. The runner therefore **re-executes itself
-isolated** (`python -I`) before any other import: that ignores the environment,
-skips user site directories, and prepends neither the script's directory nor the
-working directory, so the standard library is all that is left to import from.
-Afterwards it reaches its own siblings by path rather than by putting any
-directory back.
+The same is true of the standard library it reaches for, and of the interpreter
+itself. `python3 tools/validation/run.py` puts that directory first on
+`sys.path`, and an inherited `PYTHONPATH` puts the checkout root there too, so a
+file dropped at either — a `platform.py`, a `json.py` — would be imported in
+place of the standard library module of that name. Worse, Python runs
+`sitecustomize` and `usercustomize` *during startup*, searching that same path
+for them, so a hook in the checkout executes before the runner's first
+instruction — early enough to delete itself, rewrite the environment, or patch
+the runner before anything has looked at its path.
+
+Nothing the script does can undo that, so **the runner refuses to start unless
+its interpreter was isolated**: every caller passes `-I` — the workflow's worker
+steps, the documented command, and the workflow tests. That ignores the
+environment, skips user site directories, and prepends neither the script's
+directory nor the working directory, so the standard library is all that is left
+to import from. The runner then reaches its own siblings by path rather than by
+putting any directory back.
 
 So the runner reads the plan's candidate for itself, with the standard library
 alone, proves the checkout with its own code and Git plumbing, and refuses
@@ -1297,8 +1306,11 @@ a tree substituted for the candidate's by a `refs/replace` entry, an input a
 group declares dropped inside a directory the catalog calls generated, a
 symlink to a clean checkout standing in for a submodule at the very same commit,
 a link out of the checkout wearing a generated directory's name, a dirty
-document a replaced package description would have excused, and a shadow module
-an inherited `PYTHONPATH` would have reached — each refused by name.
+document a replaced package description would have excused, a shadow module
+an inherited `PYTHONPATH` would have reached, and a `sitecustomize` hook the
+checkout supplies, which is refused without ever running — each refused by name.
+One more asks the contract of the runner itself: started without `-I`, it
+refuses rather than proceeding.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

@@ -338,6 +338,44 @@ spec = describe "Validation execution" $ do
         writeFixtureFile (root fixture) "docs/reader.md" "an edit no commit carries\n"
         refusesDirty fixture plan ["docs/reader.md"]
 
+    it "never runs a startup hook the checkout supplies" $
+      withDirtyFixture $ \fixture plan → do
+        -- Python runs `sitecustomize` while starting up, searching `PYTHONPATH`
+        -- for it, so a hook here would execute before the runner's first
+        -- instruction. Only an interpreter isolated from the outset never looks.
+        writeFixtureFile
+          (root fixture)
+          "sitecustomize.py"
+          "import sys\nprint('the startup hook ran', file=sys.stderr)\n"
+        (result, _, errors) ←
+          run
+            (("PYTHONPATH", root fixture) : environment fixture)
+            (root fixture)
+            "python3"
+            [ "-I", tools fixture </> "run.py", "build.pass"
+            , "--plan", plan
+            , "--receipts", receiptsDirectory fixture
+            ]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "sitecustomize.py"
+        errors `shouldNotContain` "the startup hook ran"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "refuses to start at all without an isolated interpreter" $
+      withDirtyFixture $ \fixture plan → do
+        (result, _, errors) ←
+          run
+            (environment fixture)
+            (root fixture)
+            "python3"
+            [ tools fixture </> "run.py", "build.pass"
+            , "--plan", plan
+            , "--receipts", receiptsDirectory fixture
+            ]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "isolated interpreter"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
     it "refuses a shadow module an inherited import path would reach" $
       withDirtyFixture $ \fixture plan → do
         -- `PYTHONPATH` naming the checkout puts a root-level module ahead of
@@ -351,7 +389,7 @@ spec = describe "Validation execution" $ do
             (("PYTHONPATH", root fixture) : environment fixture)
             (root fixture)
             "python3"
-            [ tools fixture </> "run.py", "build.pass"
+            [ "-I", tools fixture </> "run.py", "build.pass"
             , "--plan", plan
             , "--receipts", receiptsDirectory fixture
             ]
@@ -1048,7 +1086,8 @@ runFrom fixture runner group plan =
     (environment fixture)
     (root fixture)
     "python3"
-    [runner, group, "--plan", plan, "--receipts", receiptsDirectory fixture]
+    -- `-I` as every caller passes it: the runner refuses to start otherwise.
+    ["-I", runner, group, "--plan", plan, "--receipts", receiptsDirectory fixture]
 
 runGroup ∷ Fixture → String → FilePath → [String] → IO (ExitCode, String, String)
 runGroup fixture group plan extra =
@@ -1056,7 +1095,8 @@ runGroup fixture group plan extra =
     (environment fixture)
     (root fixture)
     "python3"
-    ( [ tools fixture </> "run.py"
+    ( [ "-I"
+      , tools fixture </> "run.py"
       , group
       , "--plan"
       , plan

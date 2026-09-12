@@ -47,16 +47,25 @@ import os
 
 TOOLS_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
-# Isolating the interpreter is the only way to answer for *every* entry that
-# could carry a shadow. Narrowing `sys.path` by hand reaches the directory this
-# script lives in, but not an inherited ``PYTHONPATH`` naming the checkout, nor
-# a user site directory. ``-I`` ignores the environment, skips user site
-# packages, and (from 3.11) prepends neither the script's directory nor the
-# working directory, so the standard library is all that is left to import from.
-# The re-exec happens before any other import for that reason, and the flag
-# itself is the guard against repeating it.
+# The interpreter has to be isolated from its first instruction, not from this
+# one. Python runs ``sitecustomize`` and ``usercustomize`` during startup and
+# searches ``PYTHONPATH`` for them, so a hook dropped in the checkout executes
+# before this file is read at all — early enough to delete itself, rewrite the
+# environment, or patch this module before anything has looked at its path.
+# Re-execing here would be too late for that, so the runner refuses instead and
+# every caller starts it isolated: the workflow's worker steps, the documented
+# command, and the workflow tests all pass ``-I``. That also ignores the
+# environment, skips user site directories, and (from 3.11) prepends neither the
+# script's directory nor the working directory.
 if not sys.flags.isolated:
-    os.execv(sys.executable, [sys.executable, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+    print(
+        "error: run.py must be started with an isolated interpreter — "
+        "python3 -I tools/validation/run.py ... — because Python runs a "
+        "checkout's own sitecustomize before this script, and a run that has "
+        "already executed unproven code cannot vouch for the candidate",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 # Kept for an interpreter older than the one that made ``-I`` imply ``-P``: on
 # those, the script's own directory is still prepended and has to be dropped.

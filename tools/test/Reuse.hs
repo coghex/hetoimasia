@@ -444,7 +444,8 @@ runGroup fixture plan group extra =
     (environment fixture)
     (root fixture)
     "python3"
-    ( [ tools fixture </> "run.py"
+    ( [ "-I"
+      , tools fixture </> "run.py"
       , group
       , "--plan", plan
       , "--receipts", receiptsDirectory fixture
