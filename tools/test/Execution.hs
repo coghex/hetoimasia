@@ -23,10 +23,12 @@ import Sandbox
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
+  , createDirectoryLink
   , createFileLink
   , doesFileExist
   , getCurrentDirectory
   , getPermissions
+  , removeDirectoryRecursive
   , removeFile
   , setOwnerExecutable
   , setPermissions
@@ -293,6 +295,17 @@ spec = describe "Validation execution" $ do
         gitIn fixture ["diff", "--name-only", "HEAD"] `shouldReturn` ""
         refusesDirty fixture plan ["src/note.txt"]
 
+    it "refuses a consumed input dropped inside a generated directory" $
+      withDirtyFixture $ \fixture plan → do
+        -- `fixtures/` is declared generated and stays exempt; what a group
+        -- declares inside it does not inherit that exemption.
+        writeFixtureFile (root fixture) "fixtures/other.json" "{}\n"
+        (tolerated, _, errors) ← runGroup fixture "build.pass" plan []
+        (tolerated, errors) `shouldBe` (ExitSuccess, "")
+        removeFile (receiptPath fixture "build.pass")
+        writeFixtureFile (root fixture) "fixtures/consumed.txt" "an input no commit carries\n"
+        refusesDirty fixture plan ["fixtures/consumed.txt"]
+
     it "refuses a generated basename sitting under a path a group consumes" $
       withDirtyFixture $ \fixture plan → do
         -- The catalog declares `*.json` generated, but `src/` is a declared
@@ -334,6 +347,32 @@ spec = describe "Validation execution" $ do
           others ← gitIn fixture ["ls-files", "--others"]
           others `shouldNotContain` "vendor/lib/value.txt"
           refusesDirty fixture plan ["vendor/lib/value.txt"]
+
+    it "refuses a symlink standing in for a submodule at the same commit" $
+      withFixture $ \fixture →
+        withSystemTempDirectory "hetoimasia-submodule" $ \inner → do
+          void $ git (environment fixture) inner ["init", "-q", "-b", "master"]
+          writeFixtureFile inner "value.txt" "the submodule's committed input\n"
+          void $ git (environment fixture) inner ["add", "-A", "."]
+          void $ git (environment fixture) inner ["commit", "-q", "-m", "Seed the submodule"]
+          void $
+            gitIn
+              fixture
+              [ "-c", "protocol.file.allow=always"
+              , "submodule", "add", "-q", inner, "vendor/lib"
+              ]
+          void $ gitIn fixture ["add", "-A", "."]
+          void $ gitIn fixture ["commit", "-q", "-m", "Add the submodule"]
+          plan ← planAgainst fixture (seeded fixture)
+          -- A link to a clean checkout resting at the very same commit. Git
+          -- follows it and reports that tree as this submodule, while the
+          -- commands read another directory entirely.
+          removeDirectoryRecursive (root fixture </> "vendor/lib")
+          createDirectoryLink inner (root fixture </> "vendor/lib")
+          recorded ← revisionIn fixture (root fixture </> "vendor/lib") "HEAD"
+          gitIn fixture ["ls-tree", "HEAD", "vendor/lib"] >>= \entry →
+            entry `shouldContain` recorded
+          refusesDirty fixture plan ["vendor/lib"]
 
     it "refuses an edited classifier without consulting it" $
       withFixture $ \fixture → do
@@ -1239,8 +1278,11 @@ alternateCatalog =
 flagCommand ∷ String
 flagCommand = "[\"sh\", \"-c\", \"test \\\"$(cat flag/value)\\\" = good\"]"
 
+-- | `fixtures/consumed.txt` is an exact input inside a directory the fixture
+-- declares generated, so an example can prove that calling a directory a run's
+-- own output does not make what is dropped inside it stop being an input.
 flagInputs ∷ String
-flagInputs = "[\"flag/\", \"docs/consumed.md\"]"
+flagInputs = "[\"flag/\", \"docs/consumed.md\", \"fixtures/consumed.txt\"]"
 
 -- | A shell that backgrounds a long sleep and records it, so an example can ask
 -- whether the timeout reached the descendant rather than only the shell.

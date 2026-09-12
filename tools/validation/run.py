@@ -302,12 +302,11 @@ def checkout_differences(
     recorded = {path: (mode, object_name) for path, (mode, _, object_name) in head.items()}
     entries, conflicted = index_entries(root)
     submodules = {path for path, (_, kind, _) in head.items() if kind == "commit"}
-    added = {
-        prefix + path
-        for path in added_files(root, set(recorded) | set(entries), submodules)
-    }
     # An unmerged path is a difference by definition: it records no single thing.
     changed = {prefix + path for path in conflicted}
+    additions, opaque = added_files(root, set(recorded) | set(entries), submodules)
+    added = {prefix + path for path in additions}
+    changed |= {prefix + path for path in opaque}
     changed |= {
         prefix + path
         for path in set(recorded) | set(entries)
@@ -339,6 +338,15 @@ def submodule_differences(
     inside = os.path.join(root, path)
     here = prefix + path
     try:
+        status = os.lstat(inside)
+    except OSError:
+        return {here}, set()
+    if not stat.S_ISDIR(status.st_mode):
+        # A symlink or a file where the candidate records a submodule. Git would
+        # follow a link and report whatever clean checkout sits at the other end
+        # as this submodule, while the commands read that tree — or the link.
+        return {here}, set()
+    try:
         if git_output(inside, "rev-parse", "HEAD") != object_name:
             return {here}, set()
         return checkout_differences(inside, object_name, object_format(inside), here + "/")
@@ -346,8 +354,10 @@ def submodule_differences(
         return {here}, set()
 
 
-def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]:
-    """Every file under this checkout that neither the candidate nor the index records.
+def added_files(
+    root: str, recorded: set[str], submodules: set[str]
+) -> tuple[set[str], set[str]]:
+    """What this checkout holds that neither the candidate nor the index records.
 
     Walked here rather than asked of Git. ``git ls-files --others`` answers for
     whichever working tree Git has been pointed at, and a repository-local
@@ -359,15 +369,20 @@ def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]
     A directory is an addition too, and has to be, because Git records no empty
     ones: a directory the candidate's paths do not put in the tree is content
     the candidate does not have, and a command can read that — a check for an
-    empty directory under a declared input, say. Such a directory is named and
-    not descended into, since everything beneath it is equally an addition.
+    empty directory under a declared input, say. It is named *and* descended
+    into, because what lives inside it has to be classified on its own terms: a
+    catalog that calls a directory generated is saying its own output goes
+    there, not that anything dropped inside it stops being an input.
 
-    A directory carrying its own ``.git`` is another repository. One the
-    candidate records as a submodule is compared on its own terms; any other is
-    an addition this checkout cannot look inside, and is named as one.
+    Two sets come back. The second holds directories carrying their own
+    ``.git`` — another repository, which this one cannot look inside. Those are
+    returned as plain differences rather than additions, because a declaration
+    cannot honestly exempt content nothing here has read. A submodule the
+    candidate records is not among them: it is compared on its own terms.
     """
     implied = implied_directories(recorded)
     found: set[str] = set()
+    opaque: set[str] = set()
     pending = [(root, "")]
     while pending:
         directory, base = pending.pop()
@@ -388,11 +403,13 @@ def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]
             if relative in submodules:
                 continue
             here = relative + "/"
-            if here not in implied or os.path.lexists(os.path.join(entry.path, ".git")):
-                found.add(here)
+            if os.path.lexists(os.path.join(entry.path, ".git")):
+                opaque.add(here)
                 continue
+            if here not in implied:
+                found.add(here)
             pending.append((entry.path, here))
-    return found
+    return found, opaque
 
 
 def implied_directories(recorded: set[str]) -> set[str]:

@@ -567,8 +567,13 @@ questions are answered by comparing modes and object ids directly:
   because Git records no empty ones: a directory the candidate's own paths do
   not put in the tree is content the candidate does not have, and a command can
   read it — a check for an empty directory under a declared input, say. Such a
-  directory is named and not descended into, since everything beneath it is
-  equally an addition.
+  directory is named *and* descended into, so that what lives inside it is
+  classified on its own terms: a catalog that calls a directory generated is
+  saying its own output goes there, not that anything dropped inside it stops
+  being an input. A directory carrying its own `.git` is another repository,
+  which this one cannot look inside; it is reported as a plain difference rather
+  than an addition, because a declaration cannot honestly exempt content nothing
+  here has read.
 
 Every Git query the check does make is asked in an environment stripped of the
 variables that redirect one — `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and
@@ -578,8 +583,11 @@ the candidate's tree would otherwise leave `rev-parse HEAD` and
 index, and checked-out file described some other tree: a different revision
 wearing the candidate's name.
 
-A **submodule** gets all three asked of it too, recursively. A gitlink records
-one commit and says nothing about the tree beside it, so a submodule sitting at
+A **submodule** gets all three asked of it too, recursively — once the path is
+confirmed to be a real directory. A symlink there would be followed, and
+whatever clean checkout sat at the other end reported as this submodule, while
+the commands read that tree or the link itself. A gitlink records one commit and
+says nothing about the tree beside it, so a submodule sitting at
 exactly the commit the candidate names can still carry staged, unstaged, or
 untracked changes — and neither the superproject's index nor its untracked
 listing reaches inside, while the commands read that content. Paths found there
@@ -1271,8 +1279,10 @@ has edited to call every path harmless, a receipt contract edited the same way
 and refused without being imported, a module dropped beside the runner to shadow
 a standard library one and refused without running, an addition a redirected `core.worktree`
 keeps out of Git's own listing, an added directory the candidate cannot contain,
-and a tree substituted for the candidate's by a `refs/replace` entry — each
-refused by name.
+a tree substituted for the candidate's by a `refs/replace` entry, an input a
+group declares dropped inside a directory the catalog calls generated, and a
+symlink to a clean checkout standing in for a submodule at the very same
+commit — each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly
