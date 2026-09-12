@@ -215,6 +215,18 @@ spec = describe "Validation execution" $ do
         void $ gitIn fixture ["mv", "src/note.txt", "src/moved.txt"]
         refusesDirty fixture plan ["src/note.txt", "src/moved.txt"]
 
+    it "refuses an owner-execute bit dropped while another remains set" $
+      withFixture $ \fixture → do
+        void $ gitIn fixture ["update-index", "--chmod=+x", "--", "src/note.txt"]
+        void $ gitIn fixture ["commit", "-q", "-m", "Make the source executable"]
+        plan ← planAgainst fixture (seeded fixture)
+        -- Git's executable bit is the owner's: at 0455 it records the file as
+        -- no longer executable even though group and other still execute.
+        (changed, _, errors) ←
+          run (environment fixture) (root fixture) "chmod" ["0455", root fixture </> "src/note.txt"]
+        (changed, errors) `shouldBe` (ExitSuccess, "")
+        refusesDirty fixture plan ["src/note.txt"]
+
     it "refuses an uncommitted mode change" $
       withDirtyFixture $ \fixture plan → do
         void $ gitIn fixture ["update-index", "--chmod=+x", "--", "src/note.txt"]

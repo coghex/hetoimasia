@@ -269,7 +269,10 @@ def worktree_entry(root: str, path: str, algorithm: str) -> tuple[str, str] | No
         raise ProvenanceError(
             f"cannot read {path} to compare it with the candidate: {error}"
         ) from error
-    mode = "100755" if status.st_mode & 0o111 else "100644"
+    # Git's executable bit is the owner's, not any of the three: a file at 0455
+    # keeps group and other execution while Git records it as no longer
+    # executable, and a comparison that disagreed would miss that change.
+    mode = "100755" if status.st_mode & stat.S_IXUSR else "100644"
     return mode, blob_id(content, algorithm)
 
 

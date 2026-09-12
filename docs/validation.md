@@ -570,7 +570,10 @@ questions are answered by comparing modes and object ids directly:
   bytes and `lstat` and computing its Git object id here. A symlink hashes its
   target, a regular file its contents, and a directory or device holds no blob
   at all — so a type change is a change, a mode change is a change, and no
-  filter sits between the file and the answer; and
+  filter sits between the file and the answer. The executable bit compared is
+  the **owner's**, as Git's own model has it: a file at `0455` keeps group and
+  other execution while Git records it as no longer executable, and a comparison
+  that disagreed would miss exactly that change; and
 - **every addition** — found by walking the filesystem under the root the
   command will run in, rather than by asking Git. `git ls-files --others`
   answers for whichever working tree Git has been pointed at, and a
@@ -1293,7 +1296,8 @@ the originally resolved plan then refuses as another plan's. Six more are
 about what a checkout can be told not to report: an addition no group declares
 and no catalog calls generated, an edit hidden by
 `git update-index --assume-unchanged`, an unstaged mode change hidden by
-`core.fileMode=false`, an edit a `clean` filter reports as the committed bytes,
+`core.fileMode=false`, an owner-execute bit dropped while group and other
+execution remain set, an edit a `clean` filter reports as the committed bytes,
 a tracked symlink replaced by a regular file of the same text under
 `core.symlinks=false`, a declared-generated basename sitting under a
 consumed input or a mandatory policy root, and a submodule resting at exactly
