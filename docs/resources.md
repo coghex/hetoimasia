@@ -551,9 +551,15 @@ must hand the structured outcome on. The rules:
 - Make the one attempt guarded, and never a second one. A synchronous failure
   from that attempt is discarded in favour of the original, and a cancellation
   arriving during it escapes as itself.
-- Rethrow preservingly. `rethrowIO` on the value `tryWithContext` returned keeps
-  the primary exception's type, its value, and its retained evidence, so the
-  caller can inspect the same outcome the boundary just reported.
+- Rethrow preservingly — the cancellation included. `rethrowIO` on the value
+  `tryWithContext` returned keeps the exception's type, its value, and its
+  retained evidence, so the caller can inspect the same outcome the boundary
+  just reported. Guard the attempt with the same preserving `tryWithContext`
+  rather than a plain `try`, and rethrow the cancellation it hands back rather
+  than the bare exception inside it: `try` retains the context on the value it
+  returns, but a plain `throwIO` of that value gives it a fresh one, so the
+  annotation and the cleanup evidence the cancellation was already carrying are
+  lost.
 - Never report successful completion for an action that threw or was
   interrupted.
 
@@ -591,11 +597,11 @@ raisedByDiagnostic context =
 -- One reporting attempt for an ordinary failure, and never a second one
 -- through the same sink.
 reportAbandoned scoped released context failure primary = do
-  reported ← tryAny (logError scoped resourceComponent "Resource smoke abandoned" fields)
+  reported ← trySmoke (logError scoped resourceComponent "Resource smoke abandoned" fields)
   case reported of
     Right () → rethrowIO primary
-    Left reportingFailure
-      | isCancellation reportingFailure → throwIO reportingFailure
+    Left reportingFailure@(ExceptionWithContext _ raised)
+      | isCancellation raised → rethrowIO reportingFailure
       | otherwise → rethrowIO primary
   where
     evidence = cleanupFailuresInContext context

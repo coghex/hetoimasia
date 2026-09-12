@@ -76,8 +76,6 @@ import Control.Exception
   , displayException
   , fromException
   , rethrowIO
-  , throwIO
-  , try
   , tryWithContext
   )
 import Control.Exception.Annotation
@@ -363,7 +361,12 @@ smokeWork logger resources = do
 -- and therefore its retained cleanup evidence — untouched, so the caller
 -- receives the same structured outcome it would have without this boundary. A
 -- cancellation arriving during the attempt escapes as itself rather than being
--- displaced by the failure already in hand.
+-- displaced by the failure already in hand, and it escapes through the same
+-- preserving rethrow: 'trySmoke' hands back the context it was caught with and
+-- 'rethrowIO' puts it back, so an annotation the cancellation carried and a
+-- cleanup failure retained on it are both still readable by the caller. A
+-- plain 'Control.Exception.throwIO' here would give it a fresh context and
+-- drop both.
 reportAbandoned
   ∷ Logger
   → [Released]
@@ -372,11 +375,11 @@ reportAbandoned
   → ExceptionWithContext SomeException
   → IO a
 reportAbandoned scoped released context failure primary = do
-  reported ← tryAny (logError scoped resourceComponent "Resource smoke abandoned" fields)
+  reported ← trySmoke (logError scoped resourceComponent "Resource smoke abandoned" fields)
   case reported of
     Right () → rethrowIO primary
-    Left reportingFailure
-      | isCancellation reportingFailure → throwIO reportingFailure
+    Left reportingFailure@(ExceptionWithContext _ raised)
+      | isCancellation raised → rethrowIO reportingFailure
       | otherwise → rethrowIO primary
   where
     evidence = cleanupFailuresInContext context
@@ -394,9 +397,6 @@ isCancellation failure = isJust (fromException failure ∷ Maybe SomeAsyncExcept
 
 trySmoke ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
 trySmoke = tryWithContext
-
-tryAny ∷ IO a → IO (Either SomeException a)
-tryAny = try
 
 -- Lifecycle ledger ------------------------------------------------------------
 

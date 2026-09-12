@@ -31,11 +31,15 @@ import Control.Exception
   , ErrorCall (ErrorCall)
   , IOException
   , SomeException
+  , annotateIO
   , bracket
   , fromException
   , someExceptionContext
   , throwIO
   , try
+  )
+import Control.Exception.Annotation
+  ( ExceptionAnnotation (displayExceptionAnnotation)
   )
 import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (when)
@@ -59,6 +63,7 @@ import Hetoimasia.Foundation.Resource
   ( CleanupFailure
   , cleanupFailureLabel
   , cleanupFailures
+  , withResourceLabelled
   )
 import Hetoimasia.Runtime.Resources
   ( DiagnosticFailure (..)
@@ -108,6 +113,10 @@ spec = describe "Console resource smoke" $ do
       (boundedExample testCancelledDuringWork)
     it "propagates cancellation delivered while the report blocks"
       (boundedExample testCancelledWhileReporting)
+    it "keeps the annotation of a cancellation the report itself raised"
+      testCancellationAnnotationWhileReporting
+    it "keeps the cleanup evidence of a cancellation delivered while reporting"
+      (boundedExample testCancellationCleanupWhileReporting)
 
   describe "Sink disposal" $ do
     it "writes every cleanup record before the test closes the handle it owns"
@@ -119,6 +128,15 @@ spec = describe "Console resource smoke" $ do
 -- failure by both its type and its payload.
 workFailure ∷ ErrorCall
 workFailure = ErrorCall "resource smoke work exploded"
+
+-- | Rides on the context of a cancellation the reporting sink raises, so an
+-- example can tell the cancellation the sink threw from an identical one with a
+-- context the boundary replaced.
+data ReportMark = ReportMark
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation ReportMark where
+  displayExceptionAnnotation _ = "raised by the reporting sink"
 
 -- | The releases, in the order the demonstration attempts them: the composite's
 -- parts in its declared order, then the enclosing scope's own allocation.
@@ -206,6 +224,15 @@ cancelled ∷ Either SomeException Int → Expectation
 cancelled (Right _) = expectationFailure "the cancelled run reported success"
 cancelled (Left failure) =
   (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+
+-- | 'cancelled', and then the cancellation itself, so an example can go on to
+-- assert what its context carried.
+cancelledWith ∷ Either SomeException Int → IO SomeException
+cancelledWith outcome = do
+  cancelled outcome
+  case outcome of
+    Right _ → fail "the cancelled run reported success"
+    Left failure → pure failure
 
 -- | Require the run to fail, and return what propagated with its context.
 expectFailure ∷ IO Int → IO SomeException
@@ -398,6 +425,57 @@ testCancelledWhileReporting = do
       (\_ _ → throwIO workFailure)
       entered
   cancelled outcome
+  readMVar attempts `shouldReturn` attemptedReleases
+
+-- | The sink raises its own annotated cancellation from the one reporting
+-- attempt. Nothing is asynchronous about the delivery, so no coordination is
+-- needed: 'ThreadKilled' is classified as cancellation by the type it is
+-- thrown as.
+testCancellationAnnotationWhileReporting ∷ Expectation
+testCancellationAnnotationWhileReporting = do
+  attempts ← newMVar []
+  let sink entry =
+        when (entryLevel entry == Error) (annotateIO ReportMark (throwIO ThreadKilled))
+      logger = mkLogger defaultLogFilter (callbackSink sink)
+  -- The work fails synchronously first, so the boundary has a failure in hand
+  -- when the report raises.
+  propagated ←
+    expectFailure
+      (resourceSmoke logger (observedReleases attempts) (\_ _ → throwIO workFailure))
+  -- The cancellation still wins over that failure.
+  (fromException propagated ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+  -- And it arrives as the exception the sink raised, not a copy of it: the
+  -- annotation it was carrying is still readable.
+  (getExceptionAnnotations (someExceptionContext propagated) ∷ [ReportMark])
+    `shouldBe` [ReportMark]
+  readMVar attempts `shouldReturn` attemptedReleases
+
+-- | The reporting attempt owns a labelled scope, is cancelled while its body
+-- blocks, and its release then fails. The cancellation reaches the boundary
+-- already carrying that release as retained evidence.
+testCancellationCleanupWhileReporting ∷ Expectation
+testCancellationCleanupWhileReporting = do
+  attempts ← newMVar []
+  entered ← newEmptyMVar
+  held ← newEmptyMVar
+  let sink entry =
+        when (entryLevel entry == Error) $
+          withResourceLabelled
+            "report sink"
+            (pure ())
+            (\_ → ioError (userError "the report sink's release failed"))
+            (\_ → blockedAt entered held)
+      logger = mkLogger defaultLogFilter (callbackSink sink)
+  outcome ←
+    cancelledSmokeOutcome
+      logger
+      (observedReleases attempts)
+      (\_ _ → throwIO workFailure)
+      entered
+  propagated ← cancelledWith outcome
+  -- The scope the sink owned retained its failed release on the cancellation
+  -- before the boundary ever saw it; the boundary hands both on together.
+  labelsOf (cleanupFailures propagated) `shouldBe` ["report sink"]
   readMVar attempts `shouldReturn` attemptedReleases
 
 -- Sink disposal ---------------------------------------------------------------
