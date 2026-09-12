@@ -518,21 +518,29 @@ distinguishing a symlink from a regular file (`core.symlinks=false`). Each of
 those empties an ordinary `git diff` while the command still reads what is
 actually on disk.
 
-So the comparison asks Git for nothing but the recorded trees. Both questions
-are answered by comparing modes and object ids directly:
+So the comparison asks Git for nothing but the recorded trees. All three
+questions are answered by comparing modes and object ids directly:
 
 - **the index** against the candidate, path by path, since an unmerged or
-  staged entry is what a commit from here would carry; and
+  staged entry is what a commit from here would carry;
 - **the working tree** against the candidate, by reading each tracked path's raw
   bytes and `lstat` and computing its Git object id here. A symlink hashes its
   target, a regular file its contents, and a directory or device holds no blob
   at all — so a type change is a change, a mode change is a change, and no
-  filter sits between the file and the answer.
+  filter sits between the file and the answer; and
+- **every untracked file**, which is the unstaged form of an addition.
 
-A submodule is its own repository's `HEAD`; one this checkout cannot read is one
-the run cannot vouch for. A checkout whose filesystem cannot carry an executable
-bit is likewise refused by the mode comparison. Both are the right direction for
-a gate: such a checkout cannot faithfully hold the candidate either.
+A **submodule** gets all three asked of it too, recursively. A gitlink records
+one commit and says nothing about the tree beside it, so a submodule sitting at
+exactly the commit the candidate names can still carry staged, unstaged, or
+untracked changes — and neither the superproject's index nor its untracked
+listing reaches inside, while the commands read that content. Paths found there
+are named from the superproject. A submodule this checkout cannot read at all is
+a difference in its own right: it is not the tree the candidate named.
+
+A checkout whose filesystem cannot carry an executable bit is likewise refused,
+by the mode comparison. That is the right direction for a gate: such a checkout
+cannot faithfully hold the candidate either.
 
 This refusal is the whole of the policy. Validating uncommitted work with honest
 attribution of its own is not supported: commit it, or plan and run from the
@@ -1208,8 +1216,9 @@ and no catalog calls generated, an edit hidden by
 `git update-index --assume-unchanged`, an unstaged mode change hidden by
 `core.fileMode=false`, an edit a `clean` filter reports as the committed bytes,
 a tracked symlink replaced by a regular file of the same text under
-`core.symlinks=false`, and a declared-generated basename sitting under a
-consumed input or a mandatory policy root — each refused by name.
+`core.symlinks=false`, a declared-generated basename sitting under a
+consumed input or a mandatory policy root, and a submodule resting at exactly
+the candidate's commit while carrying an edited input — each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

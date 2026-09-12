@@ -164,41 +164,67 @@ def index_entries(root: str) -> tuple[dict[str, tuple[str, str]], set[str]]:
     return entries, conflicted
 
 
-def tracked_changes(
-    root: str, head: dict[str, tuple[str, str, str]], algorithm: str
-) -> set[str]:
-    """Every tracked path this checkout holds differently from the candidate.
+def checkout_differences(
+    root: str, commit: str, algorithm: str, prefix: str = ""
+) -> tuple[set[str], set[str]]:
+    """Every path this checkout holds differently from one recorded commit.
 
-    Two questions, because neither implies the other: the index is what a commit
-    from here would carry, and the working tree is what a command actually
-    reads. Both are answered by comparing recorded modes and object ids —
-    plumbing rather than a diff — so neither can be quieted by an attribute, a
-    filter, or a configuration setting. A checkout whose filesystem cannot carry
-    an executable bit is refused by the mode comparison, and a submodule this
-    checkout cannot read is refused by its own; both are the right direction for
-    a gate, because such a checkout cannot faithfully hold the candidate either.
+    The tracked differences and the additions come back separately, because only
+    an addition can be a run's own output; a tracked path that differs is a
+    change to the candidate whatever a catalog calls it.
+
+    Three questions, because none implies another: the index is what a commit
+    from here would carry, the working tree is what a command actually reads,
+    and an untracked file is the unstaged form of an addition. All three are
+    answered by comparing recorded modes and object ids — plumbing rather than a
+    diff — so none can be quieted by an attribute, a filter, or a configuration
+    setting.
+
+    ``prefix`` is what makes the same answer work one level down, for a
+    submodule whose paths have to be named from the superproject.
     """
+    head = head_entries(root, commit)
+    added = {prefix + path for path in untracked_files(root)}
     recorded = {path: (mode, object_name) for path, (mode, _, object_name) in head.items()}
     entries, conflicted = index_entries(root)
     # An unmerged path is a difference by definition: it records no single thing.
-    changed = set(conflicted)
+    changed = {prefix + path for path in conflicted}
     changed |= {
-        path
+        prefix + path
         for path in set(recorded) | set(entries)
         if recorded.get(path) != entries.get(path)
     }
     for path, (mode, kind, object_name) in head.items():
         if kind == "commit":
-            # A submodule's content is another repository's HEAD. One that
-            # cannot be read is one this run cannot vouch for.
-            try:
-                if git_output(os.path.join(root, path), "rev-parse", "HEAD") != object_name:
-                    changed.add(path)
-            except EvidenceError:
-                changed.add(path)
+            deeper, deeper_added = submodule_differences(root, path, object_name, prefix)
+            changed |= deeper
+            added |= deeper_added
         elif worktree_entry(root, path, algorithm) != (mode, object_name):
-            changed.add(path)
-    return changed
+            changed.add(prefix + path)
+    return changed, added
+
+
+def submodule_differences(
+    root: str, path: str, object_name: str, prefix: str
+) -> tuple[set[str], set[str]]:
+    """The same question, asked of a submodule the candidate records.
+
+    A gitlink records one commit and says nothing about the tree beside it, so a
+    submodule sitting at the right commit can still carry staged, unstaged, or
+    untracked changes — and neither the superproject's index nor its untracked
+    listing reaches inside. Commands read that content, so the comparison
+    descends rather than stopping at the commit. A submodule this checkout
+    cannot read at all is a difference too: it is not the tree the candidate
+    named, and no run can vouch for what is not there.
+    """
+    inside = os.path.join(root, path)
+    here = prefix + path
+    try:
+        if git_output(inside, "rev-parse", "HEAD") != object_name:
+            return {here}, set()
+        return checkout_differences(inside, object_name, object_format(inside), here + "/")
+    except EvidenceError:
+        return {here}, set()
 
 
 def untracked_files(root: str) -> set[str]:
@@ -266,13 +292,10 @@ def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     """
     catalog, packages = candidate_classification(root, plan)
     consumed = planner.consumed_entries(catalog, packages)
-    algorithm = object_format(root)
-    head = head_entries(root, plan["candidate"]["commit"])
-    changed = tracked_changes(root, head, algorithm) | {
-        path
-        for path in untracked_files(root)
-        if not generated(path, catalog, consumed)
-    }
+    changed, added = checkout_differences(
+        root, plan["candidate"]["commit"], object_format(root)
+    )
+    changed |= {path for path in added if not generated(path, catalog, consumed)}
     return sorted(path for path in changed if not planner.harmless_prose(path, consumed, catalog))
 
 

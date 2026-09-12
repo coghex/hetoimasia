@@ -34,7 +34,16 @@ import System.Directory
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
+import Test.Hspec
+  ( Spec
+  , describe
+  , it
+  , shouldBe
+  , shouldContain
+  , shouldNotContain
+  , shouldReturn
+  , shouldSatisfy
+  )
 
 data Fixture = Fixture
   { root ∷ FilePath
@@ -296,6 +305,35 @@ spec = describe "Validation execution" $ do
       withDirtyFixture $ \fixture plan → do
         writeFixtureFile (root fixture) "tools/validation/plan.json" "{}\n"
         refusesDirty fixture plan ["tools/validation/plan.json"]
+
+    it "refuses a submodule that is at the candidate's commit but carries an edit" $
+      withFixture $ \fixture →
+        withSystemTempDirectory "hetoimasia-submodule" $ \inner → do
+          void $ git (environment fixture) inner ["init", "-q", "-b", "master"]
+          writeFixtureFile inner "value.txt" "the submodule's committed input\n"
+          void $ git (environment fixture) inner ["add", "-A", "."]
+          void $ git (environment fixture) inner ["commit", "-q", "-m", "Seed the submodule"]
+          void $
+            gitIn
+              fixture
+              [ "-c", "protocol.file.allow=always"
+              , "submodule", "add", "-q", inner, "vendor/lib"
+              ]
+          void $ gitIn fixture ["add", "-A", "."]
+          void $ gitIn fixture ["commit", "-q", "-m", "Add the submodule"]
+          plan ← planAgainst fixture (seeded fixture)
+          writeFixtureFile (root fixture) "vendor/lib/value.txt" "an edit no commit carries\n"
+          -- A gitlink records one commit and nothing about the tree beside it.
+          -- The submodule is still exactly that commit, the superproject's own
+          -- index is untouched, and its untracked listing does not reach
+          -- inside — yet the command reads the edited file.
+          recorded ← revisionIn fixture (root fixture </> "vendor/lib") "HEAD"
+          gitIn fixture ["ls-tree", "HEAD", "vendor/lib"] >>= \entry →
+            entry `shouldContain` recorded
+          gitIn fixture ["diff", "--name-only", "--cached", "HEAD"] `shouldReturn` ""
+          others ← gitIn fixture ["ls-files", "--others"]
+          others `shouldNotContain` "vendor/lib/value.txt"
+          refusesDirty fixture plan ["vendor/lib/value.txt"]
 
     it "refuses a relevant addition that the repository's own ignore rules hide" $
       withDirtyFixture $ \fixture plan → do
@@ -980,7 +1018,12 @@ gitIn ∷ Fixture → [String] → IO String
 gitIn fixture = git (environment fixture) (root fixture)
 
 revision ∷ Fixture → String → IO String
-revision fixture name = takeWhile (/= '\n') <$> gitIn fixture ["rev-parse", name]
+revision fixture name = revisionIn fixture (root fixture) name
+
+-- | The same, resolved inside another checkout — a submodule, for instance.
+revisionIn ∷ Fixture → FilePath → String → IO String
+revisionIn fixture where' name =
+  takeWhile (/= '\n') <$> git (environment fixture) where' ["rev-parse", name]
 
 change ∷ Fixture → FilePath → String → IO ()
 change fixture path contents = do
