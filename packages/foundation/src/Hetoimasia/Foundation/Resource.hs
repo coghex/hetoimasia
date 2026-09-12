@@ -31,6 +31,14 @@
 -- to the asynchronous-exception hierarchy. A release must therefore have a
 -- controlled blocking duration.
 --
+-- 'withComposite' is the same scope for an owner built from several parts.
+-- Its 'Assembly' acquires each part and installs that part's rollback as one
+-- protected step, so at every moment after an acquisition returns exactly one
+-- authoritative release covers every part acquired so far; a failure at any
+-- stage releases exactly those and no more. The order that release runs in is
+-- declared with 'releaseRank', because the correct order is a property of the
+-- API the parts come from rather than the reverse of acquisition.
+--
 -- Retained evidence is read back with 'cleanupFailures', which needs no
 -- logger. Every rethrow inside this module preserves the primary exception's
 -- 'Control.Exception.Context.ExceptionContext', so an annotation attached
@@ -45,6 +53,14 @@ module Hetoimasia.Foundation.Resource
   ( -- * Scopes
     withResource
   , withResourceLabelled
+
+    -- * Composite construction
+  , withComposite
+  , Assembly
+  , acquirePart
+  , restoredStep
+  , ReleaseRank
+  , releaseRank
 
     -- * Retained cleanup failures
   , CleanupFailure
@@ -252,3 +268,186 @@ dropRepeatedFailures (earlier : later : rest)
   | cleanupFailureId earlier == cleanupFailureId later = dropRepeatedFailures (earlier : rest)
   | otherwise = earlier : dropRepeatedFailures (later : rest)
 dropRepeatedFailures failures = failures
+
+-- | Where one part falls in the composite's declared final release order.
+--
+-- Lower ranks are released first, and parts sharing a rank are released in
+-- acquisition order. A rank is a declaration about the API the parts come
+-- from, not a consequence of when a stage happened to run: a handle created
+-- before the allocation behind it is often destroyed before that allocation is
+-- freed, which is acquisition order rather than the reverse of it.
+newtype ReleaseRank = ReleaseRank Int
+  deriving (Eq, Ord, Show)
+
+-- | Build a 'ReleaseRank' from an ordering key the constructor chooses.
+releaseRank ∷ Int → ReleaseRank
+releaseRank = ReleaseRank
+
+-- | One acquired part, together with the release that covers it and the label
+-- a failure of that release is retained under.
+data Part = Part
+  { partRank ∷ !ReleaseRank
+  , partLabel ∷ !Text
+  , partRelease ∷ IO ()
+  }
+
+-- | What a stage may reach while a composite is being constructed: the
+-- caller's masking state, and the slot holding the one authoritative release.
+--
+-- The slot is not application state and is never observed outside the
+-- construction it belongs to. It exists so that the release covering every
+-- part acquired so far is a single value that later stages extend, rather than
+-- a chain of nested handlers a stage could step outside of.
+data Assembling = Assembling
+  { assemblingRestore ∷ ∀ x. IO x → IO x
+  , assemblingParts ∷ !(IORef [Part])
+  }
+
+-- | A staged construction of one composite value.
+--
+-- A composite owner acquires several parts in sequence, may fail between any
+-- two of them, and must release them in an order its own API dictates. An
+-- 'Assembly' is that sequence and nothing more: it is not a dependency
+-- scheduler, it registers no delayed cleanup, and it hands no release action
+-- to a caller.
+--
+-- Stages are written in @do@ notation, so a later stage may use what an
+-- earlier one produced. 'acquirePart' takes a part and installs its rollback
+-- as one protected step; 'restoredStep' runs work that acquires nothing with
+-- the caller's masking state restored. 'withComposite' runs the whole
+-- assembly and owns what it produced.
+newtype Assembly a = Assembly (Assembling → IO a)
+
+instance Functor Assembly where
+  fmap change (Assembly stages) = Assembly (fmap change . stages)
+
+instance Applicative Assembly where
+  pure value = Assembly (\_ → pure value)
+  Assembly change <*> Assembly stages =
+    Assembly (\assembling → change assembling <*> stages assembling)
+
+instance Monad Assembly where
+  Assembly stages >>= continue = Assembly $ \assembling → do
+    value ← stages assembling
+    runAssembly (continue value) assembling
+
+runAssembly ∷ Assembly a → Assembling → IO a
+runAssembly (Assembly stages) = stages
+
+-- | Acquire one part of the composite and install its rollback, under the
+-- label its cleanup failures are retained with and the rank its release takes
+-- in the declared final order.
+--
+-- The acquisition and the installation of the rollback are one protected step:
+-- the whole assembly runs under 'mask' and installing a rollback cannot block,
+-- so there is no interruptible gap between a part being acquired and being
+-- covered. Masking still permits cancellation at an interruptible operation
+-- inside the acquisition itself, which is deliberate — a blocking acquisition
+-- stays cancellable — and an acquisition that throws before returning its
+-- handle is responsible for releasing anything it acquired internally, exactly
+-- as an acquisition passed to 'withResource' is.
+--
+-- After this stage returns, the one authoritative release covers every part
+-- acquired so far, this one included. Nothing is unregistered to achieve that,
+-- and no part is released twice: the accumulated release is taken out of the
+-- construction when it runs.
+acquirePart ∷ Text → ReleaseRank → IO p → (p → IO ()) → Assembly p
+acquirePart label rank acquire release = Assembly $ \assembling → do
+  part ← acquire
+  atomicModifyIORef' (assemblingParts assembling) $ \parts →
+    (Part rank label (release part) : parts, ())
+  pure part
+
+-- | Run one step of the construction that acquires nothing — querying what an
+-- allocation must satisfy, binding two parts together, or assembling the
+-- finished value — with the caller's masking state restored.
+--
+-- This is the same restoration 'withResource' performs around its body, and it
+-- is legal here for the same reason: every part acquired so far is already
+-- covered by the authoritative release, so a cancellation delivered inside
+-- this step rolls exactly those parts back. It inherits the caller's masking
+-- state rather than forcing an unmasked one, so a caller that was already
+-- masked stays masked.
+--
+-- A step that acquires something belongs in 'acquirePart' instead. Restoring
+-- the caller's state around an acquisition is the gap this arc exists to
+-- close.
+restoredStep ∷ IO a → Assembly a
+restoredStep step = Assembly (\assembling → assemblingRestore assembling step)
+
+-- | Construct a composite value in stages, lend it to a body, and release
+-- every part it acquired in the constructor's declared order.
+--
+-- This is 'withResource' for an owner with several parts, and it keeps the
+-- same contract. A failure before the first acquisition releases nothing. A
+-- failure at any later stage — inside an acquisition, inside a restored step,
+-- or at the final binding or publication step — releases exactly the parts
+-- acquired so far, each exactly once, and propagates the triggering failure as
+-- primary, so no finished value ever reaches the body. Cleanup failures are
+-- retained under each part's own label as ordered, structured evidence that
+-- 'cleanupFailures' reads back.
+--
+-- On success the body borrows the finished value under the borrowing rules of
+-- 'withResource', and the release that runs when the body returns or throws is
+-- the declared order of 'ReleaseRank', not the reverse of acquisition. When
+-- the body succeeds and releases fail, the first cleanup failure becomes the
+-- scope's exception and the body's result is discarded, as it is for a single
+-- resource; every labelled failure is retained beside it.
+--
+-- Each release runs under 'uninterruptibleMask_' and the orchestration between
+-- them stays masked, so an asynchronous exception aimed at the thread from
+-- elsewhere is not delivered until the whole declared order has been
+-- attempted. A release must therefore have a controlled blocking duration.
+withComposite ∷ Assembly a → (a → IO r) → IO r
+withComposite assembly body = mask $ \restore → do
+  slot ← newIORef []
+  built ← tryScope (runAssembly assembly (Assembling restore slot))
+  case built of
+    -- Rollback: the current authoritative release covers exactly the parts
+    -- acquired so far, and the failure that triggered it stays primary.
+    Left primary → do
+      failures ← releaseAcquired slot
+      rethrowIO (retainCleanupFailures failures primary)
+    Right value → do
+      outcome ← tryScope (restore (body value))
+      failures ← releaseAcquired slot
+      case (outcome, failures) of
+        (Right result, []) → pure result
+        (Right _, first : rest) →
+          rethrowIO
+            (retainCleanupFailures (first : rest) (cleanupFailureException first))
+        (Left primary, _) → rethrowIO (retainCleanupFailures failures primary)
+
+-- | Run the authoritative release covering every part acquired so far, in the
+-- declared order, attempting each exactly once.
+--
+-- Taking the parts out of the slot is what makes a second release impossible:
+-- a rollback and a scope exit cannot both reach the same part, and neither can
+-- run twice.
+releaseAcquired ∷ IORef [Part] → IO [CleanupFailure]
+releaseAcquired slot = uninterruptibleMask_ $ do
+  acquired ← atomicModifyIORef' slot (\parts → ([], parts))
+  attemptEach (declaredOrder acquired)
+  where
+    attemptEach [] = pure []
+    attemptEach (part : remaining) = do
+      attempted ← attemptRelease (partLabel part) (partRelease part)
+      later ← attemptEach remaining
+      pure (maybe later (: later) attempted)
+
+-- | The declared final release order of the parts acquired so far. The slot
+-- holds them newest first, so reversing recovers acquisition order, and the
+-- stable sort below leaves parts of equal rank in it.
+declaredOrder ∷ [Part] → [Part]
+declaredOrder = sortOn partRank . reverse
+
+-- | Retain several cleanup failures on one primary exception, in the order
+-- they were observed. As in 'retainCleanupFailure', the primary exception is
+-- never rebuilt.
+retainCleanupFailures
+  ∷ [CleanupFailure]
+  → ExceptionWithContext SomeException
+  → ExceptionWithContext SomeException
+retainCleanupFailures failures primary = foldl' retain primary failures
+  where
+    retain carried failure = retainCleanupFailure failure carried

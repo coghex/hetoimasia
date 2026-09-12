@@ -7,13 +7,13 @@ D-6 through D-8); this document describes what the code does today.
 
 Scope: the scope primitive, ownership and borrowing of the scoped value, the
 argument order, the failure table, the mask discipline, what the release
-guarantee does and does not cover, and how to inspect and how not to discard
-the secondary failures a scope retains.
+guarantee does and does not cover, how to inspect and how not to discard the
+secondary failures a scope retains, and the staged constructor an owner built
+from several parts is assembled with.
 
 The continuation facade (`Scoped`, `allocResource`, `locally`, `withScoped`),
-the staged composite constructor, runtime composition, and anything involving
-Vulkan, GPU completion, retirement queues, ownership transfer, or public early
-release are not part of it yet. This module imports no logger, runtime
+runtime composition, and anything involving Vulkan, GPU completion, retirement
+queues, ownership transfer, or public early release are not part of it yet. This module imports no logger, runtime
 environment, graphics, or scripting module, and owns no application state.
 
 ## Public interface
@@ -134,6 +134,120 @@ It does not cover:
   future backend contract, and must not be solved by making a release
   interruptible.
 
+## Composite construction
+
+```haskell
+data Assembly a          -- Functor, Applicative, Monad
+data ReleaseRank
+
+releaseRank   ∷ Int → ReleaseRank
+acquirePart   ∷ Text → ReleaseRank → IO p → (p → IO ()) → Assembly p
+restoredStep  ∷ IO a → Assembly a
+withComposite ∷ Assembly a → (a → IO r) → IO r
+```
+
+A composite owner acquires several parts in sequence, may fail between any two
+of them, and must release them in an order its own API dictates. One
+`withResource` per part cannot express that: it releases in reverse allocation
+order, and a part acquired inside another part's body cannot outlive it.
+
+`withComposite` is `withResource` for that owner. An `Assembly` is the
+construction, written in `do` notation so a later stage may use what an earlier
+one produced:
+
+```haskell
+allocation ∷ Device → Assembly Allocation
+allocation device = do
+  handle ← acquirePart "handle" (releaseRank 0)
+             (createHandle device) (destroyHandle device)
+  needs  ← restoredStep (queryRequirements device handle)
+  memory ← acquirePart "handle memory" (releaseRank 1)
+             (allocateMemory device needs) (freeMemory device)
+  restoredStep (bindMemory device handle memory)
+  pure (Allocation handle memory)
+
+withComposite (allocation device) $ \owned → use owned
+```
+
+### Ownership of partial state
+
+At every moment after an acquisition returns, exactly one authoritative release
+covers every part acquired so far. `acquirePart` extends that release; nothing
+is unregistered to make room for the extension, and the accumulated release is
+taken out of the construction when it runs, so no part is released twice.
+
+A failure before the first acquisition releases nothing. A failure at any later
+stage — inside an acquisition, inside a restored step, or at the final binding
+or publication step — releases exactly the parts acquired so far, each exactly
+once, and propagates the triggering failure as primary. The body never runs on
+that path, so no half-built value is ever observable.
+
+### The staged-protection guarantee
+
+The whole assembly runs under `mask`. An acquisition and the installation of
+its rollback are one protected step: installing a rollback cannot block, so
+there is no interruptible gap between the two. This is the gap Synarchy's
+`allocResource'` left open, and closing it is the point of the constructor.
+
+Masking still permits cancellation at an interruptible operation *inside* an
+acquisition, which is deliberate: a blocking acquisition stays cancellable, and
+nothing was acquired when it is cancelled there. An acquisition that throws
+before returning its handle is responsible for releasing whatever it acquired
+internally, exactly as an acquisition passed to `withResource` is.
+
+`restoredStep` runs work that acquires nothing with the caller's masking state
+restored, as `withResource` restores it around its body. It is legal only
+because every part acquired so far is already covered: a cancellation delivered
+inside such a step rolls exactly those parts back. It inherits the caller's
+state rather than forcing an unmasked one, so a caller that was already masked
+stays masked. A step that acquires something belongs in `acquirePart`.
+
+### The declared release order
+
+The constructor declares the final release order with `releaseRank`. Lower
+ranks are released first, and parts sharing a rank are released in acquisition
+order. Both the rollback of a failed construction and the release at the end of
+a successful body use that declared order.
+
+The order is a property of the API the parts come from, not of when they were
+acquired. A buffer is created before the memory behind it, and the correct
+release is destroy the buffer, then free the memory — acquisition order, not
+the reverse of it. A scope that always released in reverse would free memory
+the buffer still referred to. Nothing about the ranks is tied to acquisition:
+the same two stages can declare either order.
+
+### Handoff to the enclosing scope
+
+On success the finished value is lent to the body under the borrowing rules
+above, and the declared release runs when that body returns or throws. The
+release never becomes a value the caller holds. Each release runs under
+`uninterruptibleMask_` and the orchestration between them stays masked, so an
+asynchronous exception aimed at the thread from elsewhere is not delivered
+until the whole declared order has been attempted.
+
+Cleanup failures obey the failure table. Each is retained under its own part's
+label, the remaining releases are still attempted, and a failure that triggered
+a rollback stays primary. When the body succeeds and releases fail, the first
+cleanup failure becomes the scope's exception and the body's result is
+discarded, as for a single resource; every labelled failure is retained beside
+it, once, including through an enclosing `withResource`.
+
+### Patterns this constructor replaces
+
+- **Delayed registration.** There is no helper that returns an action which
+  installs cleanup when it is later run. Cleanup is installed by the stage that
+  acquired the part, before that stage returns.
+- **Returned cleanup closures.** A constructor does not hand a caller a manual
+  release to invoke. Synarchy's `Image.hs` returned one only after several
+  acquisitions, and sequenced two releases so that a throwing first release
+  skipped the second.
+- **Unregistering rollback before publication.** Nothing is removed and
+  reinstalled around the final binding or publication step, so there is no
+  window in which a part is acquired but unprotected.
+- **A dependency scheduler.** `Assembly` is a sequence, not a graph. There are
+  no public early-release tokens, and no way to move a part to another live
+  owner.
+
 ## Inspecting secondary failures
 
 ```haskell
@@ -236,5 +350,11 @@ examples from `test/Test/Engine/Resources/Spec.hs`, which drive every row of
 the failure table, the failed acquisition, ordered nested evidence, the
 cancellation and throwing-release cases of the mask discipline, inspection
 through `WhileHandling`, each internal rethrow site, and both evidence losses
-above. The validation catalog covers them through the floor group
+above. The composite examples in the same file add a failure injected before
+and after each acquisition and at the binding step, the declared release order
+in both its acquisition-order and its reordered form, a throwing rollback
+release, the cancellation cases above, and the whole construction nested inside
+`withResource`. They drive it through the fake buffer of
+`test/Test/Engine/Resources/Buffer.hs`, which models exactly the four steps
+this contract needs and ships in no library. The validation catalog covers them through the floor group
 `test.engine`; see [validation.md](validation.md).
