@@ -451,6 +451,22 @@ The comparison is against the **candidate**, not the head. A plan resolved with
 a `--candidate` that differs from its head still runs from a checkout of that
 candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
 
+**The classifier is checked before it is consulted.** `plan.py` decides what
+counts as harmless prose, and it lives under `tools/validation/` — so it is one
+of the inputs it would be classifying, and a checkout that had edited it could
+otherwise have that edit excuse itself. The differences above are therefore
+found first, using only the runner's own code, and **any** difference under a
+mandatory policy root — `tools/validation/` or `.github/workflows/` — is refused
+outright, with no classification at all. Only then is `plan.py` imported, which
+is also the first moment this run knows the copy on disk is the candidate's.
+Those two roots are restated in the runner rather than read from the catalog or
+the planner, because both of those live under them.
+
+The floor this cannot reach past is `run.py` itself: a checkout that has edited
+the runner is not running the runner. The hosted workers check the candidate out
+fresh and confirm its commit before running anything, which is what makes that
+floor a real one rather than an assumption.
+
 Relevance for the third check is **the classification that produced the plan**,
 never the working tree's: the candidate commit's package graph, and the catalog
 that plan was resolved with — the fixture when `--catalog` supplied one, and the
@@ -528,7 +544,13 @@ questions are answered by comparing modes and object ids directly:
   target, a regular file its contents, and a directory or device holds no blob
   at all — so a type change is a change, a mode change is a change, and no
   filter sits between the file and the answer; and
-- **every untracked file**, which is the unstaged form of an addition.
+- **every added file**, which is the unstaged form of an addition — found by
+  walking the filesystem under the root the command will run in, rather than by
+  asking Git. `git ls-files --others` answers for whichever working tree Git has
+  been pointed at, and a repository-local `core.worktree` or an inherited
+  `GIT_WORK_TREE` can make that a different directory entirely. Every Git query
+  the check does make is asked in an environment stripped of the variables that
+  redirect one — `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and their kin.
 
 A **submodule** gets all three asked of it too, recursively. A gitlink records
 one commit and says nothing about the tree beside it, so a submodule sitting at
@@ -1218,7 +1240,9 @@ and no catalog calls generated, an edit hidden by
 a tracked symlink replaced by a regular file of the same text under
 `core.symlinks=false`, a declared-generated basename sitting under a
 consumed input or a mandatory policy root, and a submodule resting at exactly
-the candidate's commit while carrying an edited input — each refused by name.
+the candidate's commit while carrying an edited input, a classifier the checkout
+has edited to call every path harmless, and an addition a redirected
+`core.worktree` keeps out of Git's own listing — each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

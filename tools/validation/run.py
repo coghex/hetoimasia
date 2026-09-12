@@ -45,10 +45,46 @@ from datetime import datetime, timezone
 # turned off before the imports that would create it.
 sys.dont_write_bytecode = True
 
-import plan as planner
 import receipts
-from plan import PlannerError
 from receipts import EvidenceError
+
+# ``plan`` is deliberately *not* imported here. It is the candidate's own
+# classifier, loaded from the checkout being validated, so importing it would
+# run code this run has not yet established is the candidate's — and its
+# `harmless_prose` is exactly what decides whether an edit to it matters. The
+# provenance check refuses any difference under a policy root before the import
+# happens; see `candidate_classification`.
+
+# The roots a candidate can never exempt itself from, restated here rather than
+# read from the catalog or from `plan.py`. Both of those live under these very
+# prefixes: taking the list from them would let an edited policy narrow the
+# check that is meant to notice it. `plan.py` unions the same roots into every
+# candidate's identity, so this is a restatement of that contract, not a second
+# one.
+POLICY_ROOTS = ("tools/validation/", ".github/workflows/")
+
+# Environment variables that would point Git at another repository, index, or
+# working tree than the one this run is validating. A redirected listing would
+# describe a directory the commands never read.
+REDIRECTING_GIT_VARIABLES = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+)
+
+
+def git_environment() -> dict:
+    """The environment Git is asked in, with every redirection removed."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name not in REDIRECTING_GIT_VARIABLES
+    }
 
 # How long a timed-out process group is given to exit on SIGTERM before it is
 # killed outright.
@@ -61,7 +97,7 @@ def timestamp() -> str:
 
 def git_output(root: str, *arguments: str) -> str:
     process = subprocess.run(
-        ("git", "-C", root) + arguments, capture_output=True, check=False
+        ("git", "-C", root) + arguments, capture_output=True, check=False, env=git_environment()
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
@@ -69,7 +105,7 @@ def git_output(root: str, *arguments: str) -> str:
     return process.stdout.decode("utf-8", errors="replace").strip()
 
 
-def git_records(root: str, *arguments: str, environment: dict | None = None) -> list[str]:
+def git_records(root: str, *arguments: str) -> list[str]:
     """Run a NUL-separated Git query, keeping every byte of every field.
 
     ``git_output`` strips its result, which is right for a revision but wrong
@@ -77,7 +113,7 @@ def git_records(root: str, *arguments: str, environment: dict | None = None) -> 
     a stripped field would name a file that does not exist.
     """
     process = subprocess.run(
-        ("git", "-C", root) + arguments, capture_output=True, check=False, env=environment
+        ("git", "-C", root) + arguments, capture_output=True, check=False, env=git_environment()
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
@@ -140,12 +176,21 @@ def worktree_entry(root: str, path: str, algorithm: str) -> tuple[str, str] | No
 
 
 def head_entries(root: str, commit: str) -> dict[str, tuple[str, str, str]]:
-    """Every path the candidate records, with its mode, kind, and object id."""
-    try:
-        listing = planner.tree_entries(root, commit)
-    except PlannerError as failure:
-        raise EvidenceError(f"cannot read the candidate's tree: {failure}") from failure
-    return {path: (mode, kind, object_name) for path, mode, kind, object_name in listing}
+    """Every path one commit records, with its mode, kind, and object id.
+
+    Read here rather than through the planner's own copy of this listing,
+    because the planner is one of the files being compared: the check that
+    notices an edited classifier cannot be built on the classifier.
+    """
+    entries: dict[str, tuple[str, str, str]] = {}
+    for record in git_records(root, "ls-tree", "-r", "-z", commit):
+        metadata, separator, path = record.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or not path:
+            raise EvidenceError(f"cannot read the tree of {commit}: unexpected entry {record!r}")
+        mode, kind, object_name = fields
+        entries[path] = (mode, kind, object_name)
+    return entries
 
 
 def index_entries(root: str) -> tuple[dict[str, tuple[str, str]], set[str]]:
@@ -184,9 +229,13 @@ def checkout_differences(
     submodule whose paths have to be named from the superproject.
     """
     head = head_entries(root, commit)
-    added = {prefix + path for path in untracked_files(root)}
     recorded = {path: (mode, object_name) for path, (mode, _, object_name) in head.items()}
     entries, conflicted = index_entries(root)
+    submodules = {path for path, (_, kind, _) in head.items() if kind == "commit"}
+    added = {
+        prefix + path
+        for path in added_files(root, set(recorded) | set(entries), submodules)
+    }
     # An unmerged path is a difference by definition: it records no single thing.
     changed = {prefix + path for path in conflicted}
     changed |= {
@@ -227,21 +276,46 @@ def submodule_differences(
         return {here}, set()
 
 
-def untracked_files(root: str) -> set[str]:
-    """Every file in this checkout that no commit of it carries.
+def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]:
+    """Every file under this checkout that neither the candidate nor the index records.
 
-    Deliberately without ``--exclude-standard`` or any other exclude source. A
-    `.gitignore`, a `.git/info/exclude`, or a machine's global excludes could
-    otherwise hide a newly added source, consumed document, or package
-    description from this question entirely, and two of those three are not even
-    part of the candidate. Whether such a file matters is then decided by the
-    candidate's own classification, below, rather than by what some ignore rule
-    was willing to mention.
+    Walked here rather than asked of Git. ``git ls-files --others`` answers for
+    whichever working tree Git has been pointed at, and a repository-local
+    ``core.worktree``, an inherited ``GIT_WORK_TREE``, or an ignore rule can all
+    make that a different directory — or a shorter list — than the one the
+    command will run in. The filesystem under the root the command uses is the
+    only thing that can answer this, so it is read directly.
+
+    A directory carrying its own ``.git`` is another repository. One the
+    candidate records as a submodule is compared on its own terms; any other is
+    an addition this checkout cannot look inside, and is named as one.
     """
-    return set(git_records(root, "ls-files", "--others", "-z"))
+    found: set[str] = set()
+    pending = [(root, "")]
+    while pending:
+        directory, base = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise EvidenceError(f"cannot read {base or '.'} to compare this checkout: {error}") from error
+        for entry in entries:
+            if not base and entry.name == ".git":
+                continue
+            relative = base + entry.name
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                if relative not in recorded:
+                    found.add(relative)
+                continue
+            if relative in submodules:
+                continue
+            if os.path.lexists(os.path.join(entry.path, ".git")):
+                found.add(relative + "/")
+                continue
+            pending.append((entry.path, relative + "/"))
+    return found
 
 
-def generated(path: str, catalog: dict, consumed: set[str]) -> bool:
+def generated(planner, path: str, catalog: dict, consumed: set[str]) -> bool:
     """Whether the candidate's catalog declares this path as a run's own output.
 
     A declaration never outranks an input. A path some group consumes, or that
@@ -272,35 +346,59 @@ def generated(path: str, catalog: dict, consumed: set[str]) -> bool:
     return False
 
 
+def under_policy_root(path: str) -> bool:
+    """Whether a path is one the candidate's own policy is written in."""
+    return any(path.startswith(root) or path == root.rstrip("/") for root in POLICY_ROOTS)
+
+
 def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     """Every uncommitted path that keeps this checkout from being the candidate.
 
-    Relevance is read from the classification that produced the plan — the
-    candidate's package graph, and the catalog that plan was resolved with,
-    which is the fixture when one was supplied and the candidate's own otherwise
-    — rather than from whatever the working tree holds now. An edit must not be
-    able to reclassify itself as prose on the way past, and a rewritten catalog
-    in the working tree is exactly the change this refusal exists to notice.
+    The order here is the point. Differences are found first, with this module's
+    own code and nothing else, because the classifier is one of the files being
+    compared: `plan.py` decides what counts as harmless prose, and it lives
+    under a policy root, so a checkout that had edited it could otherwise have
+    that edit excuse itself. Any difference under a policy root is therefore
+    refused outright, before the classifier is so much as imported — no
+    classification, and no chance for an edited one to run.
 
-    Tracked and added paths are held to the same conservative rule: everything
-    is relevant unless it is harmless prose, the complement the candidate's
-    `input_identity` already covers. Consumed Markdown, a mandatory policy
-    input, `cabal.project`, and any `.cabal` file are never harmless however
-    they are spelled — and neither is a file no group declares at all, such as a
+    Only then is the candidate's classification consulted, for the differences
+    that remain. Relevance is read from the classification that produced the
+    plan — the candidate's package graph, and the catalog that plan was resolved
+    with, the fixture when one was supplied and the candidate's own otherwise —
+    rather than from whatever the working tree holds now.
+
+    Tracked and added paths are then held to the same conservative rule:
+    everything is relevant unless it is harmless prose, the complement the
+    candidate's `input_identity` already covers. Consumed Markdown,
+    `cabal.project`, and any `.cabal` file are never harmless however they are
+    spelled — and neither is a file no group declares at all, such as a
     `cabal.project.local` that every Cabal command would read. The one exemption
     is what the candidate's catalog declares as a run's own output.
     """
-    catalog, packages = candidate_classification(root, plan)
-    consumed = planner.consumed_entries(catalog, packages)
     changed, added = checkout_differences(
         root, plan["candidate"]["commit"], object_format(root)
     )
-    changed |= {path for path in added if not generated(path, catalog, consumed)}
+    policy = sorted(path for path in changed | added if under_policy_root(path))
+    if policy:
+        raise EvidenceError(
+            "this checkout has changed the policy that decides what a result means, "
+            f"so the candidate {plan['candidate']['commit']} cannot answer for it: "
+            + ", ".join(policy)
+        )
+    planner, catalog, packages = candidate_classification(root, plan)
+    consumed = planner.consumed_entries(catalog, packages)
+    changed |= {path for path in added if not generated(planner, path, catalog, consumed)}
     return sorted(path for path in changed if not planner.harmless_prose(path, consumed, catalog))
 
 
-def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
-    """The catalog and package graph the plan's own identity was taken from.
+def candidate_classification(root: str, plan: dict):
+    """The classifier, catalog, and package graph the plan's identity came from.
+
+    The import happens here rather than at module scope: `plan.py` is the
+    candidate's own code read out of the checkout being validated, and this is
+    the first point at which the caller has established that the checkout's copy
+    of it is the candidate's.
 
     The candidate's package graph comes from its commit and cannot have moved.
     Its catalog usually comes from there too, but a plan resolved with
@@ -310,6 +408,9 @@ def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
     longer digests to it is refused rather than believed: a classification this
     plan was not built from cannot say what a dirty checkout means.
     """
+    import plan as planner
+    from plan import PlannerError
+
     override = plan["catalog"]["override"]
     try:
         candidate = planner.GitTree(root, plan["candidate"]["commit"])
@@ -317,7 +418,7 @@ def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
         packages = planner.load_packages(candidate, required=True)
     except PlannerError as failure:
         raise EvidenceError(
-            "cannot read the classification this plan was resolved with: " f"{failure}"
+            f"cannot read the classification this plan was resolved with: {failure}"
         ) from failure
     recorded = plan["catalog"]["candidate_digest"]
     if planner.digest(catalog) != recorded:
@@ -325,7 +426,7 @@ def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
             f"the catalog at {source} is not the one this plan was resolved with "
             f"({recorded[:12]}), so it cannot say what this checkout holds"
         )
-    return catalog, packages
+    return planner, catalog, packages
 
 
 def confirm_candidate(root: str, plan: dict) -> tuple[str, str]:

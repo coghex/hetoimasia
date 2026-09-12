@@ -233,7 +233,7 @@ spec = describe "Validation execution" $ do
           (root fixture)
           "tools/validation/catalog.json"
           (fixtureCatalogWith "[\"*.md\", \"*.txt\", \".gitignore\", \"LICENSE\"]")
-        refusesDirty fixture plan ["tools/validation/catalog.json"]
+        refusesPolicy fixture plan ["tools/validation/catalog.json"]
 
     it "refuses an addition no group declares and no catalog calls generated" $
       withDirtyFixture $ \fixture plan → do
@@ -304,7 +304,7 @@ spec = describe "Validation execution" $ do
     it "refuses a generated basename sitting under a mandatory policy root" $
       withDirtyFixture $ \fixture plan → do
         writeFixtureFile (root fixture) "tools/validation/plan.json" "{}\n"
-        refusesDirty fixture plan ["tools/validation/plan.json"]
+        refusesPolicy fixture plan ["tools/validation/plan.json"]
 
     it "refuses a submodule that is at the candidate's commit but carries an edit" $
       withFixture $ \fixture →
@@ -334,6 +334,38 @@ spec = describe "Validation execution" $ do
           others ← gitIn fixture ["ls-files", "--others"]
           others `shouldNotContain` "vendor/lib/value.txt"
           refusesDirty fixture plan ["vendor/lib/value.txt"]
+
+    it "refuses an edited classifier without consulting it" $
+      withFixture $ \fixture → do
+        -- A hosted worker runs the checkout's own copy of these tools, so the
+        -- classifier is itself one of the inputs it would classify. This one
+        -- has been taught that every path is harmless prose, which under the
+        -- old order would have excused its own edit and every other.
+        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
+        plan ← planAgainst fixture (seeded fixture)
+        -- Appended, so the later definition is the one the module ends with.
+        appendFile
+          (root fixture </> "tools/validation/plan.py")
+          "\n\ndef harmless_prose(path, consumed, catalog):\n    return True\n"
+        (result, _, errors) ←
+          runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "changed the policy that decides what a result means"
+        errors `shouldContain` "tools/validation/plan.py"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "refuses an addition a redirected working tree would hide" $
+      withDirtyFixture $ \fixture plan →
+        withSystemTempDirectory "hetoimasia-elsewhere" $ \elsewhere → do
+          -- `core.worktree` points Git's own listing at a clean directory the
+          -- commands will never read, while they still run here.
+          void $ gitIn fixture ["config", "core.worktree", elsewhere]
+          writeFixtureFile (root fixture) "cabal.project.local" "package demo\n"
+          others ← gitIn fixture ["ls-files", "--others"]
+          others `shouldNotContain` "cabal.project.local"
+          refusesDirty fixture plan ["cabal.project.local"]
 
     it "refuses a relevant addition that the repository's own ignore rules hide" $
       withDirtyFixture $ \fixture plan → do
@@ -762,10 +794,18 @@ withDirtyFixture action = withFixture $ \fixture → do
 -- | Execute the floor group and require a refusal that names every path given
 -- and leaves no receipt behind.
 refusesDirty ∷ Fixture → FilePath → [String] → IO ()
-refusesDirty fixture plan paths = do
+refusesDirty = refusesWith "uncommitted changes"
+
+-- | The same, for a difference under a policy root: that one is refused before
+-- any classification, because the classifier is one of the files it covers.
+refusesPolicy ∷ Fixture → FilePath → [String] → IO ()
+refusesPolicy = refusesWith "changed the policy that decides what a result means"
+
+refusesWith ∷ String → Fixture → FilePath → [String] → IO ()
+refusesWith reason fixture plan paths = do
   (result, _, errors) ← runGroup fixture "build.pass" plan []
   result `shouldBe` ExitFailure 2
-  errors `shouldContain` "uncommitted changes"
+  errors `shouldContain` reason
   mapM_ (shouldContain errors) paths
   doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
 
@@ -837,6 +877,22 @@ planWith fixture arguments name = do
   let target = root fixture </> name
   writeFile target output
   pure target
+
+-- | Copy one of the real tools into the fixture's own tree, so an example can
+-- drive the checkout's copy the way a hosted worker does.
+vendorTool ∷ Fixture → FilePath → IO ()
+vendorTool fixture name = do
+  createDirectoryIfMissing True (root fixture </> "tools/validation")
+  copyFile (tools fixture </> name) (root fixture </> "tools/validation" </> name)
+
+-- | Execute a group through a nominated runner rather than the checkout's.
+runFrom ∷ Fixture → FilePath → String → FilePath → IO (ExitCode, String, String)
+runFrom fixture runner group plan =
+  run
+    (environment fixture)
+    (root fixture)
+    "python3"
+    [runner, group, "--plan", plan, "--receipts", receiptsDirectory fixture]
 
 runGroup ∷ Fixture → String → FilePath → [String] → IO (ExitCode, String, String)
 runGroup fixture group plan extra =
