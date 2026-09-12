@@ -451,16 +451,22 @@ The comparison is against the **candidate**, not the head. A plan resolved with
 a `--candidate` that differs from its head still runs from a checkout of that
 candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
 
-**The classifier is checked before it is consulted.** `plan.py` decides what
-counts as harmless prose, and it lives under `tools/validation/` — so it is one
-of the inputs it would be classifying, and a checkout that had edited it could
-otherwise have that edit excuse itself. The differences above are therefore
-found first, using only the runner's own code, and **any** difference under a
-mandatory policy root — `tools/validation/` or `.github/workflows/` — is refused
-outright, with no classification at all. Only then is `plan.py` imported, which
-is also the first moment this run knows the copy on disk is the candidate's.
-Those two roots are restated in the runner rather than read from the catalog or
-the planner, because both of those live under them.
+**The candidate's own code is checked before any of it runs.** `plan.py` decides
+what counts as harmless prose and `receipts.py` supplies the plan contract and
+writes the receipt — and both live under `tools/validation/`, so both are
+mandatory policy inputs of the candidate this run has not yet confirmed it is
+standing in. Importing either first would execute code out of the mutable
+checkout: an edited classifier could excuse its own edit, and an edited contract
+could forge a receipt while its own path was still unexamined.
+
+So the runner reads the plan's candidate for itself, with the standard library
+alone, proves the checkout with its own code and Git plumbing, and refuses
+**any** difference under a mandatory policy root — `tools/validation/` or
+`.github/workflows/` — outright, with no classification at all. Only then are
+`receipts` and `plan` imported, which is the first moment this run knows the
+copies on disk are the candidate's. Those two roots are restated in the runner
+rather than read from the catalog or the planner, because both of those live
+under them.
 
 The floor this cannot reach past is `run.py` itself: a checkout that has edited
 the runner is not running the runner. The hosted workers check the candidate out
@@ -544,13 +550,24 @@ questions are answered by comparing modes and object ids directly:
   target, a regular file its contents, and a directory or device holds no blob
   at all — so a type change is a change, a mode change is a change, and no
   filter sits between the file and the answer; and
-- **every added file**, which is the unstaged form of an addition — found by
-  walking the filesystem under the root the command will run in, rather than by
-  asking Git. `git ls-files --others` answers for whichever working tree Git has
-  been pointed at, and a repository-local `core.worktree` or an inherited
-  `GIT_WORK_TREE` can make that a different directory entirely. Every Git query
-  the check does make is asked in an environment stripped of the variables that
-  redirect one — `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and their kin.
+- **every addition** — found by walking the filesystem under the root the
+  command will run in, rather than by asking Git. `git ls-files --others`
+  answers for whichever working tree Git has been pointed at, and a
+  repository-local `core.worktree` or an inherited `GIT_WORK_TREE` can make that
+  a different directory entirely. A **directory** counts as an addition too,
+  because Git records no empty ones: a directory the candidate's own paths do
+  not put in the tree is content the candidate does not have, and a command can
+  read it — a check for an empty directory under a declared input, say. Such a
+  directory is named and not descended into, since everything beneath it is
+  equally an addition.
+
+Every Git query the check does make is asked in an environment stripped of the
+variables that redirect one — `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and
+their kin — and with `GIT_NO_REPLACE_OBJECTS` set. A `refs/replace` entry for
+the candidate's tree would otherwise leave `rev-parse HEAD` and
+`rev-parse HEAD^{tree}` reporting the planned identifiers while every listing,
+index, and checked-out file described some other tree: a different revision
+wearing the candidate's name.
 
 A **submodule** gets all three asked of it too, recursively. A gitlink records
 one commit and says nothing about the tree beside it, so a submodule sitting at
@@ -1241,8 +1258,11 @@ a tracked symlink replaced by a regular file of the same text under
 `core.symlinks=false`, a declared-generated basename sitting under a
 consumed input or a mandatory policy root, and a submodule resting at exactly
 the candidate's commit while carrying an edited input, a classifier the checkout
-has edited to call every path harmless, and an addition a redirected
-`core.worktree` keeps out of Git's own listing — each refused by name.
+has edited to call every path harmless, a receipt contract edited the same way
+and refused without being imported, an addition a redirected `core.worktree`
+keeps out of Git's own listing, an added directory the candidate cannot contain,
+and a tree substituted for the candidate's by a `refs/replace` entry — each
+refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

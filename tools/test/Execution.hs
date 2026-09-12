@@ -356,6 +356,48 @@ spec = describe "Validation execution" $ do
         errors `shouldContain` "tools/validation/plan.py"
         doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
 
+    it "refuses an edited receipt contract without importing it" $
+      withFixture $ \fixture → do
+        -- `receipts.py` supplies the plan contract and writes the receipt, so
+        -- importing a dirty copy would run its code — and let it forge one —
+        -- before anything had looked at its path.
+        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
+        plan ← planAgainst fixture (seeded fixture)
+        appendFile
+          (root fixture </> "tools/validation/receipts.py")
+          "\n\nimport sys\nprint('the dirty contract ran', file=sys.stderr)\n"
+        (result, _, errors) ←
+          runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "changed the policy that decides what a result means"
+        errors `shouldContain` "tools/validation/receipts.py"
+        errors `shouldNotContain` "the dirty contract ran"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "refuses a tree substituted for the candidate's by a replacement object" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "the candidate's own source\n"
+        candidateTree ← revision fixture "HEAD^{tree}"
+        plan ← planAgainst fixture (seeded fixture)
+        change fixture "src/note.txt" "another revision's source\n"
+        otherTree ← revision fixture "HEAD^{tree}"
+        void $ gitIn fixture ["reset", "-q", "--hard", "HEAD~1"]
+        -- The replacement leaves both identifiers reporting the candidate while
+        -- every listing and every file describes the other tree.
+        void $ gitIn fixture ["replace", candidateTree, otherTree]
+        void $ gitIn fixture ["reset", "-q", "--hard", "HEAD"]
+        revision fixture "HEAD^{tree}" `shouldReturn` candidateTree
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses an added directory the candidate cannot contain" $
+      withDirtyFixture $ \fixture plan → do
+        -- Git records no empty directory, so one here is content the candidate
+        -- does not have — and a command under a declared input can read it.
+        createDirectoryIfMissing True (root fixture </> "src/scratch")
+        refusesDirty fixture plan ["src/scratch/"]
+
     it "refuses an addition a redirected working tree would hide" $
       withDirtyFixture $ \fixture plan →
         withSystemTempDirectory "hetoimasia-elsewhere" $ \elsewhere → do

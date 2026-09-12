@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import signal
@@ -45,10 +46,22 @@ from datetime import datetime, timezone
 # turned off before the imports that would create it.
 sys.dont_write_bytecode = True
 
-import receipts
-from receipts import EvidenceError
+# Neither ``receipts`` nor ``plan`` is imported here, and that is the whole
+# bootstrap. Both live under ``tools/validation/``, so both are mandatory policy
+# inputs of the very candidate this run has not yet confirmed it is standing in;
+# importing either would execute code out of the mutable checkout before
+# anything had established it is the candidate's — code that supplies the
+# receipt contract and the classification the check itself depends on. So this
+# module reads the plan's candidate for itself, proves the checkout with its own
+# code and Git plumbing alone, refuses any difference under a policy root, and
+# only then imports them. See `main`.
 
-# ``plan`` is deliberately *not* imported here. It is the candidate's own
+
+class ProvenanceError(Exception):
+    """A refusal reported instead of an execution."""
+
+
+# ``plan`` is deliberately not imported here either. It is the candidate's own
 # classifier, loaded from the checkout being validated, so importing it would
 # run code this run has not yet established is the candidate's — and its
 # `harmless_prose` is exactly what decides whether an edit to it matters. The
@@ -79,12 +92,21 @@ REDIRECTING_GIT_VARIABLES = (
 
 
 def git_environment() -> dict:
-    """The environment Git is asked in, with every redirection removed."""
-    return {
+    """The environment Git is asked in, with every substitution removed.
+
+    Replacement objects are refused as well as redirection. A `refs/replace`
+    entry for the candidate's tree leaves ``rev-parse HEAD`` and
+    ``rev-parse HEAD^{tree}`` reporting the planned identifiers while every
+    listing, index, and checked-out file describes some other tree — which is
+    exactly a different revision wearing the candidate's name.
+    """
+    environment = {
         name: value
         for name, value in os.environ.items()
         if name not in REDIRECTING_GIT_VARIABLES
     }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
 
 # How long a timed-out process group is given to exit on SIGTERM before it is
 # killed outright.
@@ -101,7 +123,7 @@ def git_output(root: str, *arguments: str) -> str:
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
-        raise EvidenceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
+        raise ProvenanceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
     return process.stdout.decode("utf-8", errors="replace").strip()
 
 
@@ -117,7 +139,7 @@ def git_records(root: str, *arguments: str) -> list[str]:
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
-        raise EvidenceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
+        raise ProvenanceError("git " + " ".join(arguments) + " failed: " + (stderr or "no output"))
     output = process.stdout.decode("utf-8", errors="replace")
     return [field for field in output.split("\0") if field]
 
@@ -126,7 +148,7 @@ def object_format(root: str) -> str:
     """The hash this repository names its objects with."""
     algorithm = git_output(root, "rev-parse", "--show-object-format")
     if algorithm not in ("sha1", "sha256"):
-        raise EvidenceError(
+        raise ProvenanceError(
             f"this repository names objects with {algorithm!r}, which is not read here"
         )
     return algorithm
@@ -168,7 +190,7 @@ def worktree_entry(root: str, path: str, algorithm: str) -> tuple[str, str] | No
         with open(absolute, "rb") as handle:
             content = handle.read()
     except OSError as error:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"cannot read {path} to compare it with the candidate: {error}"
         ) from error
     mode = "100755" if status.st_mode & 0o111 else "100644"
@@ -187,7 +209,7 @@ def head_entries(root: str, commit: str) -> dict[str, tuple[str, str, str]]:
         metadata, separator, path = record.partition("\t")
         fields = metadata.split()
         if not separator or len(fields) != 3 or not path:
-            raise EvidenceError(f"cannot read the tree of {commit}: unexpected entry {record!r}")
+            raise ProvenanceError(f"cannot read the tree of {commit}: unexpected entry {record!r}")
         mode, kind, object_name = fields
         entries[path] = (mode, kind, object_name)
     return entries
@@ -201,7 +223,7 @@ def index_entries(root: str) -> tuple[dict[str, tuple[str, str]], set[str]]:
         metadata, separator, path = record.partition("\t")
         fields = metadata.split()
         if not separator or len(fields) != 3 or not path:
-            raise EvidenceError(f"cannot read this checkout's index: unexpected entry {record!r}")
+            raise ProvenanceError(f"cannot read this checkout's index: unexpected entry {record!r}")
         mode, object_name, stage = fields
         if stage != "0":
             conflicted.add(path)
@@ -272,7 +294,7 @@ def submodule_differences(
         if git_output(inside, "rev-parse", "HEAD") != object_name:
             return {here}, set()
         return checkout_differences(inside, object_name, object_format(inside), here + "/")
-    except EvidenceError:
+    except ProvenanceError:
         return {here}, set()
 
 
@@ -286,10 +308,17 @@ def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]
     command will run in. The filesystem under the root the command uses is the
     only thing that can answer this, so it is read directly.
 
+    A directory is an addition too, and has to be, because Git records no empty
+    ones: a directory the candidate's paths do not put in the tree is content
+    the candidate does not have, and a command can read that — a check for an
+    empty directory under a declared input, say. Such a directory is named and
+    not descended into, since everything beneath it is equally an addition.
+
     A directory carrying its own ``.git`` is another repository. One the
     candidate records as a submodule is compared on its own terms; any other is
     an addition this checkout cannot look inside, and is named as one.
     """
+    implied = implied_directories(recorded)
     found: set[str] = set()
     pending = [(root, "")]
     while pending:
@@ -297,7 +326,9 @@ def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]
         try:
             entries = list(os.scandir(directory))
         except OSError as error:
-            raise EvidenceError(f"cannot read {base or '.'} to compare this checkout: {error}") from error
+            raise ProvenanceError(
+                f"cannot read {base or '.'} to compare this checkout: {error}"
+            ) from error
         for entry in entries:
             if not base and entry.name == ".git":
                 continue
@@ -308,11 +339,22 @@ def added_files(root: str, recorded: set[str], submodules: set[str]) -> set[str]
                 continue
             if relative in submodules:
                 continue
-            if os.path.lexists(os.path.join(entry.path, ".git")):
-                found.add(relative + "/")
+            here = relative + "/"
+            if here not in implied or os.path.lexists(os.path.join(entry.path, ".git")):
+                found.add(here)
                 continue
-            pending.append((entry.path, relative + "/"))
+            pending.append((entry.path, here))
     return found
+
+
+def implied_directories(recorded: set[str]) -> set[str]:
+    """Every directory the recorded paths put in a tree, named with a ``/``."""
+    directories: set[str] = set()
+    for path in recorded:
+        while "/" in path:
+            path = path.rsplit("/", 1)[0]
+            directories.add(path + "/")
+    return directories
 
 
 def generated(planner, path: str, catalog: dict, consumed: set[str]) -> bool:
@@ -351,7 +393,9 @@ def under_policy_root(path: str) -> bool:
     return any(path.startswith(root) or path == root.rstrip("/") for root in POLICY_ROOTS)
 
 
-def relevant_uncommitted(root: str, plan: dict) -> list[str]:
+def relevant_uncommitted(
+    root: str, plan: dict, changed: set[str], added: set[str]
+) -> list[str]:
     """Every uncommitted path that keeps this checkout from being the candidate.
 
     The order here is the point. Differences are found first, with this module's
@@ -376,16 +420,6 @@ def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     `cabal.project.local` that every Cabal command would read. The one exemption
     is what the candidate's catalog declares as a run's own output.
     """
-    changed, added = checkout_differences(
-        root, plan["candidate"]["commit"], object_format(root)
-    )
-    policy = sorted(path for path in changed | added if under_policy_root(path))
-    if policy:
-        raise EvidenceError(
-            "this checkout has changed the policy that decides what a result means, "
-            f"so the candidate {plan['candidate']['commit']} cannot answer for it: "
-            + ", ".join(policy)
-        )
     planner, catalog, packages = candidate_classification(root, plan)
     consumed = planner.consumed_entries(catalog, packages)
     changed |= {path for path in added if not generated(planner, path, catalog, consumed)}
@@ -417,20 +451,45 @@ def candidate_classification(root: str, plan: dict):
         catalog, source = planner.read_catalog(candidate, override, root)
         packages = planner.load_packages(candidate, required=True)
     except PlannerError as failure:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"cannot read the classification this plan was resolved with: {failure}"
         ) from failure
     recorded = plan["catalog"]["candidate_digest"]
     if planner.digest(catalog) != recorded:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"the catalog at {source} is not the one this plan was resolved with "
             f"({recorded[:12]}), so it cannot say what this checkout holds"
         )
     return planner, catalog, packages
 
 
-def confirm_candidate(root: str, plan: dict) -> tuple[str, str]:
-    """Refuse to execute unless this checkout is the plan's candidate.
+def bootstrap_candidate(path: str) -> dict:
+    """The candidate a plan names, read without the candidate's own code.
+
+    ``receipts.load_plan`` is the full contract and is applied later, once the
+    checkout has been proven. This reads only what the proof itself needs, with
+    the standard library alone, because the module that would validate the rest
+    is one of the files the proof is about.
+    """
+    try:
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProvenanceError(f"cannot read plan {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise ProvenanceError(f"plan {path} is not a JSON object")
+    candidate = document.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ProvenanceError(f"plan {path} declares no candidate")
+    commit = candidate.get("commit")
+    tree = candidate.get("tree")
+    if not isinstance(commit, str) or not isinstance(tree, str):
+        raise ProvenanceError(f"plan {path} does not name the candidate's commit and tree")
+    return {"commit": commit, "tree": tree}
+
+
+def confirm_checkout(root: str, candidate: dict) -> tuple[str, str, set[str], set[str]]:
+    """Refuse to go further unless this checkout is the plan's candidate.
 
     The commit is compared as well as the tree because two commits can share a
     tree, and a receipt naming the wrong one would misdescribe what was
@@ -438,29 +497,39 @@ def confirm_candidate(root: str, plan: dict) -> tuple[str, str]:
     the head: a pull request is validated on an integration revision that is
     neither endpoint, and a plan resolved for one still executes from a checkout
     of it.
+
+    A difference under a mandatory policy root ends the run here, before any of
+    the candidate's own code has been imported. That ordering is the point: the
+    classifier and the receipt contract both live under those roots, so a
+    checkout that had edited either could otherwise have the edited copy decide
+    whether its own edit mattered.
+
+    The differences are returned rather than recomputed, because classifying
+    them is the caller's next step once the policy it would classify them with
+    has been shown to be the candidate's.
     """
-    candidate = plan["candidate"]
     executed_commit = git_output(root, "rev-parse", "HEAD")
     executed_tree = git_output(root, "rev-parse", "HEAD^{tree}")
     if executed_commit != candidate["commit"]:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"this checkout is at {executed_commit}, which is not the plan's candidate "
             f"{candidate['commit']}; an execution here would be recorded against a "
             "revision it never read"
         )
     if executed_tree != candidate["tree"]:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"this checkout's tree is {executed_tree}, which is not the candidate "
             f"{candidate['commit']}'s tree {candidate['tree']}"
         )
-    relevant = relevant_uncommitted(root, plan)
-    if relevant:
-        raise EvidenceError(
-            "this checkout carries uncommitted changes to inputs the candidate "
-            f"{candidate['commit']} classifies as relevant, so an execution here would "
-            "not be of that candidate: " + ", ".join(relevant)
+    changed, added = checkout_differences(root, candidate["commit"], object_format(root))
+    policy = sorted(path for path in changed | added if under_policy_root(path))
+    if policy:
+        raise ProvenanceError(
+            "this checkout has changed the policy that decides what a result means, "
+            f"so the candidate {candidate['commit']} cannot answer for it: "
+            + ", ".join(policy)
         )
-    return executed_commit, executed_tree
+    return executed_commit, executed_tree, changed, added
 
 
 def source_run_url() -> str:
@@ -575,24 +644,42 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
 
     root = os.path.abspath(arguments.repo_root or os.getcwd())
-    plan = receipts.load_plan(arguments.plan)
-    identity = receipts.plan_identity(plan)
-    group = receipts.plan_group(plan, arguments.group)
+
+    # Nothing runs, and nothing of the candidate's is imported, until this
+    # checkout is the candidate the plan describes. There is no override: a
+    # revision the receipt would have to be told about is precisely the one no
+    # execution here can vouch for.
+    executed_commit, executed_tree, changed, added = confirm_checkout(
+        root, bootstrap_candidate(arguments.plan)
+    )
+
+    # The policy under this checkout is now known to be the candidate's, so its
+    # own modules may be read.
+    import receipts
+    from receipts import EvidenceError
+
+    try:
+        plan = receipts.load_plan(arguments.plan)
+        identity = receipts.plan_identity(plan)
+        group = receipts.plan_group(plan, arguments.group)
+        # The declared toolchain is exactly what reuse compares against the
+        # candidate's pinned versions, so the interpreter this runner happens
+        # to be is recorded beside it rather than inside it.
+        toolchain = receipts.parse_toolchain(arguments.toolchain)
+    except EvidenceError as failure:
+        raise ProvenanceError(str(failure)) from failure
     if not group["selected"]:
-        raise EvidenceError(
+        raise ProvenanceError(
             f"the plan did not select {arguments.group!r} ({group['reason']}); "
             "an omitted group has no execution to record"
         )
-
-    # Nothing runs until this checkout is the candidate the plan describes.
-    # There is no override: a revision the receipt would have to be told about
-    # is precisely the one no execution here can vouch for.
-    executed_commit, executed_tree = confirm_candidate(root, plan)
-
-    # The declared toolchain is exactly what reuse compares against the
-    # candidate's pinned versions, so the interpreter this runner happens to
-    # be is recorded beside it rather than inside it.
-    toolchain = receipts.parse_toolchain(arguments.toolchain)
+    relevant = relevant_uncommitted(root, plan, changed, added)
+    if relevant:
+        raise ProvenanceError(
+            "this checkout carries uncommitted changes to inputs the candidate "
+            f"{plan['candidate']['commit']} classifies as relevant, so an execution here "
+            "would not be of that candidate: " + ", ".join(relevant)
+        )
 
     command = list(group["command"])
     timeout_seconds = group["timeout_seconds"]
@@ -604,7 +691,7 @@ def main(argv: list[str]) -> int:
     try:
         status, timed_out, duration, started_at, ended_at = execute(command, root, timeout_seconds)
     except OSError as error:
-        raise EvidenceError(f"cannot execute {arguments.group}: {error}") from error
+        raise ProvenanceError(f"cannot execute {arguments.group}: {error}") from error
 
     if timed_out:
         outcome = "timeout"
@@ -638,7 +725,10 @@ def main(argv: list[str]) -> int:
         "policy_version": plan["policy_version"],
         "source_run_url": arguments.source_run_url or source_run_url(),
     }
-    written = receipts.write_receipt(arguments.receipts, receipt)
+    try:
+        written = receipts.write_receipt(arguments.receipts, receipt)
+    except EvidenceError as failure:
+        raise ProvenanceError(str(failure)) from failure
     print(
         f"validation: {arguments.group} {outcome} after {duration:.1f}s "
         f"(exit {status}); receipt {written}",
@@ -650,6 +740,6 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except EvidenceError as failure:
+    except ProvenanceError as failure:
         print(f"error: {failure}", file=sys.stderr)
         sys.exit(2)
