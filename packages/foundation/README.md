@@ -7,7 +7,8 @@ validated component names, pure filter configuration, immutable scoped context,
 injectable clock and thread metadata, a deterministic one-line record layout,
 and two sinks: a borrowed handle and a caller-supplied callback; and a CPU
 resource scope that pairs an acquisition with a protected release, including a
-staged constructor for an owner assembled from several parts.
+staged constructor for an owner assembled from several parts and a continuation
+facade those scopes are composed in.
 
 Configuration is resolved once and never reconfigured in place. The pure parsers
 `parseLogLevel`, `parseComponentLevels`, and `parseDebugSelection` validate the
@@ -45,9 +46,18 @@ far and a failure at any stage releases exactly those. The order that release
 runs in is declared with `releaseRank`, because the correct order is a property
 of the API the parts come from rather than the reverse of acquisition.
 
+`Scoped` is the continuation facade over both. `allocResource` and
+`allocComposite` yield a scope value that composes in `do` notation instead of
+nesting one callback per resource, `withScoped` is its only runner, and
+`locally` is its only early-release operation. No lifetime changes: a resource
+allocated this way is released when the enclosing `withScoped` continuation
+returns or throws, one scope's own allocations unwind in reverse, and a
+composite keeps its declared order.
+
 See [docs/resources.md](../../docs/resources.md) for the failure table, the
 ownership and borrowing rules, the mask discipline and its limits, the staged
-construction contract, and the caller patterns that discard retained evidence.
+construction contract, the facade's cleanup point and documented misuse, and
+the caller patterns that discard retained evidence.
 
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when

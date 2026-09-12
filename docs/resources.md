@@ -8,13 +8,14 @@ D-6 through D-8); this document describes what the code does today.
 Scope: the scope primitive, ownership and borrowing of the scoped value, the
 argument order, the failure table, the mask discipline, what the release
 guarantee does and does not cover, how to inspect and how not to discard the
-secondary failures a scope retains, and the staged constructor an owner built
-from several parts is assembled with.
+secondary failures a scope retains, the staged constructor an owner built from
+several parts is assembled with, and the continuation facade those scopes are
+composed in.
 
-The continuation facade (`Scoped`, `allocResource`, `locally`, `withScoped`),
-runtime composition, and anything involving Vulkan, GPU completion, retirement
-queues, ownership transfer, or public early release are not part of it yet. This module imports no logger, runtime
-environment, graphics, or scripting module, and owns no application state.
+Runtime composition and anything involving Vulkan, GPU completion, retirement
+queues, ownership transfer, or public early release are not part of it yet.
+This module imports no logger, runtime environment, graphics, or scripting
+module, and owns no application state.
 
 ## Public interface
 
@@ -248,6 +249,102 @@ it, once, including through an enclosing `withResource`.
   no public early-release tokens, and no way to move a part to another live
   owner.
 
+## The continuation facade
+
+```haskell
+data Scoped a            -- Functor, Applicative, Monad, MonadIO
+
+withScoped     ∷ Scoped a → forall r. (a → IO r) → IO r
+allocResource  ∷ IO a → (a → IO ()) → Scoped a
+allocComposite ∷ Assembly a → Scoped a
+locally        ∷ Scoped a → Scoped a
+```
+
+`allocResource` takes the acquisition first and the release second, as
+`withResource` and `bracket` do. Synarchy's release-first order is not carried
+over, and the primed compatibility helpers have no successor here.
+
+A `Scoped` value is a scope that has not been entered yet. Binding two of them
+nests the second inside the first, so each allocation is one line of a `do`
+block instead of one more level of callback indentation:
+
+```haskell
+stagedUpload ∷ Device → Scoped Upload
+stagedUpload device = do
+  staging ← allocResource (createStaging device) (destroyStaging device)
+  target  ← allocComposite (allocation device)
+  size    ← liftIO (measure staging)
+  pure (Upload staging target size)
+
+withScoped (stagedUpload device) $ \upload → run upload
+```
+
+The facade changes no lifetime. `withScoped (allocResource acquire release)` is
+`withResource acquire release`, and `allocComposite` runs its assembly under
+the same staged protection `withComposite` gives it. Every row of the failure
+table, the mask discipline, and the retained evidence are the primitive's
+unchanged: the direct path and the continuation path produce the same primary
+exception and the same ordered secondary failures for the same outcomes.
+
+`Scoped` is opaque and `withScoped` is the only runner. There is no way to
+resume a scope's continuation, take a scope apart, or install cleanup for a
+resource acquired elsewhere. A scope is built with `allocResource`,
+`allocComposite`, `locally`, `pure`, `liftIO`, and the instances above, and is
+consumed by running it.
+
+`allocComposite` allocates; it is not a second runner. Composite construction
+is still written with `acquirePart` and `restoredStep`, and `withComposite`
+remains the way to enter such a scope directly.
+
+### The cleanup point
+
+A resource allocated with `allocResource` is released when the enclosing
+`withScoped` continuation returns or throws — **not** at the end of the `do`
+block that allocated it. The rest of the block, and the final callback given to
+`withScoped`, both run inside that resource's lifetime. This is the property
+Synarchy's `allocResource'` existed to work around, and `locally` is the
+supported way to end a group of lifetimes early.
+
+A failed action in a scope never runs a later acquisition: everything after it
+is inside its continuation.
+
+### Release order
+
+One scope releases its own allocations in reverse allocation order, on success,
+on failure, and on asynchronous cancellation. That order is the scope's own
+lifetime boundary, not a global rule across nested ones: a `locally` releases
+its inner allocations before the outer scope resumes, and a composite released
+by the scope keeps the order its constructor declared with `releaseRank`. A
+different order within one scope needs the composite constructor above, not a
+positioning trick.
+
+### `locally`
+
+`locally inner` runs `inner` to completion, releases everything `inner`
+allocated, and only then continues the enclosing scope with `inner`'s result.
+Staging work whose buffers must be gone before the rest of a block runs is the
+case it exists for.
+
+Its result must be an ordinary, fully evaluated value. The inner scope's
+allocations are already released when the outer scope resumes, so a borrowed
+handle returned from `inner` is a handle whose cleanup has run.
+
+Cleanup failures inside `locally` propagate into the enclosing scope under the
+failure table and are retained there as evidence `cleanupFailures` reads back,
+beside anything the outer scope's own releases add.
+
+### Borrowing and documented misuse
+
+A scoped callback borrows its values, under the same rules as `withResource`.
+Do not return a borrowed value, or anything whose validity depends on one, out
+of `withScoped` or `locally`; return ordinary results.
+
+`withScoped scope pure` is the documented misuse: it hands back a handle whose
+cleanup has already run. The type does not prevent it — `pure` is a legitimate
+continuation when the scope's result is an ordinary value — so this contract
+and the examples forbid it for borrowed ones. There is no escape operation, no
+transfer operation, and no public early-release token in this arc.
+
 ## Inspecting secondary failures
 
 ```haskell
@@ -356,5 +453,15 @@ in both its acquisition-order and its reordered form, a throwing rollback
 release, the cancellation cases above, and the whole construction nested inside
 `withResource`. They drive it through the fake buffer of
 `test/Test/Engine/Resources/Buffer.hs`, which models exactly the four steps
-this contract needs and ships in no library. The validation catalog covers them through the floor group
+this contract needs and ships in no library.
+
+The facade examples in the same file add the cleanup point observed from the
+final callback, reverse-allocation release on success, failure, and
+cancellation, a failed action leaving a later acquisition unrun, the `MonadIO`
+path, composition through `fmap` and `<*>`, the direct and continuation paths
+agreeing on one resource and on nested ones, `locally` releasing before the
+outer scope resumes while its ordinary result survives, a `locally` cleanup
+failure reaching the outer scope's evidence, and two composites allocated
+through the facade keeping their declared order while the scope unwinds in
+reverse. The validation catalog covers them through the floor group
 `test.engine`; see [validation.md](validation.md).

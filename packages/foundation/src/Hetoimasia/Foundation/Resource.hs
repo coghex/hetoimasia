@@ -39,6 +39,17 @@
 -- declared with 'releaseRank', because the correct order is a property of the
 -- API the parts come from rather than the reverse of acquisition.
 --
+-- 'Scoped' is the continuation facade over these scopes. 'allocResource' pairs
+-- an acquisition with a release and yields a scope value that composes in @do@
+-- notation instead of nesting one callback per resource, and 'allocComposite'
+-- does the same for a composite's 'Assembly'. The facade changes no lifetime:
+-- a resource allocated this way is released when the enclosing 'withScoped'
+-- continuation returns or throws, not at the end of the @do@ block that
+-- allocated it, and 'locally' is the only way to end a group of lifetimes
+-- early. One scope releases its own allocations in reverse allocation order,
+-- while a composite allocated inside it keeps the order its constructor
+-- declared.
+--
 -- Retained evidence is read back with 'cleanupFailures', which needs no
 -- logger. Every rethrow inside this module preserves the primary exception's
 -- 'Control.Exception.Context.ExceptionContext', so an annotation attached
@@ -61,6 +72,13 @@ module Hetoimasia.Foundation.Resource
   , restoredStep
   , ReleaseRank
   , releaseRank
+
+    -- * Continuation facade
+  , Scoped
+  , withScoped
+  , allocResource
+  , allocComposite
+  , locally
 
     -- * Retained cleanup failures
   , CleanupFailure
@@ -92,6 +110,7 @@ import Control.Exception.Context
   , addExceptionAnnotation
   , getExceptionAnnotations
   )
+import Control.Monad.IO.Class (MonadIO (liftIO))
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (sortOn)
 import Data.Text (Text)
@@ -451,3 +470,97 @@ retainCleanupFailures
 retainCleanupFailures failures primary = foldl' retain primary failures
   where
     retain carried failure = retainCleanupFailure failure carried
+
+-- | A scoped allocation, composed in @do@ notation.
+--
+-- A 'Scoped' value is a scope that has not been entered yet: it knows how to
+-- acquire something, lend it to a continuation, and release it afterwards.
+-- Binding two of them nests the second scope inside the first, so an
+-- allocation reads as one line of a @do@ block rather than one more level of
+-- callback indentation, and the lifetimes are exactly the ones the nested
+-- callbacks would have given.
+--
+-- The constructor is private and 'withScoped' is the only runner. There is no
+-- way to resume a scope's continuation, to take a scope apart, or to install
+-- cleanup for a resource acquired elsewhere; a scope is built with
+-- 'allocResource', 'allocComposite', 'locally', 'pure', 'liftIO', and the
+-- instances below, and it is consumed by running it.
+newtype Scoped a = Scoped
+  { withScoped ∷ ∀ r. (a → IO r) → IO r
+    -- ^ Enter the scope, run the continuation with what it allocated, and
+    -- release everything it allocated when that continuation returns or
+    -- throws.
+    --
+    -- The continuation borrows the values under the borrowing rules of
+    -- 'withResource'. Running a scope with 'pure' as the continuation is the
+    -- documented misuse: it returns a handle whose cleanup has already run.
+    -- Return ordinary, fully evaluated results instead.
+  }
+
+instance Functor Scoped where
+  fmap change scope = Scoped (\continue → withScoped scope (continue . change))
+
+instance Applicative Scoped where
+  -- A scope that allocates nothing: the continuation runs directly, so there
+  -- is no release and no masking to impose.
+  pure value = Scoped (\continue → continue value)
+  change <*> scope =
+    Scoped $ \continue →
+      withScoped change (\apply → withScoped scope (continue . apply))
+
+instance Monad Scoped where
+  -- The rest of the block runs inside the first scope, which is what makes the
+  -- release point the end of the enclosing continuation rather than the end of
+  -- this bind, and what unwinds the allocations of one scope in reverse.
+  scope >>= rest =
+    Scoped $ \continue →
+      withScoped scope (\value → withScoped (rest value) continue)
+
+instance MonadIO Scoped where
+  -- An ordinary action in the middle of a block. It owns nothing, so a failure
+  -- here unwinds the allocations made before it and runs no later acquisition.
+  liftIO action = Scoped (\continue → action >>= continue)
+
+-- | Allocate a resource for the rest of the enclosing scope.
+--
+-- The acquisition comes first and the release second, as in 'withResource',
+-- and the lifetime and failure behavior are that primitive's exactly:
+-- @'withScoped' ('allocResource' acquire release)@ is @'withResource' acquire
+-- release@. The acquisition is protected, the release runs under
+-- 'uninterruptibleMask_', the body's failure stays primary, and every cleanup
+-- failure is retained as inspectable evidence.
+--
+-- The release runs when the enclosing 'withScoped' continuation returns or
+-- throws, not at the end of the @do@ block this line appears in. A group of
+-- lifetimes that must end earlier belongs in 'locally'.
+allocResource ∷ IO a → (a → IO ()) → Scoped a
+allocResource acquire release = Scoped (withResource acquire release)
+
+-- | Allocate a composite owner for the rest of the enclosing scope.
+--
+-- This is 'allocResource' for a value built with 'withComposite': the assembly
+-- is run under the same staged protection, and the enclosing scope releases
+-- its parts in the order 'releaseRank' declared. Reverse allocation order
+-- applies between the allocations of one scope, not inside a composite, whose
+-- internal order is a property of the API its parts come from.
+--
+-- It allocates; it does not run a scope or resume one. Constructing the
+-- assembly is still 'acquirePart' and 'restoredStep', and a scope is still
+-- entered only through 'withScoped'.
+allocComposite ∷ Assembly a → Scoped a
+allocComposite assembly = Scoped (withComposite assembly)
+
+-- | End a group of lifetimes before the enclosing scope does.
+--
+-- @'locally' inner@ runs @inner@ to completion, releases everything @inner@
+-- allocated, and only then continues the enclosing scope with @inner@'s
+-- result. Staging work whose buffers must be gone before the rest of a block
+-- runs is the case this exists for.
+--
+-- The result must be an ordinary, fully evaluated value: the inner scope's
+-- allocations are already released when the outer scope resumes, so a borrowed
+-- handle returned from @inner@ is a handle whose cleanup has run. Cleanup
+-- failures inside @inner@ propagate into the enclosing scope under the failure
+-- table and are retained there as evidence 'cleanupFailures' reads back.
+locally ∷ Scoped a → Scoped a
+locally inner = Scoped (\continue → withScoped inner pure >>= continue)
