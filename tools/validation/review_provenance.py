@@ -81,8 +81,10 @@ WORKFLOW_IDENTITY = "github-actions[bot]"
 # neither is taken from any other author. Anything the owner posts that opens
 # like one of these and is not one is malformed evidence, which the proof
 # refuses rather than reads past: a truncated withdrawal must not leave the
-# approval it withdrew standing.
-REVIEW_OPENING = re.compile(r"<!--\s*pr-review:v")
+# approval it withdrew standing. Openings are recognised in any case, so a
+# differently cased marker is refused rather than overlooked; the marker
+# itself is matched exactly as the coordinator publishes it.
+REVIEW_OPENING = re.compile(r"<!--\s*pr-review:v", re.IGNORECASE)
 REVIEW_MARKER = re.compile(
     r"<!--\s*pr-review:v(?:2\s+reviewers=(?:claude|codex)(?:,(?:claude|codex))*\s+models=\S+"
     r"|1\s+reviewer=(?:claude|codex))\s+"
@@ -94,7 +96,7 @@ REVIEW_MARKER = re.compile(
 # wrote it. Its `origin` is the canonically approved revision that decision
 # traced the carry back to; the proof below re-walks the links rather than
 # trusting that field.
-RECORD_OPENING = re.compile(r"<!--\s*approval-provenance:")
+RECORD_OPENING = re.compile(r"<!--\s*approval-provenance:", re.IGNORECASE)
 CARRY_RECORD = re.compile(
     r"<!--\s*approval-provenance:v1\s+origin=(?P<origin>[0-9a-fA-F]{40})\s+"
     r"before=(?P<before>[0-9a-fA-F]{40})\s+after=(?P<after>[0-9a-fA-F]{40})\s+"

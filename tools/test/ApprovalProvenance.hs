@@ -207,6 +207,8 @@ spec = describe "Approval provenance" $ do
           , "<!-- pr-review:v3 reviewers=codex models=x head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
           , "<!-- pr-review:v2 reviewers=codex models=x head=" ++ take 12 reviewed ++ " verdict=CHANGES_REQUESTED -->"
           , approvalMarker reviewed "CHANGES_REQUESTED" ++ " " ++ approvalMarker reviewed "CHANGES_REQUESTED"
+          , "<!-- PR-REVIEW:V2 reviewers=codex models=x head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
+          , "<!-- pr-review:v2 reviewers=codex models=x\ny head=" ++ reviewed ++ " verdict=CHANGES_REQUESTED -->"
           ]
 
     it "strips when a workflow comment opens like a carry record but is not one" $
@@ -224,6 +226,17 @@ spec = describe "Approval provenance" $ do
             second
         value "provenance_reason" (provenanceOutput decision) `shouldContain` "malformed or duplicated carry record"
         shouldRemove decision
+        cased ←
+          decide
+            fixture
+            [ approvedBy owner reviewed
+            , carriedBy workflow 1 reviewed reviewed first
+            , Comment workflow ("<!-- APPROVAL-PROVENANCE:v1 origin=" ++ reviewed ++ " before=" ++ reviewed ++ " after=" ++ first ++ " run=1 attempt=1 -->")
+            ]
+            first
+            second
+        value "provenance_reason" (provenanceOutput cased) `shouldContain` "malformed or duplicated carry record"
+        shouldRemove cased
 
     it "reads past prose that merely mentions the marker's name" $
       withFixture $ \fixture → do

@@ -330,6 +330,38 @@ spec = describe "Stale approval mutation" $ do
             unwords (calls outcome) `shouldNotContain` "-X POST"
             summary outcome `shouldContain` "- `reviewed:approve`: removed"
 
+      it "recognises a differently cased marker opening as evidence it cannot read" $
+        -- Openings are found in any case; only the exact marker is canonical.
+        withStep
+          settled
+            { markers =
+                posted
+                  [ approvalMarker pushedHead "APPROVE"
+                  , "<!-- PR-REVIEW:V2 reviewers=codex models=unspecified head=" ++ pushedHead ++ " verdict=CHANGES_REQUESTED -->"
+                  ]
+            }
+          "remove"
+          "removed"
+          $ \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+            output outcome `shouldContain` "malformed or incomplete"
+
+      it "does not let whitespace inside the model token pass as a canonical approval" $
+        -- The grammar here is the script's grammar: a token the decision
+        -- would have refused cannot reverse the removal it decided on.
+        withStep
+          settled
+            { markers =
+                posted ["<!-- pr-review:v2 reviewers=codex models=x\ny head=" ++ pushedHead ++ " verdict=APPROVE -->"]
+            }
+          "remove"
+          "removed"
+          $ \outcome → do
+            result outcome `shouldBe` ExitSuccess
+            calls outcome `shouldSatisfy` any (isInfixOf "--remove-label")
+            output outcome `shouldContain` "malformed or incomplete"
+
       it "treats a well-shaped but unreal timestamp the same way" $
         withStep
           settled

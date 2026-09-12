@@ -281,9 +281,10 @@ jobs:
           # This job runs no repository code, so the rules review_provenance.py
           # applies are applied here in the runner's own jq: every comment
           # has to carry a usable id, a real timestamp, an author, and a body,
-          # every owner comment that opens like a marker has to be exactly
-          # one canonical marker, and only then does the newest marker for
-          # this head decide. A feed that fails those rules proves nothing:
+          # every owner comment that opens like a marker, in any case, has to
+          # be exactly one canonical marker in the grammar review_provenance.py
+          # accepts, and only then does the newest marker for this head
+          # decide. A feed that fails those rules proves nothing:
           # it never reverses a planned removal, and it turns a planned keep
           # into a removal rather than confirm an approval it cannot read. A
           # read that fails outright is not an empty one: acting on it could
@@ -308,9 +309,9 @@ jobs:
                 and (.user | type == "object" and (.login | type == "string" and test("\\S")))
                 and (.body | type == "string");
               def canonical:
-                "<!-- pr-review:v(?:2 reviewers=(?:claude|codex)(?:,(?:claude|codex))* models=[^ ]+|1 reviewer=(?:claude|codex)) "
-                + "head=(?<head>[0-9a-fA-F]{40}) verdict=(?<verdict>APPROVE|CHANGES_REQUESTED) -->";
-              def openings: [scan("<!--\\s*pr-review:v")] | length;
+                "<!--\\s*pr-review:v(?:2\\s+reviewers=(?:claude|codex)(?:,(?:claude|codex))*\\s+models=\\S+|1\\s+reviewer=(?:claude|codex))\\s+"
+                + "head=(?<head>[0-9a-fA-F]{40})\\s+verdict=(?<verdict>APPROVE|CHANGES_REQUESTED)\\s*-->";
+              def openings: [scan("<!--\\s*pr-review:v"; "i")] | length;
               def markers: [match(canonical; "g")];
               [.[][]]
               | if any(.[]; usable | not) then "malformed"

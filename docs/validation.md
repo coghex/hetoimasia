@@ -763,8 +763,10 @@ starting point from the pull request's own comment feed. A revision is a
   exactly one canonical record: one that is truncated, misspelled, names an
   unknown reviewer, or is duplicated is **malformed evidence**, and the whole
   feed then proves nothing, because skipping a malformed withdrawal would
-  leave the approval it withdrew authoritative. Prose that merely mentions a
-  marker's name opens nothing; or
+  leave the approval it withdrew authoritative. Openings are recognised in
+  any case, so a differently cased marker is refused rather than overlooked,
+  while the marker itself is matched exactly as the coordinator publishes it.
+  Prose that merely mentions a marker's name opens nothing; or
 - a head reached from such a revision through an **unbroken chain of recorded
   carries**: one `approval-provenance:v1` record per push, authored by this
   repository's own workflow identity (`github-actions[bot]`), naming the
@@ -846,10 +848,11 @@ exact head while the decision was queued, since the head did not move:
 stripping past a fresh approval would remove a review somebody just granted to
 this very revision, and confirming a keep past a fresh denial would record a
 carry a reviewer just refused. That job runs no repository code, so the same
-rules are applied inline through the runner's own `jq`: every comment has to
-carry the usable fields above, every owner comment that opens like a marker
-has to be exactly one canonical marker, and only then does the newest marker
-naming the event head decide, in both directions. It is applied to the
+rules are applied inline through the runner's own `jq`, with the same marker
+grammar token for token: every comment has to carry the usable fields above,
+every owner comment that opens like a marker, in any case, has to be exactly
+one canonical marker, and only then does the newest marker naming the event
+head decide, in both directions. It is applied to the
 provenance the job publishes whether or not it changes the action: a head
 approved in its own right is a new origin even when the decision was already
 keeping, so no carry is recorded for it, and a denial is reported even when
@@ -1067,9 +1070,11 @@ withdrawal without a timestamp, or with an empty, differently written, or
 well-shaped but unreal one, that would otherwise sort before the approval it
 withdrew — one whose identifier is zero, negative, boolean, or a string, one
 that cannot be attributed or whose author is blank, an owner comment whose
-marker opening is truncated, names an unknown reviewer, or is duplicated, and
-a workflow comment whose record opening is malformed, each stripping, while
-prose that merely mentions the marker's name is not evidence; a review
+marker opening is truncated, names an unknown reviewer, is differently cased,
+carries whitespace inside its model token, or is duplicated, and a workflow
+comment whose record opening is malformed or differently cased, each
+stripping, while prose that merely mentions the marker's name is not
+evidence; a review
 marker by anyone but the owner
 and a carry record by anyone but the workflow, each ignored; a later marker
 withdrawing an approval of the same head and a later one re-establishing it; a
@@ -1121,8 +1126,10 @@ head winning, a fresh approval of some other head
 ignored, a feed read that failed refused before a removal and before a keep
 alike, and the inline feed validation: an older approval of this head followed
 by a truncated denial neither reverses a planned removal nor confirms a
-planned keep, a comment whose timestamp is well-shaped but unreal treated the
-same way, and prose mentioning the marker's name left alone. So is the record
+planned keep, a differently cased opening and whitespace inside a model token
+refused rather than read past, a comment whose timestamp is well-shaped but
+unreal treated the same way, and prose mentioning the marker's name left
+alone. So is the record
 it
 writes: a kept approval recorded at the head it was carried to with the link
 and the recording run attempt named exactly, no record for a head a canonical
