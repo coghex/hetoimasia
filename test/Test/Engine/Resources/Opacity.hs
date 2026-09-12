@@ -1,5 +1,6 @@
--- | Examples proving that 'Hetoimasia.Foundation.Resource.Scoped' is opaque to
--- a client outside the package.
+-- | Examples proving that 'Hetoimasia.Foundation.Resource.Scoped' and
+-- 'Hetoimasia.Foundation.Resource.CleanupFailure' are opaque to a client
+-- outside the package.
 --
 -- The other resource examples import the foundation directly, so they share
 -- this test suite's own module environment and cannot observe what the package
@@ -10,12 +11,19 @@
 -- library's @exposed-modules@ and each module's export list allow, which is the
 -- boundary the opacity claim is about.
 --
--- Three clients are compiled. Two must be rejected, and each is checked against
--- the specific diagnostic that names the rejection's cause, so a missing
--- package, an absent compiler, or an unrelated error can never be mistaken for
--- the guarantee holding. One must be accepted, linked, and run, which is both
--- the control proving the environment is sound and the evidence that closing
--- the representation left the runner and the allocators usable.
+-- Eight clients are compiled, three for the scope facade and five for retained
+-- cleanup evidence. Six must be rejected, and each is checked against the
+-- specific diagnostic that names the rejection's cause, so a missing package,
+-- an absent compiler, or an unrelated error can never be mistaken for the
+-- guarantee holding. Two must be accepted, linked, and run, which is both the
+-- control proving the environment is sound and the evidence that closing each
+-- representation left the supported readers, runners, and allocators usable.
+--
+-- The two boundaries are closed for the same reason but protect different
+-- claims. A rewritten scope would resume a continuation; a rewritten evidence
+-- entry would put two payloads behind one 'CleanupFailureId', and inspection
+-- expands a repeated identity's carried context only the first time it is
+-- seen, so the evidence reachable only through the replacement would be lost.
 --
 -- These are Hspec examples rather than a probe: the work is running a process
 -- and asserting on its output, which this suite already does elsewhere.
@@ -42,7 +50,12 @@ import Test.Hspec
   )
 
 spec ∷ Spec
-spec = describe "Scoped opacity across the package boundary" $ do
+spec = do
+  scopedSpec
+  cleanupEvidenceSpec
+
+scopedSpec ∷ Spec
+scopedSpec = describe "Scoped opacity across the package boundary" $ do
   it "rejects a client that replaces the continuation with record update" $
     withClient "Client.hs" recordUpdateClient $ \compile → do
       outcome ← compile Typecheck
@@ -85,6 +98,61 @@ spec = describe "Scoped opacity across the package boundary" $ do
                    , "release left"
                    , "release outer"
                    ]
+
+cleanupEvidenceSpec ∷ Spec
+cleanupEvidenceSpec =
+  describe "Cleanup evidence opacity across the package boundary" $ do
+    it "rejects a client that replaces an entry's identity with record update" $
+      withReplacementClient
+        "cleanupFailureId"
+        "CleanupFailureId"
+        ["import Hetoimasia.Foundation.Resource (CleanupFailureId)"]
+
+    it "rejects a client that replaces an entry's label with record update" $
+      withReplacementClient
+        "cleanupFailureLabel"
+        "Text"
+        ["import Data.Text (Text)"]
+
+    it "rejects a client that replaces an entry's exception with record update" $
+      withReplacementClient
+        "cleanupFailureException"
+        "ExceptionWithContext SomeException"
+        ["import Control.Exception (ExceptionWithContext, SomeException)"]
+
+    it "rejects a client that names the entry constructor" $
+      withClient "Client.hs" evidenceConstructorClient $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "does not export any children"
+        clientOutput outcome `shouldContain` "CleanupFailure"
+
+    it "accepts and runs a client using only the readers and reattachment" $
+      withClient "Main.hs" evidenceClient $ \compile → do
+        outcome ← compile Link
+        case clientStatus outcome of
+          ExitSuccess → pure ()
+          status →
+            expectationFailure
+              ( "the supported client must compile, but the compiler exited with "
+                  <> show status
+                  <> ":\n"
+                  <> clientOutput outcome
+              )
+        (status, out, err) ←
+          readCreateProcessWithExitCode
+            (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+            ""
+        status `shouldBe` ExitSuccess
+        err `shouldBe` ""
+        lines out
+          `shouldBe` [ "retained = inner buried outer"
+                     , "in context = inner buried outer"
+                     , "identities distinct = True"
+                     , "display = cleanup failed in inner: user error (inner released)"
+                     , "carried by outer = buried"
+                     , "reattached = inner buried outer"
+                     , "outer alone = buried outer"
+                     ]
 
 -- | A compiled client: how the compiler exited, everything it said, and the
 -- directory the client was compiled in.
@@ -296,4 +364,161 @@ runnerClient =
     , "  entries ← reverse <$> readIORef trail"
     , "  putStrLn (\"held = \" <> held)"
     , "  mapM_ putStrLn entries"
+    ]
+
+-- | Compile one field-replacement client and require the compiler to reject it
+-- because the replacement is inaccessible, naming the reader that was reached
+-- for so the three cases cannot pass for each other's reasons.
+withReplacementClient ∷ String → String → [String] → IO ()
+withReplacementClient reader replacementType extraImports =
+  withClient "Client.hs" (replacementClient reader replacementType extraImports) $ \compile → do
+    outcome ← compile Typecheck
+    rejectedBecause outcome "Not in scope: record field"
+    clientOutput outcome `shouldContain` reader
+
+-- | The client from the issue, one field at a time: it replaces part of a
+-- retained entry through record-update syntax, which needs only the field
+-- label in scope.
+--
+-- Each of the three reader names is tried on its own, so a rejection names the
+-- field that was reached for rather than leaving the other two untested. The
+-- reader is imported by name in every case, which is what makes the rejection
+-- mean what the example claims: an unimported label is out of scope whether or
+-- not it is a field, so a client that did not import it would be rejected on
+-- the unrepaired library too.
+--
+-- The entry itself comes in as an argument, because a client can obtain one
+-- only from inspection; what is under test is the rewrite, not the
+-- acquisition.
+replacementClient ∷ String → String → [String] → String
+replacementClient reader replacementType extraImports =
+  unlines $
+    [ "module Client (rewritten) where"
+    , ""
+    ]
+      <> extraImports
+      <> [ "import Hetoimasia.Foundation.Resource (CleanupFailure, " <> reader <> ")"
+         , ""
+         , "rewritten ∷ CleanupFailure → " <> replacementType <> " → CleanupFailure"
+         , "rewritten entry replacement = entry { " <> reader <> " = replacement }"
+         ]
+
+-- | The other half of the same reach: building an entry of the client's own by
+-- naming the constructor.
+--
+-- This one is rejected on master as well, since the type has always been
+-- exported without its children. It is kept as the guard proving that the
+-- field-label route the three cases above close was the only one open.
+evidenceConstructorClient ∷ String
+evidenceConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Control.Exception (ExceptionWithContext, SomeException)"
+    , "import Data.Text (Text)"
+    , "import Hetoimasia.Foundation.Resource"
+    , "  ( CleanupFailure (CleanupFailure)"
+    , "  , CleanupFailureId"
+    , "  )"
+    , ""
+    , "forged ∷ CleanupFailureId → Text → ExceptionWithContext SomeException → CleanupFailure"
+    , "forged = CleanupFailure"
+    ]
+
+-- | A client using only what the evidence boundary offers: the three readers,
+-- both inspection entry points, the renderer, and reattachment of an unchanged
+-- entry through @base@'s annotation API.
+--
+-- The scope it drives fails in three places at once. The body throws; the
+-- inner release throws; and the outer release throws from inside a scope of
+-- its own whose release also threw, so the outer entry carries evidence that
+-- is reachable only by expanding that entry's own retained context. The client
+-- reports observation order, the carried context, and what reattaching entries
+-- that are already present does, which is the case the identity-to-payload
+-- invariant exists to permit.
+evidenceClient ∷ String
+evidenceClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Exception"
+    , "  ( ErrorCall (ErrorCall)"
+    , "  , ExceptionWithContext (ExceptionWithContext)"
+    , "  , SomeException"
+    , "  , someExceptionContext"
+    , "  , throwIO"
+    , "  , try"
+    , "  )"
+    , "import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext)"
+    , "import Data.Text (pack, unpack)"
+    , "import Hetoimasia.Foundation.Resource"
+    , "  ( CleanupFailure"
+    , "  , cleanupFailureException"
+    , "  , cleanupFailureId"
+    , "  , cleanupFailureLabel"
+    , "  , cleanupFailures"
+    , "  , cleanupFailuresInContext"
+    , "  , displayCleanupFailure"
+    , "  , withResourceLabelled"
+    , "  )"
+    , "import System.Exit (exitFailure)"
+    , "import System.IO (hPutStrLn, stderr)"
+    , ""
+    , "labelsOf ∷ [CleanupFailure] → String"
+    , "labelsOf = unwords . map (unpack . cleanupFailureLabel)"
+    , ""
+    , "-- The outer release fails from inside a scope of its own, so its"
+    , "-- exception carries evidence reachable only through that entry."
+    , "nestedRelease ∷ IO ()"
+    , "nestedRelease ="
+    , "  withResourceLabelled (pack \"buried\") (pure ()) (\\_ → throwIO (userError \"buried released\")) $ \\_ →"
+    , "    throwIO (userError \"outer released\")"
+    , ""
+    , "failingScope ∷ IO ()"
+    , "failingScope ="
+    , "  withResourceLabelled (pack \"outer\") (pure ()) (\\_ → nestedRelease) $ \\_ →"
+    , "    withResourceLabelled (pack \"inner\") (pure ()) (\\_ → throwIO (userError \"inner released\")) $ \\_ →"
+    , "      throwIO (ErrorCall \"body failed\")"
+    , ""
+    , "expectFailure ∷ IO () → IO SomeException"
+    , "expectFailure action = do"
+    , "  outcome ← try action"
+    , "  case outcome of"
+    , "    Left propagated → pure propagated"
+    , "    Right () → do"
+    , "      hPutStrLn stderr \"expected the scope to fail, but it returned\""
+    , "      exitFailure"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  propagated ← expectFailure failingScope"
+    , "  let retained = cleanupFailures propagated"
+    , "  putStrLn (\"retained = \" <> labelsOf retained)"
+    , "  putStrLn"
+    , "    ( \"in context = \""
+    , "        <> labelsOf (cleanupFailuresInContext (someExceptionContext propagated))"
+    , "    )"
+    , "  case retained of"
+    , "    [inner, buried, outer] → do"
+    , "      putStrLn"
+    , "        ( \"identities distinct = \""
+    , "            <> show"
+    , "              ( cleanupFailureId inner /= cleanupFailureId buried"
+    , "                  && cleanupFailureId buried /= cleanupFailureId outer"
+    , "              )"
+    , "        )"
+    , "      putStrLn (\"display = \" <> displayCleanupFailure inner)"
+    , "      case cleanupFailureException outer of"
+    , "        ExceptionWithContext carried _ →"
+    , "          putStrLn (\"carried by outer = \" <> labelsOf (cleanupFailuresInContext carried))"
+    , "      -- Reattaching entries that are already present is supported, and"
+    , "      -- inspection still reports each of them exactly once."
+    , "      let reattached ="
+    , "            foldr addExceptionAnnotation emptyExceptionContext (retained <> retained)"
+    , "      putStrLn (\"reattached = \" <> labelsOf (cleanupFailuresInContext reattached))"
+    , "      let alone = addExceptionAnnotation outer emptyExceptionContext"
+    , "      putStrLn (\"outer alone = \" <> labelsOf (cleanupFailuresInContext alone))"
+    , "    _ → do"
+    , "      hPutStrLn stderr (\"unexpected evidence: \" <> labelsOf retained)"
+    , "      exitFailure"
     ]

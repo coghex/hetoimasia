@@ -140,17 +140,56 @@ newtype CleanupFailureId = CleanupFailureId Integer
 -- context that exception had when it was caught, rather than a rendered
 -- message, so a caller can re-examine the failure's own annotations and
 -- backtrace.
-data CleanupFailure = CleanupFailure
-  { cleanupFailureId ∷ !CleanupFailureId
-    -- ^ Identity and observation order of this failure.
-  , cleanupFailureLabel ∷ !Text
-    -- ^ The label of the operation whose release threw.
-  , cleanupFailureException ∷ !(ExceptionWithContext SomeException)
-    -- ^ The exception the release threw, with the context it was caught with.
-  }
+--
+-- The representation is closed: the constructor is not exported, and none of
+-- the three carried values is a record field, so no field label reaches a
+-- client either. A module importing this one cannot build a 'CleanupFailure'
+-- of its own and cannot rewrite one it was handed, because record
+-- construction and record-update syntax both need a field label in scope and
+-- this type declares none. Entries are therefore read-only evidence: they are
+-- created only by 'attemptRelease', which issues each identity as it retains
+-- the failure it names.
+--
+-- That boundary is what the inspection guarantee rests on. 'gatherFailures'
+-- treats a 'CleanupFailureId' as standing for one fixed payload, expanding
+-- that payload's own context the first time the identity is seen and skipping
+-- the identity afterwards. An entry whose label or carried exception could be
+-- replaced while its identity stayed the same would make two different
+-- payloads answer to one key, and the evidence reachable only through the
+-- replacement would never be expanded. Reattaching an /unchanged/ entry any
+-- number of times, which is what nested scopes do as they unwind, is exactly
+-- the case that invariant permits.
+--
+-- Nothing here counts entries or rejects a rewrite at run time. The guarantee
+-- is the absence of a way to express one, checked when the client is compiled.
+data CleanupFailure
+  = CleanupFailure
+      !CleanupFailureId
+      -- ^ Identity and observation order of this failure.
+      !Text
+      -- ^ The label of the operation whose release threw.
+      !(ExceptionWithContext SomeException)
+      -- ^ The exception the release threw, with the context it was caught with.
 
 instance ExceptionAnnotation CleanupFailure where
   displayExceptionAnnotation = displayCleanupFailure
+
+-- | The identity and observation order of one retained cleanup failure.
+--
+-- This and the two readers below are ordinary functions over the closed
+-- representation rather than field selectors, so they read an entry without
+-- also giving a client a way to write one. Their names and types are unchanged
+-- by that.
+cleanupFailureId ∷ CleanupFailure → CleanupFailureId
+cleanupFailureId (CleanupFailure identifier _ _) = identifier
+
+-- | The label of the operation whose release threw.
+cleanupFailureLabel ∷ CleanupFailure → Text
+cleanupFailureLabel (CleanupFailure _ label _) = label
+
+-- | The exception the release threw, with the context it was caught with.
+cleanupFailureException ∷ CleanupFailure → ExceptionWithContext SomeException
+cleanupFailureException (CleanupFailure _ _ exception) = exception
 
 -- | Render one retained cleanup failure as a single line naming its operation
 -- and its exception. The failure's own context is left for the caller to
@@ -288,6 +327,12 @@ cleanupFailuresInContext context = Map.elems (gatherFailures [context] Map.empty
 -- most once is what keeps the cost proportional to the evidence retained
 -- rather than to the number of routes that reach it; nested releases each
 -- carrying the prior cleanup context offer exponentially many such routes.
+--
+-- Skipping an identity already in the accumulator is sound because a
+-- 'CleanupFailure' is read-only outside this module: an identity reached a
+-- second time carries the same label and the same exception, and therefore the
+-- same context, as the first time it was expanded. 'CleanupFailure' records
+-- why no client can break that correspondence.
 --
 -- The traversal is a worklist rather than a recursion so that the record of
 -- expanded failures is shared by every branch instead of being rebuilt per
