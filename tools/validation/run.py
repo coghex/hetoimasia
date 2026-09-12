@@ -28,15 +28,35 @@ execution at all.
 
 from __future__ import annotations
 
+# The import path is narrowed before anything shadowable is imported, and that
+# is the first line of the bootstrap. ``python3 tools/validation/run.py`` puts
+# that directory first on ``sys.path``, so a file dropped beside this one — a
+# ``platform.py``, a ``json.py`` — would be imported in place of the standard
+# library module of that name and would run before anything had looked at its
+# path. That is the same pre-validation execution the deferred ``receipts`` and
+# ``plan`` imports exist to prevent, and it has to be closed here rather than
+# there, because it happens at the top of this file.
+#
+# ``sys`` is built into the interpreter and cannot be shadowed by a file.
+# ``os`` is already loaded before any script begins, so naming it here binds the
+# module the interpreter started with. Everything after this point resolves
+# against the standard library alone; this module reaches its own siblings
+# deliberately, by path, once the checkout has been proven.
+import sys
+import os
+
+TOOLS_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+sys.path = [
+    entry for entry in sys.path if entry and os.path.abspath(entry) != TOOLS_DIRECTORY
+]
+
 import argparse
 import hashlib
 import json
-import os
 import platform
 import signal
 import stat
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -59,6 +79,34 @@ sys.dont_write_bytecode = True
 
 class ProvenanceError(Exception):
     """A refusal reported instead of an execution."""
+
+
+def candidate_module(name: str):
+    """Load one of the candidate's own validation modules, by path.
+
+    Loaded from its file rather than by putting `tools/validation/` back on the
+    import path, so the narrowing above stays in force: these modules' own
+    imports keep resolving to the standard library, and nothing dropped beside
+    them can answer for a name they ask for.
+    """
+    import importlib.util
+
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(TOOLS_DIRECTORY, name + ".py")
+    specification = importlib.util.spec_from_file_location(name, path)
+    if specification is None or specification.loader is None:
+        raise ProvenanceError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(specification)
+    # Registered before execution because these modules import each other by
+    # name, and that name has to find this copy rather than search a path.
+    sys.modules[name] = module
+    try:
+        specification.loader.exec_module(module)
+    except Exception as failure:
+        del sys.modules[name]
+        raise ProvenanceError(f"cannot load {path}: {failure}") from failure
+    return module
 
 
 # ``plan`` is deliberately not imported here either. It is the candidate's own
@@ -442,8 +490,8 @@ def candidate_classification(root: str, plan: dict):
     longer digests to it is refused rather than believed: a classification this
     plan was not built from cannot say what a dirty checkout means.
     """
-    import plan as planner
-    from plan import PlannerError
+    planner = candidate_module("plan")
+    PlannerError = planner.PlannerError
 
     override = plan["catalog"]["override"]
     try:
@@ -655,8 +703,8 @@ def main(argv: list[str]) -> int:
 
     # The policy under this checkout is now known to be the candidate's, so its
     # own modules may be read.
-    import receipts
-    from receipts import EvidenceError
+    receipts = candidate_module("receipts")
+    EvidenceError = receipts.EvidenceError
 
     try:
         plan = receipts.load_plan(arguments.plan)

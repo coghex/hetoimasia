@@ -376,6 +376,27 @@ spec = describe "Validation execution" $ do
         errors `shouldNotContain` "the dirty contract ran"
         doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
 
+    it "refuses a module dropped beside the runner without importing it" $
+      withFixture $ \fixture → do
+        -- The runner's own directory leads the import path, so a file named for
+        -- a standard library module would be imported in its place, before
+        -- anything had looked at its path.
+        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
+        plan ← planAgainst fixture (seeded fixture)
+        writeFixtureFile
+          (root fixture)
+          "tools/validation/platform.py"
+          "import sys\nprint('the shadow ran', file=sys.stderr)\n\n\ndef system():\n    return 'Shadow'\n"
+        (result, _, errors) ←
+          runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "changed the policy that decides what a result means"
+        errors `shouldContain` "tools/validation/platform.py"
+        errors `shouldNotContain` "the shadow ran"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
     it "refuses a tree substituted for the candidate's by a replacement object" $
       withFixture $ \fixture → do
         change fixture "src/note.txt" "the candidate's own source\n"

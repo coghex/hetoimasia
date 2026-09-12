@@ -459,6 +459,15 @@ standing in. Importing either first would execute code out of the mutable
 checkout: an edited classifier could excuse its own edit, and an edited contract
 could forge a receipt while its own path was still unexamined.
 
+The same is true of the standard library it reaches for. `python3
+tools/validation/run.py` puts that directory first on `sys.path`, so a file
+dropped beside the runner — a `platform.py`, a `json.py` — would be imported in
+place of the standard library module of that name, and would run at the top of
+the file, before any check existed to notice it. The runner therefore narrows
+its import path before importing anything shadowable, which is the first thing
+it does; afterwards it reaches its own siblings by path rather than by putting
+that directory back.
+
 So the runner reads the plan's candidate for itself, with the standard library
 alone, proves the checkout with its own code and Git plumbing, and refuses
 **any** difference under a mandatory policy root — `tools/validation/` or
@@ -1259,7 +1268,8 @@ a tracked symlink replaced by a regular file of the same text under
 consumed input or a mandatory policy root, and a submodule resting at exactly
 the candidate's commit while carrying an edited input, a classifier the checkout
 has edited to call every path harmless, a receipt contract edited the same way
-and refused without being imported, an addition a redirected `core.worktree`
+and refused without being imported, a module dropped beside the runner to shadow
+a standard library one and refused without running, an addition a redirected `core.worktree`
 keeps out of Git's own listing, an added directory the candidate cannot contain,
 and a tree substituted for the candidate's by a `refs/replace` entry — each
 refused by name.
