@@ -347,7 +347,9 @@ compiled. `test/Test/Engine/Resources/Opacity.hs` holds it there, compiling
 clients against the built package: a client that replaces the continuation and
 a client that names the constructor must both be rejected for exactly that
 reason, while a client using only the runner and the allocators compiles,
-links, and runs.
+links, and runs. The same file holds the companion boundary for retained
+cleanup evidence, described under
+[The evidence boundary](#the-evidence-boundary).
 
 `allocComposite` allocates; it is not a second runner. Composite construction
 is still written with `acquirePart` and `restoredStep`, and `withComposite`
@@ -418,7 +420,10 @@ cleanupFailuresInContext ∷ ExceptionContext → [CleanupFailure]
 A retained failure is structured data, not a rendered message: it carries the
 operation's label and the exception together with the context that exception
 had when the scope caught it, so its own annotations and backtrace are still
-there to examine. Inspection needs no logger.
+there to examine. Inspection needs no logger. The three readers are ordinary
+functions over a closed type rather than field selectors, so an entry can be
+read but not written; [The evidence boundary](#the-evidence-boundary) says why
+that matters.
 
 `cleanupFailures` takes the exception a caller caught and returns the retained
 failures in the order they were observed while the scopes unwound.
@@ -430,6 +435,39 @@ more than one route is reported once, while two distinct failures that render
 identically stay distinct. Evidence nested inside a `WhileHandling` annotation
 is found as well, and so is evidence a release carried out of a scope of its
 own.
+
+### The evidence boundary
+
+A `CleanupFailure` is read-only outside the foundation package. Entries are
+created only where a release is attempted and throws, and each one is issued
+its `CleanupFailureId` at that moment. A caller reads an entry with the three
+readers above and reattaches it unchanged; there is no supported way to build
+one, and no supported way to alter one it was handed.
+
+That boundary rests on the representation being closed, the same way `Scoped`'s
+does. The constructor is not exported and none of the three carried values is a
+record field, so no field label reaches a client — and record construction and
+record-update syntax both need one in scope. This is why the readers are
+ordinary functions rather than selectors: an exported selector is an exported
+field label, and a field label is a licence to write as well as read. Their
+names and types are unaffected by that, so a caller that inspects an entry's
+identity, label, exception, and attached context needs no change.
+
+The invariant the boundary protects is that one `CleanupFailureId` stands for
+one unchanging payload. [What inspection costs](#what-inspection-costs) rests
+on it directly: inspection expands a given identity's carried context the first
+time that identity is reached and skips the identity afterwards, which is sound
+only because reaching it again means reaching the same label, the same
+exception, and therefore the same context. An entry whose payload could be
+replaced while its identity stayed the same would put two payloads behind one
+key, and evidence reachable only through the replacement would never be
+expanded — the reported failures would be missing entries rather than merely
+costing more. Reattaching an *unchanged* entry any number of times, which is
+what nested scopes do as they unwind, is exactly the case the invariant is
+there to permit.
+
+Nothing counts entries or refuses a rewrite at run time; the guarantee is that
+the rewrite cannot be expressed, and it is checked when the client is compiled.
 
 ### What inspection costs
 
@@ -736,6 +774,29 @@ outer scope resumes while its ordinary result survives, a `locally` cleanup
 failure reaching the outer scope's evidence, and two composites allocated
 through the facade keeping their declared order while the scope unwinds in
 reverse.
+
+The two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
+[The continuation facade](#the-continuation-facade) and
+[The evidence boundary](#the-evidence-boundary). They compile eight
+single-module clients with the compiler on `PATH` against the package database
+this build produced, exposing only `base`, `text`, and
+`hetoimasia-foundation`, so what a client can say is exactly what the package
+boundary allows. Six must be rejected: for `Scoped`, one that replaces the
+continuation through record update and one that names the constructor; for
+retained evidence, one for each of `cleanupFailureId`, `cleanupFailureLabel`,
+and `cleanupFailureException` that imports the reader by name and then tries to
+replace it through record update, and one that names the `CleanupFailure`
+constructor. The first five of those six are rejected because no field label
+exists to write through, and the sixth because the type is exported without its
+children; each example asserts the diagnostic that names its own cause and
+refuses to count a missing package, an absent compiler, or an unrelated error
+as the guarantee holding. Two must be accepted, linked, and run: one using only
+the runner and the allocators, and one using only the three readers, both
+inspection entry points, `displayCleanupFailure`, and reattachment through
+`addExceptionAnnotation`, which asserts observation order across a scope that
+fails in three places at once, the evidence reachable only through an entry's
+own carried context, and that reattaching entries already present reports each
+of them once.
 
 The `Resource evidence inspection cost` examples in
 `test/Test/Engine/Resources/Cost.hs` cover
