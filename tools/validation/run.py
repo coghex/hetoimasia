@@ -29,12 +29,13 @@ execution at all.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
 import signal
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -85,69 +86,119 @@ def git_records(root: str, *arguments: str, environment: dict | None = None) -> 
     return [field for field in output.split("\0") if field]
 
 
-def name_status(fields: list[str]) -> set[str]:
-    """Every path a ``--name-status -z`` listing names, renames included."""
-    paths: set[str] = set()
-    index = 0
-    while index < len(fields):
-        status = fields[index]
-        index += 1
-        # A rename or a copy names both endpoints, and both of them differ from
-        # the candidate: the source is gone and the target is new.
-        needed = 2 if status[0] in ("R", "C") else 1
-        if index + needed > len(fields):
-            raise EvidenceError(f"git reported status {status!r} with no path")
-        paths.update(fields[index : index + needed])
-        index += needed
-    return paths
-
-
-def working_tree_changes(root: str) -> set[str]:
-    """Tracked paths whose working-tree content, type, or mode is not HEAD's.
-
-    Read through a temporary index built from HEAD rather than through the
-    checkout's own, because a checkout can be configured to stop noticing its
-    own differences. ``git update-index --assume-unchanged`` makes a file's
-    edits invisible to every ordinary diff, and ``core.fileMode=false`` does the
-    same for a mode; either would let a command read content the candidate does
-    not carry while the receipt claimed it did. A fresh index holds neither flag
-    nor any cached stat, so Git has to read and hash every tracked file to
-    answer, and ``core.fileMode=true`` is forced so a mode is compared rather
-    than assumed. A checkout whose filesystem cannot carry an executable bit
-    will be refused by that comparison, which is the right direction for a gate:
-    such a checkout cannot faithfully hold the candidate either.
-    """
-    with tempfile.TemporaryDirectory(prefix="validation-index-") as scratch:
-        environment = {**os.environ, "GIT_INDEX_FILE": os.path.join(scratch, "index")}
-        git_records(root, "read-tree", "HEAD", environment=environment)
-        # `diff` rather than `diff-index`: the porcelain refreshes the index it
-        # was given first, and an index this new carries no stat for anything,
-        # so the plumbing would report every tracked file as differing. The
-        # refresh is where each file is actually read and hashed.
-        return name_status(
-            git_records(
-                root,
-                "-c",
-                "core.fileMode=true",
-                "diff",
-                "--name-status",
-                "-z",
-                "HEAD",
-                environment=environment,
-            )
+def object_format(root: str) -> str:
+    """The hash this repository names its objects with."""
+    algorithm = git_output(root, "rev-parse", "--show-object-format")
+    if algorithm not in ("sha1", "sha256"):
+        raise EvidenceError(
+            f"this repository names objects with {algorithm!r}, which is not read here"
         )
+    return algorithm
 
 
-def tracked_changes(root: str) -> set[str]:
-    """Every tracked path this checkout holds differently from its HEAD commit.
+def blob_id(content: bytes, algorithm: str) -> str:
+    """Git's object id for a blob holding exactly these bytes."""
+    digest = hashlib.new(algorithm)
+    digest.update(b"blob " + str(len(content)).encode("ascii") + b"\0")
+    digest.update(content)
+    return digest.hexdigest()
 
-    The working tree is what a command reads, and the index is what a commit
-    would carry; neither implies the other, so both are asked. The index
-    comparison needs no hardening — it reads two recorded trees rather than the
-    filesystem, and nothing can suppress it.
+
+def worktree_entry(root: str, path: str, algorithm: str) -> tuple[str, str] | None:
+    """The mode and object id this checkout actually holds at one path.
+
+    Read from the filesystem and hashed here rather than asked of Git, because
+    every Git-side answer passes through machinery a repository can configure.
+    A clean filter declared in ``.git/info/attributes`` can emit the committed
+    bytes for a file that has been edited, and ``core.symlinks=false`` can make
+    a tracked symlink replaced by a regular file of the same text look
+    untouched; in both cases the command would read something the candidate
+    does not carry while the receipt claimed otherwise. Raw bytes and ``lstat``
+    have no such machinery: a symlink hashes its target, a regular file its
+    contents, and anything else holds no blob at all.
     """
-    staged = name_status(git_records(root, "diff", "--name-status", "-z", "--cached", "HEAD"))
-    return staged | working_tree_changes(root)
+    absolute = os.path.join(root, path)
+    try:
+        status = os.lstat(absolute)
+    except OSError:
+        return None
+    if stat.S_ISLNK(status.st_mode):
+        return "120000", blob_id(os.readlink(os.fsencode(absolute)), algorithm)
+    if not stat.S_ISREG(status.st_mode):
+        # A directory, a socket, a device: whatever it is, it is not the blob
+        # the candidate recorded here.
+        return None
+    try:
+        with open(absolute, "rb") as handle:
+            content = handle.read()
+    except OSError as error:
+        raise EvidenceError(
+            f"cannot read {path} to compare it with the candidate: {error}"
+        ) from error
+    mode = "100755" if status.st_mode & 0o111 else "100644"
+    return mode, blob_id(content, algorithm)
+
+
+def head_entries(root: str, commit: str) -> dict[str, tuple[str, str, str]]:
+    """Every path the candidate records, with its mode, kind, and object id."""
+    try:
+        listing = planner.tree_entries(root, commit)
+    except PlannerError as failure:
+        raise EvidenceError(f"cannot read the candidate's tree: {failure}") from failure
+    return {path: (mode, kind, object_name) for path, mode, kind, object_name in listing}
+
+
+def index_entries(root: str) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    """Every path the index records, with its mode and object id, and conflicts."""
+    entries: dict[str, tuple[str, str]] = {}
+    conflicted: set[str] = set()
+    for record in git_records(root, "ls-files", "-s", "-z"):
+        metadata, separator, path = record.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or not path:
+            raise EvidenceError(f"cannot read this checkout's index: unexpected entry {record!r}")
+        mode, object_name, stage = fields
+        if stage != "0":
+            conflicted.add(path)
+        entries[path] = (mode, object_name)
+    return entries, conflicted
+
+
+def tracked_changes(
+    root: str, head: dict[str, tuple[str, str, str]], algorithm: str
+) -> set[str]:
+    """Every tracked path this checkout holds differently from the candidate.
+
+    Two questions, because neither implies the other: the index is what a commit
+    from here would carry, and the working tree is what a command actually
+    reads. Both are answered by comparing recorded modes and object ids —
+    plumbing rather than a diff — so neither can be quieted by an attribute, a
+    filter, or a configuration setting. A checkout whose filesystem cannot carry
+    an executable bit is refused by the mode comparison, and a submodule this
+    checkout cannot read is refused by its own; both are the right direction for
+    a gate, because such a checkout cannot faithfully hold the candidate either.
+    """
+    recorded = {path: (mode, object_name) for path, (mode, _, object_name) in head.items()}
+    entries, conflicted = index_entries(root)
+    # An unmerged path is a difference by definition: it records no single thing.
+    changed = set(conflicted)
+    changed |= {
+        path
+        for path in set(recorded) | set(entries)
+        if recorded.get(path) != entries.get(path)
+    }
+    for path, (mode, kind, object_name) in head.items():
+        if kind == "commit":
+            # A submodule's content is another repository's HEAD. One that
+            # cannot be read is one this run cannot vouch for.
+            try:
+                if git_output(os.path.join(root, path), "rev-parse", "HEAD") != object_name:
+                    changed.add(path)
+            except EvidenceError:
+                changed.add(path)
+        elif worktree_entry(root, path, algorithm) != (mode, object_name):
+            changed.add(path)
+    return changed
 
 
 def untracked_files(root: str) -> set[str]:
@@ -164,23 +215,35 @@ def untracked_files(root: str) -> set[str]:
     return set(git_records(root, "ls-files", "--others", "-z"))
 
 
-def generated(path: str, catalog: dict) -> bool:
+def generated(path: str, catalog: dict, consumed: set[str]) -> bool:
     """Whether the candidate's catalog declares this path as a run's own output.
 
-    The declaration is deliberately catalog data rather than an ignore rule. A
-    `.gitignore`, a `.git/info/exclude`, and a machine's global excludes can all
-    be made to hide a source file, and two of the three are not even part of the
-    candidate; `generated_paths` is in the catalog, which lives under a mandatory
-    policy root, so widening it moves the policy identity and is reviewed with
-    the change that widened it. Entries read as input prefixes — a trailing
-    ``/`` names a directory — or as the basename classes `non_affecting_paths`
-    already uses, so both ``dist-newstyle/`` and ``*.pyc`` say what they look
-    like. A catalog that declares none exempts nothing.
+    A declaration never outranks an input. A path some group consumes, or that
+    packaging makes an input whatever a catalog says, is answered for by the
+    ordinary classification even where a `generated_paths` entry would have
+    matched it — otherwise declaring `plan.json` or `*.pyc` would quietly exempt
+    a `tools/validation/plan.json` or a `__pycache__` sitting inside a mandatory
+    policy root, which is precisely a path the runner must not overlook.
+
+    Entries say what they look like: a trailing ``/`` is a directory prefix, an
+    entry containing ``*`` is one of the basename classes `non_affecting_paths`
+    already uses, and anything else is an exact repository-relative path. A
+    catalog that declares none exempts nothing.
     """
-    return any(
-        planner.matches_input(path, entry) or planner.matches_class(path, entry)
-        for entry in catalog.get("generated_paths", ())
-    )
+    if path in planner.NEVER_HARMLESS_PATHS or path.endswith(planner.NEVER_HARMLESS_SUFFIXES):
+        return False
+    if any(planner.matches_input(path, entry) for entry in consumed):
+        return False
+    for entry in catalog.get("generated_paths", ()):
+        if entry.endswith("/"):
+            if planner.matches_input(path, entry):
+                return True
+        elif "*" in entry:
+            if planner.matches_class(path, entry):
+                return True
+        elif path == entry:
+            return True
+    return False
 
 
 def relevant_uncommitted(root: str, plan: dict) -> list[str]:
@@ -203,8 +266,12 @@ def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     """
     catalog, packages = candidate_classification(root, plan)
     consumed = planner.consumed_entries(catalog, packages)
-    changed = tracked_changes(root) | {
-        path for path in untracked_files(root) if not generated(path, catalog)
+    algorithm = object_format(root)
+    head = head_entries(root, plan["candidate"]["commit"])
+    changed = tracked_changes(root, head, algorithm) | {
+        path
+        for path in untracked_files(root)
+        if not generated(path, catalog, consumed)
     }
     return sorted(path for path in changed if not planner.harmless_prose(path, consumed, catalog))
 

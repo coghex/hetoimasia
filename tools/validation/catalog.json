@@ -24,7 +24,7 @@
     "reuse.out",
     "receipts/",
     "*.pyc",
-    ".DS_Store"
+    "*.DS_Store"
   ],
   "floor": [
     "build.all",

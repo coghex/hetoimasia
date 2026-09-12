@@ -23,6 +23,7 @@ import Sandbox
 import System.Directory
   ( copyFile
   , createDirectoryIfMissing
+  , createFileLink
   , doesFileExist
   , getCurrentDirectory
   , getPermissions
@@ -253,6 +254,48 @@ spec = describe "Validation execution" $ do
         void $ gitIn fixture ["diff", "--name-only", "HEAD"] >>= \reported →
           reported `shouldBe` ""
         refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses an edit a clean filter reports as the committed bytes" $
+      withDirtyFixture $ \fixture plan → do
+        -- A clean filter runs on the way into Git, so one that always emits the
+        -- committed content empties every diff while the command still reads
+        -- what is on disk.
+        writeFixtureFile (root fixture) ".git/info/attributes" "src/note.txt filter=hide\n"
+        void $ gitIn fixture ["config", "filter.hide.clean", "printf 'a source the failing group consumes\n'"]
+        writeFixtureFile (root fixture) "src/note.txt" "an edit no diff reports\n"
+        gitIn fixture ["diff", "--name-only", "HEAD"] `shouldReturn` ""
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses a tracked symlink replaced by a file of the same text" $
+      withFixture $ \fixture → do
+        -- The candidate records a symlink; the checkout holds a regular file
+        -- whose content is the link's target. With `core.symlinks` off Git
+        -- compares them as equal, and the command reads a file where the
+        -- candidate has a link.
+        void $ gitIn fixture ["rm", "-q", "--cached", "--", "src/note.txt"]
+        removeFile (root fixture </> "src/note.txt")
+        createFileLink (root fixture </> "probe/note.txt") (root fixture </> "src/note.txt")
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Make the source a link"]
+        plan ← planAgainst fixture (seeded fixture)
+        void $ gitIn fixture ["config", "core.symlinks", "false"]
+        removeFile (root fixture </> "src/note.txt")
+        writeFixtureFile (root fixture) "src/note.txt" (root fixture </> "probe/note.txt")
+        gitIn fixture ["diff", "--name-only", "HEAD"] `shouldReturn` ""
+        refusesDirty fixture plan ["src/note.txt"]
+
+    it "refuses a generated basename sitting under a path a group consumes" $
+      withDirtyFixture $ \fixture plan → do
+        -- The catalog declares `*.json` generated, but `src/` is a declared
+        -- input. A declaration never outranks one: the exemption is for a run's
+        -- own output, not a way to write into what a group reads.
+        writeFixtureFile (root fixture) "src/plan.json" "{}\n"
+        refusesDirty fixture plan ["src/plan.json"]
+
+    it "refuses a generated basename sitting under a mandatory policy root" $
+      withDirtyFixture $ \fixture plan → do
+        writeFixtureFile (root fixture) "tools/validation/plan.json" "{}\n"
+        refusesDirty fixture plan ["tools/validation/plan.json"]
 
     it "refuses a relevant addition that the repository's own ignore rules hide" $
       withDirtyFixture $ \fixture plan → do

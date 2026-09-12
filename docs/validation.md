@@ -66,7 +66,7 @@ every key below is required except where the table says otherwise.
 | `policy_version` | integer | The selection policy revision a person reads, recorded in every plan as `catalog_policy_version`. The plan's own `policy_version` is the digest reuse compares. |
 | `policy_inputs` | array of strings | Paths whose change invalidates selection policy itself. They are an input of *every* group, so a planner, catalog, runner, aggregate, or workflow edit widens non-optional coverage conservatively and still marks an optional group's inputs changed when its own definition moved — without ever selecting an optional group, since selection reaches those only through a request. |
 | `non_affecting_paths` | array of strings | Declared harmless classes (see below). |
-| `generated_paths` | array of strings, optional | Paths a run leaves in a checkout that no execution reads as input: build trees, a run's own plan, applicability document, and receipts, interpreter and editor debris. The [runner's provenance check](#execution-provenance) exempts these and nothing else when deciding whether a checkout is still its candidate; nothing else consults them, so they classify no committed path and can never excuse one. An entry ending in `/` is a directory prefix, an entry with `*` is a class matched the way `non_affecting_paths` are, and any other entry is an exact path. Omitting the key exempts nothing. |
+| `generated_paths` | array of strings, optional | Paths a run leaves in a checkout that no execution reads as input: build trees, a run's own plan, applicability document, and receipts, interpreter and editor debris. The [runner's provenance check](#execution-provenance) exempts these and nothing else when deciding whether a checkout is still its candidate; nothing else consults them, so they classify no committed path and can never excuse one. An entry ending in `/` is a directory prefix, an entry with `*` is a class matched the way `non_affecting_paths` are, and any other entry is an exact path. A declaration never outranks an input: a path some group consumes, or that packaging makes an input, is classified normally however it is declared here. Omitting the key exempts nothing. |
 | `floor` | array of strings | The mandatory floor. Every entry must name a registered, non-optional group. |
 | `groups` | array of objects | The registered groups, in canonical order. |
 
@@ -481,10 +481,19 @@ the candidate does not describe.
 The single exemption is what the candidate's catalog declares in
 `generated_paths`: paths a run leaves behind that no execution reads as input —
 build trees, a run's own plan, applicability document, and receipts, and
-interpreter and editor debris. Entries read as input prefixes, where a trailing
-`/` names a directory, or as the basename classes `non_affecting_paths` already
-uses, so both `dist-newstyle/` and `*.pyc` say what they look like. The field is
-optional and a catalog that declares none exempts nothing.
+interpreter and editor debris. Entries say what they look like: a trailing `/`
+is a directory prefix, an entry containing `*` is one of the basename classes
+`non_affecting_paths` already uses, and anything else is an exact
+repository-relative path. The field is optional and a catalog that declares none
+exempts nothing.
+
+**A declaration never outranks an input.** A path some group consumes, or that
+packaging makes an input whatever a catalog says, is answered for by the
+ordinary classification even where a `generated_paths` entry would have matched
+it. Declaring `plan.json` exempts the plan a run is handed at the repository
+root; it does not exempt a `tools/validation/plan.json` inside a mandatory
+policy root, and `*.pyc` does not exempt a `__pycache__` there either. The
+exemption is for a run's own output, not a way to write into what a group reads.
 
 That declaration is deliberately **catalog data rather than an ignore rule**. No
 ignore rule is consulted at all — not the repository's `.gitignore`, not
@@ -500,18 +509,30 @@ For the same reason the validation tools set `sys.dont_write_bytecode`: a
 `__pycache__` left beside them sits inside a declared policy input, and a tool
 must not create the very file the runner would refuse.
 
-**Nor is the checkout's own index or configuration trusted.** A repository can
-be told to stop noticing a file — `git update-index --assume-unchanged` — and to
-stop noticing modes — `core.fileMode=false` — and either would empty an ordinary
-diff while the command still read the edited content. The working tree is
-therefore compared against `HEAD` through a *temporary* index built from `HEAD`,
-which carries neither flag nor any cached stat, so Git has to read and hash
-every tracked file to answer, with `core.fileMode=true` forced so a mode is
-compared rather than assumed. The checkout's real index is compared too, since a
-staged change and a working-tree change are different facts. A checkout whose
-filesystem cannot carry an executable bit is refused by that comparison, which
-is the right direction for a gate: such a checkout cannot faithfully hold the
-candidate either.
+**Nor is the checkout's own index, attributes, or configuration trusted.** A
+repository can be told to stop noticing a file (`git update-index
+--assume-unchanged`), to stop noticing modes (`core.fileMode=false`), to rewrite
+a file's content on the way into Git (a `clean` filter declared in
+`.git/info/attributes`, which can simply emit the committed bytes), and to stop
+distinguishing a symlink from a regular file (`core.symlinks=false`). Each of
+those empties an ordinary `git diff` while the command still reads what is
+actually on disk.
+
+So the comparison asks Git for nothing but the recorded trees. Both questions
+are answered by comparing modes and object ids directly:
+
+- **the index** against the candidate, path by path, since an unmerged or
+  staged entry is what a commit from here would carry; and
+- **the working tree** against the candidate, by reading each tracked path's raw
+  bytes and `lstat` and computing its Git object id here. A symlink hashes its
+  target, a regular file its contents, and a directory or device holds no blob
+  at all — so a type change is a change, a mode change is a change, and no
+  filter sits between the file and the answer.
+
+A submodule is its own repository's `HEAD`; one this checkout cannot read is one
+the run cannot vouch for. A checkout whose filesystem cannot carry an executable
+bit is likewise refused by the mode comparison. Both are the right direction for
+a gate: such a checkout cannot faithfully hold the candidate either.
 
 This refusal is the whole of the policy. Validating uncommitted work with honest
 attribution of its own is not supported: commit it, or plan and run from the
@@ -1181,11 +1202,14 @@ the classification itself: a dirty path judged by the fixture catalog its plan
 was resolved with rather than the candidate's own; that fixture rewritten after
 planning so that it no longer describes the plan it produced; and a worker that
 rewrites both the catalog and its own copy of the plan's digest, whose receipt
-the originally resolved plan then refuses as another plan's. Three more are
+the originally resolved plan then refuses as another plan's. Six more are
 about what a checkout can be told not to report: an addition no group declares
 and no catalog calls generated, an edit hidden by
-`git update-index --assume-unchanged`, and an unstaged mode change hidden by
-`core.fileMode=false`, each refused by name.
+`git update-index --assume-unchanged`, an unstaged mode change hidden by
+`core.fileMode=false`, an edit a `clean` filter reports as the committed bytes,
+a tracked symlink replaced by a regular file of the same text under
+`core.symlinks=false`, and a declared-generated basename sitting under a
+consumed input or a mandatory policy root — each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly
