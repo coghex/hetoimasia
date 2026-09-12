@@ -37,6 +37,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# A one-shot tool must not write into the checkout it is validating. Importing a
+# sibling module would leave a ``__pycache__`` beside it — a file the candidate
+# does not carry, which the runner is right to refuse — so bytecode writing is
+# turned off before the imports that would create it.
+sys.dont_write_bytecode = True
+
 import plan as planner
 import receipts
 from plan import PlannerError
@@ -78,18 +84,13 @@ def git_records(root: str, *arguments: str) -> list[str]:
     return [field for field in output.split("\0") if field]
 
 
-def uncommitted_paths(root: str) -> list[str]:
-    """Every path this checkout holds differently from its own HEAD commit.
+def tracked_changes(root: str) -> set[str]:
+    """Every tracked path this checkout holds differently from its HEAD commit.
 
     Staged and unstaged edits are asked about separately, because neither
     implies the other: a working-tree diff misses a mode change that lives only
     in the index, and an index diff misses an edit that was never added. Both
-    report deletions and both endpoints of a rename. An untracked file is the
-    unstaged form of an addition and is a third question. ``--exclude-standard``
-    is what keeps a run's own operational artifacts out of the answer: the plan
-    it was handed, the applicability document beside it, and the receipts it
-    writes are all ignored paths, which is the repository stating that no tree
-    of its own contains them.
+    report deletions and both endpoints of a rename.
     """
     paths: set[str] = set()
     for staged in (("--cached",), ()):
@@ -107,35 +108,79 @@ def uncommitted_paths(root: str) -> list[str]:
                 )
             paths.update(fields[index : index + needed])
             index += needed
-    paths.update(git_records(root, "ls-files", "--others", "--exclude-standard", "-z"))
-    return sorted(paths)
+    return paths
+
+
+def untracked_files(root: str) -> set[str]:
+    """Every file in this checkout that no commit of it carries.
+
+    Deliberately without ``--exclude-standard`` or any other exclude source. A
+    `.gitignore`, a `.git/info/exclude`, or a machine's global excludes could
+    otherwise hide a newly added source, consumed document, or package
+    description from this question entirely, and two of those three are not even
+    part of the candidate. Whether such a file matters is then decided by the
+    candidate's own classification, below, rather than by what some ignore rule
+    was willing to mention.
+    """
+    return set(git_records(root, "ls-files", "--others", "-z"))
+
+
+def reaches_an_execution(path: str, consumed: set[str]) -> bool:
+    """Whether an added file could reach an execution of this candidate.
+
+    A file the candidate's tree does not carry matters when some registered
+    group would read it: it falls under a declared input, a component's own
+    sources, or one of the mandatory policy roots. Packaging is always in, on
+    the same grounds the identity refuses to treat it as prose — it decides what
+    is compiled however a catalog classifies it. Everything else — a build
+    tree, a capture, a local configuration file, a run's own plan and receipts —
+    is output or scratch that no command the plan selected reads as input.
+    """
+    if path in planner.NEVER_HARMLESS_PATHS or path.endswith(planner.NEVER_HARMLESS_SUFFIXES):
+        return True
+    return any(planner.matches_input(path, entry) for entry in consumed)
 
 
 def relevant_uncommitted(root: str, plan: dict) -> list[str]:
-    """The uncommitted paths the candidate's own classification counts as input.
+    """Every uncommitted path that keeps this checkout from being the candidate.
 
-    Relevance is read from the candidate's catalog and package graph rather than
-    from the working tree's, so an edit cannot reclassify itself as prose on the
-    way past — a catalog rewritten in the working tree is exactly the change
-    this refusal exists to notice. What remains relevant is the complement of
-    the harmless prose the candidate's input identity already omits, so a
-    consumed Markdown file or a mandatory policy input is never harmless here
-    however it is spelled.
+    Relevance is read from the classification that produced the plan — the
+    candidate's package graph, and the catalog that plan was resolved with,
+    which is the fixture when one was supplied and the candidate's own otherwise
+    — rather than from whatever the working tree holds now. An edit must not be
+    able to reclassify itself as prose on the way past, and a rewritten catalog
+    in the working tree is exactly the change this refusal exists to notice.
+
+    A tracked path is relevant unless it is harmless prose, which is the same
+    complement the candidate's `input_identity` already covers: consumed
+    Markdown and a mandatory policy input are never harmless however they are
+    spelled. An added path is relevant when it could reach an execution, which
+    is the narrower question its absence from every tree makes the right one.
     """
-    uncommitted = uncommitted_paths(root)
-    if not uncommitted:
+    tracked = tracked_changes(root)
+    untracked = untracked_files(root)
+    if not tracked and not untracked:
         return []
+    catalog, packages = candidate_classification(root, plan)
+    consumed = planner.consumed_entries(catalog, packages)
+    relevant = {path for path in tracked if not planner.harmless_prose(path, consumed, catalog)}
+    relevant |= {path for path in untracked if reaches_an_execution(path, consumed)}
+    return sorted(relevant)
+
+
+def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
+    """The catalog and package graph the plan's own identity was taken from."""
+    override = plan["catalog"]["override"]
     try:
         candidate = planner.GitTree(root, plan["candidate"]["commit"])
-        catalog, _ = planner.read_catalog(candidate, None, root)
+        catalog, _ = planner.read_catalog(candidate, override, root)
         packages = planner.load_packages(candidate, required=True)
     except PlannerError as failure:
         raise EvidenceError(
             "cannot classify this checkout's uncommitted changes against the "
             f"candidate: {failure}"
         ) from failure
-    consumed = planner.consumed_entries(catalog, packages)
-    return [path for path in uncommitted if not planner.harmless_prose(path, consumed, catalog)]
+    return catalog, packages
 
 
 def confirm_candidate(root: str, plan: dict) -> tuple[str, str]:

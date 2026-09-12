@@ -290,7 +290,7 @@ planner reads the text from `--request-file`.
 | `catalog_policy_version` | The catalog's declared policy revision, as an integer. |
 | `input_identity` | The candidate's input identity digest. |
 | `toolchain`, `runner_os` | The pinned platform the identity covers and a reusable receipt must match. |
-| `catalog` | The resolved catalog source and its group count. |
+| `catalog` | The resolved catalog `source`, its group count, and `override`: the `--catalog` path when a fixture supplied one and `null` otherwise, so the runner can reproduce the classification this plan was built from. |
 | `base`, `head`, `candidate` | Each revision's name with its resolved `commit` and `tree`. |
 | `base_package_metadata` | `present` or `absent`. |
 | `base_catalog` | `present`, `absent`, or `not-applicable` when `--catalog` overrode it. |
@@ -449,23 +449,41 @@ The comparison is against the **candidate**, not the head. A plan resolved with
 a `--candidate` that differs from its head still runs from a checkout of that
 candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
 
-Relevance for the third check is the candidate's own classification, read from
-the candidate commit's catalog and package graph rather than from the working
-tree's — an edit must not be able to reclassify itself as prose on the way past,
-and rewriting the catalog in the working tree is exactly the change this notices.
-What counts is the complement of [harmless prose](#harmless-prose): a Markdown
-file some group declares as an input, a mandatory policy input, `cabal.project`,
-or any `.cabal` file is relevant however it is spelled. Staged and unstaged
-changes are both asked about, because neither implies the other, and additions,
-deletions, renames, and mode changes all count. The diagnostic names the paths.
+Relevance for the third check is **the classification that produced the plan**,
+never the working tree's: the candidate commit's package graph, and the catalog
+that plan was resolved with — the fixture when `--catalog` supplied one, and the
+candidate's own otherwise. An edit must not be able to reclassify itself as
+prose on the way past, and a rewritten catalog in the working tree is exactly
+the change this notices. The plan records which catalog it used, so a fixture
+plan is judged by its fixture's rules rather than by the candidate's default
+catalog.
 
-Untracked files count as additions, with one exception: paths Git already
-ignores. That is how a run's own operational artifacts stay out of the way — the
-repository's `.gitignore` declares `plan.json`, `applicability.json`, and
-`receipts/`, which is the layout the hosted workers use when they download the
-plan into the checkout and write receipts beside it. Generated validation
-artifacts belong on that list or outside the checkout; anything else in the
-working tree is a change to the candidate and is refused by name.
+Staged and unstaged changes are both asked about, because neither implies the
+other — a mode change can live only in the index — and additions, deletions,
+renames, and mode changes all count. The diagnostic names the paths.
+
+A **tracked** path is relevant unless it is [harmless prose](#harmless-prose),
+which is the same complement `input_identity` covers: a Markdown file some group
+declares as an input, a mandatory policy input, `cabal.project`, or any `.cabal`
+file is relevant however it is spelled.
+
+An **added** file — one no commit of this checkout carries — is relevant when it
+could reach an execution: it falls under a declared input, a component's own
+sources, or a mandatory policy root, or it is packaging. That is the narrower
+question its absence from every tree makes the right one, and it is what leaves
+a build tree, a capture, a local configuration file, and a run's own plan,
+applicability document, and receipts irrelevant without exempting anything.
+
+**No ignore rule is consulted.** Not the repository's `.gitignore`, not
+`.git/info/exclude`, not a machine's global excludes — two of those three are
+not even part of the candidate, and any of them could otherwise hide a newly
+added source, consumed document, or package description from the question
+entirely. The repository still ignores the generated validation artifacts, but
+only to keep `git status` legible; it grants them nothing here. For the same
+reason the validation tools set `sys.dont_write_bytecode`: a `__pycache__` left
+beside them sits inside a declared policy input, and a tool must not create the
+very file the runner would refuse. A stale one from an older checkout is named
+in the diagnostic and should be removed.
 
 This refusal is the whole of the policy. Validating uncommitted work with honest
 attribution of its own is not supported: commit it, or plan and run from the

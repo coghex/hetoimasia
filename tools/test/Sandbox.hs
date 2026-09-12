@@ -61,11 +61,12 @@ writeFixtureFile root relative contents = do
 -- the tree they validate: plans, applicability documents, request bodies,
 -- receipts, and the stub GitHub these examples answer from.
 --
--- The runner refuses to execute from a checkout carrying anything the candidate
--- classifies as an input, and an untracked scratch file is such a thing unless
--- the repository says otherwise. Declaring them here is what a real repository
--- does with the same files, so the fixtures exercise the supported layout
--- rather than an exemption invented for tests.
+-- Declaring them keeps an example's own `git add -A` from committing a plan or
+-- a receipt into the tree it is about, the way a real repository keeps its
+-- generated files out of one. It is deliberately not what makes the runner
+-- tolerate them: the runner consults no ignore rule at all, and answers for an
+-- untracked file by asking whether the candidate's own classification says some
+-- group would read it.
 fixtureIgnore ∷ String
 fixtureIgnore =
   unlines

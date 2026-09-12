@@ -214,6 +214,39 @@ spec = describe "Validation execution" $ do
           (fixtureCatalogWith "[\"*.md\", \"*.txt\", \".gitignore\", \"LICENSE\"]")
         refusesDirty fixture plan ["tools/validation/catalog.json"]
 
+    it "refuses a relevant addition that the repository's own ignore rules hide" $
+      withDirtyFixture $ \fixture plan → do
+        -- The checkout's ignore rules are not the candidate's classification,
+        -- and two of the three places Git reads them from are not even part of
+        -- the candidate. None of them may answer this question.
+        appendFile (root fixture </> ".gitignore") "src/hidden.txt\n"
+        writeFixtureFile (root fixture) ".git/info/exclude" "src/excluded.txt\n"
+        writeFixtureFile (root fixture) "src/hidden.txt" "a source no commit carries\n"
+        writeFixtureFile (root fixture) "src/excluded.txt" "another one\n"
+        refusesDirty fixture plan ["src/hidden.txt", "src/excluded.txt"]
+
+    it "classifies a dirty input with the catalog its own plan was resolved with" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        -- The alternate catalog consumes a document the committed one treats as
+        -- harmless prose. Reading the candidate's own catalog instead would
+        -- accept this edit and stamp the alternate plan's identity on it.
+        writeFixtureFile (root fixture) "fixtures/alternate.json" alternateCatalog
+        plan ←
+          planWith
+            fixture
+            [ "--base", seeded fixture
+            , "--head", "HEAD"
+            , "--catalog", root fixture </> "fixtures/alternate.json"
+            ]
+            "alternate-plan.json"
+        -- The same plan runs from the clean checkout it was resolved for.
+        (clean, _, errors) ← runGroup fixture "build.pass" plan []
+        (clean, errors) `shouldBe` (ExitSuccess, "")
+        removeFile (receiptPath fixture "build.pass")
+        writeFixtureFile (root fixture) "docs/alternate.md" "an edit no commit carries\n"
+        refusesDirty fixture plan ["docs/alternate.md"]
+
     it "executes with prose no group consumes and the artifacts a run writes" $
       withDirtyFixture $ \fixture plan → do
         -- The hosted layout: the plan and the applicability document are
@@ -619,18 +652,18 @@ planInto fixture base = planCandidateInto fixture base "HEAD" "HEAD"
 
 -- | The same, for a plan whose integration candidate is not its head.
 planCandidateInto ∷ Fixture → String → String → String → FilePath → IO FilePath
-planCandidateInto fixture base head' candidate name = do
+planCandidateInto fixture base head' candidate name =
+  planWith fixture ["--base", base, "--head", head', "--candidate", candidate] name
+
+-- | Resolve a plan with whichever planner arguments an example needs.
+planWith ∷ Fixture → [String] → FilePath → IO FilePath
+planWith fixture arguments name = do
   (result, output, errors) ←
     run
       (environment fixture)
       (root fixture)
       "python3"
-      [ tools fixture </> "plan.py"
-      , "--base", base
-      , "--head", head'
-      , "--candidate", candidate
-      , "--json"
-      ]
+      ((tools fixture </> "plan.py") : arguments ++ ["--json"])
   (result, errors) `shouldBe` (ExitSuccess, "")
   let target = root fixture </> name
   writeFile target output
@@ -748,6 +781,7 @@ emptyPlan =
     , "  \"catalog_policy_version\": 1,"
     , "  \"input_identity\": \"ffff\","
     , "  \"runner_os\": \"Linux\","
+    , "  \"catalog\": {\"source\": \"fixture\", \"override\": null, \"groups\": 0},"
     , "  \"toolchain\": {},"
     , "  \"base\": {\"commit\": \"aaaa\", \"tree\": \"bbbb\"},"
     , "  \"head\": {\"commit\": \"cccc\", \"tree\": \"dddd\"},"
@@ -817,6 +851,7 @@ fixtureFiles =
   , ("probe/note.txt", "an input the optional group consumes\n")
   , ("flag/value", "good\n")
   , ("docs/consumed.md", "a document the flag group consumes\n")
+  , ("docs/alternate.md", "a document only the alternate catalog consumes\n")
   , ("tools/validation/catalog.json", fixtureCatalog)
   ]
 
@@ -859,6 +894,23 @@ fixtureCatalogWith nonAffecting =
     , groupDocument "smoke.slow" slowCommand "[\"slow/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true"
+    , "  ]"
+    , "}"
+    ]
+
+-- | A catalog that consumes a document the committed one leaves as harmless
+-- prose, so an example can tell which of the two classified a dirty checkout.
+alternateCatalog ∷ String
+alternateCatalog =
+  unlines
+    [ "{"
+    , "  \"schema_version\": 1,"
+    , "  \"policy_version\": 1,"
+    , "  \"policy_inputs\": [\"tools/validation/catalog.json\"],"
+    , "  \"non_affecting_paths\": [\"*.md\", \".gitignore\", \"LICENSE\"],"
+    , "  \"floor\": [\"build.pass\"],"
+    , "  \"groups\": ["
+    , groupDocument "build.pass" "[\"true\"]" "[\"docs/alternate.md\"]" "none" "build" "60" "false"
     , "  ]"
     , "}"
     ]

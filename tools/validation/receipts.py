@@ -180,6 +180,15 @@ def load_plan(path: str) -> dict:
         revision = require_dict(document, endpoint, "plan")
         require_str(revision, "commit", f"plan {endpoint}")
         require_str(revision, "tree", f"plan {endpoint}")
+    catalog = require_dict(document, "catalog", "plan")
+    require_str(catalog, "source", "plan catalog")
+    # A plan resolved against a fixture catalog names it here, because the
+    # runner has to read that same document to reproduce the classification the
+    # plan was built from. ``None`` is the ordinary case: the candidate's own.
+    if "override" not in catalog:
+        raise EvidenceError("plan catalog is missing 'override'")
+    if catalog["override"] is not None and not isinstance(catalog["override"], str):
+        raise EvidenceError("plan catalog field 'override' is neither a string nor null")
     request = require_dict(document, "request", "plan")
     require_str_list(request, "ids", "plan request")
     require_bool(request, "all_hspec", "plan request")

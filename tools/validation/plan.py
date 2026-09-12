@@ -28,6 +28,12 @@ import re
 import subprocess
 import sys
 
+# A one-shot tool must not write into the checkout it is validating. Importing a
+# sibling module would leave a ``__pycache__`` beside it — a file the candidate
+# does not carry, which the runner is right to refuse — so bytecode writing is
+# turned off before the imports that would create it.
+sys.dont_write_bytecode = True
+
 import receipts
 
 # The catalog's schema and the plan's are separate contracts: the plan gained
@@ -850,6 +856,7 @@ def build_plan(
     head_packages: dict[str, Package],
     base_catalog: dict | None,
     base_catalog_state: str,
+    catalog_override: str | None,
 ) -> dict:
     groups = catalog["groups"]
     groups_by_id = {group["id"]: group for group in groups}
@@ -968,7 +975,17 @@ def build_plan(
         # The platform an execution's result is a claim about. A receipt from
         # another operating system describes another machine's behaviour.
         "runner_os": identity["runner_os"],
-        "catalog": {"source": catalog_source, "groups": len(groups)},
+        # The override is recorded beside the source because the runner has to
+        # reproduce this classification to judge its own checkout, and a fixture
+        # catalog lives on the filesystem rather than in the candidate's tree.
+        # It stays out of `plan_identity`, which deliberately omits run-local
+        # filenames: what a catalog *says* is already covered by the policy
+        # identity, and where it was read from is not contract.
+        "catalog": {
+            "source": catalog_source,
+            "override": catalog_override,
+            "groups": len(groups),
+        },
         "base": {"revision": base.revision, "commit": base.commit, "tree": base.tree},
         "head": {"revision": head.revision, "commit": head.commit, "tree": head.tree},
         # Selection compares the contribution; execution happens on the
@@ -1236,6 +1253,7 @@ def main(argv: list[str]) -> int:
         head_packages,
         base_catalog,
         base_catalog_state,
+        arguments.catalog,
     )
     if arguments.as_json:
         print(json.dumps(plan, indent=2, sort_keys=False))

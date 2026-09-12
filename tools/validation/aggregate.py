@@ -38,6 +38,12 @@ import argparse
 import os
 import sys
 
+# A one-shot tool must not write into the checkout it is validating. Importing a
+# sibling module would leave a ``__pycache__`` beside it — a file the candidate
+# does not carry, which the runner is right to refuse — so bytecode writing is
+# turned off before the imports that would create it.
+sys.dont_write_bytecode = True
+
 import receipts
 from plan import PlannerError, parse_request
 from receipts import EvidenceError
