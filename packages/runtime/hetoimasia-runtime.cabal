@@ -20,7 +20,9 @@ source-repository head
     subdir: packages/runtime
 
 library
-    exposed-modules: Hetoimasia.Runtime
+    exposed-modules:
+        Hetoimasia.Runtime
+        Hetoimasia.Runtime.Resources
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings

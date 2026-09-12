@@ -26,6 +26,7 @@ import Control.Exception
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.Char (isDigit)
 import Data.Either (isLeft)
+import Data.List (isPrefixOf, tails)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
@@ -158,6 +159,12 @@ main = hspec $ do
   describe "Console startup" $ do
     it "emits the smoke records under the default configuration" testConsoleDefault
     it "applies a threshold and an exact override to the smoke path" testConsoleThreshold
+    it "emits the owned-resource lifecycle records on the resource-smoke path"
+      testConsoleResourceSmoke
+    it "silences the resource-smoke path at a warn threshold"
+      testConsoleResourceSmokeThreshold
+    it "rejects an unknown argument with a usage line naming both smoke paths"
+      testConsoleUnknownArgument
     it "fails before any entry for each invalid variable" testConsoleInvalid
     it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
     it "keeps help visible and validates configuration on that path" testConsoleHelp
@@ -1310,6 +1317,27 @@ recordComponents = map component . lines
       (_ : _ : name : _) → name
       _ → line
 
+-- | The message of one rendered record, which the layout quotes after @msg=@.
+recordMessage ∷ String → String
+recordMessage line = case filter (isPrefixOf marker) (tails line) of
+  (found : _) → takeWhile (/= '"') (drop (length marker) found)
+  [] → line
+  where
+    marker = "msg=\""
+
+-- | The @resource=@ value of a rendered release record, if this line is one.
+releasedResource ∷ String → Maybe String
+releasedResource line
+  | recordMessage line /= "Released resource" = Nothing
+  | otherwise = case mapMaybe named (words line) of
+      (value : _) → Just value
+      [] → Nothing
+  where
+    named segment
+      | marker `isPrefixOf` segment = Just (drop (length marker) segment)
+      | otherwise = Nothing
+    marker = "resource="
+
 testConsoleDefault ∷ IO ()
 testConsoleDefault = do
   (code, output, diagnostics) ← runConsole [] ["--smoke"]
@@ -1333,6 +1361,55 @@ testConsoleThreshold = do
     runConsole [("HETOIMASIA_LOG_LEVELS", "runtime=warn")] ["--smoke"]
   overridden `shouldBe` ExitSuccess
   recordComponents records `shouldBe` ["console"]
+
+-- | The owned-resource path, run as a child process exactly as the smoke path
+-- is. The message sequence asserted here is the one README.md documents.
+testConsoleResourceSmoke ∷ IO ()
+testConsoleResourceSmoke = do
+  (code, output, diagnostics) ← runConsole [] ["--resource-smoke"]
+  code `shouldBe` ExitSuccess
+  -- Records are diagnostics on stderr; this path writes no application output.
+  output `shouldBe` ""
+  recordComponents diagnostics
+    `shouldBe` ["runtime"] <> replicate 7 "runtime.resources" <> ["runtime"]
+  map recordMessage (lines diagnostics)
+    `shouldBe`
+      [ "Starting hetoimasia"
+      , "Acquired resource"
+      , "Acquired composite"
+      , "Completed bounded work"
+      , "Released resource"
+      , "Released resource"
+      , "Released resource"
+      , "Resource smoke completed"
+      , "Completed hetoimasia"
+      ]
+  -- Identifiers are in fields rather than interpolated into the messages, and
+  -- the composite's parts are released in its declared order before the
+  -- enclosing scope releases its own allocation.
+  diagnostics `shouldContain` "msg=\"Acquired resource\" id=1 resource=workspace"
+  diagnostics `shouldContain` "buffer=2 resource=channel store=3"
+  mapMaybe releasedResource (lines diagnostics)
+    `shouldBe` ["channel.buffer", "channel.store", "workspace"]
+
+testConsoleResourceSmokeThreshold ∷ IO ()
+testConsoleResourceSmokeThreshold = do
+  -- Lifecycle records are Info, so a warn threshold silences the whole path
+  -- while the resources are still acquired, used, and released.
+  (code, output, silent) ←
+    runConsole [("HETOIMASIA_LOG_LEVEL", "warn")] ["--resource-smoke"]
+  code `shouldBe` ExitSuccess
+  output `shouldBe` ""
+  silent `shouldBe` ""
+
+testConsoleUnknownArgument ∷ IO ()
+testConsoleUnknownArgument = do
+  (code, output, diagnostics) ← runConsole [] ["--resources"]
+  code `shouldNotBe` ExitSuccess
+  output `shouldBe` ""
+  diagnostics `shouldContain` "Usage: hetoimasia"
+  diagnostics `shouldContain` "--smoke"
+  diagnostics `shouldContain` "--resource-smoke"
 
 testConsoleInvalid ∷ IO ()
 testConsoleInvalid = forM_ invalid $ \(name, value) → do
@@ -1373,6 +1450,10 @@ testConsoleHelp = do
   code `shouldBe` ExitSuccess
   diagnostics `shouldBe` ""
   output `shouldContain` "Usage: hetoimasia"
+  -- Both supported paths are listed, so --help documents the one this suite
+  -- also runs as a child process below.
+  output `shouldContain` "--smoke"
+  output `shouldContain` "--resource-smoke"
   forM_ consoleVariableNames (shouldContain output)
   -- The help path resolves configuration first, so an invalid value fails it
   -- too, printing no help at all.
