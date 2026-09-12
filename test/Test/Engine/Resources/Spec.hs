@@ -69,6 +69,7 @@ import Hetoimasia.Foundation.Resource
   , withResourceLabelled
   , withScoped
   )
+import qualified Test.Engine.Resources.Cost as Cost
 import qualified Test.Engine.Resources.Opacity as Opacity
 import qualified Test.Engine.Resources.Smoke as Smoke
 import Test.Engine.Resources.Buffer
@@ -156,6 +157,8 @@ spec = describe "Resources" $ do
       testEvidenceThroughWhileHandling
     it "reports evidence reached by two routes exactly once"
       testEvidenceReachedTwiceReportedOnce
+    it "reports new evidence standing beside evidence already reached"
+      testMixedRouteEvidenceComplete
     it "loses evidence through a bare typed try"
       testBareTypedTryLosesEvidence
     it "loses evidence through a try followed by a plain throwIO"
@@ -256,6 +259,10 @@ spec = describe "Resources" $ do
   describe "Continuation facade composite allocation" $ do
     it "keeps each composite's declared order while the scope unwinds in reverse"
       testCompositeThroughFacade
+
+  -- What inspecting retained evidence costs is part of the contract, and is
+  -- observable only by measuring, so its examples group separately.
+  Cost.spec
 
   -- The facade's opacity is a property of what the package exports rather than
   -- of a value, so it is asserted by compiling clients outside the package.
@@ -770,6 +777,38 @@ testEvidenceReachedTwiceReportedOnce = do
       length retained `shouldBe` 1
       labelsOf retained `shouldBe` ["twice"]
     other → expectationFailure ("expected one retained failure, got " <> show (length other))
+
+-- | A context can hold evidence already reached by another route beside
+-- evidence reached nowhere else, on either kind of nesting. Recognizing the
+-- repeat must skip that one entry rather than the context around it.
+testMixedRouteEvidenceComplete ∷ Expectation
+testMixedRouteEvidenceComplete = do
+  first ← oneFailure "first"
+  second ← oneFailure "second"
+  third ← oneFailure "third"
+  case (first, second, third) of
+    ([earlier], [beside], [below]) → do
+      reached ←
+        expectFailure . annotateIO earlier . annotateIO beside $
+          annotateIO earlier (annotateIO below (throwIO (ErrorCall "inner")))
+            `catch` (\(_ ∷ SomeException) → throwIO (ErrorCall "outer"))
+      let context = someExceptionContext reached
+      -- The repeated entry really does stand beside new evidence on both
+      -- routes: directly, and inside the handler's annotation.
+      length (directFailures context) `shouldBe` 2
+      length (concatMap handledFailures (handledBelow context)) `shouldBe` 2
+      -- Every distinct failure is reported, once, in observation order.
+      let retained = cleanupFailures reached
+      labelsOf retained `shouldBe` ["first", "second", "third"]
+    _ → expectationFailure "expected one retained failure from each fixture"
+  where
+    -- One scope whose release fails, inspected down to its single entry.
+    oneFailure label =
+      cleanupFailures
+        <$> expectFailure
+          ( withResourceLabelled label (pure ()) (\_ → throwIO (userError "release failed")) $ \_ →
+              throwIO (ErrorCall "body failed")
+          )
 
 testBareTypedTryLosesEvidence ∷ Expectation
 testBareTypedTryLosesEvidence = do
