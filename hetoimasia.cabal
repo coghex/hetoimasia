@@ -91,11 +91,24 @@ test-suite hetoimasia-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Engine.Spec
+        Test.Engine.Logging.Component
+        Test.Engine.Logging.Configuration
+        Test.Engine.Logging.Context
+        Test.Engine.Logging.Filtering
+        Test.Engine.Logging.Layout
+        Test.Engine.Logging.Sink
+        Test.Engine.Logging.Spec
+        Test.Engine.Logging.Support
+        Test.Engine.Logging.Worker
         Test.Engine.Resources.Buffer
         Test.Engine.Resources.Cost
         Test.Engine.Resources.Opacity
         Test.Engine.Resources.Smoke
         Test.Engine.Resources.Spec
+        Test.Engine.Runtime.Application
+        Test.Engine.Runtime.Console
+        Test.Engine.Runtime.Spec
     -- -T keeps the runtime's allocation statistics available, which the
     -- cleanup-evidence inspection cost examples read.
     ghc-options: -threaded -rtsopts -with-rtsopts=-T
