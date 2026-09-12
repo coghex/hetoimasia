@@ -26,6 +26,7 @@ does not require Vulkan, Lua, a display, or a running Synarchy process.
 ```sh
 cabal build all
 cabal run exe:hetoimasia -- --smoke
+cabal run exe:hetoimasia -- --resource-smoke
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 
@@ -39,9 +40,34 @@ thread, and source line of the run:
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
-2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:90 msg="Hello from Hetoimasia."
+2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:99 msg="Hello from Hetoimasia."
 2026-09-10T12:34:56.790Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
 ```
+
+`--resource-smoke` is the owned-resource path. It acquires a workspace and a
+composite channel through the [resource scopes](docs/resources.md), does bounded
+work with them, releases everything, and reports the lifecycle — the consumer
+that shows the two contracts composing. Expected output on stderr, again with
+the timestamp, thread, and source line of the run:
+
+```text
+2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:255 crumbs=resource-smoke msg="Acquired resource" id=1 resource=workspace
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:259 crumbs=resource-smoke msg="Acquired composite" buffer=2 resource=channel store=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:300 crumbs=resource-smoke msg="Completed bounded work" published=2 staged=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=2 id=2 resource=channel.buffer
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=1 id=3 resource=channel.store
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=3 id=1 resource=workspace
+2026-09-10T12:34:56.793Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:238 crumbs=resource-smoke msg="Resource smoke completed" entries=5
+2026-09-10T12:34:56.793Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
+```
+
+The composite's parts are released in the order its constructor declared — the
+buffer before the store it is bound to, which is acquisition order rather than
+the reverse of it — and the workspace, allocated first by the enclosing scope,
+is released last. Nothing is written to stdout and no file is left behind.
+[Application lifecycle](docs/resources.md#application-lifecycle) is the
+contract these records follow.
 
 Logging is configured from the environment, read once at startup:
 `HETOIMASIA_LOG_LEVEL` sets the global threshold, `HETOIMASIA_LOG_LEVELS` sets
@@ -54,7 +80,11 @@ the accepted forms, and
 ```sh
 HETOIMASIA_LOG_LEVEL=warn cabal run exe:hetoimasia -- --smoke      # no records
 HETOIMASIA_LOG_LEVELS=runtime=warn cabal run exe:hetoimasia -- --smoke
+HETOIMASIA_LOG_LEVEL=warn cabal run exe:hetoimasia -- --resource-smoke
 ```
+
+Every lifecycle record above is `Info`, so the last command still acquires,
+uses, and releases both resources and still exits 0 — it just says nothing.
 
 ## Layout
 

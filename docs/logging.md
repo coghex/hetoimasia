@@ -342,6 +342,12 @@ when the diagnostic it tried to emit fails too.
 Generic resource-scope primitives stay out of this module; see
 [the resource ownership design](resource_ownership_design.md). A scope must run
 its cleanup and expose its outcome with no logger at all, or with a broken one.
+Composing the two is the application's obligation, and
+[Application lifecycle](resources.md#application-lifecycle) in the resource
+contract is where that composition is written down: where a logger call may and
+may not go around a scope, why a release collects a bounded lifecycle entry
+instead of writing to a sink, and how a boundary reports a resource failure once
+and still hands the structured outcome to its caller.
 
 ## Context and precedence
 

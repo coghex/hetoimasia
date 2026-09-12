@@ -9,13 +9,15 @@ Scope: the scope primitive, ownership and borrowing of the scoped value, the
 argument order, the failure table, the mask discipline, what the release
 guarantee does and does not cover, how to inspect and how not to discard the
 secondary failures a scope retains, the staged constructor an owner built from
-several parts is assembled with, and the continuation facade those scopes are
-composed in.
+several parts is assembled with, the continuation facade those scopes are
+composed in, and how an application composes them with logging.
 
-Runtime composition and anything involving Vulkan, GPU completion, retirement
-queues, ownership transfer, or public early release are not part of it yet.
-This module imports no logger, runtime environment, graphics, or scripting
-module, and owns no application state.
+Anything involving Vulkan, GPU completion, retirement queues, ownership
+transfer, or public early release is not part of it yet. This module imports no
+logger, runtime environment, graphics, or scripting module, and owns no
+application state; [Application lifecycle](#application-lifecycle) describes
+what the application does with it, and belongs to the application rather than to
+the module.
 
 ## Public interface
 
@@ -386,6 +388,153 @@ A boundary that reports resource failures through a logger follows the pattern
 in [logging.md](logging.md#module-authoring-guide): the scope raises, and the
 boundary decides what to log. A broken logger must not erase the outcome.
 
+## Application lifecycle
+
+Scopes and logging are peers. This module imports no logger, and a scope runs
+its cleanup and exposes its outcome with no logger at all or with a broken one.
+Composing the two is therefore the application's job, and these are the rules
+that composition follows. `Hetoimasia.Runtime.Resources.resourceSmoke` is the
+worked example: the console executable runs it as `--resource-smoke`, and the
+suite runs the same body with failures injected.
+
+### Where a logger call may go
+
+**Never between an acquisition and its protection.** Nothing that can fail on
+its own belongs there, and a sink write can fail. With the facade there is no
+temptation to put one there: the continuation the facade enters is already
+covered by that allocation's release, so an acquisition record emitted from it
+is emitted after the resource is protected.
+
+```haskell
+smokeScope ∷ Logger → Ledger → ReleaseOutcomes → Scoped SmokeResources
+smokeScope scoped ledger outcomes = do
+  workspace ←
+    allocResource
+      (openSlot ledger "workspace")
+      (closeSlot ledger (onReleaseWorkspace outcomes))
+  liftIO $
+    logInfo scoped resourceComponent "Acquired resource"
+      [("resource", slotName workspace), ("id", slotId workspace)]
+  channel ← allocComposite (channelAssembly ledger outcomes)
+  liftIO $
+    logInfo scoped resourceComponent "Acquired composite"
+      [ ("resource", "channel")
+      , ("buffer", slotId (channelBuffer channel))
+      , ("store", slotId (channelStore channel))
+      ]
+  pure (SmokeResources workspace channel)
+```
+
+**Never inside a release.** A release runs under `uninterruptibleMask_` and must
+have a controlled blocking duration; a sink write has none, and a sink that
+fails would then be a cleanup failure of a resource that was destroyed
+perfectly well. Collect a bounded lifecycle entry in the release and emit it
+after the scope has unwound:
+
+```haskell
+closeSlot ∷ Ledger → IO () → Slot → IO ()
+closeSlot ledger injected slot = do
+  entries ← readIORef (slotEntries slot)
+  atomicModifyIORef' (ledgerReleased ledger) $ \released →
+    (Released (slotName slot) (slotId slot) (length entries) : released, ())
+  writeIORef (slotOpen slot) False
+  injected
+```
+
+The record is appended before anything can fail, so evidence shows every
+release that was attempted rather than only those that succeeded, and the
+destruction happens whether or not the diagnostic later reaches a sink. A
+failed lifecycle log never skips a destruction, because no log runs inside one.
+
+### The reporting boundary
+
+A boundary that turns a resource failure into a diagnostic follows the worker
+example of [the logging contract](logging.md#usage), with one difference: that
+worker is terminal and swallows what it reported, while a boundary with a caller
+must hand the structured outcome on. The rules:
+
+- Classify anything thrown as asynchronous as cancellation and let it escape
+  unreported. A record emitted while cancelling is one more place the
+  cancellation could be lost.
+- Report an ordinary failure exactly once, with its context — which means the
+  evidence `cleanupFailuresInContext` reads out of it, not a rendered message.
+- Never report a sink failure back through the sink that just failed: one
+  attempt, and the attempt's own exception is discarded in favour of the
+  original. A cancellation arriving during the attempt escapes as itself.
+- Rethrow preservingly. `rethrowIO` on the value `tryWithContext` returned keeps
+  the primary exception's type, its value, and its retained evidence, so the
+  caller can inspect the same outcome the boundary just reported.
+- Never report successful completion for an action that threw or was
+  interrupted.
+
+```haskell
+resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
+resourceSmoke logger outcomes work = do
+  ledger ← newLedger
+  outcome ← trySmoke (runSmoke scoped ledger outcomes work)
+  case outcome of
+    Right entries → pure entries
+    Left primary@(ExceptionWithContext context failure)
+      | isCancellation failure → rethrowIO primary
+      | otherwise → do
+          released ← recordedReleases ledger
+          reportAbandoned scoped released context failure primary
+  where
+    scoped = withBreadcrumb "resource-smoke" logger
+
+-- One reporting attempt, and never a second one through the same sink.
+reportAbandoned scoped released context failure primary = do
+  reported ← tryAny (logError scoped resourceComponent "Resource smoke abandoned" fields)
+  case reported of
+    Right () → rethrowIO primary
+    Left reportingFailure
+      | isCancellation reportingFailure → throwIO reportingFailure
+      | otherwise → rethrowIO primary
+  where
+    evidence = cleanupFailuresInContext context
+    fields =
+      [ ("reason", Text.pack (displayException failure))
+      , ("released", renderNames released)
+      , ("cleanup.failures", number (length evidence))
+      , ("cleanup.labels", renderLabels evidence)
+      ]
+```
+
+The emission of the lifecycle records sits inside that boundary too, so a sink
+that fails while the lifecycle is being reported is handled exactly like any
+other ordinary failure: everything has already been released, one report is
+attempted, and the sink's exception propagates.
+
+### Shutdown order
+
+The order is the one [the logging contract](logging.md#ownership-and-failures)
+establishes, and nothing here changes it:
+
+1. Stop and join the producers, so nothing is still emitting.
+2. Finish subsystem cleanup, which may itself emit diagnostics.
+3. Flush and close any handle the application owns.
+
+Step 2 is where a scope unwinds, and step 3 is why the lifecycle records
+collected during that unwind are emitted before it. The console executable owns
+no handle: its sink borrows the process's `stderr`, which it never closes and
+never rebuffers, so its step 3 is empty. An application that opened its own log
+file closes it there — after the scopes have unwound, never before.
+
+### What the demonstration owns
+
+Two resources through the facade, and nothing that outlives the process. The
+workspace is a plain `allocResource`; the channel is an `allocComposite` of a
+buffer and the backing store it is bound to, released in that declared order —
+acquisition order, because what holds the reference goes before what it refers
+to — while the enclosing scope releases the workspace it allocated first last.
+There is no file, no thread, and no service: ownership is what the example
+shows, and none of those is needed to show it.
+
+Cleanup failures from the composite carry that constructor's own part labels;
+the workspace's carry `withResource`'s default label, because the facade's
+`allocResource` takes no label. Nesting a labelled `withResourceLabelled` by
+hand is the way to name one today.
+
 ## Caller patterns that discard evidence
 
 Recognizing an exception by type and keeping its attached context are separate
@@ -463,5 +612,22 @@ agreeing on one resource and on nested ones, `locally` releasing before the
 outer scope resumes while its ordinary result survives, a `locally` cleanup
 failure reaching the outer scope's evidence, and two composites allocated
 through the facade keeping their declared order while the scope unwinds in
-reverse. The validation catalog covers them through the floor group
-`test.engine`; see [validation.md](validation.md).
+reverse.
+
+The `Console resource smoke` examples in
+`test/Test/Engine/Resources/Smoke.hs` cover
+[Application lifecycle](#application-lifecycle) by running
+`Hetoimasia.Runtime.Resources.resourceSmoke` — the body the console executable
+runs — with a failure injected into the work, into one release, into two
+releases at once with the report failing too, and into the sink of a lifecycle
+record after acquisition, plus a cancellation delivered to the work and another
+delivered while the report blocks. Each asserts what a caller sees: the
+exception that propagated, the evidence `cleanupFailures` reads out of it, the
+records that reached the sink, and which releases ran. One further example
+drives the body through a handle sink over a temporary file the example owns,
+and closes that handle only after the scope has unwound, so every cleanup
+record is in the file and the borrowed handle was neither closed nor rebuffered
+by the sink. The `Console startup` group in `test/Main.hs` runs
+`--resource-smoke` as a child process for the record sequence and for the quiet
+path at a `warn` threshold. The validation catalog covers all of them through
+the floor group `test.engine`; see [validation.md](validation.md).
