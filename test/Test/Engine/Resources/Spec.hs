@@ -87,6 +87,7 @@ import System.IO
   , hPutStrLn
   , openFile
   )
+import System.Directory (doesFileExist)
 import System.IO.Error (ioeGetErrorString)
 import System.IO.Temp (withSystemTempDirectory)
 import System.FilePath ((</>))
@@ -182,6 +183,28 @@ spec = describe "Resources" $ do
       testRollbackReleaseThrows
     it "releases each part once and lets no finished value reach the caller"
       testNoDoubleReleaseOrLeakedValue
+
+  describe "Composite part metadata" $ do
+    it "releases the parts acquired before a faulting rank and acquires nothing at that stage"
+      testRankFaultReleasesAcquiredParts
+    it "releases the parts acquired before a faulting label and acquires nothing at that stage"
+      testLabelFaultReleasesAcquiredParts
+    it "rejects a faulting rank before the later stage that would have failed runs"
+      testRankFaultStopsLaterFailingStage
+    it "rejects a faulting label before the later stage that would have failed runs"
+      testLabelFaultStopsLaterFailingStage
+    it "attempts every remaining release after a faulting rank and retains the labelled evidence"
+      testRankFaultAttemptsRemainingReleases
+    it "attempts every remaining release after a faulting label and retains the labelled evidence"
+      testLabelFaultAttemptsRemainingReleases
+    it "keeps an enclosing body's failure primary when a faulting rank fails its release"
+      testRankFaultUnderEnclosingFailure
+    it "keeps an enclosing body's failure primary when a faulting label fails its release"
+      testLabelFaultUnderEnclosingFailure
+    it "keeps an earlier stage's failure primary and never evaluates a later part's metadata"
+      testEarlierFailureStaysPrimaryOverLaterMetadata
+    it "closes the handles it owns when a later part's metadata faults"
+      testMetadataFaultClosesOwnedHandles
 
   describe "Composite construction cancellation" $ do
     it "rolls back the parts acquired so far when cancelled in a restored step"
@@ -977,6 +1000,261 @@ testNoDoubleReleaseOrLeakedValue = do
   occurrences "free memory 2" performed `shouldBe` 1
   -- The body never ran, so no finished value was observable by the caller.
   trail escaped `shouldReturn` []
+
+-- Composite part metadata -----------------------------------------------------
+
+-- A part's label and rank are ordinary arguments to 'acquirePart', so either
+-- can be a thunk that throws when it is evaluated — a rank read out of a
+-- device table that has no entry for this part, or a label built from a name
+-- the caller has not validated. Both are declared beside the acquisition, so
+-- both are expected to fault at the same point in the construction, and every
+-- example below is written once per faulting field.
+
+-- | The declared rank of the faulting stage's part throws when evaluated.
+faultingRank ∷ ReleaseRank
+faultingRank = releaseRank (error "rank lookup failed")
+
+-- | The declared label of the faulting stage's part throws when evaluated.
+faultingLabel ∷ Text
+faultingLabel = error "label lookup failed"
+
+-- | Two parts that acquire and release cleanly, then a third stage carrying
+-- the faulting metadata under test.
+twoPartsThenFaultingPart ∷ Trail → Text → ReleaseRank → Assembly ()
+twoPartsThenFaultingPart releases label rank = do
+  acquirePart
+    "first"
+    (releaseRank 0)
+    (record releases "acquire first")
+    (\_ → record releases "release first")
+  acquirePart
+    "second"
+    (releaseRank 1)
+    (record releases "acquire second")
+    (\_ → record releases "release second")
+  acquirePart
+    label
+    rank
+    (record releases "acquire third")
+    (\_ → record releases "release third")
+
+testRankFaultReleasesAcquiredParts ∷ Expectation
+testRankFaultReleasesAcquiredParts =
+  metadataFaultReleasesAcquiredParts "third" faultingRank "rank lookup failed"
+
+testLabelFaultReleasesAcquiredParts ∷ Expectation
+testLabelFaultReleasesAcquiredParts =
+  metadataFaultReleasesAcquiredParts faultingLabel (releaseRank 2) "label lookup failed"
+
+-- | The faulting stage is the only thing that fails: the two parts acquired
+-- before it are released once each in the declared order, that stage acquires
+-- nothing, and the body never runs.
+metadataFaultReleasesAcquiredParts ∷ Text → ReleaseRank → String → Expectation
+metadataFaultReleasesAcquiredParts label rank message = do
+  releases ← newTrail
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        (twoPartsThenFaultingPart releases label rank)
+        (\_ → record bodies "body")
+  errorCallMessage propagated `shouldBe` Just message
+  -- The metadata is evaluated before the faulting stage acquires anything, so
+  -- that stage owns nothing to release and every earlier part is covered.
+  trail releases
+    `shouldReturn` ["acquire first", "acquire second", "release first", "release second"]
+  -- Every release succeeded, so the metadata fault carries no cleanup evidence.
+  length (cleanupFailures propagated) `shouldBe` 0
+  trail bodies `shouldReturn` []
+
+testRankFaultStopsLaterFailingStage ∷ Expectation
+testRankFaultStopsLaterFailingStage =
+  metadataFaultStopsLaterFailingStage "faulting" faultingRank "rank lookup failed"
+
+testLabelFaultStopsLaterFailingStage ∷ Expectation
+testLabelFaultStopsLaterFailingStage =
+  metadataFaultStopsLaterFailingStage faultingLabel (releaseRank 1) "label lookup failed"
+
+-- | A metadata fault is a construction failure, so the stages after it do not
+-- run at all. The binding step below would have failed, and the fault is
+-- primary because it was raised first rather than because it displaced
+-- anything.
+metadataFaultStopsLaterFailingStage ∷ Text → ReleaseRank → String → Expectation
+metadataFaultStopsLaterFailingStage label rank message = do
+  releases ← newTrail
+  bodies ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        ( do
+            acquirePart
+              "first"
+              (releaseRank 0)
+              (record releases "acquire first")
+              (\_ → record releases "release first")
+            acquirePart
+              label
+              rank
+              (record releases "acquire faulting")
+              (\_ → record releases "release faulting")
+            restoredStep (record releases "bind" *> throwIO (userError "binding failure") ∷ IO ())
+        )
+        (\_ → record bodies "body")
+  errorCallMessage propagated `shouldBe` Just message
+  ioErrorMessage propagated `shouldBe` Nothing
+  -- Neither the faulting stage's acquisition nor the binding step ran, and the
+  -- one part acquired before them was released.
+  trail releases `shouldReturn` ["acquire first", "release first"]
+  length (cleanupFailures propagated) `shouldBe` 0
+  trail bodies `shouldReturn` []
+
+testRankFaultAttemptsRemainingReleases ∷ Expectation
+testRankFaultAttemptsRemainingReleases =
+  metadataFaultAttemptsRemainingReleases "third" faultingRank "rank lookup failed"
+
+testLabelFaultAttemptsRemainingReleases ∷ Expectation
+testLabelFaultAttemptsRemainingReleases =
+  metadataFaultAttemptsRemainingReleases faultingLabel (releaseRank 2) "label lookup failed"
+
+-- | A throwing release during the rollback does not stop the remaining one,
+-- and the evidence is retained under the acquired part's own valid label. The
+-- faulting stage acquired nothing, so it contributes no cleanup entry and no
+-- fabricated label.
+metadataFaultAttemptsRemainingReleases ∷ Text → ReleaseRank → String → Expectation
+metadataFaultAttemptsRemainingReleases label rank message = do
+  releases ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        ( do
+            acquirePart
+              "first"
+              (releaseRank 0)
+              (record releases "acquire first")
+              (\_ → record releases "release first" *> throwIO (userError "first release failed"))
+            acquirePart
+              "second"
+              (releaseRank 1)
+              (record releases "acquire second")
+              (\_ → record releases "release second")
+            acquirePart
+              label
+              rank
+              (record releases "acquire third")
+              (\_ → record releases "release third")
+        )
+        (\_ → pure ())
+  errorCallMessage propagated `shouldBe` Just message
+  let retained = cleanupFailures propagated
+  labelsOf retained `shouldBe` ["first"]
+  ioMessagesOf retained `shouldBe` [Just "first release failed"]
+  trail releases
+    `shouldReturn` ["acquire first", "acquire second", "release first", "release second"]
+
+testRankFaultUnderEnclosingFailure ∷ Expectation
+testRankFaultUnderEnclosingFailure =
+  metadataFaultUnderEnclosingFailure "second" faultingRank "rank lookup failed"
+
+testLabelFaultUnderEnclosingFailure ∷ Expectation
+testLabelFaultUnderEnclosingFailure =
+  metadataFaultUnderEnclosingFailure faultingLabel (releaseRank 1) "label lookup failed"
+
+-- | A failure that is already being unwound stays primary when a metadata
+-- fault is raised beneath it. The enclosing scope's body fails, its release
+-- constructs the faulting composite, and the fault arrives as that scope's
+-- cleanup failure with the composite's own labelled evidence still reachable
+-- below it.
+metadataFaultUnderEnclosingFailure ∷ Text → ReleaseRank → String → Expectation
+metadataFaultUnderEnclosingFailure label rank message = do
+  releases ← newTrail
+  propagated ←
+    expectFailure $
+      withResourceLabelled
+        "outer resource"
+        (record releases "acquire outer")
+        ( \_ →
+            withComposite
+              ( do
+                  acquirePart
+                    "first"
+                    (releaseRank 0)
+                    (record releases "acquire first")
+                    (\_ → record releases "release first" *> throwIO (userError "first release failed"))
+                  acquirePart
+                    label
+                    rank
+                    (record releases "acquire second")
+                    (\_ → record releases "release second")
+              )
+              (\_ → pure ())
+        )
+        (\_ → throwIO (userError "outer body failure"))
+  ioErrorMessage propagated `shouldBe` Just "outer body failure"
+  let retained = cleanupFailures propagated
+  -- The composite's labelled release failure and the enclosing scope's entry
+  -- for the metadata fault are both inspectable, in observation order.
+  labelsOf retained `shouldBe` ["first", "outer resource"]
+  ioMessagesOf retained `shouldBe` [Just "first release failed", Nothing]
+  map (errorCallMessage . failureException) retained `shouldBe` [Nothing, Just message]
+  trail releases `shouldReturn` ["acquire outer", "acquire first", "release first"]
+
+-- | The stage that fails first is the primary failure. A later part's metadata
+-- is never evaluated, because the stage declaring it never runs.
+testEarlierFailureStaysPrimaryOverLaterMetadata ∷ Expectation
+testEarlierFailureStaysPrimaryOverLaterMetadata = do
+  releases ← newTrail
+  propagated ←
+    expectFailure $
+      withComposite
+        ( do
+            acquirePart
+              "first"
+              (releaseRank 0)
+              (record releases "acquire first")
+              (\_ → record releases "release first")
+            restoredStep (throwIO (userError "binding failure") ∷ IO ())
+            acquirePart
+              faultingLabel
+              faultingRank
+              (record releases "acquire second")
+              (\_ → record releases "release second")
+        )
+        (\_ → pure ())
+  ioErrorMessage propagated `shouldBe` Just "binding failure"
+  errorCallMessage propagated `shouldBe` Nothing
+  trail releases `shouldReturn` ["acquire first", "release first"]
+
+-- | The same fault against handles the composite really owns: both open files
+-- are closed when a later part's metadata faults, and the faulting stage never
+-- opened its own file.
+testMetadataFaultClosesOwnedHandles ∷ Expectation
+testMetadataFaultClosesOwnedHandles =
+  withSystemTempDirectory "hetoimasia-composite-metadata" $ \directory → do
+    let firstPath = directory </> "first.txt"
+        secondPath = directory </> "second.txt"
+        faultingPath = directory </> "third.txt"
+    borrowed ← newEmptyMVar
+    propagated ←
+      expectFailure $
+        withComposite
+          ( do
+              firstHandle ←
+                acquirePart "first handle" (releaseRank 0) (openFile firstPath WriteMode) hClose
+              secondHandle ←
+                acquirePart "second handle" (releaseRank 1) (openFile secondPath WriteMode) hClose
+              restoredStep (putMVar borrowed (firstHandle, secondHandle))
+              acquirePart
+                faultingLabel
+                (releaseRank 2)
+                (openFile faultingPath WriteMode)
+                hClose
+          )
+          (\_ → pure ())
+    errorCallMessage propagated `shouldBe` Just "label lookup failed"
+    (firstHandle, secondHandle) ← takeMVar borrowed
+    hIsOpen (firstHandle ∷ Handle) `shouldReturn` False
+    hIsOpen (secondHandle ∷ Handle) `shouldReturn` False
+    doesFileExist faultingPath `shouldReturn` False
 
 -- Composite construction cancellation -----------------------------------------
 
