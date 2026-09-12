@@ -24,12 +24,20 @@
 --   destruction, because no diagnostic runs inside one.
 --
 -- * __The boundary reports once and keeps its failure.__ An ordinary failure
---   gets exactly one 'logError' attempt, carrying the evidence
---   'cleanupFailuresInContext' reads out of the exception's own context; the
---   original exception then propagates with its type, its value, and that
---   context intact, whether the report succeeded or failed. A cancellation
---   escapes with no record at all, and no successful completion is ever
---   reported for a run that threw.
+--   of a resource or of the work gets exactly one 'logError' attempt, carrying
+--   the evidence 'cleanupFailuresInContext' reads out of the exception's own
+--   context; the original exception then propagates with its type, its value,
+--   and that context intact, whether the report succeeded or failed. A
+--   cancellation escapes with no record at all, and no successful completion is
+--   ever reported for a run that threw.
+--
+-- * __A diagnostic's own failure is never reported.__ A resource failure and a
+--   diagnostic failure are different things. When the sink a lifecycle record
+--   was written to is what failed, there is no second sink to say so through
+--   and the one that just failed is not it: the run still releases everything,
+--   and the sink's exception then propagates with no reporting attempt at all.
+--   Every lifecycle emission below is marked with 'DiagnosticFailure' so the
+--   boundary can tell the two apart.
 --
 -- Unlike the terminal worker boundary of @docs\/logging.md@, this one has a
 -- caller. It reports and then rethrows rather than swallowing, so the caller
@@ -38,6 +46,7 @@ module Hetoimasia.Runtime.Resources
   ( -- * The demonstration
     resourceSmoke
   , resourceComponent
+  , DiagnosticFailure (..)
 
     -- * Injected work
   , SmokeWork
@@ -63,6 +72,7 @@ import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , annotateIO
   , displayException
   , fromException
   , rethrowIO
@@ -70,7 +80,10 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Exception.Context (ExceptionContext)
+import Control.Exception.Annotation
+  ( ExceptionAnnotation (displayExceptionAnnotation)
+  )
+import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -102,6 +115,34 @@ import Hetoimasia.Foundation.Resource
 -- | The stable component name every record from this demonstration carries.
 resourceComponent ∷ Component
 resourceComponent = unsafeComponent "runtime.resources"
+
+-- | Marks an exception raised by one of this demonstration's own lifecycle
+-- diagnostics, rather than by a resource, a release, or the injected work.
+--
+-- The reporting boundary needs that distinction: an ordinary failure is worth
+-- one report, while a failure that came out of the sink has no sink left to be
+-- reported through. Marking the emission is the only way to tell them apart,
+-- because by the time the exception reaches the boundary an 'IOException' from
+-- a sink looks exactly like an 'IOException' from a release.
+data DiagnosticFailure = DiagnosticFailure
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation DiagnosticFailure where
+  displayExceptionAnnotation _ = "raised by a lifecycle diagnostic"
+
+-- | Emit one lifecycle diagnostic, marking whatever it raises.
+--
+-- The mark rides on the exception's context, which every rethrow inside the
+-- resource scopes preserves, so it is still directly reachable at the boundary
+-- after the scope has unwound and attached its own cleanup evidence.
+lifecycle ∷ IO () → IO ()
+lifecycle = annotateIO DiagnosticFailure
+
+-- | Whether the exception carrying this context came out of a lifecycle
+-- diagnostic.
+raisedByDiagnostic ∷ ExceptionContext → Bool
+raisedByDiagnostic context =
+  not (null (getExceptionAnnotations context ∷ [DiagnosticFailure]))
 
 -- | A borrowed in-memory slot: an identifier, and the bounded list of entries
 -- written into it while it is held.
@@ -195,13 +236,15 @@ workingReleases = ReleaseOutcomes
 -- messages. The work's result is returned.
 --
 -- On every other path nothing reports completion. An ordinary failure — from
--- the work, from a release, or from the sink a lifecycle record was written to
--- — produces exactly one @Error@ record naming what was released and what
--- cleanup evidence the exception carries, and then propagates with its context
--- intact so the caller can inspect that evidence itself through
--- 'Hetoimasia.Foundation.Resource.cleanupFailures'. If that one report also
--- fails, its exception is discarded in favour of the original. A cancellation
--- propagates unchanged and unreported.
+-- the work or from a release — produces exactly one @Error@ record naming what
+-- was released and what cleanup evidence the exception carries, and then
+-- propagates with its context intact so the caller can inspect that evidence
+-- itself through 'Hetoimasia.Foundation.Resource.cleanupFailures'. If that one
+-- report also fails, its exception is discarded in favour of the original.
+--
+-- A cancellation propagates unchanged and unreported, and so does a failure
+-- raised by a lifecycle diagnostic itself: there is no reporting attempt for a
+-- sink that has already failed.
 --
 -- Either way every resource acquired has been released before this returns.
 resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
@@ -214,6 +257,10 @@ resourceSmoke logger outcomes work = do
       -- A cancellation is never turned into a diagnostic: a record emitted
       -- while cancelling is one more place the cancellation could be lost.
       | isCancellation failure → rethrowIO primary
+      -- Neither is a diagnostic's own failure. Everything has still been
+      -- released; reporting this would mean writing to the sink that just
+      -- failed, which is the recursion the logging contract forbids.
+      | raisedByDiagnostic context → rethrowIO primary
       | otherwise → do
           released ← recordedReleases ledger
           reportAbandoned scoped released context failure primary
@@ -234,9 +281,10 @@ runSmoke scoped ledger outcomes work = do
   -- The scope has unwound: every release has run, and the records they left
   -- behind are emitted here, where a blocking write is allowed.
   released ← recordedReleases ledger
-  emitReleases scoped released
-  logInfo scoped resourceComponent "Resource smoke completed"
-    [("entries", number entries)]
+  lifecycle (emitReleases scoped released)
+  lifecycle $
+    logInfo scoped resourceComponent "Resource smoke completed"
+      [("entries", number entries)]
   pure entries
 
 -- | The two allocations, composed in @do@ notation.
@@ -251,11 +299,11 @@ smokeScope scoped ledger outcomes = do
     allocResource
       (openSlot ledger "workspace")
       (closeSlot ledger (onReleaseWorkspace outcomes))
-  liftIO $
+  liftIO . lifecycle $
     logInfo scoped resourceComponent "Acquired resource"
       [("resource", slotName workspace), ("id", slotId workspace)]
   channel ← allocComposite (channelAssembly ledger outcomes)
-  liftIO $
+  liftIO . lifecycle $
     logInfo scoped resourceComponent "Acquired composite"
       [ ("resource", "channel")
       , ("buffer", slotId (channelBuffer channel))
@@ -297,13 +345,19 @@ smokeWork logger resources = do
   forM_ ["first frame", "second frame"] (writeSlot (channelBuffer (smokeChannel resources)))
   staged ← slotCount (smokeWorkspace resources)
   published ← slotCount (channelBuffer (smokeChannel resources))
-  logInfo logger resourceComponent "Completed bounded work"
-    [("staged", number staged), ("published", number published)]
+  lifecycle $
+    logInfo logger resourceComponent "Completed bounded work"
+      [("staged", number staged), ("published", number published)]
   pure (staged + published)
 
 -- Reporting boundary ----------------------------------------------------------
 
--- | One reporting attempt, and never a second one through the same sink.
+-- | One reporting attempt for an ordinary failure, and never a second one
+-- through the same sink.
+--
+-- This is reached only for a failure of a resource, a release, or the work. A
+-- failure raised by a lifecycle diagnostic never gets here at all, which is
+-- what keeps a failing sink from being reported back through itself.
 --
 -- The original exception is rethrown either way, with its 'ExceptionContext' —
 -- and therefore its retained cleanup evidence — untouched, so the caller

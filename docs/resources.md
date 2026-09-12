@@ -456,11 +456,21 @@ must hand the structured outcome on. The rules:
 - Classify anything thrown as asynchronous as cancellation and let it escape
   unreported. A record emitted while cancelling is one more place the
   cancellation could be lost.
-- Report an ordinary failure exactly once, with its context — which means the
-  evidence `cleanupFailuresInContext` reads out of it, not a rendered message.
-- Never report a sink failure back through the sink that just failed: one
-  attempt, and the attempt's own exception is discarded in favour of the
-  original. A cancellation arriving during the attempt escapes as itself.
+- Report an ordinary failure — of a resource, of a release, or of the work —
+  exactly once, with its context, which means the evidence
+  `cleanupFailuresInContext` reads out of it rather than a rendered message.
+- **A resource failure and a diagnostic failure are different things.** When
+  what failed is the sink a lifecycle record was written to, there is no second
+  sink to say so through and the one that just failed is not it: release
+  everything, then propagate with no reporting attempt at all. An exception's
+  type cannot tell you which it was — an `IOException` from a sink and an
+  `IOException` from a release look alike — so mark the emission and check the
+  mark. The example annotates every lifecycle record it emits with
+  `DiagnosticFailure`, which rides on the exception's context through the
+  scope's preserving rethrows.
+- Make the one attempt guarded, and never a second one. A synchronous failure
+  from that attempt is discarded in favour of the original, and a cancellation
+  arriving during it escapes as itself.
 - Rethrow preservingly. `rethrowIO` on the value `tryWithContext` returned keeps
   the primary exception's type, its value, and its retained evidence, so the
   caller can inspect the same outcome the boundary just reported.
@@ -476,13 +486,30 @@ resourceSmoke logger outcomes work = do
     Right entries → pure entries
     Left primary@(ExceptionWithContext context failure)
       | isCancellation failure → rethrowIO primary
+      | raisedByDiagnostic context → rethrowIO primary
       | otherwise → do
           released ← recordedReleases ledger
           reportAbandoned scoped released context failure primary
   where
     scoped = withBreadcrumb "resource-smoke" logger
 
--- One reporting attempt, and never a second one through the same sink.
+-- Marks an exception raised by one of this demonstration's own lifecycle
+-- diagnostics, rather than by a resource, a release, or the injected work.
+data DiagnosticFailure = DiagnosticFailure
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation DiagnosticFailure where
+  displayExceptionAnnotation _ = "raised by a lifecycle diagnostic"
+
+lifecycle ∷ IO () → IO ()
+lifecycle = annotateIO DiagnosticFailure
+
+raisedByDiagnostic ∷ ExceptionContext → Bool
+raisedByDiagnostic context =
+  not (null (getExceptionAnnotations context ∷ [DiagnosticFailure]))
+
+-- One reporting attempt for an ordinary failure, and never a second one
+-- through the same sink.
 reportAbandoned scoped released context failure primary = do
   reported ← tryAny (logError scoped resourceComponent "Resource smoke abandoned" fields)
   case reported of
@@ -500,10 +527,12 @@ reportAbandoned scoped released context failure primary = do
       ]
 ```
 
-The emission of the lifecycle records sits inside that boundary too, so a sink
-that fails while the lifecycle is being reported is handled exactly like any
-other ordinary failure: everything has already been released, one report is
-attempted, and the sink's exception propagates.
+The emission of the lifecycle records sits inside that boundary too, but on the
+diagnostic side of it. If the sink fails while the lifecycle is being reported,
+everything has already been released, the marked exception takes the second
+branch above, and it propagates with nothing further written — the caller
+learns that the sink failed by receiving the sink's own exception, which is the
+only place that news can still go.
 
 ### Shutdown order
 
@@ -620,8 +649,11 @@ The `Console resource smoke` examples in
 `Hetoimasia.Runtime.Resources.resourceSmoke` — the body the console executable
 runs — with a failure injected into the work, into one release, into two
 releases at once with the report failing too, and into the sink of a lifecycle
-record after acquisition, plus a cancellation delivered to the work and another
-delivered while the report blocks. Each asserts what a caller sees: the
+record after acquisition — which releases everything and then propagates with
+no reporting attempt, beside a companion example raising the same sink
+exception from the work instead, which does get its one report — plus a
+cancellation delivered to the work and another delivered while the report
+blocks. Each asserts what a caller sees: the
 exception that propagated, the evidence `cleanupFailures` reads out of it, the
 records that reached the sink, and which releases ran. One further example
 drives the body through a handle sink over a temporary file the example owns,

@@ -33,9 +33,11 @@ import Control.Exception
   , SomeException
   , bracket
   , fromException
+  , someExceptionContext
   , throwIO
   , try
   )
+import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
@@ -59,7 +61,8 @@ import Hetoimasia.Foundation.Resource
   , cleanupFailures
   )
 import Hetoimasia.Runtime.Resources
-  ( ReleaseOutcomes (..)
+  ( DiagnosticFailure (..)
+  , ReleaseOutcomes (..)
   , SmokeWork
   , resourceSmoke
   , smokeWork
@@ -97,8 +100,10 @@ spec = describe "Console resource smoke" $ do
       testReleaseFailure
     it "keeps the work's failure and the ordered evidence when the report also fails"
       testCombinedFailures
-    it "releases everything when a lifecycle record's sink fails after acquisition"
+    it "releases everything and reports nothing when a lifecycle record's sink fails"
       testLifecycleSinkFailure
+    it "reports a work failure through a sink that only the lifecycle records broke"
+      testWorkFailureAfterLifecycleSinkRecovers
     it "propagates cancellation delivered to the work, unreported"
       (boundedExample testCancelledDuringWork)
     it "propagates cancellation delivered while the report blocks"
@@ -327,10 +332,34 @@ testLifecycleSinkFailure = do
   -- A failed diagnostic never skips a destruction.
   readMVar attempts `shouldReturn` attemptedReleases
   entries ← collected
+  -- A resource failure is worth a report; a diagnostic's own failure is not.
+  -- The sink that just failed is the only one there is, so nothing is written
+  -- back through it and no completion is claimed either.
+  summaries entries `shouldBe` acquisitions
+  -- Exactly two records were handed to the sink: the accepted acquisition and
+  -- the one that failed. There was no third, reporting attempt.
+  handed `shouldReturn` 2
+  -- The boundary recognized it as a diagnostic failure rather than guessing
+  -- from the exception's type, which a release failure shares.
+  (getExceptionAnnotations (someExceptionContext propagated) ∷ [DiagnosticFailure])
+    `shouldBe` [DiagnosticFailure]
+
+testWorkFailureAfterLifecycleSinkRecovers ∷ Expectation
+testWorkFailureAfterLifecycleSinkRecovers = do
+  -- The same sink exception, raised by the work rather than by a lifecycle
+  -- record: this one is an ordinary failure and does get its one report.
+  (sink, collected) ← newCollector
+  attempts ← newMVar []
+  let logger = mkLogger defaultLogFilter sink
+      work _ _ = ioError (userError "sink unavailable")
+  propagated ← expectFailure (resourceSmoke logger (observedReleases attempts) work)
+  (ioeGetErrorString <$> (fromException propagated ∷ Maybe IOException))
+    `shouldBe` Just "sink unavailable"
+  (getExceptionAnnotations (someExceptionContext propagated) ∷ [DiagnosticFailure])
+    `shouldBe` []
+  readMVar attempts `shouldReturn` attemptedReleases
+  entries ← collected
   summaries entries `shouldBe` acquisitions <> [abandoned]
-  -- Three records were handed to the sink: the accepted acquisition, the one
-  -- that failed, and the single report attempt.
-  handed `shouldReturn` 3
 
 testCancelledDuringWork ∷ Expectation
 testCancelledDuringWork = do

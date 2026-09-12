@@ -346,8 +346,10 @@ Composing the two is the application's obligation, and
 [Application lifecycle](resources.md#application-lifecycle) in the resource
 contract is where that composition is written down: where a logger call may and
 may not go around a scope, why a release collects a bounded lifecycle entry
-instead of writing to a sink, and how a boundary reports a resource failure once
-and still hands the structured outcome to its caller.
+instead of writing to a sink, how a boundary reports a resource failure once and
+still hands the structured outcome to its caller, and how it tells a resource
+failure apart from a failure of the diagnostic itself — which is never reported,
+because the sink that would carry the report is the one that just failed.
 
 ## Context and precedence
 

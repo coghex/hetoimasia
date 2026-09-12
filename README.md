@@ -52,13 +52,13 @@ the timestamp, thread, and source line of the run:
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
-2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:255 crumbs=resource-smoke msg="Acquired resource" id=1 resource=workspace
-2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:259 crumbs=resource-smoke msg="Acquired composite" buffer=2 resource=channel store=3
-2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:300 crumbs=resource-smoke msg="Completed bounded work" published=2 staged=3
-2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=2 id=2 resource=channel.buffer
-2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=1 id=3 resource=channel.store
-2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:399 crumbs=resource-smoke msg="Released resource" entries=3 id=1 resource=workspace
-2026-09-10T12:34:56.793Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:238 crumbs=resource-smoke msg="Resource smoke completed" entries=5
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:303 crumbs=resource-smoke msg="Acquired resource" id=1 resource=workspace
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:307 crumbs=resource-smoke msg="Acquired composite" buffer=2 resource=channel store=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:349 crumbs=resource-smoke msg="Completed bounded work" published=2 staged=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=2 id=2 resource=channel.buffer
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=1 id=3 resource=channel.store
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=3 id=1 resource=workspace
+2026-09-10T12:34:56.793Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:286 crumbs=resource-smoke msg="Resource smoke completed" entries=5
 2026-09-10T12:34:56.793Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
 ```
 
