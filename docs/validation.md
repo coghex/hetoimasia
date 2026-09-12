@@ -460,13 +460,16 @@ checkout: an edited classifier could excuse its own edit, and an edited contract
 could forge a receipt while its own path was still unexamined.
 
 The same is true of the standard library it reaches for. `python3
-tools/validation/run.py` puts that directory first on `sys.path`, so a file
-dropped beside the runner — a `platform.py`, a `json.py` — would be imported in
-place of the standard library module of that name, and would run at the top of
-the file, before any check existed to notice it. The runner therefore narrows
-its import path before importing anything shadowable, which is the first thing
-it does; afterwards it reaches its own siblings by path rather than by putting
-that directory back.
+tools/validation/run.py` puts that directory first on `sys.path`, and an
+inherited `PYTHONPATH` can put the checkout root there too, so a file dropped at
+either — a `platform.py`, a `json.py` — would be imported in place of the
+standard library module of that name and would run at the top of the file,
+before any check existed to notice it. The runner therefore **re-executes itself
+isolated** (`python -I`) before any other import: that ignores the environment,
+skips user site directories, and prepends neither the script's directory nor the
+working directory, so the standard library is all that is left to import from.
+Afterwards it reaches its own siblings by path rather than by putting any
+directory back.
 
 So the runner reads the plan's candidate for itself, with the standard library
 alone, proves the checkout with its own code and Git plumbing, and refuses
@@ -571,17 +574,28 @@ questions are answered by comparing modes and object ids directly:
   classified on its own terms: a catalog that calls a directory generated is
   saying its own output goes there, not that anything dropped inside it stops
   being an input. A directory carrying its own `.git` is another repository,
-  which this one cannot look inside; it is reported as a plain difference rather
-  than an addition, because a declaration cannot honestly exempt content nothing
-  here has read.
+  which this one cannot look inside, and a **symlink** standing where a
+  directory would be may leave the checkout entirely; neither can be walked, so
+  both are reported as plain differences rather than additions. A declaration
+  cannot honestly exempt content nothing here has read — a `generated_paths`
+  prefix matching a link must not excuse what a group declares on the far side
+  of it.
 
-Every Git query the check does make is asked in an environment stripped of the
-variables that redirect one — `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and
-their kin — and with `GIT_NO_REPLACE_OBJECTS` set. A `refs/replace` entry for
-the candidate's tree would otherwise leave `rev-parse HEAD` and
-`rev-parse HEAD^{tree}` reporting the planned identifiers while every listing,
-index, and checked-out file described some other tree: a different revision
-wearing the candidate's name.
+Git is asked in an environment stripped of the variables that redirect it —
+`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and their kin — and with
+`GIT_NO_REPLACE_OBJECTS` set. A `refs/replace` entry would otherwise substitute
+one object for another everywhere Git looked: replacing the candidate's tree
+leaves `rev-parse HEAD` and `rev-parse HEAD^{tree}` reporting the planned
+identifiers while every listing and checked-out file describes some other tree,
+and replacing a package description's blob leaves `ls-tree` naming the committed
+object while `git show` hands out different metadata — enough to drop a source
+directory from the package graph and make a dirty document there look harmless.
+
+That sanitation is applied to the runner's **own environment**, not passed to
+chosen calls, because the candidate's classifier shells out to Git as well, to
+read its catalog and its package graph. A query the runner does not make itself
+is exactly the one that would otherwise go unsanitized. Everything started from
+here inherits it, the group's own command included.
 
 A **submodule** gets all three asked of it too, recursively — once the path is
 confirmed to be a real directory. A symlink there would be followed, and
@@ -1280,9 +1294,11 @@ and refused without being imported, a module dropped beside the runner to shadow
 a standard library one and refused without running, an addition a redirected `core.worktree`
 keeps out of Git's own listing, an added directory the candidate cannot contain,
 a tree substituted for the candidate's by a `refs/replace` entry, an input a
-group declares dropped inside a directory the catalog calls generated, and a
-symlink to a clean checkout standing in for a submodule at the very same
-commit — each refused by name.
+group declares dropped inside a directory the catalog calls generated, a
+symlink to a clean checkout standing in for a submodule at the very same commit,
+a link out of the checkout wearing a generated directory's name, a dirty
+document a replaced package description would have excused, and a shadow module
+an inherited `PYTHONPATH` would have reached — each refused by name.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

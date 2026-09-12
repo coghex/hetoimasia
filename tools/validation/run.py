@@ -46,6 +46,20 @@ import sys
 import os
 
 TOOLS_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+
+# Isolating the interpreter is the only way to answer for *every* entry that
+# could carry a shadow. Narrowing `sys.path` by hand reaches the directory this
+# script lives in, but not an inherited ``PYTHONPATH`` naming the checkout, nor
+# a user site directory. ``-I`` ignores the environment, skips user site
+# packages, and (from 3.11) prepends neither the script's directory nor the
+# working directory, so the standard library is all that is left to import from.
+# The re-exec happens before any other import for that reason, and the flag
+# itself is the guard against repeating it.
+if not sys.flags.isolated:
+    os.execv(sys.executable, [sys.executable, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+
+# Kept for an interpreter older than the one that made ``-I`` imply ``-P``: on
+# those, the script's own directory is still prepended and has to be dropped.
 sys.path = [
     entry for entry in sys.path if entry and os.path.abspath(entry) != TOOLS_DIRECTORY
 ]
@@ -139,22 +153,27 @@ REDIRECTING_GIT_VARIABLES = (
 )
 
 
-def git_environment() -> dict:
-    """The environment Git is asked in, with every substitution removed.
+def sanitize_git_environment() -> None:
+    """Remove every substitution Git would otherwise honour, for good.
+
+    Applied to this process's own environment rather than passed to chosen
+    calls, because the candidate's classifier shells out to Git as well — to
+    read its catalog and its package graph — and a query this module does not
+    make is exactly the one that would go unsanitized. Everything started from
+    here inherits it, the group's own command included.
 
     Replacement objects are refused as well as redirection. A `refs/replace`
     entry for the candidate's tree leaves ``rev-parse HEAD`` and
     ``rev-parse HEAD^{tree}`` reporting the planned identifiers while every
-    listing, index, and checked-out file describes some other tree — which is
-    exactly a different revision wearing the candidate's name.
+    listing, every `git show`, and every checked-out file describes some other
+    tree — which is exactly a different revision wearing the candidate's name.
     """
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name not in REDIRECTING_GIT_VARIABLES
-    }
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    return environment
+    for name in REDIRECTING_GIT_VARIABLES:
+        os.environ.pop(name, None)
+    os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
+
+
+sanitize_git_environment()
 
 # How long a timed-out process group is given to exit on SIGTERM before it is
 # killed outright.
@@ -167,7 +186,7 @@ def timestamp() -> str:
 
 def git_output(root: str, *arguments: str) -> str:
     process = subprocess.run(
-        ("git", "-C", root) + arguments, capture_output=True, check=False, env=git_environment()
+        ("git", "-C", root) + arguments, capture_output=True, check=False
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
@@ -183,7 +202,7 @@ def git_records(root: str, *arguments: str) -> list[str]:
     a stripped field would name a file that does not exist.
     """
     process = subprocess.run(
-        ("git", "-C", root) + arguments, capture_output=True, check=False, env=git_environment()
+        ("git", "-C", root) + arguments, capture_output=True, check=False
     )
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace").strip()
@@ -396,7 +415,20 @@ def added_files(
             if not base and entry.name == ".git":
                 continue
             relative = base + entry.name
-            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            if entry.is_symlink():
+                if relative in recorded or relative in submodules:
+                    continue
+                # A link standing where a directory would be cannot be walked:
+                # it may leave this checkout entirely, and what a command reads
+                # through it is not this tree. Opaque, and so never exempt — a
+                # `generated_paths` prefix matching the link must not excuse
+                # whatever a group declares on the far side of it.
+                if entry.is_dir(follow_symlinks=True):
+                    opaque.add(relative + "/")
+                else:
+                    found.add(relative)
+                continue
+            if not entry.is_dir(follow_symlinks=False):
                 if relative not in recorded:
                     found.add(relative)
                 continue

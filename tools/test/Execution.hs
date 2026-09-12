@@ -306,6 +306,60 @@ spec = describe "Validation execution" $ do
         writeFixtureFile (root fixture) "fixtures/consumed.txt" "an input no commit carries\n"
         refusesDirty fixture plan ["fixtures/consumed.txt"]
 
+    it "refuses a generated directory that is a link out of the checkout" $
+      withDirtyFixture $ \fixture plan →
+        withSystemTempDirectory "hetoimasia-outside" $ \outside → do
+          -- `fixtures/` is declared generated, so a link wearing that name
+          -- would inherit the exemption while the command read a consumed
+          -- input from a directory that is not this checkout at all.
+          writeFile (outside </> "consumed.txt") "an input no commit carries\n"
+          createDirectoryLink outside (root fixture </> "fixtures")
+          refusesDirty fixture plan ["fixtures/"]
+
+    it "refuses a dirty input a replaced package description would excuse" $
+      withFixture $ \fixture → do
+        -- The candidate's package derives its inputs from `hs-source-dirs`, so
+        -- the description decides whether `docs/` is consumed. Replacing that
+        -- blob leaves every recorded identifier untouched — `ls-tree` still
+        -- names the committed object — while `git show` hands the classifier a
+        -- description that drops the directory.
+        writeFixtureFile (root fixture) "demo.cabal" (demoPackageWith "app docs")
+        writeFixtureFile (root fixture) "docs/reader.md" "a document the package consumes\n"
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Consume the documents"]
+        original ← blobOf fixture "HEAD" "demo.cabal"
+        writeFixtureFile (root fixture) "demo.cabal" (demoPackageWith "app")
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Stop consuming them"]
+        narrowed ← blobOf fixture "HEAD" "demo.cabal"
+        void $ gitIn fixture ["reset", "-q", "--hard", "HEAD~1"]
+        plan ← planAgainst fixture (seeded fixture)
+        void $ gitIn fixture ["replace", original, narrowed]
+        writeFixtureFile (root fixture) "docs/reader.md" "an edit no commit carries\n"
+        refusesDirty fixture plan ["docs/reader.md"]
+
+    it "refuses a shadow module an inherited import path would reach" $
+      withDirtyFixture $ \fixture plan → do
+        -- `PYTHONPATH` naming the checkout puts a root-level module ahead of
+        -- the standard library, so it would run before anything looked at it.
+        writeFixtureFile
+          (root fixture)
+          "platform.py"
+          "import sys\nprint('the shadow ran', file=sys.stderr)\n\n\ndef system():\n    return 'Shadow'\n"
+        (result, _, errors) ←
+          run
+            (("PYTHONPATH", root fixture) : environment fixture)
+            (root fixture)
+            "python3"
+            [ tools fixture </> "run.py", "build.pass"
+            , "--plan", plan
+            , "--receipts", receiptsDirectory fixture
+            ]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "platform.py"
+        errors `shouldNotContain` "the shadow ran"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
     it "refuses a generated basename sitting under a path a group consumes" $
       withDirtyFixture $ \fixture plan → do
         -- The catalog declares `*.json` generated, but `src/` is a declared
@@ -1175,6 +1229,14 @@ withFixture action = do
 gitIn ∷ Fixture → [String] → IO String
 gitIn fixture = git (environment fixture) (root fixture)
 
+-- | The object a revision records at one path.
+blobOf ∷ Fixture → String → FilePath → IO String
+blobOf fixture revision' path = do
+  listing ← gitIn fixture ["ls-tree", revision', "--", path]
+  case words listing of
+    (_ : _ : object : _) → pure object
+    _ → fail ("no object recorded for " ++ path ++ " at " ++ revision')
+
 revision ∷ Fixture → String → IO String
 revision fixture name = revisionIn fixture (root fixture) name
 
@@ -1210,7 +1272,12 @@ fixtureFiles =
   ]
 
 demoPackage ∷ String
-demoPackage =
+demoPackage = demoPackageWith "app"
+
+-- | The same package, deriving its inputs from whichever source directories an
+-- example needs it to declare.
+demoPackageWith ∷ String → String
+demoPackageWith directories =
   unlines
     [ "cabal-version: 3.16"
     , "name: demo"
@@ -1220,7 +1287,7 @@ demoPackage =
     , ""
     , "executable demo"
     , "    main-is: Main.hs"
-    , "    hs-source-dirs: app"
+    , "    hs-source-dirs: " ++ directories
     , "    default-language: GHC2024"
     , "    build-depends: base"
     ]
@@ -1245,7 +1312,7 @@ fixtureCatalogWith nonAffecting =
     , "  \"groups\": ["
     , groupDocument "build.pass" "[\"true\"]" "[]" "none" "build" "60" "false" ++ ","
     , groupDocument "test.fail" "[\"false\"]" "[\"src/\"]" "hspec" "test" "60" "false" ++ ","
-    , groupDocument "test.flag" flagCommand flagInputs "hspec" "test" "60" "false" ++ ","
+    , groupDocumentFor "test.flag" "\"demo:exe:demo\"" flagCommand flagInputs "hspec" "test" "60" "false" ++ ","
     , groupDocument "smoke.slow" slowCommand "[\"slow/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true"
@@ -1296,14 +1363,19 @@ stubbornCommand =
   "[\"sh\", \"-c\", \"(trap '' TERM; sleep 300) & echo $! > child.pid; wait\"]"
 
 groupDocument ∷ String → String → String → String → String → String → String → String
-groupDocument identifier command inputs framework category timeout optional =
+groupDocument identifier = groupDocumentFor identifier "null"
+
+-- | The same, for a group whose inputs are derived from a real component, so an
+-- example can exercise the package graph the classifier reads.
+groupDocumentFor ∷ String → String → String → String → String → String → String → String → String
+groupDocumentFor identifier component command inputs framework category timeout optional =
   init $
     unlines
       [ "    {"
       , "      \"id\": \"" ++ identifier ++ "\","
       , "      \"description\": \"Fixture group " ++ identifier ++ ".\","
       , "      \"command\": " ++ command ++ ","
-      , "      \"component\": null,"
+      , "      \"component\": " ++ component ++ ","
       , "      \"inputs\": " ++ inputs ++ ","
       , "      \"framework\": \"" ++ framework ++ "\","
       , "      \"runner\": \"cpu\","
