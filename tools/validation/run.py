@@ -157,29 +157,41 @@ def relevant_uncommitted(root: str, plan: dict) -> list[str]:
     spelled. An added path is relevant when it could reach an execution, which
     is the narrower question its absence from every tree makes the right one.
     """
-    tracked = tracked_changes(root)
-    untracked = untracked_files(root)
-    if not tracked and not untracked:
-        return []
     catalog, packages = candidate_classification(root, plan)
     consumed = planner.consumed_entries(catalog, packages)
+    tracked = tracked_changes(root)
+    untracked = untracked_files(root)
     relevant = {path for path in tracked if not planner.harmless_prose(path, consumed, catalog)}
     relevant |= {path for path in untracked if reaches_an_execution(path, consumed)}
     return sorted(relevant)
 
 
 def candidate_classification(root: str, plan: dict) -> tuple[dict, dict]:
-    """The catalog and package graph the plan's own identity was taken from."""
+    """The catalog and package graph the plan's own identity was taken from.
+
+    The candidate's package graph comes from its commit and cannot have moved.
+    Its catalog usually comes from there too, but a plan resolved with
+    ``--catalog`` names a file on the mutable filesystem, which could have been
+    rewritten since — into one that stops consuming the very path an edit is
+    about. So the plan records what that catalog said, and a document that no
+    longer digests to it is refused rather than believed: a classification this
+    plan was not built from cannot say what a dirty checkout means.
+    """
     override = plan["catalog"]["override"]
     try:
         candidate = planner.GitTree(root, plan["candidate"]["commit"])
-        catalog, _ = planner.read_catalog(candidate, override, root)
+        catalog, source = planner.read_catalog(candidate, override, root)
         packages = planner.load_packages(candidate, required=True)
     except PlannerError as failure:
         raise EvidenceError(
-            "cannot classify this checkout's uncommitted changes against the "
-            f"candidate: {failure}"
+            "cannot read the classification this plan was resolved with: " f"{failure}"
         ) from failure
+    recorded = plan["catalog"]["candidate_digest"]
+    if planner.digest(catalog) != recorded:
+        raise EvidenceError(
+            f"the catalog at {source} is not the one this plan was resolved with "
+            f"({recorded[:12]}), so it cannot say what this checkout holds"
+        )
     return catalog, packages
 
 

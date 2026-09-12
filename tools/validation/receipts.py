@@ -189,6 +189,10 @@ def load_plan(path: str) -> dict:
         raise EvidenceError("plan catalog is missing 'override'")
     if catalog["override"] is not None and not isinstance(catalog["override"], str):
         raise EvidenceError("plan catalog field 'override' is neither a string nor null")
+    # Naming a mutable path binds nothing on its own, so the plan also records
+    # what that catalog said. The runner refuses a catalog that no longer
+    # digests to this.
+    require_str(catalog, "candidate_digest", "plan catalog")
     request = require_dict(document, "request", "plan")
     require_str_list(request, "ids", "plan request")
     require_bool(request, "all_hspec", "plan request")

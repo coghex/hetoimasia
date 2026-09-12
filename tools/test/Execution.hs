@@ -247,6 +247,28 @@ spec = describe "Validation execution" $ do
         writeFixtureFile (root fixture) "docs/alternate.md" "an edit no commit carries\n"
         refusesDirty fixture plan ["docs/alternate.md"]
 
+    it "refuses an override catalog rewritten after the plan was resolved" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        writeFixtureFile (root fixture) "fixtures/alternate.json" alternateCatalog
+        plan ←
+          planWith
+            fixture
+            [ "--base", seeded fixture
+            , "--head", "HEAD"
+            , "--catalog", root fixture </> "fixtures/alternate.json"
+            ]
+            "alternate-plan.json"
+        -- Naming the path binds nothing on its own. Rewriting the fixture to
+        -- stop consuming the document would otherwise let a dirty edit to it
+        -- pass under the identity the plan had already taken.
+        writeFixtureFile (root fixture) "fixtures/alternate.json" fixtureCatalog
+        writeFixtureFile (root fixture) "docs/alternate.md" "an edit no commit carries\n"
+        (result, _, errors) ← runGroup fixture "build.pass" plan []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "not the one this plan was resolved with"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
     it "executes with prose no group consumes and the artifacts a run writes" $
       withDirtyFixture $ \fixture plan → do
         -- The hosted layout: the plan and the applicability document are
@@ -781,7 +803,8 @@ emptyPlan =
     , "  \"catalog_policy_version\": 1,"
     , "  \"input_identity\": \"ffff\","
     , "  \"runner_os\": \"Linux\","
-    , "  \"catalog\": {\"source\": \"fixture\", \"override\": null, \"groups\": 0},"
+    , "  \"catalog\": {\"source\": \"fixture\", \"override\": null,"
+    , "               \"candidate_digest\": \"aaaa\", \"groups\": 0},"
     , "  \"toolchain\": {},"
     , "  \"base\": {\"commit\": \"aaaa\", \"tree\": \"bbbb\"},"
     , "  \"head\": {\"commit\": \"cccc\", \"tree\": \"dddd\"},"

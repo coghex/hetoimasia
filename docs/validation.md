@@ -290,7 +290,7 @@ planner reads the text from `--request-file`.
 | `catalog_policy_version` | The catalog's declared policy revision, as an integer. |
 | `input_identity` | The candidate's input identity digest. |
 | `toolchain`, `runner_os` | The pinned platform the identity covers and a reusable receipt must match. |
-| `catalog` | The resolved catalog `source`, its group count, and `override`: the `--catalog` path when a fixture supplied one and `null` otherwise, so the runner can reproduce the classification this plan was built from. |
+| `catalog` | The resolved catalog `source` and its group count, plus the classification the runner must reproduce: `override` — the `--catalog` path when a fixture supplied one, `null` otherwise — and `candidate_digest`, a digest of the candidate's catalog document, which binds its contents rather than only its path. |
 | `base`, `head`, `candidate` | Each revision's name with its resolved `commit` and `tree`. |
 | `base_package_metadata` | `present` or `absent`. |
 | `base_catalog` | `present`, `absent`, or `not-applicable` when `--catalog` overrode it. |
@@ -454,9 +454,14 @@ never the working tree's: the candidate commit's package graph, and the catalog
 that plan was resolved with — the fixture when `--catalog` supplied one, and the
 candidate's own otherwise. An edit must not be able to reclassify itself as
 prose on the way past, and a rewritten catalog in the working tree is exactly
-the change this notices. The plan records which catalog it used, so a fixture
-plan is judged by its fixture's rules rather than by the candidate's default
-catalog.
+the change this notices. The plan records which catalog it used **and what that
+catalog said**, so a fixture plan is judged by its fixture's rules rather than
+by the candidate's default catalog — and naming the path is not enough on its
+own, because a fixture lives on the mutable filesystem and could be rewritten
+between planning and execution into one that stops consuming the very path an
+edit is about. The runner digests the catalog it reads and refuses a document
+that no longer matches the plan's `catalog.candidate_digest`: a classification
+the plan was not built from cannot say what a checkout holds.
 
 Staged and unstaged changes are both asked about, because neither implies the
 other — a mode change can live only in the index — and additions, deletions,
@@ -1141,7 +1146,10 @@ classifies the candidate, each refused by name; ordinary execution with prose no
 group consumes and with the plan, applicability document, and receipts a run
 writes beside itself; a fresh receipt recording an execution of another revision
 or another tree; and a fresh receipt disagreeing about each of `input_identity`,
-`policy_version`, `toolchain`, and `runner_os` in turn.
+`policy_version`, `toolchain`, and `runner_os` in turn. Two of them are about
+the classification itself: a dirty path judged by the fixture catalog its plan
+was resolved with rather than the candidate's own, and that fixture rewritten
+after planning so that it no longer describes the plan it produced.
 
 The provenance proof is driven against real Git histories and fixture comment
 feeds, with the shipped replay, provenance, and gate scripts composed exactly

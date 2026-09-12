@@ -857,6 +857,7 @@ def build_plan(
     base_catalog: dict | None,
     base_catalog_state: str,
     catalog_override: str | None,
+    candidate_catalog: dict,
 ) -> dict:
     groups = catalog["groups"]
     groups_by_id = {group["id"]: group for group in groups}
@@ -975,15 +976,18 @@ def build_plan(
         # The platform an execution's result is a claim about. A receipt from
         # another operating system describes another machine's behaviour.
         "runner_os": identity["runner_os"],
-        # The override is recorded beside the source because the runner has to
-        # reproduce this classification to judge its own checkout, and a fixture
-        # catalog lives on the filesystem rather than in the candidate's tree.
-        # It stays out of `plan_identity`, which deliberately omits run-local
-        # filenames: what a catalog *says* is already covered by the policy
-        # identity, and where it was read from is not contract.
+        # `override` and `candidate_digest` describe the classification the
+        # runner has to reproduce before it can judge its own checkout: which
+        # catalog decided this candidate's inputs, and exactly what that catalog
+        # said. A fixture catalog lives on the mutable filesystem rather than in
+        # the candidate's tree, so naming the path alone would let it be
+        # rewritten between planning and execution; the digest is what binds its
+        # contents. The path itself stays out of `plan_identity`, which
+        # deliberately omits run-local filenames.
         "catalog": {
             "source": catalog_source,
             "override": catalog_override,
+            "candidate_digest": digest(candidate_catalog),
             "groups": len(groups),
         },
         "base": {"revision": base.revision, "commit": base.commit, "tree": base.tree},
@@ -1254,6 +1258,7 @@ def main(argv: list[str]) -> int:
         base_catalog,
         base_catalog_state,
         arguments.catalog,
+        candidate_catalog,
     )
     if arguments.as_json:
         print(json.dumps(plan, indent=2, sort_keys=False))
