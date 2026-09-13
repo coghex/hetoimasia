@@ -99,7 +99,7 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/scripting-lua/` | Lua host and registration mechanism | Planned |
 | `samples/` | Future independent rendering consumers | Planned |
 | `integrations/` | Game adapters | Planned |
-| `test/` | GPU-free Hspec logging/runtime checks | Buildable |
+| `test/` | GPU-free Hspec Logging, Runtime, and Resources examples | Buildable |
 
 The two libraries have separate source roots and declared dependencies. Neither
 can import root application modules. Add future packages explicitly to

@@ -48,6 +48,12 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Routine build: `cabal build all`.
 - Console smoke: `cabal run exe:hetoimasia -- --smoke`.
 - Current focused tests: `cabal test hetoimasia-tests --test-show-details=direct`.
+- `hetoimasia-tests` is grouped by component: a new engine example belongs in
+  the `Logging`, `Runtime`, or `Resources` spec that owns the behaviour it
+  asserts, beside that component's own helpers, and `Test.Engine.Spec` only
+  composes them. Run one component with
+  `--test-options='--match <Component>'`; a selector that matches no example
+  fails the suite rather than reporting a silent pass.
 - Every validation group is declared once in `tools/validation/catalog.json`.
   Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
   groups a change requires and why; see [validation.md](docs/validation.md) for
