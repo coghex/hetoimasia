@@ -154,6 +154,15 @@
 -- foundation 'Worker', whose 'Hetoimasia.Foundation.Worker.awaitCompletion' any
 -- number of readers may use, for instance to inspect a finished job's result.
 --
+-- __A read-only handle.__ A 'SupervisedWorker' pairs that worker with the
+-- supervision state registered for it: 'stopSupervised' and 'cancelSupervised'
+-- record the owner's request in that state and ask that worker to stop, and
+-- 'workerStatus' reads only that state. The pairing is fixed by
+-- 'startSupervised' and cannot be changed outside this module: the constructor
+-- is not exported and the handle has no field labels, so 'supervisedWorker' is
+-- a plain reader that record-update syntax cannot use. No runtime check for a
+-- mismatched handle exists, because none can be built.
+--
 -- See @docs/supervision.md@ for the same contract in prose.
 module Hetoimasia.Runtime.Supervision
   ( -- * The boundary
@@ -408,14 +417,26 @@ data Supervision = Supervision
 -- worker action.
 data RuntimeControl = RuntimeControl !WorkerGroup !Supervision
 
--- | A worker started under supervision.
-data SupervisedWorker r = SupervisedWorker
-  { supervisedWorker ∷ !(Worker r)
-    -- ^ The foundation handle, for raw observation such as a job's result.
-    -- Stop and cancel it through 'stopSupervised' and 'cancelSupervised', so
-    -- supervision knows its owner asked.
-  , supervisedManaged ∷ !Managed
-  }
+-- | A worker started under supervision: the foundation worker and the
+-- supervision state registered for it, paired once by 'startSupervised'.
+--
+-- Deliberately not a record. A field label, even exported only as a reader,
+-- would let a client outside this module replace the worker through
+-- record-update syntax while keeping another worker's state, so a stop would
+-- be recorded against one worker and requested of another. Read it only
+-- through 'supervisedWorker', 'workerStatus', and the operations below.
+data SupervisedWorker r = SupervisedWorker !(Worker r) !Managed
+
+-- | The foundation handle, for raw observation such as a job's result.
+--
+-- Stop and cancel the worker through 'stopSupervised' and 'cancelSupervised',
+-- so supervision knows its owner asked.
+supervisedWorker ∷ SupervisedWorker r → Worker r
+supervisedWorker (SupervisedWorker worker _) = worker
+
+-- | The supervision state registered for the handle's worker.
+supervisedManaged ∷ SupervisedWorker r → Managed
+supervisedManaged (SupervisedWorker _ managed) = managed
 
 -- | What 'startSupervised' returns.
 data SupervisedStart r
