@@ -102,6 +102,7 @@ test-suite hetoimasia-tests
         Test.Engine.Logging.Spec
         Test.Engine.Logging.Support
         Test.Engine.Logging.Worker
+        Test.Engine.Recovery.Spec
         Test.Engine.Resources.Buffer
         Test.Engine.Resources.Cost
         Test.Engine.Resources.Opacity

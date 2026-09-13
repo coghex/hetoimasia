@@ -507,6 +507,11 @@ operation context on the same exception context, beside the cleanup failures
 retained here; [failures.md](failures.md) describes that evidence and its
 inspection. Neither kind of evidence displaces the other.
 
+`Hetoimasia.Foundation.Recovery` reads this evidence to refuse automatic retry
+or fallback after a failed cleanup: an attempted release is not proof of
+disposal. [recovery.md](recovery.md) describes that boundary; nothing in this
+contract changes for it.
+
 A boundary that reports resource failures through a logger follows the pattern
 in [logging.md](logging.md#module-authoring-guide): the scope raises, and the
 boundary decides what to log. A broken logger must not erase the outcome.

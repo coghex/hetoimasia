@@ -70,6 +70,15 @@ and cancellation is left unannotated. It imports only the `Component` and
 `SourceLocation` types from the logging module. See
 [docs/failures.md](../../docs/failures.md).
 
+`Hetoimasia.Foundation.Recovery` runs one complete owned `IO` operation under
+an explicit policy the caller supplies: a component classifier choosing a retry
+or a named fallback, one finite attempt budget shared by both, and a required or
+optional disposition. Cancellation and an attempt with failed cleanup propagate
+before the classifier is consulted. A success reports how it was reached and the
+failed attempts; exhausted optional work is explicitly unavailable; a propagated
+failure keeps its own type and evidence with the earlier attempts attached. It
+takes no logger. See [docs/recovery.md](../../docs/recovery.md).
+
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
