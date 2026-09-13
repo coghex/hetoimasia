@@ -131,6 +131,16 @@ not a verdict that Synarchy's design should be discarded.
   Closing reuses `closeWorkerGroup`'s snapshot and drain; a cancelled body
   classifies nothing more. Runtime now depends on `stm`. Contract:
   `docs/supervision.md`; `Runtime`'s `Supervision` Hspec group proves it.
+- RT-6 (#60) added `Hetoimasia.Runtime.Application.runScopedApplication` beside
+  the unchanged `Hetoimasia.Runtime.runApplication`: it enters a caller-supplied logging lifetime,
+  builds application-owned dependencies with `withScoped`, runs supervision,
+  startup, and the action on the calling thread with an application-owned
+  immutable services value, then closes and drains workers, disposes
+  dependencies, makes one managed terminal report, and lets the lifetime flush.
+  The console's exit mapping lives in the root package's private `console`
+  library (`Hetoimasia.Console.Exit`): failure exits 1, cancellation 130.
+  Contract: `docs/resources.md`, "The application runner"; `Runtime`'s
+  `Application lifecycle` Hspec group proves it.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

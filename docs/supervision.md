@@ -13,7 +13,8 @@ service and job roles, required and optional dispositions, checkpoints and
 supervised waits, the classification table, the fatal latch, optional warnings,
 closing, and the evidence all of it leaves. The generic application runner, its
 services value, dependency disposal, the application's single terminal `Error`
-report, and final flushing belong to the application runner (RT-6), not here.
+report, and final flushing belong to
+[the application runner](resources.md#the-application-runner), not here.
 
 The module depends on `base`, `stm`, `text`, the foundation package's public
 modules, and the runtime's own [logging lifetime](logging.md#logging-lifetime)

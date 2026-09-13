@@ -721,7 +721,8 @@ boundary decides what to log. A broken logger must not erase the outcome.
 Scopes and logging are peers. This module imports no logger, and a scope runs
 its cleanup and exposes its outcome with no logger at all or with a broken one.
 Composing the two is therefore the application's job, and these are the rules
-that composition follows. `Hetoimasia.Runtime.Resources.resourceSmoke` is the
+that composition follows. [The application runner](#the-application-runner)
+composes them, with workers and supervision, for any application. `Hetoimasia.Runtime.Resources.resourceSmoke` is the
 worked example: the console executable runs it as `--resource-smoke`, and the
 suite runs the same body with failures injected.
 
@@ -860,6 +861,168 @@ branch above, and it propagates with nothing further written — the caller
 learns that the sink failed by receiving the sink's own exception, which is the
 only place that news can still go.
 
+### The application runner
+
+```haskell
+-- Hetoimasia.Runtime.Application
+runScopedApplication
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)            -- enters the logging lifetime
+  → Text                                             -- the application's name
+  → Scoped dependencies                              -- construction, in dependency order
+  → (dependencies → RuntimeControl → IO services)    -- startup
+  → (services → RuntimeControl → IO a)               -- the action
+  → IO a
+```
+
+`runScopedApplication` is the generic lifecycle an application runs through. It
+sits in its own module beside `Hetoimasia.Runtime.runApplication`, which keeps
+its module, signature, behavior, and examples as the thin runner over a
+supplied logger. The new runner composes the
+runtime's existing boundaries and adds no mechanics of its own: supervision is
+[supervision.md](supervision.md)'s, worker ownership and the drain are
+[workers.md](workers.md)'s, the finalization matrix is the
+[logging lifetime](logging.md#logging-lifetime)'s, the report is the
+[reporting adapter](logging.md#recovery-and-terminal-reports)'s, and every
+release follows this document's failure table and mask discipline.
+
+**The lifecycle order**, on every run:
+
+1. Configuration is parsed and the logger constructed, by the caller, before
+   the runner is called. A failure there propagates as its own typed failure
+   with no record promised: no managed logger exists yet.
+2. The runner enters the logging lifetime through its first argument — for the
+   console, `withHandleLoggingLifetime configuration stderr`.
+3. The dependencies are constructed inside it, by `withScoped` over the
+   application's `Scoped` value, in the order that value allocates them. A
+   required component propagates its failure after cleanup of what it
+   acquired; an optional one built with
+   [`allocComponent`](#component-construction) binds `Unavailable` only after
+   its rollback. A construction failure disposes what was acquired without
+   entering the worker group.
+4. A supervised worker group is entered inside those scopes, with
+   `withSupervision`.
+5. The startup callback runs on the calling thread with the dependencies and
+   the `RuntimeControl`. It may start and acknowledge workers with
+   `startSupervised`, and it returns the application's services value.
+6. `checkRuntime` runs before that value is handed over.
+7. The action runs on the calling thread with the services value and the
+   control; `checkRuntime` runs again before its result is accepted.
+8. Supervision closes: registration closes, every live worker is asked to stop
+   — a failed or cancelled request does not skip the rest — and every worker is
+   drained with its dependencies live. Every outcome not yet handled is
+   settled, including a failure that arrived while closing, and a latched
+   failure is rethrown.
+9. The dependency scope unwinds. Dependents are disposed before their
+   dependencies, and a composite keeps its declared internal order.
+10. A failed run gets one managed terminal report, while the logger is live.
+11. The logging lifetime makes its one permitted final flush.
+12. The runner returns the action's result, or rethrows.
+
+Steps 8 onwards happen on every exit path — construction failure (from step
+9), startup failure, action failure, a supervisor-detected failure, and owner
+cancellation, which skips steps 10 and 11.
+
+**The application owns its types.** The runner is polymorphic over the
+dependencies and the services value; it names no field of either, imports no
+concrete application, and passes each callback only what it was given. The
+services value is a snapshot assembled once by startup and passed as an ordinary
+immutable argument. There is no global or central mutable availability
+registry, nothing mutates the value, and nothing re-publishes it: a component
+that degrades after startup says so through its own handle, under its own
+documented state ownership.
+
+**The calling thread.** Construction, startup, and the action all run on the
+thread that called the runner. The action is never forked to race a monitor,
+and no arbitrary `IO` is interrupted: a worker failure reaches the application
+at a checkpoint or inside `awaitSupervised`, as
+[supervision.md](supervision.md#checkpoints-and-supervised-waits) describes.
+This keeps the process main thread for a future windowing owner.
+
+**A composition.** The application declares its own types and builds them from
+the handles its components expose, under
+[the component convention](#the-component-convention):
+
+```haskell
+data Tools    = Tools    { toolsStore ∷ Store, toolsPreview ∷ Outcome Preview }
+data Services = Services { servicesStore ∷ Store, servicesPreview ∷ Maybe Preview
+                         , servicesIndexer ∷ SupervisedWorker () }
+
+main ∷ IO ()
+main = exitOnFailure $ do
+  configuration ← resolveLogFilter variables readVariable defaultLogFilter
+    >>= either (die . Text.unpack) pure
+  runScopedApplication (withHandleLoggingLifetime configuration stderr) "example"
+    tools startup action
+  where
+    tools = do
+      store ← storeScope storeConfig                 -- required
+      preview ← previewScope store Optional          -- allocComponent: data, not a catch
+      pure (Tools store preview)
+
+    startup (Tools store preview) control = do
+      indexer ← startSupervised control indexerPolicy (indexerWorker store) >>= started
+      pure (Services store (availableValue preview) indexer)
+
+    action services control = loop
+      where
+        loop = do
+          checkRuntime control
+          request ← awaitSupervised control (nextRequest (servicesStore services))
+          ...
+```
+
+`test/Test/Engine/Runtime/Composition.hs` is the worked example: two unrelated
+applications — a workshop whose services carry a supervised service, and a
+station whose services publish an optional radio's availability — run through
+the same runner.
+
+**Outcomes.**
+
+| What happened | What the runner does |
+|---|---|
+| The action returned, nothing fatal was settled, every disposal succeeded, the flush succeeded | Returns the action's result |
+| Construction, startup, or the action failed synchronously | Drains, disposes, reports once, flushes, and rethrows the failure with its type, value, and context |
+| A supervised failure was latched — even one the action caught and ignored, or one that arrived while closing | The same: a latched failure cannot become a successful run |
+| The action succeeded and a component's disposal failed | The same, with the cleanup failure primary and retained; the report carries `cleanup.failures` and `cleanup.labels` |
+| The run succeeded and the final flush failed | The flush's failure propagates, with no report attempted and no retry |
+| A managed report already failed on this lifetime, such as an optional worker's warning | No terminal report and no flush; the failure propagates with the failed attempts attached |
+| The report's own write failed synchronously | The failure being reported propagates, with its evidence; the attempt is recorded on the lifetime, so no flush follows |
+| Owner cancellation | Drains, disposes, and propagates the cancellation as itself, with no report and no flush |
+
+The one report is `Error` `Application failed` under the `runtime` component,
+with an `application` field naming the run and the fields the adapter derives:
+the primary failure's reason and origin, and every retained cleanup failure,
+including component disposal failures. A failure already reported by a terminal
+boundary inside the action, or raised by a marked diagnostic, is not reported
+again. A filter may still drop the record, and a sink may still refuse it.
+
+**Exit mapping belongs to the executable.** The runtime never exits the host
+process. The console maps what propagates out of a path in
+`Hetoimasia.Console.Exit.exitOnFailure`: a failure exits 1 after one best-effort
+line on stderr, a cancellation exits 130 with nothing written, and an explicit
+`ExitCode` such as a usage error passes through unchanged. That module lives in
+the root package's private `console` library, beside `app/`, so the suite
+drives the mapping directly as well as through the executable.
+
+**What the runner does not own.** It defines no classifier, observation
+cursor, fatal latch, closing protocol, or logging finalization rule; no worker
+restart, deadline, detach, or process termination; no environment record,
+service locator, application-wide monad, or runtime-declared services record.
+The existing `--smoke` and `--resource-smoke` paths keep their output; neither
+needs the new runner, and no console path was added for it.
+
+**The runner's state.** It holds no mutable state of its own:
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+|---|---|---|---|---|---|
+| The dependencies value | The application; its releases belong to the runner's `withScoped` | Built by construction; read by startup | The calling thread | From construction until the dependency scope unwinds, after workers drain | Released once, in reverse allocation order with each composite's declared order; never reset |
+| The services value | The application | Written once, by startup's return; read by the action | The calling thread | From startup's return until the action returns or throws | Immutable; nothing re-publishes it and nothing disposes it |
+| Worker, supervision, and latch state | The one `withSupervision` invocation | As [supervision.md](supervision.md#state) records | As recorded there | One invocation | As recorded there |
+| Recorded reporting outcomes | The logging lifetime the runner entered | As [logging.md](logging.md#logging-lifetime) records; the runner reads them once before its report | As recorded there | One lifetime | As recorded there |
+
+Nothing is global, shared between invocations, or reset.
+
 ### Shutdown order
 
 The order is the one [the logging contract](logging.md#ownership-and-failures)
@@ -881,6 +1044,10 @@ run. The flush therefore never runs inside a release, where its unbounded
 blocking would break the release contract, and never runs before the cleanup
 whose records it is meant to carry. A lifetime is never entered from a release
 callback.
+
+`runScopedApplication` performs steps 1 to 4 in exactly this order: supervision
+closing is step 1, the dependency scope's unwind is step 2, its one report is
+step 3, and the lifetime it entered makes step 4.
 
 The console executable owns no handle: its sink borrows the process's `stderr`,
 which it never closes and never rebuffers, so its step 5 is empty. An
@@ -1073,3 +1240,26 @@ by the sink. The `Console startup` group in `test/Main.hs` runs
 `--resource-smoke` as a child process for the record sequence and for the quiet
 path at a `warn` threshold. The validation catalog covers all of them through
 the floor group `test.engine`; see [validation.md](validation.md).
+
+The `Application lifecycle` examples in
+`test/Test/Engine/Runtime/Composition.hs`, selected by `--match Runtime`,
+cover [The application runner](#the-application-runner) with two
+application-owned dependency and services types through the same runner, an
+injected sink traced beside the releases, real CPU scopes, real foundation
+workers under supervision, and the supervision fixtures of
+`Test.Engine.Runtime.Supervision.Support`, coordinated with gates, STM, and
+`threadStatus` and no sleeps. They show startup and the action on the calling
+thread; boot in dependency order and disposal of dependents before
+dependencies with a composite's declared order kept; an optional component's
+unavailability published in the services value after its rollback; a
+construction failure disposing what was acquired without running startup; a
+failing startup and an owner cancellation each draining a worker before any
+dependency is disposed, the cancellation unreported and unflushed; a caught
+supervised failure and a failure arriving while closing each failing a run
+whose action returned; a component cleanup failure in the one terminal report,
+after disposal and before the flush; a final flush failure attempted once,
+failing the run with no report; and no terminal report once an optional
+worker's warning has failed. The `Exit mapping` examples in
+`test/Test/Engine/Runtime/Console.hs` run both smoke paths with a broken stderr
+for a non-zero exit, and drive `exitOnFailure` directly for cancellation and
+for an explicit status passing through.

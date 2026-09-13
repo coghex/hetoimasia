@@ -627,6 +627,14 @@ is the last thing that happens to the sink, and a record written after it may
 never reach the handle. A subsystem does not flush the shared sink itself on
 shutdown, and does not enter a lifetime of its own over a logger it was lent.
 
+**Compose an application through the runner.** A new application enters its
+logging lifetime, constructs its dependencies, supervises its workers, reports,
+and flushes through `Hetoimasia.Runtime.Application.runScopedApplication`, declaring its own
+dependencies and services types. It does not assemble that order by hand, and
+it does not log the run's terminal failure itself: the runner makes that one
+report. See [the application runner](resources.md#the-application-runner) for
+the composition example.
+
 **Supervise workers at checkpoints, not with a monitor.** A subsystem that
 starts owned workers does so through
 [`Hetoimasia.Runtime.Supervision`](supervision.md), declaring each worker's

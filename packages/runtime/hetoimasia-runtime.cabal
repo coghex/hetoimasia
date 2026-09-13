@@ -5,7 +5,8 @@ synopsis: Application lifecycle entry point for Hetoimasia
 description:
     A small runtime entry point that invokes a caller-supplied action through
     explicit services without importing any concrete application or renderer,
-    and supervision of owned workers through checkpoints and supervised waits.
+    supervision of owned workers through checkpoints and supervised waits, and
+    a generic scoped application lifecycle composing them.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -23,6 +24,7 @@ source-repository head
 library
     exposed-modules:
         Hetoimasia.Runtime
+        Hetoimasia.Runtime.Application
         Hetoimasia.Runtime.Logging
         Hetoimasia.Runtime.Reporting
         Hetoimasia.Runtime.Resources
