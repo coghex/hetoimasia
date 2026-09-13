@@ -147,6 +147,8 @@ backtrace `base` itself collected remains in the exception's context, untouched.
 
 ## Cancellation
 
+Neither `throwFailure` nor a boundary adds anything to an asynchronous
+exception. `throwFailure` given an asynchronous cause throws it with no origin.
 A boundary adds nothing to an asynchronous exception. That includes one thrown
 synchronously with an asynchronous type, such as `throwIO ThreadKilled`. It is
 rethrown with the context it already had, including annotations attached below
@@ -179,7 +181,10 @@ Inspection is a pure read. It needs no logger and works the same when logging
 is disabled, filtered out, or broken. If more than one origin were ever present,
 the earliest attached is reported. `displayExceptionContext` renders each piece
 of evidence as one line, such as
-`failure origin: gpu.textures load-texture (path=a.png) raised at src/Textures.hs:42 in failTexture`.
+`failure origin: gpu.textures "load-texture" ("path"="a.png") raised at "src/Textures.hs":42 in "failTexture"`.
+Every operation, identifier key and value, file, and function is double-quoted
+and escaped with the logger's quoting rules, so text carrying a newline or a
+quote cannot split that line or forge another entry.
 
 Evidence is attached only by `throwFailure` and `withOperationContext`: the
 annotation type they use is not exported. The evidence records a caller reads
@@ -220,8 +225,10 @@ cover:
   site;
 - the engine and native cases distinguished side by side;
 - cleanup evidence retained beside an annotated failure;
-- a delivered cancellation and a synchronously thrown `ThreadKilled`, both left
-  unannotated with their existing context;
+- a delivered cancellation, a synchronously thrown `ThreadKilled`, and
+  `ThreadKilled` passed to `throwFailure`, all left unannotated with their
+  existing context;
+- hostile operation and identifier text rendered escaped on one line;
 - inspection after the owning scope released the resource the identifiers were
   copied from, with no logger.
 

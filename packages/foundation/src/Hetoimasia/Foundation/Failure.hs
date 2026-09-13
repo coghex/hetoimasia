@@ -33,8 +33,8 @@
 -- rather than guessed at, and the exception is never converted into a textual
 -- engine exception.
 --
--- Cancellation is not annotated: a boundary rethrows an asynchronous exception
--- with the context it already had.
+-- Cancellation is not annotated: 'throwFailure' and a boundary both rethrow an
+-- asynchronous exception with the context it already had.
 --
 -- Raising and inspecting a failure need no logger. This module imports only the
 -- validated 'Component' and 'SourceLocation' types from
@@ -86,6 +86,7 @@ import Control.Exception.Context
   , getExceptionAnnotations
   )
 import Control.Monad.IO.Class (MonadIO (liftIO))
+import Data.Char (isControl, ord)
 import Data.List (intercalate, sortOn)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -195,28 +196,50 @@ entryPosition ∷ Evidence → Int
 entryPosition (OriginEntry position _) = position
 entryPosition (ContextEntry position _) = position
 
+-- | One entry renders as one line. Every caller-supplied text is double-quoted
+-- and escaped with the rules the logger applies to the values it quotes, so an
+-- operation or identifier carrying a newline or a quote cannot split the line or
+-- forge another entry. A 'Component' is validated and needs no quoting.
 describe ∷ Component → Operation → [(Text, Text)] → String
 describe component operationName identifiers =
   Text.unpack (componentText component)
     <> " "
-    <> Text.unpack (operationText operationName)
+    <> quoted (operationText operationName)
     <> case identifiers of
       [] → ""
       _ →
         " ("
-          <> intercalate ", " [Text.unpack key <> "=" <> Text.unpack value | (key, value) ← identifiers]
+          <> intercalate ", " [quoted key <> "=" <> quoted value | (key, value) ← identifiers]
           <> ")"
 
 describeSite ∷ Maybe FailureSite → String
 describeSite Nothing = "an unknown site"
 describeSite (Just site) =
-  Text.unpack (sourceFile location)
+  quoted (sourceFile location)
     <> ":"
     <> show (sourceLine location)
     <> " in "
-    <> Text.unpack (sourceFunction location)
+    <> quoted (sourceFunction location)
   where
     location = siteLocation site
+
+quoted ∷ Text → String
+quoted value = "\"" <> concatMap escaped (Text.unpack value) <> "\""
+
+escaped ∷ Char → String
+escaped '"' = "\\\""
+escaped '\\' = "\\\\"
+escaped '\n' = "\\n"
+escaped '\r' = "\\r"
+escaped '\t' = "\\t"
+escaped character
+  | isControl character = "\\u" <> hex4 (ord character)
+  | otherwise = [character]
+
+hex4 ∷ Int → String
+hex4 value = map nibble [4096, 256, 16, 1]
+  where
+    nibble place = "0123456789ABCDEF" !! ((value `div` place) `mod` 16)
 
 -- | Throw an engine failure with its origin attached.
 --
@@ -230,6 +253,10 @@ describeSite (Just site) =
 -- is raised, so the evidence holds no thunk that could fail or reach a closed
 -- resource later. A faulting identifier raises its own exception in place of
 -- the failure.
+--
+-- An asynchronous exception, including one passed here as the cause, is thrown
+-- with the context 'throwIO' gave it and no origin: a cancellation is never
+-- recorded as an engine origin.
 --
 -- No logger is involved, and nothing is written before the failure is raised.
 throwFailure
@@ -247,9 +274,11 @@ throwFailure component operationName identifiers cause = liftIO $ do
     raised ← tryWithContext (throwIO cause ∷ IO Void)
     case raised of
       Right impossible → absurd impossible
-      Left (ExceptionWithContext context exception) →
-        rethrowIO
-          (ExceptionWithContext (attach (`OriginEntry` origin) context) (exception ∷ SomeException))
+      Left caught@(ExceptionWithContext context exception)
+        | isAsynchronous exception → rethrowIO caught
+        | otherwise →
+            rethrowIO
+              (ExceptionWithContext (attach (`OriginEntry` origin) context) (exception ∷ SomeException))
 
 -- | Run an operation, adding its context to a synchronous failure that passes
 -- through.

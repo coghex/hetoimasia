@@ -31,7 +31,7 @@ import Control.Exception.Context (displayExceptionContext, getExceptionAnnotatio
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Stack (HasCallStack, callStack, getCallStack, srcLocFile, srcLocStartLine)
@@ -111,10 +111,14 @@ spec = describe "Failures" $ do
       (boundedExample testCancellationUnannotated)
     it "leaves an asynchronous exception raised synchronously unannotated"
       testSynchronousAsyncUnannotated
+    it "records no origin for an asynchronous exception passed to throwFailure"
+      testThrowFailureAsyncUnannotated
 
   describe "Failure inspection" $ do
     it "reads immutable evidence after its scope closed, with no logger"
       testInspectionWithoutLogger
+    it "renders hostile operation and identifier text on one escaped line"
+      testHostileTextRendersOneLine
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -404,6 +408,15 @@ testSynchronousAsyncUnannotated = do
   failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
   (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "kept"]
 
+testThrowFailureAsyncUnannotated ∷ Expectation
+testThrowFailureAsyncUnannotated = do
+  ExceptionWithContext context cancellation ←
+    expectContext @SomeException $
+      withOperationContext scene renderScene [] $
+        (throwFailure widgets loadWidget [] ThreadKilled ∷ IO ())
+  fromException cancellation `shouldBe` Just ThreadKilled
+  failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+
 -- Inspection -----------------------------------------------------------------
 
 testInspectionWithoutLogger ∷ Expectation
@@ -422,7 +435,24 @@ testInspectionWithoutLogger = do
   origin ← originOf evidence
   originIdentifiers origin `shouldBe` [("widget", "w-7")]
   let rendered = displayExceptionContext context
-  rendered `shouldSatisfy` isInfixOf "failure origin: test.widgets load-widget (widget=w-7)"
+  rendered `shouldSatisfy` isInfixOf "failure origin: test.widgets \"load-widget\" (\"widget\"=\"w-7\")"
 
 shouldReturnValue ∷ (Eq a, Show a) ⇒ IO a → a → Expectation
 shouldReturnValue action expected = action >>= (`shouldBe` expected)
+
+testHostileTextRendersOneLine ∷ Expectation
+testHostileTextRendersOneLine = do
+  let forged = "a.png\nduring operation: test.scene forged"
+  ExceptionWithContext context _ ←
+    expectContext @WidgetFailure $
+      withOperationContext scene (operation "render\r\"scene\"") [("frame\n", "1")] $
+        (throwFailure widgets loadWidget [("path", forged)] (WidgetMissing "hostile") ∷ IO ())
+  let rendered = lines (displayExceptionContext context)
+  -- Exactly one line per piece of evidence, and the hostile text escaped
+  -- inside quotes rather than starting a line of its own.
+  let starting label = filter (isPrefixOf label . dropWhile (== ' ')) rendered
+  length (starting "failure origin:") `shouldBe` 1
+  length (starting "during operation:") `shouldBe` 1
+  filter (isInfixOf "forged") rendered `shouldBe` starting "failure origin:"
+  rendered `shouldSatisfy` any (isInfixOf "(\"path\"=\"a.png\\nduring operation: test.scene forged\")")
+  rendered `shouldSatisfy` any (isInfixOf "test.scene \"render\\r\\\"scene\\\"\" (\"frame\\n\"=\"1\")")
