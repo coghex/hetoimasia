@@ -306,6 +306,18 @@ latches failures. Raw readers such as `awaitCompletion` on
 `supervisedWorker handle` stay available beside it and never retire, handle,
 or report anything.
 
+## A read-only handle
+
+A `SupervisedWorker` pairs the foundation worker with the supervision state
+registered for it. `stopSupervised` and `cancelSupervised` record the owner's
+request in that state and ask that worker to stop; `workerStatus` reads only
+that state. `startSupervised` fixes the pairing, and nothing outside the
+runtime package can change it: the type is exported without its constructor
+and has no field labels, so `supervisedWorker` is a plain reader.
+Record-update syntax such as `first { supervisedWorker = supervisedWorker second }`
+does not compile, and neither does naming the constructor. Because no
+mismatched handle can be built, supervision performs no runtime check for one.
+
 ## State
 
 One `withSupervision` invocation owns every piece; none is global, and none is
@@ -360,6 +372,19 @@ to reuse. They cover:
 - a run exit before closing's stop request staying unexpected, a failure
   published before closing observed before the boundary returns, an expected
   owner-requested cancellation, and a rejected start after closing.
+
+`test/Test/Engine/Runtime/Opacity.hs`, also under `Runtime` and selected by
+`--match 'Supervised worker opacity'`, checks the read-only handle at the
+package boundary. It compiles separate single-module clients against this
+build's package database with the harness from
+`Test.Engine.Resources.Opacity`, exposing only `base`, `text`, `stm`,
+`hetoimasia-foundation`, and `hetoimasia-runtime`. A client that replaces the
+raw worker through record update must be rejected with `Not in scope: record
+field`, and one that names the constructor with `does not export any children`;
+an environment failure such as a missing package never counts as either. A
+third client must compile, link, and run, reading a job's result through
+`supervisedWorker` and raw completion, stopping one service and cancelling
+another, and reporting `completed`, `stopped`, and `stopped`.
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

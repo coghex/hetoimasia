@@ -27,7 +27,18 @@
 --
 -- These are Hspec examples rather than a probe: the work is running a process
 -- and asserting on its output, which this suite already does elsewhere.
-module Test.Engine.Resources.Opacity (spec) where
+--
+-- The compilation harness is exported so the runtime component's own opacity
+-- examples compile their clients the same way, against a wider package set.
+module Test.Engine.Resources.Opacity
+  ( spec
+
+    -- * Compiling external clients
+  , Client (..)
+  , Mode (..)
+  , withPackageClient
+  , rejectedBecause
+  ) where
 
 import Control.Monad (filterM)
 import Data.Version (showVersion)
@@ -192,13 +203,22 @@ rejectedBecause outcome reason = do
 -- | Write one client into a temporary directory, compile it against this
 -- build's own package database, and hand the outcome to the example.
 --
+-- The foundation's clients see exactly @base@, @text@, and
+-- @hetoimasia-foundation@.
+withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+withClient = withPackageClient ["base", "text", "hetoimasia-foundation"]
+
+-- | Write one client into a temporary directory, compile it against this
+-- build's own package database exposing only the named packages, and hand the
+-- outcome to the example.
+--
 -- The compiler is the one on @PATH@, required to be the version this suite was
 -- itself built with, because a client compiled by a different compiler would
 -- not answer the question the example asks. @-package-env -@ suppresses any
 -- ambient package environment file, and @-hide-all-packages@ leaves the client
--- with exactly the three packages named here.
-withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient name source use = do
+-- with exactly the packages named.
+withPackageClient ∷ [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+withPackageClient packages name source use = do
   compiler ← findExecutable "ghc"
   database ← findPackageDatabase
   case (compiler, database) of
@@ -227,15 +247,15 @@ withClient name source use = do
             use $ \mode → do
               (status, out, err) ←
                 readCreateProcessWithExitCode
-                  (proc ghc (arguments mode packageDatabase name)) { cwd = Just directory }
+                  (proc ghc (arguments packages mode packageDatabase name)) { cwd = Just directory }
                   ""
               pure (Client status (out <> err) directory)
           (status, _, err) →
             expectationFailure ("ghc could not be interrogated (" <> show status <> "): " <> err)
 
 -- | The compiler arguments an external client is built with.
-arguments ∷ Mode → FilePath → FilePath → [String]
-arguments mode packageDatabase name =
+arguments ∷ [String] → Mode → FilePath → FilePath → [String]
+arguments packages mode packageDatabase name =
   [ "-XGHC2024"
   , "-XUnicodeSyntax"
   , "-package-env"
@@ -243,14 +263,9 @@ arguments mode packageDatabase name =
   , "-package-db"
   , packageDatabase
   , "-hide-all-packages"
-  , "-package"
-  , "base"
-  , "-package"
-  , "text"
-  , "-package"
-  , "hetoimasia-foundation"
-  , "-fdiagnostics-color=never"
   ]
+    <> concatMap (\package → ["-package", package]) packages
+    <> ["-fdiagnostics-color=never"]
     <> case mode of
       Typecheck → ["-fno-code", name]
       Link → [name, "-o", "client"]
