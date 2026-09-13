@@ -230,6 +230,36 @@ registering or forking anything. An application that catches a delivery keeps
 running only while its workers wind down. Cancellation of live workers and the
 protected drain follow when a failure leaves the body, as closing describes.
 
+### Evidence across invocations
+
+Worker IDs are local to one worker group, so every `withSupervision` invocation
+also has its own identity, created on entry and never reused by another
+invocation. A delivery of the latched failure carries a `Delivered` marker that
+identifies both that invocation and the worker whose failure it is, and every
+retained `SupervisedFailure` is kept under the same pair.
+
+A failure may pass through more than one boundary: an inner invocation's
+delivery propagating through an outer body, or a caught delivery rethrown
+inside a later, independent invocation. Each boundary or checkpoint it leaves
+keeps the evidence the failure already carries, in its order, and appends that
+invocation's own committed failures in commit order, skipping any failure
+already retained and the primary that invocation delivered. Duplicates are
+recognized by invocation and worker together, never by a local worker ID,
+label, or exception value alone. So:
+
+- a boundary never excludes one of its own failures because another invocation
+  delivered a worker with the same local ID;
+- `supervisedFailures` returns the union, outer failures after the inner
+  evidence they were appended to;
+- catching and rethrowing a delivery, or the same latched failure delivered
+  again at a checkpoint, a supervised wait, and the boundary's exit, retains
+  each failure once, while a failure committed after an earlier delivery is
+  still added.
+
+Each entry keeps its exception's type, value, and context, and its label,
+severity, and worker ID. The worker ID is local to the invocation that
+committed the entry.
+
 ## Closing
 
 When the body returns:
@@ -250,8 +280,10 @@ When the body throws, the group's own exit closes, requests cancellation of
 live workers, and drains, as [workers.md](workers.md#closing-and-the-drain)
 describes. Unhandled outcomes are then handled the same way, and the body's
 failure is rethrown as primary with every committed worker failure retained
-beside it. If the body's failure is a delivery of the latched failure, that
-failure is not repeated in the retained list.
+beside it, after any evidence the failure already carried. If the body's
+failure is a delivery of this invocation's latched failure, that failure is not
+repeated in the retained list; a delivery from another invocation excludes
+nothing here.
 
 When the body is cancelled, the cancellation propagates as itself once the
 drain has finished, with nothing more classified or warned about: no
@@ -284,6 +316,7 @@ shared with or reused by another invocation.
 | Pending registrations | `startSupervised` inserts before the worker runs; commits remove; checkpoints, waits, and closing read | Application thread; the boundary at closing | One invocation; a worker leaves when its outcome is committed |
 | Owner stop request flag | `stopSupervised` and `cancelSupervised` write only while the worker's outcome is unpublished; an abandoned start writes; classification reads | Application thread | One worker; set once, never cleared |
 | Worker status | A commit writes once; `workerStatus` reads | Application thread writes; any thread reads, in STM | One worker; `WorkerLive` until committed, then never changes |
+| Invocation identity | Created on entry; deliveries and the boundary attach it to evidence | Application thread | One invocation; never reused by another invocation |
 | Committed failures and the fatal latch | Commits append and latch; deliveries and the boundary read | Application thread | One invocation; append-only; the latch is set once and never cleared |
 | Warning attempt | Consumed by the commit that makes a worker unavailable, then attempted once | Application thread | At most one per worker; never repeated |
 
@@ -318,6 +351,11 @@ to reuse. They cover:
   forks nothing;
 - simultaneous failures in registration order, a mixed optional and fatal
   batch, and the application's own failure staying primary;
+- evidence across invocations: an outer failure retained beside an inner
+  primary whose worker has the same local ID, inner secondary evidence kept
+  when an outer boundary appends its own, a caught delivery rethrown inside a
+  later independent invocation, and repeated deliveries retaining each
+  secondary once while adding a later failure;
 - a classifier failure and a cancellation during classification;
 - a run exit before closing's stop request staying unexpected, a failure
   published before closing observed before the boundary returns, an expected

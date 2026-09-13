@@ -74,6 +74,17 @@
 -- 'SupervisedFailure' evidence that 'supervisedFailures' reads back. A
 -- synchronous worker failure propagates with its own type, value, and context.
 --
+-- __Evidence across invocations.__ Worker IDs are local to one group, so every
+-- invocation also has its own identity. A delivery is marked with the
+-- invocation and the worker whose latched failure it is, and each retained
+-- failure is keyed the same way. When a failure that already carries retained
+-- evidence leaves a further boundary or checkpoint, the evidence it carries is
+-- kept in order and that invocation's committed failures are appended in
+-- commit order, skipping any failure already retained and the primary it
+-- delivered itself. A failure is never excluded because another invocation
+-- delivered a worker with the same local ID, and a repeated delivery never
+-- retains an entry twice.
+--
 -- Latching a fatal failure also initiates owned shutdown, in the same
 -- transaction: a stop is requested of every supervised worker whose outcome is
 -- still pending, and a later 'startSupervised' rethrows the latched failure
@@ -128,6 +139,9 @@
 -- +--------------------------+------------------------------------------+-----------------------------+----------------------------------+
 -- | Worker status            | Commits write once; 'workerStatus' reads | Application thread writes;  | One worker; 'WorkerLive' until   |
 -- |                          |                                          | any thread reads, in STM    | committed, then never changes    |
+-- +--------------------------+------------------------------------------+-----------------------------+----------------------------------+
+-- | Invocation identity      | Created on entry; deliveries and the     | Application thread          | One invocation; never reused by  |
+-- |                          | boundary attach it to evidence           |                             | another invocation               |
 -- +--------------------------+------------------------------------------+-----------------------------+----------------------------------+
 -- | Committed failures and   | Commits append and latch; deliveries and | Application thread          | One invocation; append-only; the |
 -- | the fatal latch          | the boundary read                        |                             | latch is set once, never cleared |
@@ -215,6 +229,7 @@ import Data.List (sortOn)
 import Data.Maybe (isJust, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.Unique (Unique, hashUnique, newUnique)
 import Hetoimasia.Foundation.Failure (operation)
 import Hetoimasia.Foundation.Log (Component)
 import Hetoimasia.Foundation.Recovery
@@ -378,6 +393,8 @@ data Managed = Managed
 -- readers, writers, and lifetime.
 data Supervision = Supervision
   { supervisionLifetime ∷ !LoggingLifetime
+  , supervisionInvocation ∷ !Unique
+    -- ^ Distinguishes this invocation's evidence from another's.
   , supervisionPending ∷ !(TVar [Managed])
     -- ^ In registration order.
   , supervisionFailures ∷ !(TVar [SupervisedFailure])
@@ -421,7 +438,7 @@ data SupervisedStart r
 -- what the boundary returns or rethrows.
 withSupervision ∷ LoggingLifetime → (RuntimeControl → IO a) → IO a
 withSupervision lifetime body = do
-  state ← Supervision lifetime <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Nothing
+  state ← Supervision lifetime <$> newUnique <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Nothing
   outcome ← tryWithContext $ withWorkerGroup $ \group → do
     result ← body (RuntimeControl group state)
     report ← closeWorkerGroup group
@@ -433,11 +450,7 @@ withSupervision lifetime body = do
     Left failure@(ExceptionWithContext context exception) → do
       unless (isCancellation exception) $ for_ (groupReport context) (settleClosing state)
       failures ← atomically (readTVar (supervisionFailures state))
-      let delivered = deliveredWorker context
-          retained = reverse [entry | entry ← failures, Just (failedWorker entry) /= delivered]
-      if null retained
-        then rethrowIO failure
-        else rethrowIO (withFailures retained failure)
+      rethrowIO (withFailures (supervisionInvocation state) (reverse failures) failure)
 
 -- | The report the group attached when it drained with this failure pending.
 groupReport ∷ ExceptionContext → Maybe GroupReport
@@ -730,48 +743,68 @@ deliver ∷ Supervision → IO ()
 deliver state = do
   (latch, failures) ← atomically ((,) <$> readTVar (supervisionLatch state) <*> readTVar (supervisionFailures state))
   for_ latch $ \primary → do
-    let ExceptionWithContext context exception = failedException primary
-        retained = reverse [entry | entry ← failures, failedWorker entry /= failedWorker primary]
-        marked = ExceptionWithContext (addExceptionAnnotation (Delivered (failedWorker primary)) context) exception
-    rethrowIO (if null retained then marked else withFailures retained marked)
+    let invocation = supervisionInvocation state
+        ExceptionWithContext context exception = failedException primary
+        marked = ExceptionWithContext (addExceptionAnnotation (Delivered (Occurrence invocation (failedWorker primary))) context) exception
+    rethrowIO (withFailures invocation (reverse failures) marked)
 
 -- Evidence ---------------------------------------------------------------------
 
--- | Marks a delivery of the latched failure, naming its worker.
-newtype Delivered = Delivered WorkerId
+-- | One committed worker failure, named across invocations: the invocation that
+-- committed it and its worker, whose ID is local to that invocation's group.
+data Occurrence = Occurrence !Unique !WorkerId
+  deriving (Eq)
+
+-- | Marks a delivery of an invocation's latched failure.
+newtype Delivered = Delivered Occurrence
 
 instance ExceptionAnnotation Delivered where
-  displayExceptionAnnotation (Delivered worker) = "fatal supervised failure of worker " <> show worker
+  displayExceptionAnnotation (Delivered (Occurrence invocation worker)) =
+    "fatal supervised failure of worker " <> show worker <> " in supervision invocation " <> show (hashUnique invocation)
 
-deliveredWorker ∷ ExceptionContext → Maybe WorkerId
-deliveredWorker context = listToMaybe [worker | Delivered worker ← getExceptionAnnotations context]
-
--- | The failures retained beside a propagated failure, with their attachment
--- position so the latest attachment wins.
-data FailuresEntry = FailuresEntry !Int ![SupervisedFailure]
+-- | The failures retained beside a propagated failure, each with its
+-- occurrence, and the attachment position so the latest attachment wins. Every
+-- attachment extends the one before it, so the latest holds them all.
+data FailuresEntry = FailuresEntry !Int ![(Occurrence, SupervisedFailure)]
 
 instance ExceptionAnnotation FailuresEntry where
   displayExceptionAnnotation (FailuresEntry _ failures) =
     "supervised worker failures retained: "
-      <> unwords [show (Text.unpack (failedLabel entry)) <> " " <> show (failedSeverity entry) | entry ← failures]
+      <> unwords [show (Text.unpack (failedLabel entry)) <> " " <> show (failedSeverity entry) | (_, entry) ← failures]
 
-withFailures ∷ [SupervisedFailure] → ExceptionWithContext SomeException → ExceptionWithContext SomeException
-withFailures failures (ExceptionWithContext context exception) =
-  ExceptionWithContext (addExceptionAnnotation (FailuresEntry position failures) context) exception
+-- | Retain an invocation's committed failures, given in commit order, beside a
+-- propagated failure: after the evidence it already carries, skipping every
+-- occurrence already retained or delivered as that failure.
+withFailures ∷ Unique → [SupervisedFailure] → ExceptionWithContext SomeException → ExceptionWithContext SomeException
+withFailures invocation committed failure@(ExceptionWithContext context exception)
+  | null unseen = failure
+  | otherwise = ExceptionWithContext (addExceptionAnnotation (FailuresEntry position (existing <> unseen)) context) exception
   where
+    existing = retainedInContext context
+    seen = map fst existing <> [occurrence | Delivered occurrence ← getExceptionAnnotations context]
+    unseen =
+      [ (occurrence, entry)
+      | entry ← committed
+      , let occurrence = Occurrence invocation (failedWorker entry)
+      , occurrence `notElem` seen
+      ]
     position = length (getExceptionAnnotations context ∷ [FailuresEntry])
 
--- | The worker failures a supervision boundary or checkpoint retained beside the
--- failure it propagated, in commit order: registration order within one
--- checkpoint. The propagated failure itself is not repeated. Empty when none.
+retainedInContext ∷ ExceptionContext → [(Occurrence, SupervisedFailure)]
+retainedInContext context =
+  maybe [] snd . listToMaybe . reverse . sortOn fst $
+    [(position, failures) | FailuresEntry position failures ← getExceptionAnnotations context]
+
+-- | The worker failures retained beside a propagated failure: those it already
+-- carried in their order, then each further boundary's or checkpoint's own in
+-- commit order, which is registration order within one checkpoint. A delivered
+-- primary is not repeated, and no failure is retained twice. Empty when none.
 supervisedFailures ∷ SomeException → [SupervisedFailure]
 supervisedFailures = supervisedFailuresInContext . someExceptionContext
 
 -- | 'supervisedFailures' for a caller holding the context directly.
 supervisedFailuresInContext ∷ ExceptionContext → [SupervisedFailure]
-supervisedFailuresInContext context =
-  maybe [] snd . listToMaybe . reverse . sortOn fst $
-    [(position, failures) | FailuresEntry position failures ← getExceptionAnnotations context]
+supervisedFailuresInContext = map snd . retainedInContext
 
 isCancellation ∷ SomeException → Bool
 isCancellation failure = isJust (fromException failure ∷ Maybe SomeAsyncException)
