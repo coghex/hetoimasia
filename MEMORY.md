@@ -121,6 +121,16 @@ not a verdict that Synarchy's design should be discarded.
   matrix; secondary flush failures and known failed reports ride on the failure
   as evidence. Both console paths run inside it, the resource path through
   `managedResourceSmoke`. Contract: `docs/logging.md`, "Logging lifetime".
+- RT-8 (#59) added `Hetoimasia.Runtime.Supervision`: `withSupervision` owns one
+  worker group inside a logging lifetime and lends `RuntimeControl`;
+  `startSupervised` registers a `Service`/`Job` role, `Required`/`Optional`
+  disposition, and component classifier before child code runs, with a startup
+  wait woken by certainly-fatal outcomes; `checkRuntime` and `awaitSupervised`
+  select, classify outside STM, commit, then warn or rethrow; the first fatal
+  status is latched and simultaneous failures are ordered by registration.
+  Closing reuses `closeWorkerGroup`'s snapshot and drain; a cancelled body
+  classifies nothing more. Runtime now depends on `stm`. Contract:
+  `docs/supervision.md`; `Runtime`'s `Supervision` Hspec group proves it.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
@@ -221,7 +231,8 @@ not a verdict that Synarchy's design should be discarded.
   boundary with a `Scoped` adapter, gated fork/registration, STM startup and
   terminal observation, run-exit ordering, group-owned cancellation helpers,
   retirement, and a protected drain; it adds `stm`, not `async`. Supervision
-  (RT-8) and application integration (RT-6) still await implementation;
+  (RT-8, #59) is implemented in `Hetoimasia.Runtime.Supervision`; application
+  integration (RT-6) still awaits implementation, and
   `runApplication` still only logs around an `IO` action and neither constructs
   services nor supervises workers.
 - Runtime epic #52 and all eight children #53–#60 are filed and approved as of

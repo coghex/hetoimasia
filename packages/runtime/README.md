@@ -33,6 +33,17 @@ paths run inside it; `managedResourceSmoke` is `resourceSmoke` with its report's
 outcome recorded on the lifetime. The contract is
 [Logging lifetime](../../docs/logging.md#logging-lifetime).
 
+`Hetoimasia.Runtime.Supervision` supervises an owned worker group on the
+application thread: `withSupervision` lends a narrow `RuntimeControl` for
+managed startup with a per-worker service-or-job role, required-or-optional
+disposition, and component classifier; `checkRuntime` and `awaitSupervised`
+observe worker outcomes only where the application places them; a fatal
+failure is latched for the invocation; optional warnings go through the logging
+lifetime; and closing settles every outcome before the boundary returns or
+rethrows. It reuses the foundation worker group's stop and drain, and reports
+no terminal `Error` and flushes nothing. The contract is
+[Supervision](../../docs/supervision.md).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before

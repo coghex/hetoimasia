@@ -303,7 +303,9 @@ an expected stop from an unexpected exit, and an owner-requested cancellation
 from an unexpected one — and can register its policy in `prepare`, wait for
 startup alongside other failures in one transaction, and commit observations
 with `observeCompletion` — but none of that classification is implemented
-here. Nothing is restarted or replayed.
+here. Nothing is restarted or replayed. The runtime's supervisor,
+`Hetoimasia.Runtime.Supervision`, does exactly that on top of this group; its
+contract is [supervision.md](supervision.md).
 
 ## Verification
 

@@ -627,6 +627,16 @@ is the last thing that happens to the sink, and a record written after it may
 never reach the handle. A subsystem does not flush the shared sink itself on
 shutdown, and does not enter a lifetime of its own over a logger it was lent.
 
+**Supervise workers at checkpoints, not with a monitor.** A subsystem that
+starts owned workers does so through
+[`Hetoimasia.Runtime.Supervision`](supervision.md), declaring each worker's
+role, required or optional disposition, and the classifier for its own
+failures. Place `checkRuntime` before and after starting a worker, at each loop
+iteration, and before accepting a final result, and block only in
+`awaitSupervised`. An optional worker's `Warning` is emitted through the
+logging lifetime by supervision itself; the subsystem does not log it again.
+See [where checkpoints go](supervision.md#checkpoints-and-supervised-waits).
+
 **Logging imposes no error type.** Nothing here asks a game or engine module to
 adopt a shared exception or result type. `logError` is a severity on a record,
 not a way to fail, and a failing sink is the only exception this module raises
