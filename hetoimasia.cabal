@@ -92,6 +92,7 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Spec
+        Test.Engine.Failures.Spec
         Test.Engine.Logging.Component
         Test.Engine.Logging.Configuration
         Test.Engine.Logging.Context

@@ -502,6 +502,11 @@ case outcome of
     report failure (map displayCleanupFailure (cleanupFailures failure))
 ```
 
+An engine failure raised with `throwFailure` also carries its origin and any
+operation context on the same exception context, beside the cleanup failures
+retained here; [failures.md](failures.md) describes that evidence and its
+inspection. Neither kind of evidence displaces the other.
+
 A boundary that reports resource failures through a logger follows the pattern
 in [logging.md](logging.md#module-authoring-guide): the scope raises, and the
 boundary decides what to log. A broken logger must not erase the outcome.
