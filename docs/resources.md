@@ -816,9 +816,12 @@ the demonstration uses it rather than repeating them. The rules:
 
 ```haskell
 resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
-resourceSmoke logger outcomes work = do
+resourceSmoke = smokeReportedBy reportTerminalFailure
+
+smokeReportedBy ∷ Reporter → Logger → ReleaseOutcomes → SmokeWork → IO Int
+smokeReportedBy report logger outcomes work = do
   ledger ← newLedger
-  reportTerminalFailure scoped resourceComponent "Resource smoke abandoned"
+  report scoped resourceComponent "Resource smoke abandoned"
     (releasedFields <$> recordedReleases ledger)
     (runSmoke scoped ledger outcomes work)
   where
@@ -842,6 +845,14 @@ propagates through `rethrowIO`, and a cancellation raised during the attempt
 propagates as itself. `DiagnosticFailure` is defined by the adapter and
 re-exported by `Hetoimasia.Runtime.Resources`.
 
+The reporter is injected so the same run has exactly one terminal report on
+both of its paths. `resourceSmoke` uses `reportTerminalFailure`.
+`managedResourceSmoke`, which the console executable runs inside a
+[logging lifetime](logging.md#logging-lifetime), uses
+`reportTerminalFailureWith` with the lifetime's `recordReport`, so a report that
+failed reaches the lifetime owner while the original failure still propagates.
+Neither wraps the run in a second reporter.
+
 The emission of the lifecycle records sits inside that boundary too, but on the
 diagnostic side of it. If the sink fails while the lifecycle is being reported,
 everything has already been released, the marked exception takes the second
@@ -856,13 +867,25 @@ establishes, and nothing here changes it:
 
 1. Stop and join the producers, so nothing is still emitting.
 2. Finish subsystem cleanup, which may itself emit diagnostics.
-3. Flush and close any handle the application owns.
+3. Make the terminal report, once, through the boundary chosen to own it.
+4. Make the final flush.
+5. Close any handle the application owns.
 
-Step 2 is where a scope unwinds, and step 3 is why the lifecycle records
-collected during that unwind are emitted before it. The console executable owns
-no handle: its sink borrows the process's `stderr`, which it never closes and
-never rebuffers, so its step 3 is empty. An application that opened its own log
-file closes it there — after the scopes have unwound, never before.
+Step 2 is where a scope unwinds, and the lifecycle records collected during that
+unwind are emitted after it, in step 2's own tail, then step 3 reports a failure
+if there was one. Steps 1 to 3 all happen inside the callback of a
+[logging lifetime](logging.md#logging-lifetime), and step 4 is that lifetime's
+own phase: it starts only once the callback has returned or thrown, and so only
+once every `withScoped` inside it has finished unwinding and every release has
+run. The flush therefore never runs inside a release, where its unbounded
+blocking would break the release contract, and never runs before the cleanup
+whose records it is meant to carry. A lifetime is never entered from a release
+callback.
+
+The console executable owns no handle: its sink borrows the process's `stderr`,
+which it never closes and never rebuffers, so its step 5 is empty. An
+application that opened its own log file closes it there — after the lifetime
+has returned, never before.
 
 ### What the demonstration owns
 

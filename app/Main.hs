@@ -9,13 +9,13 @@ import Hetoimasia.Foundation.Log
   , LogFilter
   , LogVariables (..)
   , defaultLogFilter
-  , handleLogger
   , logInfo
   , resolveLogFilter
   , unsafeComponent
   )
 import Hetoimasia.Runtime (runApplication)
-import Hetoimasia.Runtime.Resources (resourceSmoke, smokeWork, workingReleases)
+import Hetoimasia.Runtime.Logging (lifetimeLogger, withHandleLoggingLifetime)
+import Hetoimasia.Runtime.Resources (managedResourceSmoke, smokeWork, workingReleases)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (die)
 import System.IO (stderr)
@@ -91,22 +91,29 @@ consoleComponent ∷ Component
 consoleComponent = unsafeComponent "console"
 
 -- | @stderr@ is this process's, not the logger's: the sink borrows it, and the
--- runtime scope holding it outlives every entry written through it.
+-- logging lifetime holding it outlives every entry written through it. The
+-- lifetime makes the final flush once the application has returned, and a
+-- failed flush fails the run.
 smoke ∷ LogFilter → IO ()
-smoke configuration = do
-  logger ← handleLogger configuration stderr
-  runApplication logger "hetoimasia" $
-    logInfo logger consoleComponent "Hello from Hetoimasia." []
+smoke configuration =
+  withHandleLoggingLifetime configuration stderr $ \lifetime → do
+    let logger = lifetimeLogger lifetime
+    runApplication logger "hetoimasia" $
+      logInfo logger consoleComponent "Hello from Hetoimasia." []
 
--- | The owned-resource path. It borrows @stderr@ exactly as 'smoke' does, and
--- the work and the cleanup outcomes are the module's own defaults, so what this
--- executable runs is the same body the suite drives with failures injected.
+-- | The owned-resource path. It borrows @stderr@ through a logging lifetime
+-- exactly as 'smoke' does, and the work and the cleanup outcomes are the
+-- module's own defaults, so what this executable runs is the same body the
+-- suite drives with failures injected.
 --
--- 'resourceSmoke' returns the work's result and this path has nothing to do
--- with it: the demonstration's output is its diagnostics, and stdout stays
--- empty.
+-- 'managedResourceSmoke' is 'Hetoimasia.Runtime.Resources.resourceSmoke' with
+-- its one terminal report's outcome recorded on the lifetime, so a report that
+-- failed stops the final flush from using the sink that just failed.
+--
+-- The run returns the work's result and this path has nothing to do with it:
+-- the demonstration's output is its diagnostics, and stdout stays empty.
 resourceSmokePath ∷ LogFilter → IO ()
-resourceSmokePath configuration = do
-  logger ← handleLogger configuration stderr
-  runApplication logger "hetoimasia" $
-    void (resourceSmoke logger workingReleases smokeWork)
+resourceSmokePath configuration =
+  withHandleLoggingLifetime configuration stderr $ \lifetime →
+    runApplication (lifetimeLogger lifetime) "hetoimasia" $
+      void (managedResourceSmoke lifetime workingReleases smokeWork)
