@@ -131,6 +131,16 @@ not a verdict that Synarchy's design should be discarded.
   Closing reuses `closeWorkerGroup`'s snapshot and drain; a cancelled body
   classifies nothing more. Runtime now depends on `stm`. Contract:
   `docs/supervision.md`; `Runtime`'s `Supervision` Hspec group proves it.
+- RT-6 (#60) added `Hetoimasia.Runtime.Application.runScopedApplication` beside
+  the unchanged `Hetoimasia.Runtime.runApplication`: it enters a caller-supplied logging lifetime,
+  builds application-owned dependencies with `withScoped`, runs supervision,
+  startup, and the action on the calling thread with an application-owned
+  immutable services value, then closes and drains workers, disposes
+  dependencies, makes one managed terminal report, and lets the lifetime flush.
+  The console's exit mapping lives in the root package's private `console`
+  library (`Hetoimasia.Console.Exit`): failure exits 1, cancellation 130.
+  Contract: `docs/resources.md`, "The application runner"; `Runtime`'s
+  `Application lifecycle` Hspec group proves it.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
@@ -231,10 +241,10 @@ not a verdict that Synarchy's design should be discarded.
   boundary with a `Scoped` adapter, gated fork/registration, STM startup and
   terminal observation, run-exit ordering, group-owned cancellation helpers,
   retirement, and a protected drain; it adds `stm`, not `async`. Supervision
-  (RT-8, #59) is implemented in `Hetoimasia.Runtime.Supervision`; application
-  integration (RT-6) still awaits implementation, and
-  `runApplication` still only logs around an `IO` action and neither constructs
-  services nor supervises workers.
+  (RT-8, #59) is implemented in `Hetoimasia.Runtime.Supervision`, and
+  application integration (RT-6, #60) in
+  `Hetoimasia.Runtime.Application.runScopedApplication`; `runApplication` stays
+  the thin runner that only logs around an `IO` action.
 - Runtime epic #52 and all eight children #53–#60 are filed and approved as of
   2026-09-13. Issue-review amendments are part of each implementation spec.
   Solve #53 → #54 → #55, then #56 → #57 alongside #58, then #59 → #60.

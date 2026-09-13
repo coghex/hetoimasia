@@ -5,10 +5,14 @@
 -- contract rather than two copies of it.
 module Test.Engine.Runtime.Console (spec) where
 
+import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (throwIO, try)
 import Control.Monad (forM_)
 import Data.List (isPrefixOf, tails)
 import Data.Maybe (mapMaybe)
 import qualified Data.Text as Text
+import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode)
 import Hetoimasia.Foundation.Log
   ( variableComponentLevels
   , variableDebug
@@ -16,11 +20,16 @@ import Hetoimasia.Foundation.Log
   )
 import System.Directory (findExecutable)
 import System.Environment (getEnvironment)
-import System.Exit (ExitCode (ExitSuccess))
+import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitWith)
+import System.IO (hClose)
 import System.Process
-  ( CreateProcess (env)
+  ( CreateProcess (env, std_err)
+  , StdStream (UseHandle)
+  , createPipe
   , proc
   , readCreateProcessWithExitCode
+  , waitForProcess
+  , withCreateProcess
   )
 import Test.Engine.Logging.Configuration (consoleVariables)
 import Test.Hspec
@@ -47,6 +56,10 @@ spec = describe "Console startup" $ do
   it "fails before any entry for each invalid variable" testConsoleInvalid
   it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
   it "keeps help visible and validates configuration on that path" testConsoleHelp
+  describe "Exit mapping" $ do
+    it "exits non-zero when a runtime failure propagates out of a path" testConsolePropagatedFailure
+    it "maps a cancellation to the cancellation status" testExitCancellation
+    it "passes an explicit exit status through unchanged" testExitPassthrough
 
 -- | The three variable names the console application reads, as the environment
 -- spells them.
@@ -76,6 +89,23 @@ runConsole variables arguments = do
       readCreateProcessWithExitCode
         (proc executable arguments) { env = Just controlled }
         ""
+
+-- | Run the built console executable with its stderr on a pipe whose reading end
+-- is already closed, so the first diagnostic write fails in the child.
+runConsoleWithBrokenStderr ∷ [String] → IO ExitCode
+runConsoleWithBrokenStderr arguments = do
+  found ← findExecutable "hetoimasia"
+  case found of
+    Nothing → fail "the hetoimasia executable is not on this test's search path"
+    Just executable → do
+      inherited ← getEnvironment
+      (reading, writing) ← createPipe
+      hClose reading
+      let controlled = [pair | pair@(name, _) ← inherited, name `notElem` consoleVariableNames]
+      -- The process library closes the writing end in this process once the
+      -- child has it.
+      withCreateProcess (proc executable arguments) { env = Just controlled, std_err = UseHandle writing } $
+        \_ _ _ child → waitForProcess child
 
 -- | The component of each rendered record, which is its third segment. A line
 -- that is not a record is kept whole so a failure shows it.
@@ -230,3 +260,32 @@ testConsoleHelp = do
   rejected `shouldNotBe` ExitSuccess
   helpOutput `shouldBe` ""
   reason `shouldStartWith` "HETOIMASIA_DEBUG: "
+
+-- | A sink write that fails inside the runtime propagates out of the path, and
+-- the executable's mapping, not the runtime, turns it into a failed exit.
+testConsolePropagatedFailure ∷ IO ()
+testConsolePropagatedFailure =
+  forM_ [["--smoke"], ["--resource-smoke"]] $ \arguments →
+    runConsoleWithBrokenStderr arguments >>= (`shouldBe` failureExitCode)
+
+-- | A cancellation delivered to a running path leaves as the cancellation
+-- status, with no failure line written.
+testExitCancellation ∷ IO ()
+testExitCancellation = do
+  entered ← newEmptyMVar
+  held ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ try (exitOnFailure (putMVar entered () >> takeMVar held)) >>= putMVar outcome
+  takeMVar entered
+  killThread runner
+  takeMVar outcome >>= (`shouldBe` Left cancellationExitCode)
+  -- Keeps the path's MVar reachable, so its block is a cancellation point
+  -- rather than a deadlock the runtime could resolve on its own.
+  putMVar held ()
+
+-- | A usage or configuration @die@ keeps its own status.
+testExitPassthrough ∷ IO ()
+testExitPassthrough = do
+  try (exitOnFailure (exitWith (ExitFailure 3))) >>= (`shouldBe` Left (ExitFailure 3))
+  try (exitOnFailure (throwIO (ExitFailure 4))) >>= (`shouldBe` Left (ExitFailure 4))
+  cancellationExitCode `shouldNotBe` failureExitCode

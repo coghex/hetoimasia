@@ -4,6 +4,7 @@ import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
+import Hetoimasia.Console.Exit (exitOnFailure)
 import Hetoimasia.Foundation.Log
   ( Component
   , LogFilter
@@ -25,7 +26,7 @@ import System.IO (stderr)
 -- message on stderr naming it — before any entry is emitted and before the
 -- application action runs.
 main ∷ IO ()
-main = do
+main = exitOnFailure $ do
   configuration ← resolveLogFilter logVariables readVariable defaultLogFilter
   logFilter ← either (die . Text.unpack) pure configuration
   args ← getArgs
@@ -91,9 +92,8 @@ consoleComponent ∷ Component
 consoleComponent = unsafeComponent "console"
 
 -- | @stderr@ is this process's, not the logger's: the sink borrows it, and the
--- logging lifetime holding it outlives every entry written through it. The
--- lifetime makes the final flush once the application has returned, and a
--- failed flush fails the run.
+-- logging lifetime holding it outlives every entry written through it and makes
+-- the final flush once the application has returned; a failed flush fails it.
 smoke ∷ LogFilter → IO ()
 smoke configuration =
   withHandleLoggingLifetime configuration stderr $ \lifetime → do
@@ -117,3 +117,8 @@ resourceSmokePath configuration =
   withHandleLoggingLifetime configuration stderr $ \lifetime →
     runApplication (lifetimeLogger lifetime) "hetoimasia" $
       void (managedResourceSmoke lifetime workingReleases smokeWork)
+
+-- Every path above runs under 'exitOnFailure', which maps what propagates out of
+-- it to an exit status: a runtime failure exits 1 and a cancellation exits 130.
+-- The runtime itself never exits the process. The mapping sits below the paths so
+-- the source locations their records carry stay where they were.
