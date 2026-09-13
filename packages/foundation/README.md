@@ -88,6 +88,18 @@ value. The `Scoped` representation and the part ledger it shares with the
 resource module live in a hidden module that no client can import. See
 [Component construction](../../docs/resources.md#component-construction).
 
-Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
+`Hetoimasia.Foundation.Worker` owns CPU worker threads. `withWorkerGroup` is an
+`IO` lifetime boundary that runs inside the scopes of the components its workers
+borrow, and `allocWorkerGroup` composes it in `Scoped`. A worker's startup is a
+scoped construction on its own thread; startup acknowledgement, a cooperative
+stop request, a cancellation request delivered by a group-owned helper, and
+terminal observation are distinct operations, observed through STM. Every exit
+from the group requests all stops before waiting for any and drains every
+worker and helper before the enclosing dependencies unwind; a worker that never
+stops keeps them alive. The module publishes raw outcomes, run-exit ordering,
+and cleanup evidence, and classifies none of them. See
+[docs/workers.md](../../docs/workers.md).
+
+Depends on `base`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
