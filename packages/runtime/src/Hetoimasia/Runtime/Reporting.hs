@@ -317,15 +317,30 @@ terminalFields context failure =
   where
     cleanup = cleanupFailuresInContext context
 
--- | The innermost recovery that ended in this failure, if one did. The failure
--- itself is the last attempt, so it is counted but not listed.
+-- | What the innermost recovery that ended in this failure recorded.
+--
+-- 'recover' attaches a 'RecoveryHistory' only when earlier attempts failed, and
+-- it lists those earlier attempts, not the one that propagated. That attempt's
+-- number follows from the history and is reported as @attempts.terminal@;
+-- whether it was a retry or a fallback is not recorded, so no kind is claimed
+-- for it.
+--
+-- A failure with no history either failed the first attempt of a recovery or
+-- never passed through 'recover', and nothing on the exception tells the two
+-- apart. It is reported as @recovery=unrecorded@ with @attempts.earlier=none@
+-- and no operation or attempt count, rather than a guessed one.
 historyFields ∷ [RecoveryHistory] → [(Text, Text)]
-historyFields [] = []
+historyFields [] = [("recovery", "unrecorded"), ("attempts.earlier", "none")]
 historyFields (history : _) =
-  [ ("operation", operationText (historyOperation history))
-  , ("attempts", number (length (historyAttempts history) + 1))
-  , ("attempts.failed", renderAttempts (historyAttempts history))
+  [ ("recovery", "recorded")
+  , ("operation", operationText (historyOperation history))
+  , ("attempts", number terminal)
+  , ("attempts.earlier", renderAttempts earlier)
+  , ("attempts.terminal", number terminal)
   ]
+  where
+    earlier = historyAttempts history
+    terminal = length earlier + 1
 
 -- | Origin and the innermost observation boundary, as fields.
 --

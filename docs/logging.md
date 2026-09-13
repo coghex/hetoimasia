@@ -691,8 +691,10 @@ boundary was called. Where the failure was raised goes in fields:
 |---|---|
 | `disposition` | `recovered`, `unavailable`, or `propagated`. |
 | `availability` | `available` or `unavailable`. |
-| `operation` | The recovered operation; for a terminal failure, the one whose recovery ended in it. |
-| `attempts`, `attempts.failed` | The total attempt count and each failed attempt as `number:kind`, oldest first. |
+| `operation` | The recovered or unavailable operation; for a terminal failure, the one whose recorded recovery ended in it. |
+| `attempts`, `attempts.failed` | On a recovered or unavailable outcome: the total attempt count and every failed attempt as `number:kind`, oldest first. |
+| `recovery` | On a terminal failure: `recorded` when `recover` attached a history, otherwise `unrecorded`. |
+| `attempts.earlier`, `attempts.terminal` | On a terminal failure: the earlier failed attempts as `number:kind` (`none` when unrecorded), and the propagated attempt's number. |
 | `recovered.by` | `retry` or `fallback "name"`, on a recovered outcome. |
 | `reason` | The latest failure's `displayException` text. |
 | `cleanup.failures`, `cleanup.labels` | Retained cleanup evidence, on a terminal failure. |
@@ -700,6 +702,14 @@ boundary was called. Where the failure was raised goes in fields:
 | `origin.component`, `origin.operation`, `origin.identifiers` | The recorded origin. |
 | `origin.site`, `origin.function` | Where it was raised; `origin.site=unknown` when no site was recorded. |
 | `observed.*` | The innermost `withOperationContext` boundary, if any: where the failure was seen, never where it was thrown. |
+
+A terminal failure carries only what `recover` recorded on it. Its history lists
+the earlier attempts, so the propagated attempt is named by number alone:
+whether it was a retry or a fallback is not recorded. A failure of a recovery's
+first attempt carries no history and cannot be told apart from one that never
+passed through `recover`, so its report says `recovery=unrecorded` and
+`attempts.earlier=none` and gives no operation or attempt count. A caller that
+knows the operation can add it as an extra field.
 
 A terminal report's extra fields, such as the resources a scope released, win
 over these on a shared key. They are computed inside the guarded attempt, after

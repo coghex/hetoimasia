@@ -109,6 +109,8 @@ spec = describe "Outcome reporting" $ do
       testUnavailableWarning
     it "reports a terminal required failure once as an error and rethrows it"
       testTerminalError
+    it "reports a first-attempt terminal failure's recovery as unrecorded"
+      testFirstAttemptTerminalError
 
   describe "Origin" $ do
     it "reports the failure's origin in fields distinct from the reporting site"
@@ -340,12 +342,42 @@ testTerminalError = do
   entry ← single entries
   field "disposition" entry `shouldBe` Just "propagated"
   field "availability" entry `shouldBe` Just "unavailable"
+  field "recovery" entry `shouldBe` Just "recorded"
   field "operation" entry `shouldBe` Just "load-widget"
   field "attempts" entry `shouldBe` Just "2"
-  field "attempts.failed" entry `shouldBe` Just "1:initial"
+  field "attempts.earlier" entry `shouldBe` Just "1:initial"
+  -- The propagated attempt is the terminal one, named by its number.
+  field "attempts.terminal" entry `shouldBe` Just "2"
+  field "attempts.failed" entry `shouldBe` Nothing
   field "cleanup.failures" entry `shouldBe` Just "0"
   field "widget" entry `shouldBe` Just "w1"
   readIORef attempts `shouldReturn` 2
+
+-- | 'recover' attaches no history to a failure of its first attempt, so the
+-- report cannot tell it from a failure that never passed through 'recover' and
+-- says so rather than inventing an operation or a count.
+testFirstAttemptTerminalError ∷ Expectation
+testFirstAttemptTerminalError = do
+  (sink, collected) ← newCollector
+  attempts ← newIORef 0
+  let logger = mkLoggerWith defaultLogFilter fixedMetadata sink
+  propagated ←
+    expectFailure $
+      reportTerminalFailure logger reporting "Widget load failed" (pure []) $
+        recover loadWidget (retrying Required 1) (flaky attempts 5)
+  widgetOf propagated `shouldBe` Just (WidgetBroken 1)
+  recoveryHistory propagated `shouldSatisfy` null
+  entry ← single =<< collected
+  entryLevel entry `shouldBe` Error
+  field "disposition" entry `shouldBe` Just "propagated"
+  field "recovery" entry `shouldBe` Just "unrecorded"
+  field "attempts.earlier" entry `shouldBe` Just "none"
+  field "attempts.terminal" entry `shouldBe` Nothing
+  field "attempts" entry `shouldBe` Nothing
+  field "operation" entry `shouldBe` Nothing
+  -- The origin still names the operation that raised the failure.
+  field "origin.operation" entry `shouldBe` Just "load-widget"
+  readIORef attempts `shouldReturn` 1
 
 -- Origin ----------------------------------------------------------------------
 
@@ -478,8 +510,10 @@ testNoDuplicateTerminalError = do
   -- that handled it, summarizing the chain.
   summaries entries `shouldBe` [(Error, "test.reporting", "Widget load failed")]
   entry ← single entries
+  field "recovery" entry `shouldBe` Just "recorded"
   field "attempts" entry `shouldBe` Just "3"
-  field "attempts.failed" entry `shouldBe` Just "1:initial,2:retry"
+  field "attempts.earlier" entry `shouldBe` Just "1:initial,2:retry"
+  field "attempts.terminal" entry `shouldBe` Just "3"
   readIORef attempts `shouldReturn` 3
 
 -- Diagnostic failures ---------------------------------------------------------
