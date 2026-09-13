@@ -397,6 +397,11 @@ An entry from `emitStartup` reports the site where `emitStartup` was called.
 `SourceLocation` holds the file, the line, and the name of the function whose
 call produced that site.
 
+That site is where the entry was reported. Where a failure was raised is a
+different fact: `Hetoimasia.Foundation.Failure` attributes a failure's origin
+with the same outermost-frame policy and carries it on the exception, with no
+logger involved. See [failures.md](failures.md#origin-is-not-the-log-entrys-source).
+
 ## Metadata injection for tests
 
 `MetadataProviders` holds the two values an entry cannot derive from its call:

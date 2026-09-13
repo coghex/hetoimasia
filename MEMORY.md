@@ -93,6 +93,13 @@ not a verdict that Synarchy's design should be discarded.
   `allocComposite`, `locally`), and the injected runtime resource demonstration.
   All are implemented at `7e92e73`, with the later repairs reviewed. The
   demonstration's `Channel` is an owned pair of slots, not a message queue.
+- RT-1 (#53) added `Hetoimasia.Foundation.Failure`: `throwFailure` attaches a
+  component, operation, identifiers, and outermost-frame caller site to a typed
+  exception's context without wrapping it; `withOperationContext` adds ordered
+  outer context to synchronous failures, leaving cancellation unannotated and
+  native causes native with an unknown throw site; `failureEvidence` reads it
+  back without a logger. `docs/failures.md` carries the contract, and the
+  `Failures` Hspec group proves it.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

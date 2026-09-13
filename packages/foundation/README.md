@@ -59,6 +59,17 @@ ownership and borrowing rules, the mask discipline and its limits, the staged
 construction contract, the facade's cleanup point and documented misuse, and
 the caller patterns that discard retained evidence.
 
+`Hetoimasia.Foundation.Failure` records where an engine failure came from on
+the exception itself. `throwFailure` throws a component's own typed exception
+with its component, operation, identifiers, and caller source location
+attached. `withOperationContext` lets an outer boundary add the operation it was
+performing, including to a native exception, which keeps its type and is
+reported with an unknown throw site. `failureEvidence` reads the evidence back
+with no logger. The exception is never wrapped, so typed catches still match,
+and cancellation is left unannotated. It imports only the `Component` and
+`SourceLocation` types from the logging module. See
+[docs/failures.md](../../docs/failures.md).
+
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
