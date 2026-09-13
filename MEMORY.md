@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated: 2026-09-10. Durable project context for future interactive sessions.
+Updated: 2026-09-13. Durable project context for future interactive sessions.
 Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 [the foundation design](docs/engine_foundation_design.md).
 
@@ -88,7 +88,11 @@ not a verdict that Synarchy's design should be discarded.
   `CleanupFailure` that `cleanupFailures` reads back, including through a
   caller's `WhileHandling` nesting. Every internal rethrow uses `rethrowIO`
   with the primary's own context. `docs/resources.md` carries the contract.
-  RES-2 through RES-4 are unimplemented.
+  RES-2 through RES-4 subsequently added ranked composite construction,
+  the `Scoped` continuation facade (`withScoped`, `allocResource`,
+  `allocComposite`, `locally`), and the injected runtime resource demonstration.
+  All are implemented at `7e92e73`, with the later repairs reviewed. The
+  demonstration's `Channel` is an owned pair of slots, not a message queue.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
@@ -135,7 +139,9 @@ not a verdict that Synarchy's design should be discarded.
   [validation.md](docs/validation.md). `build-test` and `review-approved` are
   the checks the installed drainer reads. A prose-only update now inherits an
   earlier run's code evidence through candidate input identity and receipt
-  artifacts; clean-merge review inheritance is still unimplemented. The
+  artifacts. Review inheritance requires a proven approved revision and an
+  identical-tree push or an exact clean merge with a commit already on master;
+  CI evidence is assessed independently. See [workflow.md](docs/workflow.md). The
   selected GitHub repo was verified empty with zero issues and PRs before the
   initial publication on 2026-09-10; repeat deduplication when turning designs
   into tracker artifacts.
@@ -158,11 +164,49 @@ not a verdict that Synarchy's design should be discarded.
   Preserve typed catch behavior and inspectable structured evidence.
 - The resource design selects a small scoped continuation facade for
   `allocResource`/`locally`, over safe CPU ownership and composite constructors.
-  An application-wide monad remains undecided. Dynamic ownership transfer and
+  The runtime design uses explicit IO and narrow handles over this facade;
+  an application-wide monad is outside the accepted arc. Dynamic ownership transfer and
   GPU retirement are later work. FND-1 reuses the resource epic and its children;
   do not create a second implementation from the broader foundation plan.
 - Unicode type syntax is retained; standard Prelude is the bootstrap choice.
   A broader custom operator/prelude policy is undecided.
-- First rendering milestone, threading needs, Vulkan baseline, window library,
-  render contract, and Lua integration need bounded design and implementation.
+- The first rendering milestone is a window with a rendered triangle, explicitly
+  selected by the owner. On 2026-09-12 the owner selected macOS and Linux
+  verification from the start, with Linux-only remote CI and macOS validation
+  locally. Do not add hosted macOS jobs. The Vulkan baseline, thread/ownership
+  APIs for graphics, Linux graphics test environment, render contract, and Lua integration
+  still need bounded design. See [the backend design](docs/vulkan_backend_design.md).
+- The owner clarified that reusable infrastructure must come before Vulkan:
+  messaging, runtime initialization/lifecycle, threading, and GLFW should be
+  developed methodically and validated independently. The triangle is an
+  eventual graphics milestone, not a near-term demonstration target. Queues
+  with Hspec coverage are accepted as pre-graphics work; include worker
+  lifecycle before Vulkan even though a triangle alone would not require it.
+- Separate GLFW and Vulkan components and a first main-thread window/render
+  loop are accepted. Worker support does not move GLFW's owning-thread
+  operations. The resource continuation is implemented. The
+  [runtime foundation design](docs/runtime_foundation_design.md) now specifies
+  component contexts, scoped construction, recovery, worker ownership,
+  supervision, and boot/shutdown composition through explicit IO and narrow
+  handles. These contracts await implementation; `runApplication` still only
+  logs around an `IO` action and neither constructs services nor supervises workers.
+- Runtime epic #52 and all eight children #53–#60 are filed and approved as of
+  2026-09-13. Issue-review amendments are part of each implementation spec.
+  Solve #53 → #54 → #55, then #56 → #57 alongside #58, then #59 → #60.
+  Use normal freshness/claim gates; do not create duplicate runtime issues or
+  reopen accepted D-13 through D-18 decisions. Workers keep borrowed dependencies
+  alive until completion; supervision uses checkpoints and supervised waits;
+  logging finalization has its own IO lifetime outside controlled releases.
+  Application services remain application-owned and immutable. Messaging and
+  independent GLFW work still need their own designs before Vulkan.
+- The owner wants Synarchy's solid GLFW integration preserved deliberately.
+  The backend design records its existing window/callback, resize, Vulkan
+  synchronization, and shared-scope test decisions as reuse evidence.
+- Review at `7e92e73` found no current defect in the cleanup-evidence opacity
+  repair (#47 / PR #48) or TEST-1 (#50 / PR #51). Local checks passed 145 engine
+  and 262 workflow examples, build, smoke, and the three focused component
+  selections; an empty selector fails. Logging, Runtime, and Resources now
+  compose through `Test.Engine.Spec`. Graphics fixtures remain deferred TEST-2;
+  no backend implementation exists yet. Earlier bootstrap entries above are
+  historical snapshots, not the present resource implementation inventory.
 - No engine save format or game migration commitment exists yet.

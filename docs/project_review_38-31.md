@@ -20,14 +20,14 @@ Status legend: `[ ]` unprocessed · `[#N]` filed as issue N · `[no-issue]` revi
 
 ## Status
 
-- [ ] PRR-1. Prevent deferred cleanup metadata from bypassing composite release
-- [ ] PRR-2. Make Scoped opaque to public record updates
-- [ ] PRR-3. Avoid exponential traversal of retained cleanup evidence
-- [ ] PRR-4. Preserve cancellation context through the runtime reporting boundary
+- [x] PRR-1. Prevent deferred cleanup metadata from bypassing composite release — [#39]
+- [x] PRR-2. Make Scoped opaque to public record updates — [#40]
+- [x] PRR-3. Avoid exponential traversal of retained cleanup evidence — [#41]
+- [x] PRR-4. Preserve cancellation context through the runtime reporting boundary — [#42]
 
 ## 1. Composite cleanup
 
-### PRR-1. Prevent deferred cleanup metadata from bypassing composite release
+### [#39] PRR-1. Prevent deferred cleanup metadata from bypassing composite release
 
 > **Captured note:** P1. PR #36 stores unevaluated part metadata and later
 > forces it outside the release exception handlers. A throwing rank or label
@@ -94,7 +94,7 @@ labels and ranks in the current console demonstration do not trigger it.
 
 ## 2. Continuation encapsulation
 
-### PRR-2. Make Scoped opaque to public record updates
+### [#40] PRR-2. Make Scoped opaque to public record updates
 
 > **Captured note:** P2. PR #37 hides the `Scoped` constructor but exports
 > `withScoped` as a record selector. Client code can use record-update syntax
@@ -153,7 +153,7 @@ hatch. Inspecting the export list alone therefore did not prove opacity.
 
 ## 3. Cleanup evidence inspection
 
-### PRR-3. Avoid exponential traversal of retained cleanup evidence
+### [#41] PRR-3. Avoid exponential traversal of retained cleanup evidence
 
 > **Captured note:** P2. PR #35 removes duplicate cleanup failures only after
 > recursively expanding all paths to them. Nested releases that themselves
@@ -228,7 +228,7 @@ with `-O1` against the built foundation library.
 
 ## 4. Runtime reporting cancellation
 
-### PRR-4. Preserve cancellation context through the runtime reporting boundary
+### [#42] PRR-4. Preserve cancellation context through the runtime reporting boundary
 
 > **Captured note:** P2. PR #38 uses a preserving rethrow for the original work
 > failure, but `try` followed by bare `throwIO` for cancellation during its

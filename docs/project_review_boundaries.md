@@ -38,7 +38,13 @@ the next sweep instead of being ignored.
           35,
           36,
           37,
-          38
+          38,
+          43,
+          44,
+          45,
+          46,
+          48,
+          51
         ]
       }
     }

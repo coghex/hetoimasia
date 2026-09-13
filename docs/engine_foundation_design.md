@@ -6,6 +6,13 @@ the initial architecture diagram with a bounded delivery plan.
 
 Design state: `exploring`
 
+Current direction, clarified by the owner on 2026-09-12: complete messaging,
+runtime initialization/lifecycle, threading, and independent GLFW windowing
+before Vulkan. The rendering slices below are future context, not the current
+work queue. The first eventual graphics result is a windowed triangle on macOS
+and Linux, with Linux-only remote CI and local macOS validation. See D-8 and
+[the backend design](vulkan_backend_design.md).
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -102,10 +109,12 @@ arbitrary mutable references. Concurrency is introduced for measured needs.
 The initial Logger uses an injectable sink and no global state. The runtime
 runner logs start and successful completion, returns the action's result, and
 propagates exceptions. It owns no resource scope yet. Standard IO is sufficient
-for this baseline. A scoped continuation facade is selected for later resource
-implementation in [the resource design](resource_ownership_design.md); the
-application-wide monad remains undecided. That document also preserves subsystem
-boundaries, future GPU lifetimes, and the Synarchy decisions to retain.
+for this baseline. The scoped continuation facade is now implemented under
+[the resource contract](resources.md). The accepted
+[runtime design](runtime_foundation_design.md) composes it through explicit IO
+and narrow handles; an application-wide monad is outside that arc. The resource
+design preserves subsystem boundaries, future GPU lifetimes, and the Synarchy
+decisions to retain.
 
 ## Decisions
 
@@ -155,6 +164,28 @@ Logging LOG-3 is the resource implementation gate. FND-1 delegates to the RES
 arc; reuse its tracker artifacts rather than create duplicate implementation.
 This broader rendering/Lua design remains exploring because Q-3 is still open.
 
+### D-8. Complete reusable infrastructure before Vulkan
+
+The owner explicitly prioritized methodical infrastructure work over quickly
+reaching another triangle. Logging and CPU resource ownership are implemented,
+including the `Scoped` continuation facade. Messaging, runtime composition and
+initialization, worker lifecycle, and GLFW windowing need their own contracts
+and validation before Vulkan implementation. The accepted runtime arc uses
+explicit IO and narrow handles, with no universal EngineEnv or application-wide
+monad.
+
+The [backend design](vulkan_backend_design.md) records the current implementation
+inventory, accepted component/main-thread separation, and the infrastructure
+questions. FND-2/FND-3 remain gated on that work. Refine focused designs rather
+than treating this early rendering-oriented delivery plan as permission to skip
+the infrastructure phase.
+
+The [runtime foundation design](runtime_foundation_design.md) now specifies
+errors, recovery, component contexts, and lifecycle. Epic #52 and all eight
+children #53–#60 are filed and approved; implementation is the next step.
+The resource continuation already propagates native exceptions safely and
+remains the ownership mechanism under these new contracts.
+
 ## Proposals
 
 - Use the current console/services scaffold as the first runnable checkpoint.
@@ -162,8 +193,9 @@ This broader rendering/Lua design remains exploring because Q-3 is still open.
   only when resource handling or another concrete requirement benefits.
 - Keep standard Prelude with Unicode type syntax initially; reconsider a custom
   vocabulary separately from component design.
-- Choose the smallest Vulkan/windowing/rendering contract needed for the first
-  offscreen scene, then prove reuse with a second consumer.
+- Establish the infrastructure under D-8, then refine the Vulkan contract for
+  the accepted windowed-triangle milestone and later prove reuse with a second
+  rendering consumer.
 - Migrate Synarchy via captured scenes and then a bounded live scenario after
   the engine can serve them; full game compatibility is a later design arc.
 
@@ -171,21 +203,26 @@ This broader rendering/Lua design remains exploring because Q-3 is still open.
 
 ### Q-1. Workflow service setup
 
-CI and Kanban per-repository service setup remain open. The publication target
-is settled in D-6. Recheck tracker overlap before readiness is granted.
+CI and Kanban setup are recorded in [workflow.md](workflow.md); this is no
+longer a prerequisite design question. Installed services' current running
+state is local operational state and must be checked when needed. The
+publication target is settled in D-6.
 
 ### Q-2. Resource scope and continuation model
 
 Resolved for FND-1 by D-7 and the dedicated resource design: a small scoped CPS
-facade composes resource lifetimes over the failure-safe primitive. An
-application-wide monad remains a separate future choice.
+facade composes resource lifetimes over the failure-safe primitive. The runtime
+arc now selects explicit IO and narrow handles above it; it does not introduce
+an application-wide monad.
 
 ### Q-3. First Vulkan scene and platform baseline
 
-Select the Vulkan feature baseline, device/window library integration, initial
-offscreen target, scene, and evidence before FND-2/FND-3 are implementation-ready.
-Procedural test geometry is a proposal; imported or generated artwork requires
-an explicit source and asset plan. No production art is currently required.
+Partly resolved in the [backend design](vulkan_backend_design.md): the owner
+selected a windowed triangle, separate GLFW/Vulkan components, and macOS/Linux
+verification with Linux remote CI and local macOS validation. Vulkan capability
+and completion contracts remain open and deferred behind D-8's infrastructure
+work. Reconcile the original FND-2/FND-3 slice descriptions with those accepted
+choices before processing; do not file the old offscreen-first sequence.
 
 ## Verification strategy
 

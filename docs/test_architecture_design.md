@@ -19,8 +19,8 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish component-owned tests and scoped shared fixtures
-- [ ] TEST-1. Split the headless engine suite into component specs
+- [x] EPIC. Establish component-owned tests and scoped shared fixtures — [#49]
+- [x] TEST-1. Split the headless engine suite into component specs — [#50]
 - [ ] TEST-2. Add a shared fixture for the first concrete graphics suite — [deferred]: production graphics interfaces exist and Q-1 is settled with the owner
 
 The ledger records issue processing, not implementation completion. A linked

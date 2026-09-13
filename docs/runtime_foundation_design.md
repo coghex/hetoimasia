@@ -2,15 +2,15 @@
 
 Define how components fail, recover, initialize, and share services before
 messaging, worker, and GLFW implementations depend on those conventions.
-The error/origin/recovery phase has been processed into #52 through #55.
-Contexts, state ownership, initialization, and worker lifecycle remain in this
-arc. D-13 through D-16 settle the safety and supervision choices raised by the
+Epic #52 and all eight children (#53 through #60) are filed. The arc covers
+errors, recovery, contexts, state ownership, initialization, and worker lifecycle.
+D-13 through D-16 settle the safety and supervision choices raised by the
 review of the processor's additions: retain worker dependencies until completion,
 recover construction inside its owning scope, supervise through checkpoints,
 and distinguish services from finite jobs. P-10 through P-12 specify the complete
 contracts. D-17 records owner approval of those contracts; D-18 records the
-approved supervision split and operator-escape clarification. Five composition
-slices remain, with supervision in RT-8 and application integration in RT-6.
+approved supervision split and operator-escape clarification. Supervision belongs
+to RT-8 and application integration to RT-6; implementation remains outstanding.
 
 Design state: `ready for issue processing`
 
@@ -20,8 +20,10 @@ Started 2026-09-12 against Hetoimasia
 The earlier readiness covered EPIC and RT-1 through RT-3, which are now linked
 and unaffected by later design work. Q-5 through Q-7 now have concrete resolutions
 under D-13 through D-18 and P-10 through P-13. The owner granted fresh readiness
-for the complete revised design. Each tracker artifact still needs the normal
-processing approval; document readiness is not implementation completion.
+for the complete revised design. Processing is complete as of 2026-09-13;
+all eight child issues carry canonical approval. Their review amendments are
+part of the implementation specifications. Readiness is not implementation
+completion, and solvers still follow the normal freshness and claim gates.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -33,22 +35,22 @@ concrete precondition
 - [x] RT-1. Preserve typed failures with structured origin and operation context — [#53]
 - [x] RT-2. Add bounded recovery around complete owned operations — [#54]
 - [x] RT-3. Report recovery and terminal outcomes through the existing logger — [#55]
-- [ ] RT-4. Compose component contexts and scoped initialization
-- [ ] RT-5. Establish scoped worker startup, cancellation, and joining
-- [ ] RT-7. Own borrowed logging lifetime and final flush
-- [ ] RT-8. Supervise worker outcomes through checkpoints and supervised waits
-- [ ] RT-6. Integrate application startup, availability, and shutdown
+- [x] RT-4. Compose component contexts and scoped initialization — [#56]
+- [x] RT-5. Establish scoped worker startup, cancellation, and joining — [#57]
+- [x] RT-7. Own borrowed logging lifetime and final flush — [#58]
+- [x] RT-8. Supervise worker outcomes through checkpoints and supervised waits — [#59]
+- [x] RT-6. Integrate application startup, availability, and shutdown — [#60]
 
-EPIC and RT-1 through RT-3 are filed. Five composition slices remain unfiled;
+EPIC and all eight child slices are filed; none remains to be processed.
+The checked ledger records tracker creation, not merged implementation.
 RT-7 separates logging lifetime from RT-4's construction work without renumbering
 existing IDs, and RT-8 separates supervision from RT-6's application integration.
-Further processing follows ledger order, one artifact at a time. There are no
-remaining composition design gates. Completing the error phase does not complete
-this epic.
+There are no remaining composition design gates. Completing the error phase
+does not complete this epic.
 
-Epic #52 was refreshed and verified against this eight-child plan on 2026-09-12
-under the owner's D-18 request. Its checklist distinguishes filed issues from
-unfiled slices; no remaining child was created by the refresh.
+Epic #52's D-18 refresh and subsequent child links were verified on 2026-09-13.
+It links all eight issues and keeps its implementation checkboxes open until
+the respective work is complete.
 
 ## Epic contract
 
@@ -359,11 +361,11 @@ RT-7, and RT-8. P-13 defines the delivery and documentation boundary.
 
 The owner also approved documenting external operator-forced termination and
 its loss of managed cleanup/flushing, without promising a portable second-Ctrl-C
-escape or adding internal forced shutdown. Refresh #52's contracts, children,
-dependencies, and done conditions to match this revision. No child is created or
-marked implemented by that refresh. There are eight children, three filed and
-five unfiled, processed in ledger order. The approved revision remains ready;
-D-13 through D-17's behavioral decisions are preserved.
+escape or adding internal forced shutdown. The approved #52 refresh aligned its
+contracts, children, dependencies, and done conditions with this revision without
+creating or marking any child implemented. At that decision there were eight
+children, three filed and five unfiled; subsequent processing filed the remaining
+five in ledger order. D-13 through D-17's behavioral decisions are preserved.
 
 ## Desired experience and scope
 
@@ -1249,9 +1251,10 @@ or new engine component is needed merely because these are separate PRs.
 
 ## Correctness review of the processor's composition additions — 2026-09-12
 
-The filed error-phase issues #53 through #55 retain the accepted error/origin,
-complete-operation recovery, and diagnostic contracts. The new problems are in
-the unfiled RT-4 through RT-6 composition additions:
+At this review, the filed error-phase issues #53 through #55 retained the accepted
+error/origin, complete-operation recovery, and diagnostic contracts. The problems
+below were found in the then-unfiled RT-4 through RT-6 composition additions and
+resolved by the subsequent decisions and contracts in this document:
 
 1. **Live acquisition is not RT-2.** #54 requires complete owned attempts and
    explicitly excludes returning a live replacement service. RT-4 needs its
@@ -1647,19 +1650,16 @@ remains Linux-only; validate the CPU behavior locally on macOS as well.
 
 ## Processing handoff
 
-The umbrella (#52) and the error phase (#53 through #55) are filed. The complete
-approved design has eight children: three filed and five remaining. With D-18's
-approved refinement, the processor resumes with RT-4, RT-5, RT-7, RT-8, then RT-6,
-performing normal per-child deduplication and obtaining separate approval for
-every tracker artifact. D-13 through D-18 must not be asked again.
+Processing is complete: epic #52 links all eight approved children, #53 through
+#60. There is no next unfiled slice and no duplicate tracker artifact to create.
+D-13 through D-18 must not be asked again. Each solver reads its live issue and
+canonical review amendments and follows the normal freshness and claim gates.
 
-Epic #52's approved D-18 refresh is complete and its body was verified against
-this plan. Future processing still reconciles live tracker state before creating
-an artifact. RT-4 precedes RT-5's trusted facade work; RT-7 can be solved alongside
-those slices after RT-3, despite ledger creation order. RT-8 then joins worker
-ownership and logging lifetime; RT-6 composes construction, logging lifetime,
-and supervision. Existing child issue bodies may carry historical gates; this
-design records their resolution without changing the filed error contracts.
+Implementation proceeds through #53 → #54 → #55, then #56 → #57 alongside
+#58. After #57 and #58, #59 supplies supervision; #60 integrates #56, #58, and
+#59. This preserves RT-5's dependency on RT-4's trusted facade seam and RT-7's
+independence from construction and worker ownership. The epic's checklist
+records implementation completion separately from this document's filed ledger.
 
 Every implementation's required contracts, state tables, and validation evidence
 belong in that implementation PR before final review and merge. The epic remains
