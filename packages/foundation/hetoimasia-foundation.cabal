@@ -8,8 +8,11 @@ description:
     CPU resource scopes; and origin and operation context for engine failures,
     retained on the exception; bounded, classified recovery around one
     complete owned operation; and scoped component construction that selects
-    among rolled-back alternatives under the same policy. This library
-    has no application state, graphics, scripting, or game dependencies.
+    among rolled-back alternatives under the same policy; and owned CPU worker
+    threads with scoped startup, cooperative stop, cancellation, terminal
+    observation, and a protected drain before borrowed dependencies unwind.
+    This library has no application state, graphics, scripting, or game
+    dependencies.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -30,6 +33,7 @@ library
         Hetoimasia.Foundation.Log
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
+        Hetoimasia.Foundation.Worker
     -- Shares the Scoped representation and the composite ledger between the
     -- resource API and the scoped constructors of other foundation modules
     -- without exposing either constructor to clients.
@@ -42,5 +46,6 @@ library
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
+        stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         time >=1.14 && <1.15

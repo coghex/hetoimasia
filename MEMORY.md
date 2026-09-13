@@ -209,8 +209,14 @@ not a verdict that Synarchy's design should be discarded.
   [runtime foundation design](docs/runtime_foundation_design.md) now specifies
   component contexts, scoped construction, recovery, worker ownership,
   supervision, and boot/shutdown composition through explicit IO and narrow
-  handles. These contracts await implementation; `runApplication` still only
-  logs around an `IO` action and neither constructs services nor supervises workers.
+  handles. RT-5 (#57) implements the raw worker contract in foundation's
+  `Hetoimasia.Foundation.Worker` ([docs/workers.md](docs/workers.md)): a group
+  boundary with a `Scoped` adapter, gated fork/registration, STM startup and
+  terminal observation, run-exit ordering, group-owned cancellation helpers,
+  retirement, and a protected drain; it adds `stm`, not `async`. Supervision
+  (RT-8) and application integration (RT-6) still await implementation;
+  `runApplication` still only logs around an `IO` action and neither constructs
+  services nor supervises workers.
 - Runtime epic #52 and all eight children #53–#60 are filed and approved as of
   2026-09-13. Issue-review amendments are part of each implementation spec.
   Solve #53 → #54 → #55, then #56 → #57 alongside #58, then #59 → #60.

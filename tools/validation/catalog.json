@@ -50,7 +50,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the Logging, Runtime, Resources, Failures, and Recovery components.",
+      "description": "Focused Hspec examples for the Logging, Runtime, Resources, Failures, Recovery, and Workers components.",
       "command": [
         "cabal",
         "test",
