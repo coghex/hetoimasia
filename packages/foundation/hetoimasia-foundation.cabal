@@ -6,8 +6,9 @@ description:
     A structured logging interface with validated components, pure filter
     configuration, scoped context, and explicit sink ownership; failure-preserving
     CPU resource scopes; and origin and operation context for engine failures,
-    retained on the exception; and bounded, classified recovery around one
-    complete owned operation. This library
+    retained on the exception; bounded, classified recovery around one
+    complete owned operation; and scoped component construction that selects
+    among rolled-back alternatives under the same policy. This library
     has no application state, graphics, scripting, or game dependencies.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -29,6 +30,11 @@ library
         Hetoimasia.Foundation.Log
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
+    -- Shares the Scoped representation and the composite ledger between the
+    -- resource API and the scoped constructors of other foundation modules
+    -- without exposing either constructor to clients.
+    other-modules:
+        Hetoimasia.Foundation.Resource.Internal
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings

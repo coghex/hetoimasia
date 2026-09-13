@@ -9,9 +9,15 @@ P-2, P-3, and P-5); this document describes what the code does today.
 Scope: the boundary, its policy, the attempt order, its outcomes, and the
 evidence it leaves on a propagated failure. Reporting recovery through the
 logger belongs to the runtime adapter described in
-[Recovery and terminal reports](logging.md#recovery-and-terminal-reports). A
-fallback that hands a live replacement service to the rest of the application
-(RT-4) and deadlines or worker supervision (RT-5) are not part of it.
+[Recovery and terminal reports](logging.md#recovery-and-terminal-reports).
+Deadlines and worker supervision are not part of it.
+
+A fallback that hands a live replacement component to the rest of the
+application is not `recover` either. The same module's `allocComponent` does
+that: it selects among composite alternatives under this same policy, attempt
+order, and evidence, and keeps the selected parts alive for the enclosing
+scope. Its contract lives with the scopes it extends, in
+[Component construction](resources.md#component-construction).
 
 The module takes no logger, emits no diagnostics, and does not import the
 logging module. It reads cleanup evidence through
@@ -21,7 +27,8 @@ type from [failures.md](failures.md); it changes neither.
 ## Public interface
 
 ```haskell
-recover ∷ Operation → RecoveryPolicy a → IO a → IO (Outcome a)
+recover        ∷ Operation → RecoveryPolicy a → IO a → IO (Outcome a)
+allocComponent ∷ Operation → RecoveryPolicy (Assembly a) → Assembly a → Scoped (Outcome a)
 
 data RecoveryPolicy a = RecoveryPolicy
   { policyDisposition ∷ Disposition
@@ -82,7 +89,8 @@ to evaluate is that attempt's failure. Anything deeper — a lazy field, a closu
 a borrowed handle — is the operation's responsibility: produce the result fully
 while its resources are live, and never return a handle whose owning scope has
 closed. A fallback that must hand a live replacement service to the rest of
-application startup needs a scoped consumer, which is not this API.
+application startup needs a scoped consumer: use `allocComponent`, described in
+[Component construction](resources.md#component-construction).
 
 ## The policy
 

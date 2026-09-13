@@ -70,6 +70,7 @@ import Hetoimasia.Foundation.Resource
   , withScoped
   )
 import qualified Test.Engine.Resources.Cost as Cost
+import qualified Test.Engine.Resources.Construction as Construction
 import qualified Test.Engine.Resources.Opacity as Opacity
 import qualified Test.Engine.Resources.Smoke as Smoke
 import Test.Engine.Resources.Buffer
@@ -259,6 +260,11 @@ spec = describe "Resources" $ do
   describe "Continuation facade composite allocation" $ do
     it "keeps each composite's declared order while the scope unwinds in reverse"
       testCompositeThroughFacade
+
+  -- Scoped component construction selects among composite alternatives and
+  -- keeps the selected parts under this facade's release, so its examples
+  -- group beside the facade they extend.
+  Construction.spec
 
   -- What inspecting retained evidence costs is part of the contract, and is
   -- observable only by measuring, so its examples group separately.
