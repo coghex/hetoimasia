@@ -74,6 +74,14 @@
 -- 'SupervisedFailure' evidence that 'supervisedFailures' reads back. A
 -- synchronous worker failure propagates with its own type, value, and context.
 --
+-- Latching a fatal failure also initiates owned shutdown, in the same
+-- transaction: a stop is requested of every supervised worker whose outcome is
+-- still pending, and a later 'startSupervised' rethrows the latched failure
+-- without registering or forking anything. An application that catches the
+-- delivery therefore keeps running only while its workers wind down; the
+-- cancellation of live workers and the drain follow when a failure leaves the
+-- body.
+--
 -- A classifier that throws stops supervision: its failure becomes the worker's
 -- fatal status, carrying the worker failure it was handling as a
 -- 'Control.Exception.WhileHandling' annotation, as
@@ -115,8 +123,8 @@
 -- |                          | and waits read                           |                             |                                  |
 -- +--------------------------+------------------------------------------+-----------------------------+----------------------------------+
 -- | Owner stop request flag  | 'stopSupervised', 'cancelSupervised',    | Application thread          | One worker; set once, never      |
--- |                          | and an abandoned start write;            |                             | cleared                          |
--- |                          | classification reads                     |                             |                                  |
+-- |                          | before publication, and an abandoned     |                             | cleared                          |
+-- |                          | start write; classification reads        |                             |                                  |
 -- +--------------------------+------------------------------------------+-----------------------------+----------------------------------+
 -- | Worker status            | Commits write once; 'workerStatus' reads | Application thread writes;  | One worker; 'WorkerLive' until   |
 -- |                          |                                          | any thread reads, in STM    | committed, then never changes    |
@@ -175,6 +183,7 @@ import Control.Concurrent.STM
   , modifyTVar'
   , newTVarIO
   , readTVar
+  , readTVarIO
   , throwSTM
   , writeTVar
   )
@@ -360,6 +369,7 @@ data Managed = Managed
   , managedPolicy ∷ !WorkerPolicy
   , managedPoll ∷ !(STM (Maybe WorkerSummary))
   , managedObserve ∷ !(STM ())
+  , managedStop ∷ !(STM ())
   , managedRequested ∷ !(TVar Bool)
   , managedStatus ∷ !(TVar WorkerStatus)
   }
@@ -475,8 +485,13 @@ instance Exception StartupInterrupted
 -- worker that acknowledged and has already finished. A fatal outcome is
 -- rethrown; a recognized optional failure is 'WorkerStartUnavailable'. The
 -- start itself is never retried, and nothing restarts a worker.
+--
+-- Once a fatal failure is latched, this rethrows it without registering or
+-- forking anything: shutdown has already begun.
 startSupervised ∷ RuntimeControl → WorkerPolicy → WorkerDefinition r → IO (SupervisedStart r)
 startSupervised (RuntimeControl group state) policy definition = do
+  alreadyLatched ← isJust <$> readTVarIO (supervisionLatch state)
+  when alreadyLatched (deliver state)
   registered ← newIORef Nothing
   let prepare worker = mask_ $ do
         managed ← newManaged worker policy
@@ -519,20 +534,32 @@ newManaged worker policy =
   Managed (workerId worker) (workerLabel worker) policy
     (fmap (() <$) <$> pollCompletion worker)
     (() <$ observeCompletion worker)
+    (requestStop worker)
     <$> newTVarIO False
     <*> newTVarIO WorkerLive
 
 -- | Ask a supervised worker to stop, recording that its owner asked.
+--
+-- A request made after the worker's outcome was published is not recorded: it
+-- cannot explain an outcome that already happened.
 stopSupervised ∷ SupervisedWorker r → IO ()
 stopSupervised handle = atomically $ do
-  writeTVar (managedRequested (supervisedManaged handle)) True
+  recordOwnerRequest (supervisedManaged handle)
   requestStop (supervisedWorker handle)
 
--- | Request cancellation of a supervised worker, recording that its owner asked.
+-- | Request cancellation of a supervised worker, recording that its owner
+-- asked, under the same rule as 'stopSupervised'.
 cancelSupervised ∷ SupervisedWorker r → IO ()
 cancelSupervised handle = do
-  atomically (writeTVar (managedRequested (supervisedManaged handle)) True)
+  atomically (recordOwnerRequest (supervisedManaged handle))
   requestCancel (supervisedWorker handle)
+
+-- | Record the owner's request only while the worker's outcome is unpublished.
+recordOwnerRequest ∷ Managed → STM ()
+recordOwnerRequest managed =
+  managedPoll managed >>= \case
+    Nothing → writeTVar (managedRequested managed) True
+    Just _ → pure ()
 
 -- | What supervision has committed about a worker so far.
 workerStatus ∷ SupervisedWorker r → STM WorkerStatus
@@ -669,7 +696,11 @@ settle state batch = do
               let entry = failed managed Fatal failure
               modifyTVar' (supervisionFailures state) (entry :)
               readTVar (supervisionLatch state) >>= \case
-                Nothing → writeTVar (supervisionLatch state) (Just entry)
+                Nothing → do
+                  -- Latching initiates owned shutdown: every worker still
+                  -- pending is asked to stop, in this same transaction.
+                  writeTVar (supervisionLatch state) (Just entry)
+                  readTVar (supervisionPending state) >>= traverse_ managedStop
                 Just _ → pure ()
               pure []
             WorkerUnavailable failure → do

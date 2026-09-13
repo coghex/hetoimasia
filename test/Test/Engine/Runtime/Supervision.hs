@@ -77,12 +77,16 @@ spec = describe "Supervision" $ do
       (boundedSupervision testUnexpectedTermination)
     it "fails the run for a cleanup failure on an optional worker"
       (boundedSupervision testOptionalCleanupFailure)
+    it "keeps an unexpected cancellation unexpected when a stop or cancel is requested after publication"
+      (boundedSupervision testLateRequestExplainsNothing)
 
   describe "Warnings and the fatal latch" $ do
     it "commits an optional disposition before its warning, and a failed warning neither repeats nor restores it"
       (boundedSupervision testWarningAfterCommit)
     it "keeps a caught fatal delivery latched through the final settlement"
       (boundedSupervision testCaughtFatalLatched)
+    it "initiates owned shutdown on a caught fatal: siblings are asked to stop and a later start forks nothing"
+      (boundedSupervision testFatalInitiatesShutdown)
 
   describe "Simultaneous failures" $ do
     it "selects the primary by registration order and retains every other typed failure"
@@ -319,6 +323,32 @@ testOptionalCleanupFailure = do
   failure `shouldSatisfy` brokenIs "release"
   length (cleanupFailuresInContext context) `shouldBe` 1
 
+testLateRequestExplainsNothing ∷ Expectation
+testLateRequestExplainsNothing = do
+  thread ← newEmptyMVar
+  failure@(ExceptionWithContext _ raised) ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \control → do
+      let decoder =
+            workerDefinition "decoder" (\_ → pure ()) $ \token () → do
+              myThreadId >>= putMVar thread
+              atomically (awaitStopRequest token)
+      worker ← expectStarted =<< startSupervised control (required Service) decoder
+      -- A foreign cancellation ends the worker before its owner asks anything.
+      takeMVar thread >>= (`throwTo` ThreadKilled)
+      _ ← awaitTerminal (supervisedWorker worker)
+      -- Both requests race in after the outcome was published, before any
+      -- checkpoint handled it. Neither may explain that outcome.
+      stopSupervised worker
+      cancelSupervised worker
+      checkRuntime control
+  case fromException raised of
+    Just (UnexpectedWorkerTermination summary) → do
+      completionExit summary `shouldBe` RunExited RunCancelled NothingRequested
+      case completionResult summary of
+        Cancelled _ → pure ()
+        _ → expectationFailure "expected the worker's cancellation to be retained"
+    Nothing → expectationFailure ("expected an unexpected termination, found " <> show failure)
+
 -- Warnings and the fatal latch -------------------------------------------------
 
 testWarningAfterCommit ∷ Expectation
@@ -367,6 +397,32 @@ testCaughtFatalLatched = do
       pure ()
   readIORef caught >>= (`shouldBe` [True, True, True])
   failure `shouldSatisfy` brokenIs "input"
+
+testFatalInitiatesShutdown ∷ Expectation
+testFatalInitiatesShutdown = do
+  trace ← newTrace
+  gate ← newGate
+  observed ← newIORef Nothing
+  failure ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \control → do
+      sibling ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "sibling")
+      worker ← expectStarted =<< startSupervised control (required Service) (failingAfter trace "engine" gate (Broken "engine"))
+      openGate gate
+      _ ← awaitTerminal (supervisedWorker worker)
+      delivered ← attempt (checkRuntime control)
+      -- The application caught the delivery, and its sibling was still asked
+      -- to stop: waiting for it returns rather than hanging.
+      stopped ← awaitTerminal (supervisedWorker sibling)
+      late ← attempt (startSupervised control (required Service) (serviceUntilStopped trace "late"))
+      writeIORef observed $
+        Just
+          ( either (brokenIs "engine") (const False) delivered
+          , completionExit stopped
+          , either (brokenIs "engine") (const False) late
+          )
+  failure `shouldSatisfy` brokenIs "engine"
+  readIORef observed >>= (`shouldBe` Just (True, RunExited RunReturned StopWasRequested, True))
+  traced trace >>= (`shouldSatisfy` notElem "acquire late")
 
 -- Simultaneous failures --------------------------------------------------------
 

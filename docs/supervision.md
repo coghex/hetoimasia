@@ -124,7 +124,8 @@ handled exactly once, after any failed startup has drained:
 
 Because the disposition is committed first, no later checkpoint handles or
 reports it again. A start after closing returns `WorkerStartRejected` and forks
-nothing. Starting a worker is never run through `recover`.
+nothing. A start once a fatal failure is latched rethrows that failure and
+forks nothing. Starting a worker is never run through `recover`.
 
 ## Checkpoints and supervised waits
 
@@ -167,7 +168,8 @@ committed is handled at the next checkpoint.
 
 The owner's request below is the run-exit record's request, or a request the
 owner made through `stopSupervised`, `cancelSupervised`, an abandoned start, or
-closing.
+closing. A stop or cancel requested only after the worker's outcome was
+published is not recorded: it cannot explain an outcome that already happened.
 
 | Terminal outcome | Status |
 |---|---|
@@ -219,6 +221,13 @@ retained beside the propagated failure as a `SupervisedFailure` with its own
 context, and `supervisedFailures` reads them back in commit order. A delivered
 synchronous worker failure keeps its type, value, context, origin, and cleanup
 evidence.
+
+Latching also initiates owned shutdown, in the same transaction that sets the
+latch: a stop is requested of every supervised worker whose outcome is still
+pending, and a later `startSupervised` rethrows the latched failure without
+registering or forking anything. An application that catches a delivery keeps
+running only while its workers wind down. Cancellation of live workers and the
+protected drain follow when a failure leaves the body, as closing describes.
 
 ## Closing
 
@@ -272,7 +281,7 @@ shared with or reused by another invocation.
 | State | Readers and writers | Thread | Lifetime and reset |
 |---|---|---|---|
 | Pending registrations | `startSupervised` inserts before the worker runs; commits remove; checkpoints, waits, and closing read | Application thread; the boundary at closing | One invocation; a worker leaves when its outcome is committed |
-| Owner stop request flag | `stopSupervised`, `cancelSupervised`, and an abandoned start write; classification reads | Application thread | One worker; set once, never cleared |
+| Owner stop request flag | `stopSupervised` and `cancelSupervised` write only while the worker's outcome is unpublished; an abandoned start writes; classification reads | Application thread | One worker; set once, never cleared |
 | Worker status | A commit writes once; `workerStatus` reads | Application thread writes; any thread reads, in STM | One worker; `WorkerLive` until committed, then never changes |
 | Committed failures and the fatal latch | Commits append and latch; deliveries and the boundary read | Application thread | One invocation; append-only; the latch is set once and never cleared |
 | Warning attempt | Consumed by the commit that makes a worker unavailable, then attempted once | Application thread | At most one per worker; never repeated |
@@ -298,10 +307,14 @@ to reuse. They cover:
 - optional and required startup failures handled exactly once;
 - finite-job completion, an expected exit after a requested stop, an
   unexpected service exit, and an unexpected child cancellation;
+- a stop or cancel requested after publication not turning an earlier
+  unexpected cancellation into an expected stop;
 - a cleanup failure on an optional worker failing the run;
 - an optional disposition committed before its warning, and a failed warning
   that neither repeats nor restores availability;
-- a caught fatal delivery staying latched through the final settlement;
+- a caught fatal delivery staying latched through the final settlement, and
+  still initiating shutdown: a sibling is asked to stop and a later start
+  forks nothing;
 - simultaneous failures in registration order, a mixed optional and fatal
   batch, and the application's own failure staying primary;
 - a classifier failure and a cancellation during classification;
