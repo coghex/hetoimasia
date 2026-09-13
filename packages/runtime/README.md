@@ -24,6 +24,15 @@ handles a failure and rethrows it preservingly. `resourceSmoke` reports through
 it. The contract is
 [Recovery and terminal reports](../../docs/logging.md#recovery-and-terminal-reports).
 
+`Hetoimasia.Runtime.Logging` is the borrowed logging lifetime:
+`withLoggingLifetime` lends a caller-built logger to a callback through a narrow
+handle that records managed reporting-attempt outcomes, then makes at most one
+final flush after the callback, outside every resource release, following the
+settled outcome. It owns no handle and changes no buffering. Both console smoke
+paths run inside it; `managedResourceSmoke` is `resourceSmoke` with its report's
+outcome recorded on the lifetime. The contract is
+[Logging lifetime](../../docs/logging.md#logging-lifetime).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before

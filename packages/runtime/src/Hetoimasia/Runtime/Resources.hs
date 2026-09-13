@@ -46,6 +46,7 @@
 module Hetoimasia.Runtime.Resources
   ( -- * The demonstration
     resourceSmoke
+  , managedResourceSmoke
   , resourceComponent
   , DiagnosticFailure (..)
 
@@ -91,10 +92,12 @@ import Hetoimasia.Foundation.Resource
   , restoredStep
   , withScoped
   )
+import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, recordReport)
 import Hetoimasia.Runtime.Reporting
   ( DiagnosticFailure (..)
   , markDiagnostic
   , reportTerminalFailure
+  , reportTerminalFailureWith
   )
 
 -- | The stable component name every record from this demonstration carries.
@@ -215,13 +218,34 @@ workingReleases = ReleaseOutcomes
 --
 -- Either way every resource acquired has been released before this returns.
 resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
-resourceSmoke logger outcomes work = do
+resourceSmoke = smokeReportedBy reportTerminalFailure
+
+-- | 'resourceSmoke' inside a logging lifetime, with the same work, records, and
+-- single terminal report, over the lifetime's logger.
+--
+-- The one difference is where the reporting attempt's outcome goes: it is
+-- recorded on the lifetime before the original failure is rethrown, including
+-- when the report itself failed. The lifetime then knows this path's
+-- diagnostics have already failed and makes no final flush through it, which
+-- inferring from the rethrown failure alone could not tell it. This is the path
+-- the console executable's @--resource-smoke@ runs.
+managedResourceSmoke ∷ LoggingLifetime → ReleaseOutcomes → SmokeWork → IO Int
+managedResourceSmoke lifetime =
+  smokeReportedBy (reportTerminalFailureWith (recordReport lifetime)) (lifetimeLogger lifetime)
+
+-- | The terminal reporting boundary a run uses: the adapter's
+-- 'reportTerminalFailure', or the same boundary with a recorder attached.
+type Reporter = ∀ a. Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+
+-- | The demonstration with its one terminal reporter injected.
+smokeReportedBy ∷ Reporter → Logger → ReleaseOutcomes → SmokeWork → IO Int
+smokeReportedBy report logger outcomes work = do
   ledger ← newLedger
   -- The adapter classifies what the run threw: a cancellation and a marked
   -- diagnostic's own failure propagate unreported, and anything else gets its
   -- one guarded report. The released names are read from the ledger inside
   -- that attempt, after the scope has unwound.
-  reportTerminalFailure scoped resourceComponent "Resource smoke abandoned"
+  report scoped resourceComponent "Resource smoke abandoned"
     (releasedFields <$> recordedReleases ledger)
     (runSmoke scoped ledger outcomes work)
   where

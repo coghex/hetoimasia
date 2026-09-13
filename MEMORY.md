@@ -114,6 +114,13 @@ not a verdict that Synarchy's design should be discarded.
   goes in `origin.*`/`observed.*` fields, separate from the entry's source.
   `DiagnosticFailure` moved into it; `resourceSmoke` is its consumer. The
   contract is in `docs/logging.md`, proven by `Runtime`'s `Outcome reporting`.
+- RT-7 (#58) added `Hetoimasia.Runtime.Logging`: `withLoggingLifetime` borrows
+  a logger, lends it through a `LoggingLifetime` handle that records managed
+  reporting-attempt outcomes (`reportTerminalFailureWith`'s recorder), and makes
+  at most one final flush after the callback, outside releases, following P-11's
+  matrix; secondary flush failures and known failed reports ride on the failure
+  as evidence. Both console paths run inside it, the resource path through
+  `managedResourceSmoke`. Contract: `docs/logging.md`, "Logging lifetime".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

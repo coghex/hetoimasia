@@ -63,6 +63,7 @@ module Hetoimasia.Runtime.Reporting
 
     -- * Terminal failures
   , reportTerminalFailure
+  , reportTerminalFailureWith
   , terminalReportAttempted
 
     -- * Lifecycle diagnostics
@@ -240,7 +241,23 @@ terminalReportAttemptedInContext context =
 reportTerminalFailure
   ∷ HasCallStack
   ⇒ Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
-reportTerminalFailure logger component message extra work = do
+reportTerminalFailure = reportTerminalFailureWith (\_ → pure ())
+
+-- | 'reportTerminalFailure', handing what became of its one reporting attempt
+-- to a recorder before the failure is rethrown.
+--
+-- The recorder receives 'ReportAccepted' or 'ReportFailed' exactly when an
+-- attempt was made, including when the attempt failed and the original failure
+-- is about to be rethrown in its place; it is not called for a result, a
+-- cancellation, a marked diagnostic failure, or a failure already reported. It
+-- runs between the attempt and the rethrow, so it must neither block nor throw:
+-- 'Hetoimasia.Runtime.Logging.recordReport' is the recorder a logging lifetime
+-- supplies. Everything else is 'reportTerminalFailure' unchanged.
+reportTerminalFailureWith
+  ∷ HasCallStack
+  ⇒ (ReportResult → IO ())
+  → Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+reportTerminalFailureWith recorder logger component message extra work = do
   outcome ← tryWithContext work
   case outcome of
     Right value → pure value
@@ -250,9 +267,10 @@ reportTerminalFailure logger component message extra work = do
       | terminalReportAttemptedInContext context → rethrowIO primary
       | otherwise → do
           -- A cancellation during the attempt leaves from inside it.
-          _ ←
+          attempted ←
             attemptReport logger Error component message $
               (terminalFields context failure <>) <$> extra
+          recorder attempted
           rethrowIO (ExceptionWithContext (addExceptionAnnotation TerminalReport context) failure)
 
 -- The one guarded attempt -------------------------------------------------------

@@ -320,7 +320,11 @@ its sink. Shut down in this order:
 
 1. Stop and join the producers, so nothing is still emitting.
 2. Finish subsystem cleanup, which may itself emit diagnostics.
-3. Flush and close any handle the application owns.
+3. Make the terminal report, once, through the boundary chosen to own it.
+4. Make the final flush. The [logging lifetime](#logging-lifetime) owns this
+   step and enforces its place: after the callback holding steps 1 to 3 has
+   returned or thrown, and outside every controlled resource release.
+5. Close any handle the application owns, after the lifetime has returned.
 
 Deriving a logger extends no handle lifetime by itself: a derived logger is an
 immutable value sharing its root's sink, and holding one is not a claim on the
@@ -350,6 +354,93 @@ instead of writing to a sink, how a boundary reports a resource failure once and
 still hands the structured outcome to its caller, and how it tells a resource
 failure apart from a failure of the diagnostic itself — which is never reported,
 because the sink that would carry the report is the one that just failed.
+
+### Logging lifetime
+
+```haskell
+data LoggingLifetime
+withLoggingLifetime       ∷ Logger → (LoggingLifetime → IO a) → IO a
+withHandleLoggingLifetime ∷ LogFilter → Handle → (LoggingLifetime → IO a) → IO a
+lifetimeLogger            ∷ LoggingLifetime → Logger
+
+recordReport    ∷ LoggingLifetime → ReportResult → IO ()
+recordedReports ∷ LoggingLifetime → IO [ReportResult]
+
+flushFailures ∷ SomeException → [ExceptionWithContext SomeException]
+failedReports ∷ SomeException → [ExceptionWithContext SomeException]
+```
+
+`Hetoimasia.Runtime.Logging` turns step 4 of the shutdown order from a caller
+obligation into a boundary. `withLoggingLifetime` is an explicit `IO` callback,
+outside the `Scoped` runner, that borrows a logger the caller already built,
+lends it to the callback through a `LoggingLifetime` handle, and makes the final
+flush once the callback has finished. `withHandleLoggingLifetime` builds one
+`handleLogger` over a borrowed handle first; the console runs both of its smoke
+paths through it over the process's `stderr`, and every logger derived from the
+lent one shares that sink.
+
+**What the handle lends and records.** `lifetimeLogger` is the borrowed logger.
+`recordReport` records what became of one runtime-managed reporting attempt:
+pass it as the recorder of `reportTerminalFailureWith`, or hand it the
+`ReportResult` that `reportOutcome` returned. That is all. The handle looks up
+no other service, owns no handle, changes no buffering, creates no output
+backend, and changes nothing about ordinary logging calls: a direct `logInfo`
+whose sink fails still throws to its caller. It is not an application
+environment.
+
+**What the callback owes.** Every producer has stopped and every component
+scope inside the callback has unwound before it returns, and the chosen
+terminal-report owner has made its one report inside it. The lifetime reports
+nothing itself: an arbitrary callback failure never becomes a record here.
+
+**The final flush.** At most one attempt per lifetime, through `flushLogger`,
+after the callback has returned or thrown. The flush runs with the caller's
+masking state and keeps its ordinary interruptibility: no bounded duration is
+promised, and no successful flush during cancellation. Never enter a lifetime
+from a release callback — a release runs under `uninterruptibleMask_`, and a
+flush has no controlled blocking duration.
+
+**Finalization follows the settled outcome.**
+
+| Outcome entering finalization | What the lifetime does |
+|---|---|
+| The callback returned; diagnostics usable | Flush once. Return the result only if the flush succeeds; a synchronous flush failure fails the run with the flush's own exception, marked `DiagnosticFailure`. |
+| The callback threw synchronously; diagnostics usable | Flush once, then rethrow the callback's failure with its type, value, and context. A synchronous flush failure rides on that context as secondary evidence `flushFailures` reads back, with its own type, value, and context. No `CleanupFailure` is forged for it. |
+| A managed reporting attempt already failed | No flush and no new attempt through that path. Return the result, or rethrow the failure with every failed attempt attached as evidence `failedReports` reads back. `recordedReports` holds them either way. |
+| The callback threw a failure marked `DiagnosticFailure` | No flush: the sink that failed is the one a flush would use. The failure propagates unchanged. |
+| The callback is being cancelled | Propagate the cancellation with its context. No report, no flush. |
+| A cancellation arrives during the flush | Propagate it as itself, with its own context, in place of the settled outcome. It is never turned into a logger failure, and the flush is not retried. |
+
+Diagnostic usability comes from explicit provenance only: the
+`DiagnosticFailure` mark on what the callback threw, or a `ReportFailed` outcome
+recorded on the handle. An exception's type is never consulted, and there is no
+global sink-health registry. Reading either kind of evidence needs no logger,
+and neither changes the primary's typed catch behavior, its origin, or its
+cleanup evidence.
+
+**What the lifetime does not own.** The handle behind the sink, its buffering,
+and its closing stay the caller's; closing it is step 5, after the lifetime has
+returned. Owned log files and a file-close policy are not part of it.
+Configuration parsing and logger construction happen before it, so a failure
+there propagates as its own typed failure with no promise of a record: no
+managed logger exists yet. `runApplication` stays the thin supplied-logger
+runner, and `resourceSmoke` keeps its public entry point and its one terminal
+report. The console's resource-smoke path runs `managedResourceSmoke`, the
+same run with that report's outcome recorded on the lifetime, so a report that
+failed and was discarded in favour of the original failure still reaches the
+lifetime owner.
+
+**The lifetime's state.**
+
+| State | Owner | Writers | Readers | Thread | Lifetime and reset |
+|---|---|---|---|---|---|
+| Recorded reporting-attempt outcomes | The `withLoggingLifetime` call that created the handle | `recordReport`, atomically; nothing is ever removed | `recordedReports`; finalization, once | Any thread holding the handle; finalization on the calling thread | Created empty per call, never shared or reset. A record made after finalization has read it is kept and has no effect. |
+| The final flush attempt | Finalization | Finalization, at most once | None: its outcome is the lifetime's result or evidence on its failure | The thread that called `withLoggingLifetime` | Not stored; decided and made once per call. |
+
+The `Logging lifetime` group in
+[`test/Test/Engine/Runtime/Lifetime.hs`](../test/Test/Engine/Runtime/Lifetime.hs),
+selected by `--match Runtime`, drives each row above with injected sinks,
+release traces, and a temporary borrowed handle.
 
 ## Context and precedence
 
@@ -529,6 +620,13 @@ whether it is required. [The component convention](resources.md#the-component-co
 spells these out beside `allocComponent`, the constructor that selects among
 alternatives.
 
+**Produce inside the logging lifetime.** A subsystem, worker, or thread that
+emits diagnostics is stopped and joined inside the application's
+[logging lifetime](#logging-lifetime) callback, never after it: the final flush
+is the last thing that happens to the sink, and a record written after it may
+never reach the handle. A subsystem does not flush the shared sink itself on
+shutdown, and does not enter a lifetime of its own over a logger it was lent.
+
 **Logging imposes no error type.** Nothing here asks a game or engine module to
 adopt a shared exception or result type. `logError` is a severity on a record,
 not a way to fail, and a failing sink is the only exception this module raises
@@ -538,15 +636,16 @@ not a way to fail, and a failing sink is the only exception this module raises
 
 A root logger is built once, where the application assembles its services, from
 the configuration resolved at startup and a sink over a handle the application
-owns:
+borrows, inside the logging lifetime that makes its final flush:
 
 ```haskell
 main ∷ IO ()
 main = do
   configuration ← resolveLogFilter logVariables readVariable defaultLogFilter
   logFilter ← either (die . Text.unpack) pure configuration
-  root ← handleLogger logFilter stderr
-  runApplication root "hetoimasia" (application root)
+  withHandleLoggingLifetime logFilter stderr $ \lifetime → do
+    let root = lifetimeLogger lifetime
+    runApplication root "hetoimasia" (application root)
 ```
 
 A subsystem takes that logger, derives its own scope once, and uses its own
@@ -652,6 +751,10 @@ reportOutcome
 reportTerminalFailure
   ∷ HasCallStack ⇒ Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
 
+reportTerminalFailureWith
+  ∷ HasCallStack
+  ⇒ (ReportResult → IO ()) → Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+
 data ReportResult = NoReport | ReportAccepted | ReportFailed (ExceptionWithContext SomeException)
 
 markDiagnostic          ∷ IO a → IO a
@@ -752,3 +855,14 @@ The `Outcome reporting` group in
 [`test/Test/Engine/Runtime/Reporting.hs`](../test/Test/Engine/Runtime/Reporting.hs),
 selected by `--match Runtime`, drives each rule above with an injected sink.
 `resourceSmoke` is the adapter's existing runtime consumer.
+
+**A terminal report's outcome can be handed on.** `reportTerminalFailure`
+discards what became of its attempt, because the failure it rethrows is the
+outcome that matters to its caller. `reportTerminalFailureWith` is the same
+boundary with a recorder called between the attempt and the rethrow: it receives
+`ReportAccepted` or `ReportFailed` exactly when an attempt was made — including
+one that failed while the original failure is rethrown in its place — and is not
+called otherwise. The recorder must neither block nor throw. A
+[logging lifetime](#logging-lifetime) supplies `recordReport` as that recorder,
+which is how it learns that a path's diagnostics have already failed without
+guessing from the failure it later receives.
