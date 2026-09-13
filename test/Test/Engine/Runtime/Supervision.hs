@@ -24,10 +24,15 @@ import Control.Exception
   , SomeException
   , WhileHandling (WhileHandling)
   , fromException
+  , rethrowIO
+  , someExceptionContext
   , throwIO
+  , toException
+  , try
   , tryWithContext
   )
-import Control.Exception.Context (getExceptionAnnotations)
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -42,9 +47,11 @@ import Hetoimasia.Foundation.Worker
   , RunExit (..)
   , WorkerEvidence (..)
   , awaitCompletion
+  , WorkerDefinition
   , awaitStopRequest
   , workerDefinition
   , workerEvidenceInContext
+  , workerId
   )
 import Hetoimasia.Runtime.Logging (recordedReports)
 import Hetoimasia.Runtime.Reporting (ReportResult (..))
@@ -96,6 +103,16 @@ spec = describe "Supervision" $ do
     it "keeps the application's own failure primary with worker failures beside it"
       (boundedSupervision testApplicationFailurePrimary)
 
+  describe "Evidence across invocations" $ do
+    it "retains an outer failure beside an inner primary whose worker has the same local ID"
+      (boundedSupervision testNestedSameLocalId)
+    it "keeps inner secondary evidence when an outer boundary retains its own failure"
+      (boundedSupervision testNestedSecondaryKept)
+    it "composes a caught delivery rethrown inside a later independent invocation"
+      (boundedSupervision testLaterIndependentInvocation)
+    it "retains each secondary once across repeated deliveries and adds a later failure"
+      (boundedSupervision testRepeatedDeliveries)
+
   describe "Classifier failures" $ do
     it "stops supervision on a classifier failure, retaining the handled worker failure"
       (boundedSupervision testClassifierFailure)
@@ -139,6 +156,51 @@ statusOf worker = statusName <$> atomically (workerStatus worker)
 retainedLabels ∷ ExceptionWithContext SomeException → [(Text, Severity)]
 retainedLabels (ExceptionWithContext context _) =
   [(failedLabel entry, failedSeverity entry) | entry ← supervisedFailuresInContext context]
+
+-- | A context annotation a worker attaches to its own failure.
+newtype Provenance = Provenance Text
+
+instance ExceptionAnnotation Provenance where
+  displayExceptionAnnotation (Provenance name) = "raised by " <> show name
+
+-- | A worker that throws once its gate opens, with a 'Provenance' naming it in
+-- the failure's context.
+annotatedFailingAfter ∷ Trace → Text → Gate → WorkerDefinition ()
+annotatedFailingAfter trace name gate =
+  workerDefinition name (\_ → owned trace name) $ \_ () → do
+    readMVar gate
+    rethrowIO (ExceptionWithContext (addExceptionAnnotation (Provenance name) emptyExceptionContext) (toException (Broken name)))
+
+-- | What one retained failure preserved: label, severity, worker ID, typed
+-- payload, and the provenance its context carries.
+data Kept = Kept Text Severity String (Maybe Broken) [Text]
+  deriving (Eq, Show)
+
+kept ∷ SupervisedFailure → Kept
+kept entry =
+  let ExceptionWithContext context raised = failedException entry
+   in Kept
+        (failedLabel entry)
+        (failedSeverity entry)
+        (show (failedWorker entry))
+        (fromException raised)
+        [name | Provenance name ← getExceptionAnnotations context]
+
+-- | Retained evidence read through both public inspection functions, which
+-- must agree.
+inspected ∷ SomeException → IO [Kept]
+inspected raised = do
+  let direct = map kept (supervisedFailures raised)
+  map kept (supervisedFailuresInContext (someExceptionContext raised)) `shouldBe` direct
+  pure direct
+
+-- | The evidence one worker's failure should keep.
+keptFor ∷ SupervisedWorker () → Text → Kept
+keptFor worker name =
+  Kept name Fatal (show (workerId (supervisedWorker worker))) (Just (Broken name)) [name]
+
+expectRaised ∷ IO a → IO SomeException
+expectRaised action = try action >>= either pure (\_ → throwIO (userError "expected a failure, but it returned"))
 
 -- Waking -----------------------------------------------------------------------
 
@@ -603,3 +665,113 @@ testExpectedCancellationAndRejectedStart = do
     _ → expectationFailure "a start after closing was not rejected"
   -- Nothing of the rejected worker ran.
   traced trace >>= (`shouldBe` ["acquire sampler", "release sampler"])
+
+-- Evidence across invocations --------------------------------------------------
+
+testNestedSameLocalId ∷ Expectation
+testNestedSameLocalId = do
+  trace ← newTrace
+  outerGate ← newGate
+  innerGate ← newGate
+  handles ← newIORef Nothing
+  raised ← expectRaised $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \outer → do
+      outerWorker ← expectStarted =<< startSupervised outer (required Job) (annotatedFailingAfter trace "outer" outerGate)
+      withSupervision (collectedLifetime collected) $ \inner → do
+        innerWorker ← expectStarted =<< startSupervised inner (required Job) (annotatedFailingAfter trace "inner" innerGate)
+        writeIORef handles (Just (outerWorker, innerWorker))
+        openGate outerGate >> openGate innerGate
+        _ ← awaitTerminal (supervisedWorker outerWorker)
+        _ ← awaitTerminal (supervisedWorker innerWorker)
+        checkRuntime inner
+  Just (outerWorker, innerWorker) ← readIORef handles
+  -- Both workers have the same local ID in their own groups.
+  workerId (supervisedWorker outerWorker) `shouldBe` workerId (supervisedWorker innerWorker)
+  fromException raised `shouldBe` Just (Broken "inner")
+  inspected raised >>= (`shouldBe` [keptFor outerWorker "outer"])
+
+testNestedSecondaryKept ∷ Expectation
+testNestedSecondaryKept = do
+  trace ← newTrace
+  outerGate ← newGate
+  primaryGate ← newGate
+  secondaryGate ← newGate
+  handles ← newIORef Nothing
+  raised ← expectRaised $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \outer → do
+      finished ← expectStarted =<< startSupervised outer (required Job) (job "finished" (\_ → pure ()))
+      _ ← awaitSupervised outer (awaitCompletion (supervisedWorker finished))
+      outerWorker ← expectStarted =<< startSupervised outer (required Job) (annotatedFailingAfter trace "outer" outerGate)
+      withSupervision (collectedLifetime collected) $ \inner → do
+        primary ← expectStarted =<< startSupervised inner (required Job) (annotatedFailingAfter trace "inner-primary" primaryGate)
+        secondary ← expectStarted =<< startSupervised inner (required Job) (annotatedFailingAfter trace "inner-secondary" secondaryGate)
+        writeIORef handles (Just (outerWorker, secondary))
+        openGate outerGate >> openGate primaryGate >> openGate secondaryGate
+        mapM_ (awaitTerminal . supervisedWorker) [outerWorker, primary, secondary]
+        checkRuntime inner
+  Just (outerWorker, secondary) ← readIORef handles
+  fromException raised `shouldBe` Just (Broken "inner-primary")
+  inspected raised >>= (`shouldBe` [keptFor secondary "inner-secondary", keptFor outerWorker "outer"])
+
+testLaterIndependentInvocation ∷ Expectation
+testLaterIndependentInvocation = do
+  trace ← newTrace
+  primaryGate ← newGate
+  secondaryGate ← newGate
+  laterGate ← newGate
+  handles ← newIORef Nothing
+  raised ← expectRaised $ withCollectedLifetime ignoreWrites $ \collected → do
+    earlier ← attempt $ withSupervision (collectedLifetime collected) $ \control → do
+      primary ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "earlier-primary" primaryGate)
+      secondary ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "earlier-secondary" secondaryGate)
+      openGate primaryGate >> openGate secondaryGate
+      mapM_ (awaitTerminal . supervisedWorker) [primary, secondary]
+      writeIORef handles (Just (primary, secondary, Nothing))
+      checkRuntime control
+    delivered ← either pure (\_ → fail "the earlier invocation returned") earlier
+    withSupervision (collectedLifetime collected) $ \control → do
+      later ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "later" laterGate)
+      modifyIORef' handles (fmap (\(primary, secondary, _) → (primary, secondary, Just later)))
+      openGate laterGate
+      _ ← awaitTerminal (supervisedWorker later)
+      rethrowIO delivered ∷ IO ()
+  Just (primary, secondary, Just later) ← readIORef handles
+  -- The later invocation's worker shares its local ID with the delivered primary.
+  workerId (supervisedWorker later) `shouldBe` workerId (supervisedWorker primary)
+  fromException raised `shouldBe` Just (Broken "earlier-primary")
+  inspected raised >>= (`shouldBe` [keptFor secondary "earlier-secondary", keptFor later "later"])
+
+testRepeatedDeliveries ∷ Expectation
+testRepeatedDeliveries = do
+  trace ← newTrace
+  primaryGate ← newGate
+  secondaryGate ← newGate
+  laterGate ← newGate
+  observed ← newIORef Nothing
+  raised ← expectRaised $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \control → do
+      primary ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "primary" primaryGate)
+      secondary ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "secondary" secondaryGate)
+      later ← expectStarted =<< startSupervised control (required Job) (annotatedFailingAfter trace "later" laterGate)
+      openGate primaryGate >> openGate secondaryGate
+      mapM_ (awaitTerminal . supervisedWorker) [primary, secondary]
+      first ← try @SomeException (checkRuntime control)
+      -- A further failure is committed after the first delivery.
+      openGate laterGate
+      _ ← awaitTerminal (supervisedWorker later)
+      second ← try @SomeException (checkRuntime control)
+      waited ← try @SomeException (awaitSupervised control (pure ()))
+      writeIORef observed (Just (secondary, later, [first, second, waited]))
+      -- The application rethrows the first delivery it caught.
+      either (\caught → rethrowIO (ExceptionWithContext (someExceptionContext caught) caught)) pure first
+  Just (secondary, later, deliveries) ← readIORef observed
+  caught ← traverse (either pure (\() → throwIO (userError "a delivery returned"))) deliveries
+  map fromException caught `shouldBe` replicate 3 (Just (Broken "primary"))
+  evidence ← traverse inspected caught
+  evidence
+    `shouldBe` [ [keptFor secondary "secondary"]
+               , [keptFor secondary "secondary", keptFor later "later"]
+               , [keptFor secondary "secondary", keptFor later "later"]
+               ]
+  fromException raised `shouldBe` Just (Broken "primary")
+  inspected raised >>= (`shouldBe` [keptFor secondary "secondary", keptFor later "later"])
