@@ -100,6 +100,13 @@ not a verdict that Synarchy's design should be discarded.
   native causes native with an unknown throw site; `failureEvidence` reads it
   back without a logger. `docs/failures.md` carries the contract, and the
   `Failures` Hspec group proves it.
+- RT-2 (#54) added `Hetoimasia.Foundation.Recovery`: `recover` runs one
+  complete owned `IO` operation under an explicit, validated policy (component
+  classifier, one finite budget across retry and named fallback, required or
+  optional disposition, injected wait). Cancellation and attempts with cleanup
+  evidence propagate before classification; histories ride on the propagated
+  failure as an annotation. No logger and no `Scoped` catch instance.
+  `docs/recovery.md` carries the contract; the `Recovery` Hspec group proves it.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

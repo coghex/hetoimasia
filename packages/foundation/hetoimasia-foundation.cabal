@@ -6,7 +6,8 @@ description:
     A structured logging interface with validated components, pure filter
     configuration, scoped context, and explicit sink ownership; failure-preserving
     CPU resource scopes; and origin and operation context for engine failures,
-    retained on the exception. This library
+    retained on the exception; and bounded, classified recovery around one
+    complete owned operation. This library
     has no application state, graphics, scripting, or game dependencies.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -26,6 +27,7 @@ library
     exposed-modules:
         Hetoimasia.Foundation.Failure
         Hetoimasia.Foundation.Log
+        Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
     hs-source-dirs: src
     default-language: GHC2024
