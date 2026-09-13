@@ -9,8 +9,9 @@ and P-4); this document describes what the code does today.
 Scope: raising an engine failure with its origin, adding operation context at
 an outer boundary, native causes, cancellation, inspection, and the caller
 patterns that discard evidence. Recovery policy is described in
-[recovery.md](recovery.md); reporting through the logger and component or
-application lifecycle are not part of it.
+[recovery.md](recovery.md). Reporting a failure's origin through the logger is
+described in [Recovery and terminal reports](logging.md#recovery-and-terminal-reports);
+component and application lifecycle are not part of it.
 
 The module owns no state, defines no central engine error type or component
 taxonomy, and works over any `Exception` instance. A component's exception type

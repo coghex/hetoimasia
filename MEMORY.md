@@ -107,6 +107,13 @@ not a verdict that Synarchy's design should be discarded.
   evidence propagate before classification; histories ride on the propagated
   failure as an annotation. No logger and no `Scoped` catch instance.
   `docs/recovery.md` carries the contract; the `Recovery` Hspec group proves it.
+- RT-3 (#55) added `Hetoimasia.Runtime.Reporting`: `reportOutcome` warns once
+  for a recovered or unavailable outcome the caller already holds, and
+  `reportTerminalFailure` makes one guarded `Error` attempt, then rethrows
+  preservingly with a mark so enclosing boundaries do not report again. Origin
+  goes in `origin.*`/`observed.*` fields, separate from the entry's source.
+  `DiagnosticFailure` moved into it; `resourceSmoke` is its consumer. The
+  contract is in `docs/logging.md`, proven by `Runtime`'s `Outcome reporting`.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

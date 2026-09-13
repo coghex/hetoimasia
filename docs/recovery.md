@@ -8,9 +8,10 @@ P-2, P-3, and P-5); this document describes what the code does today.
 
 Scope: the boundary, its policy, the attempt order, its outcomes, and the
 evidence it leaves on a propagated failure. Reporting recovery through the
-logger (RT-3), a fallback that hands a live replacement service to the rest of
-the application (RT-4), and deadlines or worker supervision (RT-5) are not part
-of it.
+logger belongs to the runtime adapter described in
+[Recovery and terminal reports](logging.md#recovery-and-terminal-reports). A
+fallback that hands a live replacement service to the rest of the application
+(RT-4) and deadlines or worker supervision (RT-5) are not part of it.
 
 The module takes no logger, emits no diagnostics, and does not import the
 logging module. It reads cleanup evidence through

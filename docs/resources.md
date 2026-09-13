@@ -579,7 +579,10 @@ failed lifecycle log never skips a destruction, because no log runs inside one.
 A boundary that turns a resource failure into a diagnostic follows the worker
 example of [the logging contract](logging.md#usage), with one difference: that
 worker is terminal and swallows what it reported, while a boundary with a caller
-must hand the structured outcome on. The rules:
+must hand the structured outcome on. `Hetoimasia.Runtime.Reporting` implements
+these rules once as `reportTerminalFailure`, described in
+[Recovery and terminal reports](logging.md#recovery-and-terminal-reports), and
+the demonstration uses it rather than repeating them. The rules:
 
 - Classify anything thrown as asynchronous as cancellation and let it escape
   unreported. A record emitted while cancelling is one more place the
@@ -615,51 +618,29 @@ must hand the structured outcome on. The rules:
 resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
 resourceSmoke logger outcomes work = do
   ledger ← newLedger
-  outcome ← trySmoke (runSmoke scoped ledger outcomes work)
-  case outcome of
-    Right entries → pure entries
-    Left primary@(ExceptionWithContext context failure)
-      | isCancellation failure → rethrowIO primary
-      | raisedByDiagnostic context → rethrowIO primary
-      | otherwise → do
-          released ← recordedReleases ledger
-          reportAbandoned scoped released context failure primary
+  reportTerminalFailure scoped resourceComponent "Resource smoke abandoned"
+    (releasedFields <$> recordedReleases ledger)
+    (runSmoke scoped ledger outcomes work)
   where
     scoped = withBreadcrumb "resource-smoke" logger
 
--- Marks an exception raised by one of this demonstration's own lifecycle
--- diagnostics, rather than by a resource, a release, or the injected work.
-data DiagnosticFailure = DiagnosticFailure
-  deriving (Eq, Show)
-
-instance ExceptionAnnotation DiagnosticFailure where
-  displayExceptionAnnotation _ = "raised by a lifecycle diagnostic"
-
+-- Every lifecycle record is emitted through the adapter's mark.
 lifecycle ∷ IO () → IO ()
-lifecycle = annotateIO DiagnosticFailure
+lifecycle = markDiagnostic
 
-raisedByDiagnostic ∷ ExceptionContext → Bool
-raisedByDiagnostic context =
-  not (null (getExceptionAnnotations context ∷ [DiagnosticFailure]))
-
--- One reporting attempt for an ordinary failure, and never a second one
--- through the same sink.
-reportAbandoned scoped released context failure primary = do
-  reported ← trySmoke (logError scoped resourceComponent "Resource smoke abandoned" fields)
-  case reported of
-    Right () → rethrowIO primary
-    Left reportingFailure@(ExceptionWithContext _ raised)
-      | isCancellation raised → rethrowIO reportingFailure
-      | otherwise → rethrowIO primary
-  where
-    evidence = cleanupFailuresInContext context
-    fields =
-      [ ("reason", Text.pack (displayException failure))
-      , ("released", renderNames released)
-      , ("cleanup.failures", number (length evidence))
-      , ("cleanup.labels", renderLabels evidence)
-      ]
+releasedFields ∷ [Released] → [(Text, Text)]
+releasedFields released =
+  [("released", Text.intercalate "," (map releasedResource released))]
 ```
+
+`reportTerminalFailure` classifies what the run threw. A cancellation and a
+failure marked by `markDiagnostic` propagate with no attempt. Anything else gets
+one guarded `Error` attempt carrying the cleanup evidence
+`cleanupFailuresInContext` reads, the failure's origin, and the released names
+read from the ledger inside that attempt. The original exception then
+propagates through `rethrowIO`, and a cancellation raised during the attempt
+propagates as itself. `DiagnosticFailure` is defined by the adapter and
+re-exported by `Hetoimasia.Runtime.Resources`.
 
 The emission of the lifecycle records sits inside that boundary too, but on the
 diagnostic side of it. If the sink fails while the lifecycle is being reported,

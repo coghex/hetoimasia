@@ -16,6 +16,14 @@ injected-failure examples run the same body. It owns no file, thread, or
 service, and it is the worked example behind
 [Application lifecycle](../../docs/resources.md#application-lifecycle).
 
+`Hetoimasia.Runtime.Reporting` is the adapter that explains recovery outcomes
+and terminal failures through an injected logger: `reportOutcome` warns about a
+recovered or unavailable outcome the caller already holds, and
+`reportTerminalFailure` makes one guarded `Error` attempt at the boundary that
+handles a failure and rethrows it preservingly. `resourceSmoke` reports through
+it. The contract is
+[Recovery and terminal reports](../../docs/logging.md#recovery-and-terminal-reports).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before

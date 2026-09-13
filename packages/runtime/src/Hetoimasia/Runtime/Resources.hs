@@ -24,12 +24,13 @@
 --   destruction, because no diagnostic runs inside one.
 --
 -- * __The boundary reports once and keeps its failure.__ An ordinary failure
---   of a resource or of the work gets exactly one 'logError' attempt, carrying
---   the evidence 'cleanupFailuresInContext' reads out of the exception's own
---   context; the original exception then propagates with its type, its value,
---   and that context intact, whether the report succeeded or failed. A
---   cancellation escapes with no record at all, and no successful completion is
---   ever reported for a run that threw.
+--   of a resource or of the work gets exactly one guarded @Error@ attempt
+--   through 'Hetoimasia.Runtime.Reporting.reportTerminalFailure', carrying the
+--   cleanup evidence and origin the exception's own context holds; the original
+--   exception then propagates with its type, its value, and that context
+--   intact, whether the report succeeded or failed. A cancellation escapes with
+--   no record at all, and no successful completion is ever reported for a run
+--   that threw.
 --
 -- * __A diagnostic's own failure is never reported.__ A resource failure and a
 --   diagnostic failure are different things. When the sink a lifecycle record
@@ -68,79 +69,46 @@ module Hetoimasia.Runtime.Resources
   , workingReleases
   ) where
 
-import Control.Exception
-  ( ExceptionWithContext (ExceptionWithContext)
-  , SomeAsyncException
-  , SomeException
-  , annotateIO
-  , displayException
-  , fromException
-  , rethrowIO
-  , tryWithContext
-  )
-import Control.Exception.Annotation
-  ( ExceptionAnnotation (displayExceptionAnnotation)
-  )
-import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log
   ( Component
   , Logger
-  , logError
   , logInfo
   , unsafeComponent
   , withBreadcrumb
   )
 import Hetoimasia.Foundation.Resource
   ( Assembly
-  , CleanupFailure
   , Scoped
   , acquirePart
   , allocComposite
   , allocResource
-  , cleanupFailureLabel
-  , cleanupFailuresInContext
   , releaseRank
   , restoredStep
   , withScoped
+  )
+import Hetoimasia.Runtime.Reporting
+  ( DiagnosticFailure (..)
+  , markDiagnostic
+  , reportTerminalFailure
   )
 
 -- | The stable component name every record from this demonstration carries.
 resourceComponent ∷ Component
 resourceComponent = unsafeComponent "runtime.resources"
 
--- | Marks an exception raised by one of this demonstration's own lifecycle
--- diagnostics, rather than by a resource, a release, or the injected work.
---
--- The reporting boundary needs that distinction: an ordinary failure is worth
--- one report, while a failure that came out of the sink has no sink left to be
--- reported through. Marking the emission is the only way to tell them apart,
--- because by the time the exception reaches the boundary an 'IOException' from
--- a sink looks exactly like an 'IOException' from a release.
-data DiagnosticFailure = DiagnosticFailure
-  deriving (Eq, Show)
-
-instance ExceptionAnnotation DiagnosticFailure where
-  displayExceptionAnnotation _ = "raised by a lifecycle diagnostic"
-
--- | Emit one lifecycle diagnostic, marking whatever it raises.
+-- | Emit one lifecycle diagnostic, marking a synchronous failure it raises with
+-- 'DiagnosticFailure'.
 --
 -- The mark rides on the exception's context, which every rethrow inside the
 -- resource scopes preserves, so it is still directly reachable at the boundary
 -- after the scope has unwound and attached its own cleanup evidence.
 lifecycle ∷ IO () → IO ()
-lifecycle = annotateIO DiagnosticFailure
-
--- | Whether the exception carrying this context came out of a lifecycle
--- diagnostic.
-raisedByDiagnostic ∷ ExceptionContext → Bool
-raisedByDiagnostic context =
-  not (null (getExceptionAnnotations context ∷ [DiagnosticFailure]))
+lifecycle = markDiagnostic
 
 -- | A borrowed in-memory slot: an identifier, and the bounded list of entries
 -- written into it while it is held.
@@ -235,10 +203,11 @@ workingReleases = ReleaseOutcomes
 --
 -- On every other path nothing reports completion. An ordinary failure — from
 -- the work or from a release — produces exactly one @Error@ record naming what
--- was released and what cleanup evidence the exception carries, and then
--- propagates with its context intact so the caller can inspect that evidence
--- itself through 'Hetoimasia.Foundation.Resource.cleanupFailures'. If that one
--- report also fails, its exception is discarded in favour of the original.
+-- was released, what cleanup evidence the exception carries, and where the
+-- failure came from, and then propagates with its context intact so the caller
+-- can inspect that evidence itself through
+-- 'Hetoimasia.Foundation.Resource.cleanupFailures'. If that one report also
+-- fails, its exception is discarded in favour of the original.
 --
 -- A cancellation propagates unchanged and unreported, and so does a failure
 -- raised by a lifecycle diagnostic itself: there is no reporting attempt for a
@@ -248,20 +217,13 @@ workingReleases = ReleaseOutcomes
 resourceSmoke ∷ Logger → ReleaseOutcomes → SmokeWork → IO Int
 resourceSmoke logger outcomes work = do
   ledger ← newLedger
-  outcome ← trySmoke (runSmoke scoped ledger outcomes work)
-  case outcome of
-    Right entries → pure entries
-    Left primary@(ExceptionWithContext context failure)
-      -- A cancellation is never turned into a diagnostic: a record emitted
-      -- while cancelling is one more place the cancellation could be lost.
-      | isCancellation failure → rethrowIO primary
-      -- Neither is a diagnostic's own failure. Everything has still been
-      -- released; reporting this would mean writing to the sink that just
-      -- failed, which is the recursion the logging contract forbids.
-      | raisedByDiagnostic context → rethrowIO primary
-      | otherwise → do
-          released ← recordedReleases ledger
-          reportAbandoned scoped released context failure primary
+  -- The adapter classifies what the run threw: a cancellation and a marked
+  -- diagnostic's own failure propagate unreported, and anything else gets its
+  -- one guarded report. The released names are read from the ledger inside
+  -- that attempt, after the scope has unwound.
+  reportTerminalFailure scoped resourceComponent "Resource smoke abandoned"
+    (releasedFields <$> recordedReleases ledger)
+    (runSmoke scoped ledger outcomes work)
   where
     -- The derived logger the whole demonstration uses. The caller's logger is
     -- unchanged, and every record below carries this breadcrumb.
@@ -348,56 +310,6 @@ smokeWork logger resources = do
       [("staged", number staged), ("published", number published)]
   pure (staged + published)
 
--- Reporting boundary ----------------------------------------------------------
-
--- | One reporting attempt for an ordinary failure, and never a second one
--- through the same sink.
---
--- This is reached only for a failure of a resource, a release, or the work. A
--- failure raised by a lifecycle diagnostic never gets here at all, which is
--- what keeps a failing sink from being reported back through itself.
---
--- The original exception is rethrown either way, with its 'ExceptionContext' —
--- and therefore its retained cleanup evidence — untouched, so the caller
--- receives the same structured outcome it would have without this boundary. A
--- cancellation arriving during the attempt escapes as itself rather than being
--- displaced by the failure already in hand, and it escapes through the same
--- preserving rethrow: 'trySmoke' hands back the context it was caught with and
--- 'rethrowIO' puts it back, so an annotation the cancellation carried and a
--- cleanup failure retained on it are both still readable by the caller. A
--- plain 'Control.Exception.throwIO' here would give it a fresh context and
--- drop both.
-reportAbandoned
-  ∷ Logger
-  → [Released]
-  → ExceptionContext
-  → SomeException
-  → ExceptionWithContext SomeException
-  → IO a
-reportAbandoned scoped released context failure primary = do
-  reported ← trySmoke (logError scoped resourceComponent "Resource smoke abandoned" fields)
-  case reported of
-    Right () → rethrowIO primary
-    Left reportingFailure@(ExceptionWithContext _ raised)
-      | isCancellation raised → rethrowIO reportingFailure
-      | otherwise → rethrowIO primary
-  where
-    evidence = cleanupFailuresInContext context
-    fields =
-      [ ("reason", Text.pack (displayException failure))
-      , ("released", renderNames released)
-      , ("cleanup.failures", number (length evidence))
-      , ("cleanup.labels", renderLabels evidence)
-      ]
-
--- | Anything thrown as asynchronous is cancellation, classified exactly as the
--- worker boundary of @docs\/logging.md@ classifies it.
-isCancellation ∷ SomeException → Bool
-isCancellation failure = isJust (fromException failure ∷ Maybe SomeAsyncException)
-
-trySmoke ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
-trySmoke = tryWithContext
-
 -- Lifecycle ledger ------------------------------------------------------------
 
 -- | One release that was attempted, as the release recorded it.
@@ -458,11 +370,11 @@ emitReleases scoped released = forM_ released $ \entry →
 
 -- Rendering -------------------------------------------------------------------
 
-renderNames ∷ [Released] → Text
-renderNames = Text.intercalate "," . map releasedResource
-
-renderLabels ∷ [CleanupFailure] → Text
-renderLabels = Text.intercalate "," . map cleanupFailureLabel
+-- | What the run released, as the terminal report's own field. Cleanup evidence
+-- and origin come from the adapter.
+releasedFields ∷ [Released] → [(Text, Text)]
+releasedFields released =
+  [("released", Text.intercalate "," (map releasedResource released))]
 
 number ∷ Int → Text
 number = Text.pack . show

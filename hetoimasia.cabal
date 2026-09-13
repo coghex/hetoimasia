@@ -110,6 +110,7 @@ test-suite hetoimasia-tests
         Test.Engine.Resources.Spec
         Test.Engine.Runtime.Application
         Test.Engine.Runtime.Console
+        Test.Engine.Runtime.Reporting
         Test.Engine.Runtime.Spec
     -- -T keeps the runtime's allocation statistics available, which the
     -- cleanup-evidence inspection cost examples read.

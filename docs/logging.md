@@ -508,7 +508,10 @@ subsystem that returns or rethrows has not handled anything yet, so it should
 not also log an `Error` about it: the handling boundary — the one that retries,
 degrades, or fails the operation — logs it, with the context it has. Logging at
 every frame of the propagation turns one failure into a pile of records that
-look like several.
+look like several. A boundary that recovers, degrades, or ends work through
+`Hetoimasia.Foundation.Recovery` reports through the runtime adapter described
+in [Recovery and terminal reports](#recovery-and-terminal-reports) rather than
+calling `logWarning` or `logError` itself.
 
 **Engine libraries log; applications print.** A library reports diagnostics
 through its injected logger and writes to no handle of its own. Command-line
@@ -625,3 +628,108 @@ failing `Info` propagates its sink exception like any other logging call.
 
 The `Worker reporting boundary` group in [`test/Main.hs`](../test/Main.hs) runs
 this body verbatim for each of those outcomes.
+
+### Recovery and terminal reports
+
+`Hetoimasia.Runtime.Reporting` explains the outcomes of
+[recovery](recovery.md) and the evidence of [failures](failures.md) through an
+injected logger. Neither of those modules takes a logger; this adapter lives in
+the runtime package so that the foundation never needs one.
+
+```haskell
+reportOutcome
+  ∷ HasCallStack ⇒ Logger → Component → Operation → Outcome a → IO ReportResult
+
+reportTerminalFailure
+  ∷ HasCallStack ⇒ Logger → Component → Text → IO [(Text, Text)] → IO a → IO a
+
+data ReportResult = NoReport | ReportAccepted | ReportFailed (ExceptionWithContext SomeException)
+
+markDiagnostic          ∷ IO a → IO a
+raisedByDiagnostic      ∷ ExceptionContext → Bool
+terminalReportAttempted ∷ SomeException → Bool
+```
+
+**The boundary that chooses the disposition owns the report.** That is the code
+that called `recover` and decides what the application does with its outcome,
+or the code that stops a failure from propagating any further. A helper that
+returns an outcome or rethrows a failure has chosen nothing and reports nothing.
+
+**Record the outcome before the diagnostic.** `recover` hands the caller its
+`Outcome` before any report exists. Store the availability it selects — mark
+the optional service unavailable, keep the fallback result — and only then call
+`reportOutcome`. A warning never stands in for that state change, and nothing
+the report does can undo it: a failed report comes back as `ReportFailed`
+instead of being thrown.
+
+```haskell
+outcome ← recover loadAudio audioPolicy openAudio
+writeIORef audioAvailability (availability outcome)   -- the decision, first
+_ ← reportOutcome logger audioComponent loadAudio outcome
+```
+
+**Levels follow what happened, never the exception's type.**
+
+| What happened | Report |
+|---|---|
+| The first attempt succeeded | None: `NoReport`. |
+| A retry or fallback succeeded | One `Warning`, `Operation recovered`. |
+| Optional work is `Unavailable` | One `Warning`, `Operation unavailable`. |
+| A failure reached the boundary that handles it | One `Error`, with the caller's message. |
+
+**Report once, bounded by the real attempts.** A recovery report summarizes
+every failed attempt in one record. `reportTerminalFailure` makes one guarded
+attempt for an ordinary failure, then rethrows it preservingly with a mark, so
+an enclosing `reportTerminalFailure` rethrows it without a second `Error`. A
+failed attempt is not retried, and filtering is never bypassed to force a
+record out.
+
+**Origin is not the reporting site.** The entry's `SourceLocation` is where the
+boundary was called. Where the failure was raised goes in fields:
+
+| Field | Value |
+|---|---|
+| `disposition` | `recovered`, `unavailable`, or `propagated`. |
+| `availability` | `available` or `unavailable`. |
+| `operation` | The recovered operation; for a terminal failure, the one whose recovery ended in it. |
+| `attempts`, `attempts.failed` | The total attempt count and each failed attempt as `number:kind`, oldest first. |
+| `recovered.by` | `retry` or `fallback "name"`, on a recovered outcome. |
+| `reason` | The latest failure's `displayException` text. |
+| `cleanup.failures`, `cleanup.labels` | Retained cleanup evidence, on a terminal failure. |
+| `origin` | `engine` when `throwFailure` recorded one, otherwise `unrecorded`. |
+| `origin.component`, `origin.operation`, `origin.identifiers` | The recorded origin. |
+| `origin.site`, `origin.function` | Where it was raised; `origin.site=unknown` when no site was recorded. |
+| `observed.*` | The innermost `withOperationContext` boundary, if any: where the failure was seen, never where it was thrown. |
+
+A terminal report's extra fields, such as the resources a scope released, win
+over these on a shared key. They are computed inside the guarded attempt, after
+the work's scopes have unwound.
+
+**Diagnostics are best effort here, and only here.** A synchronous failure while
+computing the fields, formatting the record, or writing it never replaces the
+failure being reported, never changes an outcome, and never runs the operation
+again: the report runs after the operation and its cleanup have finished. Direct
+`logInfo` or `logError` calls elsewhere keep their contract, and their sink
+failures still propagate.
+
+**A diagnostic's own failure is never reported.** Every emission the adapter
+makes is marked with `DiagnosticFailure`. Wrap a boundary's own lifecycle records
+in `markDiagnostic`, and `reportTerminalFailure` rethrows a failure raised by one
+without an attempt, because the sink it would write to is the one that just
+failed. The mark is added to synchronous failures only.
+
+**Cancellation is never reported or displaced.** Anything thrown as
+asynchronous escapes `reportTerminalFailure` unreported with its context
+unchanged. A cancellation arriving during either kind of report escapes as
+itself, with its own context and cleanup evidence, in place of the failure being
+reported.
+
+**Never inside a release, never before protection.** Both functions report after
+the work they are given has returned or thrown. Do not call either from a
+release callback or between an acquisition and the installation of its
+release; see [Application lifecycle](resources.md#application-lifecycle).
+
+The `Outcome reporting` group in
+[`test/Test/Engine/Runtime/Reporting.hs`](../test/Test/Engine/Runtime/Reporting.hs),
+selected by `--match Runtime`, drives each rule above with an injected sink.
+`resourceSmoke` is the adapter's existing runtime consumer.
