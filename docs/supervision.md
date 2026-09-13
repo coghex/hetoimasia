@@ -373,9 +373,9 @@ to reuse. They cover:
   published before closing observed before the boundary returns, an expected
   owner-requested cancellation, and a rejected start after closing.
 
-`test/Test/Engine/Runtime/Opacity.hs`, also under `Runtime` and selected by
-`--match 'Supervised worker opacity'`, checks the read-only handle at the
-package boundary. It compiles separate single-module clients against this
+`test/Test/Engine/Runtime/Opacity.hs`, also under `Runtime`, checks the
+read-only handle at the package boundary; `--test-options='--match opacity'`
+selects it together with the resource opacity examples. It compiles separate single-module clients against this
 build's package database with the harness from
 `Test.Engine.Resources.Opacity`, exposing only `base`, `text`, `stm`,
 `hetoimasia-foundation`, and `hetoimasia-runtime`. A client that replaces the
