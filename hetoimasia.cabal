@@ -105,6 +105,8 @@ test-suite hetoimasia-tests
         Test.Engine.Recovery.Spec
         Test.Engine.Resources.Buffer
         Test.Engine.Resources.Cost
+        Test.Engine.Resources.Construction
+        Test.Engine.Resources.Journal
         Test.Engine.Resources.Opacity
         Test.Engine.Resources.Smoke
         Test.Engine.Resources.Spec

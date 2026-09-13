@@ -37,7 +37,7 @@ body and the release both fail it preserves the body's failure and retains
 every cleanup failure beside it as ordered, structured evidence that
 `cleanupFailures` reads back. Acquisition is cancellable, each release runs
 uninterruptibly, and a release must therefore have a controlled blocking
-duration. The module imports no logger and no other module in this package.
+duration. The module imports no logger and no public module in this package.
 
 `withComposite` is the same scope for an owner assembled from several parts. Its
 `Assembly` acquires each part and installs that part's rollback as one protected
@@ -78,6 +78,15 @@ before the classifier is consulted. A success reports how it was reached and the
 failed attempts; exhausted optional work is explicitly unavailable; a propagated
 failure keeps its own type and evidence with the earlier attempts attached. It
 takes no logger. See [docs/recovery.md](../../docs/recovery.md).
+
+`allocComponent`, in the same module, constructs a live component for the rest
+of an enclosing `Scoped` block under that policy. Each attempt is an `Assembly`
+with its own part ledger, rolled back before the classifier chooses another
+alternative; the selected attempt's parts are released when the scope exits,
+and the consumer runs once against an immutable `Available` or `Unavailable`
+value. The `Scoped` representation and the part ledger it shares with the
+resource module live in a hidden module that no client can import. See
+[Component construction](../../docs/resources.md#component-construction).
 
 Depends on `base`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when

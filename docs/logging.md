@@ -520,6 +520,15 @@ stdout, which is why they stay visible at any threshold. The console
 executable's `--help` text is application output; the records its smoke path
 emits are diagnostics.
 
+**Construct through one scoped constructor and an opaque handle.** A
+subsystem that owns resources exposes one constructor in `Scoped`, takes a
+pure configuration value the application validated before any acquisition,
+keeps its private state behind an opaque handle, and documents every state in
+one table in its module. When it offers alternatives, the application decides
+whether it is required. [The component convention](resources.md#the-component-convention)
+spells these out beside `allocComponent`, the constructor that selects among
+alternatives.
+
 **Logging imposes no error type.** Nothing here asks a game or engine module to
 adopt a shared exception or result type. `logError` is a severity on a record,
 not a way to fail, and a failing sink is the only exception this module raises

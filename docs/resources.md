@@ -10,7 +10,9 @@ argument order, the failure table, the mask discipline, what the release
 guarantee does and does not cover, how to inspect and how not to discard the
 secondary failures a scope retains, the staged constructor an owner built from
 several parts is assembled with, the continuation facade those scopes are
-composed in, and how an application composes them with logging.
+composed in, the scoped constructor that selects a live component among
+alternatives, the component convention, and how an application composes them
+with logging.
 
 Anything involving Vulkan, GPU completion, retirement queues, ownership
 transfer, or public early release is not part of it yet. This module imports no
@@ -327,8 +329,8 @@ exception and the same ordered secondary failures for the same outcomes.
 `Scoped` is opaque and `withScoped` is the only runner. There is no way to
 resume a scope's continuation, take a scope apart, or install cleanup for a
 resource acquired elsewhere. A scope is built with `allocResource`,
-`allocComposite`, `locally`, `pure`, `liftIO`, and the instances above, and is
-consumed by running it.
+`allocComposite`, `locally`, `pure`, `liftIO`, the instances above, and
+[`allocComponent`](#component-construction), and is consumed by running it.
 
 That opacity rests on the representation being closed, not on a check made
 while a scope runs. `Scoped` wraps its continuation in an unexported
@@ -403,6 +405,204 @@ cleanup has already run. The type does not prevent it — `pure` is a legitimate
 continuation when the scope's result is an ordinary value — so this contract
 and the examples forbid it for borrowed ones. There is no escape operation, no
 transfer operation, and no public early-release token in this arc.
+
+## Component construction
+
+```haskell
+-- Hetoimasia.Foundation.Recovery
+allocComponent ∷ Operation → RecoveryPolicy (Assembly a) → Assembly a → Scoped (Outcome a)
+```
+
+`allocComponent` constructs a live component for the rest of the enclosing
+scope, choosing among `Assembly` alternatives when an attempt fails. It lives
+beside `recover` because it reuses that boundary's definitions unchanged — the
+`RecoveryPolicy`, the budget rule, the exclusions, the `Disposition`, the
+`Outcome`, and the `AttemptFailure` and `RecoveryHistory` evidence described in
+[recovery.md](recovery.md) — but it is a different boundary with a different
+lifetime. `recover` runs one complete operation and returns an ordinary value
+after every scope inside it has closed. `allocComponent` keeps the selected
+attempt's parts alive until the enclosing `withScoped` continuation returns or
+throws, and it never calls `recover`.
+
+```haskell
+renderer ∷ Device → RendererConfig → Disposition → Scoped (Outcome Renderer)
+renderer device config disposition =
+  allocComponent (operation "renderer") policy (rendererAssembly device config Vulkan)
+  where
+    policy = RecoveryPolicy
+      { policyDisposition = disposition   -- the caller's choice
+      , policyBudget      = 2             -- the initial attempt and one more
+      , policyClassifier  = classify      -- the component's knowledge
+      , policyWait        = \_ → pure () }
+    classify failure = pure $ case failureOf failure of
+      Just NoDiscreteDevice → Just (Fallback (operation "software") (pure (rendererAssembly device config Software)))
+      _                     → Nothing
+
+withScoped (renderer device config Optional) $ \availability → case availability of
+  Available recovered → run (recoveredValue recovered)
+  Unavailable reason  → runHeadless reason
+```
+
+### Alternatives and the policy
+
+The assembly passed to `allocComponent` is the initial alternative. After a
+recognized failure the classifier names the next one:
+
+- `Retry` runs the initial assembly again, even after a fallback.
+- `Fallback name select` runs a named alternative. `select` is the first step
+  of that attempt, run with the caller's masking state restored while nothing
+  is acquired, and the assembly it returns is the rest of the attempt. A
+  failure of `select` is therefore that attempt's failure, classified like any
+  other.
+
+One budget counts the initial attempt and every later one, and switching
+between alternatives never resets it. The policy is evaluated and validated
+when the scope is entered, before any alternative runs: a budget below one
+throws `InvalidRecoveryPolicy` and nothing else happens.
+
+**Required or optional is the caller's decision** at the composition boundary,
+through `policyDisposition`. The component decides only which of its failures
+another alternative can survive, through the classifier, and owns its private
+sub-part invariants. Nothing about an exception's type makes a component
+optional.
+
+### Attempt order
+
+Each attempt starts with a fresh part ledger and runs its assembly under the
+rules of [Composite construction](#composite-construction): acquisition and
+rollback installation are one protected step, part metadata is evaluated
+before its acquisition, and `restoredStep` is the only restored work. When the
+attempt fails:
+
+1. **Rollback comes first.** Exactly the parts that attempt acquired are
+   released, in their declared order, each exactly once, before anything looks
+   at the failure. The construction failure stays primary and every cleanup
+   failure is retained beside it.
+2. **Cancellation propagates.** A cancellation that failed the attempt
+   propagates with that rollback evidence. A cancellation requested while the
+   rollback ran is deferred until every release has been attempted — the
+   releases stay uninterruptible — and is then delivered with the caller's
+   masking state restored. It propagates as itself with the rollback's cleanup
+   failures retained and the construction failure attached as `WhileHandling`.
+   A caller that was already masked keeps its masking state, and the request
+   stays pending as it would anywhere else.
+3. **Failed cleanup propagates.** A failure carrying cleanup evidence is not
+   classified and no other alternative runs: an attempted release is not proof
+   of disposal. No override treats a failed rollback as complete.
+4. **The classifier is consulted,** with the caller's masking state, since the
+   attempt holds nothing any more. A failure it does not recognize propagates.
+5. **Budget remaining:** the wait runs, then the selected alternative starts.
+6. **No budget left:** `Required` construction propagates the failure;
+   `Optional` construction binds `Unavailable`.
+
+A failure raised by the classifier, by evaluating its selection, or by the wait
+stops construction and propagates with the handled failure attached as
+`WhileHandling`; a cancellation there propagates as itself. A propagated
+failure after earlier failed attempts carries one `RecoveryHistory` listing
+them, oldest first, each with its own origin and cleanup evidence — exactly as
+`recover` attaches it.
+
+### The availability value
+
+The continuation receives an immutable `Outcome`:
+
+- **`Available`** carries the live handle as `recoveredValue`, the attempt kind
+  that built it as `recoveredBy` (`InitialAttempt`, `RetryAttempt`, or
+  `FallbackAttempt` with the alternative's name), and every failed attempt
+  before it, oldest first, as `recoveredFailures`.
+- **`Unavailable`** carries no handle. It names the component, the reason (the
+  last attempt, which the classifier recognized with no budget left), and every
+  attempt before it. It exists only for an `Optional` policy and only after the
+  rollback has finished, so it owns nothing and no release follows it.
+
+A consumer of an optional component branches on that data; it does not catch.
+
+### The protected handoff and the once-only consumer
+
+A successful attempt's ledger becomes the scope's release without ever leaving
+the masked region. The continuation's failure handler is installed while still
+masked, and only then is the caller's masking state restored and the
+continuation invoked. There is no interval in which the handle lacks its
+release or the consumer lacks its failure protection, and no token lets a
+caller detach, duplicate, or trigger that release.
+
+A cancellation delivered at that handoff may preempt the continuation's first
+effect. It still releases every acquired part and propagates with the evidence
+of that release; it cannot leak the handle, and it cannot start another
+attempt.
+
+Once construction resolves to `Available` or a permitted `Unavailable`, the
+continuation is invoked exactly once, subject to cancellation before entry.
+Construction that propagates a failure never invokes it. After the continuation
+has been entered, nothing can start another attempt:
+
+| Continuation | Final release | Outcome |
+|---|---|---|
+| Succeeds | Succeeds | The continuation's result is returned |
+| Fails | Succeeds | The continuation's failure propagates unchanged; no attempt follows |
+| Succeeds | Fails | The scope fails with the release's exception and the result is discarded; no attempt follows |
+| Fails | Fails | The continuation's failure propagates with every cleanup failure retained; no attempt follows |
+
+This is the failure table above, applied to the selected attempt's release. A
+lazy value the continuation forces and a failure of the continuation after
+`Unavailable` are continuation failures like any other.
+
+### The handle never leaves the scope
+
+The handle is borrowed under [Ownership and borrowing](#ownership-and-borrowing).
+It is valid only inside the enclosing `withScoped` continuation, and the result
+leaving that continuation must be an ordinary, fully evaluated value. There is
+no transfer, no early release, and no catch instance on `Scoped`.
+
+### State the constructor holds
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+|---|---|---|---|---|---|
+| Per-attempt part ledger | One attempt of one entry into the scope | Written by that attempt's `acquirePart` stages; read and emptied by its rollback, or by the scope's release for the selected attempt | The thread entering the scope | From the attempt's start until its rollback, or for the selected attempt until the scope's release | Created empty per attempt and never reused; emptied when its releases run, so no part is released twice |
+| Selected release | The scope, once construction succeeds | Run only by the scope when the continuation returns or throws; never exposed | The thread entering the scope | From the successful attempt's last stage until the scope exits | Attempted exactly once; never reset |
+| Attempt history | The entry into the scope while it builds; then the `Outcome` or the propagated failure | Appended by the constructor after each failed, classified attempt; read by the continuation or by `recoveryHistory` | The thread entering the scope | Bounded by the budget; lives as long as the value carrying it | Immutable once handed on; a new entry into the scope starts a new history |
+
+None of this is application state, and none of it is visible outside the entry
+into the scope that created it.
+
+### The component convention
+
+A component that owns resources follows these conventions. They are
+[the working agreements](../AGENTS.md)' architecture rules made concrete, and
+`test/Test/Engine/Resources/Journal.hs` is the worked example.
+
+- **One constructor.** A component exposes one construction function in
+  `Scoped` — over `allocResource`, `allocComposite`, or `allocComponent` —
+  taking its dependencies and its configuration as ordinary arguments.
+- **An opaque handle.** The constructor yields a handle whose constructor and
+  fields are not exported. Every consumer takes the handles it needs as
+  parameters, exactly as it takes a `Logger`. There is no environment record,
+  `Reader` facade, capability class, service locator, or global registry.
+- **Pure, validated configuration.** The component defines its own
+  configuration value and a pure validation for it, run by the application
+  before any acquisition, the way `resolveLogFilter` validates logging
+  configuration. A component never reads a shared application configuration
+  record.
+- **Private state behind the handle.** State is created inside the constructor
+  and reachable only through the handle's operations.
+- **One state table per component module,** naming every state's owner,
+  readers and writers, thread, lifetime, and reset or disposal behavior, as the
+  table above does for the constructor itself.
+- **The caller decides availability.** A component offers alternatives and a
+  classifier; the application chooses the budget and whether the component is
+  required.
+
+### The implementation seam
+
+`Scoped`, the composite ledger, and the cleanup-failure primitives are defined
+in `Hetoimasia.Foundation.Resource.Internal`, which the foundation library lists
+under `other-modules`. `Hetoimasia.Foundation.Resource` re-exports only the
+closed types and the operations over them, and `allocComponent` builds its
+scope through the hidden module from inside the same library. No client can
+import that module, so the opacity described under
+[The continuation facade](#the-continuation-facade) and
+[The evidence boundary](#the-evidence-boundary) is unchanged, and the opacity
+examples are unchanged.
 
 ## Inspecting secondary failures
 
@@ -765,6 +965,31 @@ outer scope resumes while its ordinary result survives, a `locally` cleanup
 failure reaching the outer scope's evidence, and two composites allocated
 through the facade keeping their declared order while the scope unwinds in
 reverse.
+
+The `Scoped component construction` examples in
+`test/Test/Engine/Resources/Construction.hs` cover
+[Component construction](#component-construction) with typed synthetic
+failures, real CPU scopes, and ordered traces. Through the synthetic journal
+component of `test/Test/Engine/Resources/Journal.hs` they show a configuration
+fault observed before any acquisition, private state reachable only through the
+handle, a fallback handle live for the whole consumer with the consumer run
+once, an exhausted optional component bound as `Unavailable` data with its
+reason and history, and required exhaustion across both alternatives
+propagating the latest failure with each earlier attempt's origin and cleanup
+evidence in order. With assemblies placed exactly they show an invalid policy
+rejected before any effect, one budget exhausted across alternatives without
+reset, rollback of exactly the failed attempt's parts in declared order before
+the classifier, the wait, and the next alternative, an unrecognized failure, an
+attempt with cleanup evidence, and a classifier failure each propagating as
+specified, and a consumer failure, a lazy result forced in the consumer, a
+final release failure, and a failing consumer of `Unavailable` each following
+the failure table with no further attempt. The cancellation examples, coordinated
+with `MVar`s and `threadStatus` and no sleeps, cancel a blocking acquisition,
+request cancellation while a throwing rollback release runs — asserting the
+request stays pending until every release has been attempted and then escapes
+with the rollback evidence, invoking neither another alternative nor the
+consumer — and leave a cancellation pending as construction completes, which
+preempts the consumer and still releases every part.
 
 The two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
 [The continuation facade](#the-continuation-facade) and
