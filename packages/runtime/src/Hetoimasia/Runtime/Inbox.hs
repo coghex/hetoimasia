@@ -34,10 +34,53 @@
 -- type, context, and evidence. A failure or cancellation while the context is
 -- being constructed happens before the inbox exists.
 --
--- __Dispatch.__ One prepared message at a time. The stop check and the receive
--- are one STM choice, and a requested stop wins over a simultaneously ready
--- message. The handler runs outside STM. A message a committed receive selected
+-- __Dispatch.__ One prepared message at a time. The stop check, the receive,
+-- and the recording of a drain acknowledgement are one STM decision, and a
+-- requested stop wins over a simultaneously ready message and over a drained
+-- inbox. The handler runs outside STM. A message a committed receive selected
 -- is in flight: a stop cannot retract its effects, and nothing retries it.
+--
+-- __Finish versus stop.__ 'stopInboxService' is the ordinary stop: the next
+-- decision takes the stop, and accepted backlog is aborted and counted, not
+-- processed. 'finishInboxService' is the graceful finish:
+--
+-- 1. it closes admission normally — a close, not an abort — so the backlog is
+--    kept and later sends report 'Hetoimasia.Foundation.Messaging.Channel.Closed';
+-- 2. the worker completes the in-flight handler, then handles the accepted
+--    backlog in FIFO order;
+-- 3. once those handlers returned, the decision that observes the normally
+--    closed, empty inbox records the drain acknowledgement in the same
+--    transaction. Empty depth alone is never an acknowledgement, and a stop
+--    that has already won is never followed by one;
+-- 4. having acknowledged, the worker waits for its stop token rather than
+--    returning, so it stays a 'Service';
+-- 5. finish observes the acknowledgement through 'awaitSupervised', asks for
+--    the stop with 'stopSupervised', and awaits the terminal completion
+--    through 'awaitSupervised' again, so pending outcomes and the fatal latch
+--    are handled before either read.
+--
+-- The finish wait also ends when the completion is published without an
+-- acknowledgement, so finish never waits for a marker a terminal worker can no
+-- longer produce. An unrelated worker's outcome that arrives while it waits is
+-- settled by 'awaitSupervised' and the wait resumes; it consumes nothing.
+-- Request a finish while the services the handler depends on are still
+-- available: the backlog is handled with them, before closing drains the group.
+--
+-- __Finish outcomes.__ 'InboxFinished' requires a genuine acknowledgement, a
+-- 'Succeeded' completion whose 'InboxExit' records that acknowledgement and zero
+-- discards, and the 'WorkerStopped' status, which supervision gives only after
+-- successful cleanup. When supervision settles 'WorkerStopped' otherwise — a
+-- stop or cancellation that won before the drain, or a cancellation after it —
+-- the finish is 'InboxUnfinished', carrying the acknowledgement if one was made
+-- and the actual completion. A recognized failure of an optional service,
+-- including a cancellation after the drain that no owner asked for, is
+-- 'InboxFinishUnavailable', with its single warning. A required, unrecognized,
+-- or cleanup failure propagates from 'finishInboxService' through supervision
+-- with its original evidence; in every case a recorded acknowledgement and the
+-- actual completion stay readable on the handle. Repeated finishes, stops, and
+-- completion reads re-run no handler and return the same evidence; admission
+-- never reopens, and a later stop or cancellation leaves a recorded
+-- acknowledgement in place.
 --
 -- __Abort before teardown.__ Every exit from the service — an ordinary stop,
 -- including one closing requested, a synchronous handler failure, cancellation
@@ -58,23 +101,27 @@
 -- instance with "Hetoimasia.Foundation.Recovery" — does so before the exception
 -- escapes, and returning normally lets dispatch continue.
 --
--- __The exit record.__ On an ordinary stop the service aborts its inbox, then
--- reads the channel's cumulative discard count from committed state into an
--- immutable 'InboxExit', which is the run's result. It records nothing else:
--- accepted backlog is __not__ processed on stop, and there is no drain count or
--- acknowledgement. A failed, cancelled, or cleanup-failed run keeps its actual
--- 'Completion' evidence; no 'InboxExit' is manufactured for it.
+-- __The exit record.__ When its stop is requested the service aborts its inbox,
+-- then reads, in the same transaction, the channel's cumulative discard count
+-- and the drain acknowledgement it recorded, if any, into an immutable
+-- 'InboxExit', which is the run's result. After a finish it records the
+-- acknowledgement and zero discards; after an ordinary stop it records no
+-- acknowledgement and the real discard count, because that backlog is not
+-- processed. A failed, cancelled, or cleanup-failed run keeps its actual
+-- 'Completion' evidence; no 'InboxExit' is manufactured for it, and the
+-- acknowledgement stays readable through 'inboxAcknowledgedDrain'.
 --
--- __Completion.__ 'inboxCompletion' and 'awaitInboxCompletion' are raw,
--- non-consuming STM reads of the typed completion. They compose with
+-- __Completion.__ 'inboxCompletion', 'awaitInboxCompletion', and
+-- 'inboxAcknowledgedDrain' are raw, non-consuming STM reads. They compose with
 -- 'Hetoimasia.Runtime.Supervision.awaitSupervised' inside supervision — which
 -- may deliver a latched fatal failure instead of returning that evidence — and
 -- stay readable after the group has drained. 'WorkerStopped' alone is not an
 -- exit record; the completion's 'Succeeded' result is.
 --
 -- __Dependencies.__ Borrowed dependencies stay alive through worker cleanup
--- under the group's drain. A stuck handler keeps its resources under the same
--- policy: no deadline and no detach.
+-- under the group's drain, including when the owner is cancelled during a
+-- finish. A stuck handler keeps its resources under the same policy: no
+-- deadline and no detach.
 --
 -- __State.__
 --
@@ -87,8 +134,12 @@
 -- | Inbox channel   | Producers send; the dispatch loop receives;   | Any sender; the worker     | The worker's startup scope; aborted on |
 -- |                 | the run and the abort release abort           |                            | every exit, never reopened             |
 -- +-----------------+-----------------------------------------------+----------------------------+----------------------------------------+
--- | Stop exit       | The run writes it once as its result; any     | Worker writes; any thread  | Published with the completion; never   |
--- | record          | number of completion readers                  | reads, in STM              | changes or is consumed                 |
+-- | Drain           | The dispatch decision that observes the       | Worker writes; any thread  | One start; written at most once, never |
+-- | acknowledgement | closed, empty inbox writes it once; finish,   | reads, in STM              | cleared, kept after completion         |
+-- |                 | the exit record, and handle readers read      |                            |                                        |
+-- +-----------------+-----------------------------------------------+----------------------------+----------------------------------------+
+-- | Exit record     | The run writes it once as its result; any     | Worker writes; any thread  | Published with the completion; never   |
+-- |                 | number of completion readers                  | reads, in STM              | changes or is consumed                 |
 -- +-----------------+-----------------------------------------------+----------------------------+----------------------------------------+
 --
 -- The module takes no logger: its one failure propagates, and supervision owns
@@ -112,46 +163,60 @@ module Hetoimasia.Runtime.Inbox
   , inboxStatus
   , inboxCompletion
   , awaitInboxCompletion
+  , inboxAcknowledgedDrain
+
+    -- * Finishing
+  , InboxFinish (..)
+  , finishInboxService
 
     -- * The exit record
   , InboxExit
   , inboxDiscarded
+  , inboxDrain
+  , DrainAcknowledgement
+  , drainHandled
 
     -- * Failures
   , InboxInvariantViolated (..)
   , inboxComponent
   , inboxHandoffOperation
+  , inboxFinishOperation
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, orElse, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, uninterruptibleMask_)
 import Control.Monad (unless, void)
 import Control.Monad.IO.Class (liftIO)
+import Data.Foldable (for_)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel
   ( ChannelControl
-  , ChannelStatistics (statisticsDiscarded)
+  , ChannelStatistics (statisticsDequeued, statisticsDiscarded)
   , Delivery (..)
   , Sender
+  , Termination (..)
   , abortChannel
   , awaitReceive
   , channelReceiver
   , channelSender
   , channelStatistics
+  , closeChannel
   , newChannel
   )
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker
-  ( Completion
+  ( Completion (completionResult)
+  , Result (Succeeded)
   , StopToken
   , WorkerDefinition
   , awaitCompletion
   , awaitStopRequest
   , pollCompletion
   , workerDefinition
+  , workerLabel
   )
 import Hetoimasia.Runtime.Supervision
   ( Disposition
@@ -161,7 +226,8 @@ import Hetoimasia.Runtime.Supervision
   , SupervisedStart (..)
   , SupervisedWorker
   , WorkerPolicy (..)
-  , WorkerStatus
+  , WorkerStatus (WorkerStopped, WorkerUnavailable)
+  , awaitSupervised
   , cancelSupervised
   , startSupervised
   , stopSupervised
@@ -200,18 +266,52 @@ data InboxPolicy = InboxPolicy
 
 -- The exit record --------------------------------------------------------------
 
--- | What an ordinarily stopped inbox service returns.
+-- | What an inbox service returns when its stop is requested.
 --
--- It records only the inbox's cumulative discarded-entry count, read after the
--- stop's abort. It has no drain count: accepted backlog is not processed on
--- stop.
-data InboxExit = InboxExit !Natural
+-- It records the inbox's cumulative discarded-entry count, read after the
+-- stop's abort, and the drain acknowledgement the service recorded before that
+-- stop, if any. Its representation is private: no client builds, updates, or
+-- forges one.
+data InboxExit = InboxExit !Natural !(Maybe DrainAcknowledgement)
   deriving (Eq, Show)
 
 -- | Entries the inbox discarded over its life, as its cumulative counter reads
--- after the stop's abort.
+-- after the stop's abort. Zero after a finish; the real count after an
+-- ordinary stop.
 inboxDiscarded ∷ InboxExit → Natural
-inboxDiscarded (InboxExit discarded) = discarded
+inboxDiscarded (InboxExit discarded _) = discarded
+
+-- | The drain acknowledgement recorded before the stop, or 'Nothing' when the
+-- stop won before a drain.
+inboxDrain ∷ InboxExit → Maybe DrainAcknowledgement
+inboxDrain (InboxExit _ drain) = drain
+
+-- | Evidence that the service handled every message it accepted and then
+-- observed its normally closed, empty inbox, in the decision that recorded it.
+--
+-- Only that decision constructs one.
+data DrainAcknowledgement = DrainAcknowledgement !Natural
+  deriving (Eq, Show)
+
+-- | How many messages the service had received, and handled, when it
+-- acknowledged the drain.
+drainHandled ∷ DrainAcknowledgement → Natural
+drainHandled (DrainAcknowledgement handled) = handled
+
+-- | What 'finishInboxService' reports.
+data InboxFinish
+  = InboxFinished !InboxExit
+    -- ^ A genuine drain acknowledgement, then an expected stop with successful
+    -- cleanup. The exit record holds that acknowledgement and zero discards.
+  | InboxUnfinished !(Maybe DrainAcknowledgement) !(Completion InboxExit)
+    -- ^ Supervision settled 'WorkerStopped', but not as a finish: a stop or
+    -- cancellation won before the drain, or a cancellation ended the service
+    -- after one. It carries the acknowledgement, if one was recorded, and the
+    -- actual completion.
+  | InboxFinishUnavailable !(ExceptionWithContext SomeException)
+    -- ^ An optional service failed with a recognized failure — possibly an
+    -- unexpected cancellation — and its single warning was attempted by
+    -- supervision. The acknowledgement, if any, stays on the handle.
 
 -- Failures ---------------------------------------------------------------------
 
@@ -223,6 +323,9 @@ data InboxInvariantViolated
     -- ^ A startup found its handoff already written.
   | InboxEndedWhileRunning
     -- ^ The inbox ended while its service was still dispatching.
+  | FinishUnsettled
+    -- ^ A finish found its service's completion with no committed stop or
+    -- unavailable status.
   deriving (Eq, Show)
 
 instance Exception InboxInvariantViolated
@@ -235,6 +338,10 @@ inboxComponent = unsafeComponent "runtime.inbox"
 inboxHandoffOperation ∷ Operation
 inboxHandoffOperation = operation "inbox-handoff"
 
+-- | The operation a finish's invariant failure names as its origin.
+inboxFinishOperation ∷ Operation
+inboxFinishOperation = operation "inbox-finish"
+
 -- The service handle -----------------------------------------------------------
 
 -- | A started inbox service, held by the application.
@@ -243,7 +350,8 @@ inboxHandoffOperation = operation "inbox-handoff"
 -- can pair one service's endpoint with another's worker.
 type role InboxService nominal
 
-data InboxService a = InboxService !(SupervisedWorker InboxExit) !(Sender a)
+data InboxService a
+  = InboxService !(SupervisedWorker InboxExit) !(ChannelControl a) !(TVar (Maybe DrainAcknowledgement))
 
 -- | What 'startInboxService' returns.
 data InboxStart a
@@ -258,28 +366,64 @@ data InboxStart a
 
 -- | The send endpoint, for the application to give to producers.
 inboxSender ∷ InboxService a → Sender a
-inboxSender (InboxService _ sender) = sender
+inboxSender (InboxService _ inbox _) = channelSender inbox
 
 -- | Ask the service to stop, as 'stopSupervised' does. Accepted backlog is
--- discarded, not processed.
+-- discarded, not processed; use 'finishInboxService' to process it first.
 stopInboxService ∷ InboxService a → IO ()
-stopInboxService (InboxService worker _) = stopSupervised worker
+stopInboxService (InboxService worker _ _) = stopSupervised worker
 
 -- | Request cancellation of the service, as 'cancelSupervised' does.
 cancelInboxService ∷ InboxService a → IO ()
-cancelInboxService (InboxService worker _) = cancelSupervised worker
+cancelInboxService (InboxService worker _ _) = cancelSupervised worker
 
 -- | What supervision has committed about the service.
 inboxStatus ∷ InboxService a → STM WorkerStatus
-inboxStatus (InboxService worker _) = workerStatus worker
+inboxStatus (InboxService worker _ _) = workerStatus worker
 
 -- | The typed completion if it has been published. Raw and non-consuming.
 inboxCompletion ∷ InboxService a → STM (Maybe (Completion InboxExit))
-inboxCompletion (InboxService worker _) = pollCompletion (supervisedWorker worker)
+inboxCompletion (InboxService worker _ _) = pollCompletion (supervisedWorker worker)
 
 -- | Retry until the typed completion is published. Raw and non-consuming.
 awaitInboxCompletion ∷ InboxService a → STM (Completion InboxExit)
-awaitInboxCompletion (InboxService worker _) = awaitCompletion (supervisedWorker worker)
+awaitInboxCompletion (InboxService worker _ _) = awaitCompletion (supervisedWorker worker)
+
+-- | The drain acknowledgement if the service has recorded one. Raw and
+-- non-consuming; it stays readable whatever the completion turns out to be.
+inboxAcknowledgedDrain ∷ InboxService a → STM (Maybe DrainAcknowledgement)
+inboxAcknowledgedDrain (InboxService _ _ drain) = readTVar drain
+
+-- Finishing --------------------------------------------------------------------
+
+-- | Finish the service gracefully: close admission, let it handle the accepted
+-- backlog and acknowledge the drain, then stop it and await its completion,
+-- all through supervised waits.
+--
+-- Call it on the application thread, while the services the handler depends on
+-- are still available. See the module header for the protocol and what each
+-- outcome means. A required, unrecognized, or cleanup failure — this service's
+-- or a latched one — propagates from here with its original evidence, and an
+-- owner cancellation propagates after the group drained the worker.
+finishInboxService ∷ RuntimeControl → InboxService a → IO InboxFinish
+finishInboxService control (InboxService worker inbox drain) = do
+  atomically (closeChannel inbox)
+  acknowledged ←
+    awaitSupervised control ((Just <$> (readTVar drain >>= maybe retry pure)) `orElse` (Nothing <$ awaitCompletion raw))
+  for_ acknowledged (\_ → stopSupervised worker)
+  completion ← awaitSupervised control (awaitCompletion raw)
+  atomically (workerStatus worker) >>= \case
+    WorkerStopped
+      | Just acknowledgement ← acknowledged
+      , Succeeded exit ← completionResult completion
+      , inboxDrain exit == Just acknowledgement
+      , inboxDiscarded exit == 0 →
+          pure (InboxFinished exit)
+      | otherwise → pure (InboxUnfinished acknowledged completion)
+    WorkerUnavailable failure → pure (InboxFinishUnavailable failure)
+    _ → throwFailure inboxComponent inboxFinishOperation [("service", workerLabel raw)] FinishUnsettled
+  where
+    raw = supervisedWorker worker
 
 -- Starting ---------------------------------------------------------------------
 
@@ -291,15 +435,16 @@ awaitInboxCompletion (InboxService worker _) = awaitCompletion (supervisedWorker
 startInboxService ∷ RuntimeControl → InboxPolicy → InboxDefinition a → IO (InboxStart a)
 startInboxService control policy (InboxDefinition label capacity startup handler) = do
   handoff ← newTVarIO Nothing
+  drain ← newTVarIO Nothing
   let supervised = WorkerPolicy Service (inboxDisposition policy) (inboxPolicyComponent policy) (inboxClassifier policy)
-      definition = serviceDefinition label capacity startup handler handoff
+      definition = serviceDefinition label capacity startup handler handoff drain
   startSupervised control supervised definition >>= \case
     WorkerStartRejected → pure InboxStartRejected
     WorkerStartUnavailable _ failure → pure (InboxStartUnavailable failure)
     WorkerStarted worker →
       -- Acknowledgement follows the write, so this read never needs to wait.
       readTVarIO handoff >>= \case
-        Just inbox → pure (InboxStarted (InboxService worker (channelSender inbox)))
+        Just inbox → pure (InboxStarted (InboxService worker inbox drain))
         Nothing → throwFailure inboxComponent inboxHandoffOperation [("service", label)] HandoffEmpty
 
 -- | The worker behind an inbox service.
@@ -309,8 +454,9 @@ serviceDefinition
   → (StopToken → Scoped context)
   → (context → Prepared a → IO ())
   → TVar (Maybe (ChannelControl a))
+  → TVar (Maybe DrainAcknowledgement)
   → WorkerDefinition InboxExit
-serviceDefinition label capacity startup handler handoff =
+serviceDefinition label capacity startup handler handoff drain =
   workerDefinition label construct $ \token (context, inbox) → dispatch token context inbox
   where
     construct token = do
@@ -330,16 +476,36 @@ serviceDefinition label capacity startup handler handoff =
 
     dispatch token context inbox = loop
       where
-        loop = do
-          next ← atomically ((Nothing <$ awaitStopRequest token) `orElse` (Just <$> awaitReceive (channelReceiver inbox)))
-          case next of
-            Nothing → finish
-            Just (Delivered message) → handler context message >> loop
-            Just (Ended _) →
+        loop =
+          atomically decide >>= \case
+            StopTaken → exit
+            Handle message → handler context message >> loop
+            DrainAcknowledged → atomically (awaitStopRequest token) >> exit
+            EndedWhileRunning →
               throwFailure inboxComponent inboxHandoffOperation [("service", label)] InboxEndedWhileRunning
-        finish = atomically $ do
+        -- One decision: a requested stop wins over a ready message and over a
+        -- drained inbox, and a drain is acknowledged in the transaction that
+        -- observed the closed, empty inbox, never after a stop won.
+        decide =
+          (StopTaken <$ awaitStopRequest token)
+            `orElse` ( awaitReceive (channelReceiver inbox) >>= \case
+                         Delivered message → pure (Handle message)
+                         Ended Drained → do
+                           handled ← statisticsDequeued <$> channelStatistics inbox
+                           writeTVar drain (Just (DrainAcknowledgement handled))
+                           pure DrainAcknowledged
+                         Ended Aborted → pure EndedWhileRunning
+                     )
+        exit = atomically $ do
           void (abortChannel inbox)
-          InboxExit . statisticsDiscarded <$> channelStatistics inbox
+          InboxExit . statisticsDiscarded <$> channelStatistics inbox <*> readTVar drain
+
+-- | One dispatch decision.
+data Decision a
+  = StopTaken
+  | Handle (Prepared a)
+  | DrainAcknowledged
+  | EndedWhileRunning
 
 -- | The abort safeguard: end admission and drop the backlog by its counter.
 -- Never retries, waits, or calls out.

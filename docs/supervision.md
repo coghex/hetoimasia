@@ -334,23 +334,47 @@ the owner's `InboxPolicy` — its disposition, warning component, and classifier
   required or unrecognized is fatal; retained cleanup failure is fatal. Nothing
   isolates, skips, or replays a message. A handler that recovers returns
   normally and dispatch continues.
-- **The exit record.** An ordinary stop returns an `InboxExit` holding the
-  inbox's cumulative discard count, so the service's status is `WorkerStopped`
-  and its typed completion is `Succeeded InboxExit`. Accepted backlog is not
-  processed on stop, and the record has no drain field. A failed, cancelled, or
-  cleanup-failed service keeps its actual completion; `WorkerStopped` after a
-  cancellation is never read as an exit record.
-- **Observation.** `inboxCompletion` and `awaitInboxCompletion` are raw,
-  non-consuming reads. Inside `awaitSupervised` a latched fatal failure may be
+- **Finish versus stop.** An ordinary stop discards accepted backlog.
+  `finishInboxService` closes admission normally, lets the worker handle the
+  in-flight message and the backlog in FIFO order, and waits — through
+  `awaitSupervised` — for the worker's drain acknowledgement, which is recorded
+  in the same dispatch transaction that checks for a stop and observes the
+  closed, empty inbox. Having acknowledged, the worker waits for its stop token,
+  so it is never an `UnexpectedServiceExit`. Finish then calls `stopSupervised`
+  and awaits the completion through `awaitSupervised`, so pending outcomes,
+  unrelated ones included, and the fatal latch are handled first. Its wait also
+  ends on a completion published without an acknowledgement.
+- **Finish outcomes.** `InboxFinished` needs the acknowledgement, a `Succeeded`
+  exit record holding it with zero discards, and `WorkerStopped`. A stop or
+  cancellation before the drain, or a cancellation after it that settles as
+  `WorkerStopped`, is `InboxUnfinished` with the acknowledgement, if any, and
+  the actual completion. A recognized optional failure is
+  `InboxFinishUnavailable` with its single warning — including a cancellation
+  after the drain that no owner asked for, which is an
+  `UnexpectedWorkerTermination` judged by the policy. Required, unrecognized,
+  and cleanup failures propagate with their evidence. None of this changes the
+  classification table above.
+- **Requesting graceful completion.** Finish while prerequisite services are
+  still available: closing's stop, after the application action returns, is an
+  ordinary stop.
+- **The exit record.** A stop returns an `InboxExit` holding the inbox's
+  cumulative discard count and the drain acknowledgement, if one was recorded,
+  so the service's status is `WorkerStopped` and its typed completion is
+  `Succeeded InboxExit`. A failed, cancelled, or cleanup-failed service keeps
+  its actual completion, and its acknowledgement stays readable on the handle;
+  `WorkerStopped` after a cancellation is never read as an exit record.
+- **Observation.** `inboxCompletion`, `awaitInboxCompletion`, and
+  `inboxAcknowledgedDrain` are raw, non-consuming reads. Inside `awaitSupervised` a latched fatal failure may be
   delivered instead of the completion; after the boundary drained, the
   completion stays readable directly.
 
-The adapter adds two state rows, both owned by the one start that creates them:
+The adapter adds three state rows, all owned by the one start that creates them:
 
 | State | Readers and writers | Thread | Lifetime and reset |
 |---|---|---|---|
 | Service handoff | The worker's startup writes it once, as its last step; the starter reads it once after `WorkerStarted` | Worker writes; application thread reads | One start; never cleared, dropped with the start |
-| Ordinary stop exit record | The run returns it once after the abort; any number of completion readers | Worker writes; any thread reads, in STM | Published with the completion; never changes or is consumed |
+| Drain acknowledgement | The dispatch decision that observes the closed, empty inbox writes it once; finish, the exit record, and handle readers read it | Worker writes; any thread reads, in STM | One start; never cleared, kept after completion |
+| Inbox exit record | The run returns it once after the abort; any number of completion readers | Worker writes; any thread reads, in STM | Published with the completion; never changes or is consumed |
 
 ## A read-only handle
 
@@ -431,8 +455,8 @@ an environment failure such as a missing package never counts as either. A
 third client must compile, link, and run, reading a job's result through
 `supervisedWorker` and raw completion, stopping one service and cancelling
 another, and reporting `completed`, `stopped`, and `stopped`. The inbox
-adapter's examples and its own package-boundary clients are listed in
-[messaging.md](messaging.md#verification).
+adapter's examples, its graceful finish examples, and its own package-boundary
+clients are listed in [messaging.md](messaging.md#verification).
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

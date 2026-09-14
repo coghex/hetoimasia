@@ -6,7 +6,8 @@
 -- example that has already hung.
 --
 -- The channel examples live in "Test.Engine.Messaging.Channel", the snapshot
--- examples in "Test.Engine.Messaging.Snapshot", and the external-client examples
+-- examples in "Test.Engine.Messaging.Snapshot", the bounded-turn example in
+-- "Test.Engine.Messaging.Turns", and the external-client examples
 -- in "Test.Engine.Messaging.Opacity". All are composed into this group, so @--match Messaging@ selects all of them.
 module Test.Engine.Messaging.Spec (spec) where
 
@@ -47,6 +48,7 @@ import System.Timeout (timeout)
 import qualified Test.Engine.Messaging.Channel as Channel
 import qualified Test.Engine.Messaging.Opacity as Opacity
 import qualified Test.Engine.Messaging.Snapshot as Snapshot
+import qualified Test.Engine.Messaging.Turns as Turns
 import Test.Hspec
   ( Expectation
   , Spec
@@ -75,6 +77,7 @@ spec = describe "Messaging" $ do
 
   Channel.spec
   Snapshot.spec
+  Turns.spec
   Opacity.spec
 
 -- Fixtures -------------------------------------------------------------------
