@@ -19,6 +19,9 @@
 -- guards. It holds only occupancy and poison.
 module Hetoimasia.GLFW.Internal.Native
   ( productionNative
+
+    -- * Error codes
+  , glfwPlatformUnavailable
   ) where
 
 import Control.Monad (void)
@@ -150,3 +153,7 @@ foreign import capi "hetoimasia_glfw.h value GLFW_NO_API" glfwNoApi ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_VISIBLE" glfwVisible ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FOCUSED" glfwFocused ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FOCUS_ON_SHOW" glfwFocusOnShow ∷ CInt
+
+-- | @GLFW_PLATFORM_UNAVAILABLE@, the error an initialization requesting a
+-- platform this library was not built with reports.
+foreign import capi "hetoimasia_glfw.h value GLFW_PLATFORM_UNAVAILABLE" glfwPlatformUnavailable ∷ CInt

@@ -32,7 +32,7 @@ import Hetoimasia.Foundation.Failure
   )
 import Hetoimasia.Foundation.Log (componentText)
 import Hetoimasia.Foundation.Resource (allocComposite, withComposite, withScoped)
-import Hetoimasia.GLFW.Internal.Native (productionNative)
+import Hetoimasia.GLFW.Internal.Native (glfwPlatformUnavailable, productionNative)
 import Hetoimasia.GLFW.Internal.Session
   ( Native (..)
   , WindowRequest (..)
@@ -141,7 +141,7 @@ initializationError = do
   failure ← maybe (failCheck ("unexpected failure: " <> displayException caught)) pure (fromException caught)
   when (nativeOutcome failure /= NativeCallFailed) $
     failCheck ("initialization reported " <> show (nativeOutcome failure))
-  let unavailableCode = 0x0001000E
+  let unavailableCode = fromIntegral glfwPlatformUnavailable
       reported = reportedErrors (nativeReports failure)
       matching =
         [ entry
