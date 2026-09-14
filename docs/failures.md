@@ -6,8 +6,8 @@ The accepted policy lives in
 [the runtime foundation design](runtime_foundation_design.md) (D-4, D-5, P-1,
 and P-4); this document describes what the code does today.
 
-Scope: raising an engine failure with its origin, adding operation context at
-an outer boundary, native causes, cancellation, inspection, and the caller
+Scope: raising an engine failure with its origin, in `IO` or inside a
+transaction, adding operation context at an outer boundary, native causes, cancellation, inspection, and the caller
 patterns that discard evidence. Recovery policy is described in
 [recovery.md](recovery.md). Reporting a failure's origin through the logger is
 described in [Recovery and terminal reports](logging.md#recovery-and-terminal-reports);
@@ -29,6 +29,10 @@ operationText ∷ Operation → Text
 throwFailure
   ∷ (HasCallStack, MonadIO m, Exception e)
   ⇒ Component → Operation → [(Text, Text)] → e → m a
+
+throwFailureSTM
+  ∷ (HasCallStack, Exception e)
+  ⇒ Component → Operation → [(Text, Text)] → e → STM a
 
 withOperationContext
   ∷ HasCallStack
@@ -134,6 +138,57 @@ The identifiers and the boundary's source information are evaluated before the
 operation runs. A faulting identifier fails the boundary before the operation
 starts, so it can never displace a failure being propagated.
 
+## Raising inside a transaction
+
+`throwFailureSTM` is the `STM` companion of `throwFailure`. It takes the same
+component, operation, identifiers, and cause, and attaches the same origin
+evidence, so a transaction can abort with a typed engine failure:
+
+```haskell
+failCursor ∷ HasCallStack ⇒ CursorFailure → STM a
+failCursor = throwFailureSTM snapshots (operation "read-snapshot") [("cursor", "c-3")]
+```
+
+What it shares with `throwFailure`:
+
+- The cause keeps its type, its value, and every annotation it already carried.
+  It can be caught by its own type with `catchSTM` inside the transaction and
+  with ordinary handlers outside `atomically`.
+- The origin records the component, operation, identifiers, and the caller's
+  site under the same [attribution](#caller-attribution) policy, including a
+  wrapper that declares `HasCallStack`.
+- The identifiers and the source information are evaluated before the failure
+  is raised. A faulting identifier raises its own exception in place of the
+  failure, inside the transaction.
+- A cause that already carries an origin keeps reporting that earlier origin,
+  with its operation contexts in order, as [inspection](#inspection) always does.
+  A caught failure carries its annotations onward when it is passed as the
+  `ExceptionWithContext` value a context-aware catch returns; for both
+  functions, a bare `SomeException` is given a fresh context by `base`.
+- An asynchronous cause gains no origin and keeps the context it already had.
+
+Where it differs:
+
+- **No backtrace.** `throwIO` adds the backtrace annotations `base` collects in
+  `IO`, and `throwSTM` collects none. The origin's site is the only source
+  information a failure raised here gains. Collecting a backtrace would need IO,
+  and the companion performs none: no logging, no recovery, and no unsafe
+  escape from the transaction.
+- **Context arrives at the IO boundary.** `withOperationContext` is an `IO`
+  boundary, so it adds its context when the failure escapes `atomically` inside
+  it. Inside the transaction nothing has added context yet.
+- **Inspecting inside the transaction needs `SomeException`.** A `catchSTM`
+  handler typed at `SomeException` sees the context, and `failureEvidence` reads
+  it. A handler typed at the component's own exception receives the bare value,
+  and rethrowing that value with `throwSTM` discards the evidence, as a
+  [typed `try`](#caller-patterns-that-discard-evidence) does in `IO`.
+
+Rollback follows `STM`. A failure that escapes `atomically` discards every write
+that transaction made, and the transaction commits nothing. A failure caught
+with `catchSTM` discards only the writes made by the action that `catchSTM`
+guarded. Writes the transaction made before or after that action remain and
+commit with the rest of the transaction.
+
 ## Native causes
 
 A native or library exception, such as an `IOException` from `openFile`, carries
@@ -142,15 +197,16 @@ was observed, and the exception stays an `IOException` with its own payload. It
 is never converted into a textual engine exception.
 
 Inspection distinguishes the two cases. An exception raised by `throwFailure`
-has `failureCause = EngineOrigin origin`, with its throw site known.
+or `throwFailureSTM` has `failureCause = EngineOrigin origin`, with its throw site known.
 Any other exception has `failureCause = NativeCause`: no engine origin was
 recorded, and the throw site is unknown. No site is invented for it. Any
 backtrace `base` itself collected remains in the exception's context, untouched.
 
 ## Cancellation
 
-Neither `throwFailure` nor a boundary adds anything to an asynchronous
-exception. `throwFailure` given an asynchronous cause throws it with no origin.
+Neither `throwFailure`, `throwFailureSTM`, nor a boundary adds anything to an
+asynchronous exception. Either raising function given an asynchronous cause
+throws it with no origin.
 A boundary adds nothing to an asynchronous exception. That includes one thrown
 synchronously with an asynchronous type, such as `throwIO ThreadKilled`. It is
 rethrown with the context it already had, including annotations attached below
@@ -188,8 +244,8 @@ Every operation, identifier key and value, file, and function is double-quoted
 and escaped with the logger's quoting rules, so text carrying a newline or a
 quote cannot split that line or forge another entry.
 
-Evidence is attached only by `throwFailure` and `withOperationContext`: the
-annotation type they use is not exported. The evidence records a caller reads
+Evidence is attached only by `throwFailure`, `throwFailureSTM`, and
+`withOperationContext`: the annotation type they use is not exported. The evidence records a caller reads
 are ordinary values. Constructing one attaches nothing.
 
 ## Caller patterns that discard evidence
@@ -232,7 +288,16 @@ cover:
   existing context;
 - hostile operation and identifier text rendered escaped on one line;
 - inspection after the owning scope released the resource the identifiers were
-  copied from, with no logger.
+  copied from, with no logger;
+- inside `STM`: a typed engine failure and a native exception caught by their own
+  types with `catchSTM` and outside `atomically`; the recorded origin for a
+  direct call and through a `HasCallStack` wrapper; evidence read by a
+  `SomeException` handler inside the transaction, and lost by rethrowing a
+  typed handler's bare value; context from an enclosing `withOperationContext`;
+  a caller's annotation and an earlier origin with its ordered contexts kept;
+  an asynchronous cause left without an origin; a faulting identifier raising
+  its own exception; and rollback of an escaping failure and of only the
+  caught action's writes.
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

@@ -8,6 +8,8 @@
 -- lets an outer boundary add the operation it was performing to a failure
 -- passing through it, whether that failure was raised by 'throwFailure' or by a
 -- native or library call. 'failureEvidence' reads both back.
+-- 'throwFailureSTM' raises the same failure, with the same evidence, inside a
+-- transaction.
 --
 -- Nothing here wraps the exception. Its type, its value, and every annotation
 -- already attached to it are kept, so a caller's @catch@, @try@, or
@@ -33,8 +35,9 @@
 -- rather than guessed at, and the exception is never converted into a textual
 -- engine exception.
 --
--- Cancellation is not annotated: 'throwFailure' and a boundary both rethrow an
--- asynchronous exception with the context it already had.
+-- Cancellation is not annotated: 'throwFailure', 'throwFailureSTM', and a
+-- boundary all rethrow an asynchronous exception with the context it already
+-- had.
 --
 -- Raising and inspecting a failure need no logger. This module imports only the
 -- validated 'Component' and 'SourceLocation' types from
@@ -50,6 +53,7 @@ module Hetoimasia.Foundation.Failure
 
     -- * Raising
   , throwFailure
+  , throwFailureSTM
 
     -- * Operation boundaries
   , withOperationContext
@@ -77,6 +81,7 @@ import Control.Exception
   , rethrowIO
   , someExceptionContext
   , throwIO
+  , toException
   , tryWithContext
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
@@ -86,6 +91,7 @@ import Control.Exception.Context
   , getExceptionAnnotations
   )
 import Control.Monad.IO.Class (MonadIO (liftIO))
+import Control.Monad.STM (STM, throwSTM)
 import Data.Char (isControl, ord)
 import Data.List (intercalate, sortOn)
 import Data.Maybe (isJust)
@@ -153,10 +159,11 @@ data OperationContext = OperationContext
 -- | What is known about where a failure came from.
 data FailureCause
   = EngineOrigin !FailureOrigin
-    -- ^ Raised by 'throwFailure', whose throw site is known.
+    -- ^ Raised by 'throwFailure' or 'throwFailureSTM', whose throw site is
+    -- known.
   | NativeCause
     -- ^ No engine origin was recorded: a native or library exception, or one
-    -- thrown without 'throwFailure'. Its throw site is unknown, and no site is
+    -- thrown without either. Its throw site is unknown, and no site is
     -- invented for it.
   deriving (Eq, Show)
 
@@ -170,7 +177,8 @@ data FailureEvidence = FailureEvidence
   deriving (Eq, Show)
 
 -- | The annotation this module attaches. It is not exported, so evidence can
--- only be attached by 'throwFailure' and 'withOperationContext'.
+-- only be attached by 'throwFailure', 'throwFailureSTM', and
+-- 'withOperationContext'.
 --
 -- Each entry records how many entries its context already held when it was
 -- attached. Inspection orders by that position, so attachment order is a
@@ -263,11 +271,7 @@ throwFailure
   ∷ (HasCallStack, MonadIO m, Exception e)
   ⇒ Component → Operation → [(Text, Text)] → e → m a
 throwFailure component operationName identifiers cause = liftIO $ do
-  origin ←
-    evaluate $
-      forced
-        (FailureOrigin component operationName identifiers (siteOf callStack))
-        [forceIdentifiers identifiers, forceSite (siteOf callStack)]
+  origin ← evaluate (originAt component operationName identifiers callStack)
   -- Nothing between the throw and the rethrow is interruptible, so no
   -- cancellation can arrive in between and replace the failure.
   mask_ $ do
@@ -279,6 +283,47 @@ throwFailure component operationName identifiers cause = liftIO $ do
         | otherwise →
             rethrowIO
               (ExceptionWithContext (attach (`OriginEntry` origin) context) (exception ∷ SomeException))
+
+-- | Throw an engine failure with its origin attached, inside a transaction.
+--
+-- This is 'throwFailure' for 'STM'. It takes the same arguments and attaches the
+-- same origin evidence: the exception keeps its own type, its value, and every
+-- annotation it already carried, and the origin is attributed to the call site
+-- outside every function that declared 'HasCallStack'. A cause that already
+-- carries an origin keeps reporting that earlier origin, as inspection always
+-- does. As with 'throwFailure', a caught failure keeps its annotations when it
+-- is passed on as an 'ExceptionWithContext' value rather than a bare
+-- 'SomeException'.
+--
+-- The identifiers and the source information are evaluated before the failure
+-- is raised. A faulting identifier raises its own exception in place of the
+-- failure. An asynchronous cause is raised with the context it already had and
+-- no origin.
+--
+-- Nothing else happens: no IO, no logging, no recovery. Unlike 'throwIO',
+-- 'throwSTM' collects no backtrace, so the origin's site is the only source
+-- information a failure raised here gains.
+--
+-- A failure that escapes 'Control.Monad.STM.atomically' rolls that transaction
+-- back and arrives in 'IO' with its evidence, where an enclosing
+-- 'withOperationContext' adds its context as usual. A failure caught with
+-- 'Control.Monad.STM.catchSTM' discards the writes of the action that handler
+-- guarded, and only those. Reading the evidence inside the handler needs a
+-- 'SomeException' handler: one typed at the component's own exception receives
+-- the bare value, without its context.
+throwFailureSTM
+  ∷ (HasCallStack, Exception e)
+  ⇒ Component → Operation → [(Text, Text)] → e → STM a
+throwFailureSTM component operationName identifiers cause = do
+  origin ← pure $! originAt component operationName identifiers callStack
+  let raised = toException cause
+      context = someExceptionContext raised
+  -- 'throwSTM' would give a bare 'SomeException' a fresh context, so the
+  -- context travels beside it, including on the asynchronous branch.
+  throwSTM $
+    if isAsynchronous raised
+      then ExceptionWithContext context raised
+      else ExceptionWithContext (attach (`OriginEntry` origin) context) raised
 
 -- | Run an operation, adding its context to a synchronous failure that passes
 -- through.
@@ -340,6 +385,15 @@ attach entry context =
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
+
+-- | An origin whose identifiers and site are forced as soon as it is.
+originAt ∷ Component → Operation → [(Text, Text)] → CallStack → FailureOrigin
+originAt component operationName identifiers stack =
+  forced
+    (FailureOrigin component operationName identifiers site)
+    [forceIdentifiers identifiers, forceSite site]
+  where
+    site = siteOf stack
 
 -- | The outermost frame and the whole stack, matching the logger's source
 -- attribution.
