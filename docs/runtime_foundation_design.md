@@ -10,7 +10,9 @@ recover construction inside its owning scope, supervise through checkpoints,
 and distinguish services from finite jobs. P-10 through P-12 specify the complete
 contracts. D-17 records owner approval of those contracts; D-18 records the
 approved supervision split and operator-escape clarification. Supervision belongs
-to RT-8 and application integration to RT-6; implementation remains outstanding.
+to RT-8 and application integration to RT-6. All eight implementation children
+and the two supervision repairs (#69 and #70) are merged and verified at
+`89798772ec637d82b32da9cf2a603acd28443f9d` on 2026-09-13.
 
 Design state: `ready for issue processing`
 
@@ -21,9 +23,12 @@ The earlier readiness covered EPIC and RT-1 through RT-3, which are now linked
 and unaffected by later design work. Q-5 through Q-7 now have concrete resolutions
 under D-13 through D-18 and P-10 through P-13. The owner granted fresh readiness
 for the complete revised design. Processing is complete as of 2026-09-13;
-all eight child issues carry canonical approval. Their review amendments are
-part of the implementation specifications. Readiness is not implementation
-completion, and solvers still follow the normal freshness and claim gates.
+all eight child issues were approved and subsequently closed by merged PRs
+#61 through #68. Their review amendments remain part of the implementation
+specifications. The completion review found two supervision defects, repaired
+by #69 / PR #71 and #70 / PR #72; both repairs passed the follow-up review.
+The retained design-state and processing ledger describe the approved design
+and tracker creation; implementation completion is recorded separately below.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -45,12 +50,26 @@ EPIC and all eight child slices are filed; none remains to be processed.
 The checked ledger records tracker creation, not merged implementation.
 RT-7 separates logging lifetime from RT-4's construction work without renumbering
 existing IDs, and RT-8 separates supervision from RT-6's application integration.
-There are no remaining composition design gates. Completing the error phase
-does not complete this epic.
+There are no remaining composition design gates. Completion covers the full
+runtime arc, including construction, workers, logging lifetime, supervision,
+and application integration.
 
-Epic #52's D-18 refresh and subsequent child links were verified on 2026-09-13.
-It links all eight issues and keeps its implementation checkboxes open until
-the respective work is complete.
+## Implementation completion
+
+Epic #52's eight children (#53–#60) and the two review follow-ups (#69–#70)
+are closed by merged PRs. The owner requested completion housekeeping on
+2026-09-13; the epic's eight implementation checkboxes are now checked and
+epic #52 is closed as completed. Review at `8979877` verified both repairs: retained
+failure evidence composes across supervision invocations, and public record
+updates cannot separate a supervised worker from its management state.
+
+Local macOS verification passed a warning-clean build, 298 engine Hspec
+examples, 262 workflow examples, both console/resource smoke modes, and the
+two original evidence-loss reproductions. The validation planner covered every
+changed input and selected all four existing groups. The corresponding
+[Linux CI run](https://github.com/coghex/hetoimasia/actions/runs/34789937761)
+passed, including its permitted evidence reuse. No further blocking repair was
+identified; messaging and independent GLFW design remain separate arcs.
 
 ## Epic contract
 

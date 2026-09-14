@@ -10,8 +10,12 @@ Owner: `coghex/hetoimasia`; publication target: `master`.
 Drafted and reviewed 2026-09-11 against Hetoimasia
 `b4ef301566259d5c43b7cca46cc366db50f73f2a`. The owner accepted the hierarchy,
 fixture contracts, and sequencing, then requested final edits and readiness if
-the review passed. The epic and TEST-1 are ready for drafting; TEST-2 retains its
-explicit design gate. This document remains local and unpublished.
+the review passed. The epic and TEST-1 have since been processed as #49 and #50;
+TEST-1 is implemented. On 2026-09-14 the owner assigned TEST-2 to GLFW-7 and
+settled its thread model (D-7 below). The owner authorized final review and
+readiness of this revision alongside the GLFW design on 2026-09-14; the review
+passed. Historical source observations below describe their recorded revision,
+not current master.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -21,10 +25,14 @@ concrete precondition
 
 - [x] EPIC. Establish component-owned tests and scoped shared fixtures — [#49]
 - [x] TEST-1. Split the headless engine suite into component specs — [#50]
-- [ ] TEST-2. Add a shared fixture for the first concrete graphics suite — [deferred]: production graphics interfaces exist and Q-1 is settled with the owner
+- [ ] TEST-2. Add a shared fixture for the first concrete graphics suite — [deferred]: awaiting GLFW-7's approved issue for existing-issue adoption; Q-1 resolved; implementation requires GLFW-1/GLFW-2
 
 The ledger records issue processing, not implementation completion. A linked
 issue does not satisfy a requirement that its implementation has merged.
+GLFW-7 owns the future fixture issue. Once it exists, a separate
+`process-design-doc` run over this document approves an existing-issue disposition
+and links it here and under epic #49. Do not process TEST-2 into an additional
+implementation or update this cursor as a side effect of the GLFW processor.
 
 ## Epic contract
 
@@ -42,6 +50,15 @@ issue does not satisfy a requirement that its implementation has merged.
   reopening the completed logging implementation.
 
 ## Current state and evidence
+
+Rechecked 2026-09-14 against `master@16cab02`: TEST-1 (#50) is closed, the
+resource, runtime and messaging APIs exist, and no GLFW package exists yet.
+The owner selected GLFW-7 in [the GLFW design](glfw_integration_design.md) as
+TEST-2's implementation. Epic #49 still has the old deferred fixture language;
+the TEST-2 adoption needs its approved tracker edit. Its unchecked TEST-1 item
+is separate housekeeping with its own approval. Keep TEST-2 unchecked in the
+epic until implementation and evidence exist. This document already records the
+thread model in D-7 and resolves Q-1; the deferred marker does not reopen it.
 
 Inspected Hetoimasia at `b4ef301566259d5c43b7cca46cc366db50f73f2a` on
 2026-09-11. These are source observations, not a new test execution:
@@ -116,6 +133,11 @@ scope exit alone proves no GPU completion. A graphics fixture must also join
 its own outstanding work before its root scope exits. This is not a promise of
 in-process cleanup after a hard process kill or driver failure.
 
+The first GLFW-only fixture submits no GPU work and needs no GPU completion
+operation. It must settle its assertion worker and dispatcher before releasing
+native roots. Future Vulkan fixtures must prove actual GPU completion before
+releasing resources used by submitted work; CPU fixture success is not that proof.
+
 ### D-4. Separate component grouping from execution requirements
 
 Keep headless tests independently buildable and runnable without window/GPU
@@ -161,6 +183,34 @@ not depend on TEST-1 merging. TEST-1 then reorganizes the current suite, includi
 whatever resource coverage has landed. Concrete graphics fixtures wait for
 their production interfaces and lifetime contracts.
 
+### D-7. GLFW-7 fulfills TEST-2; Vulkan fixtures belong to the Vulkan arc
+
+Accepted by the owner on 2026-09-14. Use GLFW-7 as the one implementation of the
+first concrete shared native fixture, linked under both its GLFW epic and #49.
+The executable's process main thread owns the production session and dispatches
+native operations. Hspec assertions run in a controlled worker through a
+test-only dispatcher. Verify native thread identity at setup, example operations
+and teardown; failed or cancelled execution on either side settles the other.
+
+Construct/select the spec tree before native acquisition. Compatible selected
+examples share one session and, only where reset/isolation is established, an
+ordinary window. Mutation, failure, incompatible configuration and lifecycle
+examples use private windows; no example may terminate the shared session.
+Use a separate GLFW supermodule/native suite; existing engine tests remain
+independent. D-3 still governs rollback and borrower lifetimes.
+
+GLFW-1/GLFW-2 must deliver the production APIs before implementation. They do
+not gate recording this chosen thread model or drafting GLFW-7 with those
+prerequisites. GLFW-7 owns Xvfb/window-manager setup, catalog/display-runner
+support, native CI wiring, and its required tests and documentation. Its small
+native Hspec group is non-optional and required when affected, outside the
+mandatory floor; remote runs use Linux X11, local macOS runs use Cocoa.
+Interactive/lengthy probes stay optional.
+
+TEST-2 is fulfilled when GLFW-7 delivers the shared fixture and evidence; do not
+leave an additional GPU requirement on #49. The later Vulkan arc owns its own
+instance/device fixtures, sharing configuration and actual GPU-completion proof.
+
 ## Implementation proposals
 
 ### P-1. Keep the first refactor small
@@ -195,8 +245,9 @@ their required checks; do not classify this refactor as a prose-only update.
 
 The later graphics runner should compose the smallest existing production
 scopes its selected specs need. Typed fixture values expose borrowed handles
-or operations to the relevant component specs. This may use Hspec hooks or an
-explicit scope around the graphics runner; the concrete choice remains Q-1.
+or operations to the relevant component specs. D-7 selects the main-thread
+owner/dispatcher with a controlled Hspec assertion worker for GLFW; use the
+production resource scopes around that entire borrower lifetime.
 
 Construct and select the spec tree without acquiring graphics resources.
 Listing/discovery, dry runs, and runs selecting no graphics examples must not
@@ -212,12 +263,11 @@ fixture registry before concrete consumers justify an abstraction.
 
 ### Q-1. What does the first concrete graphics fixture require?
 
-Deliberately deferred; blocks TEST-2 only. Once the backend/window interfaces
-exist, identify the first compatible examples, required instance/device/window
-configuration, actual thread model, and GPU completion operations. Then choose
-the narrow context, suite placement, and Hspec integration using those APIs.
-Review those choices with the owner before processing TEST-2. Do not invent
-backend capabilities or duplicate their implementation to unblock this design.
+Resolved by D-7 and GLFW design D-14. The first concrete fixture owns a GLFW
+session and scoped NoAPI windows with the selected main-thread dispatcher.
+It has no Vulkan instance/device or GPU work. GLFW-7 delivers this outcome
+after GLFW-1/GLFW-2; the later Vulkan arc specifies its distinct GPU fixture.
+Do not file another TEST-2 issue or invent GPU completion to unblock GLFW.
 
 ## Verification strategy
 
@@ -238,8 +288,10 @@ unwinding at the harness boundary. Verify that discovery, dry runs, and selectio
 outside the graphics group acquire no graphics fixture. Use deterministic
 coordination, not sleeps.
 Existing resource primitive tests remain authoritative for their lower-level
-contracts; graphics runs must separately demonstrate actual backend completion,
-thread constraints, and teardown. Compile-only success proves no GPU execution.
+contracts; native runs must separately demonstrate thread constraints and
+teardown. The GLFW fixture proves worker/dispatcher completion; later Vulkan
+fixtures must additionally prove actual GPU completion. Compile-only success
+proves neither native lifecycle execution nor GPU execution.
 
 ## Delivery plan
 
@@ -269,33 +321,34 @@ thread constraints, and teardown. Compile-only success proves no GPU execution.
   roots safely while retaining independent examples and private lifecycle tests.
 - **Scope:** one bounded fixture integration, its owning suite, harness coverage,
   catalog declaration, and ownership/run instructions in the same PR.
-- **Phase:** deferred until concrete graphics interfaces exist and Q-1 is settled.
+- **Phase:** shared native verification, delivered through GLFW-7.
 - **Depends on:** TEST-1.
-- **External gates:** the relevant production backend/ownership APIs exist and
-  Q-1 is settled with the owner before this child is drafted.
-- **Ordering:** later; this slice does not authorize building the backend.
-- **Relevant decisions:** D-1 through D-6.
+- **External gates:** GLFW-1/GLFW-2 before implementation. Q-1 is settled by D-7;
+  draft/link the single GLFW-7 issue through the GLFW design's processor.
+- **Ordering:** owned by GLFW-7; this slice does not authorize building the backend.
+- **Relevant decisions:** D-1 through D-7.
 - **Acceptance signals:** the harness and real-backend evidence described above,
   accurate selected-group results, and independent headless execution.
 - **Out of scope:** a general fixture framework, cross-process handle reuse,
-  scheduler integration, or implementing unrelated graphics features.
-- **Open questions:** Q-1; settle before drafting this implementation issue.
+  scheduler integration, Vulkan fixtures/GPU completion implementation, or
+  implementing unrelated graphics features.
+- **Open questions:** none.
 
 ## Processing handoff
 
-The two delivery slices above are ready within their stated gates; no issues
-have been filed for them. Process EPIC first, then exactly one eligible child per
-invocation, with separate approval for each tracker artifact. TEST-1 can be
-drafted while its external work continues, but cannot be solved before those
-implementations merge. Deferred CI-5 does not block it.
+EPIC #49 and TEST-1 #50 are already linked; TEST-1 is implemented. Checking its
+stale checkbox in #49 is separate housekeeping requiring its own approval, not
+a prerequisite for GLFW-7 and not part of the TEST-2 adoption edit.
 
-Keep TEST-2 deferred until its production interfaces and owner-approved Q-1
-choices exist; return to this design to record those choices and review that
-slice before processing it. Do not silently choose a fixture/thread model or
-draft a placeholder implementation issue. The epic's full completion still
-requires the graphics outcome; TEST-1 alone does not complete it.
+Process GLFW-7 once through the ready GLFW design. Then run
+`process-design-doc` separately over this document and present an existing-issue
+disposition for TEST-2 with GLFW-7's actual issue number. Its approved epic edit
+replaces TEST-2's unresolved-design gate with GLFW-7 ownership and GLFW-1/GLFW-2
+implementation prerequisites, records D-7's thread model and the Vulkan arc's
+separate GPU obligations, and keeps TEST-2 unchecked. Only then update this
+ledger to link that existing issue. Do not file a second implementation.
 
-Recheck the foundation arc before processing TEST-2: if its first graphics PR
-already owns this exact fixture outcome, link that work rather than create a
-duplicate. Required code, tests, contracts, and evidence travel together in each
-implementation PR.
+Code, tests, documentation, and required Linux/local-macOS evidence belong in
+GLFW-7's one PR. On verified completion, check TEST-2 under #49; the epic's
+remaining completion criteria still apply. No source-document link alone proves
+delivery.

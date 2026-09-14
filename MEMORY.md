@@ -300,15 +300,52 @@ not a verdict that Synarchy's design should be discarded.
   application integration (RT-6, #60) in
   `Hetoimasia.Runtime.Application.runScopedApplication`; `runApplication` stays
   the thin runner that only logs around an `IO` action.
-- Runtime epic #52 and all eight children #53–#60 are filed and approved as of
-  2026-09-13. Issue-review amendments are part of each implementation spec.
-  Solve #53 → #54 → #55, then #56 → #57 alongside #58, then #59 → #60.
-  Use normal freshness/claim gates; do not create duplicate runtime issues or
+- Runtime epic #52's eight children #53–#60 are merged, along with supervision
+  repairs #69 / PR #71 and #70 / PR #72. Review at `8979877` on 2026-09-13
+  found no remaining blocking repair: local build, 298 engine and 262 workflow
+  Hspec examples, both smoke modes, and the two original evidence-loss
+  reproductions pass; current-master Linux CI is green. Review coverage includes
+  PRs #61–#68 and #71–#72. The owner requested completion housekeeping;
+  epic #52 is closed with its checklist complete. Do not create duplicate runtime issues or
   reopen accepted D-13 through D-18 decisions. Workers keep borrowed dependencies
   alive until completion; supervision uses checkpoints and supervised waits;
   logging finalization has its own IO lifetime outside controlled releases.
   Application services remain application-owned and immutable. Messaging and
   independent GLFW work still need their own designs before Vulkan.
+- Messaging design started in [docs/messaging_design.md](docs/messaging_design.md)
+  against `8979877`, with Synarchy `fe225c5` inspected read-only. It is now
+  `ready for issue processing`, by owner signoff on 2026-09-13 (D-12):
+  the owner approved typed bounded FIFO channels plus latest-value snapshots,
+  deferring broadcast/request-reply; ordinary sends report Full immediately with
+  waiting explicitly selected; close preserves backlog and explicit abort discards
+  it (D-4 through D-6). Publication requires opaque payloads prepared to normal
+  form through NFData in producer IO (D-7). Snapshots start with an initial value,
+  use independent opaque cursors checked against snapshot identity, retain the
+  final value after close, and deliver an unseen final publication before EOF
+  (D-8). Initial telemetry is atomic counters, with timestamps and queue-age
+  measurement deferred (D-9). The owner also approved explicit graceful finish
+  (close, process accepted work, acknowledge drain, request stop, await cleanup),
+  aborting backlog on ordinary stop without replaying in-flight effects (D-10),
+  and the optional reusable runtime adapter for supervised inbox services (D-11).
+  All eight behavioral questions are resolved. Six delivery slices cover
+  payload preparation, an additive STM origin-aware failure helper, FIFO,
+  snapshots, supervised inbox startup/stop, and acknowledged graceful finish.
+  Cross-agent feedback was checked against the code and installed GHC/STM
+  sources: MSG-3 needs MSG-1 only; MSG-2 gates the snapshot cursor check in MSG-4.
+  The accepted design makes startup handoff non-retrying after acknowledgement,
+  closes inbox admission before component teardown, counts aborts from depth
+  without traversing backlog, and preserves prepared handles through reads.
+  P-8 specifies a private ordinary-stop exit record: MSG-5 exposes cumulative
+  discards only, and MSG-6 adds drain state with the actual finish protocol.
+  An escaping synchronous handler exception terminates dispatch and follows the
+  existing worker/supervisor failure policy; only explicit safe recovery inside
+  the handler can continue. There is no per-message catch-and-continue or replay.
+  Cancellation/cleanup failure retains its original completion instead of
+  fabricating an ordinary result. STM failure origin matches the engine annotation,
+  without promising the IO throw primitive's additional backtrace.
+  The corrected specification and split are approved for processing; the tracker
+  readiness recheck found no overlapping arc. No messaging issues or implementation
+  have been created, and the design remains unpublished.
 - The owner wants Synarchy's solid GLFW integration preserved deliberately.
   The backend design records its existing window/callback, resize, Vulkan
   synchronization, and shared-scope test decisions as reuse evidence.
