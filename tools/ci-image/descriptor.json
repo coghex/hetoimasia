@@ -1,0 +1,11 @@
+{
+  "architecture": "amd64",
+  "cabal": "3.16.1.0",
+  "digest": "sha256:c27b23a913d45053e8995444f66a98d16b8bb4cdcacc0b898849029f5b8ea7fb",
+  "ghc": "9.12.2",
+  "native_manifest": "aa870b72e97cfb3c83af885e1cd52080fa0258acb2b9e0ffede13bbbaa40c80d",
+  "platform": "linux",
+  "recipe_fingerprint": "21b45922a31a77e23b3c7672b8f4148dcd25264f1ff1bdb0822ba30aaaab998b",
+  "reference": "ghcr.io/coghex/hetoimasia-ci",
+  "schema_version": 1
+}
