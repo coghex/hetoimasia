@@ -4,18 +4,20 @@ Current behavior of `Hetoimasia.Foundation.Messaging.Payload`, the prepared
 payload boundary every messaging transport accepts, and of
 `Hetoimasia.Foundation.Messaging.Channel`, the bounded FIFO channel that carries
 prepared payloads, and of `Hetoimasia.Foundation.Messaging.Snapshot`, the
-latest-value snapshot read through checked cursors. The accepted contract is epic #73; this document describes
-what the code does today.
+latest-value snapshot read through checked cursors, and of
+`Hetoimasia.Runtime.Inbox`, the optional runtime adapter that runs a supervised
+service with one inbox. The accepted contract is epic #73; this document
+describes what the code does today.
 
 Scope: preparing a payload to normal form on the producer's thread, reading and
 forwarding a prepared payload, what a preparation failure does, and what a
 client cannot do to a prepared handle; then creating a bounded channel, sending
 and receiving, closing and aborting it, its counters, where waiting on it is
 safe, and which endpoint may do what; then publishing a latest value, reading and
-waiting through cursors, closing a snapshot, and the cursor-mismatch failure.
-The runtime inbox adapter arrives in a later slice of the same arc and is not
-described here. The
-transactional failure companion is described in
+waiting through cursors, closing a snapshot, and the cursor-mismatch failure;
+then starting and stopping a supervised inbox service. Graceful finish and drain
+acknowledgement arrive in a later slice of the same arc and are not described
+here. The transactional failure companion is described in
 [failures.md](failures.md).
 
 ## Public interface
@@ -409,6 +411,169 @@ cursor mismatch, inside STM.
 | Record update of `snapshotReader` | It is a function, not a record field |
 | `coerce` between endpoint, observation, or cursor types | Every role is nominal |
 
+## Supervised inbox services
+
+```haskell
+data InboxDefinition a                   -- abstract; role nominal
+inboxDefinition ∷ Text → Integer → (StopToken → Scoped context)
+                → (context → Prepared a → IO ()) → InboxDefinition a
+data InboxPolicy = InboxPolicy
+  { inboxDisposition ∷ Disposition, inboxPolicyComponent ∷ Component
+  , inboxClassifier ∷ ExceptionWithContext SomeException → IO Recognition }
+
+startInboxService ∷ RuntimeControl → InboxPolicy → InboxDefinition a → IO (InboxStart a)
+data InboxStart a = InboxStarted (InboxService a)
+                  | InboxStartUnavailable (ExceptionWithContext SomeException)
+                  | InboxStartRejected
+
+data InboxService a                      -- abstract; role nominal
+inboxSender          ∷ InboxService a → Sender a
+stopInboxService     ∷ InboxService a → IO ()
+cancelInboxService   ∷ InboxService a → IO ()
+inboxStatus          ∷ InboxService a → STM WorkerStatus
+inboxCompletion      ∷ InboxService a → STM (Maybe (Completion InboxExit))
+awaitInboxCompletion ∷ InboxService a → STM (Completion InboxExit)
+
+data InboxExit                           -- abstract
+inboxDiscarded ∷ InboxExit → Natural
+
+data InboxInvariantViolated = HandoffEmpty | HandoffAlreadyWritten | InboxEndedWhileRunning
+```
+
+`Hetoimasia.Runtime.Inbox` lives in the runtime package and is optional:
+channels work without it, and component protocols and handlers stay with their
+components. It starts one supervised `Service` through `startSupervised` and
+the worker's own `Scoped` startup, with the owner's disposition, warning
+component, and classifier. It is not a second runner, supervisor, thread
+registry, restart policy, or scheduler, and it changes no supervision or worker
+contract.
+
+### Roles and endpoints
+
+The application holds the `InboxService` handle and gives producers only its
+`Sender`. The worker receives its own `StopToken`, passed to the context
+startup, and the context that startup built, passed to the handler; it never
+receives the application's `RuntimeControl`. The handle exposes the endpoint,
+stop, cancel, status, and completion reads and nothing else. Its constructor,
+the supervised worker inside it, the definition's constructor, and the handoff
+are private.
+
+### Startup order
+
+Inside the worker's startup, on the worker's thread:
+
+1. The component context and every resource it owns are constructed.
+2. The inbox is allocated with `newChannel` and the definition's capacity, and
+   its abort is registered as the release of that allocation — the innermost
+   one, so reverse scope order ends admission and drops the backlog before any
+   component resource is released. No allocation follows it.
+3. The inbox's control endpoint is written into a private one-shot handoff.
+
+Only then does the worker acknowledge startup. A capacity `newChannel` rejects
+is a startup failure raised after the context was built, which is released.
+
+### Handoff
+
+`startSupervised` returns `WorkerStarted` only after acknowledgement, so the
+handoff is already full when the adapter reads it. It reads it once, with a
+read that never retries, and starts no second readiness wait. An empty handoff,
+or a startup that finds its handoff already written, raises
+`InboxInvariantViolated` through `throwFailure` with the `runtime.inbox`
+component, the `inbox-handoff` operation, and the service label. An invariant
+failure or an owner cancellation during that read leaves the started worker
+registered with its group, which stops and drains it on exit.
+
+### Failed starts
+
+| Start | Returned or raised | Component construction and release |
+|---|---|---|
+| Registration closed | `InboxStartRejected` | Nothing runs |
+| Recognized failure of an optional service, during startup or as it acknowledged | `InboxStartUnavailable` with the failure, and its one warning | What was constructed is released |
+| Required, unrecognized, or cleanup failure during startup | Propagates as from `startSupervised`, with its type, context, and evidence | What was constructed is released |
+| Owner cancellation of the start | Propagates as cancellation after the worker drained | What was constructed is released |
+
+None of these exposes an endpoint. A failure or cancellation while the context
+is being constructed happens before the inbox exists; the inbox is closed during
+component release wherever its allocation had succeeded. Once the start has
+returned an endpoint, a cancellation delivered before dispatch begins still
+closes that endpoint before the component is torn down, and keeps its
+`Cancelled` completion.
+
+### Dispatch
+
+The service handles one `Prepared` message at a time. The stop check and the
+receive are one STM choice, `awaitStopRequest` `orElse` `awaitReceive`, so a
+requested stop wins when a message is simultaneously ready. The handler runs
+outside STM. A message a committed receive selected is in flight: a stop cannot
+retract its effects, the handler runs to its end, and nothing retries it. A
+stuck handler keeps the worker, and its resources and borrowed dependencies,
+alive under the group's drain; there is no deadline or detach.
+
+### Abort on stop and on failure
+
+Every exit from the service aborts the inbox — admission ends and pending
+references are dropped — before the component's resources are released and
+before the terminal completion is published:
+
+- an ordinary stop, whether requested with `stopInboxService` or by closing
+  when the application action returns;
+- a synchronous handler failure;
+- cancellation, including cancellation before the run loop begins;
+- an exit straight after acknowledgement.
+
+The safeguard is the inbox allocation's release. It runs under
+`uninterruptibleMask_`, executes no `retry`, waits for nothing, invokes no
+handler, logs nothing, joins no worker, and uses the channel's counter-based
+`abortChannel` rather than traversing the backlog it drops. An ordinary stop
+aborts once more inside the run, before reading the exit record; the release's
+second abort is idempotent.
+
+### Handler failures and recovery
+
+A synchronous exception escaping the handler ends dispatch; the next queued
+message is not handled. The exception fails the run with its original type and
+context after the abort and the scope's cleanup, and supervision decides:
+
+- a recognized failure of an optional service makes it unavailable, with its
+  single warning;
+- a required or unrecognized failure is fatal;
+- a retained cleanup failure is fatal.
+
+There is no per-message isolation, catch-and-continue, warning-and-skip, or
+replay. A handler that can recover — explicitly, for instance with
+`recover` from [recovery.md](recovery.md) — does so before the exception
+escapes; returning normally lets dispatch continue with the next message.
+
+### The exit record
+
+On an ordinary stop the service aborts its inbox and then, in the same
+transaction, reads the channel's cumulative discarded count into an
+`InboxExit`, which is the run's result. The count is the channel's cumulative
+counter, not the latest abort's return value. `InboxExit` is immutable, its
+constructor is private, and `inboxDiscarded` is an ordinary function, so no
+client builds or updates one.
+
+It records nothing else. Accepted backlog is **not** processed on stop in this
+slice: it is discarded and counted. The record has no drain count and no drain
+acknowledgement.
+
+### Completion observation
+
+`inboxCompletion` and `awaitInboxCompletion` read the typed completion without
+consuming it; repeated reads return the same value. They compose with
+`awaitSupervised` inside supervision, where a latched fatal failure may be
+delivered instead, and remain readable after the boundary drained.
+
+| Exit | Completion result | Supervision status |
+|---|---|---|
+| Ordinary stop with successful cleanup, including closing's stop | `Succeeded InboxExit` | `WorkerStopped` |
+| Handler failure | `Failed` with the handler's exception | Unavailable or fatal, by policy |
+| Cleanup failure after a stop | `Failed` with the cleanup evidence | Fatal |
+| Cancellation | `Cancelled` | `WorkerStopped` when the owner asked, otherwise by policy |
+
+No `InboxExit` is manufactured for a failure, cancellation, or cleanup failure,
+and `WorkerStopped` alone is not read as an ordinary exit.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime and reset |
@@ -421,6 +586,9 @@ cursor mismatch, inside STM.
 | Snapshot revision | The snapshot, controlled by the `SnapshotPublisher` holder | Written with the value by `publish`; read with it | Any thread holding an endpoint | Zero at construction; advanced only by publication; never reset, never wraps |
 | Snapshot terminal flag | The snapshot, controlled by the `SnapshotPublisher` holder | `closeSnapshot` writes; `publish` and `awaitSnapshot` read | Any thread holding an endpoint | Open until the first close; never reopens |
 | Reader's last revision | The reader holding the cursor | That reader alone, by keeping or replacing its cursor | The reader's thread | As long as the reader keeps the cursor; the snapshot stores no copy and no registry |
+| Service handoff | The inbox service's start | The worker's startup writes it once, as its last step; the starter reads it once, without waiting, after `WorkerStarted` | Worker writes; application thread reads | One start; never cleared; dropped with the start |
+| Service inbox | The inbox service's worker, through its startup scope | Producers send through the `Sender`; the dispatch loop receives; the run and the abort release abort | Producers' threads; the worker | The worker's startup scope; aborted on every exit, never reopened |
+| Ordinary stop exit record | The inbox service's worker | The run returns it once after the stop's abort; any number of completion readers | Worker writes; any thread reads, in STM | Published with the completion; immutable, never consumed or reset |
 
 The payload module owns no other state and no STM operation. Each channel owns
 only its own three rows; nothing is shared between channels, and there is no
@@ -446,6 +614,12 @@ The snapshot module follows the same guide. It takes no logger:
 one failure, a cursor mismatch, propagates to the misusing caller with its
 engine origin. Its representation stays behind abstract endpoints,
 observations, and cursors, and its state rows are documented above.
+
+The inbox adapter follows the same guide. It takes no logger: optional
+unavailability is warned about once by supervision, and its one failure of its
+own, `InboxInvariantViolated`, propagates with its engine origin. Its handle,
+definition, and exit record are abstract, and its state rows are documented
+above.
 
 ## Verification
 
@@ -553,6 +727,41 @@ select. They cover:
   `SnapshotReader` each rejected for its named cause, and a linked client using
   every publish, read, wait, and close operation, the observation readers, and
   the cursor-mismatch failure.
+
+The inbox adapter's examples live under `Runtime`, in
+`test/Test/Engine/Runtime/Inbox.hs`, with their external clients in
+`test/Test/Engine/Runtime/Opacity.hs`; `--match Runtime` selects them, and
+`--match 'Inbox'` selects only them. Each uses real `withSupervision`,
+`startInboxService`, and `awaitSupervised` over a collecting logging lifetime.
+A component context's traced release records whether the inbox still admits a
+message through the returned endpoint. Handlers signal entry through `MVar`s
+and wait on gates, and closing's drain is detected with `awaitBlockedOnSTM`; no
+example sleeps. They cover:
+
+- a required context failure, a rejected start, an optional recognized context
+  failure, and owner cancellation during construction, each exposing no
+  endpoint, with the context released and nothing constructed for the
+  rejection;
+- a start returning a usable endpoint, and a service stopped straight after
+  acknowledgement closing its inbox before teardown;
+- an ordinary stop and closing's stop each aborting a full backlog before
+  component release, retaining `Succeeded InboxExit` with the discard count
+  across repeated reads;
+- a stop winning over a simultaneously ready message, and an in-flight message
+  finishing once without being retried;
+- a handler exception with messages queued, which are never handled: fatal with
+  its type and context for a required service and for an unrecognized optional
+  one, unavailable with one warning for a recognized optional one, and an
+  explicitly recovering handler letting the next message be handled;
+- cancellation and cleanup failure keeping their `Cancelled` and `Failed`
+  completions with no exit record;
+- a borrowed dependency usable by the handler and by component release, and
+  released only after the drain;
+- external clients: record update of `inboxSender`, naming the `InboxService`,
+  `InboxDefinition`, or `InboxExit` constructor, taking a service from
+  `InboxStartUnavailable`, and record update of `inboxDiscarded` each rejected
+  for its named cause, and a linked client that starts a service, sends, stops
+  it, and prints its discard count.
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

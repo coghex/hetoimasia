@@ -3,7 +3,8 @@
 -- The thin runner, the application lifecycle, the console executable's startup
 -- and exit mapping, the logging
 -- lifetime, the recovery and terminal-failure reporting adapter, worker
--- supervision, and the supervised handle's package boundary sit under
+-- supervision, the supervised inbox adapter, and the supervised and inbox
+-- handles' package boundaries sit under
 -- the @Runtime@ group this module roots, so @--match Runtime@ selects the
 -- component and nothing else.
 module Test.Engine.Runtime.Spec (spec) where
@@ -11,6 +12,7 @@ module Test.Engine.Runtime.Spec (spec) where
 import qualified Test.Engine.Runtime.Application as Application
 import qualified Test.Engine.Runtime.Composition as Composition
 import qualified Test.Engine.Runtime.Console as Console
+import qualified Test.Engine.Runtime.Inbox as Inbox
 import qualified Test.Engine.Runtime.Lifetime as Lifetime
 import qualified Test.Engine.Runtime.Opacity as Opacity
 import qualified Test.Engine.Runtime.Reporting as Reporting
@@ -22,6 +24,7 @@ spec = describe "Runtime" $ do
   Application.spec
   Composition.spec
   Console.spec
+  Inbox.spec
   Lifetime.spec
   Opacity.spec
   Reporting.spec

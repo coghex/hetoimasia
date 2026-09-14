@@ -129,6 +129,7 @@ test-suite hetoimasia-tests
         Test.Engine.Runtime.Application
         Test.Engine.Runtime.Composition
         Test.Engine.Runtime.Console
+        Test.Engine.Runtime.Inbox
         Test.Engine.Runtime.Lifetime
         Test.Engine.Runtime.Opacity
         Test.Engine.Runtime.Reporting
