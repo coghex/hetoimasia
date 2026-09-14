@@ -753,8 +753,12 @@ example sleeps. They cover:
   its type and context for a required service and for an unrecognized optional
   one, unavailable with one warning for a recognized optional one, and an
   explicitly recovering handler letting the next message be handled;
-- cancellation and cleanup failure keeping their `Cancelled` and `Failed`
-  completions with no exit record;
+- a cancellation delivered after the handoff returned and before any message
+  was dispatched — once the worker parks in its first receive — closing the
+  returned endpoint before teardown and keeping its `Cancelled` completion,
+  judged an unexpected termination, with no handler run;
+- an in-flight cancellation and a cleanup failure keeping their `Cancelled` and
+  `Failed` completions with no exit record;
 - a borrowed dependency usable by the handler and by component release, and
   released only after the drain;
 - external clients: record update of `inboxSender`, naming the `InboxService`,

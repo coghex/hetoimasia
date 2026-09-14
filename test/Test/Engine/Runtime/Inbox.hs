@@ -13,7 +13,7 @@
 -- stops an example that has already hung.
 module Test.Engine.Runtime.Inbox (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
@@ -39,11 +39,12 @@ import Hetoimasia.Foundation.Log (LogEntry)
 import Hetoimasia.Foundation.Messaging.Channel (SendResult (..), Sender, send)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext, withScoped)
-import Hetoimasia.Foundation.Worker (Completion (..), Result (..))
+import Hetoimasia.Foundation.Worker (Completion (..), Requested (..), Result (..), RunEnd (..), RunExit (..))
 import Hetoimasia.Runtime.Inbox
 import Hetoimasia.Runtime.Supervision
   ( Disposition (..)
   , Recognition (..)
+  , UnexpectedWorkerTermination (..)
   , WorkerStatus (..)
   , awaitSupervised
   , checkRuntime
@@ -111,7 +112,9 @@ spec = describe "Inbox services" $ do
       (boundedSupervision testHandlerRecovers)
 
   describe "Failure evidence" $ do
-    it "keeps a cancellation's completion without an exit record"
+    it "closes the endpoint before teardown for a cancellation after the handoff and before any dispatch"
+      (boundedSupervision testCancellationBeforeDispatch)
+    it "keeps an in-flight cancellation's completion without an exit record"
       (boundedSupervision testCancellationEvidence)
     it "keeps a cleanup failure's completion without an exit record"
       (boundedSupervision testCleanupFailureEvidence)
@@ -478,6 +481,43 @@ testHandlerRecovers = do
     >>= (`shouldBe` ["acquire context", "handle 1", "recovered transient", "handle 2", "release context: inbox closed"])
 
 -- Failure evidence -------------------------------------------------------------
+
+testCancellationBeforeDispatch ∷ Expectation
+testCancellationBeforeDispatch = do
+  trace ← newTrace
+  probe ← newEmptyMVar
+  workerThread ← newEmptyMVar
+  retained ← newIORef Nothing
+  let noting =
+        inboxDefinition
+          "inbox"
+          4
+          (\_ → probedContext trace probe >> liftIO (myThreadId >>= putMVar workerThread))
+          (handling trace ignore)
+  ExceptionWithContext _ raised ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \control → do
+      started ← startedWith probe =<< startInboxService control requiredInbox noting
+      writeIORef retained (Just started)
+      -- The handoff has returned and no message was ever sent: once the worker
+      -- parks in its first receive, a cancellation lands before any dispatch.
+      -- An owner's cancellation is also a stop request, which that receive
+      -- could honour first, so the cancellation is delivered to the thread.
+      thread ← readMVar workerThread
+      awaitBlockedOnSTM thread
+      throwTo thread ThreadKilled
+      _ ← awaitSupervised control (awaitInboxCompletion started)
+      pure ()
+  case fromException raised of
+    Just (UnexpectedWorkerTermination _) → pure ()
+    Nothing → expectationFailure "expected the cancellation to be judged an unexpected termination"
+  Just started ← readIORef retained
+  completion ← atomically (awaitInboxCompletion started)
+  completionExit completion `shouldBe` RunExited RunCancelled NothingRequested
+  case completionResult completion of
+    Cancelled (ExceptionWithContext _ cancellation) → fromException cancellation `shouldBe` Just ThreadKilled
+    _ → expectationFailure ("expected a cancelled completion, found " <> Text.unpack (resultName completion))
+  exitOf completion `shouldBe` Nothing
+  traced trace >>= (`shouldBe` ["acquire context", "release context: inbox closed"])
 
 testCancellationEvidence ∷ Expectation
 testCancellationEvidence = do
