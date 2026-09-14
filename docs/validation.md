@@ -397,6 +397,12 @@ Before executing anything, a worker verifies that its environment is the planned
 image and links a native consumer against the image's GLFW; see
 [Planning and verifying against the image](#planning-and-verifying-against-the-image).
 It installs nothing: no `apt`, no GHC, and no GLFW build happens in a worker.
+Every container job runs with Docker's `--init`, so an init process as PID 1
+reaps orphaned descendants the way the hosted runner's own init does: without
+it, a process group the runner killed on a timeout would leave zombies that
+still answer a liveness probe. Each container job also records its workspace as
+a Git `safe.directory` before its first Git read, because the job runs as root
+over a checkout the runner's user owns.
 
 Two caches are restored, both inside the environment boundary the plan declares
 and both keyed on inputs a Markdown edit cannot change; see

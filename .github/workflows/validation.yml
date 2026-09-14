@@ -300,6 +300,10 @@ jobs:
     # build happens here.
     container:
       image: ${{ needs.plan.outputs.image }}
+      # An init process as PID 1 reaps orphaned descendants, as the hosted
+      # runner's own init does. Without it a process group the runner killed
+      # on a timeout leaves zombies that still answer a liveness probe.
+      options: --init
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -505,6 +509,10 @@ jobs:
       contents: read
     container:
       image: ${{ needs.plan.outputs.image }}
+      # An init process as PID 1 reaps orphaned descendants, as the hosted
+      # runner's own init does. Without it a process group the runner killed
+      # on a timeout leaves zombies that still answer a liveness probe.
+      options: --init
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -668,6 +676,10 @@ jobs:
       contents: read
     container:
       image: ${{ needs.plan.outputs.image }}
+      # An init process as PID 1 reaps orphaned descendants, as the hosted
+      # runner's own init does. Without it a process group the runner killed
+      # on a timeout leaves zombies that still answer a liveness probe.
+      options: --init
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
