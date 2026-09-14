@@ -1,6 +1,7 @@
--- | Examples proving that 'Hetoimasia.Foundation.Resource.Scoped' and
--- 'Hetoimasia.Foundation.Resource.CleanupFailure' are opaque to a client
--- outside the package.
+-- | Examples proving that 'Hetoimasia.Foundation.Resource.Scoped',
+-- 'Hetoimasia.Foundation.Resource.CleanupFailure', and the collection types of
+-- "Hetoimasia.Foundation.Resource.Collection" are opaque to a client outside
+-- the package.
 --
 -- The other resource examples import the foundation directly, so they share
 -- this test suite's own module environment and cannot observe what the package
@@ -11,19 +12,23 @@
 -- library's @exposed-modules@ and each module's export list allow, which is the
 -- boundary the opacity claim is about.
 --
--- Eight clients are compiled, three for the scope facade and five for retained
--- cleanup evidence. Six must be rejected, and each is checked against the
--- specific diagnostic that names the rejection's cause, so a missing package,
--- an absent compiler, or an unrelated error can never be mistaken for the
--- guarantee holding. Two must be accepted, linked, and run, which is both the
--- control proving the environment is sound and the evidence that closing each
--- representation left the supported readers, runners, and allocators usable.
+-- Fifteen clients are compiled: three for the scope facade, five for retained
+-- cleanup evidence, and seven for the resource collection. Twelve must be
+-- rejected, and each is checked against the specific diagnostic that names the
+-- rejection's cause, so a missing package, an absent compiler, or an unrelated
+-- error can never be mistaken for the guarantee holding. Three must be
+-- accepted, linked, and run, which is both the control proving the environment
+-- is sound and the evidence that closing each representation left the
+-- supported readers, runners, and allocators usable.
 --
--- The two boundaries are closed for the same reason but protect different
--- claims. A rewritten scope would resume a continuation; a rewritten evidence
--- entry would put two payloads behind one 'CleanupFailureId', and inspection
--- expands a repeated identity's carried context only the first time it is
--- seen, so the evidence reachable only through the replacement would be lost.
+-- The boundaries are closed for the same reason but protect different claims.
+-- A rewritten scope would resume a continuation; a rewritten evidence entry
+-- would put two payloads behind one 'CleanupFailureId', and inspection expands
+-- a repeated identity's carried context only the first time it is seen, so the
+-- evidence reachable only through the replacement would be lost. A forged or
+-- recast collection token, or a member's release reached from outside, would
+-- let a client release a member the collection still owns, or borrow a value
+-- at a type it was never acquired at.
 --
 -- These are Hspec examples rather than a probe: the work is running a process
 -- and asserting on its output, which this suite already does elsewhere.
@@ -64,6 +69,7 @@ spec ∷ Spec
 spec = do
   scopedSpec
   cleanupEvidenceSpec
+  collectionSpec
 
 scopedSpec ∷ Spec
 scopedSpec = describe "Scoped opacity across the package boundary" $ do
@@ -163,6 +169,87 @@ cleanupEvidenceSpec =
                      , "carried by outer = buried"
                      , "reattached = inner buried outer"
                      , "outer alone = buried outer"
+                     ]
+
+collectionSpec ∷ Spec
+collectionSpec =
+  describe "Collection opacity across the package boundary" $ do
+    it "rejects a client that names the collection constructor" $
+      withClient "Client.hs" (collectionConstructorClient "Collection (Collection)" "Collection") $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "does not export any children"
+        clientOutput outcome `shouldContain` "Collection"
+
+    it "rejects a client that names the member token constructor" $
+      withClient "Client.hs" (collectionConstructorClient "Member (Member)" "Member") $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "does not export any children"
+        clientOutput outcome `shouldContain` "Member"
+
+    it "rejects a client that rewrites a collection with record update" $
+      withClient "Client.hs" collectionUpdateClient $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "Not in scope: record field"
+        clientOutput outcome `shouldContain` "liveMemberCount"
+
+    it "rejects a client that rewrites a member token with record update" $
+      withClient "Client.hs" memberUpdateClient $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "Not in scope: record field"
+        clientOutput outcome `shouldContain` "memberStatus"
+
+    it "rejects a client that coerces a member token to another type with the same representation" $
+      withClient "Client.hs" memberCoercionClient $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "Couldn't match type"
+        clientOutput outcome `shouldContain` "coerce"
+
+    it "rejects a client that reaches for a member's release through the implementation module" $
+      withClient "Client.hs" releaseExtractionClient $ \compile → do
+        outcome ← compile Typecheck
+        case clientStatus outcome of
+          ExitFailure _ → pure ()
+          ExitSuccess →
+            expectationFailure
+              ("the client compiled, so a member's release is reachable:\n" <> clientOutput outcome)
+        -- The one environment-looking diagnostic this case expects: the
+        -- module is found in the built package and refused as hidden.
+        clientOutput outcome `shouldContain` "hidden module"
+        clientOutput outcome `shouldContain` "hetoimasia-foundation"
+        clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+    it "accepts and runs a client using only the public collection operations" $
+      withClient "Main.hs" collectionClient $ \compile → do
+        outcome ← compile Link
+        case clientStatus outcome of
+          ExitSuccess → pure ()
+          status →
+            expectationFailure
+              ( "the supported client must compile, but the compiler exited with "
+                  <> show status
+                  <> ":\n"
+                  <> clientOutput outcome
+              )
+        (status, out, err) ←
+          readCreateProcessWithExitCode
+            (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+            ""
+        status `shouldBe` ExitSuccess
+        err `shouldBe` ""
+        lines out
+          `shouldBe` [ "acquire left"
+                     , "acquire middle"
+                     , "acquire right"
+                     , "borrow left+right"
+                     , "in use = RetirementInUse"
+                     , "release middle"
+                     , "retired = Retired"
+                     , "again = AlreadyRetired"
+                     , "live = 2"
+                     , "release right"
+                     , "release left"
+                     , "middle after exit = retired"
+                     , "left after exit = retired"
                      ]
 
 -- | A compiled client: how the compiler exited, everything it said, and the
@@ -536,4 +623,132 @@ evidenceClient =
     , "    _ → do"
     , "      hPutStrLn stderr (\"unexpected evidence: \" <> labelsOf retained)"
     , "      exitFailure"
+    ]
+
+-- | A client that imports one collection type together with its constructor.
+collectionConstructorClient ∷ String → String → String
+collectionConstructorClient imported typeName =
+  unlines
+    [ "module Client (named) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.Collection (" <> imported <> ")"
+    , ""
+    , "named ∷ Maybe " <> typeName <> (if typeName == "Member" then " ()" else "")
+    , "named = Nothing"
+    ]
+
+-- | A client that imports the collection's reader by name and tries to replace
+-- it through record-update syntax.
+collectionUpdateClient ∷ String
+collectionUpdateClient =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.Collection (Collection, liveMemberCount)"
+    , ""
+    , "rewritten ∷ Collection → Collection"
+    , "rewritten collection = collection { liveMemberCount = pure 0 }"
+    ]
+
+-- | A client that imports a token's reader by name and tries to replace it
+-- through record-update syntax.
+memberUpdateClient ∷ String
+memberUpdateClient =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.Collection (Member, MemberStatus (MemberLive), memberStatus)"
+    , ""
+    , "rewritten ∷ Member () → Member ()"
+    , "rewritten member = member { memberStatus = pure MemberLive }"
+    ]
+
+-- | A client that recasts a token through 'Data.Coerce.coerce' between two
+-- types sharing a representation. Without a nominal role this would compile,
+-- because coercing under a type constructor needs no constructor in scope.
+memberCoercionClient ∷ String
+memberCoercionClient =
+  unlines
+    [ "module Client (recast) where"
+    , ""
+    , "import Data.Coerce (coerce)"
+    , "import Hetoimasia.Foundation.Resource.Collection (Member)"
+    , ""
+    , "newtype Celsius = Celsius Double"
+    , ""
+    , "recast ∷ Member Celsius → Member Double"
+    , "recast = coerce"
+    ]
+
+-- | A client that reaches for the ledger release primitive a member's release
+-- is stored with. The public module exports no release, so the only route to
+-- one is the implementation module, which the package hides.
+releaseExtractionClient ∷ String
+releaseExtractionClient =
+  unlines
+    [ "module Client (release) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.Internal (Ledger, releaseAcquired)"
+    , ""
+    , "release ∷ Ledger → IO ()"
+    , "release ledger = () <$ releaseAcquired ledger"
+    ]
+
+-- | A client using only the public collection operations. It reports its
+-- acquisitions, a nested borrow, the retirement outcomes, and each release in
+-- order, then the terminal state of tokens it retained past the scope.
+collectionClient ∷ String
+collectionClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Data.Text (Text, pack, unpack)"
+    , "import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, withScoped)"
+    , "import Hetoimasia.Foundation.Resource.Collection"
+    , "  ( Member"
+    , "  , MemberStatus (..)"
+    , "  , acquireMember"
+    , "  , allocCollection"
+    , "  , liveMemberCount"
+    , "  , memberStatus"
+    , "  , retireMember"
+    , "  , withMember"
+    , "  )"
+    , ""
+    , "member ∷ String → Assembly Text"
+    , "member name ="
+    , "  acquirePart"
+    , "    (pack name)"
+    , "    (releaseRank 0)"
+    , "    (putStrLn (\"acquire \" <> name) >> pure (pack name))"
+    , "    (\\held → putStrLn (\"release \" <> unpack held))"
+    , ""
+    , "describeStatus ∷ MemberStatus → String"
+    , "describeStatus status = case status of"
+    , "  MemberLive → \"live\""
+    , "  MemberRetired → \"retired\""
+    , "  MemberRetirementFailed _ → \"failed\""
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  (middle, left) ← withScoped (allocCollection 3) $ \\collection → do"
+    , "    left ← acquireMember collection (member \"left\")"
+    , "    middle ← acquireMember collection (member \"middle\")"
+    , "    right ← acquireMember collection (member \"right\")"
+    , "    joined ← withMember collection left $ \\l →"
+    , "      withMember collection right $ \\r → pure (unpack l <> \"+\" <> unpack r)"
+    , "    putStrLn (\"borrow \" <> joined)"
+    , "    inUse ← withMember collection middle (\\_ → retireMember collection middle)"
+    , "    putStrLn (\"in use = \" <> show inUse)"
+    , "    retired ← retireMember collection middle"
+    , "    putStrLn (\"retired = \" <> show retired)"
+    , "    again ← retireMember collection middle"
+    , "    putStrLn (\"again = \" <> show again)"
+    , "    live ← liveMemberCount collection"
+    , "    putStrLn (\"live = \" <> show live)"
+    , "    pure (middle, left ∷ Member Text)"
+    , "  middleStatus ← memberStatus middle"
+    , "  putStrLn (\"middle after exit = \" <> describeStatus middleStatus)"
+    , "  leftStatus ← memberStatus left"
+    , "  putStrLn (\"left after exit = \" <> describeStatus leftStatus)"
     ]
