@@ -49,7 +49,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Console smoke: `cabal run exe:hetoimasia -- --smoke`.
 - Current focused tests: `cabal test hetoimasia-tests --test-show-details=direct`.
 - `hetoimasia-tests` is grouped by component: a new engine example belongs in
-  the `Logging`, `Runtime`, `Resources`, `Failures`, `Recovery`, or `Workers` spec that owns the behaviour it
+  the `Logging`, `Runtime`, `Resources`, `Failures`, `Recovery`, `Workers`, or `Messaging` spec that owns the behaviour it
   asserts, beside that component's own helpers, and `Test.Engine.Spec` only
   composes them. Run one component with
   `--test-options='--match <Component>'`; a selector that matches no example
