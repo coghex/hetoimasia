@@ -44,6 +44,15 @@ rethrows. It reuses the foundation worker group's stop and drain, and reports
 no terminal `Error` and flushes nothing. The contract is
 [Supervision](../../docs/supervision.md).
 
+`Hetoimasia.Runtime.Inbox` is an optional adapter for a supervised service with
+one FIFO inbox: `startInboxService` constructs a component's context and then
+its inbox inside the worker's startup, hands the send endpoint to the
+application, dispatches one prepared message at a time until a stop, and aborts
+the inbox before the component is torn down on every exit, returning an
+`InboxExit` discard count on an ordinary stop. It adds no supervisor, scheduler,
+or restart policy. The contract is
+[Supervised inbox services](../../docs/messaging.md#supervised-inbox-services).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before

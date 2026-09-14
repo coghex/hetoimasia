@@ -307,6 +307,22 @@ here. Nothing is restarted or replayed. The runtime's supervisor,
 `Hetoimasia.Runtime.Supervision`, does exactly that on top of this group; its
 contract is [supervision.md](supervision.md).
 
+The runtime's optional inbox adapter, `Hetoimasia.Runtime.Inbox`, is a
+supervised service built only from this contract, which it does not change.
+Its startup is one `Scoped` construction: the component context first, then
+the inbox with an abort release registered innermost, then a one-shot handoff
+write as the last step. Because acknowledgement is published only after that
+startup succeeded, the handoff is full whenever `awaitStartup` reports
+`Acknowledged`, and a failed or cancelled startup hands off nothing. Because
+completion is published only after the scope unwound, the abort — run under
+`uninterruptibleMask_`, without `retry`, waiting, or traversal of the backlog —
+precedes both component teardown and completion on every exit, including
+cancellation delivered between acknowledgement and the first receive. Its run
+result on an ordinary stop is an `InboxExit` with the cumulative discard count;
+every other exit leaves the raw `Failed` or `Cancelled` result untouched. The
+worker's stop token, not the application's control, is what the component
+startup receives. See [messaging.md](messaging.md#supervised-inbox-services).
+
 ## Verification
 
 `cabal test hetoimasia-tests --test-show-details=direct --test-options='--match /Workers/'`

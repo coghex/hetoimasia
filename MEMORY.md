@@ -171,6 +171,17 @@ not a verdict that Synarchy's design should be discarded.
   checks the cursor's identity first, raising `ForeignSnapshotCursor` through
   `throwFailureSTM`, then returns the newest unseen publication, `EndOfStream`
   once closed, or retries. No per-reader state. Contract in `docs/messaging.md`.
+- MSG-5 (#78) added `Hetoimasia.Runtime.Inbox`, the optional supervised inbox
+  adapter over `startSupervised`: `startInboxService` builds the component's
+  `Scoped` context, then the inbox with an `uninterruptibleMask_` abort as the
+  innermost release, then writes a one-shot `TVar` handoff before
+  acknowledgement, read once without waiting after `WorkerStarted`. Dispatch
+  is a stop-first `orElse` over one prepared message at a time; handler
+  exceptions escape to supervision's policy with no isolation or replay. An
+  ordinary stop aborts and returns an opaque `InboxExit` holding the cumulative
+  discard count (no drain field; backlog is not processed on stop). Graceful
+  finish and drain acknowledgement remain MSG-6. Contract in `docs/messaging.md`;
+  examples under `Runtime`'s `Inbox services` and its opacity clients.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

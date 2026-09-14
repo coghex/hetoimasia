@@ -306,6 +306,52 @@ latches failures. Raw readers such as `awaitCompletion` on
 `supervisedWorker handle` stay available beside it and never retire, handle,
 or report anything.
 
+## Supervised inbox services
+
+`Hetoimasia.Runtime.Inbox` is an optional adapter over `startSupervised`, not a
+second supervisor. `startInboxService` registers an ordinary `Service` with
+the owner's `InboxPolicy` — its disposition, warning component, and classifier
+— and every rule above applies to it unchanged. Its full contract is in
+[messaging.md](messaging.md#supervised-inbox-services); in supervision terms:
+
+- **Startup order.** The worker's startup builds the component context first,
+  then allocates the inbox with its abort as the innermost release, then writes
+  the endpoint into a private one-shot handoff before acknowledgement. The
+  starter reads the handoff once, without waiting, after `WorkerStarted`. An
+  empty handoff or duplicate write raises `InboxInvariantViolated` through
+  `throwFailure`; the started worker is still owned, stopped, and drained by the
+  group.
+- **Start outcomes.** `InboxStartRejected` and `InboxStartUnavailable` carry no
+  endpoint. A fatal startup failure and owner cancellation propagate exactly as
+  from `startSupervised`.
+- **Abort on stop and on failure.** Every exit — a stop requested by the owner
+  or by closing, a handler failure, cancellation, or an exit straight after
+  acknowledgement — aborts the inbox before component resources are released
+  and before completion is published.
+- **Handler failures.** A synchronous exception escaping the handler fails the
+  service with its own type and context after the abort and cleanup, and is
+  classified here: optional and recognized is unavailable with one warning;
+  required or unrecognized is fatal; retained cleanup failure is fatal. Nothing
+  isolates, skips, or replays a message. A handler that recovers returns
+  normally and dispatch continues.
+- **The exit record.** An ordinary stop returns an `InboxExit` holding the
+  inbox's cumulative discard count, so the service's status is `WorkerStopped`
+  and its typed completion is `Succeeded InboxExit`. Accepted backlog is not
+  processed on stop, and the record has no drain field. A failed, cancelled, or
+  cleanup-failed service keeps its actual completion; `WorkerStopped` after a
+  cancellation is never read as an exit record.
+- **Observation.** `inboxCompletion` and `awaitInboxCompletion` are raw,
+  non-consuming reads. Inside `awaitSupervised` a latched fatal failure may be
+  delivered instead of the completion; after the boundary drained, the
+  completion stays readable directly.
+
+The adapter adds two state rows, both owned by the one start that creates them:
+
+| State | Readers and writers | Thread | Lifetime and reset |
+|---|---|---|---|
+| Service handoff | The worker's startup writes it once, as its last step; the starter reads it once after `WorkerStarted` | Worker writes; application thread reads | One start; never cleared, dropped with the start |
+| Ordinary stop exit record | The run returns it once after the abort; any number of completion readers | Worker writes; any thread reads, in STM | Published with the completion; never changes or is consumed |
+
 ## A read-only handle
 
 A `SupervisedWorker` pairs the foundation worker with the supervision state
@@ -384,7 +430,9 @@ field`, and one that names the constructor with `does not export any children`;
 an environment failure such as a missing package never counts as either. A
 third client must compile, link, and run, reading a job's result through
 `supervisedWorker` and raw completion, stopping one service and cancelling
-another, and reporting `completed`, `stopped`, and `stopped`.
+another, and reporting `completed`, `stopped`, and `stopped`. The inbox
+adapter's examples and its own package-boundary clients are listed in
+[messaging.md](messaging.md#verification).
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

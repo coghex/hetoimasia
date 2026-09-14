@@ -1,5 +1,6 @@
 -- | Examples proving that 'Hetoimasia.Runtime.Supervision.SupervisedWorker' is
--- a read-only handle to a client outside the runtime package.
+-- a read-only handle to a client outside the runtime package, and that
+-- 'Hetoimasia.Runtime.Inbox' keeps its service handle and exit record closed.
 --
 -- A supervised handle pairs the foundation worker with the supervision state
 -- registered for it. 'Hetoimasia.Runtime.Supervision.stopSupervised' and
@@ -12,11 +13,13 @@
 -- These examples compile separate single-module clients with the harness from
 -- "Test.Engine.Resources.Opacity", exposing @base@, @text@, @stm@,
 -- @hetoimasia-foundation@, and @hetoimasia-runtime@ and hiding everything
--- else. Two clients must be rejected, each for the specific diagnostic naming
--- its cause, so a missing package, an absent compiler, or an unrelated error
--- can never pass for the boundary holding. One must be accepted, linked, and
--- run, which is both the environment control and the evidence that the
--- supported readers and operations stay usable.
+-- else. For the supervised handle two clients must be rejected, and for the
+-- inbox service's handle, definition, start result, and exit record six, each
+-- for the specific diagnostic naming its cause, so a missing package, an absent
+-- compiler, or an unrelated error can never pass for the boundary holding. One
+-- client for each interface must be accepted, linked, and run, which is both
+-- the environment control and the evidence that the supported readers and
+-- operations stay usable.
 module Test.Engine.Runtime.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
@@ -26,7 +29,12 @@ import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, w
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
 
 spec ∷ Spec
-spec = describe "Supervised worker opacity across the package boundary" $ do
+spec = do
+  supervisedSpec
+  inboxSpec
+
+supervisedSpec ∷ Spec
+supervisedSpec = describe "Supervised worker opacity across the package boundary" $ do
   it "rejects a client that replaces the raw worker with record update" $
     withClient "Client.hs" recordUpdateClient $ \compile → do
       outcome ← compile Typecheck
@@ -178,4 +186,178 @@ supportedClient =
     , "      putStrLn (\"job status = \" <> named jobStatus)"
     , "      putStrLn (\"stopped status = \" <> named stoppedStatus)"
     , "      putStrLn (\"cancelled status = \" <> named cancelledStatus)"
+    ]
+
+-- Inbox services ---------------------------------------------------------------
+
+-- | Examples proving that an inbox service's handle, its definition, and its
+-- exit record stay closed to a client outside the runtime package.
+--
+-- A service handle pairs one supervised worker with the send endpoint its
+-- startup handed off, so a rewritten handle would let a producer send to one
+-- service while its owner stops another. The definition's constructor would
+-- let a client build the startup, and so the handoff, itself. An exit record
+-- rebuilt or updated by a client would claim a discard count no inbox counted.
+-- A failed start carries no service handle at all.
+inboxSpec ∷ Spec
+inboxSpec = describe "Inbox service opacity across the package boundary" $ do
+  it "rejects a client that replaces a service's endpoint with record update" $
+    withClient "Client.hs" inboxRecordUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "inboxSender"
+
+  it "rejects a client that names the service handle's constructor" $
+    withClient "Client.hs" (importingClient "InboxService (InboxService)") $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "InboxService"
+
+  it "rejects a client that names the definition's constructor to build its own startup and handoff" $
+    withClient "Client.hs" (importingClient "InboxDefinition (InboxDefinition)") $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "InboxDefinition"
+
+  it "rejects a client that takes a send endpoint from an unavailable start" $
+    withClient "Client.hs" failedStartClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "should have 1 argument"
+      clientOutput outcome `shouldContain` "InboxStartUnavailable"
+
+  it "rejects a client that constructs an exit record" $
+    withClient "Client.hs" (importingClient "InboxExit (InboxExit)") $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "InboxExit"
+
+  it "rejects a client that updates an exit record's discard count" $
+    withClient "Client.hs" exitUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "inboxDiscarded"
+
+  it "accepts and runs a client that starts a service, sends, stops it, and reads its discard count" $
+    withClient "Main.hs" inboxClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the supported client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out `shouldBe` ["sends = [Accepted,Accepted]", "discarded = 2"]
+
+-- | A client that only imports the named item from the inbox module.
+importingClient ∷ String → String
+importingClient item =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.Runtime.Inbox (" <> item <> ")"
+    ]
+
+-- | Pairs one service's worker with another service's endpoint through
+-- record-update syntax, which needs only the exported reader to be a field.
+inboxRecordUpdateClient ∷ String
+inboxRecordUpdateClient =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Runtime.Inbox (InboxService, inboxSender)"
+    , ""
+    , "rewritten ∷ InboxService a → InboxService a → InboxService a"
+    , "rewritten first second = first { inboxSender = inboxSender second }"
+    ]
+
+-- | Expects an unavailable start to carry a service whose endpoint it can read.
+failedStartClient ∷ String
+failedStartClient =
+  unlines
+    [ "module Client (endpoint) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Channel (Sender)"
+    , "import Hetoimasia.Runtime.Inbox (InboxStart (..), inboxSender)"
+    , ""
+    , "endpoint ∷ InboxStart a → Maybe (Sender a)"
+    , "endpoint (InboxStartUnavailable service _) = Just (inboxSender service)"
+    , "endpoint _ = Nothing"
+    ]
+
+-- | Rewrites the discard count of an exit record it was given.
+exitUpdateClient ∷ String
+exitUpdateClient =
+  unlines
+    [ "module Client (reset) where"
+    , ""
+    , "import Hetoimasia.Runtime.Inbox (InboxExit, inboxDiscarded)"
+    , ""
+    , "reset ∷ InboxExit → InboxExit"
+    , "reset exit = exit { inboxDiscarded = 0 }"
+    ]
+
+-- | A client using only what the inbox interface offers: it holds the handler
+-- inside the first message, queues two more, stops the service, and reads the
+-- discard count from the completion's exit record.
+inboxClient ∷ String
+inboxClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)"
+    , "import Control.Concurrent.STM (atomically)"
+    , "import Control.Monad (when)"
+    , "import Data.Text (pack)"
+    , "import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger, unsafeComponent)"
+    , "import Hetoimasia.Foundation.Messaging.Channel (send)"
+    , "import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)"
+    , "import Hetoimasia.Foundation.Worker (Completion (completionResult), Result (Succeeded))"
+    , "import Hetoimasia.Runtime.Inbox"
+    , "  ( InboxPolicy (InboxPolicy)"
+    , "  , InboxStart (InboxStarted)"
+    , "  , awaitInboxCompletion"
+    , "  , inboxDefinition"
+    , "  , inboxDiscarded"
+    , "  , inboxSender"
+    , "  , startInboxService"
+    , "  , stopInboxService"
+    , "  )"
+    , "import Hetoimasia.Runtime.Logging (withLoggingLifetime)"
+    , "import Hetoimasia.Runtime.Supervision (Disposition (Required), Recognition (Unrecognized), awaitSupervised, withSupervision)"
+    , "import System.Exit (exitFailure)"
+    , "import System.IO (hPutStrLn, stderr)"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  entered ← newEmptyMVar"
+    , "  gate ← newEmptyMVar"
+    , "  let policy = InboxPolicy Required (unsafeComponent (pack \"client.inbox\")) (\\_ → pure Unrecognized)"
+    , "      handler ∷ () → Prepared Int → IO ()"
+    , "      handler () message = when (preparedValue message == 1) (putMVar entered () >> readMVar gate)"
+    , "  withLoggingLifetime (mkLogger defaultLogFilter (callbackSink (\\_ → pure ()))) $ \\lifetime →"
+    , "    withSupervision lifetime $ \\control → do"
+    , "      started ← startInboxService control policy (inboxDefinition (pack \"client\") 4 (\\_ → pure ()) handler)"
+    , "      service ← case started of"
+    , "        InboxStarted service → pure service"
+    , "        _ → hPutStrLn stderr \"expected a started inbox service\" >> exitFailure"
+    , "      let offer value = prepare value >>= atomically . send (inboxSender service)"
+    , "      _ ← offer 1"
+    , "      readMVar entered"
+    , "      sends ← traverse offer [2, 3]"
+    , "      putStrLn (\"sends = \" <> show sends)"
+    , "      stopInboxService service"
+    , "      putMVar gate ()"
+    , "      completion ← awaitSupervised control (awaitInboxCompletion service)"
+    , "      case completionResult completion of"
+    , "        Succeeded exit → putStrLn (\"discarded = \" <> show (inboxDiscarded exit))"
+    , "        _ → hPutStrLn stderr \"the inbox service did not stop cleanly\" >> exitFailure"
     ]

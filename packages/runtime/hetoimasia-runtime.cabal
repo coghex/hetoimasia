@@ -25,6 +25,7 @@ library
     exposed-modules:
         Hetoimasia.Runtime
         Hetoimasia.Runtime.Application
+        Hetoimasia.Runtime.Inbox
         Hetoimasia.Runtime.Logging
         Hetoimasia.Runtime.Reporting
         Hetoimasia.Runtime.Resources
