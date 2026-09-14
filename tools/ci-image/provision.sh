@@ -19,10 +19,12 @@ case "$stage" in
     apt-get update
     # C build prerequisites, the libraries GHC's binary distribution links, the
     # tools actions need inside a container (git for checkout, zstd for the
-    # cache), and the X11 development and runtime libraries GLFW builds against.
+    # cache), the tools the workflow tests' shipped steps and process checks
+    # call (jq, and procps for kill and ps), and the X11 development and runtime
+    # libraries GLFW builds against.
     apt-get install --yes --no-install-recommends \
-      binutils build-essential ca-certificates cmake curl git pkg-config \
-      python3 unzip xz-utils zstd \
+      binutils build-essential ca-certificates cmake curl git jq pkg-config \
+      procps python3 unzip xz-utils zstd \
       libffi-dev libgmp-dev libncurses-dev libnuma-dev zlib1g-dev \
       libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxrandr-dev
     rm -rf /var/lib/apt/lists/*

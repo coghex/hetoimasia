@@ -867,7 +867,8 @@ Linux workers install nothing. They run inside one published image,
 - `CABAL_DIR=/opt/hetoimasia/cabal` with an explicit `store-dir` of
   `/opt/hetoimasia/cabal/store`, and a Hackage index snapshot that
   `cabal.project`'s `index-state` selects from;
-- the C build prerequisites, CMake, `pkg-config`, and the X11 development and
+- the C build prerequisites, CMake, `pkg-config`, the tools the workflow tests'
+  shipped steps call (`git`, `jq`, `procps`), and the X11 development and
   runtime libraries GLFW builds against, over an `ubuntu:24.04` base pinned by
   digest, with the resolved package list retained at
   `/opt/hetoimasia/packages.txt`;
