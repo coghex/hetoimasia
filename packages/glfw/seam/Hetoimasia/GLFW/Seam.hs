@@ -18,7 +18,14 @@
 -- Each seam has its own guard, so examples never share occupancy with each
 -- other or with a production session.
 --
--- The seam exposes no native handle and no session constructor.
+-- Windows are created through the public "Hetoimasia.GLFW.Window" interface
+-- in a seam session. The seam hands each a scripted native handle, keeps the
+-- callbacks the model attached to it, and delivers scripted 'WindowEvent's to
+-- them from inside an owner-boundary step, as GLFW would from inside a setter
+-- or a poll: 'seamDrive'. 'seamRejectCloseRequest' is the private close-request
+-- transition. Neither is a public command.
+--
+-- The seam exposes no native handle and no session or window constructor.
 module Hetoimasia.GLFW.Seam
   ( -- * Seams
     Seam
@@ -26,9 +33,16 @@ module Hetoimasia.GLFW.Seam
   , SeamScript (..)
   , defaultScript
   , seamSession
-  , seamWindow
   , seamCalls
   , seamLiveCallbacks
+  , seamLiveWindowCallbacks
+  , featureUnavailableCode
+
+    -- * Driving windows
+  , WindowEvent (..)
+  , DriveOrigin (..)
+  , seamDrive
+  , seamRejectCloseRequest
 
     -- * Thread identity
   , asProcessMainThread
@@ -43,34 +57,42 @@ module Hetoimasia.GLFW.Seam
     -- * What the model asked of the native library
   , NativeCall (..)
   , WindowHint (..)
-  , WindowRequest (..)
-  , WindowVisibility (..)
+  , WindowAttribute (..)
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, runInBoundThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, finally, throw, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Int (Int32)
 import Data.Text (Text)
-import Foreign.Ptr (castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
-import Hetoimasia.Foundation.Resource (Assembly, Scoped, allocComposite)
+import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
+import Hetoimasia.Foundation.Failure (operation)
+import Hetoimasia.Foundation.Resource (Scoped, allocComposite)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
 import Hetoimasia.GLFW.Internal.Session
   ( Backend (..)
   , CallbackStorage (CallbackStorage)
   , Guard
   , Native (..)
+  , NativeWindow
   , Session
   , SessionConfig
+  , WindowAttribute (..)
+  , WindowCallbackStorage (WindowCallbackStorage)
+  , WindowCallbacks (..)
   , WindowHint (..)
-  , WindowRequest (..)
-  , WindowVisibility (..)
   , newGuard
   , sessionAssembly
-  , windowAssemblyThrough
+  )
+import Hetoimasia.GLFW.Internal.Window
+  ( CloseRequest
+  , Window
+  , WindowResult
+  , rejectCloseRequest
+  , windowStep
   )
 
 -- | One native operation the model asked for, in the order it asked.
@@ -87,7 +109,37 @@ data NativeCall
   | ResetWindowHints
   | SetWindowHint WindowHint
   | CreateWindow Int32 Int32 Text
-  | DestroyWindow
+    -- ^ Answered with the next window key, starting at one.
+  | DestroyWindow Int
+  | CreateWindowCallbacks
+  | AttachWindowCallbacks Int
+  | DetachWindowCallbacks Int
+  | FreeWindowCallbacks
+  | QueryWindowSize
+  | QueryFramebufferSize
+  | QueryContentScale
+  | QueryWindowPosition
+  | QueryWindowAttribute WindowAttribute
+  deriving (Eq, Show)
+
+-- | A native event the seam delivers to a window's attached callbacks.
+data WindowEvent
+  = ResizedTo Int Int
+  | FramebufferResizedTo Int Int
+  | ContentScaledTo Float Float
+  | MovedTo Int Int
+  | FocusChanged Bool
+  | IconifyChanged Bool
+  | MaximizeChanged Bool
+  | RefreshRequested
+  | CloseRequested
+  | CallbackRaises SomeException
+    -- ^ A size callback whose payload raises the exception when copied.
+
+-- | Which kind of native call the events are delivered from inside.
+data DriveOrigin
+  = DuringSetter
+  | DuringPoll
   deriving (Eq, Show)
 
 -- | How the scripted native library answers.
@@ -106,6 +158,13 @@ data SeamScript = SeamScript
   , scriptCreateWindow ∷ Reporter → IO Bool
     -- ^ 'True' returns a live handle; 'False' returns null.
   , scriptDestroyWindow ∷ Reporter → IO ()
+  , scriptAttachWindowCallbacks ∷ Reporter → IO ()
+  , scriptDetachWindowCallbacks ∷ Reporter → IO ()
+  , scriptWindowSize ∷ Reporter → IO (Int, Int)
+  , scriptFramebufferSize ∷ Reporter → IO (Int, Int)
+  , scriptContentScale ∷ Reporter → IO (Float, Float)
+  , scriptWindowPosition ∷ Reporter → IO (Int, Int)
+  , scriptWindowAttribute ∷ WindowAttribute → Reporter → IO Bool
   }
 
 -- | A platform supporting X11 on which every step succeeds silently.
@@ -120,7 +179,18 @@ defaultScript =
     , scriptDetachErrorCallback = \_ → pure ()
     , scriptCreateWindow = \_ → pure True
     , scriptDestroyWindow = \_ → pure ()
+    , scriptAttachWindowCallbacks = \_ → pure ()
+    , scriptDetachWindowCallbacks = \_ → pure ()
+    , scriptWindowSize = \_ → pure (800, 600)
+    , scriptFramebufferSize = \_ → pure (1600, 1200)
+    , scriptContentScale = \_ → pure (2, 2)
+    , scriptWindowPosition = \_ → pure (40, 30)
+    , scriptWindowAttribute = \_ _ → pure False
     }
+
+-- | The code the scripted library reports for a property it cannot provide.
+featureUnavailableCode ∷ Int
+featureUnavailableCode = 0x0001000C
 
 -- | A scripted native library and what it has observed.
 data Seam = Seam
@@ -136,6 +206,10 @@ data Seam = Seam
   , seamNextKey ∷ IORef Int
   , seamHinted ∷ IORef (Maybe Backend)
   , seamNextWindow ∷ IORef Int
+  , seamWindowCallbacks ∷ IORef [(Int, WindowCallbacks)]
+    -- ^ Allocated and not yet freed window callback storage, by key.
+  , seamAttachedWindows ∷ IORef [(Int, Int)]
+    -- ^ Window key to the callback storage key attached to it.
   }
 
 -- | What a scripted step reports errors through.
@@ -154,15 +228,12 @@ newSeam script =
     <*> newIORef 1
     <*> newIORef Nothing
     <*> newIORef 1
+    <*> newIORef []
+    <*> newIORef []
 
 -- | Enter a session over this seam's native table.
 seamSession ∷ Seam → SessionConfig → Scoped Session
 seamSession seam = allocComposite . sessionAssembly (seamNative seam)
-
--- | Construct a creation-seam window through this seam's native table, which
--- creates nothing real.
-seamWindow ∷ Seam → Session → WindowRequest → Assembly ()
-seamWindow seam session request = () <$ windowAssemblyThrough (seamNative seam) session request
 
 -- | Every native call so far, oldest first.
 seamCalls ∷ Seam → IO [NativeCall]
@@ -171,6 +242,42 @@ seamCalls seam = reverse <$> readIORef (seamLog seam)
 -- | How many allocated callback storages have not been freed.
 seamLiveCallbacks ∷ Seam → IO Int
 seamLiveCallbacks seam = length <$> readIORef (seamCallbacks seam)
+
+-- | How many allocated window callback storages have not been freed.
+seamLiveWindowCallbacks ∷ Seam → IO Int
+seamLiveWindowCallbacks seam = length <$> readIORef (seamWindowCallbacks seam)
+
+-- | Deliver events to a window's attached callbacks from inside one owner
+-- boundary step, then let the model reconcile them. An ended window answers
+-- without a native step; events for a window with no callbacks attached are
+-- dropped, as GLFW drops them.
+seamDrive ∷ Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
+seamDrive seam window origin events =
+  windowStep window (operation (originName origin)) $ \handle → do
+    attached ← readIORef (seamAttachedWindows seam)
+    stored ← readIORef (seamWindowCallbacks seam)
+    case lookup (windowKey handle) attached >>= (`lookup` stored) of
+      Nothing → pure ()
+      Just callbacks → mapM_ (deliver callbacks) events
+  where
+    originName DuringSetter = "seam setter"
+    originName DuringPoll = "seam poll"
+    deliver callbacks event = case event of
+      ResizedTo width height → onWindowSize callbacks (fromIntegral width) (fromIntegral height)
+      FramebufferResizedTo width height → onFramebufferSize callbacks (fromIntegral width) (fromIntegral height)
+      ContentScaledTo x y → onContentScale callbacks (realToFrac x) (realToFrac y)
+      MovedTo x y → onWindowPosition callbacks (fromIntegral x) (fromIntegral y)
+      FocusChanged flag → onWindowFocus callbacks (flagOf flag)
+      IconifyChanged flag → onWindowIconify callbacks (flagOf flag)
+      MaximizeChanged flag → onWindowMaximize callbacks (flagOf flag)
+      RefreshRequested → onWindowRefresh callbacks
+      CloseRequested → onWindowClose callbacks
+      CallbackRaises failure → onWindowSize callbacks (throw failure) 1
+    flagOf flag = if flag then 1 else 0
+
+-- | Reject a close request through the model's private transition.
+seamRejectCloseRequest ∷ Window → CloseRequest → IO (WindowResult Bool)
+seamRejectCloseRequest = rejectCloseRequest
 
 -- | Treat the calling Haskell thread as the process main thread.
 designateProcessMainThread ∷ Seam → IO ()
@@ -210,6 +317,10 @@ reportErrorWithFailingIdentity ∷ Reporter → Int → ByteString → IO ()
 reportErrorWithFailingIdentity reporter@(Reporter seam) code description = do
   atomicWriteIORef (seamIdentityFails seam) True
   reportError reporter code description `finally` atomicWriteIORef (seamIdentityFails seam) False
+
+-- | The scripted key a seam window handle stands for.
+windowKey ∷ Ptr NativeWindow → Int
+windowKey = fromIntegral . ptrToIntPtr
 
 seamNative ∷ Seam → Native
 seamNative seam =
@@ -258,15 +369,45 @@ seamNative seam =
             handle ← atomicModifyIORef' (seamNextWindow seam) (\next → (next + 1, next))
             pure (intPtrToPtr (fromIntegral handle))
           else pure nullPtr
-    , nativeDestroyWindow = \_ → do
-        record DestroyWindow
+    , nativeDestroyWindow = \handle → do
+        record (DestroyWindow (windowKey handle))
         scriptDestroyWindow script reporter
+    , nativeNewWindowCallbacks = \callbacks → do
+        record CreateWindowCallbacks
+        key ← atomicModifyIORef' (seamNextKey seam) (\next → (next + 1, next))
+        atomicModifyIORef' (seamWindowCallbacks seam) (\stored → ((key, callbacks) : stored, ()))
+        pure (WindowCallbackStorage [castPtrToFunPtr (intPtrToPtr (fromIntegral key))])
+    , nativeAttachWindowCallbacks = \handle storage → do
+        record (AttachWindowCallbacks (windowKey handle))
+        scriptAttachWindowCallbacks script reporter
+        atomicModifyIORef' (seamAttachedWindows seam) $ \attached →
+          ((windowKey handle, storageKey storage) : attached, ())
+    , nativeDetachWindowCallbacks = \handle → do
+        record (DetachWindowCallbacks (windowKey handle))
+        scriptDetachWindowCallbacks script reporter
+        atomicModifyIORef' (seamAttachedWindows seam) $ \attached →
+          (filter ((/= windowKey handle) . fst) attached, ())
+    , nativeFreeWindowCallbacks = \storage → do
+        record FreeWindowCallbacks
+        atomicModifyIORef' (seamWindowCallbacks seam) $ \stored →
+          (filter ((/= storageKey storage) . fst) stored, ())
+    , nativeWindowSize = \_ → record QueryWindowSize >> scriptWindowSize script reporter
+    , nativeFramebufferSize = \_ → record QueryFramebufferSize >> scriptFramebufferSize script reporter
+    , nativeContentScale = \_ → record QueryContentScale >> scriptContentScale script reporter
+    , nativeWindowPosition = \_ → record QueryWindowPosition >> scriptWindowPosition script reporter
+    , nativeWindowAttribute = \_ attribute → do
+        record (QueryWindowAttribute attribute)
+        scriptWindowAttribute script attribute reporter
+    , nativeFeatureUnavailable = featureUnavailableCode
     }
   where
     script = seamScript seam
     reporter = Reporter seam
     record call = atomicModifyIORef' (seamLog seam) (\calls → (call : calls, ()))
     keyOf (CallbackStorage pointer) = fromIntegral (ptrToIntPtr (castFunPtrToPtr pointer))
+    storageKey (WindowCallbackStorage pointers) = case pointers of
+      [pointer] → fromIntegral (ptrToIntPtr (castFunPtrToPtr pointer))
+      _ → 0
     identity = do
       failing ← readIORef (seamIdentityFails seam)
       if failing

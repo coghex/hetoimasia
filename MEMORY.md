@@ -235,6 +235,23 @@ not a verdict that Synarchy's design should be discarded.
   `glfw-native-check` runs a real session locally and is built, not run, by
   `cabal build all` (`tests: True` for that package only). Contract:
   `docs/glfw.md`.
+- GLFW-2 (#90) added `Hetoimasia.GLFW.Window`: `allocWindow`/`withWindow`
+  build a window in a live session from a validated `WindowConfig` through one
+  `Assembly` (`Hetoimasia.GLFW.Internal.Window.windowAssembly`) that
+  collection-backed construction will reuse. Dimensions are checked before C,
+  hints are reset per window, and identities are the session's `Unique` plus a
+  never-reissued local number. Each window publishes a prepared, opaque
+  `WindowObservation` through a snapshot (separate logical, framebuffer, scale,
+  placement; `Unavailable` for a `GLFW_FEATURE_UNAVAILABLE`-only query). Nine
+  callbacks are contained at the trampoline and reconciled at owner boundaries
+  (creation, `synchronizeWindow`, the private `windowStep`), where a latched
+  fault is rethrown with `window callback` context; close requests latch with
+  per-window numbers and never destroy. Release: mark terminal and detach, then
+  destroy, then free storage only if certain (else keep it and poison the
+  session), then publish the terminal phase and close the snapshot in one
+  transaction. The old private creation seam was removed. The seam's
+  `seamDrive`/`seamRejectCloseRequest` are private drivers, not commands.
+  Contract: `docs/glfw.md`, "Windows".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

@@ -120,6 +120,7 @@ test-suite hetoimasia-tests
         Test.Engine.GLFW.Opacity
         Test.Engine.GLFW.Session
         Test.Engine.GLFW.Spec
+        Test.Engine.GLFW.Window
         Test.Engine.Logging.Component
         Test.Engine.Logging.Configuration
         Test.Engine.Logging.Context

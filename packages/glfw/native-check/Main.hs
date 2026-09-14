@@ -3,8 +3,11 @@
 -- It exercises the real session against the installed GLFW on the platform
 -- it runs on: entering and leaving a session, a sequential session after a
 -- complete teardown, duplicate and wrong-thread entry, owner-only use from
--- another thread, a hidden NoAPI window through the creation seam, and an
--- initialization error observed before any event polling exists.
+-- another thread, hidden non-focusing NoAPI windows — their creation,
+-- observation, and release, hint isolation between two live windows, a session
+-- surviving a window's release, and a terminal handle — a fault raised inside a
+-- real native callback, and an initialization error observed before any event
+-- polling exists.
 --
 -- GLFW requires the process main thread, and Hspec runs its examples on
 -- threads of its own, so this is a plain executable whose checks run in order
@@ -18,29 +21,40 @@ module Main (main) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (Exception, SomeException, displayException, fromException, try)
+import Control.Concurrent.STM (atomically)
+import Control.Exception (ErrorCall (ErrorCall), Exception, SomeException, displayException, fromException, throw, try)
 import Control.Monad (unless, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
-import Foreign.Ptr (nullPtr)
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
   , FailureEvidence (..)
   , FailureOrigin (..)
+  , OperationContext (..)
   , failureEvidence
+  , operation
   , operationText
   )
 import Hetoimasia.Foundation.Log (componentText)
-import Hetoimasia.Foundation.Resource (allocComposite, withComposite, withScoped)
-import Hetoimasia.GLFW.Internal.Native (glfwPlatformUnavailable, productionNative)
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.Foundation.Resource (allocComposite, withScoped)
+import Hetoimasia.GLFW.Internal.Native
+  ( glfwPlatformUnavailable
+  , leakResizableHintForCheck
+  , pollEventsForCheck
+  , productionNative
+  , setWindowSizeForCheck
+  , windowResizableForCheck
+  )
 import Hetoimasia.GLFW.Internal.Session
   ( Native (..)
-  , WindowRequest (..)
-  , WindowVisibility (..)
-  , nativeWindowAssembly
+  , WindowCallbacks (..)
   , sessionAssembly
   )
+import Hetoimasia.GLFW.Internal.Window (windowNativeHandle, windowStep)
 import Hetoimasia.GLFW.Session
+import Hetoimasia.GLFW.Window
 import System.Exit (exitFailure)
 import System.IO (hFlush, stdout)
 import System.Info (os)
@@ -74,7 +88,10 @@ checks =
   , ("rejects entry from a bound worker thread", workerEntry forkOS)
   , ("rejects entry from an unbound thread", workerEntry forkIO)
   , ("rejects owner-only use from another thread", ownerOnlyElsewhere)
-  , ("creates and destroys a hidden NoAPI window", hiddenWindow)
+  , ("creates, observes, and releases a hidden non-focusing window", hiddenWindow)
+  , ("resets creation hints between two live windows", hintIsolation)
+  , ("creates another window after a window's release", recreateWindow)
+  , ("rethrows a fault raised inside a real native callback at the owner boundary", callbackFault)
   , ("observes an initialization error before any event polling", initializationError)
   , ("enters a session after the failed initialization rolled back", enterAndLeave)
   ]
@@ -112,19 +129,118 @@ ownerOnlyElsewhere =
     pure (show misuse)
 
 hiddenWindow ∷ IO String
-hiddenWindow =
+hiddenWindow = do
+  (initial, synchronized, afterEnd, final, ended, identity) ←
+    withSession defaultSessionConfig $ \session → do
+      (initial, synchronized, window) ←
+        withWindow session (hiddenTestWindowConfig "hetoimasia native check" 320 240) $ \window → do
+          initial ← currentObservation window
+          synchronized ← synchronizeWindow window
+          pure (initial, synchronized, window)
+      -- Deliberate misuse: the handle escaped its scope to prove it is terminal.
+      afterEnd ← synchronizeWindow window
+      final ← currentObservation window
+      ended ← windowEnded window
+      pure (initial, synchronized, afterEnd, final, ended, windowIdentity window)
+  case observedFramebufferExtent initial of
+    Observed (Extent width height) | width > 0 && height > 0 → pure ()
+    other → failCheck ("the initial framebuffer observation is " <> show other)
+  unless (observedPhase initial == WindowOpen && observedVisible initial == Observed False) $
+    failCheck ("the initial observation is " <> show initial)
+  case synchronized of
+    WindowAvailable _ → pure ()
+    WindowEnded _ → failCheck "a live window answered as ended"
+  unless (afterEnd == WindowEnded identity && ended) $
+    failCheck ("after its scope the handle answered " <> show afterEnd)
+  unless (observedPhase final == WindowReleased) $
+    failCheck ("the terminal observation is " <> show final)
+  pure
+    ( "logical "
+        <> show (observedLogicalExtent initial)
+        <> ", framebuffer "
+        <> show (observedFramebufferExtent initial)
+        <> ", scale "
+        <> show (observedContentScale initial)
+        <> ", placement "
+        <> show (observedPlacement initial)
+        <> "; terminal "
+        <> show (observedPhase final)
+        <> " at revision "
+        <> show (observedRevision final)
+        <> ", then "
+        <> show afterEnd
+    )
+
+hintIsolation ∷ IO String
+hintIsolation =
+  withSession defaultSessionConfig $ \session →
+    withWindow session (hiddenTestWindowConfig "first" 200 150) $ \first → do
+      leakResizableHintForCheck
+      withWindow session (hiddenTestWindowConfig "second" 220 160) $ \second → do
+        resizable ← windowResizableForCheck (windowNativeHandle second)
+        unless resizable $ failCheck "the second window inherited a stray GLFW_RESIZABLE hint"
+        firstObserved ← currentObservation first
+        secondObserved ← currentObservation second
+        unless (all ((== Observed False) . observedVisible) [firstObserved, secondObserved]) $
+          failCheck "a hidden window was observed visible"
+        when (windowIdentity first == windowIdentity second) $
+          failCheck "two live windows share an identity"
+        pure
+          ( show (windowIdentity first)
+              <> " and "
+              <> show (windowIdentity second)
+              <> " live and hidden; a stray hint was reset before the second"
+          )
+
+recreateWindow ∷ IO String
+recreateWindow =
   withSession defaultSessionConfig $ \session → do
-    let request =
-          WindowRequest
-            { windowWidth = 320
-            , windowHeight = 240
-            , windowTitle = "hetoimasia native check"
-            , windowVisibility = HiddenTestWindow
-            }
-    created ← withComposite (nativeWindowAssembly session request) (\window → pure (window /= nullPtr))
-    unless created $ failCheck "the creation seam lent a null window"
+    released ← withWindow session (hiddenTestWindowConfig "released" 160 120) (pure . windowIdentity)
+    recreated ← withWindow session (hiddenTestWindowConfig "recreated" 160 120) (pure . windowIdentity)
+    when (released == recreated) $ failCheck "the recreated window reused an identity"
     reports ← takeAsynchronousReports session
-    pure ("hidden window created and destroyed, asynchronous reports " <> show reports)
+    pure (show released <> " released, then " <> show recreated <> "; asynchronous reports " <> show reports)
+
+-- | A production table whose size callback copies a payload that raises, so the
+-- fault is raised inside the model's trampoline while GLFW is calling it.
+callbackFault ∷ IO String
+callbackFault = do
+  let faulting =
+        productionNative
+          { nativeNewWindowCallbacks = \callbacks →
+              nativeNewWindowCallbacks
+                productionNative
+                callbacks
+                  { onWindowSize = \_ height →
+                      onWindowSize callbacks (throw (ErrorCall "injected size callback fault")) height
+                  }
+          }
+  withScoped (allocComposite (sessionAssembly faulting defaultSessionConfig)) $ \session →
+    withWindow session (hiddenTestWindowConfig "faulting" 200 150) $ \window → do
+      outcome ←
+        try $
+          windowStep window (operation "resize for check") $ \handle → do
+            setWindowSizeForCheck handle 260 190
+            pollEventsForCheck
+      caught ← either pure (\result → failCheck ("the boundary completed with " <> show result)) outcome
+      case fromException caught of
+        Just (ErrorCall message) → do
+          let contexts =
+                [ (operationText (contextOperation context), contextIdentifiers context)
+                | context ← failureContexts (failureEvidence caught)
+                ]
+          unless (any ((== "window callback") . fst) contexts) $
+            failCheck ("the fault carries no callback context: " <> show contexts)
+          after ← synchronizeWindow window
+          case after of
+            WindowAvailable _ → pure ()
+            WindowEnded _ → failCheck "the window ended after a contained fault"
+          pure ("rethrown " <> show message <> " with " <> show contexts)
+        Nothing → failCheck ("unexpected failure: " <> displayException caught)
+
+currentObservation ∷ Window → IO WindowObservation
+currentObservation window =
+  preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))
 
 -- | Request a backend this platform's GLFW was not built with, past the model's
 -- own refusal, so that GLFW's initialization itself fails and reports why.
