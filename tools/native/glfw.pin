@@ -1,0 +1,10 @@
+# The pinned upstream GLFW source the native recipe builds, locally on macOS and
+# inside the Linux CI image alike. Changing any value here changes the native
+# recipe fingerprint, so every prefix, manifest, and image built from the old
+# pin stops matching. See docs/validation.md.
+GLFW_VERSION=3.4
+GLFW_URL=https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+GLFW_SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9
+# The macOS deployment target a local Cocoa prefix is built for when
+# MACOSX_DEPLOYMENT_TARGET does not choose one.
+MACOS_DEPLOYMENT_TARGET=13.0

@@ -5,7 +5,8 @@
 # candidate never pays for a Haskell image to learn that it needs one job. The
 # plan job then asks whether a finished run already executed any selected group
 # against byte-identical inputs, and records the answer as applicability. The
-# workers execute whatever is left. `build-test` then runs whatever happened
+# workers execute whatever is left, inside the published CI image the
+# candidate's descriptor names. `build-test` then runs whatever happened
 # upstream and decides the verdict from the receipts and that applicability, so
 # a selected group can never pass because nothing ran it, an explained omission
 # is never reported as a failure, and a reused group is always reported as an
@@ -29,13 +30,16 @@ concurrency:
   group: validation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
-# Every job reads; none writes, and none uses a secret.
+# Every job reads; none writes, and none uses a secret. The CI image is a public
+# package, so no worker needs a registry credential or a package grant.
 permissions:
   contents: read
 
-# The pinned platform is declared once. The planner folds these exact values
-# into the candidate's input identity and the workers install them, so evidence
-# can never be reused across a toolchain the candidate was not planned for.
+# The pinned platform is declared once. The planner checks the committed image
+# descriptor against these exact values and folds them, with the image digest
+# and its native manifest, into the candidate's input identity; each worker
+# verifies them inside the image. Evidence can never be reused across a
+# toolchain the candidate was not planned for.
 env:
   GHC_VERSION: '9.12.2'
   CABAL_VERSION: '3.16.1.0'
@@ -67,6 +71,12 @@ jobs:
       # integration candidate. Publishing it pins the revision the workers must
       # confirm they checked out, so two jobs can never report on two trees.
       candidate: ${{ github.sha }}
+      # The exact image reference, `<repository>@<digest>`, every Linux worker
+      # runs in, and the cache environment boundary derived from the planned
+      # toolchain map.
+      image: ${{ steps.image.outputs.image }}
+      environment: ${{ steps.image.outputs.environment }}
+      seed: ${{ steps.seed.outputs.seed }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -122,7 +132,9 @@ jobs:
           set -uo pipefail
           # Selection compares the contribution, but identity fingerprints the
           # integration candidate the workers actually check out, and the
-          # toolchain and platform this workflow pins are part of it.
+          # toolchain and platform this workflow pins are part of it. The
+          # planner reads the candidate's image descriptor without pulling the
+          # image, and refuses one that no longer describes the candidate.
           arguments=(--base "$BASE" --head "$HEAD" --candidate "$CANDIDATE" --json)
           arguments+=(--toolchain "ghc=$GHC_VERSION" --toolchain "cabal=$CABAL_VERSION")
           arguments+=(--runner-os "$WORKER_OS")
@@ -157,6 +169,8 @@ jobs:
               f" policy version {plan['catalog_policy_version']}"
               f" (`{plan['policy_version'][:12]}`),"
               f" inputs `{plan['input_identity'][:12]}`.",
+              "",
+              "Toolchain: " + ", ".join(f"`{name}` `{value}`" for name, value in sorted(plan["toolchain"].items())) + ".",
               "",
               "| Group | Selected | Reason | Inputs changed |",
               "| --- | --- | --- | --- |",
@@ -205,6 +219,64 @@ jobs:
           cat reuse.out >> "$GITHUB_OUTPUT"
           cat reuse.out
 
+      - name: Resolve the execution image
+        id: image
+        run: |
+          set -euo pipefail
+          python3 tools/validation/ci_image.py outputs --plan plan.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: Look up the default-branch dependency cache
+        id: seed-lookup
+        # Only asked on a default-branch push whose engine worker will not run:
+        # a running engine worker builds and saves the dependencies itself, and
+        # a pull request's cache is not a seed any other pull request restores.
+        if: github.event_name == 'push' && steps.reuse.outputs.run-haskell-engine != 'true' && steps.image.outputs.image != ''
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: cabal-store-${{ steps.image.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          lookup-only: true
+
+      - name: Decide whether to seed the dependency cache
+        id: seed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          ENGINE: ${{ steps.reuse.outputs.run-haskell-engine }}
+          LOOKUP: ${{ steps.seed-lookup.outcome }}
+          HIT: ${{ steps.seed-lookup.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          # Reused test evidence can leave every worker skipped on a
+          # default-branch push, which proves nothing about whether that branch
+          # holds a dependency cache pull requests can restore. A missing seed is
+          # built on its own, without executing any test group again.
+          seed=false
+          if [ "$EVENT_NAME" != "push" ]; then
+            reason="only a default-branch push seeds the shared dependency cache"
+          elif [ -z "$IMAGE" ]; then
+            reason="the plan names no CI image"
+          elif [ "$ENGINE" = "true" ]; then
+            reason="the haskell-engine worker builds and saves the dependencies itself"
+          elif [ "$LOOKUP" != "success" ]; then
+            seed=true
+            reason="the dependency cache lookup did not answer, so it is seeded rather than assumed"
+          elif [ "$HIT" = "true" ]; then
+            reason="the default-branch dependency cache for this environment already exists"
+          else
+            seed=true
+            reason="no default-branch dependency cache exists for this environment and dependency configuration"
+          fi
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "seed-dependencies: $seed ($reason)"
+          {
+            echo "## Dependency cache seed"
+            echo
+            echo "Seed: \`$seed\` — $reason."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload the plan
         uses: actions/upload-artifact@v7
         with:
@@ -223,6 +295,11 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # Bound to the descriptor's exact digest: the runtime's digest-addressed
+    # launch establishes which image runs. No apt, no GHC install, and no GLFW
+    # build happens here.
+    container:
+      image: ${{ needs.plan.outputs.image }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -243,43 +320,74 @@ jobs:
         with:
           name: validation-plan
 
-      - name: Restore the toolchain
-        uses: actions/cache@v6
-        with:
-          path: ~/.ghcup
-          # The toolchain depends on the compiler and Cabal versions and on
-          # nothing in the repository, so no source edit can evict it.
-          key: ghcup-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-${{ env.CABAL_VERSION }}
+      - name: Verify the execution environment
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: |
+          set -euo pipefail
+          # The embedded recipe fingerprint, the native manifest this image
+          # actually carries, the compilers it actually runs, and the Cabal
+          # store it resolves, all against the plan. The map it writes is the
+          # one every receipt below declares, and it must equal the plan's.
+          python3 tools/validation/ci_image.py verify-worker \
+            --plan plan.json --toolchain-file "$RUNNER_TEMP/toolchain.txt" | tee "$RUNNER_TEMP/verify.out"
+          declared="$(sed -n 's/^environment=//p' "$RUNNER_TEMP/verify.out")"
+          if [ "$declared" != "$ENVIRONMENT" ]; then
+            echo "::error::this worker's verified environment $declared is not the planned $ENVIRONMENT"
+            exit 1
+          fi
 
-      - name: Install GHC and Cabal
-        id: setup
-        uses: haskell-actions/setup@v2
-        with:
-          ghc-version: ${{ env.GHC_VERSION }}
-          cabal-version: ${{ env.CABAL_VERSION }}
-          cabal-update: true
+      - name: Link a native consumer against the image's GLFW
+        run: python3 tools/native/native.py link-check
 
       - name: Restore the package store
-        uses: actions/cache@v6
+        id: store
+        uses: actions/cache/restore@v6
         with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          # `cabal.project` carries the pinned Hackage index state, and the
-          # `.cabal` files carry the dependency bounds. Nothing else can change
-          # which packages are built, so a Markdown edit never evicts this.
-          key: cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          path: /opt/hetoimasia/cabal/store
+          # The environment key is the planned image, platform, and toolchain;
+          # `cabal.project` carries the pinned Hackage index state and the
+          # `.cabal` files the dependency bounds. The fallback stays inside the
+          # same environment: no restore may cross an image or native change.
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
           restore-keys: |
-            cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
+            cabal-store-${{ needs.plan.outputs.environment }}-
 
       - name: Restore the build tree
-        uses: actions/cache@v6
+        id: tree
+        uses: actions/cache/restore@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           # A partial match still saves most of the compile: a cache miss costs
           # time and can never change a result.
           restore-keys: |
-            dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
-            dist-newstyle-engine-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
+            dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-engine-${{ needs.plan.outputs.environment }}-
+
+      - name: Record the cache results
+        env:
+          SCOPE: ${{ github.ref }}
+          STORE_HIT: ${{ steps.store.outputs.cache-hit }}
+          STORE_KEY: ${{ steps.store.outputs.cache-primary-key }}
+          STORE_MATCHED: ${{ steps.store.outputs.cache-matched-key }}
+          TREE_HIT: ${{ steps.tree.outputs.cache-hit }}
+          TREE_KEY: ${{ steps.tree.outputs.cache-primary-key }}
+          TREE_MATCHED: ${{ steps.tree.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          result() { if [ "$1" = "true" ]; then echo hit; elif [ -n "$2" ]; then echo partial; else echo miss; fi; }
+          {
+            echo "## haskell-engine caches"
+            echo
+            echo "Scope \`$SCOPE\`."
+            echo
+            echo "| Cache | Result | Key | Restored from |"
+            echo "| --- | --- | --- | --- |"
+            echo "| package store | $(result "$STORE_HIT" "$STORE_MATCHED") | \`$STORE_KEY\` | \`${STORE_MATCHED:-none}\` |"
+            echo "| build tree | $(result "$TREE_HIT" "$TREE_MATCHED") | \`$TREE_KEY\` | \`${TREE_MATCHED:-none}\` |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run the groups this candidate still needs
         env:
@@ -288,6 +396,10 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p receipts
+          toolchain=()
+          while IFS= read -r entry; do
+            toolchain+=(--toolchain "$entry")
+          done < "$RUNNER_TEMP/toolchain.txt"
           status=0
           # Every owned group runs even after one fails, so the aggregate sees
           # a receipt for each of them rather than inferring the rest from the
@@ -308,10 +420,23 @@ jobs:
             python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
-              --toolchain "ghc=$(ghc --numeric-version)" \
-              --toolchain "cabal=$(cabal --numeric-version)" || status=1
+              "${toolchain[@]}" || status=1
           done
           exit "$status"
+
+      - name: Save the package store
+        if: ${{ !cancelled() && steps.store.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: ${{ steps.store.outputs.cache-primary-key }}
+
+      - name: Save the build tree
+        if: ${{ !cancelled() && steps.tree.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: dist-newstyle
+          key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
         if: always()
@@ -373,6 +498,8 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    container:
+      image: ${{ needs.plan.outputs.image }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -393,36 +520,64 @@ jobs:
         with:
           name: validation-plan
 
-      - name: Restore the toolchain
-        uses: actions/cache@v6
-        with:
-          path: ~/.ghcup
-          key: ghcup-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-${{ env.CABAL_VERSION }}
+      - name: Verify the execution environment
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 tools/validation/ci_image.py verify-worker \
+            --plan plan.json --toolchain-file "$RUNNER_TEMP/toolchain.txt" | tee "$RUNNER_TEMP/verify.out"
+          declared="$(sed -n 's/^environment=//p' "$RUNNER_TEMP/verify.out")"
+          if [ "$declared" != "$ENVIRONMENT" ]; then
+            echo "::error::this worker's verified environment $declared is not the planned $ENVIRONMENT"
+            exit 1
+          fi
 
-      - name: Install GHC and Cabal
-        id: setup
-        uses: haskell-actions/setup@v2
-        with:
-          ghc-version: ${{ env.GHC_VERSION }}
-          cabal-version: ${{ env.CABAL_VERSION }}
-          cabal-update: true
+      - name: Link a native consumer against the image's GLFW
+        run: python3 tools/native/native.py link-check
 
       - name: Restore the package store
-        uses: actions/cache@v6
+        id: store
+        uses: actions/cache/restore@v6
         with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          key: cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          path: /opt/hetoimasia/cabal/store
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
           restore-keys: |
-            cabal-store-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
+            cabal-store-${{ needs.plan.outputs.environment }}-
 
       - name: Restore the build tree
-        uses: actions/cache@v6
+        id: tree
+        uses: actions/cache/restore@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           restore-keys: |
-            dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
-            dist-newstyle-workflow-${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-
+            dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-
+
+      - name: Record the cache results
+        env:
+          SCOPE: ${{ github.ref }}
+          STORE_HIT: ${{ steps.store.outputs.cache-hit }}
+          STORE_KEY: ${{ steps.store.outputs.cache-primary-key }}
+          STORE_MATCHED: ${{ steps.store.outputs.cache-matched-key }}
+          TREE_HIT: ${{ steps.tree.outputs.cache-hit }}
+          TREE_KEY: ${{ steps.tree.outputs.cache-primary-key }}
+          TREE_MATCHED: ${{ steps.tree.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          result() { if [ "$1" = "true" ]; then echo hit; elif [ -n "$2" ]; then echo partial; else echo miss; fi; }
+          {
+            echo "## haskell-workflow caches"
+            echo
+            echo "Scope \`$SCOPE\`."
+            echo
+            echo "| Cache | Result | Key | Restored from |"
+            echo "| --- | --- | --- | --- |"
+            echo "| package store | $(result "$STORE_HIT" "$STORE_MATCHED") | \`$STORE_KEY\` | \`${STORE_MATCHED:-none}\` |"
+            echo "| build tree | $(result "$TREE_HIT" "$TREE_MATCHED") | \`$TREE_KEY\` | \`${TREE_MATCHED:-none}\` |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run the groups this candidate still needs
         env:
@@ -431,6 +586,10 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p receipts
+          toolchain=()
+          while IFS= read -r entry; do
+            toolchain+=(--toolchain "$entry")
+          done < "$RUNNER_TEMP/toolchain.txt"
           status=0
           for group in test.workflow; do
             case " $EXECUTE " in
@@ -446,10 +605,23 @@ jobs:
             python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
-              --toolchain "ghc=$(ghc --numeric-version)" \
-              --toolchain "cabal=$(cabal --numeric-version)" || status=1
+              "${toolchain[@]}" || status=1
           done
           exit "$status"
+
+      - name: Save the package store
+        if: ${{ !cancelled() && steps.store.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: ${{ steps.store.outputs.cache-primary-key }}
+
+      - name: Save the build tree
+        if: ${{ !cancelled() && steps.tree.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: dist-newstyle
+          key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
         if: always()
@@ -473,6 +645,71 @@ jobs:
           # A re-run of this same run would otherwise collide with the attempt
           # before it; the newest attempt is the one that should stand.
           overwrite: true
+
+  seed-dependencies:
+    needs: plan
+    # Only a default-branch push whose engine worker did not run and whose
+    # environment has no dependency cache yet. It builds dependencies and
+    # executes no validation group, so it writes no receipt.
+    if: needs.plan.outputs.seed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.plan.outputs.image }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Confirm the pinned candidate
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$CANDIDATE" ]; then
+            echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
+            exit 1
+          fi
+
+      - name: Download the plan
+        uses: actions/download-artifact@v8
+        with:
+          name: validation-plan
+
+      - name: Verify the execution environment
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 tools/validation/ci_image.py verify-worker \
+            --plan plan.json --toolchain-file "$RUNNER_TEMP/toolchain.txt" | tee "$RUNNER_TEMP/verify.out"
+          declared="$(sed -n 's/^environment=//p' "$RUNNER_TEMP/verify.out")"
+          if [ "$declared" != "$ENVIRONMENT" ]; then
+            echo "::error::this worker's verified environment $declared is not the planned $ENVIRONMENT"
+            exit 1
+          fi
+
+      - name: Restore the package store
+        id: store
+        uses: actions/cache/restore@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          restore-keys: |
+            cabal-store-${{ needs.plan.outputs.environment }}-
+
+      - name: Build the dependencies and nothing else
+        if: steps.store.outputs.cache-hit != 'true'
+        run: cabal build all --enable-tests --only-dependencies
+
+      - name: Save the package store
+        if: steps.store.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: ${{ steps.store.outputs.cache-primary-key }}
 
   build-test:
     needs: [plan, haskell-engine, haskell-workflow]
