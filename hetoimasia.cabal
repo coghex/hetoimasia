@@ -117,6 +117,7 @@ test-suite hetoimasia-tests
         Test.Engine.Messaging.Channel
         Test.Engine.Messaging.Opacity
         Test.Engine.Messaging.Snapshot
+        Test.Engine.Messaging.Turns
         Test.Engine.Messaging.Spec
         Test.Engine.Recovery.Spec
         Test.Engine.Resources.Buffer
@@ -130,6 +131,8 @@ test-suite hetoimasia-tests
         Test.Engine.Runtime.Composition
         Test.Engine.Runtime.Console
         Test.Engine.Runtime.Inbox
+        Test.Engine.Runtime.Inbox.Support
+        Test.Engine.Runtime.InboxFinish
         Test.Engine.Runtime.Lifetime
         Test.Engine.Runtime.Opacity
         Test.Engine.Runtime.Reporting

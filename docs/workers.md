@@ -317,9 +317,13 @@ startup succeeded, the handoff is full whenever `awaitStartup` reports
 completion is published only after the scope unwound, the abort — run under
 `uninterruptibleMask_`, without `retry`, waiting, or traversal of the backlog —
 precedes both component teardown and completion on every exit, including
-cancellation delivered between acknowledgement and the first receive. Its run
-result on an ordinary stop is an `InboxExit` with the cumulative discard count;
-every other exit leaves the raw `Failed` or `Cancelled` result untouched. The
+cancellation delivered between acknowledgement and the first receive. A
+graceful finish uses only the stop token and raw completion: after acknowledging
+its drain, the run waits for its stop request before returning, so the run-exit
+record shows the request, and the finish observes the completion only after
+that stop. Its run result when a stop is taken is an `InboxExit` with the
+cumulative discard count and the drain acknowledgement, if any; every other
+exit leaves the raw `Failed` or `Cancelled` result untouched. The
 worker's stop token, not the application's control, is what the component
 startup receives. See [messaging.md](messaging.md#supervised-inbox-services).
 

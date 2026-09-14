@@ -179,9 +179,23 @@ not a verdict that Synarchy's design should be discarded.
   is a stop-first `orElse` over one prepared message at a time; handler
   exceptions escape to supervision's policy with no isolation or replay. An
   ordinary stop aborts and returns an opaque `InboxExit` holding the cumulative
-  discard count (no drain field; backlog is not processed on stop). Graceful
-  finish and drain acknowledgement remain MSG-6. Contract in `docs/messaging.md`;
-  examples under `Runtime`'s `Inbox services` and its opacity clients.
+  discard count (backlog is not processed on stop). Contract in
+  `docs/messaging.md`; examples under `Runtime`'s `Inbox services` and its
+  opacity clients.
+- MSG-6 (#79) completed the messaging arc: `finishInboxService` closes
+  admission normally, lets the worker handle the in-flight message and backlog
+  in FIFO order, and waits through `awaitSupervised` for a `DrainAcknowledgement`
+  the worker records in the same STM decision as its stop check and the closed,
+  empty receive, then waits for its stop token. Finish stops through
+  `stopSupervised` and awaits completion supervised, reporting `InboxFinished`,
+  `InboxUnfinished` (with any acknowledgement and the actual completion), or
+  `InboxFinishUnavailable`; other failures propagate. `InboxExit` gained a
+  private acknowledgement field read by `inboxDrain`; `inboxAcknowledgedDrain`
+  reads it raw on the handle. A cancellation after the drain has no
+  deterministic public trigger that settles as `WorkerStopped`; its example is
+  the policy-judged unexpected termination. The combined command/snapshot
+  example is under `Runtime`'s `Inbox finish`; the bounded-turn loop is
+  `Messaging`'s `Bounded turns`, a test-only pattern, not an API.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

@@ -14,12 +14,13 @@
 -- "Test.Engine.Resources.Opacity", exposing @base@, @text@, @stm@,
 -- @hetoimasia-foundation@, and @hetoimasia-runtime@ and hiding everything
 -- else. For the supervised handle two clients must be rejected, and for the
--- inbox service's handle, definition, start result, and exit record six, each
--- for the specific diagnostic naming its cause, so a missing package, an absent
--- compiler, or an unrelated error can never pass for the boundary holding. One
--- client for each interface must be accepted, linked, and run, which is both
--- the environment control and the evidence that the supported readers and
--- operations stay usable.
+-- inbox service's handle, definition, start result, exit record, and drain
+-- acknowledgement nine, each for the specific diagnostic naming its cause, so a
+-- missing package, an absent compiler, or an unrelated error can never pass for
+-- the boundary holding. One client for the supervised handle and two for the
+-- inbox — one stopping a service, one finishing it — must be accepted, linked,
+-- and run, which is both the environment control and the evidence that the
+-- supported readers and operations stay usable.
 module Test.Engine.Runtime.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
@@ -197,8 +198,9 @@ supportedClient =
 -- startup handed off, so a rewritten handle would let a producer send to one
 -- service while its owner stops another. The definition's constructor would
 -- let a client build the startup, and so the handoff, itself. An exit record
--- rebuilt or updated by a client would claim a discard count no inbox counted.
--- A failed start carries no service handle at all.
+-- rebuilt or updated by a client would claim a discard count no inbox counted,
+-- or a drain no service acknowledged, and a forged acknowledgement would claim
+-- the same. A failed start carries no service handle at all.
 inboxSpec ∷ Spec
 inboxSpec = describe "Inbox service opacity across the package boundary" $ do
   it "rejects a client that replaces a service's endpoint with record update" $
@@ -237,6 +239,24 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
       rejectedBecause outcome "Not in scope: record field"
       clientOutput outcome `shouldContain` "inboxDiscarded"
 
+  it "rejects a client that updates an exit record's drain acknowledgement" $
+    withClient "Client.hs" drainUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "inboxDrain"
+
+  it "rejects a client that forges a drain acknowledgement with its constructor" $
+    withClient "Client.hs" (importingClient "DrainAcknowledgement (DrainAcknowledgement)") $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "DrainAcknowledgement"
+
+  it "rejects a client that rewrites a drain acknowledgement's handled count" $
+    withClient "Client.hs" handledUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "drainHandled"
+
   it "accepts and runs a client that starts a service, sends, stops it, and reads its discard count" $
     withClient "Main.hs" inboxClient $ \compile → do
       outcome ← compile Link
@@ -256,6 +276,26 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
       status `shouldBe` ExitSuccess
       err `shouldBe` ""
       lines out `shouldBe` ["sends = [Accepted,Accepted]", "discarded = 2"]
+
+  it "accepts and runs a client that finishes a service and reads both exit record accessors" $
+    withClient "Main.hs" finishClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the supported client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out `shouldBe` ["sends = [Accepted,Accepted]", "discarded = 0", "drained after = Just 2", "handle drained after = Just 2"]
 
 -- | A client that only imports the named item from the inbox module.
 importingClient ∷ String → String
@@ -303,6 +343,30 @@ exitUpdateClient =
     , ""
     , "reset ∷ InboxExit → InboxExit"
     , "reset exit = exit { inboxDiscarded = 0 }"
+    ]
+
+-- | Rewrites the drain acknowledgement of an exit record it was given.
+drainUpdateClient ∷ String
+drainUpdateClient =
+  unlines
+    [ "module Client (undrained) where"
+    , ""
+    , "import Hetoimasia.Runtime.Inbox (InboxExit, inboxDrain)"
+    , ""
+    , "undrained ∷ InboxExit → InboxExit"
+    , "undrained exit = exit { inboxDrain = Nothing }"
+    ]
+
+-- | Rewrites the handled count of a drain acknowledgement it was given.
+handledUpdateClient ∷ String
+handledUpdateClient =
+  unlines
+    [ "module Client (inflated) where"
+    , ""
+    , "import Hetoimasia.Runtime.Inbox (DrainAcknowledgement, drainHandled)"
+    , ""
+    , "inflated ∷ DrainAcknowledgement → DrainAcknowledgement"
+    , "inflated acknowledgement = acknowledgement { drainHandled = 99 }"
     ]
 
 -- | A client using only what the inbox interface offers: it holds the handler
@@ -360,4 +424,57 @@ inboxClient =
     , "      case completionResult completion of"
     , "        Succeeded exit → putStrLn (\"discarded = \" <> show (inboxDiscarded exit))"
     , "        _ → hPutStrLn stderr \"the inbox service did not stop cleanly\" >> exitFailure"
+    ]
+
+-- | A client using only what the inbox interface offers to finish a service: it
+-- sends two messages, finishes the service, and reads the discard count and the
+-- drain acknowledgement from the exit record and from the service handle.
+finishClient ∷ String
+finishClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Concurrent.STM (atomically)"
+    , "import Data.Text (pack)"
+    , "import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger, unsafeComponent)"
+    , "import Hetoimasia.Foundation.Messaging.Channel (send)"
+    , "import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)"
+    , "import Hetoimasia.Runtime.Inbox"
+    , "  ( InboxFinish (InboxFinished)"
+    , "  , InboxPolicy (InboxPolicy)"
+    , "  , InboxStart (InboxStarted)"
+    , "  , drainHandled"
+    , "  , finishInboxService"
+    , "  , inboxAcknowledgedDrain"
+    , "  , inboxDefinition"
+    , "  , inboxDiscarded"
+    , "  , inboxDrain"
+    , "  , inboxSender"
+    , "  , startInboxService"
+    , "  )"
+    , "import Hetoimasia.Runtime.Logging (withLoggingLifetime)"
+    , "import Hetoimasia.Runtime.Supervision (Disposition (Required), Recognition (Unrecognized), withSupervision)"
+    , "import System.Exit (exitFailure)"
+    , "import System.IO (hPutStrLn, stderr)"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  let policy = InboxPolicy Required (unsafeComponent (pack \"client.inbox\")) (\\_ → pure Unrecognized)"
+    , "      handler ∷ () → Prepared Int → IO ()"
+    , "      handler () _ = pure ()"
+    , "  withLoggingLifetime (mkLogger defaultLogFilter (callbackSink (\\_ → pure ()))) $ \\lifetime →"
+    , "    withSupervision lifetime $ \\control → do"
+    , "      started ← startInboxService control policy (inboxDefinition (pack \"client\") 4 (\\_ → pure ()) handler)"
+    , "      service ← case started of"
+    , "        InboxStarted service → pure service"
+    , "        _ → hPutStrLn stderr \"expected a started inbox service\" >> exitFailure"
+    , "      sends ← traverse (\\value → prepare value >>= atomically . send (inboxSender service)) [1, 2]"
+    , "      putStrLn (\"sends = \" <> show sends)"
+    , "      finishInboxService control service >>= \\case"
+    , "        InboxFinished exit → do"
+    , "          putStrLn (\"discarded = \" <> show (inboxDiscarded exit))"
+    , "          putStrLn (\"drained after = \" <> show (drainHandled <$> inboxDrain exit))"
+    , "        _ → hPutStrLn stderr \"the inbox service did not finish\" >> exitFailure"
+    , "      acknowledged ← atomically (inboxAcknowledgedDrain service)"
+    , "      putStrLn (\"handle drained after = \" <> show (drainHandled <$> acknowledged))"
     ]
