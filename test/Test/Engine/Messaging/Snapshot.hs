@@ -230,6 +230,10 @@ testCoherentPairs = do
   publisher ← newIntSnapshot 0
   let reader = snapshotReader publisher
       count = 500
+  -- Every reader starts from the initial cursor, captured before any
+  -- publication, so a waiting reader scheduled after the last publication still
+  -- has something newer to receive.
+  initial ← observedCursor <$> atomically (readSnapshot reader)
   start ← newGate
   let checkedReader waiting = do
         done ← newEmptyMVar
@@ -248,7 +252,7 @@ testCoherentPairs = do
                   unless (toInteger value == revision) $
                     throwIO (userError ("value " <> show value <> " paired with revision " <> show revision))
                   unless (value == count) (loop (observedCursor observation))
-            atomically (readSnapshot reader) >>= loop . observedCursor
+            loop initial
           putMVar done outcome
         pure done
   readers ← forM [True, True, False, False] checkedReader
