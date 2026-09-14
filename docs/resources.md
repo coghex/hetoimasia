@@ -471,7 +471,7 @@ enforces that itself.
 The collection cannot outlive its scope. When the enclosing continuation
 returns or throws, admission closes; afterwards every operation on the
 collection is rejected with `CollectionClosed`, so a collection value that
-leaked out of its scope reaches nothing.
+leaked out of its scope reaches nothing, not even `liveMemberCount`.
 
 ### Acquisition
 
@@ -514,15 +514,15 @@ after the borrow has returned.
 ### Retirement
 
 `retireMember` checks the owner thread, the token's collection, and the phase,
-then answers from the member's state:
+then answers from the member's state, in the order of this table:
 
 | Member state | Outcome |
 |---|---|
-| Live, not borrowed | Its parts are released now, in their declared order, each once and uninterruptibly: `Retired`, or the failure below |
-| Live, borrowed by a running callback | `RetirementInUse`; nothing runs |
-| Live, while another member is borrowed | Rejected with `CollectionReentered Borrowing` |
+| Borrowed by a running callback | `RetirementInUse`; nothing runs |
+| Any other member, live or terminal, while a callback is borrowing | Rejected with `CollectionReentered Borrowing`; nothing runs |
 | Retired successfully | `AlreadyRetired`; nothing runs |
 | Retirement failed | The stored failure is rethrown — the same exception, context, and cleanup identities — and the release is not called again |
+| Live | Its parts are released now, in their declared order, each once and uninterruptibly: `Retired`, or the failure below |
 
 Retirement claims the release exactly once and makes access terminal. A
 successful retirement removes the member's ledger entry and its value and
@@ -1409,12 +1409,13 @@ callback, and a borrow dropped after its callback fails or is cancelled. Misuse:
 every owner operation from another thread and a foreign token rejected with no
 effect, and acquisition, borrowing, and retirement re-entered from an assembly,
 an early release, and a release at exit each rejected, with a borrowing
-callback allowed to borrow but not to acquire or retire another member. Terminal
-tokens: statuses read after exit while the closed collection rejects every
-operation, a release failed at exit reported through its retained token, and
-two hundred open, borrow, and retire cycles under a limit of one leaving no
-live member, with the garbage collector unable to reach any retired payload
-through the retained tokens. Cleanup failures: a caught early-retirement
+callback allowed to borrow but not to acquire or retire another member, live
+or already terminal. Terminal tokens: statuses read after exit while the closed
+collection rejects every operation, including `liveMemberCount`, a failed early
+retirement and a release failed at exit each reported through a retained token
+whose payload the garbage collector can no longer reach, and two hundred open,
+borrow, and retire cycles under a limit of one leaving no live member, with no
+retired payload reachable through the retained tokens. Cleanup failures: a caught early-retirement
 failure still failing a successful body's exit while the remaining members are
 released, a failing and a cancelled body each staying primary beside early and
 final evidence, a failing rollback poisoning acquisition while a live member

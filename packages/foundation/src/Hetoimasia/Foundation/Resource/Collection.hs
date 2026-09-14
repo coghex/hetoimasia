@@ -303,11 +303,16 @@ allocCollection limit = Scoped $ \continue → do
         rethrowIO (retainCleanupFailures failures (cleanupFailureException first))
       (Left primary, _) → rethrowIO (retainCleanupFailures failures primary)
 
--- | The number of members currently live. Owner thread only.
+-- | The number of members currently live. Owner thread only; rejected with
+-- 'CollectionClosed' once the collection's scope has exited. Reading it while
+-- the collection is busy changes nothing, so it is not a reentry.
 liveMemberCount ∷ Collection → IO Int
 liveMemberCount collection = do
   requireOwner collection
-  Map.size <$> readIORef (collectionLive collection)
+  phase ← readIORef (collectionPhase collection)
+  case phase of
+    PhaseClosed → throwIO CollectionClosed
+    _ → Map.size <$> readIORef (collectionLive collection)
 
 -- | Build one member from an 'Assembly' and register it.
 --
@@ -374,12 +379,13 @@ withMember collection member@(Member _ _ state) action = mask $ \restore → do
 -- | Release one member before the collection's scope ends.
 --
 -- After the owner thread, the token's collection, and the phase are checked,
--- a terminal member answers from its stored state: 'AlreadyRetired' after a
+-- a member that a running callback borrows answers 'RetirementInUse'. While
+-- any callback is borrowing, retiring any other member — live or already
+-- terminal — is rejected with 'CollectionReentered' 'Borrowing'. Otherwise a
+-- terminal member answers from its stored state: 'AlreadyRetired' after a
 -- successful release, or its stored failure rethrown after a failed one. A
--- member that a running callback borrows answers 'RetirementInUse'. Any other
--- active borrow rejects the call. Otherwise the member leaves the ledger and
--- its parts are released in their declared order, each exactly once and
--- uninterruptibly.
+-- live member leaves the ledger and its parts are released in their declared
+-- order, each exactly once and uninterruptibly.
 --
 -- A release that fails leaves the member in a failed terminal state, poisons
 -- and latches the collection, and propagates the first cleanup failure's
@@ -391,19 +397,22 @@ retireMember collection member@(Member _ identifier state) = mask_ $ do
   requireOpen collection
   held ← readIORef state
   case held of
-    MemberReleased → pure AlreadyRetired
-    MemberReleaseFailed failure → rethrowIO failure
-    MemberHeld _ ledger borrows
-      | borrows > 0 → pure RetirementInUse
-      | otherwise → do
-          requireNoBorrow collection
-          writeIORef (collectionPhase collection) (PhaseBusy Retiring)
-          modifyIORef' (collectionLive collection) (Map.delete identifier)
-          failures ← releaseAcquired ledger
-          settled ← settle state failures
-          latch collection failures
-          writeIORef (collectionPhase collection) PhaseOpen
-          maybe (pure Retired) rethrowIO settled
+    MemberHeld _ _ borrows | borrows > 0 → pure RetirementInUse
+    _ → do
+      requireNoBorrow collection
+      retireUnborrowed held
+  where
+    retireUnborrowed held = case held of
+      MemberReleased → pure AlreadyRetired
+      MemberReleaseFailed failure → rethrowIO failure
+      MemberHeld _ ledger _ → do
+        writeIORef (collectionPhase collection) (PhaseBusy Retiring)
+        modifyIORef' (collectionLive collection) (Map.delete identifier)
+        failures ← releaseAcquired ledger
+        settled ← settle state failures
+        latch collection failures
+        writeIORef (collectionPhase collection) PhaseOpen
+        maybe (pure Retired) rethrowIO settled
 
 -- | A member's state, readable from any thread and after the collection has
 -- exited. A terminal state never changes.

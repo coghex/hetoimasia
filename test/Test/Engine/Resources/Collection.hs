@@ -125,6 +125,8 @@ spec = do
       testReentryFromAssembly
     it "rejects acquisition and retirement of other members from a borrowing callback"
       testReentryFromBorrow
+    it "rejects retirement of other terminal members from a borrowing callback"
+      testTerminalRetirementFromBorrow
     it "rejects acquisition, borrowing, and retirement re-entered from an early release"
       testReentryFromRetirementRelease
     it "rejects acquisition, borrowing, and retirement re-entered from a release at exit"
@@ -133,7 +135,9 @@ spec = do
   describe "Resource collection terminal tokens" $ do
     it "reports terminal states after the collection exits and rejects the closed collection"
       testTerminalTokensAfterExit
-    it "reports a release that failed at exit through the retained token"
+    it "releases a failed early retirement's payload while its token keeps only the failure"
+      testFailedRetirementPayloadReleased
+    it "reports a release that failed at exit through the retained token, which keeps only the failure"
       testFailedAtExitToken
     it "keeps owner bookkeeping and payloads bounded by live members across open and retire cycles"
       testBoundedBookkeeping
@@ -252,6 +256,21 @@ observedPayload weaks =
         pure payload
     )
     (\_ → pure ())
+
+-- | 'observedPayload' whose release throws an 'IOException' carrying
+-- @"payload released"@.
+failingPayload ∷ IORef [Weak (IORef ())] → Assembly (IORef ())
+failingPayload weaks =
+  acquirePart
+    "payload"
+    (releaseRank 0)
+    ( do
+        payload ← newIORef ()
+        weak ← mkWeakIORef payload (pure ())
+        readIORef weaks >>= writeIORef weaks . (weak :)
+        pure payload
+    )
+    (\_ → throwIO (userError "payload released"))
 
 -- | How many of the observed payloads the garbage collector still reaches.
 reachablePayloads ∷ IORef [Weak (IORef ())] → IO Int
@@ -612,6 +631,30 @@ testReentryFromBorrow = do
     trail events `shouldReturn` ["acquire borrowed", "acquire other"]
     liveMemberCount collection `shouldReturn` 2
 
+testTerminalRetirementFromBorrow ∷ Expectation
+testTerminalRetirementFromBorrow = do
+  events ← newTrail
+  exited ←
+    expectFailure $
+      withScoped (allocCollection 3) $ \collection → do
+        borrowed ← acquireMember collection (tracked events "borrowed")
+        retired ← acquireMember collection (tracked events "retired")
+        broken ← acquireMember collection (failing events "broken")
+        retireMember collection retired `shouldReturn` Retired
+        void (expectFailure (retireMember collection broken))
+        withMember collection borrowed $ \_ → do
+          rejectedWith (CollectionReentered Borrowing) (retireMember collection retired)
+          rejectedWith (CollectionReentered Borrowing) (retireMember collection broken)
+          retireMember collection borrowed `shouldReturn` RetirementInUse
+        -- Outside the borrow, both answer from their stored state again.
+        retireMember collection retired `shouldReturn` AlreadyRetired
+        again ← expectFailure (retireMember collection broken)
+        ioErrorMessage again `shouldBe` Just "broken released"
+  ioErrorMessage exited `shouldBe` Just "broken released"
+  performed ← trail events
+  occurrences "release retired" performed `shouldBe` 1
+  occurrences "release broken" performed `shouldBe` 1
+
 -- | A member whose release probes its own collection through the slot, and
 -- records what the probe observed.
 probing
@@ -697,23 +740,44 @@ testTerminalTokensAfterExit = do
   rejectedWith CollectionClosed (acquireMember collection (tracked events "late"))
   rejectedWith CollectionClosed (withMember collection atExit (\_ → record events "borrowed"))
   rejectedWith CollectionClosed (retireMember collection early)
-  liveMemberCount collection `shouldReturn` 0
+  rejectedWith CollectionClosed (liveMemberCount collection)
   trail events `shouldReturn` []
 
-testFailedAtExitToken ∷ Expectation
-testFailedAtExitToken = do
-  events ← newTrail
+testFailedRetirementPayloadReleased ∷ Expectation
+testFailedRetirementPayloadReleased = do
+  weaks ← newIORef []
   retained ← newEmptyMVar
   exited ←
     expectFailure $
-      withScoped (allocCollection 1) $ \collection →
-        acquireMember collection (failing events "member") >>= putMVar retained
+      withScoped (allocCollection 1) $ \collection → do
+        member ← acquireMember collection (failingPayload weaks)
+        reachablePayloads weaks `shouldReturn` 1
+        void (expectFailure (retireMember collection member))
+        -- The collection and the token are both still live here.
+        reachablePayloads weaks `shouldReturn` 0
+        putMVar retained member
+  member ← takeMVar retained
+  ioErrorMessage exited `shouldBe` Just "payload released"
+  status ← memberStatus member
+  (storedFailure status >>= ioErrorMessage) `shouldBe` Just "payload released"
+  reachablePayloads weaks `shouldReturn` 0
+
+testFailedAtExitToken ∷ Expectation
+testFailedAtExitToken = do
+  weaks ← newIORef []
+  retained ← newEmptyMVar
+  exited ←
+    expectFailure $
+      withScoped (allocCollection 1) $ \collection → do
+        acquireMember collection (failingPayload weaks) >>= putMVar retained
+        reachablePayloads weaks `shouldReturn` 1
   member ← takeMVar retained
   status ← memberStatus member
-  (storedFailure status >>= ioErrorMessage) `shouldBe` Just "member released"
-  ioErrorMessage exited `shouldBe` Just "member released"
-  labelsOf (cleanupFailures exited) `shouldBe` ["member"]
-  trail events `shouldReturn` ["acquire member", "release member"]
+  (storedFailure status >>= ioErrorMessage) `shouldBe` Just "payload released"
+  ioErrorMessage exited `shouldBe` Just "payload released"
+  labelsOf (cleanupFailures exited) `shouldBe` ["payload"]
+  -- The retained token and the failure it stores keep no payload reachable.
+  reachablePayloads weaks `shouldReturn` 0
 
 testBoundedBookkeeping ∷ Expectation
 testBoundedBookkeeping = do
