@@ -10,7 +10,9 @@ description:
     complete owned operation; and scoped component construction that selects
     among rolled-back alternatives under the same policy; and owned CPU worker
     threads with scoped startup, cooperative stop, cancellation, terminal
-    observation, and a protected drain before borrowed dependencies unwind.
+    observation, and a protected drain before borrowed dependencies unwind;
+    and immutable message payloads fully evaluated through NFData on the
+    producer's thread before publication.
     This library has no application state, graphics, scripting, or game
     dependencies.
 license: GPL-3.0-only
@@ -31,6 +33,7 @@ library
     exposed-modules:
         Hetoimasia.Foundation.Failure
         Hetoimasia.Foundation.Log
+        Hetoimasia.Foundation.Messaging.Payload
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
         Hetoimasia.Foundation.Worker
@@ -46,6 +49,7 @@ library
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
+        deepseq >=1.5.1 && <1.6,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         time >=1.14 && <1.15

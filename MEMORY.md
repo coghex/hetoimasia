@@ -141,6 +141,13 @@ not a verdict that Synarchy's design should be discarded.
   library (`Hetoimasia.Console.Exit`): failure exits 1, cancellation 130.
   Contract: `docs/resources.md`, "The application runner"; `Runtime`'s
   `Application lifecycle` Hspec group proves it.
+- MSG-1 (#74) added `Hetoimasia.Foundation.Messaging.Payload`: `prepare`
+  fully evaluates a value through its `NFData` instance in producer IO and
+  returns an opaque, nominal-role `Prepared` handle; `preparedValue` reads it
+  without `NFData` or re-evaluation. Failures propagate untouched, cancellation
+  stays cancellation, and there is no transport state or STM. Foundation and
+  the root tests now depend on `deepseq`. Contract: `docs/messaging.md`; the new
+  `Messaging` Hspec group proves it and is where later messaging slices go.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

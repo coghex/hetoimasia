@@ -114,6 +114,8 @@ test-suite hetoimasia-tests
         Test.Engine.Logging.Spec
         Test.Engine.Logging.Support
         Test.Engine.Logging.Worker
+        Test.Engine.Messaging.Opacity
+        Test.Engine.Messaging.Spec
         Test.Engine.Recovery.Spec
         Test.Engine.Resources.Buffer
         Test.Engine.Resources.Cost
@@ -139,6 +141,7 @@ test-suite hetoimasia-tests
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
+        deepseq >=1.5.1 && <1.6,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hetoimasia:console,

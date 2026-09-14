@@ -100,6 +100,16 @@ stops keeps them alive. The module publishes raw outcomes, run-exit ordering,
 and cleanup evidence, and classifies none of them. See
 [docs/workers.md](../../docs/workers.md).
 
-Depends on `base`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
+`Hetoimasia.Foundation.Messaging.Payload` is the boundary later messaging
+transports accept. `prepare` fully evaluates a value through its `NFData`
+instance on the producer's thread and returns an opaque `Prepared` handle, so a
+failure nested in a lazy field is raised to the producer rather than a consumer.
+`preparedValue` reads the value without evaluating anything or needing
+`NFData`, so an unchanged payload is forwarded without being prepared again. The
+handle cannot be constructed, rewritten, coerced, or mapped from outside the
+module. It owns no transport state. See
+[docs/messaging.md](../../docs/messaging.md).
+
+Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
