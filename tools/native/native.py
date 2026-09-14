@@ -507,7 +507,10 @@ def build(prefix: str, target: str, source_cache: str) -> str:
 # --------------------------------------------------------------------------
 # Link check
 
+# GLFW_INCLUDE_NONE keeps the header from pulling in an OpenGL header: the
+# consumer uses no client API, and the image deliberately carries none.
 CONSUMER = r"""
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <stdio.h>
 
