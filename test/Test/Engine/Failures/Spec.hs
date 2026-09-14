@@ -12,6 +12,7 @@ module Test.Engine.Failures.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.STM (STM, atomically, catchSTM, newTVarIO, readTVarIO, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
@@ -22,6 +23,7 @@ import Control.Exception
   , catchNoPropagate
   , fromException
   , rethrowIO
+  , throw
   , throwIO
   , try
   , tryWithContext
@@ -46,6 +48,7 @@ import Hetoimasia.Foundation.Failure
   , failureEvidenceInContext
   , operation
   , throwFailure
+  , throwFailureSTM
   , withOperationContext
   )
 import Hetoimasia.Foundation.Log (Component, SourceLocation (..), unsafeComponent)
@@ -120,6 +123,28 @@ spec = describe "Failures" $ do
     it "renders hostile operation and identifier text on one escaped line"
       testHostileTextRendersOneLine
 
+  describe "Failures inside STM" $ do
+    it "is caught by its own type with catchSTM and outside atomically"
+      testSTMTypedCatch
+    it "records the component, operation, identifiers, and call site"
+      testSTMDirectOrigin
+    it "attributes a wrapper that declares HasCallStack to its own caller"
+      testSTMWrapperAttribution
+    it "exposes evidence to a SomeException handler but not to a typed handler's value"
+      testSTMEvidenceInsideCatch
+    it "gains context from an enclosing withOperationContext once it escapes atomically"
+      testSTMOperationContext
+    it "keeps an annotation the cause already carried"
+      testSTMKeepsAnnotation
+    it "keeps an earlier origin and its ordered contexts"
+      testSTMKeepsEarlierOrigin
+    it "records no origin for an asynchronous cause and keeps its context"
+      testSTMAsyncUnannotated
+    it "raises a faulting identifier's own exception instead of the failure"
+      testSTMFaultingIdentifier
+    it "rolls back an escaping transaction and only the caught action's writes"
+      testSTMRollback
+
 -- Fixtures -------------------------------------------------------------------
 
 -- | A component's own exception type. The foundation never imports it.
@@ -153,6 +178,19 @@ renderScene = operation "render-scene"
 failWidget ∷ HasCallStack ⇒ WidgetFailure → IO a
 failWidget = throwFailure widgets loadWidget [("widget", "w-7")]
 
+-- | The same wrapper for a transaction.
+failWidgetSTM ∷ HasCallStack ⇒ WidgetFailure → STM a
+failWidgetSTM = throwFailureSTM widgets loadWidget [("widget", "w-7")]
+
+commitScene ∷ Operation
+commitScene = operation "commit-scene"
+
+-- | Raised by an identifier that faults when it is evaluated.
+data IdentifierFault = IdentifierFault
+  deriving (Eq, Show)
+
+instance Exception IdentifierFault
+
 -- | The line this value is used on.
 callLine ∷ HasCallStack ⇒ Int
 callLine = case getCallStack callStack of
@@ -178,6 +216,12 @@ originOf ∷ FailureEvidence → IO FailureOrigin
 originOf evidence = case failureCause evidence of
   EngineOrigin origin → pure origin
   NativeCause → fail ("expected an engine origin, but found " <> show evidence)
+
+-- | Run @action@, requiring it to fail, and return the failure with its
+-- context, ready to pass on as a cause. A bare 'SomeException' would not do:
+-- @base@ gives it a fresh context when it is thrown again.
+caughtWithContext ∷ IO a → IO (ExceptionWithContext SomeException)
+caughtWithContext = expectContext @SomeException
 
 siteOf ∷ Maybe FailureSite → IO FailureSite
 siteOf = maybe (fail "expected source information") pure
@@ -456,3 +500,144 @@ testHostileTextRendersOneLine = do
   filter (isInfixOf "forged") rendered `shouldBe` starting "failure origin:"
   rendered `shouldSatisfy` any (isInfixOf "(\"path\"=\"a.png\\nduring operation: test.scene forged\")")
   rendered `shouldSatisfy` any (isInfixOf "test.scene \"render\\r\\\"scene\\\"\" (\"frame\\n\"=\"1\")")
+
+-- Failures inside STM --------------------------------------------------------
+
+testSTMTypedCatch ∷ Expectation
+testSTMTypedCatch = do
+  engine ← try (atomically (failWidgetSTM (WidgetMissing "valve")) ∷ IO ())
+  engine `shouldBe` Left (WidgetMissing "valve")
+  native ← try @IOException (atomically (throwFailureSTM widgets loadWidget [] (userError "native stm failure")) ∷ IO ())
+  either (Just . ioeGetErrorString) (const Nothing) native `shouldBe` Just "native stm failure"
+  caughtEngine ←
+    atomically $
+      (failWidgetSTM (WidgetBroken 3) >> pure Nothing) `catchSTM` \(failure ∷ WidgetFailure) → pure (Just failure)
+  caughtEngine `shouldBe` Just (WidgetBroken 3)
+  caughtNative ←
+    atomically $
+      (throwFailureSTM widgets loadWidget [] (userError "caught stm failure") >> pure Nothing)
+        `catchSTM` \(failure ∷ IOException) → pure (Just (ioeGetErrorString failure))
+  caughtNative `shouldBe` Just "caught stm failure"
+
+testSTMDirectOrigin ∷ Expectation
+testSTMDirectOrigin = do
+  (line, ExceptionWithContext context failure) ← (callLine,) <$> expectContext (atomically (throwFailureSTM widgets loadWidget [("widget", "w-1"), ("attempt", "2")] (WidgetBroken 1)) ∷ IO ())
+  failure `shouldBe` WidgetBroken 1
+  let evidence = failureEvidenceInContext context
+  failureContexts evidence `shouldBe` []
+  origin ← originOf evidence
+  originComponent origin `shouldBe` widgets
+  originOperation origin `shouldBe` loadWidget
+  originIdentifiers origin `shouldBe` [("widget", "w-1"), ("attempt", "2")]
+  site ← siteOf (originSite origin)
+  siteLocation site `shouldBe` SourceLocation callFile line "throwFailureSTM"
+  siteCallStack site `shouldBe` [SourceLocation callFile line "throwFailureSTM"]
+
+testSTMWrapperAttribution ∷ Expectation
+testSTMWrapperAttribution = do
+  (line, ExceptionWithContext context failure) ← (callLine,) <$> expectContext (atomically (failWidgetSTM (WidgetMissing "lid")) ∷ IO ())
+  failure `shouldBe` WidgetMissing "lid"
+  origin ← originOf (failureEvidenceInContext context)
+  site ← siteOf (originSite origin)
+  siteLocation site `shouldBe` SourceLocation callFile line "failWidgetSTM"
+  map sourceFunction (siteCallStack site) `shouldBe` ["throwFailureSTM", "failWidgetSTM"]
+  case map sourceLine (siteCallStack site) of
+    [inner, outer] → do
+      outer `shouldBe` line
+      inner `shouldSatisfy` (/= line)
+    other → expectationFailure ("expected two frames, found " <> show other)
+
+testSTMEvidenceInsideCatch ∷ Expectation
+testSTMEvidenceInsideCatch = do
+  -- A SomeException handler reads the evidence without leaving the transaction.
+  (line, inspected) ←
+    (callLine,) <$> atomically ((failWidgetSTM (WidgetBroken 3) >> pure Nothing) `catchSTM` \(caught ∷ SomeException) → pure (Just (fromException caught, failureEvidence caught)))
+  case inspected of
+    Just (failure, evidence) → do
+      failure `shouldBe` Just (WidgetBroken 3)
+      origin ← originOf evidence
+      site ← siteOf (originSite origin)
+      siteLocation site `shouldBe` SourceLocation callFile line "failWidgetSTM"
+    Nothing → expectationFailure "expected the handler to run"
+  -- A typed handler matches, but holds only the value: rethrowing it raises
+  -- the same type and value with no evidence.
+  ExceptionWithContext context failure ←
+    expectContext @WidgetFailure $
+      atomically (failWidgetSTM (WidgetBroken 5) `catchSTM` \(caught ∷ WidgetFailure) → throwSTM caught ∷ STM ())
+  failure `shouldBe` WidgetBroken 5
+  failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+
+testSTMOperationContext ∷ Expectation
+testSTMOperationContext = do
+  (line, ExceptionWithContext context failure) ←
+    (callLine,) <$> expectContext (withOperationContext scene renderScene [("frame", "12")] (atomically (failWidgetSTM (WidgetBroken 2))) ∷ IO ())
+  failure `shouldBe` WidgetBroken 2
+  let evidence = failureEvidenceInContext context
+  origin ← originOf evidence
+  site ← siteOf (originSite origin)
+  siteLocation site `shouldBe` SourceLocation callFile line "failWidgetSTM"
+  map contextOperation (failureContexts evidence) `shouldBe` [renderScene]
+  map contextIdentifiers (failureContexts evidence) `shouldBe` [[("frame", "12")]]
+
+testSTMKeepsAnnotation ∷ Expectation
+testSTMKeepsAnnotation = do
+  cause ← caughtWithContext (annotateIO (Marker "carried") (throwIO (WidgetBroken 4)) ∷ IO ())
+  ExceptionWithContext context failure ←
+    expectContext @WidgetFailure (atomically (throwFailureSTM scene commitScene [("scene", "s-2")] cause) ∷ IO ())
+  failure `shouldBe` WidgetBroken 4
+  (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "carried"]
+  origin ← originOf (failureEvidenceInContext context)
+  originComponent origin `shouldBe` scene
+  originOperation origin `shouldBe` commitScene
+  originIdentifiers origin `shouldBe` [("scene", "s-2")]
+
+testSTMKeepsEarlierOrigin ∷ Expectation
+testSTMKeepsEarlierOrigin = do
+  (line, cause) ← (callLine,) <$> caughtWithContext (withOperationContext widgets loadWidget [] (failWidget (WidgetMissing "seal")) ∷ IO ())
+  ExceptionWithContext context failure ←
+    expectContext @WidgetFailure $
+      withOperationContext scene renderScene [] (atomically (throwFailureSTM scene commitScene [] cause) ∷ IO ())
+  failure `shouldBe` WidgetMissing "seal"
+  let evidence = failureEvidenceInContext context
+  origin ← originOf evidence
+  originOperation origin `shouldBe` loadWidget
+  site ← siteOf (originSite origin)
+  siteLocation site `shouldBe` SourceLocation callFile line "failWidget"
+  map contextOperation (failureContexts evidence) `shouldBe` [loadWidget, renderScene]
+
+testSTMAsyncUnannotated ∷ Expectation
+testSTMAsyncUnannotated = do
+  cause ← caughtWithContext (annotateIO (Marker "kept") (throwIO ThreadKilled) ∷ IO ())
+  ExceptionWithContext context cancellation ←
+    expectContext @SomeException (atomically (throwFailureSTM widgets loadWidget [] cause) ∷ IO ())
+  fromException cancellation `shouldBe` Just ThreadKilled
+  failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+  (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "kept"]
+  ExceptionWithContext bareContext bare ←
+    expectContext @SomeException (atomically (throwFailureSTM widgets loadWidget [] ThreadKilled) ∷ IO ())
+  fromException bare `shouldBe` Just ThreadKilled
+  failureEvidenceInContext bareContext `shouldBe` FailureEvidence NativeCause []
+
+testSTMFaultingIdentifier ∷ Expectation
+testSTMFaultingIdentifier = do
+  ExceptionWithContext context failure ←
+    expectContext @SomeException (atomically (throwFailureSTM widgets loadWidget [("widget", throw IdentifierFault)] (WidgetBroken 8)) ∷ IO ())
+  fromException failure `shouldBe` Just IdentifierFault
+  (fromException failure ∷ Maybe WidgetFailure) `shouldBe` Nothing
+  failureCause (failureEvidenceInContext context) `shouldBe` NativeCause
+
+testSTMRollback ∷ Expectation
+testSTMRollback = do
+  escaped ← newTVarIO (0 ∷ Int)
+  outcome ← try (atomically (writeTVar escaped 1 >> failWidgetSTM (WidgetBroken 6)) ∷ IO ())
+  outcome `shouldBe` Left (WidgetBroken 6)
+  readTVarIO escaped `shouldReturnValue` 0
+  before ← newTVarIO (0 ∷ Int)
+  guarded ← newTVarIO (0 ∷ Int)
+  caught ← atomically $ do
+    writeTVar before 1
+    (writeTVar guarded 1 >> failWidgetSTM (WidgetBroken 7) >> pure Nothing)
+      `catchSTM` \(failure ∷ WidgetFailure) → pure (Just failure)
+  caught `shouldBe` Just (WidgetBroken 7)
+  readTVarIO before `shouldReturnValue` 1
+  readTVarIO guarded `shouldReturnValue` 0
