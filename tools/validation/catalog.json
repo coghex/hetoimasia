@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 5,
+  "policy_version": 6,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -50,7 +50,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the Logging, Runtime, Resources, Failures, Recovery, and Workers components.",
+      "description": "Focused Hspec examples for the Logging, Runtime, Resources, Failures, Recovery, Workers, Messaging, and GLFW components.",
       "command": [
         "cabal",
         "test",

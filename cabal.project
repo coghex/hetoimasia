@@ -2,6 +2,7 @@ packages:
   .
   packages/foundation
   packages/runtime
+  packages/glfw
 
 -- Use the known index baseline from Synarchy; advance deliberately.
 index-state: 2026-08-14T00:00:00Z
@@ -19,3 +20,10 @@ package hetoimasia-foundation
 
 package hetoimasia-runtime
   ghc-options: -Werror -j
+
+package hetoimasia-glfw
+  ghc-options: -Werror -j
+  -- The native check is a test suite. Enabling tests for this package alone
+  -- makes `cabal build all` compile it from a clean configuration; building it
+  -- runs nothing, so no native session is initialized.
+  tests: True

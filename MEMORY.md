@@ -217,6 +217,24 @@ not a verdict that Synarchy's design should be discarded.
   on first publication from this public repository. Container jobs need
   `--init` and a Git `safe.directory` entry. `docs/validation.md` carries the
   image, descriptor, builder, cache-layer, and macOS contracts.
+- GLFW-1 (#89) added `hetoimasia-glfw` under `packages/glfw/`, the first
+  consumer of that contract. It depends on foundation, not runtime. A private
+  `model` sublibrary holds the session over a table of native operations; a
+  private `native` sublibrary holds the CAPI imports through
+  `native/cbits/hetoimasia_glfw.h`, a thread-identity shim, and the process
+  guard; the public `seam` sublibrary is the test-only scripted native table.
+  `Hetoimasia.GLFW.Session.withSession`/`allocSession` resolves the backend (X11
+  or Cocoa; Wayland is always `UnsupportedBackend`), requires the bound process
+  main thread, claims the guard, then installs a bounded error callback,
+  initializes, and verifies the platform. Owner-thread reports fail their
+  operation; others are read with `takeAsynchronousReports` or retained at
+  teardown. An unsafe teardown leaks the callback storage and poisons the guard.
+  Linking is `pkgconfig-depends` plus per-OS `frameworks`/`extra-libraries`,
+  checked against the manifest by the `GLFW` Hspec group; the planner accepts
+  those link-only `if os(...)` blocks and follows `package:library` deps.
+  `glfw-native-check` runs a real session locally and is built, not run, by
+  `cabal build all` (`tests: True` for that package only). Contract:
+  `docs/glfw.md`.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
