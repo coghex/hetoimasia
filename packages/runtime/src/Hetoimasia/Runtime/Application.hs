@@ -1,9 +1,10 @@
 -- | The generic application lifecycle.
 --
--- 'runScopedApplication' sits beside 'Hetoimasia.Runtime.runApplication', the
--- thin runner over a supplied logger, which keeps its module, signature,
--- behavior, and examples. It composes the runtime's other boundaries in one
--- fixed order and adds no mechanics of its own:
+-- 'runScopedApplication' and 'runScopedApplicationWithQuiescence' sit beside
+-- 'Hetoimasia.Runtime.runApplication', the thin runner over a supplied logger,
+-- which keeps its module, signature, behavior, and examples. They compose the
+-- runtime's other boundaries in one fixed order and add no mechanics of their
+-- own:
 --
 -- 1. Configuration parsing and logger construction happen before it, in the
 --    caller. A failure there propagates as its own typed failure, with no
@@ -17,25 +18,79 @@
 --    availability value only after safe rollback. A construction failure
 --    disposes what was acquired without entering the worker group.
 -- 4. A supervised worker group is entered inside those scopes
---    ("Hetoimasia.Runtime.Supervision").
+--    ("Hetoimasia.Runtime.Supervision"), and the application quiescence guard
+--    is installed immediately inside it, before the first checkpoint.
 -- 5. The startup callback runs on the calling thread with the dependencies and
 --    the 'RuntimeControl'. It may start and acknowledge workers, and it returns
 --    the application's immutable services value.
 -- 6. A checkpoint runs before that value is handed over.
 -- 7. The action runs on the calling thread with the services value and the
 --    control, and a checkpoint runs before its result is accepted.
--- 8. Supervision closes: registration closes, every live worker is asked to
+-- 8. The quiescence action runs once, with the dependencies still live, as the
+--    guard's release. 'runScopedApplication' supplies one that does nothing.
+-- 9. Supervision closes: registration closes, every live worker is asked to
 --    stop, every worker is drained, and every outcome not yet handled is
 --    settled, with the fatal latch rethrown.
--- 9. The dependency scope unwinds: dependents are disposed before their
---    dependencies, and each composite keeps its declared internal order.
--- 10. A failed run gets one managed terminal report while the logger is live.
--- 11. The logging lifetime makes its one permitted final flush.
--- 12. The result is returned, or the failure is rethrown preservingly.
+-- 10. The dependency scope unwinds: dependents are disposed before their
+--     dependencies, and each composite keeps its declared internal order.
+-- 11. A failed run gets one managed terminal report while the logger is live.
+-- 12. The logging lifetime makes its one permitted final flush.
+-- 13. The result is returned, or the failure is rethrown preservingly.
 --
--- Steps 8 to 12 happen on every exit path: construction failure (from step 9),
--- startup failure, action failure, a supervisor-detected failure, and owner
--- cancellation, which skips steps 10 and 11.
+-- Steps 9 to 13 happen on every exit path: construction failure (from step
+-- 10), startup failure, action failure, a supervisor-detected failure, and
+-- owner cancellation, which skips steps 11 and 12. Step 8 happens on every
+-- exit once the guard is installed — a checkpoint failure, startup or action
+-- failure, action cancellation, and a successful return — and never after a
+-- construction failure, when no worker group was entered.
+--
+-- __Quiescence.__ Dependencies are services the workers may wait on, such as
+-- a component whose command port is executed by the calling thread. Once the
+-- action returns, nothing executes those commands, so a worker still awaiting
+-- a reply could not finish stopping and the drain in step 9 would wait on it.
+-- The quiescence action closes that gap: it is the application's
+-- dependency-local transaction, of shape @dependencies → STM ()@, that closes
+-- admission and settles pending requests — refusing a reply a worker awaits,
+-- for instance — so that worker can observe its stop request and exit.
+--
+-- It runs as the release of a guard entered through
+-- 'Hetoimasia.Foundation.Resource.withResourceLabelled' under the label
+-- @application quiescence@, so it runs under @uninterruptibleMask_@, exactly
+-- once, with the dependencies live and before supervision begins its boundary
+-- close: registration closure, stop requests to remaining workers, and the
+-- boundary drain. That is the whole ordering promise. It does not precede:
+--
+-- * the stop requests the fatal latch makes. Settling a fatal worker outcome
+--   latches it and asks every pending worker to stop in the same transaction,
+--   before 'checkRuntime' or 'Hetoimasia.Runtime.Supervision.awaitSupervised'
+--   rethrows it and the guard runs;
+-- * the drain of an individual worker whose managed startup was abandoned.
+--   When 'Hetoimasia.Runtime.Supervision.startSupervised' fails or is
+--   cancelled while preparing or waiting for startup, that worker is cancelled
+--   and drained before the failure propagates to the guard.
+--
+-- A worker finalizer therefore cannot depend on a calling-thread command after
+-- quiescence, nor, in those two cases, on one issued before it.
+--
+-- The action is finite, non-retrying component bookkeeping. It receives the
+-- dependencies and nothing else; it destroys nothing, waits for no worker,
+-- executes no queued work, pumps no native event, flushes no log, and invokes
+-- no application callback. Because it runs uninterruptibly, a transaction that
+-- retries blocks the calling thread with the drain never reached: that is an
+-- implementation defect of the action, not a waiting strategy, and the runtime
+-- does not try to make arbitrary STM non-retrying.
+--
+-- Its failure follows the resource failure table. If startup, the action, a
+-- checkpoint, or cancellation already failed the run, that failure propagates
+-- with its type, value, and context, and the quiescence failure is retained
+-- beside it as @application quiescence@ cleanup evidence. If the work
+-- succeeded, its result is discarded and the quiescence failure becomes
+-- primary, retained under the same label; supervision then closes as it does
+-- for any body failure, the dependencies unwind, and the run is reported and
+-- flushed as a failure under the outcomes below. Nothing after quiescence
+-- changes: supervision's stop, drain, settlement, and fatal delivery, the
+-- dependency unwind, the reporting and flushing matrix, and the protected wait
+-- for a worker that cannot stop, which is never detached.
 --
 -- __The application owns its types.__ The runner is polymorphic over the
 -- dependencies and the services value. It enumerates no field of either,
@@ -46,9 +101,9 @@
 -- component that degrades after startup says so through its own handle, under
 -- its own documented state ownership.
 --
--- __The calling thread.__ Construction, startup, and the action all run on the
--- thread that called 'runScopedApplication'. Nothing forks the action to race
--- it against a monitor, and nothing promises to interrupt arbitrary 'IO': a
+-- __The calling thread.__ Construction, startup, the action, and quiescence
+-- all run on the thread that called the runner. Nothing forks the action to
+-- race it against a monitor, and nothing promises to interrupt arbitrary 'IO': a
 -- worker failure reaches the application at a checkpoint or a supervised
 -- wait. This keeps the process main thread for a future windowing owner.
 --
@@ -58,7 +113,8 @@
 --   succeeded, and the flush succeeded: its result is returned.
 -- * Any synchronous failure — construction, startup, the action, a latched
 --   supervised failure (even one the action caught, or one that arrived while
---   closing), or a disposal failure after a successful action — fails the run.
+--   closing), or a quiescence or disposal failure after a successful action —
+--   fails the run.
 --   One managed terminal report is attempted after component disposal,
 --   carrying the primary failure with its origin evidence and every retained
 --   cleanup failure, and the failure is rethrown with its type, value, and
@@ -94,14 +150,16 @@
 -- prose with a composition example.
 module Hetoimasia.Runtime.Application
   ( runScopedApplication
+  , runScopedApplicationWithQuiescence
   , applicationComponent
   ) where
 
+import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (ExceptionWithContext, SomeException, rethrowIO, tryWithContext)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
-import Hetoimasia.Foundation.Resource (Scoped, withScoped)
+import Hetoimasia.Foundation.Resource (Scoped, withResourceLabelled, withScoped)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, recordReport, recordedReports)
 import Hetoimasia.Runtime.Reporting (ReportResult (..), reportTerminalFailureWith)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime, withSupervision)
@@ -123,6 +181,9 @@ applicationComponent = unsafeComponent "runtime"
 -- after. The text names the application in its terminal report.
 --
 -- The report's entry records the site that called this function.
+--
+-- It is 'runScopedApplicationWithQuiescence' with a quiescence action that does
+-- nothing, which adds no observable step.
 runScopedApplication
   ∷ HasCallStack
   ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
@@ -131,17 +192,42 @@ runScopedApplication
   → (dependencies → RuntimeControl → IO services)
   → (services → RuntimeControl → IO a)
   → IO a
-runScopedApplication enterLifetime name dependencies startup action =
+runScopedApplication enterLifetime name dependencies =
+  runScopedApplicationWithQuiescence enterLifetime name dependencies (\_ → pure ())
+
+-- | 'runScopedApplication' with a quiescence action, the fourth argument, which
+-- runs once with the constructed dependencies after the supervised region
+-- exits and before supervision's boundary close, as the module header's
+-- "Quiescence" describes.
+--
+-- The report's entry records the site that called this function.
+runScopedApplicationWithQuiescence
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
+  → Text
+  → Scoped dependencies
+  → (dependencies → STM ())
+  → (dependencies → RuntimeControl → IO services)
+  → (services → RuntimeControl → IO a)
+  → IO a
+runScopedApplicationWithQuiescence enterLifetime name dependencies quiesce startup action =
   enterLifetime $ \lifetime →
     reportOnce lifetime name $
       withScoped dependencies $ \built →
-        withSupervision lifetime $ \control → do
-          checkRuntime control
-          services ← startup built control
-          checkRuntime control
-          result ← action services control
-          checkRuntime control
-          pure result
+        withSupervision lifetime $ \control →
+          withResourceLabelled quiescenceLabel (pure ()) (\() → atomically (quiesce built)) $ \() → do
+            -- The guard is installed before the first checkpoint, so every exit
+            -- from here quiesces before supervision closes.
+            checkRuntime control
+            services ← startup built control
+            checkRuntime control
+            result ← action services control
+            checkRuntime control
+            pure result
+
+-- | The cleanup label a quiescence failure is retained under.
+quiescenceLabel ∷ Text
+quiescenceLabel = "application quiescence"
 
 -- | The one managed terminal report, made after the work and every scope inside
 -- it have unwound, unless a managed report on this lifetime has already failed.

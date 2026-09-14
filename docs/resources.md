@@ -1061,17 +1061,30 @@ runScopedApplication
   → (dependencies → RuntimeControl → IO services)    -- startup
   → (services → RuntimeControl → IO a)               -- the action
   → IO a
+
+runScopedApplicationWithQuiescence
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)            -- enters the logging lifetime
+  → Text                                             -- the application's name
+  → Scoped dependencies                              -- construction, in dependency order
+  → (dependencies → STM ())                          -- quiescence
+  → (dependencies → RuntimeControl → IO services)    -- startup
+  → (services → RuntimeControl → IO a)               -- the action
+  → IO a
 ```
 
-`runScopedApplication` is the generic lifecycle an application runs through. It
-sits in its own module beside `Hetoimasia.Runtime.runApplication`, which keeps
-its module, signature, behavior, and examples as the thin runner over a
-supplied logger. The new runner composes the
-runtime's existing boundaries and adds no mechanics of its own: supervision is
-[supervision.md](supervision.md)'s, worker ownership and the drain are
-[workers.md](workers.md)'s, the finalization matrix is the
-[logging lifetime](logging.md#logging-lifetime)'s, the report is the
-[reporting adapter](logging.md#recovery-and-terminal-reports)'s, and every
+`runScopedApplication` is the generic lifecycle an application runs through.
+`runScopedApplicationWithQuiescence` is the same lifecycle with one added
+dependency-local step, [quiescence](#quiescence); `runScopedApplication` is
+exactly that runner with the quiescence action `\_ → pure ()`, which adds no
+observable step. Both record the application's call site in the terminal report.
+They sit in their own module beside `Hetoimasia.Runtime.runApplication`, which
+keeps its module, signature, behavior, and examples as the thin runner over a
+supplied logger. The runner composes the runtime's existing boundaries and adds
+no mechanics of its own: supervision is [supervision.md](supervision.md)'s,
+worker ownership and the drain are [workers.md](workers.md)'s, the finalization
+matrix is the [logging lifetime](logging.md#logging-lifetime)'s, the report is
+the [reporting adapter](logging.md#recovery-and-terminal-reports)'s, and every
 release follows this document's failure table and mask discipline.
 
 **The lifecycle order**, on every run:
@@ -1089,27 +1102,96 @@ release follows this document's failure table and mask discipline.
    its rollback. A construction failure disposes what was acquired without
    entering the worker group.
 4. A supervised worker group is entered inside those scopes, with
-   `withSupervision`.
+   `withSupervision`, and the quiescence guard is installed immediately inside
+   it, before the first `checkRuntime`.
 5. The startup callback runs on the calling thread with the dependencies and
    the `RuntimeControl`. It may start and acknowledge workers with
    `startSupervised`, and it returns the application's services value.
 6. `checkRuntime` runs before that value is handed over.
 7. The action runs on the calling thread with the services value and the
    control; `checkRuntime` runs again before its result is accepted.
-8. Supervision closes: registration closes, every live worker is asked to stop
+8. The quiescence action runs once, with the dependencies still live.
+9. Supervision closes: registration closes, every live worker is asked to stop
    — a failed or cancelled request does not skip the rest — and every worker is
    drained with its dependencies live. Every outcome not yet handled is
    settled, including a failure that arrived while closing, and a latched
    failure is rethrown.
-9. The dependency scope unwinds. Dependents are disposed before their
-   dependencies, and a composite keeps its declared internal order.
-10. A failed run gets one managed terminal report, while the logger is live.
-11. The logging lifetime makes its one permitted final flush.
-12. The runner returns the action's result, or rethrows.
+10. The dependency scope unwinds. Dependents are disposed before their
+    dependencies, and a composite keeps its declared internal order.
+11. A failed run gets one managed terminal report, while the logger is live.
+12. The logging lifetime makes its one permitted final flush.
+13. The runner returns the action's result, or rethrows.
 
-Steps 8 onwards happen on every exit path — construction failure (from step
-9), startup failure, action failure, a supervisor-detected failure, and owner
-cancellation, which skips steps 10 and 11.
+Steps 9 onwards happen on every exit path — construction failure (from step
+10), startup failure, action failure, a supervisor-detected failure, and owner
+cancellation, which skips steps 11 and 12. Step 8 happens on every exit after
+the guard is installed and never after a construction failure; see
+[quiescence](#quiescence).
+
+#### Quiescence
+
+A dependency may be a service the workers wait on — a component whose command
+port is executed by the calling thread's event loop, for instance. Once the
+action returns, nothing executes those commands, so a worker still awaiting a
+reply could not finish stopping, and step 9's drain would wait on it while the
+port closed only in step 10. The quiescence action closes that gap in the same
+way a [supervised inbox](messaging.md#supervised-inbox-services) closes
+admission and settles pending work before its owner asks it to stop: it is the
+application's transaction over its dependencies that closes admission and
+settles pending requests, so a waiting worker observes a refusal and can exit.
+
+**When it runs.** The guard is entered immediately inside the supervised
+region, before the first checkpoint, and runs its action exactly once whenever
+that region exits: a startup callback failure, a checkpoint failure (including
+the one before startup, although at present it cannot throw), an action failure,
+action cancellation, and a successful return. It does not run when dependency
+construction fails, because no worker group was entered.
+
+**What it precedes.** It runs with the dependencies live and before supervision
+begins its boundary close: registration closure, the stop requests to remaining
+workers, and the boundary drain. That boundary ordering is the whole guarantee.
+It does not precede:
+
+- **A fatal-latch stop.** Settling a fatal worker outcome latches it and asks
+  every pending worker to stop in the same transaction, before `checkRuntime` or
+  `awaitSupervised` rethrows it and the guard runs.
+- **A startup-local drain.** When `startSupervised` fails or is cancelled while
+  preparing or waiting for a worker's startup, that worker is cancelled and
+  drained before the failure reaches the guard.
+
+Neither contract changes to widen the promise. A worker finalizer therefore
+cannot depend on a calling-thread command after quiescence, and in those two
+cases not on one issued before it either.
+
+**What the action may do.** It receives the dependencies and nothing else, and
+it is finite, non-retrying component bookkeeping: it destroys nothing, waits for
+no worker, executes no queued work, pumps no native event, flushes no log, and
+invokes no application callback. It runs as a release, so under
+`uninterruptibleMask_` with [a release's controlled blocking
+duration](#mask-discipline): a transaction that retries blocks the calling
+thread with the drain never reached. That is a defect in the action, not a
+waiting strategy, and the runtime does not try to make arbitrary STM
+non-retrying.
+
+**When it fails.** It is entered with `withResourceLabelled` under the label
+`application quiescence`, so the [failure table](#the-failure-table) applies:
+
+- If startup, the action, a checkpoint, or cancellation already failed the run,
+  that failure propagates with its type, value, and context, and the quiescence
+  failure is retained beside it as `application quiescence` cleanup evidence.
+- If the work succeeded, its result is discarded and the quiescence failure
+  becomes primary, retained under the same label. Supervision then closes as it
+  does for any failing body — stop requests, cancellation requests, and the
+  protected drain — and the dependencies unwind before the run is reported and
+  flushed as a failure.
+
+**What does not change.** After quiescence, supervision still performs its stop,
+drain, settlement, and fatal delivery; the dependency scope still unwinds
+dependents first; a synchronous failure still follows the terminal-report and
+final-flush rules below, including their suppression; owner cancellation still
+drains, releases, and propagates as itself with no report and no flush; and a
+worker that cannot stop still keeps the protected wait, never detached and
+never outliving its dependencies.
 
 **The application owns its types.** The runner is polymorphic over the
 dependencies and the services value; it names no field of either, imports no
@@ -1120,10 +1202,10 @@ registry, nothing mutates the value, and nothing re-publishes it: a component
 that degrades after startup says so through its own handle, under its own
 documented state ownership.
 
-**The calling thread.** Construction, startup, and the action all run on the
-thread that called the runner. The action is never forked to race a monitor,
-and no arbitrary `IO` is interrupted: a worker failure reaches the application
-at a checkpoint or inside `awaitSupervised`, as
+**The calling thread.** Construction, startup, the action, and quiescence all
+run on the thread that called the runner. The action is never forked to race a
+monitor, and no arbitrary `IO` is interrupted: a worker failure reaches the
+application at a checkpoint or inside `awaitSupervised`, as
 [supervision.md](supervision.md#checkpoints-and-supervised-waits) describes.
 This keeps the process main thread for a future windowing owner.
 
@@ -1173,6 +1255,8 @@ the same runner.
 | Construction, startup, or the action failed synchronously | Drains, disposes, reports once, flushes, and rethrows the failure with its type, value, and context |
 | A supervised failure was latched — even one the action caught and ignored, or one that arrived while closing | The same: a latched failure cannot become a successful run |
 | The action succeeded and a component's disposal failed | The same, with the cleanup failure primary and retained; the report carries `cleanup.failures` and `cleanup.labels` |
+| The action succeeded and quiescence failed | The same: the result is discarded, the quiescence failure is primary and retained under `application quiescence`, and supervision closes as for a failing body |
+| Quiescence failed while another failure or cancellation was already propagating | That failure or cancellation propagates unchanged under its own row, with the quiescence failure retained under `application quiescence` |
 | The run succeeded and the final flush failed | The flush's failure propagates, with no report attempted and no retry |
 | A managed report already failed on this lifetime, such as an optional worker's warning | No terminal report and no flush; the failure propagates with the failed attempts attached |
 | The report's own write failed synchronously | The failure being reported propagates, with its evidence; the attempt is recorded on the lifetime, so no flush follows |
@@ -1204,7 +1288,7 @@ needs the new runner, and no console path was added for it.
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 |---|---|---|---|---|---|
-| The dependencies value | The application; its releases belong to the runner's `withScoped` | Built by construction; read by startup | The calling thread | From construction until the dependency scope unwinds, after workers drain | Released once, in reverse allocation order with each composite's declared order; never reset |
+| The dependencies value | The application; its releases belong to the runner's `withScoped` | Built by construction; read by startup and by quiescence | The calling thread | From construction until the dependency scope unwinds, after workers drain | Released once, in reverse allocation order with each composite's declared order; never reset |
 | The services value | The application | Written once, by startup's return; read by the action | The calling thread | From startup's return until the action returns or throws | Immutable; nothing re-publishes it and nothing disposes it |
 | Worker, supervision, and latch state | The one `withSupervision` invocation | As [supervision.md](supervision.md#state) records | As recorded there | One invocation | As recorded there |
 | Recorded reporting outcomes | The logging lifetime the runner entered | As [logging.md](logging.md#logging-lifetime) records; the runner reads them once before its report | As recorded there | One lifetime | As recorded there |
@@ -1233,9 +1317,10 @@ blocking would break the release contract, and never runs before the cleanup
 whose records it is meant to carry. A lifetime is never entered from a release
 callback.
 
-`runScopedApplication` performs steps 1 to 4 in exactly this order: supervision
-closing is step 1, the dependency scope's unwind is step 2, its one report is
-step 3, and the lifetime it entered makes step 4.
+`runScopedApplication` and `runScopedApplicationWithQuiescence` perform steps 1
+to 4 in exactly this order: quiescence and supervision closing are step 1, the
+dependency scope's unwind is step 2, the one report is step 3, and the lifetime
+the runner entered makes step 4.
 
 The console executable owns no handle: its sink borrows the process's `stderr`,
 which it never closes and never rebuffers, so its step 5 is empty. An
