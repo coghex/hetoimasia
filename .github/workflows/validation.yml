@@ -309,6 +309,11 @@ jobs:
           CANDIDATE: ${{ needs.plan.outputs.candidate }}
         run: |
           set -euo pipefail
+          # The container runs as root over a workspace the runner's user owns,
+          # which Git refuses as dubious ownership. The exception is recorded in
+          # the job's global configuration, so the runner's later Git reads of
+          # this same checkout are answered too.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           actual="$(git rev-parse HEAD)"
           if [ "$actual" != "$CANDIDATE" ]; then
             echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
@@ -425,14 +430,14 @@ jobs:
           exit "$status"
 
       - name: Save the package store
-        if: ${{ !cancelled() && steps.store.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.store.outcome == 'success' && steps.store.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: /opt/hetoimasia/cabal/store
           key: ${{ steps.store.outputs.cache-primary-key }}
 
       - name: Save the build tree
-        if: ${{ !cancelled() && steps.tree.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.tree.outcome == 'success' && steps.tree.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: dist-newstyle
@@ -509,6 +514,11 @@ jobs:
           CANDIDATE: ${{ needs.plan.outputs.candidate }}
         run: |
           set -euo pipefail
+          # The container runs as root over a workspace the runner's user owns,
+          # which Git refuses as dubious ownership. The exception is recorded in
+          # the job's global configuration, so the runner's later Git reads of
+          # this same checkout are answered too.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           actual="$(git rev-parse HEAD)"
           if [ "$actual" != "$CANDIDATE" ]; then
             echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
@@ -610,14 +620,14 @@ jobs:
           exit "$status"
 
       - name: Save the package store
-        if: ${{ !cancelled() && steps.store.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.store.outcome == 'success' && steps.store.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: /opt/hetoimasia/cabal/store
           key: ${{ steps.store.outputs.cache-primary-key }}
 
       - name: Save the build tree
-        if: ${{ !cancelled() && steps.tree.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.tree.outcome == 'success' && steps.tree.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: dist-newstyle
@@ -667,6 +677,11 @@ jobs:
           CANDIDATE: ${{ needs.plan.outputs.candidate }}
         run: |
           set -euo pipefail
+          # The container runs as root over a workspace the runner's user owns,
+          # which Git refuses as dubious ownership. The exception is recorded in
+          # the job's global configuration, so the runner's later Git reads of
+          # this same checkout are answered too.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           actual="$(git rev-parse HEAD)"
           if [ "$actual" != "$CANDIDATE" ]; then
             echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
@@ -705,7 +720,7 @@ jobs:
         run: cabal build all --enable-tests --only-dependencies
 
       - name: Save the package store
-        if: steps.store.outputs.cache-hit != 'true'
+        if: steps.store.outcome == 'success' && steps.store.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: /opt/hetoimasia/cabal/store

@@ -191,6 +191,9 @@ jobs:
 
   anonymous-pull:
     needs: descriptor
+    # Explicit, because a skipped `publish` — every hit — would otherwise skip
+    # this too, and a hit's image has to be pullable just the same.
+    if: always() && needs.descriptor.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # No grant at all: the package must be public for this pull to succeed,
