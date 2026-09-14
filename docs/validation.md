@@ -146,7 +146,13 @@ document a group genuinely consumes belongs in that group's `inputs`.
 
 Supported Cabal syntax is bounded to what this repository uses: layout-style
 stanzas, `common`/`import`, multiline fields, package-relative `hs-source-dirs`,
-`main-is`, `build-depends`, and `build-tool-depends`. Conditional (`if`/`else`)
+`main-is`, `build-depends`, and `build-tool-depends`. A `build-depends` entry of
+the form `package:library` is followed to that one library, a sublibrary or the
+main library, so a suite depending on a sublibrary consumes that sublibrary's
+own sources; the braced `package:{a,b}` form is rejected. Inside a stanza, an
+`if os(...)` block and the `else` directly after it are accepted when they
+declare only `extra-libraries` and `frameworks`, which choose what a link adds on
+one platform and name no input. Any other conditional, anything else inside one,
 and brace-delimited syntax can change dependencies, so the planner rejects them
 with a diagnostic rather than silently omitting a dependency. `cabal.project` is
 read for its `packages:` field; a glob entry is rejected for the same reason.

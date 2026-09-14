@@ -39,6 +39,39 @@ spec = describe "Validation planner" $ do
         selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
         selectionOf plan "test.harness" `shouldBe` Just (Selection "unaffected" False False)
 
+    it "follows a sublibrary dependency to that library's own sources" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/extra/Extra.hs" (extraModule 1)
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ extraLibrary)
+        change fixture "demo.cabal" sublibraryDemoPackage
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/extra/Extra.hs" (extraModule 2)
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "unaffected" False False)
+
+    it "accepts an operating-system conditional that declares only link fields" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ linkConditionals)
+        plan ← planJson fixture []
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
+
+    it "rejects an operating-system conditional that declares anything but link fields" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal"
+          (alphaPackage ++ unlines ["    if os(linux)", "        build-depends: containers"])
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "may declare only extra-libraries and frameworks"
+
+    it "rejects a conditional on anything but the operating system" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal"
+          (alphaPackage ++ unlines ["    if flag(fast)", "        extra-libraries: m"])
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "conditional or brace-delimited Cabal syntax is not supported"
+
     it "selects a test suite through its executable build-tool dependency" $
       withFixture $ \fixture → do
         change fixture "app/Main.hs" "module Main (main) where\nmain :: IO ()\nmain = putStrLn \"revised\"\n"
@@ -475,6 +508,40 @@ alphaPackage =
     , "    hs-source-dirs: src"
     , "    default-language: GHC2024"
     , "    build-depends: base"
+    ]
+
+-- | A public sublibrary of the fixture library with a source directory of its own.
+extraLibrary ∷ String
+extraLibrary =
+  unlines
+    [ ""
+    , "library extra"
+    , "    visibility: public"
+    , "    exposed-modules: Extra"
+    , "    hs-source-dirs: extra"
+    , "    default-language: GHC2024"
+    , "    build-depends: base"
+    ]
+
+extraModule ∷ Int → String
+extraModule value = "module Extra (extra) where\nextra :: Int\nextra = " ++ show value ++ "\n"
+
+-- | The fixture package with the harness suite depending on the sublibrary
+-- alone, so only that suite consumes the sublibrary's sources.
+sublibraryDemoPackage ∷ String
+sublibraryDemoPackage = unlines (init (lines demoPackage) ++ ["        base,", "        alpha:extra"])
+
+-- | Link declarations inside operating-system conditionals, including an
+-- @else@ block and a multiline field.
+linkConditionals ∷ String
+linkConditionals =
+  unlines
+    [ "    if os(darwin)"
+    , "        frameworks: Cocoa"
+    , "    else"
+    , "        extra-libraries:"
+    , "            rt"
+    , "            m"
     ]
 
 fixtureCatalog ∷ String

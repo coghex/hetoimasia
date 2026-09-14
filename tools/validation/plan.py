@@ -69,6 +69,13 @@ ID_PATTERN = re.compile(r"^[a-z0-9]+(\.[a-z0-9-]+)+$")
 FIELD_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)$")
 STANZA_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)(?:\s+(\S+))?\s*$")
 CONDITIONAL_PATTERN = re.compile(r"^(if|elif|else)\b")
+OS_CONDITIONAL_PATTERN = re.compile(r"^if\s+os\(\s*[A-Za-z][A-Za-z0-9_-]*\s*\)$")
+PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+
+# The only fields an operating-system conditional may declare. They choose what
+# an ordinary link adds on one platform and never name a source, a dependency,
+# or anything else a group's inputs are derived from.
+LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
 
 STANZA_KEYWORDS = {
     "library",
@@ -235,9 +242,11 @@ class WorkTree:
 #
 # Supported syntax is deliberately bounded to what this repository uses:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
-# relative ``hs-source-dirs``, ``main-is``, ``build-depends`` and
-# ``build-tool-depends``. Conditional and brace-delimited syntax can change
-# dependencies, so it is rejected with a diagnostic rather than ignored.
+# relative ``hs-source-dirs``, ``main-is``, ``build-depends`` (including a
+# ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
+# ``if os(...)``/``else`` block inside a stanza that declares only link fields.
+# Any other conditional, and brace-delimited syntax, can change dependencies, so
+# it is rejected with a diagnostic rather than ignored.
 
 
 class Package:
@@ -263,6 +272,11 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
     stanza: dict[str, list[str]] = top_level
     field: str | None = None
     field_indent = 0
+    # An open operating-system conditional: its indentation, whether it is the
+    # `if` an `else` may follow, and the indentation of the field it is reading.
+    conditional_indent: int | None = None
+    conditional_is_if = False
+    conditional_field_indent: int | None = None
 
     for number, line in enumerate(text.splitlines(), start=1):
         without_comment = line.split("--", 1)[0] if line.lstrip().startswith("--") else line
@@ -271,10 +285,37 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
         indent = len(without_comment) - len(without_comment.lstrip())
         content = without_comment.strip()
 
+        closed_if: int | None = None
+        if conditional_indent is not None:
+            if indent > conditional_indent:
+                if conditional_field_indent is not None and indent > conditional_field_indent:
+                    continue
+                body = FIELD_PATTERN.match(content)
+                if not body or body.group(1).lower() not in LINK_ONLY_FIELDS:
+                    raise PlannerError(
+                        f"{path}:{number}: an operating-system conditional may declare only "
+                        f"{' and '.join(sorted(LINK_ONLY_FIELDS))}; anything else inside it can "
+                        "change dependencies or inputs silently"
+                    )
+                conditional_field_indent = indent
+                continue
+            closed_if = conditional_indent if conditional_is_if else None
+            conditional_indent = None
+            conditional_field_indent = None
+
         if CONDITIONAL_PATTERN.match(content) or content in ("{", "}") or content.endswith("{"):
+            opens_if = OS_CONDITIONAL_PATTERN.fullmatch(content) is not None
+            opens_else = content == "else" and closed_if == indent
+            if indent > 0 and stanza is not top_level and (opens_if or opens_else):
+                conditional_indent = indent
+                conditional_is_if = opens_if
+                conditional_field_indent = None
+                field = None
+                continue
             raise PlannerError(
                 f"{path}:{number}: conditional or brace-delimited Cabal syntax is not supported "
-                "by the validation planner; it can change dependencies silently"
+                "by the validation planner; it can change dependencies silently (only an "
+                "`if os(...)` or `else` block inside a stanza declaring link fields is accepted)"
             )
 
         if field is not None and indent > field_indent:
@@ -416,9 +457,26 @@ def component_closure(
             continue
         previous = ""
         for token in fields.get("build-depends", []):
-            if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", token) and previous not in (">=", "<", "==", "&&", ">", "<="):
+            names_package = previous not in (">=", "<", "==", "&&", ">", "<=")
+            if PACKAGE_NAME_PATTERN.fullmatch(token) and names_package:
                 if token in packages:
                     pending.append((token, "lib", token))
+            elif ":" in token and names_package:
+                # `package:library` names one library of a package: a sublibrary,
+                # or the main library when the two names agree, which is how the
+                # main library is keyed.
+                dependency, _, library = token.partition(":")
+                if library.startswith("{"):
+                    raise PlannerError(
+                        f"{package.cabal_path}: the braced sublibrary dependency {token!r} is not "
+                        "supported by the validation planner; name each library on its own"
+                    )
+                if (
+                    PACKAGE_NAME_PATTERN.fullmatch(dependency)
+                    and PACKAGE_NAME_PATTERN.fullmatch(library)
+                    and dependency in packages
+                ):
+                    pending.append((dependency, "lib", library))
             previous = token
         for token in fields.get("build-tool-depends", []):
             if ":" in token:
