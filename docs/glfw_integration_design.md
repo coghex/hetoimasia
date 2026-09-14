@@ -16,6 +16,10 @@ Owner decisions D-9 through D-16 were recorded on 2026-09-14. Final review on
 2026-09-14 incorporated the linking, CI identity and prerequisite clarifications.
 The owner authorized readiness after that review; its checks passed. Ownership,
 input-reset, pre-drain and delivery contracts are ready for issue processing.
+The owner approved the cross-issue amendments on 2026-09-14 after backlog
+review. D-17 through D-20 record the refined contracts; the fourteen slices and
+their dependency order remain unchanged. Readiness of the design is distinct
+from fresh canonical approval of the five amended issue bodies.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -82,7 +86,7 @@ docs-worktree HEAD.
 | `Hetoimasia.Runtime.Supervision` | `checkRuntime` and `awaitSupervised` settle worker outcomes. Arbitrary native blocking calls are not supervised waits. |
 | `Messaging.Payload`, `Channel`, and `Snapshot` | Producer-side deep preparation, explicit Full/Closed admission, distinct close/abort, coherent observations, and checked snapshot cursors are already available. |
 | `Hetoimasia.Runtime.Inbox` | Owns a background worker's inbox. Its worker execution model does not give it GLFW main-thread authority. Do not put GLFW operations in an inbox handler. |
-| `docs/test_architecture_design.md`, epic #49 | TEST-1 (#50) is closed. D-14 assigns TEST-2 to GLFW-7 and settles the GLFW thread model; implementation still waits for GLFW-1/GLFW-2. Epic #49 needs the matching approved tracker refresh. |
+| `docs/test_architecture_design.md`, epic #49 | TEST-1 (#50) is complete. TEST-2 is linked to GLFW-7/#93 through the separately approved existing-issue disposition; implementation still waits for GLFW-1/GLFW-2 and native evidence. |
 | `tools/validation/catalog.json` | Existing mandatory floor, affected non-optional tests, and PR-requested groups remain authoritative. Optional groups stay optional when affected. |
 
 The current workflow has no display provisioning and routes four CPU groups
@@ -97,13 +101,12 @@ Its narrow triangle-era scope is historical context for that rendering milestone
 not a decision against the broader window manipulation now requested. Rendering
 work and its proposed GLFW/Vulkan interop remain deferred.
 
-The final all-state tracker recheck on 2026-09-14 found no existing GLFW epic or
-children.
-Epic #73 remains open with all messaging children closed; its housekeeping is
-outside this design. Recheck per-child overlap during processing. Coordinate GLFW-7 with
-TEST-2 rather than filing two implementations of the same fixture. D-14 records
-the owner-approved disposition; keep TEST-2's implementation unchecked in the
-tracker until GLFW-7 has actually merged and been verified.
+Initial tracker deduplication preceded processing. Epic #86 and all fourteen
+children (#87–#100) now exist, as the ledger records. The 2026-09-14 backlog
+review verified the completed CI, resource and messaging children and closed
+their epics (#8, #22, #73) with owner approval. TEST-1's completed checkbox
+under #49 is also synchronized. Keep TEST-2/#93 unchecked until its
+implementation and native evidence land; do not file a duplicate fixture.
 
 ### Synarchy: preserve these decisions deliberately
 
@@ -311,7 +314,9 @@ recipe locally and in CI, with a pinned upstream archive URL and SHA-256,
 out-of-tree build and private install prefix. Cabal resolves matching headers
 and library from that prefix; do not silently fall back to whichever GLFW a
 package manager currently supplies. Cache keys cover source checksum, recipe,
-target OS/architecture, C toolchain/SDK, and build options. Restored Haskell
+target OS/architecture, C compiler identity, selected SDK identity, deployment
+target, and effective build options. Record these in the native manifest and
+verify them before accepting a cached local prefix. Restored Haskell
 build products that link GLFW must also be invalidated when this native identity
 changes. A local prefix miss or a dedicated builder's cache miss costs a build;
 mismatched artifacts cannot be accepted as evidence of the selected dependency.
@@ -541,6 +546,14 @@ application-owned update opportunity; another control check. Service control
 must remain reachable under continuously full input and command queues.
 Budgets count attempted dispatches, including rejected commands.
 
+GLFW-9 adds fair scheduling when it introduces per-window ports. Preserve FIFO
+within each port and one bounded total command budget across the host and all
+window ports. A continuously replenished port cannot starve another eligible
+port. Document a finite service bound in turns for the finite live-port set,
+assuming turns continue and individual dispatches return. Keep scheduler state
+bounded by live ports through creation/closure; do not promise cross-port FIFO
+or a wall-clock deadline. This is separate from checkpoint reachability.
+
 A dispatch-count budget cannot bound one handler or a native OS operation.
 Applications keep long work in workers and do not wait for worker completion
 while withholding the owner operations that worker needs.
@@ -579,7 +592,7 @@ checkpoint failure. Installing it only inside the action misses startup exits.
 The pre-drain action closes command/input admission and resolves pending outcomes.
 Input feeds become terminal, while window lifecycle observations remain publishable
 through disposal so they can record its actual result. It runs before withSupervision
-starts joining workers. It does not destroy windows, wait for workers, execute
+starts its boundary drain. It does not destroy windows, wait for workers, execute
 queued commands, pump native events, flush logs, or invoke game callbacks.
 
 Concrete API proposal: an additive runScopedApplicationWithQuiescence takes the
@@ -602,7 +615,13 @@ means this hook must be finite and non-retrying; GLFW's implementation should be
 pure component bookkeeping in STM, with immutable data prepared beforehand.
 Do not alter the semantics of all Scoped releases.
 
-Shutdown order:
+This is a boundary-ordering guarantee, matching the revised #92. Settling a
+fatal worker outcome may request stops before a checkpoint propagates and the
+guard runs. Abandoned or cancelled managed startup drains that individual
+worker before propagating to this guard. Preserve both contracts; quiescence
+does not precede or unblock those earlier drains.
+
+Ordinary boundary shutdown order:
 
 ```text
 reject new work and settle pending callers
@@ -613,8 +632,10 @@ reject new work and settle pending callers
     -> existing terminal reporting / logging lifetime completes
 ```
 
-A worker finalizer cannot require a future main-thread command after quiescence.
-Such an ownership dependency must be redesigned before implementation. Retain
+Worker startup and cleanup, including rollback and finalizers, cannot require
+completion of a main-thread command: the owner may already be synchronously
+starting or draining that worker. This restriction also applies before
+quiescence. Such an ownership dependency must be redesigned before implementation. Retain
 the existing protected wait if a worker cannot stop; do not detach it and
 destroy its borrowed resources. Native driver/OS calls have their own latency;
 there is no new hard-deadline promise.
@@ -651,6 +672,38 @@ Validate size limits and aspect constraints together before mutation. For a
 multi-step mode change, record which native steps happened, inspect failures,
 and reconcile observed state before deciding whether restoration/fallback is
 safe. A failed transition must not update the cache as if the target succeeded.
+
+The session owns at most one fullscreen claimant per monitor connection
+identity. Reserve the destination before transition mutation and return typed
+MonitorBusy for another window without native effects. Keep the claim while
+iconified. Release it after confirmed departure from fullscreen, successful
+disposal, or disconnect; uncertain native effects keep the claim unavailable
+until reconciliation proves release safe. Switching monitors reserves the
+destination before mutation and releases the source after confirmed departure.
+Different monitors remain independently claimable; borderless desktop windows
+claim no video mode. Bookkeeping is bounded by current monitors/active
+transitions. This is session state, not a generic foundation locking service.
+
+GLFW-6 defines ordinary-command eligibility after its mode transitions exist:
+
+| Applied mode | Ordinary controls |
+|---|---|
+| Windowed | Preserve GLFW-5's controls and validation. |
+| Borderless | Reject ordinary size, position, constraints, and maximize that break controller-owned placement. Title, visibility, focus/attention, minimize and restoration from minimize remain eligible where supported. |
+| Fullscreen | Reject ordinary size, position, constraints, show/hide, and maximize. Title, focus/attention, minimize and restore remain eligible where supported and consistent with the monitor claim. |
+
+During a transition ordinary manipulation remains rejected. Ineligible commands
+receive typed mode-specific rejection before native mutation. Geometry and
+video-mode changes in borderless/fullscreen go through the mode controller;
+an ordinary resize cannot silently change the fullscreen video mode.
+
+Preserve known windowed constraints separately. Only windowed ordinary commands
+change them; mode transitions may suspend native limits/aspect constraints for
+their own geometry, then reapply the preserved set on return. Validate the
+geometry and constraints together before mutation. A partial application keeps
+GLFW-5's indeterminate-state rule; never claim successful restoration or silent
+constraint relaxation. If no reachable compatible fallback placement exists,
+report finite recovery exhaustion honestly and preserve the saved placement.
 
 Validate every native numeric conversion, including positions and video-mode
 preferences; negative desktop coordinates are valid where supported. Window
@@ -816,6 +869,7 @@ window currently has focus:
 ```mermaid
 stateDiagram-v2
     Running --> ResetPending: ordered admission is full
+    Running --> ResetPending: application admission is suspended
     ResetPending --> ResetAcknowledged: consumer clears state and acknowledges
     ResetAcknowledged --> Running: owner reports gap and resumes a fresh epoch
     Running --> Closed: input or window closes
@@ -829,6 +883,19 @@ logger, or consumer handler runs in STM. Independent windows have independent
 overflow episodes and capacity. Any additional native capture buffer must also
 be bounded and feed the same reset protocol; bounding only the final channel
 does not satisfy this design.
+
+Application admission is reusable after initial readiness. Temporarily disabling
+it after it has been enabled atomically closes ordinary admission and begins
+the same acknowledged reset: abort the backlog with honest discard accounting,
+clear the producer's held-state baseline, reserve a fresh epoch, and notify the
+consumer with reason AdmissionSuspended. Initial pre-readiness disablement does
+not need a reset. The consumer finishes/abandons in-flight handlers and clears
+held/gesture state before acknowledging. Re-enable only opens the application
+gate; it does not bypass acknowledgement, owner resumption, focus, or closure.
+Repeated toggles during a pending/acknowledged episode neither replace its token
+nor advance its epoch, and cannot erase an existing overflow warning obligation.
+Intentional suspension alone schedules no overflow warning and needs no warning
+attempt before resumption. Terminal closure remains immediate without an ack.
 
 On detecting the first overflow of a running generation:
 
@@ -881,7 +948,8 @@ At a safe owner boundary, claim and attempt one structured Warning for an
 overflow episode using the injected logger outside callbacks, STM, and resource
 release. Retain the claim separately from the current queue so neither a quick
 acknowledgement nor further callbacks can lose it. Resumption requires the
-consumer acknowledgement and completion of this warning attempt. A failed
+consumer acknowledgement and completion of any required overflow-warning
+attempt; intentional admission suspension has no such diagnostic obligation. A failed
 diagnostic follows the existing logging/runtime failure policy; do not keep
 retrying a sink. Cancellation or terminal shutdown can prevent a pending attempt;
 retain the episode/counters in final observations rather than promise a log that
@@ -1169,15 +1237,12 @@ nor this arc creates Vulkan instances/devices or submits GPU work; Vulkan fixtur
 sharing and actual GPU completion remain requirements of the later Vulkan arc.
 There is no dummy GPU wait in a GLFW-only fixture.
 
-The docs-worktree test design records this model in D-7 and resolves Q-1;
-TEST-2's remaining deferred marker is an implementation prerequisite, not an
-unresolved thread model. After the GLFW processor creates GLFW-7, use a separate
-`process-design-doc` run over the test design with the existing-issue disposition
-to approve its link under #49 and in TEST-2's ledger. Do not file a duplicate or
-silently mutate both processing cursors in the GLFW run. TEST-2 remains unchecked
-in the epic until implementation and evidence exist. Checking TEST-1 under #49
-is separate housekeeping with its own approval, not part of GLFW-7's adoption.
-GLFW-1/GLFW-2 are implementation prerequisites, not unresolved thread decisions.
+The test design records this model in D-7 and resolves Q-1. A separate approved
+`process-design-doc` existing-issue disposition linked TEST-2 to GLFW-7/#93 in
+the test ledger and epic #49. Do not file a duplicate. TEST-2 remains unchecked
+in the epic until implementation and evidence exist. The owner subsequently
+approved checking completed TEST-1 as separate backlog housekeeping.
+GLFW-1/GLFW-2 remain implementation prerequisites, not unresolved decisions.
 
 ### D-15. Require a small native group when affected
 
@@ -1200,6 +1265,38 @@ publishing the candidate and the author committing its verified digest. P-14
 defines bootstrap, metadata verification, permissions, identity and fixed paths.
 GLFW-14 owns provisioning whichever distribution mechanism is used; the selected
 Linux mechanism is the image. macOS retains its local cached native build.
+
+### D-17. Preserve the boundary-only quiescence guarantee
+
+Approved by the owner on 2026-09-14 after backlog review. GLFW-3/#94 follows
+the revised GLFW-4/#92 contract: its hook precedes supervision's boundary drain,
+while fatal-latch stops and startup-local drains may precede the hook. Worker
+startup/cleanup cannot require a main-thread command completion. P-9 and the
+two slices' acceptance record these limits without changing worker semantics.
+
+### D-18. Arbitrate fullscreen monitors and mode-specific controls
+
+Approved by the owner on 2026-09-14. GLFW-6/#98 owns the session's one-claimant
+fullscreen rule, retained through iconification, and the operation matrix and
+windowed-constraint preservation in P-10. Competing windows get MonitorBusy;
+uncertain native effects cannot make a monitor falsely available. This refines
+the existing mode slice, with no new generic locking abstraction.
+
+### D-19. Reset on temporary application input suspension
+
+Approved by the owner on 2026-09-14. GLFW-8/#99 supports reusable admission
+through P-13's acknowledged reset and fresh epoch. Initial unreadiness differs
+from temporary suspension; AdmissionSuspended schedules no overflow warning,
+and repeated toggles cannot bypass acknowledgement or terminal precedence.
+An unchecked reusable Boolean and a one-way-only gate were not selected.
+
+### D-20. Make dynamic command dispatch fair and handoffs explicit
+
+Approved by the owner on 2026-09-14. GLFW-9/#95 preserves FIFO within each
+port, fairly services the host and live-window ports under one total turn
+budget, and proves progress independently of checkpoint reachability. Creation
+prepares ordinary completion data separately from the protected opaque handle
+handoff in P-6; NFData does not validate mutable endpoint internals.
 
 ## Open questions
 
@@ -1245,8 +1342,8 @@ builds need the C dependency before GLFW-7 exists. D-16 selects the Linux image.
 
 ### Q-9. Does GLFW-7 fulfill TEST-2?
 
-Resolved by D-14: GLFW-7 fulfills TEST-2. The related design records the same
-fixture model and ownership; epic #49 needs the matching approved tracker edit.
+Resolved by D-14: GLFW-7/#93 fulfills TEST-2. The separately approved adoption
+linked the same issue in the related design and epic #49.
 Vulkan fixtures and GPU-completion checks belong to the later Vulkan arc.
 
 ### Q-10. Is the isolated X11 native group automatically required when affected?
@@ -1264,7 +1361,10 @@ still own provisioning if that distribution choice changes in a later design.
 
 Q-1 through Q-11 are resolved. The owner-authorized final readiness review passed;
 there is no remaining design gate on these slices beyond their declared
-implementation dependencies and the separate tracker adoption described in D-14.
+implementation dependencies. The separate tracker adoption in D-14 is complete.
+D-17 through D-20 record the subsequently approved backlog refinements without
+new open policy questions; amended issue bodies still require fresh canonical
+readiness review before solving.
 
 ## Verification strategy
 
@@ -1280,7 +1380,8 @@ STM behavior. Do not duplicate the model in a fake. Prove:
 - coherent observation units/revisions and unsupported-field representation;
 - command Full/Closed behavior, outcome settlement, FIFO, interrupted effects,
   and bookkeeping bounds;
-- quiescence before joins on every startup/action/checkpoint exit;
+- quiescence before the boundary drain on startup/action/checkpoint exits,
+  while fatal-latch stops and abandoned-startup drains retain their earlier order;
 - no late native use by cancelled/stopped workers;
 - mode-cache preservation, repeated requests, missing/disconnected monitors,
   partial native failures, and safe/unsafe fallback distinctions;
@@ -1289,7 +1390,14 @@ STM behavior. Do not duplicate the model in a fake. Prove:
 - reset acknowledgement cannot unblock a newer/different feed, a paused input
   consumer cannot block window close, and a click retains its captured location
   after later cursor motion;
-- turn fairness without sleeps as correctness assertions.
+- turn fairness across the host and per-window ports under sustained load;
+- competing fullscreen claims, iconification, conservative release after
+  uncertain effects, per-mode control eligibility and constraint restoration;
+- press/disable/suppressed-release/re-enable requiring acknowledged reset,
+  including repeated toggles, existing overflow, and terminal races;
+- local native cache invalidation on compiler/SDK/deployment/options changes.
+
+Use explicit coordination rather than sleeps as correctness assertions.
 
 Compile opacity clients outside each package. Keep constructors, endpoint
 mutation, native handles, and bookkeeping private.
@@ -1439,6 +1547,9 @@ settled child contracts.
   declaration drift. Document and check CMake/pkg-config availability. Verify
   equality of the planner/worker toolchain maps, with digest-bound worker launch
   and independent native-manifest/compiler checks.
+  Local-cache cases change only the compiler, SDK, deployment target or build
+  options and reject incompatible prefixes, linked products and evidence;
+  identical complete configurations remain reusable.
   Hspec covers workflow contracts; native compiler/link/version checks need no
   display. The PR includes the initial validated image descriptor and evidence.
 - **Out of scope:** Haskell GLFW API, Xvfb runtime setup, Vulkan packages,
@@ -1505,18 +1616,19 @@ settled child contracts.
 
 ### GLFW-4. Quiesce application services before supervised worker drain
 
-- **Outcome:** application composition can close service admission before joining
-  workers without releasing their dependencies.
+- **Outcome:** application composition can close service admission before the
+  supervision boundary drain without releasing workers' dependencies.
 - **Scope:** one additive lifecycle seam using existing failure-preserving
   scopes; original runner behavior preserved; every exit path covered.
 - **Phase:** runtime integration.
 - **Related labels:** existing `runtime`.
 - **Depends on:** none.
 - **Ordering:** independent.
-- **Relevant decisions:** D-1, D-4, D-11.
+- **Relevant decisions:** D-1, D-4, D-11, D-17.
 - **Acceptance signals:** deterministic Hspec worker-awaiting-service example;
   startup/final checkpoint failure and cancellation cannot bypass quiescence;
   release/report/flush ordering and original exception context remain intact.
+  Fatal-latch stops and startup-local drains retain their earlier ordering.
 - **Out of scope:** GLFW imports in runtime, native destruction, generic scheduler.
 - **Open questions:** none.
 
@@ -1558,10 +1670,11 @@ settled child contracts.
 - **Related labels:** existing `runtime`.
 - **Depends on:** GLFW-13, GLFW-4, GLFW-7.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-4, D-5, D-6, D-11.
+- **Relevant decisions:** D-1, D-4, D-5, D-6, D-11, D-17.
 - **Acceptance signals:** saturated queues do not starve checkpoints; queued
-  callers settle before worker join; no owner waiting on itself; actual
-  background workers progress during native waits.
+  callers settle before the boundary drain; no owner waiting on itself; actual
+  background workers progress during native waits. Abandoned startup drains
+  with cleanup independent of main-thread replies before quiescence runs.
 - **Out of scope:** every manipulation command, input interpretation, rendering.
 - **Open questions:** none.
 
@@ -1571,15 +1684,18 @@ settled child contracts.
   through the owned main-thread protocol.
 - **Scope:** use GLFW-10's collection with GLFW-2's native assembly; create/close
   commands, per-window admission and pending outcomes, lifecycle observations,
-  capacity rejection, failed-creation rollback, and host-wide shutdown.
+  capacity rejection, failed-creation rollback, host-wide shutdown, fair port
+  scheduling and protected capability handoff separate from prepared data.
 - **Phase:** dynamic window ownership.
 - **Depends on:** GLFW-3, GLFW-10.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-6, D-10, D-11.
+- **Relevant decisions:** D-2, D-4, D-6, D-10, D-11, D-20.
 - **Acceptance signals:** native and model tests close windows in different orders,
   leave unrelated windows usable, reject stale ports, settle pending callers,
   preserve cleanup evidence, and retain bounded owner bookkeeping across repeated
-  creation/closure with a fixed live-window limit.
+  creation/closure with a fixed live-window limit. Sustained traffic cannot
+  starve another window or the host port, including rejected requests and
+  window churn; FIFO within ports and the total turn budget both hold.
 - **Out of scope:** reimplementing the collection, generic GPU retirement, raw
   native pointers in worker messages, and future surface ownership.
 - **Open questions:** none.
@@ -1624,33 +1740,42 @@ settled child contracts.
 - **Outcome:** selected mode changes preserve/restorable windowed placement and
   continue safely across supported monitor changes.
 - **Scope:** consume GLFW-11's monitor inventory; selected-monitor placement,
-  mode state machine, startup seeding, finite recovery and honest partial results.
+  mode state machine, startup seeding, finite recovery and honest partial results;
+  session-owned fullscreen claims, per-mode ordinary-command eligibility and
+  windowed-constraint suspension/restoration.
 - **Phase:** manipulation.
 - **Depends on:** GLFW-5, GLFW-11.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-4, D-7, D-8.
+- **Relevant decisions:** D-2, D-3, D-4, D-7, D-8, D-18.
 - **Acceptance signals:** Synarchy's restoration cases plus hotplug, unsupported
   positioning, repeated requests and partial failures; native mode evidence.
+  Competing windows cannot steal a fullscreen monitor, including during
+  iconification or uncertain teardown. Ordinary resize cannot change a
+  fullscreen video mode; constraint restoration and failure stay honest.
 - **Out of scope:** Vulkan presentation settings, persistent monitor/save schema.
 - **Open questions:** none. Discovery is delivered independently in GLFW-11.
 
 ### GLFW-8. Implement bounded input feeds and acknowledged resets
 
 - **Outcome:** one logical consumer receives prepared input with a visible,
-  acknowledged recovery boundary after overflow.
+  acknowledged reset after overflow or temporary application suspension.
 - **Scope:** P-13's opaque feed/epoch/reset tokens; phase and admission model;
   channel abort and accounting; acknowledgement; warning claim/resumption;
-  focus/held-state rules; terminal behavior and component-owned model tests.
+  focus/held-state rules; reusable admission, distinct reset reasons, terminal
+  behavior and component-owned model tests.
 - **Phase:** input protocol.
 - **Depends on:** GLFW-9.
 - **Ordering:** independent of manipulation after dynamic window ownership.
-- **Relevant decisions:** D-2, D-4, D-5, D-6, D-10, D-12.
+- **Relevant decisions:** D-2, D-4, D-5, D-6, D-10, D-12, D-19.
 - **Acceptance signals:** one stable reset token per episode, no old backlog
   delivered after reset detection, no new-epoch input before acknowledgement,
   exact queue discard accounting, bounded suppressed-event state, stale/foreign
   acknowledgement handling, duplicate acknowledgements, a stalled/cancelled
   consumer, resumption racing closure, warning failure/cancellation, and no
-  synthetic press from an already held key.
+  synthetic press from an already held key. Disabling between press/release
+  cannot leave held/gesture state stuck; re-enable requires acknowledged reset
+  and a fresh epoch, repeated toggles preserve an existing episode, and
+  intentional suspension schedules no overflow warning.
 - **Out of scope:** native keyboard/mouse callback registration, game actions,
   Lua routing, IME, replay, clipboard/drop and automatic worker restart.
 - **Open questions:** none. Native sources are connected separately in GLFW-12.

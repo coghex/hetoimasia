@@ -25,14 +25,12 @@ concrete precondition
 
 - [x] EPIC. Establish component-owned tests and scoped shared fixtures — [#49]
 - [x] TEST-1. Split the headless engine suite into component specs — [#50]
-- [ ] TEST-2. Add a shared fixture for the first concrete graphics suite — [deferred]: awaiting GLFW-7's approved issue for existing-issue adoption; Q-1 resolved; implementation requires GLFW-1/GLFW-2
+- [x] TEST-2. Add a shared fixture for the first concrete graphics suite — [#93]
 
 The ledger records issue processing, not implementation completion. A linked
 issue does not satisfy a requirement that its implementation has merged.
-GLFW-7 owns the future fixture issue. Once it exists, a separate
-`process-design-doc` run over this document approves an existing-issue disposition
-and links it here and under epic #49. Do not process TEST-2 into an additional
-implementation or update this cursor as a side effect of the GLFW processor.
+GLFW-7 is filed as #93 and linked here and under epic #49. TEST-2 stays
+unchecked in the epic until #93 merges with its evidence.
 
 ## Epic contract
 
@@ -316,6 +314,9 @@ proves neither native lifecycle execution nor GPU execution.
 - **Open questions:** none blocking; P-1 is the proposed file organization.
 
 ### TEST-2. Add a shared fixture for the first concrete graphics suite
+
+> Linked to #93 (GLFW-7) on 2026-09-14 as an existing issue; no second
+> implementation is filed.
 
 - **Outcome:** compatible tests of the first available backend share expensive
   roots safely while retaining independent examples and private lifecycle tests.
