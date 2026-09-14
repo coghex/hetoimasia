@@ -7,6 +7,10 @@
 -- stubs because the cases that matter do not happen on demand against the real
 -- ones: a registry that errors, a tag a concurrent builder published a moment
 -- earlier, and a compiler or SDK upgrade under an unchanged GLFW pin.
+--
+-- The real registry transport, @tools/ci-image/registry.py@, is not driven
+-- here: it only answers the builder's four requests against GHCR and Docker,
+-- and the builder workflow's own runs are what exercise it.
 module CiImage (spec) where
 
 import Control.Exception (evaluate)
