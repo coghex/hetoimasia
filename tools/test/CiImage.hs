@@ -439,9 +439,11 @@ recipePaths =
   , "tools/ci-image/Dockerfile"
   , "tools/ci-image/builder.py"
   , "tools/ci-image/provision.sh"
+  , "tools/ci-image/registry.py"
   , "tools/ci-image/toolchain.pin"
   , "tools/native/glfw.pin"
   , "tools/native/native.py"
+  , "tools/validation/ci_image.py"
   ]
 
 projectFiles ∷ [(FilePath, String)]
@@ -890,6 +892,8 @@ variations =
   , probeVariation "architecture" "architecture" "arch" "x86_64" "arm64"
   , Variation "deployment target" "deployment_target" [("MACOSX_DEPLOYMENT_TARGET", "14.0")] (const (pure ())) (const (pure ()))
   , Variation "build options" "build_options" [("HETOIMASIA_GLFW_BUILD_TYPE", "Debug")] (const (pure ())) (const (pure ()))
+  , Variation "SDK selected through SDKROOT" "environment" [("SDKROOT", "/fixture/SDKs/MacOSX27.sdk")] (const (pure ())) (const (pure ()))
+  , Variation "compiler flags" "environment" [("CFLAGS", "-O0 -g")] (const (pure ())) (const (pure ()))
   ]
   where
     probeVariation label name file changed original =
@@ -928,16 +932,27 @@ withNative action = do
       unlines
         [ "#!/bin/sh"
         , "case \"$*\" in"
+        , "  *--show-sdk-path) echo /fixture/SDKs/MacOSX.sdk ;;"
         , "  *--show-sdk-version) " ++ answering "sdk-version" ++ " ;;"
         , "  *--show-sdk-build-version) " ++ answering "sdk-build" ++ " ;;"
         , "esac"
         ]
     let inherited =
           filter
-            ((`notElem` ["CC", "MACOSX_DEPLOYMENT_TARGET", "HETOIMASIA_GLFW_BUILD_TYPE", "PKG_CONFIG_PATH", "HETOIMASIA_NATIVE_PREFIX"]) . fst)
+            ((`notElem` (["CC", "MACOSX_DEPLOYMENT_TARGET", "HETOIMASIA_GLFW_BUILD_TYPE", "PKG_CONFIG_PATH", "HETOIMASIA_NATIVE_PREFIX"] ++ ambientBuildVariables)) . fst)
             settings
         path = stubs ++ maybe "" (':' :) (lookup "PATH" inherited)
     action (Native directory prefix (directory </> "dist-newstyle") stubs interpreter here (overriding [("PATH", path)] inherited))
+
+-- | The ambient variables the native identity records, cleared from the
+-- inherited environment so a developer's own shell cannot move a fixture's
+-- identity.
+ambientBuildVariables ∷ [String]
+ambientBuildVariables =
+  [ "CFLAGS", "CMAKE_GENERATOR", "CMAKE_OSX_ARCHITECTURES", "CMAKE_OSX_DEPLOYMENT_TARGET"
+  , "CMAKE_OSX_SYSROOT", "CMAKE_PREFIX_PATH", "CMAKE_TOOLCHAIN_FILE", "CPATH", "CPPFLAGS"
+  , "C_INCLUDE_PATH", "LDFLAGS", "LIBRARY_PATH", "SDKROOT"
+  ]
 
 nativeTool ∷ Native → [(String, String)] → [String] → IO (ExitCode, String, String)
 nativeTool native overrides arguments =

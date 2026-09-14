@@ -46,8 +46,14 @@ RECIPE_MARKER = "tools/ci-image/Dockerfile"
 
 # Every recipe input: a trailing ``/`` is a directory prefix, anything else an
 # exact path. The builder workflow is one, because it decides how the recipe
-# is built and tagged.
-RECIPE_ROOTS = ("tools/ci-image/", "tools/native/", ".github/workflows/ci-image.yml")
+# is built and tagged, and so is this module, because the builder and its
+# registry transport load it to decide what a valid image is.
+RECIPE_ROOTS = (
+    "tools/ci-image/",
+    "tools/native/",
+    ".github/workflows/ci-image.yml",
+    "tools/validation/ci_image.py",
+)
 
 # The toolchain map entries this image contributes beside ``ghc`` and ``cabal``.
 IMAGE_ENTRY = "ci-image"

@@ -894,9 +894,10 @@ then only ever addressed by digest.
 ### The recipe fingerprint
 
 Every file under `tools/ci-image/` and `tools/native/`, plus
-`.github/workflows/ci-image.yml`, is a recipe input — the Dockerfile, the
-provisioning script, both pin files, the builder and its registry transport, and
-the native recipe — **except** `tools/ci-image/descriptor.json`.
+`.github/workflows/ci-image.yml` and `tools/validation/ci_image.py`, is a recipe
+input — the Dockerfile, the provisioning script, both pin files, the builder and
+its registry transport, the image contract they load, and the native recipe —
+**except** `tools/ci-image/descriptor.json`.
 `tools/validation/ci_image.py` fingerprints each input's path, mode, type, and
 content id from one commit's tree:
 
@@ -1050,8 +1051,12 @@ Beside the prefix it writes `hetoimasia-native-manifest.json`: the GLFW version,
 source URL and checksum, the recipe fingerprint, the archive's checksum, the
 `pkg-config` metadata — including `pkg-config --libs --static glfw3`, which on
 macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — and the native
-identity: platform, architecture, C compiler, SDK, deployment target, and the
-effective CMake options. The `native-manifest` toolchain entry is that file's
+identity: platform, architecture, C compiler, SDK, deployment target, the
+effective CMake options, and the exact value or absence of every variable CMake
+or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
+`CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
+macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
+`SDKROOT` cannot select a different one behind the recorded identity. The `native-manifest` toolchain entry is that file's
 SHA-256.
 
 | Command | What it does |
@@ -1092,7 +1097,8 @@ The prefix defaults to `~/.cache/hetoimasia/native/glfw`; `--prefix` or
 
 Refresh the prefix whenever `check` or `prepare` reports a different
 configuration — a Command Line Tools or Xcode update, another SDK, deployment
-target, architecture, or build type, or a changed pin or recipe — by running
+target, architecture, or build type, a changed `SDKROOT` or compiler flags, or a
+changed pin or recipe — by running
 `build` again. `prepare` refuses a `dist-newstyle` linked against the previous
 manifest; remove it rather than reuse those products.
 
@@ -1769,8 +1775,8 @@ decision step and assert that a default-branch push whose tests were all reused
 seeds a missing cache, that an existing cache, a running engine worker, and a
 pull request do not, that a lookup that did not answer seeds, and that the
 seeding job builds only dependencies. The native examples assert, for a change
-to only the C compiler, the SDK, the architecture, the deployment target, or the
-build options, that the old prefix and a build directory stamped against it are
+to only the C compiler, the SDK, the architecture, the deployment target, the
+build options, `SDKROOT`, or compiler flags, that the old prefix and a build directory stamped against it are
 refused and the manifest identity changes, and that restoring the configuration
 restores the identity; and that an absent prefix beside a visible system GLFW, a
 prefix whose metadata was replaced by a system GLFW, generated link requirement

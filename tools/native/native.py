@@ -148,15 +148,40 @@ def probe(command: list[str]) -> str:
     return lines[0].strip() if lines else ""
 
 
+# Variables CMake or the C compiler read on their own. Any of them can change
+# what the recipe builds without appearing among its options — `SDKROOT`
+# initializes CMake's sysroot, `CFLAGS` its compile flags — so the identity
+# records each one's exact value, including its absence.
+AMBIENT_BUILD_VARIABLES = (
+    "CFLAGS",
+    "CMAKE_GENERATOR",
+    "CMAKE_OSX_ARCHITECTURES",
+    "CMAKE_OSX_DEPLOYMENT_TARGET",
+    "CMAKE_OSX_SYSROOT",
+    "CMAKE_PREFIX_PATH",
+    "CMAKE_TOOLCHAIN_FILE",
+    "CPATH",
+    "CPPFLAGS",
+    "C_INCLUDE_PATH",
+    "LDFLAGS",
+    "LIBRARY_PATH",
+    "SDKROOT",
+)
+
+
 def compiler() -> str:
     return os.environ.get("CC") or "cc"
+
+
+def ambient_environment() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in AMBIENT_BUILD_VARIABLES}
 
 
 def build_type() -> str:
     return os.environ.get("HETOIMASIA_GLFW_BUILD_TYPE") or "Release"
 
 
-def build_options(target: str, architecture: str, deployment_target: str) -> list[str]:
+def build_options(target: str, architecture: str, deployment_target: str, sysroot: str | None) -> list[str]:
     """The effective CMake options the recipe configures GLFW with."""
     options = [
         "BUILD_SHARED_LIBS=OFF",
@@ -169,9 +194,12 @@ def build_options(target: str, architecture: str, deployment_target: str) -> lis
         "GLFW_INSTALL=ON",
     ]
     if target == "Darwin":
+        # The sysroot is passed explicitly, so the SDK the identity probed is
+        # the SDK CMake builds against rather than whatever SDKROOT selects.
         options += [
             "CMAKE_OSX_ARCHITECTURES=" + architecture,
             "CMAKE_OSX_DEPLOYMENT_TARGET=" + deployment_target,
+            "CMAKE_OSX_SYSROOT=" + (sysroot or ""),
             "GLFW_BUILD_COCOA=ON",
         ]
     elif target == "Linux":
@@ -191,10 +219,13 @@ def native_identity(target: str, pin: dict[str, str]) -> dict:
     """
     cc = compiler()
     architecture = probe(["uname", "-m"])
+    sysroot = None
     if target == "Darwin":
-        sdk = "macosx {} ({})".format(
+        sysroot = probe(["xcrun", "--sdk", "macosx", "--show-sdk-path"])
+        sdk = "macosx {} ({}) at {}".format(
             probe(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
             probe(["xcrun", "--sdk", "macosx", "--show-sdk-build-version"]),
+            sysroot,
         )
         deployment_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET") or pin["MACOS_DEPLOYMENT_TARGET"]
     else:
@@ -206,7 +237,8 @@ def native_identity(target: str, pin: dict[str, str]) -> dict:
         "c_compiler": f"{probe([cc, '--version'])} [{probe([cc, '-dumpmachine'])}]",
         "sdk": sdk,
         "deployment_target": deployment_target,
-        "build_options": build_options(target, architecture, deployment_target),
+        "build_options": build_options(target, architecture, deployment_target, sysroot),
+        "environment": ambient_environment(),
     }
 
 
