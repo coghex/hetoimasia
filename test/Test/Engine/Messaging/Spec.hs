@@ -5,9 +5,9 @@
 -- coordinated with 'MVar's, never with a sleep; 'boundedExample' only stops an
 -- example that has already hung.
 --
--- The channel examples live in "Test.Engine.Messaging.Channel" and the
--- external-client examples in "Test.Engine.Messaging.Opacity". Both are composed
--- into this group, so @--match Messaging@ selects all of them.
+-- The channel examples live in "Test.Engine.Messaging.Channel", the snapshot
+-- examples in "Test.Engine.Messaging.Snapshot", and the external-client examples
+-- in "Test.Engine.Messaging.Opacity". All are composed into this group, so @--match Messaging@ selects all of them.
 module Test.Engine.Messaging.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -46,6 +46,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
 import qualified Test.Engine.Messaging.Channel as Channel
 import qualified Test.Engine.Messaging.Opacity as Opacity
+import qualified Test.Engine.Messaging.Snapshot as Snapshot
 import Test.Hspec
   ( Expectation
   , Spec
@@ -73,6 +74,7 @@ spec = describe "Messaging" $ do
       (boundedExample testCancelledPreparation)
 
   Channel.spec
+  Snapshot.spec
   Opacity.spec
 
 -- Fixtures -------------------------------------------------------------------

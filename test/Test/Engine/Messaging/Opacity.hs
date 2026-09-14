@@ -25,6 +25,13 @@
 -- endpoint, naming an endpoint's constructor, and replacing an endpoint through
 -- record update. One must be accepted, linked, and run, using every supported
 -- send, receive, control, and statistics operation.
+--
+-- The snapshot clients expose the same packages. Seven must be rejected for
+-- their named cause: forging a cursor or an observation from its constructor,
+-- replacing an observation's payload or a publisher's read endpoint through
+-- record update, and publishing or closing through a read endpoint. One must be
+-- accepted, linked, and run, using every publish, read, wait, and close
+-- operation and catching the cursor-mismatch failure.
 module Test.Engine.Messaging.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
@@ -37,6 +44,7 @@ spec ∷ Spec
 spec = do
   payloadSpec
   channelSpec
+  snapshotSpec
 
 payloadSpec ∷ Spec
 payloadSpec = describe "Prepared payload opacity across the package boundary" $ do
@@ -316,6 +324,203 @@ supportedChannelClient =
     , "  statistics other >>= putStrLn"
     , "  rejected 0"
     , "  rejected (maximumCapacity + 1)"
+    ]
+
+snapshotSpec ∷ Spec
+snapshotSpec = describe "Snapshot endpoint authority across the package boundary" $ do
+  it "rejects a client that forges a cursor from its constructor" $
+    withChannelClient cursorConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "SnapshotCursor"
+
+  it "rejects a client that forges an observation from its constructor" $
+    withChannelClient observationConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "Observation"
+
+  it "rejects a client that replaces an observation's payload with record update" $
+    withChannelClient observationUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "observedValue"
+
+  it "rejects a client that replaces a publisher's read endpoint with record update" $
+    withChannelClient publisherUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "snapshotReader"
+
+  it "rejects a client that publishes through a read endpoint" $
+    withChannelClient publishFromReaderClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match type"
+      clientOutput outcome `shouldContain` "SnapshotReader"
+      clientOutput outcome `shouldContain` "SnapshotPublisher"
+
+  it "rejects a client that closes through a read endpoint" $
+    withChannelClient closeFromSnapshotReaderClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match type"
+      clientOutput outcome `shouldContain` "SnapshotReader"
+      clientOutput outcome `shouldContain` "SnapshotPublisher"
+
+  it "accepts and runs a client using every publish, read, wait, and close operation" $
+    withPackageClient channelPackages "Main.hs" supportedSnapshotClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the supported client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "initial = first at 0"
+                   , "publish = Published"
+                   , "updated = second at 1"
+                   , "waiting = retried"
+                   , "forwarded = second at 1"
+                   , "close = PublicationClosed"
+                   , "current = second at 1"
+                   , "after close = end"
+                   , "mismatch = ForeignSnapshotCursor 1"
+                   ]
+
+-- | Building a cursor from its constructor.
+cursorConstructorClient ∷ String
+cursorConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotCursor (SnapshotCursor))"
+    , ""
+    , "forged ∷ SnapshotCursor Int"
+    , "forged = SnapshotCursor"
+    ]
+
+-- | Building an observation from its constructor.
+observationConstructorClient ∷ String
+observationConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (Observation (Observation))"
+    , ""
+    , "forged ∷ Observation Int"
+    , "forged = Observation"
+    ]
+
+-- | Replacing an observation's payload through record-update syntax. The reader
+-- is imported by name, so the rejection means it is not a field rather than
+-- that it was never imported.
+observationUpdateClient ∷ String
+observationUpdateClient =
+  unlines
+    [ "module Client (replaced) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Payload (Prepared)"
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (Observation, observedValue)"
+    , ""
+    , "replaced ∷ Observation Int → Prepared Int → Observation Int"
+    , "replaced observation replacement = observation { observedValue = replacement }"
+    ]
+
+-- | Replacing the read endpoint a publisher hands out, through record-update
+-- syntax.
+publisherUpdateClient ∷ String
+publisherUpdateClient =
+  unlines
+    [ "module Client (rewired) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotPublisher, SnapshotReader, snapshotReader)"
+    , ""
+    , "rewired ∷ SnapshotPublisher Int → SnapshotReader Int → SnapshotPublisher Int"
+    , "rewired publisher replacement = publisher { snapshotReader = replacement }"
+    ]
+
+-- | Publishing through a read endpoint.
+publishFromReaderClient ∷ String
+publishFromReaderClient =
+  unlines
+    [ "module Client (published) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Foundation.Messaging.Payload (Prepared)"
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (Publication, SnapshotReader, publish)"
+    , ""
+    , "published ∷ SnapshotReader Int → Prepared Int → STM Publication"
+    , "published = publish"
+    ]
+
+-- | Closing through a read endpoint.
+closeFromSnapshotReaderClient ∷ String
+closeFromSnapshotReaderClient =
+  unlines
+    [ "module Client (closed) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, closeSnapshot)"
+    , ""
+    , "closed ∷ SnapshotReader Int → STM ()"
+    , "closed = closeSnapshot"
+    ]
+
+-- | A client using every supported snapshot operation, including the
+-- observation readers, and catching the cursor-mismatch failure.
+supportedSnapshotClient ∷ String
+supportedSnapshotClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Concurrent.STM (atomically, orElse)"
+    , "import Control.Exception (try)"
+    , "import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)"
+    , "import Hetoimasia.Foundation.Messaging.Snapshot"
+    , ""
+    , "described ∷ Observation String → String"
+    , "described observation ="
+    , "  preparedValue (observedValue observation) <> \" at \" <> show (cursorRevision (observedCursor observation))"
+    , ""
+    , "update ∷ Update String → String"
+    , "update (Updated observation) = described observation"
+    , "update EndOfStream = \"end\""
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  publisher ← newSnapshot =<< prepare \"first\""
+    , "  let reader = snapshotReader publisher"
+    , "  initial ← atomically (readSnapshot reader)"
+    , "  putStrLn (\"initial = \" <> described initial)"
+    , "  second ← prepare \"second\""
+    , "  atomically (publish publisher second) >>= putStrLn . (\"publish = \" <>) . show"
+    , "  updated ← atomically (awaitSnapshot reader (observedCursor initial))"
+    , "  putStrLn (\"updated = \" <> update updated)"
+    , "  latest ← atomically (readSnapshot reader)"
+    , "  waiting ← atomically ((update <$> awaitSnapshot reader (observedCursor latest)) `orElse` pure \"retried\")"
+    , "  putStrLn (\"waiting = \" <> waiting)"
+    , "  other ← newSnapshot =<< prepare \"other\""
+    , "  _ ← atomically (publish other (observedValue latest))"
+    , "  atomically (readSnapshot (snapshotReader other)) >>= putStrLn . (\"forwarded = \" <>) . described"
+    , "  atomically (closeSnapshot publisher)"
+    , "  atomically (closeSnapshot publisher)"
+    , "  third ← prepare \"third\""
+    , "  atomically (publish publisher third) >>= putStrLn . (\"close = \" <>) . show"
+    , "  atomically (readSnapshot reader) >>= putStrLn . (\"current = \" <>) . described"
+    , "  atomically (awaitSnapshot reader (observedCursor latest)) >>= putStrLn . (\"after close = \" <>) . update"
+    , "  mismatch ← try (atomically (awaitSnapshot (snapshotReader other) (observedCursor latest)))"
+    , "  case mismatch of"
+    , "    Left failure → putStrLn (\"mismatch = \" <> show (failure ∷ ForeignSnapshotCursor))"
+    , "    Right result → putStrLn (\"mismatch = nothing, \" <> update result)"
     ]
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()

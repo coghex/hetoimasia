@@ -161,6 +161,16 @@ not a verdict that Synarchy's design should be discarded.
   accepted/dequeued/discarded counts in one transaction. It is a two-list queue
   in TVars, not `TBQueue`. Composition with `awaitSupervised` and
   `awaitStopRequest` is proven in `Messaging`; contract in `docs/messaging.md`.
+- MSG-4 (#77) added `Hetoimasia.Foundation.Messaging.Snapshot`: `newSnapshot`
+  builds a latest-value snapshot from a `Prepared` initial value with a fresh
+  `Data.Unique` identity and returns a `SnapshotPublisher` that hands out a
+  read-only `SnapshotReader`. Value, `Natural` revision, and terminal flag live
+  in one `TVar`, so `publish` replaces value and revision together; every
+  publication advances the revision and close does not. `readSnapshot` returns
+  an opaque `Observation` (`observedValue`, `observedCursor`); `awaitSnapshot`
+  checks the cursor's identity first, raising `ForeignSnapshotCursor` through
+  `throwFailureSTM`, then returns the newest unseen publication, `EndOfStream`
+  once closed, or retries. No per-reader state. Contract in `docs/messaging.md`.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
