@@ -28,6 +28,7 @@ extra-source-files:
     .github/workflows/validation.yml
     tools/ci-image/Dockerfile
     tools/ci-image/builder.py
+    tools/ci-image/descriptor.json
     tools/ci-image/provision.sh
     tools/ci-image/registry.py
     tools/ci-image/toolchain.pin
