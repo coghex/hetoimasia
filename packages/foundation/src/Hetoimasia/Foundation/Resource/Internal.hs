@@ -3,9 +3,10 @@
 --
 -- This module is listed under @other-modules@, so no client of the package can
 -- import it. It exists so that a scoped constructor defined in another module
--- of this library — 'Hetoimasia.Foundation.Recovery.allocComponent' today, the
--- trusted worker adapter later — can build a 'Scoped' value and drive a
--- composite's part ledger without the public module exporting either
+-- of this library — 'Hetoimasia.Foundation.Recovery.allocComponent',
+-- 'Hetoimasia.Foundation.Worker.allocWorkerGroup', and the member ledger of
+-- "Hetoimasia.Foundation.Resource.Collection" — can build a 'Scoped' value and
+-- drive a composite's part ledger without the public module exporting either
 -- constructor. The public module re-exports only the closed types and the
 -- operations over them, so the opacity that module documents is unchanged:
 -- a client still has no name for the continuation, the ledger, or a
@@ -42,6 +43,7 @@ module Hetoimasia.Foundation.Resource.Internal
   , restoredStep
   , Ledger
   , assemble
+  , assembleSeparately
   , lendAssembled
   , releaseAcquired
   , declaredOrder
@@ -443,6 +445,26 @@ assemble
   → Assembly a
   → IO (Either (ExceptionWithContext SomeException) (Ledger, a))
 assemble restore assembly = do
+  built ← assembleSeparately restore assembly
+  pure $ case built of
+    Left (primary, failures) → Left (retainCleanupFailures failures primary)
+    Right owned → Right owned
+
+-- | 'assemble', handing back a failed construction's rollback failures beside
+-- the untouched primary instead of already retained on it.
+--
+-- The rollback is the same one 'assemble' performs, attempted before this
+-- returns. An owner that must remember whether a rollback failed — the
+-- collection in "Hetoimasia.Foundation.Resource.Collection" latches such a
+-- failure — reads the list here rather than recovering it from the primary's
+-- context, where it would be indistinguishable from evidence the construction's
+-- own exception already carried. The caller is responsible for retaining the
+-- failures on the primary before rethrowing it.
+assembleSeparately
+  ∷ (∀ x. IO x → IO x)
+  → Assembly a
+  → IO (Either (ExceptionWithContext SomeException, [CleanupFailure]) (Ledger, a))
+assembleSeparately restore assembly = do
   slot ← newIORef []
   built ← tryScope (runAssembly assembly (Assembling restore slot))
   case built of
@@ -450,7 +472,7 @@ assemble restore assembly = do
     -- acquired so far, and the failure that triggered it stays primary.
     Left primary → do
       failures ← releaseAcquired slot
-      pure (Left (retainCleanupFailures failures primary))
+      pure (Left (primary, failures))
     Right value → pure (Right (slot, value))
 
 -- | Lend a value built by 'assemble' to a body, then release its ledger.

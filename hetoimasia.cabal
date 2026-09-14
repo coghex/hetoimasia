@@ -132,6 +132,7 @@ test-suite hetoimasia-tests
         Test.Engine.Messaging.Spec
         Test.Engine.Recovery.Spec
         Test.Engine.Resources.Buffer
+        Test.Engine.Resources.Collection
         Test.Engine.Resources.Cost
         Test.Engine.Resources.Construction
         Test.Engine.Resources.Journal

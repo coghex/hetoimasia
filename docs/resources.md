@@ -10,12 +10,13 @@ argument order, the failure table, the mask discipline, what the release
 guarantee does and does not cover, how to inspect and how not to discard the
 secondary failures a scope retains, the staged constructor an owner built from
 several parts is assembled with, the continuation facade those scopes are
-composed in, the scoped constructor that selects a live component among
-alternatives, the component convention, and how an application composes them
-with logging.
+composed in, the scoped collection whose members are retired independently,
+the scoped constructor that selects a live component among alternatives, the
+component convention, and how an application composes them with logging.
 
-Anything involving Vulkan, GPU completion, retirement queues, ownership
-transfer, or public early release is not part of it yet. This module imports no
+Anything involving Vulkan, GPU completion, retirement queues, or ownership
+transfer is not part of it yet, and early release of an individual resource
+exists only through [the scoped collection](#scoped-resource-collections). This module imports no
 logger, runtime environment, graphics, or scripting module, and owns no
 application state; [Application lifecycle](#application-lifecycle) describes
 what the application does with it, and belongs to the application rather than to
@@ -52,9 +53,12 @@ whose validity depends on it — a handle, a pointer, a lazily read `String`, a
 record holding any of those. The type does not prevent it; this contract does.
 Return ordinary, fully evaluated results instead.
 
-There is no escape hatch, no transfer operation, and no public early release.
-A value whose lifetime must outlast one scope belongs to an owner that has not
-been designed yet, not to a scope that returns it.
+There is no escape hatch and no transfer operation, and a scope has no way to
+release one of its own allocations early. A resource whose lifetime must end
+before its scope does, independently of its neighbours, belongs to a
+[scoped resource collection](#scoped-resource-collections). A value whose
+lifetime must outlast its scope belongs to an owner that has not been designed
+yet, not to a scope that returns it.
 
 ## The failure table
 
@@ -285,9 +289,11 @@ it, once, including through an enclosing `withResource`.
 - **Unregistering rollback before publication.** Nothing is removed and
   reinstalled around the final binding or publication step, so there is no
   window in which a part is acquired but unprotected.
-- **A dependency scheduler.** `Assembly` is a sequence, not a graph. There are
-  no public early-release tokens, and no way to move a part to another live
-  owner.
+- **A dependency scheduler.** `Assembly` is a sequence, not a graph. A part
+  has no early-release token of its own, and there is no way to move a part to
+  another live owner. A whole assembly can become one member of a
+  [scoped resource collection](#scoped-resource-collections), which releases
+  all of its parts together.
 
 ## The continuation facade
 
@@ -403,8 +409,190 @@ of `withScoped` or `locally`; return ordinary results.
 `withScoped scope pure` is the documented misuse: it hands back a handle whose
 cleanup has already run. The type does not prevent it — `pure` is a legitimate
 continuation when the scope's result is an ordinary value — so this contract
-and the examples forbid it for borrowed ones. There is no escape operation, no
-transfer operation, and no public early-release token in this arc.
+and the examples forbid it for borrowed ones. `Scoped` has no escape
+operation, no transfer operation, and no early-release token, and that boundary
+is unchanged by the collection below: nothing allocated through `Scoped` can be
+released before its enclosing continuation ends, except as a group by
+`locally`. The collection's members are released early, but the collection is
+itself a `Scoped` allocation that cannot outlive its scope.
+
+## Scoped resource collections
+
+```haskell
+-- Hetoimasia.Foundation.Resource.Collection
+data Collection
+data Member a            -- nominal in a
+
+allocCollection ∷ Int → Scoped Collection
+liveMemberCount ∷ Collection → IO Int
+acquireMember   ∷ Collection → Assembly a → IO (Member a)
+withMember      ∷ Collection → Member a → (a → IO r) → IO r
+retireMember    ∷ Collection → Member a → IO Retirement
+memberStatus    ∷ Member a → IO MemberStatus
+
+data Retirement      = Retired | AlreadyRetired | RetirementInUse
+data MemberStatus    = MemberLive | MemberRetired
+                     | MemberRetirementFailed (ExceptionWithContext SomeException)
+data CollectionError = InvalidMemberLimit Int | NotOwnerThread | ForeignMember
+                     | CollectionReentered Activity | CollectionClosed
+                     | MemberLimitReached Int | CollectionPoisoned | MemberNotLive
+data Activity        = Acquiring | Borrowing | Retiring | Closing
+```
+
+A collection owns independent resources whose lifetimes end when the
+application decides — windows created while running and closed in any order —
+while its enclosing scope stays their final owner. Every other lifetime in this
+document is lexical. The module imports no logger, runtime, messaging, or
+windowing module, and is built through
+[the implementation seam](#the-implementation-seam), so neither `Scoped`'s
+continuation nor a member's release is exposed.
+
+```haskell
+withScoped (allocCollection 8) $ \windows → do
+  editor  ← acquireMember windows (windowAssembly editorConfig)
+  preview ← acquireMember windows (windowAssembly previewConfig)
+  withMember windows editor render
+  _ ← retireMember windows preview    -- preview ends; editor stays live
+  runUntilQuit windows editor
+-- editor, and anything else still live, is released here
+```
+
+### Owner, thread, and lifetime
+
+`allocCollection limit` allocates a collection for the rest of the enclosing
+scope. A limit below one is rejected with `InvalidMemberLimit` before the
+collection exists. The collection has a fresh identity, and the thread that
+entered the scope is its only owner: `acquireMember`, `withMember`,
+`retireMember`, and `liveMemberCount` called from any other thread fail with
+`NotOwnerThread` before any effect. Concurrent member operations from several
+threads are not supported. A native owner with a stricter thread requirement
+enforces that itself.
+
+The collection cannot outlive its scope. When the enclosing continuation
+returns or throws, admission closes; afterwards every operation on the
+collection is rejected with `CollectionClosed`, so a collection value that
+leaked out of its scope reaches nothing, not even `liveMemberCount`.
+
+### Acquisition
+
+`acquireMember` checks, in order and before its `Assembly` runs, the owner
+thread, that the collection is not already busy (`CollectionReentered`) or
+closed, that no borrowing callback is running, that the collection is not
+poisoned (`CollectionPoisoned`), and that it holds fewer live members than its
+limit (`MemberLimitReached`). It then chooses the member's identity and runs the
+assembly under the staged protection of
+[Composite construction](#composite-construction). Each part's label and rank
+are evaluated at that part's own stage, as
+[When part metadata is evaluated](#when-part-metadata-is-evaluated) describes;
+later metadata may depend on earlier acquisitions, so nothing is preflighted.
+
+A failing stage rolls back exactly the parts acquired so far and propagates its
+own failure with their ordered cleanup evidence retained. No member is
+registered and no capacity is consumed. On success the finished release is
+registered in the collection while still masked, with no interruptible
+operation in between, and the token is returned only after registration. A
+cancellation that arrives at that handoff therefore leaves a registered member,
+which the collection releases at exit; no member is ever neither registered
+nor released.
+
+### Borrowing
+
+`withMember` checks the owner thread, that the token was issued by this
+collection (`ForeignMember`), the collection's phase, and that the member is
+live (`MemberNotLive`). It records a borrow, runs the callback with the caller's
+masking state, and drops the borrow on every exit, including failure and
+cancellation. The borrowed value follows
+[Ownership and borrowing](#ownership-and-borrowing): it must not escape the
+callback. No linear typing is claimed.
+
+A borrowing callback may borrow other live members. It may not acquire a member
+or retire a different one: both are rejected with
+`CollectionReentered Borrowing`. Retiring the member it is borrowing returns
+`RetirementInUse` and never waits for the callback, so the caller retires it
+after the borrow has returned.
+
+### Retirement
+
+`retireMember` checks the owner thread, the token's collection, and the phase,
+then answers from the member's state, in the order of this table:
+
+| Member state | Outcome |
+|---|---|
+| Borrowed by a running callback | `RetirementInUse`; nothing runs |
+| Any other member, live or terminal, while a callback is borrowing | Rejected with `CollectionReentered Borrowing`; nothing runs |
+| Retired successfully | `AlreadyRetired`; nothing runs |
+| Retirement failed | The stored failure is rethrown — the same exception, context, and cleanup identities — and the release is not called again |
+| Live | Its parts are released now, in their declared order, each once and uninterruptibly: `Retired`, or the failure below |
+
+Retirement claims the release exactly once and makes access terminal. A
+successful retirement removes the member's ledger entry and its value and
+release references, so what the owner keeps is proportional to its live members
+rather than to every member it ever opened. A failed retirement discards the
+same references and keeps only the exception it propagated: the first cleanup
+failure's exception, with every cleanup failure of that member retained beside
+it, as a composite's release reports it.
+
+A `Member` is an identity, not a borrowed value. It holds neither the collection
+nor the member's value, and it may be retained after retirement and after the
+scope, where `memberStatus` reports `MemberRetired` or `MemberRetirementFailed`.
+A terminal state never changes, and `memberStatus` may be called from any
+thread. What a client keeps by retaining tokens is the client's memory, not the
+collection's. The token's type parameter is nominal, so a `Member` cannot be
+coerced to a token at another type sharing a representation.
+
+### Reentry
+
+An `Assembly`, a release, and a borrowing callback all run user code on the
+owner thread, which could call back into the same collection and defeat a
+capacity check or disturb the ledger being released. While a collection is
+acquiring, retiring, or closing, an acquisition, borrow, or retirement against
+it is rejected with `CollectionReentered Acquiring`, `Retiring`, or `Closing`
+before any effect. Borrowing is the lighter state described above.
+
+### Poisoning and the exit outcome
+
+Any release failure poisons the collection: a retirement whose release threw,
+and a failed acquisition whose rollback release threw. Further acquisition is
+rejected with `CollectionPoisoned`, while live members stay borrowable and
+retirable. A construction failure whose rollback succeeded does not poison.
+
+The failure is also latched. Catching the exception an early retirement or an
+acquisition propagated cannot make the collection's exit succeed, and no
+release is attempted a second time to find out. At exit:
+
+| Body | Cleanup failures, latched or at exit | Outcome |
+|---|---|---|
+| Succeeds | None | The body's result is returned |
+| Succeeds | Some | The first cleanup failure's exception is primary, with every cleanup failure retained beside it |
+| Fails or is cancelled | Any | The body's exception propagates unchanged, with every cleanup failure retained beside it |
+
+This is [the failure table](#the-failure-table) applied to everything the
+collection released. Exception types, contexts, and `CleanupFailureId`s are
+preserved; no textual collection exception replaces them.
+
+### Release order at exit
+
+Exit closes admission, then releases the members still live in reverse
+registration order, each member's parts in the order its assembly declared with
+`releaseRank`. Every remaining member is attempted even when an earlier one
+fails, and every token is left in its terminal state. Members must be
+independent: a dependency they share belongs outside the collection's scope, and
+a dependency between two members belongs in one composite or another explicit
+owner. The collection is not a dependency scheduler.
+
+### State the collection holds
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+|---|---|---|---|---|---|
+| Phase | The collection | Read by every operation; written by acquisition, retirement, and exit | Owner | The scope | Closed at exit and never reopened |
+| Active borrows | The collection | Written by `withMember`; read by acquisition and retirement | Owner | The scope | Each borrow drops its count on every exit |
+| Member identity counter | The collection | `acquireMember` | Owner | The scope | Monotone; never reused |
+| Live-member ledger | The collection | Inserted by acquisition; removed by retirement and exit | Owner | Registration until retirement or exit | Entry removed at retirement; emptied at exit |
+| Latched cleanup failures | The collection | Written by failed retirements and rollbacks; read by acquisition and exit | Owner | First failure until exit | Handed to the exit outcome and cleared |
+| Live member state: value, release, borrow count | The collection | Borrows read the value; retirement and exit take the release | Owner | Registration until retirement or exit | Replaced by a terminal state holding no value or release |
+| Terminal member state | Whoever retains the token | `memberStatus` | Any | As long as the token is retained | Immutable; a failed state keeps only its exception |
+
+None of this is application state.
 
 ## Component construction
 
@@ -1181,7 +1369,7 @@ with the rollback evidence, invoking neither another alternative nor the
 consumer — and leave a cancellation pending as construction completes, which
 preempts the consumer and still releases every part.
 
-The two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
+The first two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
 [The continuation facade](#the-continuation-facade) and
 [The evidence boundary](#the-evidence-boundary). They compile eight
 single-module clients with the compiler on `PATH` against the package database
@@ -1203,6 +1391,50 @@ inspection entry points, `displayCleanupFailure`, and reattachment through
 fails in three places at once, the evidence reachable only through an entry's
 own carried context, and that reattaching entries already present reports each
 of them once.
+
+The `Resource collection` groups in `test/Test/Engine/Resources/Collection.hs`
+cover [Scoped resource collections](#scoped-resource-collections) with real CPU
+scopes and ordered traces, coordinated with `MVar`s and `threadStatus` and no
+sleeps. Admission: a limit below one, rejection at the live-member limit before
+the assembly runs and reuse of a retired slot, rollback of a failing stage with
+no member registered, no capacity consumed, and no poisoning, a member cancelled
+inside its assembly rolled back, and a member whose acquisition returns with a
+cancellation pending registered and released exactly once at exit. Borrowing
+and retirement: a middle member retired while its neighbours stay live and the
+rest released in reverse, repeated retirement inert after success and reporting
+the stored failure with the same cleanup identities after a failed release,
+with each release called once, `RetirementInUse` during a borrow and `Retired`
+after it, a nested borrow of another member, the caller's masking state in the
+callback, and a borrow dropped after its callback fails or is cancelled. Misuse:
+every owner operation from another thread and a foreign token rejected with no
+effect, and acquisition, borrowing, and retirement re-entered from an assembly,
+an early release, and a release at exit each rejected, with a borrowing
+callback allowed to borrow but not to acquire or retire another member, live
+or already terminal. Terminal tokens: statuses read after exit while the closed
+collection rejects every operation, including `liveMemberCount`, a failed early
+retirement and a release failed at exit each reported through a retained token
+whose payload the garbage collector can no longer reach, and two hundred open,
+borrow, and retire cycles under a limit of one leaving no live member, with no
+retired payload reachable through the retained tokens. Cleanup failures: a caught early-retirement
+failure still failing a successful body's exit while the remaining members are
+released, a failing and a cancelled body each staying primary beside early and
+final evidence, a failing rollback poisoning acquisition while a live member
+stays borrowable and retirable and then failing a successful body's exit with
+the same cleanup identity, the body staying primary over such a rollback,
+reverse registration order with each member's declared ranks, and a successful
+body failing with the first of several final release failures.
+
+The `Collection opacity across the package boundary` group in
+`test/Test/Engine/Resources/Opacity.hs` compiles seven more clients the same
+way. Six must be rejected: one naming each of the `Collection` and `Member`
+constructors, one each rewriting a collection through `liveMemberCount` and a
+token through `memberStatus` with record update, one coercing a `Member
+Celsius` to a `Member Double`, which the nominal role refuses, and one
+importing the ledger release primitive from the implementation module, which
+the package hides. One must be accepted, linked, and run: it uses only the
+public operations to acquire three members, borrow two together, observe
+`RetirementInUse`, `Retired`, and `AlreadyRetired`, release the rest at exit in
+reverse order, and read both retained tokens' terminal states afterwards.
 
 The `Resource evidence inspection cost` examples in
 `test/Test/Engine/Resources/Cost.hs` cover

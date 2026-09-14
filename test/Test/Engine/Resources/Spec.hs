@@ -69,6 +69,7 @@ import Hetoimasia.Foundation.Resource
   , withResourceLabelled
   , withScoped
   )
+import qualified Test.Engine.Resources.Collection as Collection
 import qualified Test.Engine.Resources.Cost as Cost
 import qualified Test.Engine.Resources.Construction as Construction
 import qualified Test.Engine.Resources.Opacity as Opacity
@@ -265,6 +266,11 @@ spec = describe "Resources" $ do
   -- keeps the selected parts under this facade's release, so its examples
   -- group beside the facade they extend.
   Construction.spec
+
+  -- A collection owns members acquired from ordinary assemblies and releases
+  -- them early or at its scope's exit, so its examples group beside the
+  -- constructors whose staged protection it reuses.
+  Collection.spec
 
   -- What inspecting retained evidence costs is part of the contract, and is
   -- observable only by measuring, so its examples group separately.

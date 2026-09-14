@@ -93,6 +93,14 @@ not a verdict that Synarchy's design should be discarded.
   `allocComposite`, `locally`), and the injected runtime resource demonstration.
   All are implemented at `7e92e73`, with the later repairs reviewed. The
   demonstration's `Channel` is an owned pair of slots, not a message queue.
+- GLFW-10 (#87) added `Hetoimasia.Foundation.Resource.Collection`, the
+  resource prerequisite for dynamic windows: a `Scoped` collection with one
+  owner thread and a positive live-member limit that acquires members from
+  ordinary `Assembly` values, lends them through `withMember`, and retires them
+  early in any order. Reentry while acquiring, retiring, or closing is rejected;
+  any release failure poisons acquisition and is latched into the exit outcome.
+  `Scoped` itself still has no early-release token. Contract:
+  `docs/resources.md`, "Scoped resource collections".
 - RT-1 (#53) added `Hetoimasia.Foundation.Failure`: `throwFailure` attaches a
   component, operation, identifiers, and outermost-frame caller site to a typed
   exception's context without wrapping it; `withOperationContext` adds ordered
