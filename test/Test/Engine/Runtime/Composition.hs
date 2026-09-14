@@ -1,10 +1,13 @@
--- | Examples for 'runScopedApplication', the generic application lifecycle.
+-- | Examples for 'runScopedApplication' and
+-- 'runScopedApplicationWithQuiescence', the generic application lifecycle.
 --
 -- Two unrelated applications drive the same runner: a workshop whose
 -- dependencies are a store and a composite bench, whose services carry a
 -- supervised service worker; and a station whose dependencies are a required
 -- logbook and an optional radio built with 'allocComponent', whose services
--- publish the radio's availability. Neither type is known to the runtime.
+-- publish the radio's availability. Neither type is known to the runtime. The
+-- quiescence examples add a counter, whose dependency is a reply desk a worker
+-- may be left waiting on.
 --
 -- The examples prove the composition, not the matrices it reuses: supervision's
 -- classification and closing are proven by "Test.Engine.Runtime.Supervision",
@@ -15,7 +18,7 @@ module Test.Engine.Runtime.Composition (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, retry)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ExceptionWithContext (ExceptionWithContext)
@@ -26,6 +29,8 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (void, when)
+import Control.Monad.IO.Class (liftIO)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -57,8 +62,8 @@ import Hetoimasia.Foundation.Resource
   , releaseRank
   , restoredStep
   )
-import Hetoimasia.Foundation.Worker (awaitStopRequest, workerDefinition)
-import Hetoimasia.Runtime.Application (runScopedApplication)
+import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, stopRequested, workerDefinition)
+import Hetoimasia.Runtime.Application (runScopedApplication, runScopedApplicationWithQuiescence)
 import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( Disposition (..)
@@ -69,6 +74,7 @@ import Hetoimasia.Runtime.Supervision
   , WorkerStatus (..)
   , awaitSupervised
   , startSupervised
+  , supervisedWorker
   , workerStatus
   )
 import System.IO.Error (ioeGetErrorString)
@@ -77,15 +83,18 @@ import Test.Engine.Runtime.Supervision.Support
   ( Broken (..)
   , Trace
   , awaitBlockedOnSTM
+  , awaitTerminal
   , boundedSupervision
   , brokenIs
   , expectFailure
   , expectStarted
   , failingAfter
+  , job
   , newGate
   , newTrace
   , openGate
   , optional
+  , owned
   , record
   , required
   , serviceUntilStopped
@@ -127,6 +136,32 @@ spec = describe "Application lifecycle" $ do
       testFlushFailure
     it "attempts no terminal report once a managed report has failed"
       testKnownFailedDiagnostic
+  describe "Quiescence" $ do
+    it "releases a worker awaiting a reply from a dependency-owned service so the boundary drain completes"
+      testQuiescenceReleasesReplyWait
+    describe "runs exactly once, with dependencies live, on every exit from the supervised region" $ do
+      it "startup callback failure" (testQuiescenceOnce StartupFails)
+      it "post-startup checkpoint failure" (testQuiescenceOnce StartupCheckpointFails)
+      it "action failure" (testQuiescenceOnce ActionFails)
+      it "final checkpoint failure" (testQuiescenceOnce FinalCheckpointFails)
+      it "successful action return" (testQuiescenceOnce ActionReturns)
+      it "action cancellation" testQuiescenceOnCancellation
+    it "does not run when dependency construction fails"
+      testQuiescenceSkippedOnConstructionFailure
+    it "precedes the boundary's stop requests on ordinary shutdown"
+      testQuiescencePrecedesBoundaryStop
+    it "may follow a stop the fatal latch already requested"
+      testFatalLatchStopPrecedesQuiescence
+    it "may follow the drain of a worker whose managed startup was cancelled"
+      testAbandonedStartupDrainPrecedesQuiescence
+    it "retains its failure as cleanup evidence while an action failure stays primary"
+      testQuiescenceFailureDuringFailure
+    it "retains its failure as cleanup evidence while cancellation propagates unreported and unflushed"
+      testQuiescenceFailureDuringCancellation
+    it "discards a successful result when it fails, then drains, disposes, reports, and flushes"
+      testQuiescenceFailureAfterSuccess
+    it "leaves runScopedApplication identical to a no-op quiescence action"
+      testNoOpQuiescenceIdentical
 
 -- Harness ----------------------------------------------------------------------
 
@@ -479,3 +514,324 @@ testKnownFailedDiagnostic = boundedSupervision $ do
   where
     failWarningsAndErrors entry =
       when (entryLevel entry `elem` [Warning, Error]) (ioError (userError "sink unavailable"))
+
+-- Quiescence ---------------------------------------------------------------------
+
+-- | The runner with a quiescence action, over the harness's logger.
+runQuiescentIn
+  ∷ Harness → Scoped d → (d → STM ()) → (d → RuntimeControl → IO s) → (s → RuntimeControl → IO a) → IO a
+runQuiescentIn harness = runScopedApplicationWithQuiescence (withLoggingLifetime (harnessLogger harness)) "test-app"
+
+-- | A dependency-local journal: quiescence writes to it inside its transaction,
+-- and the counter's release and its workers write to it too, so one list orders
+-- all of them.
+type Journal = TVar [Text]
+
+note ∷ Journal → Text → STM ()
+note journal entry = modifyTVar' journal (<> [entry])
+
+noteIO ∷ Journal → Text → IO ()
+noteIO journal = atomically . note journal
+
+-- | The counter: a journal allocated as a traced dependency, whose release
+-- notes itself.
+counter ∷ Journal → Scoped Journal
+counter journal = allocResource (noteIO journal "acquire counter" >> pure journal) (\_ → noteIO journal "release counter")
+
+quiesceCounter ∷ Journal → STM ()
+quiesceCounter journal = note journal "quiesce"
+
+-- | A reply desk owned by a dependency: a worker files a request and waits for
+-- a reply that only the calling thread would give, or for the desk to close.
+data Desk = Desk
+  { deskJournal ∷ Journal
+  , deskWaiting ∷ TVar Bool
+  , deskClosed ∷ TVar Bool
+  }
+
+-- | A job that files a request and waits for its reply, ignoring its stop
+-- token: only quiescence closing the desk lets it return.
+awaitReply ∷ Desk → WorkerDefinition ()
+awaitReply desk = job "requester" $ \_ → do
+  atomically (writeTVar (deskWaiting desk) True)
+  atomically (readTVar (deskClosed desk) >>= \closed → if closed then pure () else retry)
+  noteIO (deskJournal desk) "reply refused"
+
+testQuiescenceReleasesReplyWait ∷ Expectation
+testQuiescenceReleasesReplyWait = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  desk ← Desk journal <$> newTVarIO False <*> newTVarIO False
+  let quiesce d = writeTVar (deskClosed d) True >> note (deskJournal d) "quiesce"
+  result ←
+    runQuiescentIn harness (allocResource (pure desk) (\d → noteIO (deskJournal d) "release desk")) quiesce
+      (\d control → startSupervised control (required Job) (awaitReply d) >>= expectStarted >> pure d)
+      ( \d control → do
+          -- The requester is parked on its reply before the action returns.
+          awaitSupervised control (readTVar (deskWaiting d) >>= \waiting → if waiting then pure () else retry)
+          pure (5 ∷ Int)
+      )
+  result `shouldBe` 5
+  readTVarIO journal `shouldReturn` ["quiesce", "reply refused", "release desk"]
+  errorEntries harness `shouldReturn` []
+
+-- | How a run leaves the supervised region.
+data Exit
+  = StartupFails
+  | StartupCheckpointFails
+  | ActionFails
+  | FinalCheckpointFails
+  | ActionReturns
+  deriving (Eq, Show)
+
+-- | A required job that fails, has been observed terminal by raw observation,
+-- and is left for the next checkpoint to handle.
+failedUnhandled ∷ Trace → RuntimeControl → IO ()
+failedUnhandled trace control = do
+  gate ← newGate
+  worker ← startSupervised control (required Job) (failingAfter trace "breaker" gate (Broken "checkpoint failed")) >>= expectStarted
+  openGate gate
+  void (awaitTerminal (supervisedWorker worker))
+
+testQuiescenceOnce ∷ Exit → Expectation
+testQuiescenceOnce exit = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  journal ← newTVarIO []
+  outcome ←
+    tryWithContext $
+      runQuiescentIn harness (counter journal) quiesceCounter
+        ( \built control → do
+            when (exit == StartupFails) (throwIO (Broken "startup failed"))
+            when (exit == StartupCheckpointFails) (failedUnhandled trace control)
+            pure built
+        )
+        ( \_ control → do
+            when (exit == ActionFails) (throwIO (Broken "action failed"))
+            when (exit == FinalCheckpointFails) (failedUnhandled trace control)
+            pure (3 ∷ Int)
+        )
+  case (exit, outcome) of
+    (ActionReturns, Right result) → result `shouldBe` 3
+    (ActionReturns, Left _) → expectationFailure "a successful run failed"
+    (_, Right _) → expectationFailure "a failing run returned"
+    (StartupFails, Left failure) → failure `shouldSatisfy` brokenIs "startup failed"
+    (ActionFails, Left failure) → failure `shouldSatisfy` brokenIs "action failed"
+    (_, Left failure) → failure `shouldSatisfy` brokenIs "checkpoint failed"
+  readTVarIO journal `shouldReturn` ["acquire counter", "quiesce", "release counter"]
+  flushes harness `shouldReturn` 1
+
+testQuiescenceOnCancellation ∷ Expectation
+testQuiescenceOnCancellation = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  entered ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $
+    try
+      ( runQuiescentIn harness (counter journal) quiesceCounter (\built _ → pure built) $ \_ control → do
+          putMVar entered ()
+          awaitSupervised control retry
+      )
+      >>= putMVar outcome
+  takeMVar entered
+  awaitBlockedOnSTM runner
+  killThread runner
+  takeMVar outcome >>= \case
+    Right () → expectationFailure "the cancelled application returned"
+    Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+  readTVarIO journal `shouldReturn` ["acquire counter", "quiesce", "release counter"]
+  errorEntries harness `shouldReturn` []
+  flushes harness `shouldReturn` 0
+
+testQuiescenceSkippedOnConstructionFailure ∷ Expectation
+testQuiescenceSkippedOnConstructionFailure = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  let failing = do
+        built ← counter journal
+        allocResource (throwIO (Broken "no mast")) (\() → pure ())
+        pure built
+  propagated ←
+    expectFailure $
+      runQuiescentIn harness failing quiesceCounter (\built _ → pure built) (\_ _ → pure ())
+  propagated `shouldSatisfy` brokenIs "no mast"
+  readTVarIO journal `shouldReturn` ["acquire counter", "release counter"]
+  void (expectOneReport harness)
+
+-- | A dependency a service publishes its stop token into, and in which
+-- quiescence records whether that token had already been asked to stop.
+data Switchboard = Switchboard
+  { switchToken ∷ TVar (Maybe StopToken)
+  , switchSeen ∷ TVar (Maybe Bool)
+  }
+
+newSwitchboard ∷ IO Switchboard
+newSwitchboard = Switchboard <$> newTVarIO Nothing <*> newTVarIO Nothing
+
+-- | A service that publishes its stop token from startup, then runs until
+-- stopped.
+publishingService ∷ Trace → Switchboard → WorkerDefinition ()
+publishingService trace board =
+  workerDefinition "operator" (\token → liftIO (atomically (writeTVar (switchToken board) (Just token))) >> owned trace "operator") $
+    \token () → atomically (awaitStopRequest token)
+
+-- | Record, without retrying, whether the published token was already asked
+-- to stop.
+quiesceSwitchboard ∷ Switchboard → STM ()
+quiesceSwitchboard board =
+  readTVar (switchToken board) >>= \case
+    Nothing → writeTVar (switchSeen board) Nothing
+    Just token → stopRequested token >>= writeTVar (switchSeen board) . Just
+
+testQuiescencePrecedesBoundaryStop ∷ Expectation
+testQuiescencePrecedesBoundaryStop = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  board ← newSwitchboard
+  runQuiescentIn harness (pure board) quiesceSwitchboard
+    (\b control → startSupervised control (required Service) (publishingService trace b) >>= expectStarted >> pure b)
+    (\_ _ → record trace "action")
+  readTVarIO (switchSeen board) `shouldReturn` Just False
+  traced trace `shouldReturn` ["acquire operator", "action", "release operator", "flush"]
+
+testFatalLatchStopPrecedesQuiescence ∷ Expectation
+testFatalLatchStopPrecedesQuiescence = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  board ← newSwitchboard
+  gate ← newGate
+  propagated ←
+    expectFailure $
+      runQuiescentIn harness (pure board) quiesceSwitchboard
+        ( \b control → do
+            void (startSupervised control (required Service) (publishingService trace b) >>= expectStarted)
+            void (startSupervised control (required Service) (failingAfter trace "fuse" gate (Broken "fuse blew")) >>= expectStarted)
+            pure b
+        )
+        (\_ control → openGate gate >> awaitSupervised control retry)
+  propagated `shouldSatisfy` brokenIs "fuse blew"
+  -- Settling the fuse latched it and asked the operator to stop in the same
+  -- transaction, before the wait rethrew and quiescence ran.
+  readTVarIO (switchSeen board) `shouldReturn` Just True
+  void (expectOneReport harness)
+
+testAbandonedStartupDrainPrecedesQuiescence ∷ Expectation
+testAbandonedStartupDrainPrecedesQuiescence = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  entered ← newEmptyMVar
+  never ← newGate
+  outcome ← newEmptyMVar
+  let stalled =
+        workerDefinition "stalled"
+          ( \_ → do
+              allocResource (noteIO journal "acquire stalled") (\() → noteIO journal "release stalled")
+              liftIO (putMVar entered () >> takeMVar never)
+          )
+          (\_ () → pure ())
+  runner ← forkIO $
+    try
+      ( runQuiescentIn harness (counter journal) quiesceCounter
+          (\built control → startSupervised control (required Service) stalled >>= expectStarted >> pure built)
+          (\_ _ → pure ())
+      )
+      >>= putMVar outcome
+  takeMVar entered
+  awaitBlockedOnSTM runner
+  killThread runner
+  takeMVar outcome >>= \case
+    Right () → expectationFailure "the cancelled application returned"
+    Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+  readTVarIO journal `shouldReturn`
+    ["acquire counter", "acquire stalled", "release stalled", "quiesce", "release counter"]
+  flushes harness `shouldReturn` 0
+
+-- | A quiescence action that fails. Its transaction's writes roll back with the
+-- throw, so the retained @application quiescence@ label is what shows it ran.
+failingQuiescence ∷ d → STM ()
+failingQuiescence _ = throwSTM (Broken "quiescence failed")
+
+quiescenceLabels ∷ ExceptionWithContext SomeException → [Text]
+quiescenceLabels (ExceptionWithContext context _) = map cleanupFailureLabel (cleanupFailuresInContext context)
+
+testQuiescenceFailureDuringFailure ∷ Expectation
+testQuiescenceFailureDuringFailure = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  propagated ←
+    expectFailure $
+      runQuiescentIn harness (counter journal) failingQuiescence (\built _ → pure built)
+        (\_ _ → throwIO (Broken "action failed"))
+  propagated `shouldSatisfy` brokenIs "action failed"
+  quiescenceLabels propagated `shouldBe` ["application quiescence"]
+  readTVarIO journal `shouldReturn` ["acquire counter", "release counter"]
+  entry ← expectOneReport harness
+  Map.lookup "cleanup.labels" (entryFields entry) `shouldBe` Just "application quiescence"
+  flushes harness `shouldReturn` 1
+
+testQuiescenceFailureDuringCancellation ∷ Expectation
+testQuiescenceFailureDuringCancellation = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  journal ← newTVarIO []
+  entered ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $
+    tryWithContext
+      ( runQuiescentIn harness (counter journal) failingQuiescence (\built _ → pure built) $ \_ control → do
+          putMVar entered ()
+          awaitSupervised control retry
+      )
+      >>= putMVar outcome
+  takeMVar entered
+  awaitBlockedOnSTM runner
+  killThread runner
+  takeMVar outcome >>= \case
+    Right () → expectationFailure "the cancelled application returned"
+    Left (failure@(ExceptionWithContext _ exception) ∷ ExceptionWithContext SomeException) → do
+      (fromException exception ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      quiescenceLabels failure `shouldBe` ["application quiescence"]
+  readTVarIO journal `shouldReturn` ["acquire counter", "release counter"]
+  errorEntries harness `shouldReturn` []
+  flushes harness `shouldReturn` 0
+
+testQuiescenceFailureAfterSuccess ∷ Expectation
+testQuiescenceFailureAfterSuccess = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  propagated ←
+    expectFailure $
+      runQuiescentIn harness (workshop trace (pure ())) failingQuiescence (openFloor trace)
+        (\_ _ → record trace "action" >> pure (9 ∷ Int))
+  propagated `shouldSatisfy` brokenIs "quiescence failed"
+  quiescenceLabels propagated `shouldBe` ["application quiescence"]
+  -- The polisher tolerates the failure-path cancellation and settles as stopped:
+  -- it drains before the dependencies unwind, then the one report and the flush.
+  traced trace `shouldReturn`
+    workshopBoot
+      <> ["startup", "acquire polisher", "action", "release polisher"]
+      <> workshopDisposal
+      <> ["write Application failed", "flush"]
+  entry ← expectOneReport harness
+  Map.lookup "cleanup.labels" (entryFields entry) `shouldBe` Just "application quiescence"
+
+testNoOpQuiescenceIdentical ∷ Expectation
+testNoOpQuiescenceIdentical = boundedSupervision $ do
+  let scenario ∷ (∀ d s a. Harness → Scoped d → (d → RuntimeControl → IO s) → (s → RuntimeControl → IO a) → IO a) → Bool → IO ([Text], [(Text, Map.Map Text Text)])
+      scenario runner failing = do
+        harness ← newHarness ignoreWrites (pure ())
+        let trace = harnessTrace harness
+        _ ←
+          tryWithContext
+            ( runner harness (workshop trace (pure ())) (openFloor trace) $ \_ _ → do
+                record trace "action"
+                when failing (throwIO (Broken "action failed"))
+            )
+            ∷ IO (Either (ExceptionWithContext SomeException) ())
+        entries ← errorEntries harness
+        (,) <$> traced trace <*> pure [(entryMessage entry, entryFields entry) | entry ← entries]
+      noOp harness dependencies = runQuiescentIn harness dependencies (\_ → pure ())
+  for_ [False, True] $ \failing → do
+    plain ← scenario runIn failing
+    quiescent ← scenario noOp failing
+    quiescent `shouldBe` plain
