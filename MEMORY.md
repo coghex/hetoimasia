@@ -148,6 +148,19 @@ not a verdict that Synarchy's design should be discarded.
   stays cancellation, and there is no transport state or STM. Foundation and
   the root tests now depend on `deepseq`. Contract: `docs/messaging.md`; the new
   `Messaging` Hspec group proves it and is where later messaging slices go.
+- MSG-3 (#76) added `Hetoimasia.Foundation.Messaging.Channel`: `newChannel`
+  builds a bounded FIFO channel of `Prepared` payloads from an owner-chosen
+  capacity (a non-positive or above-`maxBound ∷ Int` capacity throws
+  `ChannelCapacityRejected` with engine origin) and returns a `ChannelControl`
+  that hands out `Sender` and `Receiver` endpoints. `send` reports
+  `Accepted`/`Full`/`Closed` without waiting and `awaitSend` waits only while
+  open; `receive` distinguishes an entry, empty, drained, and aborted, and
+  `awaitReceive` waits only while open and empty. Close keeps the backlog,
+  abort drops it and returns the depth counter's count; neither retries.
+  `channelStatistics` reads capacity, depth, high-water, and `Natural`
+  accepted/dequeued/discarded counts in one transaction. It is a two-list queue
+  in TVars, not `TBQueue`. Composition with `awaitSupervised` and
+  `awaitStopRequest` is proven in `Messaging`; contract in `docs/messaging.md`.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

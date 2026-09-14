@@ -110,6 +110,18 @@ handle cannot be constructed, rewritten, coerced, or mapped from outside the
 module. It owns no transport state. See
 [docs/messaging.md](../../docs/messaging.md).
 
+`Hetoimasia.Foundation.Messaging.Channel` is a bounded FIFO channel of prepared
+payloads. `newChannel` takes a capacity the owner chooses, rejecting one that is
+not positive or too large with a typed failure carrying its engine origin, and
+returns the owner-control endpoint, which hands out a send endpoint and a
+receive endpoint that carry only their own authority. Every send and receive is
+an STM operation: an ordinary send reports `Full` at once, and waiting for
+capacity or for an entry is a separate operation. Close keeps the backlog for
+draining; abort drops it and returns how many entries it discarded; neither
+waits. Atomic statistics report capacity, depth, high-water, and accepted,
+dequeued, and discarded counts under a conservation invariant. See
+[docs/messaging.md](../../docs/messaging.md#bounded-fifo-channels).
+
 Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.

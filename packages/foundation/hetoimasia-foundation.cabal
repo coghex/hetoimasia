@@ -12,7 +12,9 @@ description:
     threads with scoped startup, cooperative stop, cancellation, terminal
     observation, and a protected drain before borrowed dependencies unwind;
     and immutable message payloads fully evaluated through NFData on the
-    producer's thread before publication.
+    producer's thread before publication, carried by bounded FIFO channels with
+    separate send, receive, and owner-control endpoints, a terminal state, and
+    atomic counters.
     This library has no application state, graphics, scripting, or game
     dependencies.
 license: GPL-3.0-only
@@ -33,6 +35,7 @@ library
     exposed-modules:
         Hetoimasia.Foundation.Failure
         Hetoimasia.Foundation.Log
+        Hetoimasia.Foundation.Messaging.Channel
         Hetoimasia.Foundation.Messaging.Payload
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource

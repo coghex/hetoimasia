@@ -52,8 +52,9 @@
 -- State: the module owns none. A 'Prepared' value is immutable, owned by
 -- whoever holds it, readable from any thread, and lives as long as it is
 -- referenced; there is no reset or disposal. It adds no queue, snapshot, or
--- other transport state and no STM operation; FIFO channels, snapshots, and
--- the runtime inbox adapter arrive in later slices.
+-- other transport state and no STM operation. Bounded FIFO channels live in
+-- "Hetoimasia.Foundation.Messaging.Channel"; snapshots and the runtime inbox
+-- adapter arrive in later slices.
 --
 -- See @docs/messaging.md@ for the same contract in prose.
 module Hetoimasia.Foundation.Messaging.Payload

@@ -5,8 +5,9 @@
 -- coordinated with 'MVar's, never with a sleep; 'boundedExample' only stops an
 -- example that has already hung.
 --
--- The external-client examples live in "Test.Engine.Messaging.Opacity" and are
--- composed into this group, so @--match Messaging@ selects both.
+-- The channel examples live in "Test.Engine.Messaging.Channel" and the
+-- external-client examples in "Test.Engine.Messaging.Opacity". Both are composed
+-- into this group, so @--match Messaging@ selects all of them.
 module Test.Engine.Messaging.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -43,6 +44,7 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue
 import System.IO.Error (ioeGetErrorString)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
+import qualified Test.Engine.Messaging.Channel as Channel
 import qualified Test.Engine.Messaging.Opacity as Opacity
 import Test.Hspec
   ( Expectation
@@ -70,6 +72,7 @@ spec = describe "Messaging" $ do
     it "ends a preparation cancelled from another thread by cancellation"
       (boundedExample testCancelledPreparation)
 
+  Channel.spec
   Opacity.spec
 
 -- Fixtures -------------------------------------------------------------------
