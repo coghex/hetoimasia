@@ -31,7 +31,11 @@ consumed ∷ [(FilePath, String)]
 consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
-  , ("tools/validation/plan.py", "Validation.hs, Execution.hs, Reuse.hs, and TimingStep.hs run it")
+  , ("tools/validation/plan.py", "Validation.hs, Execution.hs, Reuse.hs, TimingStep.hs, and CiImage.hs run it")
+  , ("tools/validation/ci_image.py", "CiImage.hs runs it, and plan.py and run.py load it")
+  , ("tools/ci-image/builder.py", "CiImage.hs runs it")
+  , ("tools/native/native.py", "CiImage.hs runs it, and ci_image.py runs it to verify a worker")
+  , ("tools/native/glfw.pin", "native.py reads it")
   , ("tools/validation/range.py", "Execution.hs runs it")
   , ("tools/validation/run.py", "Execution.hs, Reuse.hs, and TimingStep.hs run it")
   , ("tools/validation/receipts.py", "run.py, aggregate.py, and reuse.py load it")
@@ -42,7 +46,7 @@ consumed =
   , ("tools/validation/review_replay.py", "ReviewReplay.hs and ApprovalProvenance.hs run it")
   , ("tools/validation/timings.py", "Timings.hs and TimingStep.hs run it")
   , (".github/workflows/review-gate.yml", "DismissalStep.hs extracts its dismissal step")
-  , (".github/workflows/validation.yml", "TimingStep.hs extracts its timing step")
+  , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps")
   ]
 
 -- | The packaging declaration the inventory is derived from.

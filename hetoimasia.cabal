@@ -23,10 +23,19 @@ extra-doc-files:
     tools/README.md
     tools/KANBAN-LICENSE
 extra-source-files:
+    .github/workflows/ci-image.yml
     .github/workflows/review-gate.yml
     .github/workflows/validation.yml
+    tools/ci-image/Dockerfile
+    tools/ci-image/builder.py
+    tools/ci-image/provision.sh
+    tools/ci-image/registry.py
+    tools/ci-image/toolchain.pin
     tools/docs_land.sh
     tools/docs_land_paths.py
+    tools/native/glfw.pin
+    tools/native/native.py
+    tools/validation/ci_image.py
     tools/validation/plan.py
     tools/validation/range.py
     tools/validation/catalog.json
@@ -78,6 +87,7 @@ test-suite workflow-tests
     hs-source-dirs: tools/test
     other-modules:
         ApprovalProvenance
+        CiImage
         DismissalStep
         Execution
         Json
