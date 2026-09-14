@@ -116,6 +116,10 @@ test-suite hetoimasia-tests
     other-modules:
         Test.Engine.Spec
         Test.Engine.Failures.Spec
+        Test.Engine.GLFW.Linking
+        Test.Engine.GLFW.Opacity
+        Test.Engine.GLFW.Session
+        Test.Engine.GLFW.Spec
         Test.Engine.Logging.Component
         Test.Engine.Logging.Configuration
         Test.Engine.Logging.Context
@@ -158,6 +162,7 @@ test-suite hetoimasia-tests
     build-tool-depends: hetoimasia:hetoimasia
     build-depends:
         base >=4.21 && <4.22,
+        bytestring >=0.12 && <0.13,
         containers >=0.7 && <0.8,
         deepseq >=1.5.1 && <1.6,
         directory >=1.3 && <1.4,
@@ -170,4 +175,6 @@ test-suite hetoimasia-tests
         text >=2.1 && <2.2,
         time >=1.14 && <1.15,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:seam ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0

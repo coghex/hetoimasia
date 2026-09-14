@@ -1,0 +1,116 @@
+cabal-version: 3.16
+name: hetoimasia-glfw
+version: 0.1.0.0
+synopsis: GLFW 3.4 native binding and main-thread session for Hetoimasia
+description:
+    A small private binding to upstream GLFW 3.4 and one scoped session owned by
+    the process main thread: exclusive initialization and termination, bounded
+    evidence of what the native error callback reported, and a private NoAPI
+    window creation seam. It depends on the foundation library and not on the
+    runtime, and imports no game, scripting, logging, or rendering module.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.12.2
+extra-doc-files: README.md
+extra-source-files:
+    native/cbits/hetoimasia_glfw.h
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/glfw
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The session model: exclusivity, thread checks, staged construction and
+-- rollback, bounded error capture, and the creation seam, written over a table
+-- of native operations. It binds nothing, so the test seam can drive it
+-- without linking GLFW.
+library model
+    import: language
+    visibility: private
+    hs-source-dirs: model
+    exposed-modules:
+        Hetoimasia.GLFW.Internal.Capture
+        Hetoimasia.GLFW.Internal.Session
+    build-depends:
+        base >=4.21 && <4.22,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0
+
+-- The foreign imports, the thread-identity shim, and the production operation
+-- table. Native handles and ABI declarations never leave this package.
+library native
+    import: language
+    visibility: private
+    hs-source-dirs: native
+    exposed-modules:
+        Hetoimasia.GLFW.Internal.Native
+    c-sources: native/cbits/hetoimasia_glfw.c
+    include-dirs: native/cbits
+    pkgconfig-depends: glfw3 >=3.4 && <3.5
+    -- The ordinary-link requirements the native manifest records beyond the
+    -- archive itself (`pkg-config --libs --static glfw3`). The GLFW examples in
+    -- hetoimasia-tests assert that these agree with the manifest.
+    if os(darwin)
+        frameworks: Cocoa IOKit CoreFoundation
+    if os(linux)
+        extra-libraries: rt m dl
+    build-depends:
+        base >=4.21 && <4.22,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-glfw:model
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.GLFW.Session
+    build-depends:
+        base >=4.21 && <4.22,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw:model,
+        hetoimasia-glfw:native
+
+-- The private test seam: the real session model over a scripted native
+-- library, for CPU examples that must not initialize GLFW. It is public only so
+-- the root package's test suite can depend on it; it exposes no native handle
+-- and no session constructor, and links no native library.
+library seam
+    import: language
+    visibility: public
+    hs-source-dirs: seam
+    exposed-modules:
+        Hetoimasia.GLFW.Seam
+    build-depends:
+        base >=4.21 && <4.22,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw:model
+
+-- The native session check. It runs a real session on the process main
+-- thread, so it is a plain executable rather than an Hspec suite, and it is
+-- neither part of hetoimasia-tests nor of any validation group.
+test-suite glfw-native-check
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: native-check
+    ghc-options: -threaded
+    build-depends:
+        base >=4.21 && <4.22,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw,
+        hetoimasia-glfw:model,
+        hetoimasia-glfw:native
