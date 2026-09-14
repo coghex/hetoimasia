@@ -122,6 +122,18 @@ waits. Atomic statistics report capacity, depth, high-water, and accepted,
 dequeued, and discarded counts under a conservation invariant. See
 [docs/messaging.md](../../docs/messaging.md#bounded-fifo-channels).
 
+`Hetoimasia.Foundation.Messaging.Snapshot` is a latest-value snapshot of a
+prepared payload. `newSnapshot` creates one with a fresh identity from a prepared
+initial value and returns the publisher endpoint, which hands out a read-only
+endpoint. Each publication replaces the value and advances a non-wrapping
+revision in one write. A read returns an opaque observation pairing the payload
+with a cursor for this snapshot and revision; a waiting read from a cursor
+returns the newest unseen publication, end-of-stream once closed, and retries
+only while open. A cursor from another snapshot raises a typed misuse failure
+with engine origin before anything is inspected. Close keeps the final value,
+never retries, and never reopens. See
+[docs/messaging.md](../../docs/messaging.md#latest-value-snapshots).
+
 Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.

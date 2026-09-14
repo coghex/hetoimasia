@@ -3,15 +3,18 @@
 Current behavior of `Hetoimasia.Foundation.Messaging.Payload`, the prepared
 payload boundary every messaging transport accepts, and of
 `Hetoimasia.Foundation.Messaging.Channel`, the bounded FIFO channel that carries
-prepared payloads. The accepted contract is epic #73; this document describes
+prepared payloads, and of `Hetoimasia.Foundation.Messaging.Snapshot`, the
+latest-value snapshot read through checked cursors. The accepted contract is epic #73; this document describes
 what the code does today.
 
 Scope: preparing a payload to normal form on the producer's thread, reading and
 forwarding a prepared payload, what a preparation failure does, and what a
 client cannot do to a prepared handle; then creating a bounded channel, sending
 and receiving, closing and aborting it, its counters, where waiting on it is
-safe, and which endpoint may do what. Snapshot publication and the runtime inbox
-adapter arrive in later slices of the same arc and are not described here. The
+safe, and which endpoint may do what; then publishing a latest value, reading and
+waiting through cursors, closing a snapshot, and the cursor-mismatch failure.
+The runtime inbox adapter arrives in a later slice of the same arc and is not
+described here. The
 transactional failure companion is described in
 [failures.md](failures.md).
 
@@ -250,6 +253,162 @@ construction's, in `IO`.
 | Record update of `channelSender` or `channelReceiver` | They are functions, not record fields |
 | `coerce ∷ Sender A → Sender B` | Every endpoint's role is nominal |
 
+## Latest-value snapshots
+
+```haskell
+data SnapshotPublisher a             -- abstract; role nominal
+data SnapshotReader a                -- abstract; role nominal
+data Observation a                   -- abstract; role nominal
+data SnapshotCursor a                -- abstract; role nominal; Eq
+
+newSnapshot    ∷ Prepared a → IO (SnapshotPublisher a)
+snapshotReader ∷ SnapshotPublisher a → SnapshotReader a
+
+publish       ∷ SnapshotPublisher a → Prepared a → STM Publication   -- Published | PublicationClosed
+closeSnapshot ∷ SnapshotPublisher a → STM ()
+
+readSnapshot   ∷ SnapshotReader a → STM (Observation a)
+awaitSnapshot  ∷ HasCallStack ⇒ SnapshotReader a → SnapshotCursor a → STM (Update a)
+                                                  -- Updated observation | EndOfStream
+observedValue  ∷ Observation a → Prepared a
+observedCursor ∷ Observation a → SnapshotCursor a
+cursorRevision ∷ SnapshotCursor a → Natural
+```
+
+A snapshot holds one latest value. It is for state a reader needs only the
+newest of, such as a processed input state; a stream in which every entry
+matters belongs in a channel. A coherent snapshot does not relate separate
+streams: publishing a state before the events that follow it is an ordering the
+components involved agree on, not something a snapshot provides.
+
+### Endpoints and identity
+
+`newSnapshot` creates an open snapshot from a prepared initial value and returns
+the publisher endpoint, which hands out the read endpoint with
+`snapshotReader`. A `SnapshotReader` can read and wait; it cannot publish or
+close. Every operation is an ordinary function, no endpoint or observation has a
+record selector, and no `TVar` or other private state escapes the module.
+
+Every `newSnapshot` call has a fresh identity. A new lifetime is always a new
+snapshot, never a revision reset on an old one: nothing resets or reopens a
+snapshot.
+
+Any number of threads may hold the publisher or a reader. One logical publisher
+per snapshot is an ownership convention the owner keeps, not something the types
+enforce; two threads publishing to one snapshot each advance the revision, and
+readers see whichever publication committed last.
+
+### Publication and revision
+
+`publish` replaces the value and its revision in one write, so a reader never
+observes a value paired with another publication's revision, or a mix of
+fields.
+
+- The initial value has revision zero. Every committed publication advances the
+  revision by one, including publication of an equal value, or of the very
+  handle already held: no `Eq` instance is required and no content is compared.
+- The revision is a `Natural` and never wraps.
+- A transaction that rolls back, by `retry` under `orElse` or by an exception,
+  changes neither value nor revision.
+- `publish` never waits. On a closed snapshot it returns `PublicationClosed`
+  and changes nothing.
+
+### Observations and cursors
+
+`readSnapshot` returns an `Observation`: the current `Prepared` payload, read
+with `observedValue`, paired with a `SnapshotCursor`, read with
+`observedCursor`. The cursor names this snapshot and the observed revision,
+which `cursorRevision` reads. Neither an observation nor a cursor can be built,
+rewritten, or re-typed outside the module.
+
+A read changes nothing another reader can see. The observed payload is the very
+handle that was published, so it can be published to another snapshot or sent
+on a channel unchanged, without `NFData` and without evaluation.
+
+A cursor is the reader's own last revision. The snapshot keeps no per-reader
+state and no history of earlier publications.
+
+### Waiting
+
+`awaitSnapshot` takes a cursor:
+
+| Snapshot | Newer than the cursor | Result |
+|---|---|---|
+| Open or closed | Yes | `Updated`, with the newest publication and its new cursor |
+| Closed | No | `EndOfStream` |
+| Open | No | `retry` |
+
+A reader that missed intermediate publications receives only the newest. Two
+readers waiting from the same cursor each receive the same publication, and
+neither acknowledges anything for the other. A reader advances only the cursor it
+holds; waiting again from an older cursor returns the current value again.
+
+### Cursor mismatch
+
+A cursor from a different snapshot is API misuse. `awaitSnapshot` raises
+`ForeignSnapshotCursor` with
+[`throwFailureSTM`](failures.md#raising-inside-a-transaction): component
+`foundation.messaging`, operation `await-snapshot`, the cursor's revision as the
+`cursor-revision` identifier, and the caller's site as the origin. The
+exception's value carries the same revision.
+
+The identity check comes first, before the value, revision, or terminal flag is
+read and before any wait, so a mismatch fails at once whether the target is
+open, closed, or has something newer. Identities are compared exactly; revisions
+and hashes play no part, so a cursor from another snapshot at the same revision
+is rejected, and so is a retained cursor from a closed earlier lifetime used
+with its replacement. A failure that escapes `atomically` rolls the whole
+transaction back.
+
+### Close
+
+`closeSnapshot` ends publication:
+
+- It is idempotent and never executes `retry`, so it is safe inside a
+  controlled release.
+- It keeps the last value, and the same cursor, for current reads.
+- It does not advance the revision and is not a publication. A waiter holding a
+  cursor older than the final publication receives that publication first and
+  `EndOfStream` next; a waiter holding the current cursor receives
+  `EndOfStream`, including when the snapshot is closed before any publication.
+- It wakes waiting readers.
+- A closed snapshot never reopens; a later `publish` returns
+  `PublicationClosed` with value and revision unchanged.
+
+### Where waiting on a snapshot is safe
+
+As with a channel, wait composed with the owner's own wake:
+`awaitSupervised control (awaitSnapshot reader cursor)` on the application
+thread, where a pending worker outcome is settled before the read commits and a
+pending fatal failure is rethrown with the read never committed; and, on a
+worker,
+`atomically ((Right <$> awaitSnapshot reader cursor) `orElse` (Left <$> awaitStopRequest token))`.
+Never wait on a snapshot inside a release.
+
+### Native resources
+
+A snapshot grants no lifetime ownership over anything a value refers to. A
+native handle inside a published value is still owned, and released, by the
+scope that owns it; keeping the value in a snapshot, including after close, does
+not extend that scope.
+
+### Transaction hygiene
+
+No snapshot transaction evaluates a payload — the value is stored in a lazy
+field and returned as the same handle — reads a clock, logs, invokes a callback,
+or uses `unsafeIOToSTM`. The only failure a snapshot operation raises is the
+cursor mismatch, inside STM.
+
+### Snapshot opacity
+
+| Attempt | Why it is rejected |
+|---|---|
+| `publish` or `closeSnapshot` with a `SnapshotReader` | Both take a `SnapshotPublisher` |
+| Naming the `SnapshotCursor` or `Observation` constructor | Each is exported without its children |
+| Record update of `observedValue` | It is a function, not a record field |
+| Record update of `snapshotReader` | It is a function, not a record field |
+| `coerce` between endpoint, observation, or cursor types | Every role is nominal |
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime and reset |
@@ -258,10 +417,15 @@ construction's, in `IO`.
 | Channel entries | The channel, controlled by the `ChannelControl` holder | Sends append; receives remove the oldest; abort drops every entry | Any thread holding the endpoint | From admission until received or discarded; an unreferenced channel is collected with any entries it holds |
 | Channel terminal flag | The channel, controlled by the `ChannelControl` holder | Close and abort write; every send and receive reads | Any thread holding the endpoint | Open until the first close or abort; abort may replace close; never reopens |
 | Channel counters | The channel, controlled by the `ChannelControl` holder | Accepting sends, receives, and abort write; `channelStatistics` reads | Any thread holding the endpoint | Cumulative for the channel's life; never reset and never wrap |
+| Snapshot value | The snapshot, controlled by the `SnapshotPublisher` holder | `publish` writes; `readSnapshot` and `awaitSnapshot` read | Any thread holding an endpoint | From construction until replaced; kept after close; lives while referenced |
+| Snapshot revision | The snapshot, controlled by the `SnapshotPublisher` holder | Written with the value by `publish`; read with it | Any thread holding an endpoint | Zero at construction; advanced only by publication; never reset, never wraps |
+| Snapshot terminal flag | The snapshot, controlled by the `SnapshotPublisher` holder | `closeSnapshot` writes; `publish` and `awaitSnapshot` read | Any thread holding an endpoint | Open until the first close; never reopens |
+| Reader's last revision | The reader holding the cursor | That reader alone, by keeping or replacing its cursor | The reader's thread | As long as the reader keeps the cursor; the snapshot stores no copy and no registry |
 
 The payload module owns no other state and no STM operation. Each channel owns
 only its own three rows; nothing is shared between channels, and there is no
-disposal step.
+disposal step. Each snapshot owns its value, revision, and terminal flag, and
+each reader owns its own last revision; nothing is shared between snapshots.
 
 ## Module authoring
 
@@ -276,6 +440,12 @@ The channel module follows the same guide. It takes no logger: `Full`,
 diagnostics, and its one failure, a rejected capacity, propagates to the owner
 with its engine origin. Its representation stays behind three abstract
 endpoints, and its state rows are documented above.
+
+The snapshot module follows the same guide. It takes no logger:
+`PublicationClosed` and `EndOfStream` are results the caller handles, and its
+one failure, a cursor mismatch, propagates to the misusing caller with its
+engine origin. Its representation stays behind abstract endpoints,
+observations, and cursors, and its state rows are documented above.
 
 ## Verification
 
@@ -342,6 +512,47 @@ asserts an order only timing could decide. They cover:
   `Receiver`, naming the `Sender` constructor, and record update of
   `channelSender` each rejected for its named cause, and a linked client using
   every send, receive, control, and statistics operation.
+
+The snapshot examples live in `test/Test/Engine/Messaging/Snapshot.hs`, with
+their external clients in `test/Test/Engine/Messaging/Opacity.hs`. Blocked waits
+are detected with `awaitBlockedOnSTM`, concurrent readers start from a gate, and
+a read that must not wait is run under `orElse`, which only a `retry` can
+select. They cover:
+
+- the initial value observed at revision zero before any publication, with a
+  waiting read from its cursor retrying;
+- an equal value, and the same handle, each advancing the revision;
+- two readers blocked on the same cursor each receiving the newest publication,
+  the original cursor still seeing it, and a reader that missed intermediate
+  publications receiving only the newest;
+- waiting and current readers checking every observation against 500
+  concurrent publications, where publication n carries value n, for a value
+  paired with another publication's revision;
+- a publication rolled back by an exception and by `retry` under `orElse`
+  leaving value and revision unchanged;
+- an observed payload whose `NFData` instance counts evaluations published to
+  another snapshot with the count unchanged;
+- after close, an unseen final publication delivered before `EndOfStream`, the
+  final value still read, and publishing reporting `PublicationClosed` without
+  change, again after a repeated close;
+- close before any publication, and repeated, ending a waiter holding the
+  initial cursor while reads keep the initial value and cursor;
+- a blocked waiting read woken by close with `EndOfStream`;
+- a cursor from another snapshot at the same revision raising
+  `ForeignSnapshotCursor` with its engine origin, identifier, and the caller's
+  site, without waiting, against an open target, a closed target, and the
+  replacement of a closed earlier lifetime;
+- a blocked waiting read composed with a real worker's `awaitStopRequest`,
+  leaving through the stop branch;
+- real `withSupervision` and `awaitSupervised`: an optional worker's published
+  failure settled, and its warning written, before a ready waiting read commits;
+  and a required worker's published failure rethrown with the read never
+  committed;
+- external clients: forging a cursor or an observation, record update of
+  `observedValue` or `snapshotReader`, and publishing or closing through a
+  `SnapshotReader` each rejected for its named cause, and a linked client using
+  every publish, read, wait, and close operation, the observation readers, and
+  the cursor-mismatch failure.
 
 The validation catalog covers them through the floor group `test.engine`; see
 [validation.md](validation.md).

@@ -14,7 +14,7 @@ description:
     and immutable message payloads fully evaluated through NFData on the
     producer's thread before publication, carried by bounded FIFO channels with
     separate send, receive, and owner-control endpoints, a terminal state, and
-    atomic counters.
+    atomic counters, and by latest-value snapshots read through checked cursors.
     This library has no application state, graphics, scripting, or game
     dependencies.
 license: GPL-3.0-only
@@ -37,6 +37,7 @@ library
         Hetoimasia.Foundation.Log
         Hetoimasia.Foundation.Messaging.Channel
         Hetoimasia.Foundation.Messaging.Payload
+        Hetoimasia.Foundation.Messaging.Snapshot
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
         Hetoimasia.Foundation.Worker
