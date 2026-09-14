@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated: 2026-09-13. Durable project context for future interactive sessions.
+Updated: 2026-09-14. Durable project context for future interactive sessions.
 Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 [the foundation design](docs/engine_foundation_design.md).
 
@@ -204,6 +204,19 @@ not a verdict that Synarchy's design should be discarded.
   the policy-judged unexpected termination. The combined command/snapshot
   example is under `Runtime`'s `Inbox finish`; the bounded-turn loop is
   `Messaging`'s `Bounded turns`, a test-only pattern, not an API.
+- GLFW-14 (#88) supplies native provisioning for the GLFW arc (#86) before
+  GLFW-1. `tools/native/native.py` builds a checksum-pinned upstream GLFW 3.4
+  as a static PIC archive into a private prefix and records a native manifest
+  whose identity covers the C compiler, SDK, architecture, deployment target,
+  and CMake options; `check`/`prepare` refuse any other prefix or a system GLFW.
+  Linux CI runs in the public `ghcr.io/coghex/hetoimasia-ci` image, addressed
+  only by the digest committed in `tools/ci-image/descriptor.json`. Changing any
+  recipe input means running the `ci-image` builder and committing its returned
+  descriptor in the same pull request; the planner refuses a stale descriptor
+  and never selects an older image. The GHCR package inherited public visibility
+  on first publication from this public repository. Container jobs need
+  `--init` and a Git `safe.directory` entry. `docs/validation.md` carries the
+  image, descriptor, builder, cache-layer, and macOS contracts.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

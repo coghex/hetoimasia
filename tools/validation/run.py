@@ -551,6 +551,10 @@ def candidate_classification(root: str, plan: dict):
     longer digests to it is refused rather than believed: a classification this
     plan was not built from cannot say what a dirty checkout means.
     """
+    # `plan` imports its image contract by name, and the narrowed import path
+    # cannot find it; loading it first registers the candidate's own copy under
+    # that name. It lives under the same policy root, so it is just as proven.
+    candidate_module("ci_image")
     planner = candidate_module("plan")
     PlannerError = planner.PlannerError
 

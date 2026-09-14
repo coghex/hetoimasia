@@ -316,10 +316,12 @@ The workflow's default permission is `contents: read`, and no job uses a secret.
 The `plan` job adds `actions: read` so it can look up an earlier run's receipt
 artifacts, and `build-test` already held it for the timings.
 
-The pinned platform is declared once, as workflow-level `env`: the planner folds
-those exact values into the candidate's input identity and the workers install
-them, so evidence can never be reused across a toolchain the candidate was not
-planned for.
+The pinned platform is declared once, as workflow-level `env`. The planner checks
+the candidate's committed [image descriptor](#the-descriptor) against those
+exact values and folds them, with the image digest and its native manifest, into
+the candidate's input identity; each worker verifies them inside the image. So
+evidence can never be reused across a toolchain the candidate was not planned
+for.
 
 ### `plan`
 
@@ -364,9 +366,9 @@ publishes an applicability document that reuses nothing.
 
 ### Workers
 
-Two workers run in parallel, each with a 45-minute timeout, each pinned to
-GHC 9.12.2 and Cabal 3.16.1.0, and each **skipped entirely** when the plan
-selected none of the groups it owns:
+Two workers run in parallel, each with a 45-minute timeout, each inside the
+[Linux CI image](#the-linux-ci-image) the plan names by exact digest, and each
+**skipped entirely** when the plan selected none of the groups it owns:
 
 | Job | Groups, in order |
 | --- | --- |
@@ -391,13 +393,25 @@ Selection uses the merge-base range, but every job executes one integration
 candidate — the commit GitHub resolved for the event. Each worker asserts that
 it checked that exact commit out, so two jobs can never report on two trees.
 
-Three caches are restored, all keyed on inputs a Markdown edit cannot change:
+Before executing anything, a worker verifies that its environment is the planned
+image and links a native consumer against the image's GLFW; see
+[Planning and verifying against the image](#planning-and-verifying-against-the-image).
+It installs nothing: no `apt`, no GHC, and no GLFW build happens in a worker.
+Every container job runs with Docker's `--init`, so an init process as PID 1
+reaps orphaned descendants the way the hosted runner's own init does: without
+it, a process group the runner killed on a timeout would leave zombies that
+still answer a liveness probe. Each container job also records its workspace as
+a Git `safe.directory` before its first Git read, because the job runs as root
+over a checkout the runner's user owns.
 
-| Cache | Key |
-| --- | --- |
-| `~/.ghcup` | the GHC and Cabal versions |
-| the Cabal package store | `cabal.project` (which pins `index-state`) and every `.cabal` file |
-| `dist-newstyle` | those, plus every Haskell source, with a restore-keys fallback |
+Two caches are restored, both inside the environment boundary the plan declares
+and both keyed on inputs a Markdown edit cannot change; see
+[Cache layers](#cache-layers):
+
+| Cache | Path | Key |
+| --- | --- | --- |
+| the Cabal package store | `/opt/hetoimasia/cabal/store` | the environment key, `cabal.project` (which pins `index-state`), and every `.cabal` file |
+| the build tree | `dist-newstyle` | those, plus every Haskell source, with fallbacks that stay inside the same environment |
 
 A cache miss costs time and can never change a result.
 
@@ -848,6 +862,259 @@ The aggregate prints one line per group with its reason and outcome, and exits
 `0` for a passing verdict, `1` for a failing one, and `2` for a diagnostic that
 prevented a verdict at all.
 
+## The Linux CI image
+
+Linux workers install nothing. They run inside one published image,
+`ghcr.io/coghex/hetoimasia-ci`, which carries:
+
+- GHC 9.12.2 at `/opt/hetoimasia/ghc` and Cabal 3.16.1.0 at
+  `/opt/hetoimasia/cabal-install`, both on `PATH`, installed from the upstream
+  binary distributions `tools/ci-image/toolchain.pin` pins by URL and SHA-256;
+- `CABAL_DIR=/opt/hetoimasia/cabal` with an explicit `store-dir` of
+  `/opt/hetoimasia/cabal/store`, and a Hackage index snapshot that
+  `cabal.project`'s `index-state` selects from;
+- the C build prerequisites, CMake, `pkg-config`, the tools the workflow tests'
+  shipped steps call (`git`, `jq`, `procps`), and the X11 development and
+  runtime libraries GLFW builds against, over an `ubuntu:24.04` base pinned by
+  digest, with the resolved package list retained at
+  `/opt/hetoimasia/packages.txt`;
+- the private GLFW prefix at `/opt/hetoimasia/native/glfw`, built by the
+  [native recipe](#the-native-glfw-recipe) and exported through
+  `PKG_CONFIG_PATH`.
+
+It carries no project source, project build output, captures, display server,
+window manager, or Vulkan SDK. It embeds its recipe fingerprint and native
+manifest hash in `/opt/hetoimasia/image.json` and in its labels, and never its
+own digest, which does not exist until it is pushed.
+
+Input hashes cannot promise a byte-identical rebuild: the Ubuntu archive and the
+Hackage index move. That is why an image is published once per fingerprint and
+then only ever addressed by digest.
+
+### The recipe fingerprint
+
+Every file under `tools/ci-image/` and `tools/native/`, plus
+`.github/workflows/ci-image.yml` and `tools/validation/ci_image.py`, is a recipe
+input — the Dockerfile, the provisioning script, both pin files, the builder and
+its registry transport, the image contract they load, and the native recipe —
+**except** `tools/ci-image/descriptor.json`.
+`tools/validation/ci_image.py` fingerprints each input's path, mode, type, and
+content id from one commit's tree:
+
+```bash
+python3 tools/validation/ci_image.py fingerprint --revision HEAD
+```
+
+The builder's build context is exactly those files, extracted from the same
+commit by `tools/ci-image/builder.py stage`, so an image cannot be built from
+anything its fingerprint does not cover, and the descriptor never reaches it.
+
+### The descriptor
+
+`tools/ci-image/descriptor.json` names the image every Linux worker runs:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1`. |
+| `reference` | The registry repository, without a tag. |
+| `digest` | The image's `sha256:` digest. Workers run exactly this. |
+| `recipe_fingerprint` | The recipe fingerprint the image was built from. |
+| `native_manifest` | The SHA-256 of the native manifest inside the image. |
+| `platform`, `architecture` | `linux` and `amd64`. |
+| `ghc`, `cabal` | The compiler versions the image runs. |
+
+The author commits the descriptor the builder returns, in the same pull request
+as the recipe change, through an ordinary push. Because the descriptor is
+excluded from the fingerprint and from the build context, committing it changes
+neither the fingerprint it records nor the image.
+
+### The builder
+
+`.github/workflows/ci-image.yml` is the only workflow holding `packages: write`,
+and only its `publish` job does. It starts by `workflow_dispatch`, or from a
+same-repository pull request that changes an image input; an ordinary source
+change and a descriptor-only commit never start it, and a fork's pull request
+cannot publish.
+
+| Job | What it does |
+| --- | --- |
+| `resolve` | Fingerprints the checked-out commit and looks up the tag `fp-<fingerprint>`. An existing image whose labels name this fingerprint, a native manifest hash, and the pinned GHC and Cabal is a **hit**; a tag the registry confirms absent is a **miss**. |
+| `publish` | Runs only on a miss, serialized by a concurrency group per fingerprint. It looks the tag up **again**, so a builder that published while this one waited is returned rather than rebuilt. On a confirmed miss it builds, validates the candidate inside itself — GHC and Cabal versions, the native prefix check and link check, the store path, the embedded fingerprint, and the labels — pushes once, and reads the published metadata back. |
+| `descriptor` | Writes the descriptor for the hit or the published image, as the `ci-image-descriptor` artifact and in the job summary. |
+| `anonymous-pull` | Pulls the reference by digest with no credentials and no token grant, and records how long the pull took. |
+
+A registry error is never a miss, and an existing tag whose metadata does not
+describe the fingerprint is refused rather than overwritten: both fail without
+publishing. The decisions live in `builder.py`; the GHCR and Docker transport
+it drives is `tools/ci-image/registry.py`, behind the small protocol
+`builder.py` documents.
+
+To change the image:
+
+1. Change a recipe input on a branch of this repository and push it to a pull
+   request. The validation plan fails, naming the builder, until the
+   descriptor matches.
+2. Wait for the `ci-image` run, then commit its descriptor:
+
+   ```bash
+   gh run download <run-id> --name ci-image-descriptor --dir tools/ci-image
+   git commit tools/ci-image/descriptor.json -m "Describe the rebuilt CI image"
+   git push
+   ```
+
+3. That push starts validation in the new image, before merge.
+
+The first publication creates the package. A new GHCR package is private even in
+a public repository, so it must be made public once, under the package's
+settings, before anything can pull it anonymously; the Dockerfile's
+`org.opencontainers.image.source` label associates it with this repository. The
+`anonymous-pull` job, or `docker pull ghcr.io/coghex/hetoimasia-ci@<digest>` from
+a session not logged in to GHCR, verifies both. Keep published versions that
+active work or retained evidence references.
+
+### Planning and verifying against the image
+
+A plan for `--runner-os Linux` whose candidate carries `tools/ci-image/Dockerfile`
+reads the descriptor from that **candidate's** tree, without pulling anything,
+and refuses it before execution — naming the builder as the fix — when:
+
+- it is missing, malformed, or of another schema;
+- its `recipe_fingerprint` is not the candidate's recomputed fingerprint;
+- its `ghc` or `cabal` disagrees with the `--toolchain` pins the workflow passes.
+
+Otherwise `ghc`, `cabal`, `ci-image` (the digest), and `native-manifest` (the
+hash) form the plan's `toolchain` map, the descriptor is recorded as the plan's
+`ci_image`, and the prose output names the image. That map describes the planned
+worker environment, not the host that planned it. A candidate with no recipe
+keeps the toolchain its caller declares, and a plan for any other platform may
+not declare `ci-image` at all:
+
+```bash
+python3 tools/validation/plan.py --base origin/master --head HEAD \
+  --runner-os Linux --toolchain ghc=9.12.2 --toolchain cabal=3.16.1.0
+```
+
+Every Linux worker runs in a `container:` bound to that exact digest, which is
+what establishes which image runs. Its first step then runs:
+
+```bash
+python3 tools/validation/ci_image.py verify-worker --plan plan.json --toolchain-file <file>
+```
+
+which checks the recipe fingerprint the image embeds, the hash of the native
+manifest it actually carries, the prefix check, the compilers it actually runs,
+`CABAL_DIR`, and the store Cabal resolves, then builds a map from those actual
+values. That map must equal the plan's in its entirety, and it is what every
+receipt the worker writes records. A second step links and runs a native
+consumer against the image's GLFW. Receipts written before these entries existed
+record a different toolchain and are invalidated once.
+
+### Cache layers
+
+Three reuse layers stay distinct:
+
+| Layer | Holds | Invalidated by |
+| --- | --- | --- |
+| The published image | Toolchain, system prerequisites, compiled GLFW | Any recipe input; never project source |
+| The Cabal package store | Compiled external Haskell packages | The environment key, `cabal.project`, any `.cabal` file |
+| The build tree | Incremental local-package compilation | The same, plus any Haskell source |
+
+The **environment key** is a SHA-256 over the plan's `runner_os` and its whole
+toolchain map, printed by `ci_image.py outputs`. A new image digest or native
+manifest therefore moves every cache key, while re-committing the same
+descriptor moves none. Every restore fallback stays inside one environment key,
+so nothing linked against one native identity is restored into another. Cache
+paths are the fixed container locations. Each worker writes its cache scope and
+whether each cache was a hit, a partial restore, or a miss to the job summary.
+
+Pull-request caches are scoped to that pull request; only a default-branch cache
+is a seed other pull requests restore. A default-branch push whose engine worker
+is skipped because its evidence was reused would otherwise never save one, so
+the `plan` job then looks the store key up without downloading it. On a miss the
+`seed-dependencies` job verifies the image and runs
+`cabal build all --enable-tests --only-dependencies` and saves the store. It
+executes no validation group and writes no receipt. A documentation-only
+candidate with reusable evidence and a seeded cache still launches no worker and
+pulls no image.
+
+### The native GLFW recipe
+
+`tools/native/native.py`, with the pin in `tools/native/glfw.pin`, builds the
+same GLFW for a local macOS prefix and for the image. It fetches the pinned
+upstream archive, refuses it unless its SHA-256 matches, and builds only a
+static, position-independent `libglfw3.a`, with upstream examples, tests, and
+documentation disabled, X11 on and Wayland off on Linux, and Cocoa on macOS,
+into a private prefix whose library directory is `lib`. Fetched source, build
+products, and the prefix all stay outside the checkout.
+
+Beside the prefix it writes `hetoimasia-native-manifest.json`: the GLFW version,
+source URL and checksum, the recipe fingerprint, the archive's checksum, the
+`pkg-config` metadata — including `pkg-config --libs --static glfw3`, which on
+macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — and the native
+identity: platform, architecture, C compiler, SDK, deployment target, the
+effective CMake options, and the exact value or absence of every variable CMake
+or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
+`CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
+macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
+`SDKROOT` cannot select a different one behind the recorded identity. The `native-manifest` toolchain entry is that file's
+SHA-256.
+
+| Command | What it does |
+| --- | --- |
+| `build [--prefix P]` | Fetch, verify, build, install, and record a fresh prefix. |
+| `check [--prefix P] [--build-dir D]` | Refuse the prefix unless it is exactly what this configuration would build. |
+| `prepare [--prefix P] [--build-dir D]` | Check, stamp the build directory with the manifest, and print the `PKG_CONFIG_PATH` export. |
+| `link-check [--prefix P]` | Link a consumer that calls `glfwGetVersionString` with only the recorded flags and no library-path variables, require it to define the symbol itself and depend on no shared GLFW, and run it. It needs no display. |
+| `toolchain [--prefix P]` | Check, then print `native-manifest=<hash>`. |
+| `identity`, `record`, `fingerprint` | Print this configuration's identity, write a manifest for an existing prefix, or print the recipe fingerprint. |
+
+`check` never falls back to another GLFW. It refuses an absent prefix — naming a
+system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe
+fingerprint, or native identity differs from this configuration, an archive that
+is not the recorded one, any shared GLFW library in the prefix, a `glfw3.pc`
+that resolves to another prefix, a version other than the pin, and **manifest
+drift**, where the generated link requirements no longer match the recorded
+ones. With `--build-dir`, it also refuses a build directory whose products were
+stamped with another manifest.
+
+#### Developer prerequisites and macOS
+
+CMake and `pkg-config` are required; either one missing is a clear failure. On
+macOS:
+
+```bash
+brew install cmake pkgconf
+python3 tools/native/native.py build
+eval "$(python3 tools/native/native.py prepare)"
+pkg-config --modversion glfw3 && pkg-config --libs --static glfw3
+python3 tools/native/native.py link-check
+```
+
+The prefix defaults to `~/.cache/hetoimasia/native/glfw`; `--prefix` or
+`HETOIMASIA_NATIVE_PREFIX` chooses another. The deployment target is
+`MACOSX_DEPLOYMENT_TARGET`, or the pin's `MACOS_DEPLOYMENT_TARGET` when unset;
+`HETOIMASIA_GLFW_BUILD_TYPE` overrides the `Release` build type.
+
+Refresh the prefix whenever `check` or `prepare` reports a different
+configuration — a Command Line Tools or Xcode update, another SDK, deployment
+target, architecture, or build type, a changed `SDKROOT` or compiler flags, or a
+changed pin or recipe — by running
+`build` again. `prepare` refuses a `dist-newstyle` linked against the previous
+manifest; remove it rather than reuse those products.
+
+A local run records its own identity and never claims the Linux digest. Plan and
+run with the same map:
+
+```bash
+native="$(python3 tools/native/native.py toolchain)"
+python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
+  --toolchain "$native" --json > plan.json
+python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
+  --toolchain "$native"
+```
+
 ## The review gate
 
 `.github/workflows/review-gate.yml` publishes `review-approved` on every
@@ -1240,7 +1507,7 @@ candidate whose checks have not passed reports `BLOCKED`.
 
 ## What the hosted platform cannot cover
 
-Both workers run on GitHub's hosted `ubuntu-latest` runners: headless Linux,
+Both workers run on GitHub's hosted `ubuntu-latest` runners, inside the CI image: headless Linux,
 CPU only, with no GPU and no Vulkan loader. Everything currently registered in
 the catalog is a CPU build, an Hspec suite, or a console smoke run, so the
 hosted platform covers all of it. It cannot cover rendering: once a renderer
@@ -1478,5 +1745,41 @@ fails against any cleanup that infers the group's fate from the process it
 launched; the worker example supplies a passing receipt alongside a `failure`
 result, so it fails against any aggregate that lets receipts vouch for the job
 that wrote them.
+
+The CI image and the native recipe are covered by driving the shipped
+`ci_image.py`, `plan.py`, `builder.py`, and `native.py` against temporary Git
+repositories, a fake image root, a stub registry transport, and stub compilers
+and SDK probes. The fingerprint examples assert that every recipe input, a new
+input, and a mode change move it while the descriptor, an ordinary source
+change, and prose do not, and that a first build needs no descriptor and never
+stages one. The planner examples assert that a matching descriptor contributes
+`ci-image` and `native-manifest` without changing selection for a change that
+touches no image input; that a stale fingerprint, a malformed native-manifest
+hash, and a disagreeing GHC or Cabal version are each refused with the builder
+instruction; that the descriptor is read from an integration candidate whose
+upstream recipe change the head does not carry; that a candidate with no recipe
+keeps its declared toolchain; and that a local plan cannot claim the Linux
+digest. The cache examples assert that the environment key moves with a new
+digest and a new native manifest and not with a re-committed descriptor.
+
+The worker examples assert that a verified worker declares exactly the planned
+map, and that another GHC, another Cabal, an actual native manifest other than
+the planned one, a different `ci-image` entry, another embedded fingerprint, and
+a store outside the fixed location are each refused. The builder examples assert
+that a validated hit builds and pushes nothing, that a confirmed miss is
+rechecked and then built, validated, pushed, and read back once, that a tag a
+concurrent builder published while this one waited is returned rather than
+overwritten, and that a lookup error, invalid existing metadata, and a candidate
+that fails validation each publish nothing. The seeding examples run the shipped
+decision step and assert that a default-branch push whose tests were all reused
+seeds a missing cache, that an existing cache, a running engine worker, and a
+pull request do not, that a lookup that did not answer seeds, and that the
+seeding job builds only dependencies. The native examples assert, for a change
+to only the C compiler, the SDK, the architecture, the deployment target, the
+build options, `SDKROOT`, or compiler flags, that the old prefix and a build directory stamped against it are
+refused and the manifest identity changes, and that restoring the configuration
+restores the identity; and that an absent prefix beside a visible system GLFW, a
+prefix whose metadata was replaced by a system GLFW, generated link requirement
+drift, and a missing `pkg-config` are each refused.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

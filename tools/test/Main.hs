@@ -8,6 +8,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
 import qualified ApprovalProvenance
+import qualified CiImage
 import qualified DismissalStep
 import qualified Execution
 import qualified Packaging
@@ -80,6 +81,7 @@ main = hspec $ do
   ReviewReplay.spec
   DismissalStep.spec
   ApprovalProvenance.spec
+  CiImage.spec
   Packaging.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a

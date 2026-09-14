@@ -1,0 +1,217 @@
+# Resolve the Linux CI image for one recipe fingerprint, publish it only on a
+# confirmed miss, and return the descriptor the author commits.
+#
+# This is the only workflow that holds `packages: write`, and only its publish
+# job does. It starts by manual dispatch or from a same-repository pull request
+# that changes an image input; an ordinary source change never starts it, and
+# ordinary validation workers only pull the digest the committed descriptor
+# names. See docs/validation.md.
+name: ci-image
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - 'tools/ci-image/**'
+      - 'tools/native/**'
+      - 'tools/validation/ci_image.py'
+      - '.github/workflows/ci-image.yml'
+      # Committing the returned descriptor is not an image input.
+      - '!tools/ci-image/descriptor.json'
+
+permissions:
+  contents: read
+
+# The image must install exactly the toolchain the validation workflow pins.
+env:
+  GHC_VERSION: '9.12.2'
+  CABAL_VERSION: '3.16.1.0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    # A fork's pull request can neither hold a package grant nor be allowed to
+    # start publication.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+      status: ${{ steps.lookup.outputs.status }}
+      digest: ${{ steps.lookup.outputs.digest }}
+      native-manifest: ${{ steps.lookup.outputs.native-manifest }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Name the image
+        id: name
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "image=ghcr.io/${REPOSITORY,,}-ci" >> "$GITHUB_OUTPUT"
+
+      - name: Fingerprint the recipe
+        id: fingerprint
+        run: |
+          set -euo pipefail
+          fingerprint="$(python3 tools/validation/ci_image.py fingerprint --revision HEAD)"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "recipe fingerprint $fingerprint"
+
+      - name: Look up the published tag
+        id: lookup
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          FINGERPRINT: ${{ steps.fingerprint.outputs.fingerprint }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/ci-image/builder.py resolve \
+            --image "$IMAGE" --fingerprint "$FINGERPRINT" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --registry tools/ci-image/registry.py \
+            --github-output "$GITHUB_OUTPUT"
+
+  publish:
+    needs: resolve
+    if: needs.resolve.outputs.status == 'miss'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    # Publication for one fingerprint is serialized. The job looks the tag up
+    # again once it holds the group, so a builder that published while this one
+    # waited is returned rather than overwritten.
+    concurrency:
+      group: ci-image-publish-${{ needs.resolve.outputs.fingerprint }}
+      cancel-in-progress: false
+    outputs:
+      status: ${{ steps.publish.outputs.status }}
+      digest: ${{ steps.publish.outputs.digest }}
+      native-manifest: ${{ steps.publish.outputs.native-manifest }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Confirm the fingerprint
+        env:
+          FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          actual="$(python3 tools/validation/ci_image.py fingerprint --revision HEAD)"
+          if [ "$actual" != "$FINGERPRINT" ]; then
+            echo "::error::this job checked out recipe fingerprint $actual rather than the resolved $FINGERPRINT"
+            exit 1
+          fi
+
+      - name: Stage the build context
+        run: python3 tools/ci-image/builder.py stage --revision HEAD --output "$RUNNER_TEMP/context"
+
+      - name: Sign in to the registry
+        env:
+          ACTOR: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+
+      - name: Publish once
+        id: publish
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/ci-image/builder.py publish \
+            --image "$IMAGE" --fingerprint "$FINGERPRINT" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --registry tools/ci-image/registry.py \
+            --context "$RUNNER_TEMP/context" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Sign out of the registry
+        if: always()
+        run: docker logout ghcr.io
+
+  descriptor:
+    needs: [resolve, publish]
+    if: always() && needs.resolve.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      reference: ${{ steps.write.outputs.reference }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Write the descriptor
+        id: write
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
+          RESOLVED_DIGEST: ${{ needs.resolve.outputs.digest }}
+          RESOLVED_MANIFEST: ${{ needs.resolve.outputs.native-manifest }}
+          PUBLISHED_DIGEST: ${{ needs.publish.outputs.digest }}
+          PUBLISHED_MANIFEST: ${{ needs.publish.outputs.native-manifest }}
+        run: |
+          set -euo pipefail
+          digest="${PUBLISHED_DIGEST:-$RESOLVED_DIGEST}"
+          manifest="${PUBLISHED_MANIFEST:-$RESOLVED_MANIFEST}"
+          python3 tools/ci-image/builder.py descriptor \
+            --image "$IMAGE" --digest "$digest" --fingerprint "$FINGERPRINT" \
+            --native-manifest "$manifest" --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --output descriptor.json
+          echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "## CI image descriptor"
+            echo
+            echo "Commit this as \`tools/ci-image/descriptor.json\`:"
+            echo
+            echo '```json'
+            cat descriptor.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the descriptor
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-image-descriptor
+          path: descriptor.json
+          if-no-files-found: error
+
+  anonymous-pull:
+    needs: descriptor
+    # Explicit, because a skipped `publish` — every hit — would otherwise skip
+    # this too, and a hit's image has to be pullable just the same.
+    if: always() && needs.descriptor.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No grant at all: the package must be public for this pull to succeed,
+    # exactly as ordinary validation workers pull it.
+    permissions: {}
+    steps:
+      - name: Pull the image by digest without credentials
+        env:
+          REFERENCE: ${{ needs.descriptor.outputs.reference }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          started=$(date +%s)
+          docker pull "$REFERENCE"
+          ended=$(date +%s)
+          {
+            echo "## Anonymous pull"
+            echo
+            echo "Pulled \`$REFERENCE\` with no registry credentials in $((ended - started))s."
+          } >> "$GITHUB_STEP_SUMMARY"

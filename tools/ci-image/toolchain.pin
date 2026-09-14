@@ -1,0 +1,10 @@
+# The Haskell toolchain the Linux CI image installs, pinned to upstream
+# binary distributions and their SHA-256 checksums. The versions must equal the
+# GHC_VERSION and CABAL_VERSION the validation workflow pins; the builder
+# refuses to publish an image whose installed compilers disagree with them.
+GHC_VERSION=9.12.2
+GHC_URL=https://downloads.haskell.org/~ghc/9.12.2/ghc-9.12.2-x86_64-ubuntu22_04-linux.tar.xz
+GHC_SHA256=0ced5b556e5fadf592ca7c1bcd2e13f528304fbcccc8e17aa3c521ff33dec55a
+CABAL_VERSION=3.16.1.0
+CABAL_URL=https://downloads.haskell.org/~cabal/cabal-install-3.16.1.0/cabal-install-3.16.1.0-x86_64-linux-ubuntu24_04.tar.xz
+CABAL_SHA256=f7284888f523ff0bb3d8bfc9e7b8c89ab3b95fe87792aefc06019801b9f6ef74

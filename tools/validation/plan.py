@@ -34,6 +34,7 @@ import sys
 # turned off before the imports that would create it.
 sys.dont_write_bytecode = True
 
+import ci_image
 import receipts
 
 # The catalog's schema and the plan's are separate contracts: the plan gained
@@ -996,6 +997,11 @@ def build_plan(
         # The platform an execution's result is a claim about. A receipt from
         # another operating system describes another machine's behaviour.
         "runner_os": identity["runner_os"],
+        # The descriptor of the image Linux workers run, read from the
+        # candidate and already checked against it, or null when the plan has
+        # no image. Its digest and native manifest are also in `toolchain`,
+        # which is what every compatibility comparison reads.
+        "ci_image": identity["ci_image"],
         # `override` and `candidate_digest` describe the classification the
         # runner has to reproduce before it can judge its own checkout: which
         # catalog decided this candidate's inputs, and exactly what that catalog
@@ -1047,6 +1053,8 @@ def render_prose(plan: dict) -> str:
     lines.append(f"  inputs   {plan['input_identity'][:12]}")
     declared = ", ".join(f"{name} {version}" for name, version in sorted(plan["toolchain"].items()))
     lines.append(f"  pinned   {declared or 'no toolchain'} on {plan['runner_os']}")
+    if plan["ci_image"]:
+        lines.append(f"  image    {plan['ci_image']['reference']}@{plan['ci_image']['digest']}")
     request = plan["request"]
     if request["resolved"]:
         lines.append(f"  request  {', '.join(request['resolved'])} (from {request['source']})")
@@ -1237,10 +1245,21 @@ def main(argv: list[str]) -> int:
         toolchain = receipts.parse_toolchain(arguments.toolchain)
     except receipts.EvidenceError as failure:
         raise PlannerError(str(failure)) from failure
+    runner_os = arguments.runner_os or os.environ.get("RUNNER_OS") or platform.system()
     entries = tree_entries(root, candidate.commit)
+    # The toolchain map describes the planned worker environment, not this
+    # host. For Linux workers that is the image the candidate's own descriptor
+    # names, so its digest and native manifest join the map before identity is
+    # taken from it — and a descriptor that no longer describes the candidate
+    # stops the plan here, before anything executes.
+    try:
+        image, toolchain = ci_image.plan_image(candidate.read, entries, toolchain, runner_os, candidate.label)
+    except ci_image.ImageError as failure:
+        raise PlannerError(str(failure)) from failure
     policy = policy_identity(candidate_catalog, entries)
     identity = {
-        "runner_os": arguments.runner_os or os.environ.get("RUNNER_OS") or platform.system(),
+        "runner_os": runner_os,
+        "ci_image": image,
         "policy_version": policy,
         "input_identity": input_identity(
             candidate_catalog, candidate_packages, entries, policy, toolchain

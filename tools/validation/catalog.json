@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 4,
+  "policy_version": 5,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -85,7 +85,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper and this planner against temporary Git repositories.",
+      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, and the native recipe helper against temporary Git repositories.",
       "command": [
         "cabal",
         "test",
@@ -94,8 +94,10 @@
       ],
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
+        "tools/ci-image/",
         "tools/docs_land.sh",
         "tools/docs_land_paths.py",
+        "tools/native/",
         "tools/validation/"
       ],
       "framework": "hspec",
