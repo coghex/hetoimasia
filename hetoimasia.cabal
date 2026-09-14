@@ -114,6 +114,7 @@ test-suite hetoimasia-tests
         Test.Engine.Logging.Spec
         Test.Engine.Logging.Support
         Test.Engine.Logging.Worker
+        Test.Engine.Messaging.Channel
         Test.Engine.Messaging.Opacity
         Test.Engine.Messaging.Spec
         Test.Engine.Recovery.Spec

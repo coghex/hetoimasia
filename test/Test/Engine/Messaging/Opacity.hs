@@ -1,6 +1,7 @@
 -- | Examples proving that 'Hetoimasia.Foundation.Messaging.Payload.Prepared'
--- can be obtained only through preparation, from a client outside the
--- foundation package.
+-- can be obtained only through preparation, and that each channel endpoint of
+-- "Hetoimasia.Foundation.Messaging.Channel" carries only its own authority, from
+-- clients outside the foundation package.
 --
 -- These examples compile separate single-module clients with the harness from
 -- "Test.Engine.Resources.Opacity", exposing @base@, @deepseq@, and
@@ -18,6 +19,12 @@
 -- One client must be accepted, linked, and run. It is the environment control,
 -- and it shows that preparing, reading, and forwarding stay usable, with
 -- unconstrained polymorphic readers and forwarders that require no 'NFData'.
+--
+-- The channel clients also expose @stm@. Five must be rejected for their named
+-- cause: receiving from a send endpoint, closing from a send or a receive
+-- endpoint, naming an endpoint's constructor, and replacing an endpoint through
+-- record update. One must be accepted, linked, and run, using every supported
+-- send, receive, control, and statistics operation.
 module Test.Engine.Messaging.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
@@ -27,7 +34,12 @@ import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, w
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
 
 spec ∷ Spec
-spec = describe "Prepared payload opacity across the package boundary" $ do
+spec = do
+  payloadSpec
+  channelSpec
+
+payloadSpec ∷ Spec
+payloadSpec = describe "Prepared payload opacity across the package boundary" $ do
   it "rejects a client that names the constructor" $
     withClient constructorClient $ \compile → do
       outcome ← compile Typecheck
@@ -96,6 +108,215 @@ spec = describe "Prepared payload opacity across the package boundary" $ do
 
 packages ∷ [String]
 packages = ["base", "deepseq", "hetoimasia-foundation"]
+
+channelSpec ∷ Spec
+channelSpec = describe "Channel endpoint authority across the package boundary" $ do
+  it "rejects a client that receives from a send endpoint" $
+    withChannelClient receiveFromSenderClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match type"
+      clientOutput outcome `shouldContain` "Sender"
+      clientOutput outcome `shouldContain` "Receiver"
+
+  it "rejects a client that closes from a send endpoint" $
+    withChannelClient closeFromSenderClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match type"
+      clientOutput outcome `shouldContain` "Sender"
+      clientOutput outcome `shouldContain` "ChannelControl"
+
+  it "rejects a client that closes from a receive endpoint" $
+    withChannelClient closeFromReceiverClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match type"
+      clientOutput outcome `shouldContain` "Receiver"
+      clientOutput outcome `shouldContain` "ChannelControl"
+
+  it "rejects a client that constructs an endpoint from its internals" $
+    withChannelClient endpointConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "Sender"
+
+  it "rejects a client that replaces an endpoint with record update" $
+    withChannelClient endpointUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "channelSender"
+
+  it "accepts and runs a client using every send, receive, control, and statistics operation" $
+    withPackageClient channelPackages "Main.hs" supportedChannelClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the supported client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "sends = Accepted Admitted Full"
+                   , "received first"
+                   , "delivered second"
+                   , "empty"
+                   , "reopened = Accepted"
+                   , "after close = Closed"
+                   , "received third"
+                   , "ended Drained"
+                   , "statistics = 2 0 2 3 3 0"
+                   , "discarded = 1"
+                   , "after abort = AdmissionClosed"
+                   , "terminated Aborted"
+                   , "statistics = 1 0 1 1 0 1"
+                   , "rejected = CapacityNotPositive 0"
+                   , "rejected = CapacityAboveMaximum " <> show (toInteger (maxBound ∷ Int) + 1)
+                   ]
+
+channelPackages ∷ [String]
+channelPackages = ["base", "deepseq", "stm", "hetoimasia-foundation"]
+
+withChannelClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
+withChannelClient = withPackageClient channelPackages "Client.hs"
+
+-- | Receiving through a send endpoint.
+receiveFromSenderClient ∷ String
+receiveFromSenderClient =
+  unlines
+    [ "module Client (taken) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Foundation.Messaging.Channel (Receipt, Sender, receive)"
+    , ""
+    , "taken ∷ Sender Int → STM (Receipt Int)"
+    , "taken = receive"
+    ]
+
+-- | Closing through a send endpoint.
+closeFromSenderClient ∷ String
+closeFromSenderClient =
+  unlines
+    [ "module Client (closed) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Foundation.Messaging.Channel (Sender, closeChannel)"
+    , ""
+    , "closed ∷ Sender Int → STM ()"
+    , "closed = closeChannel"
+    ]
+
+-- | Closing through a receive endpoint.
+closeFromReceiverClient ∷ String
+closeFromReceiverClient =
+  unlines
+    [ "module Client (closed) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Foundation.Messaging.Channel (Receiver, closeChannel)"
+    , ""
+    , "closed ∷ Receiver Int → STM ()"
+    , "closed = closeChannel"
+    ]
+
+-- | Building a send endpoint by naming its constructor.
+endpointConstructorClient ∷ String
+endpointConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Channel (ChannelControl, Sender (Sender))"
+    , ""
+    , "forged ∷ ChannelControl Int → Sender Int"
+    , "forged = Sender"
+    ]
+
+-- | Replacing the send endpoint an owner-control endpoint hands out, through
+-- record-update syntax. The reader is imported by name, so the rejection means
+-- it is not a field rather than that it was never imported.
+endpointUpdateClient ∷ String
+endpointUpdateClient =
+  unlines
+    [ "module Client (rewired) where"
+    , ""
+    , "import Hetoimasia.Foundation.Messaging.Channel (ChannelControl, Sender, channelSender)"
+    , ""
+    , "rewired ∷ ChannelControl Int → Sender Int → ChannelControl Int"
+    , "rewired control replacement = control { channelSender = replacement }"
+    ]
+
+-- | A client using every supported channel operation.
+supportedChannelClient ∷ String
+supportedChannelClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Concurrent.STM (atomically)"
+    , "import Control.Exception (try)"
+    , "import Hetoimasia.Foundation.Messaging.Channel"
+    , "import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)"
+    , ""
+    , "receipt ∷ Receipt String → String"
+    , "receipt (Received payload) = \"received \" <> preparedValue payload"
+    , "receipt Empty = \"empty\""
+    , "receipt (Terminated termination) = \"terminated \" <> show termination"
+    , ""
+    , "delivery ∷ Delivery String → String"
+    , "delivery (Delivered payload) = \"delivered \" <> preparedValue payload"
+    , "delivery (Ended termination) = \"ended \" <> show termination"
+    , ""
+    , "statistics ∷ ChannelControl String → IO String"
+    , "statistics control = do"
+    , "  s ← atomically (channelStatistics control)"
+    , "  pure $ unwords"
+    , "    [ \"statistics =\""
+    , "    , show (statisticsCapacity s), show (statisticsDepth s), show (statisticsHighWater s)"
+    , "    , show (statisticsAccepted s), show (statisticsDequeued s), show (statisticsDiscarded s)"
+    , "    ]"
+    , ""
+    , "rejected ∷ Integer → IO ()"
+    , "rejected capacity = do"
+    , "  outcome ← try (newChannel capacity ∷ IO (ChannelControl String))"
+    , "  case outcome of"
+    , "    Left failure → putStrLn (\"rejected = \" <> show (failure ∷ ChannelCapacityRejected))"
+    , "    Right _ → putStrLn \"rejected = nothing\""
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  control ← newChannel 2"
+    , "  let sender = channelSender control"
+    , "      receiver = channelReceiver control"
+    , "  first ← prepare \"first\""
+    , "  second ← prepare \"second\""
+    , "  third ← prepare \"third\""
+    , "  sent ← atomically (send sender first)"
+    , "  waited ← atomically (awaitSend sender second)"
+    , "  full ← atomically (send sender third)"
+    , "  putStrLn (unwords [\"sends =\", show sent, show waited, show full])"
+    , "  atomically (receive receiver) >>= putStrLn . receipt"
+    , "  atomically (awaitReceive receiver) >>= putStrLn . delivery"
+    , "  atomically (receive receiver) >>= putStrLn . receipt"
+    , "  atomically (send sender third) >>= putStrLn . (\"reopened = \" <>) . show"
+    , "  atomically (closeChannel control)"
+    , "  atomically (send sender first) >>= putStrLn . (\"after close = \" <>) . show"
+    , "  atomically (receive receiver) >>= putStrLn . receipt"
+    , "  atomically (awaitReceive receiver) >>= putStrLn . delivery"
+    , "  statistics control >>= putStrLn"
+    , "  other ← newChannel 1"
+    , "  _ ← atomically (send (channelSender other) first)"
+    , "  atomically (abortChannel other) >>= putStrLn . (\"discarded = \" <>) . show"
+    , "  atomically (awaitSend (channelSender other) second) >>= putStrLn . (\"after abort = \" <>) . show"
+    , "  atomically (receive (channelReceiver other)) >>= putStrLn . receipt"
+    , "  statistics other >>= putStrLn"
+    , "  rejected 0"
+    , "  rejected (maximumCapacity + 1)"
+    ]
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withClient = withPackageClient packages "Client.hs"
