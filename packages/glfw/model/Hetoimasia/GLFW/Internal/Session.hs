@@ -233,7 +233,7 @@ import Hetoimasia.GLFW.Internal.Control
   , fullWindowCapabilities
   , windowCapabilities
   )
-import Hetoimasia.GLFW.Internal.Mode (MonitorClaims)
+import Hetoimasia.GLFW.Internal.Mode (MonitorClaims, pruneClaims)
 import Hetoimasia.GLFW.Internal.Monitor
   ( MonitorDescription
   , MonitorId
@@ -857,13 +857,15 @@ monitorInventory = monitorsReader . sessionMonitors
 -- inventory.
 synchronizeMonitors ∷ Session → IO MonitorInventory
 synchronizeMonitors session =
-  ownerOperation session synchronizeMonitorsOperation [] (synchronizeInventory (sessionMonitors session))
+  ownerOperation session synchronizeMonitorsOperation [] (refreshMonitors session)
 
 -- | Refresh the monitor inventory only if the monitor callback captured a change
 -- since the last refresh: the owner loop's step after native events.
 reconcileMonitorEvents ∷ Session → IO ()
 reconcileMonitorEvents session =
-  ownerOperation session reconcileMonitorsOperation [] (reconcileInventory (sessionMonitors session))
+  ownerOperation session reconcileMonitorsOperation [] $ do
+    reconcileInventory (sessionMonitors session)
+    pruneSessionClaims session
 
 -- | Re-resolve a monitor identity against the monitors GLFW reports now, and
 -- answer its fresh description, or 'MonitorDisconnected' for an identity whose
@@ -871,7 +873,7 @@ reconcileMonitorEvents session =
 resolveMonitor ∷ Session → MonitorId → IO (MonitorResult MonitorDescription)
 resolveMonitor session identity =
   ownerOperation session resolveMonitorOperation (monitorIdentifiers identity) $
-    resolveInventory (sessionMonitors session) identity >>= \case
+    resolveMonitorPointer session identity >>= \case
       MonitorAvailable (description, _) → pure (MonitorAvailable description)
       MonitorDisconnected ended → pure (MonitorDisconnected ended)
 
@@ -883,7 +885,7 @@ resolveMonitor session identity =
 withResolvedMonitor ∷ Session → Operation → MonitorId → (Ptr NativeMonitor → IO a) → IO (MonitorResult a)
 withResolvedMonitor session operationName identity action =
   ownerOperation session operationName identifiers $
-    resolveInventory (sessionMonitors session) identity >>= \case
+    resolveMonitorPointer session identity >>= \case
       MonitorDisconnected ended → pure (MonitorDisconnected ended)
       MonitorAvailable (_, pointer) → do
         settleStrayOwnerReports capture
@@ -918,13 +920,20 @@ identifyWindowMonitor = identifyPointer . sessionMonitors
 -- | Refresh the inventory and answer it. The caller is already inside an owner
 -- operation.
 refreshMonitors ∷ Session → IO MonitorInventory
-refreshMonitors = synchronizeInventory . sessionMonitors
+refreshMonitors session = synchronizeInventory (sessionMonitors session) <* pruneSessionClaims session
 
 -- | Refresh the inventory and answer the identity's description and the live
 -- pointer this boundary's enumeration returned, which must not outlive the
 -- calling boundary. The caller is already inside an owner operation.
 resolveMonitorPointer ∷ Session → MonitorId → IO (MonitorResult (MonitorDescription, Ptr NativeMonitor))
-resolveMonitorPointer = resolveInventory . sessionMonitors
+resolveMonitorPointer session identity = resolveInventory (sessionMonitors session) identity <* pruneSessionClaims session
+
+-- | Drop the claims of identities the inventory no longer holds: every refresh
+-- and resolution does, so a disconnected monitor's claim ends with its identity.
+pruneSessionClaims ∷ Session → IO ()
+pruneSessionClaims session = do
+  live ← liveIdentities (sessionMonitors session)
+  atomicModifyIORef' (sessionClaims session) (\claims → (pruneClaims live claims, ()))
 
 monitorIdentifiers ∷ MonitorId → [(Text, Text)]
 monitorIdentifiers identity = [("monitor", Text.pack (show (monitorLocalIdentity identity)))]

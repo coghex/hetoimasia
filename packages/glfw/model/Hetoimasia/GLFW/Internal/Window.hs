@@ -130,7 +130,8 @@
 -- window is sampled, and its applied mode and monitor claims are reconciled with
 -- that sample; an inert request settles at once; otherwise the target is
 -- attempted under "Hetoimasia.Foundation.Recovery"'s 'recover', whose budget is
--- one attempt plus the request's fallback attempts. Each attempt is one complete
+-- one attempt plus the request's fallback attempts, or those fallback attempts
+-- alone when reconciliation starts from the fallback. Each attempt is one complete
 -- owned operation. It validates and plans before any native call, reserves a
 -- fullscreen monitor last, makes its steps — each bracketed by the error capture,
 -- stopping at the first that reports — and samples, reconciles, and publishes
@@ -139,7 +140,13 @@
 -- suspended or indeterminate; a cleanup that reports an error stops recovery. The
 -- transition settles after one more sample, whose revision it names, with the
 -- request and its outcome recorded. A request refused before any native call,
--- with no fallback to take, records nothing.
+-- with no fallback to take or as 'MonitorBusy', which no fallback answers,
+-- records nothing. A cleanup that raises instead of reporting, or a cleanup
+-- failure beside a primary failure that is not a mode attempt's, propagates.
+--
+-- Every full sample — a synchronization, a control's post-call sample, and a
+-- transition's samples — derives the applied mode and settles the window's
+-- monitor claims before it publishes.
 --
 -- The transition interval is that execution, from setting the marker to the
 -- settlement, on the owner thread. Nothing else executes a command inside it: the
@@ -372,7 +379,7 @@ import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find)
-import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe, maybeToList)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Data.Unique (Unique)
@@ -1261,10 +1268,11 @@ reconcileWith forced = reconcileAdjusted forced id
 -- sample it was reconciled with.
 reconcileAdjusted ∷ Bool → (WindowObservation → WindowObservation) → IO () → Window → Maybe Sample → IO ()
 reconcileAdjusted forced adjust interruption window sample = do
+  derived ← maybe (pure id) (presentationFrom window) sample
   pending ← readIORef (windowCaptures window)
   OwnerState current issued ← readIORef (windowOwnerState window)
   let (reconciledObservation, issued') = reconciled (windowId window) sample pending current issued
-      folded = adjust reconciledObservation
+      folded = adjust (derived reconciledObservation)
       signalled = capturedRefresh pending || capturedCloses pending > 0
       next = folded {obsRevision = obsRevision current + 1}
   prepared ← if forced || folded /= current || signalled then Just <$> prepare next else pure Nothing
@@ -1283,6 +1291,19 @@ reconcileAdjusted forced adjust interruption window sample = do
     when cleared $ forM_ prepared (commitObservation window next issued')
     pure cleared
   unless committed (reconcileAdjusted forced adjust interruption window sample)
+
+-- | Settle a window's monitor claims with a full sample, and answer how its
+-- applied mode changes: derived from the sample against the current monitors.
+presentationFrom ∷ Window → Sample → IO (WindowObservation → WindowObservation)
+presentationFrom window taken = do
+  monitors ← currentSessionMonitors session
+  live ← liveMonitors session
+  atomicModifyIORef' (sessionClaims session) $ \claims →
+    (settleClaims (windowLocalIdentity (windowId window)) (sampleMonitor taken) (pruneClaims live claims), ())
+  let applied = deriveApplied monitors (sampleMonitor taken) (sampleDecorated taken) (samplePlacement taken)
+  pure (\observation → observation {obsMode = recordApplied applied (obsMode observation)})
+  where
+    session = windowSession window
 
 -- | Publish a prepared observation and record it as the owner's current one.
 -- The caller must be masked: neither write is interruptible, so the two cannot
@@ -1580,7 +1601,7 @@ runTransition window requirement request first =
     outcome ← if inert then pure ModeInert else recovering window requirement request first
     case outcome of
       ModeFailed [ModeAttemptFailure TargetAttempt (RefusedBeforeMutation rejection)]
-        | withoutFallback → pure (ModeRefused rejection)
+        | withoutFallback || refusedOutright rejection → pure (ModeRefused rejection)
       ModeFailed [ModeAttemptFailure TargetAttempt (UnsupportedTarget reason)]
         | withoutFallback → pure (ModeUnsupported reason)
       _ → ModeSettled outcome <$> samplePresentation True window (recordSettled request outcome)
@@ -1602,10 +1623,13 @@ recovering window requirement request first = do
       pure (ModeFailed (attemptFailures (Recovery.unavailableEarlier unavailable <> [Recovery.unavailableReason unavailable])))
     Left caught@(ExceptionWithContext context raised)
       | requirement == ModeOptional
-      , Nothing ← (fromException raised ∷ Maybe SomeAsyncException) →
+      , Nothing ← (fromException raised ∷ Maybe SomeAsyncException)
+      , Just latest ← fromException raised →
           case cleanupFailuresInContext context of
-            [] → maybe (rethrowIO caught) (\latest → pure (ModeFailed (earlier context <> [latest]))) (fromException raised)
-            cleanups → pure (ModeRecoveryStopped (earlier context <> maybeToList (fromException raised)) (cleanupReports cleanups))
+            [] → pure (ModeFailed (earlier context <> [latest]))
+            cleanups
+              | Just reports ← cleanupReports cleanups → pure (ModeRecoveryStopped (earlier context <> [latest]) reports)
+              | otherwise → rethrowIO caught
       | otherwise → rethrowIO caught
   where
     fallback = requestedFallback request
@@ -1615,7 +1639,9 @@ recovering window requirement request first = do
         { Recovery.policyDisposition = case requirement of
             ModeRequired → Recovery.Required
             ModeOptional → Recovery.Optional
-        , Recovery.policyBudget = 1 + fallbackAttempts fallback
+        , Recovery.policyBudget = case first of
+            TargetAttempt → 1 + fallbackAttempts fallback
+            WindowedFallbackAttempt → fallbackAttempts fallback
         , Recovery.policyClassifier = pure . classify
         , Recovery.policyWait = const (pure ())
         }
@@ -1626,28 +1652,33 @@ recovering window requirement request first = do
         , recognized how →
             Just (Recovery.Fallback windowedFallbackOperation (modeAttempt window request WindowedFallbackAttempt))
       _ → Nothing
-    -- A busy monitor and a transition already in progress are refusals, never
-    -- reasons to move the window.
     recognized = \case
-      RefusedBeforeMutation TransitionAlreadyInProgress → False
-      RefusedBeforeMutation (MonitorBusy _) → False
-      RefusedBeforeMutation _ → True
+      RefusedBeforeMutation rejection → not (refusedOutright rejection)
       UnsupportedTarget _ → True
       StoppedPartway {} → True
+
+-- | A busy monitor and a transition already in progress are refusals, never
+-- reasons to move the window, whatever fallback the request carries.
+refusedOutright ∷ ModeRejection → Bool
+refusedOutright = \case
+  TransitionAlreadyInProgress → True
+  MonitorBusy _ → True
+  _ → False
 
 attemptFailures ∷ [Recovery.AttemptFailure] → [ModeAttemptFailure]
 attemptFailures = mapMaybe $ \attempted → case Recovery.attemptException attempted of
   ExceptionWithContext _ raised → fromException raised
 
--- | The reports of the first cleanup failure that was a native failure.
-cleanupReports ∷ [CleanupFailure] → Reports
-cleanupReports cleanups =
-  fromMaybe (Reports [] 0 0) . listToMaybe $
-    [ nativeReports failure
-    | cleanup ← cleanups
-    , ExceptionWithContext _ raised ← [cleanupFailureException cleanup]
-    , Just failure ← [fromException raised]
-    ]
+-- | The reports of cleanup failures that are all native failures reported by a
+-- returning call, combined; 'Nothing' when any is something else, which is not
+-- representable as data.
+cleanupReports ∷ [CleanupFailure] → Maybe Reports
+cleanupReports cleanups = combined <$> traverse native cleanups
+  where
+    native cleanup = case cleanupFailureException cleanup of
+      ExceptionWithContext _ raised → nativeReports <$> fromException raised
+    combined reports =
+      Reports (concatMap reportedErrors reports) (sum (map reportsLost reports)) (sum (map callbackFaults reports))
 
 -- | One complete owned attempt: validate and plan, make the steps, and sample,
 -- answering the steps or failing with a 'ModeAttemptFailure'. Its cleanup
@@ -1767,10 +1798,7 @@ samplePresentation forced window adjust =
       raiseLatchedFault window
       pure (PostCallSampleFailed (nativeOutcome failure) (nativeReports failure))
     Right sample → do
-      monitors ← currentSessionMonitors session
-      settle (sampleMonitor sample)
-      let applied = deriveApplied monitors (sampleMonitor sample) (sampleDecorated sample) (samplePlacement sample)
-      reconcileAdjusted forced (withRecord (adjust . recordApplied applied)) (pure ()) window (Just sample)
+      reconcileAdjusted forced (withRecord adjust) (pure ()) window (Just sample)
       raiseLatchedFault window
       OwnerState current _ ← readIORef (windowOwnerState window)
       pure (PostCallRevision (obsRevision current))

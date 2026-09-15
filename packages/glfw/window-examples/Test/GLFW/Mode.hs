@@ -19,7 +19,7 @@
 module Test.GLFW.Mode (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, join, replicateM, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
@@ -28,6 +28,7 @@ import Data.Text (Text)
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.Foundation.Resource (cleanupFailures)
 import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), WindowClaim (..))
 import Hetoimasia.GLFW.Internal.Seam
@@ -76,17 +77,19 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testPartialFailure)
     it "stops recovery when restoring the windowed constraints fails during an attempt's cleanup"
       (boundedExample testCleanupStopsRecovery)
+    it "propagates a cleanup that raises instead of reporting, settling its command as interrupted rather than as data"
+      (boundedExample testRaisingCleanup)
     it "fails a required startup mode under the required policy, rolling the window back, and records an optional one"
       (boundedExample testStartupRequirement)
 
   describe "fullscreen claims" $ do
-    it "gives a second window MonitorBusy without native effect, including while the first is iconified"
+    it "gives a second window MonitorBusy without native effect or record, including while the first is iconified and with a fallback configured"
       (boundedExample testMonitorBusy)
     it "claims different monitors independently and releases each claim in both close orders"
       (boundedExample testIndependentClaims)
-    it "invalidates a claim when its monitor disconnects"
+    it "releases a claim as soon as a refresh observes its monitor disconnected"
       (boundedExample testClaimDisconnect)
-    it "keeps claims unavailable after an unobserved transition or a failed disposal until reconciliation proves release"
+    it "keeps claims unavailable after an unobserved transition or a failed disposal until a later sample proves release"
       (boundedExample testUncertainClaims)
     it "switches monitors by reserving the destination first and releasing the source only after confirmed departure"
       (boundedExample testMonitorSwitch)
@@ -94,7 +97,7 @@ spec = describe "GLFW window modes" $ do
   describe "eligibility" $ do
     it "applies the operation matrix after entering each mode, rejecting ineligible controls before any native setter"
       (boundedExample testOperationMatrix)
-    it "refuses controls that depend on an indeterminate presentation until reconciliation establishes one"
+    it "refuses controls that depend on an indeterminate presentation until a later synchronization establishes one"
       (boundedExample testIndeterminatePresentation)
     it "refuses commands inside a transition's interval, serves another window there, and admits them after settlement"
       (boundedExample testTransitionInterval)
@@ -393,10 +396,11 @@ testEmptyInventory = withDesk tracked $ \desk → withWindowIn desk "first" $ \w
   claims ← monitorClaims (deskSession desk)
   entering `shouldSatisfy` appliedCleanly
   let unreachable = ModeAttemptFailure WindowedFallbackAttempt (RefusedBeforeMutation NoReachablePlacement)
-  reconciled `shouldBe` WindowAvailable (Just (ModeFailed [unreachable, unreachable]))
+  -- One configured fallback attempt, and no more.
+  reconciled `shouldBe` WindowAvailable (Just (ModeFailed [unreachable]))
   afterReconciliation `shouldBe` beforeReconciliation
   placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
-  modeLastOutcome record `shouldBe` Just (ModeFailed [unreachable, unreachable])
+  modeLastOutcome record `shouldBe` Just (ModeFailed [unreachable])
   claims `shouldBe` Map.empty
 
 testUnsupportedBorderless ∷ Expectation
@@ -488,6 +492,36 @@ testCleanupStopsRecovery = do
                  ]
     refusedSize `shouldBe` Rejected (ControlRejected target ActiveConstraintsIndeterminate)
 
+testRaisingCleanup ∷ Expectation
+testRaisingCleanup = do
+  failing ← newIORef False
+  let script =
+        tracked
+          { scriptWindowControl = \call reporter → readIORef failing >>= \on → when on $ case call of
+              SetWindowDecorated _ False → reportError reporter platformErrorCode "The decoration could not be set"
+              SetWindowSizeLimits {} → throwIO (userError "the restoration raised")
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    let target = windowIdentity window
+    installed ← execute desk [window] (setSizeConstraintsCommand target (sizeConstraints (Extent 100 100) (Extent 3000 3000) Nothing))
+    writeIORef failing True
+    ticket ← submit (windowCommandPort (deskHost desk)) (mode window (modeRequest (borderlessMode (deskLeft desk)) (windowedFallback 2)))
+    raised ← try @SomeException (seamExecuteNext (deskSeam desk) (deskHost desk) [window])
+    writeIORef failing False
+    settled ← atomically (pollCompletion ticket)
+    calls ← modeCalls desk
+    installed `shouldSatisfy` attempted
+    case raised of
+      Left caught → do
+        (fromException caught ∷ Maybe ModeAttemptFailure) `shouldSatisfy` \case
+          Just (ModeAttemptFailure TargetAttempt (StoppedPartway {})) → True
+          _ → False
+        length (cleanupFailures caught) `shouldBe` 1
+      Right step → unexpected ("the raising cleanup settled as data: " <> show step)
+    settled `shouldBe` Just (Interrupted (submittedRequest (ticketOrigin ticket)))
+    filter (\case SetWindowMonitor {} → True; _ → False) calls `shouldBe` []
+
 testStartupRequirement ∷ Expectation
 testStartupRequirement = withDesk tracked $ \desk → do
   let seam = deskSeam desk
@@ -531,7 +565,9 @@ testMonitorBusy = withDesk tracked $ \desk →
     _ ← seamDrive (deskSeam desk) first DuringPoll [IconifyChanged True]
     beforeIconified ← length <$> seamCalls (deskSeam desk)
     busyWhileIconified ← run (mode second (fullscreenOn right))
+    busyWithFallback ← run (mode second (modeRequest (fullscreenMode right currentVideoMode) (windowedFallback 2)))
     settersWhileIconified ← filter isSetter . drop beforeIconified <$> seamCalls (deskSeam desk)
+    secondRecord ← recordOf second
     firstObservation ← current first
     claims ← monitorClaims (deskSession desk)
     owning `shouldSatisfy` appliedCleanly
@@ -539,7 +575,10 @@ testMonitorBusy = withDesk tracked $ \desk →
     settersAfterBusy `shouldBe` []
     minimized `shouldSatisfy` attempted
     busyWhileIconified `shouldBe` busyFor
+    busyWithFallback `shouldBe` busyFor
     settersWhileIconified `shouldBe` []
+    modeRequested secondRecord `shouldBe` windowedMode
+    modeLastOutcome secondRecord `shouldBe` Nothing
     observedIconified firstObservation `shouldBe` Observed True
     observedFullscreenMonitor firstObservation `shouldBe` Observed (Just right)
     claims `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimHeld)]
@@ -579,10 +618,12 @@ testClaimDisconnect = withDesk tracked $ \desk →
     seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor), (3, leftMonitor)]) 2)
     seamDeliverMonitorEvents seam [MonitorDetached 1, MonitorAttached 3]
     reconnected ← named "left" =<< synchronizeMonitors (deskSession desk)
+    afterRefresh ← monitorClaims (deskSession desk)
     stale ← run (mode second (fullscreenOn left))
     fresh ← run (mode second (fullscreenOn reconnected))
     claims ← monitorClaims (deskSession desk)
     owning `shouldSatisfy` appliedCleanly
+    afterRefresh `shouldBe` Map.empty
     (reconnected == left) `shouldBe` False
     stale `shouldBe` Rejected (ModeRejected (windowIdentity second) (ModeMonitorDisconnected left))
     fresh `shouldSatisfy` appliedCleanly
@@ -620,7 +661,7 @@ testUncertainClaims = do
       busyRight ← run (mode bystander (fullscreenOn right))
       writeIORef failingSwitch False
       writeIORef unobservable False
-      reconciled ← reconcileWindowMode switching
+      synchronized ← synchronizeWindow switching
       proven ← claims
       freed ← run (mode bystander (fullscreenOn left))
       returned ← run (mode bystander windowed)
@@ -631,7 +672,7 @@ testUncertainClaims = do
       uncertain `shouldBe` Map.fromList [(left, WindowClaim 2 ClaimUncertain), (right, WindowClaim 2 ClaimUncertain)]
       busyLeft `shouldBe` busy left
       busyRight `shouldBe` busy right
-      reconciled `shouldBe` WindowAvailable Nothing
+      appliedOf synchronized `shouldBe` Just (AppliedFullscreen right)
       proven `shouldBe` Map.fromList [(right, WindowClaim 2 ClaimHeld)]
       freed `shouldSatisfy` appliedCleanly
       returned `shouldSatisfy` appliedCleanly
@@ -759,7 +800,7 @@ testIndeterminatePresentation = do
     refusedShow ← run (showWindowCommand target)
     titled ← run (setWindowTitleCommand target "still eligible")
     writeIORef unobservable False
-    reconciled ← reconcileWindowMode window
+    synchronized ← synchronizeWindow window
     reconciledRecord ← recordOf window
     ineligible ← run (setWindowSizeCommand target (Extent 640 480))
     returned ← run (mode window windowed)
@@ -774,7 +815,7 @@ testIndeterminatePresentation = do
     titled `shouldSatisfy` \case
       Attempted (ControlAttempt _ ControlReturned _) → True
       _ → False
-    reconciled `shouldBe` WindowAvailable Nothing
+    appliedOf synchronized `shouldBe` Just (AppliedBorderless (deskLeft desk))
     modeApplied reconciledRecord `shouldBe` AppliedBorderless (deskLeft desk)
     ineligible `shouldBe` Rejected (ControlRejected target (ControlIneligibleInMode BorderlessPresentation))
     returned `shouldSatisfy` appliedCleanly
@@ -955,6 +996,11 @@ fullscreenExact monitor width height refresh = modeRequest (fullscreenMode monit
 
 windowed ∷ ModeRequest
 windowed = modeRequest windowedMode noModeFallback
+
+appliedOf ∷ WindowResult WindowObservation → Maybe AppliedMode
+appliedOf = \case
+  WindowAvailable observation → Just (modeApplied (observedMode observation))
+  WindowEnded _ → Nothing
 
 recordOf ∷ Window → IO ModeRecord
 recordOf window = observedMode <$> current window

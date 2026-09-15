@@ -1358,7 +1358,8 @@ In order:
    the window's mode record, a new revision is published, and the command
    settles as `Transitioned`, naming that revision.
 
-A request refused before any native call with no fallback to take settles as
+A request refused before any native call with no fallback to take, or refused
+as `MonitorBusy`, which no fallback answers, settles as
 `Rejected (ModeRejected window rejection)`, and a target the platform cannot
 perform with no fallback as `Unsupported` with `BorderlessOperation` or
 `FullscreenOperation`; neither is recorded.
@@ -1445,6 +1446,10 @@ with the inventory's current connections, never refreshed there, so a monitor
 no current identity names, or one whose change the callback captured but no
 refresh folded, is `Unavailable`.
 
+The applied mode is re-derived at every full sample: a synchronization, a
+control's post-call sample, and a transition's samples, so a window manager that
+converges later is reflected, and eligibility follows it.
+
 `observedMode` is the window's `ModeRecord`: `modeRequested` and `modeFallback`,
 the last request that executed; `modeApplied`, an `AppliedMode`; the
 `modeSavedPlacement`; and `modeLastOutcome`. The applied mode is derived from
@@ -1494,7 +1499,10 @@ attempt left windowed while its native constraints were suspended or
 indeterminate. A restoration call that reports an error fails the cleanup, and,
 as the recovery contract requires, a failure carrying cleanup evidence is never
 retried: the transition settles as `ModeRecoveryStopped`, with every attempt and
-the cleanup's reports, and no further native call is made.
+the cleanup's reports, and no further native call is made. A cleanup that raises
+instead of returning, or a cleanup failure beside a primary failure that is not a
+mode attempt's, is not representable as data: it propagates with its evidence,
+and the command settles as `Interrupted`.
 
 | `ModeOutcome` | Meaning |
 |---|---|
@@ -1511,8 +1519,8 @@ and the window's creation rolls back.
 
 After the owner loop refreshes the monitor inventory, it reconciles every window
 that is not closing. A window whose applied mode names an ended monitor identity
-takes its recorded windowed fallback at once, with no further command, and its
-outcome is recorded; with no fallback it is only resampled. GLFW itself takes a
+takes its recorded windowed fallback at once, with no further command, attempting
+it at most its configured number of times, and its outcome is recorded; with no fallback it is only resampled. GLFW itself takes a
 fullscreen window off a disconnected monitor. A window whose applied mode is
 indeterminate is resampled. If no placement is reachable the fallback reports
 exhaustion and the saved placement is preserved.
@@ -1525,7 +1533,8 @@ window and whether the claim is reserved, held, or uncertain:
 - a fullscreen attempt reserves its monitor after every other check and before
   its first native call; a monitor another window claims — reserved, held, or
   uncertain — is `MonitorBusy`, and nothing is called;
-- after every sample of a window, its claims are reconciled with its observed
+- after every full sample of a window — a synchronization, a control's
+  post-call sample, or a transition's sample — its claims are reconciled with its observed
   fullscreen monitor: that monitor is held and the window's other claims are
   released, because departure from them is confirmed or their reservation is
   proven unused; no fullscreen monitor releases them all; an unavailable report
@@ -1534,8 +1543,10 @@ window and whether the claim is reserved, held, or uncertain:
   until the window is observed off it, and after a failed switch keeps whichever
   claim is still observed, releasing only a destination observed unused;
 - iconifying a fullscreen window changes no claim;
-- a claim on an ended identity is dropped whenever claims are consulted, so the
-  claims never outnumber the current monitors;
+- a claim on an ended identity is dropped by every inventory refresh and
+  resolution — `synchronizeMonitors`, `resolveMonitor`, the owner loop's monitor
+  step — and whenever claims are consulted, so a disconnect releases it at once
+  and the claims never outnumber the current monitors;
 - a window's release drops its claims only when its disposal succeeded; any other
   release leaves them uncertain, and an uncertain claim is never available to
   another window.
