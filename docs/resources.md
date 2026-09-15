@@ -426,6 +426,7 @@ data Member a            -- nominal in a
 allocCollection ∷ Int → Scoped Collection
 liveMemberCount ∷ Collection → IO Int
 acquireMember   ∷ Collection → Assembly a → IO (Member a)
+acquireMemberThen ∷ Collection → Assembly a → (Member a → IO b) → IO b
 withMember      ∷ Collection → Member a → (a → IO r) → IO r
 retireMember    ∷ Collection → Member a → IO Retirement
 memberStatus    ∷ Member a → IO MemberStatus
@@ -494,6 +495,17 @@ operation in between, and the token is returned only after registration. A
 cancellation that arrives at that handoff therefore leaves a registered member,
 which the collection releases at exit; no member is ever neither registered
 nor released.
+
+An owner that keeps its own record of members — the window host's registry of
+windows and their ports — uses `acquireMemberThen`. It acquires exactly as
+`acquireMember` does, with the assembly running under the caller's masking state
+so a cancellation during construction rolls it back, and then runs the owner's
+handoff with the token in the same masked step as the registration, with no
+interruptible operation before it. A cancellation therefore cannot land between
+the collection's registration and the owner's. The handoff must not block, since
+a blocking operation is interruptible even when masked; it may borrow members.
+If it raises, the member stays registered, the exit releases it, and the failure
+propagates.
 
 ### Borrowing
 

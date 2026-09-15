@@ -28,6 +28,7 @@ window collection, or rendering operation.
 | `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
+| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
 | `glfw-window-examples` | executable, test-only | The window model, window command, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
@@ -950,7 +951,8 @@ without settling tickets; there is no abort.
 
 ## The window host and owner loop
 
-`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, composes a
+`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, which
+re-exports the private `runtime-glfw-core` implementation, composes a
 session, its windows, and their command bookkeeping with the runtime's
 [application lifecycle](resources.md#the-application-runner). It follows the
 [module authoring guide](logging.md#module-authoring-guide): it takes no logger
@@ -1116,14 +1118,18 @@ port after that one, in cyclic order, that has a command queued. So:
   ports together, and a rejected attempt counts.
 - **No starvation.** No port is attempted twice while another port with a
   command queued waits, however continuously the first is refilled.
-- **A service bound.** Let `P` be the number of ports dispatched from when a
-  turn's command work begins, at most `1 + hostWindowLimit`, and `B` the budget.
-  A port with a command queued at that moment has that command attempted within
-  `⌈P / B⌉` turns' command work, counting that turn, assuming turns continue and
-  every dispatch returns. A window created meanwhile takes its place behind the
-  host's port, which the creation just served, so it never delays a port already
-  waiting, and a closed window's port leaves the order. This is a bound in turns,
-  not a wall-clock deadline, and it is separate from checkpoint reachability.
+- **A service bound.** Let `P` be the most ports dispatched from while a command
+  waits, at most `1 + hostWindowLimit`, and `B` the budget. Each attempt on a
+  port is followed by at most `P - 1` attempts on other ports before that port's
+  next, so a command at position `k` of its port's queue when a turn's command
+  work begins — the oldest is position one — is attempted within `⌈k · P / B⌉`
+  turns' command work, counting that turn, assuming turns continue and every
+  dispatch returns. The oldest command of every port with one queued is
+  therefore attempted within `⌈P / B⌉` turns. A window created meanwhile takes
+  its place behind the host's port, which the creation just served, so it never
+  delays a port already waiting, and a closed window's port leaves the order.
+  This is a bound in turns, not a wall-clock deadline, and it is separate from
+  checkpoint reachability.
 
 The scheduler's only state is the cursor, so its bookkeeping stays bounded
 through creation, closure, and churn.
@@ -1233,8 +1239,10 @@ windows; capacity and configuration rejections before any native call; a failed
 construction rolled back with its native evidence and no consumed capacity; a
 rollback cleanup failure poisoning creation and surviving to final exit; an
 unawaited creation's window enumerable, live through the drain, and disposed at
-shutdown; a cancellation during construction rolled back, and one landing after
-registration leaving the window registered and disposed; the middle of three
+shutdown; a cancellation delivered from another thread during construction
+rolling it back with no registry entry and its capacity reclaimed, and one
+pending across registration delivered before publication, leaving the window
+registered and disposed; the middle of three
 windows closed while the others observe and execute; close orders A-B-C and
 C-A-B each disposing every window with callbacks detached before destruction;
 retained ports, borrows, closes, and readers of a disposed window answering
@@ -1248,8 +1256,9 @@ bookkeeping bounded and identities never reissued across forty cycles of
 creation and an honoured native close request; shutdown with a window closing
 and closes racing it, every port closed before the drain and every window
 released once after it; and fair dispatch with a replenished, partly rejected
-port beside a waiting window port and host request, through closure and
-creation, within the documented bound and the budget.
+port beside a waiting window port holding two commands and a host request,
+through closure and creation, each command within its documented bound and
+every turn within the budget.
 
 ## State
 

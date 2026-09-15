@@ -114,6 +114,20 @@ library runtime-glfw
         Hetoimasia.Runtime.GLFW
     build-depends:
         base >=4.21 && <4.22,
+        hetoimasia-glfw:runtime-glfw-core
+
+-- The runtime integration's implementation, including the test-only host hooks
+-- the dynamic window examples use to deliver a cancellation at a precise point.
+-- Private, so no package outside this one can name them; the public
+-- runtime-glfw sublibrary re-exports everything else.
+library runtime-glfw-core
+    import: language
+    visibility: private
+    hs-source-dirs: runtime-glfw-core
+    exposed-modules:
+        Hetoimasia.Runtime.GLFW.Internal
+    build-depends:
+        base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
@@ -181,6 +195,7 @@ executable glfw-window-examples
         hetoimasia-glfw,
         hetoimasia-glfw:model,
         hetoimasia-glfw:runtime-glfw,
+        hetoimasia-glfw:runtime-glfw-core,
         hetoimasia-glfw:seam-core
 
 -- The native Hspec suite. The executable's process main thread owns one shared

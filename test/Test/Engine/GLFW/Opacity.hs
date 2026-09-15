@@ -29,11 +29,13 @@
 -- as well, exposing @hetoimasia-runtime@ and that sublibrary beside the rest.
 -- This suite does not import the sublibrary: it is built and registered because
 -- @glfw-window-examples@, one of this suite's build tools, depends on it.
--- Five clients must be rejected: one names the host's constructor, one asks
+-- Six clients must be rejected: one names the host's constructor, one asks
 -- the host for its session, windows' command host, and settings, one reaches
 -- for the owner loop's executor and event processing in the private modules
 -- the sublibrary uses, one asks the host for the collection that owns its
--- windows and the registry of their members and ports, and one forges a
+-- windows and the registry of their members and ports, one reaches for that
+-- collection and the host's test hooks in the private @runtime-glfw-core@
+-- implementation, and one forges a
 -- window's client capabilities, or reads another window's port out of them,
 -- through the capability's constructor and fields. One client must be accepted,
 -- linked, and run: it uses the host's supported configuration, construction,
@@ -219,6 +221,20 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hostCollection"
       clientOutput outcome `shouldContain` "hostEntries"
 
+  it "rejects a client that reaches for the collection or the host hooks in the window host's private implementation" $
+    withHostClient "Client.hs" hostCoreClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the window host's collection is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW.Internal"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "runtime-glfw-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that forges a window's client capabilities or takes another window's port out of them" $
     withHostClient "Client.hs" windowClientForgeryClient $ \compile → do
       outcome ← compile Typecheck
@@ -336,6 +352,20 @@ hostCollectionClient =
     , ""
     , "import Hetoimasia.Foundation.Resource.Collection (Collection)"
     , "import Hetoimasia.Runtime.GLFW (WindowHost, hostCollection, hostEntries)"
+    , ""
+    , "collection ∷ WindowHost → Collection"
+    , "collection = hostCollection"
+    ]
+
+-- | A client importing the window host's collection and hooks from its private
+-- implementation.
+hostCoreClient ∷ String
+hostCoreClient =
+  unlines
+    [ "module Client (collection) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.Collection (Collection)"
+    , "import Hetoimasia.Runtime.GLFW.Internal (WindowHost, allocWindowHostWith, hostCollection)"
     , ""
     , "collection ∷ WindowHost → Collection"
     , "collection = hostCollection"

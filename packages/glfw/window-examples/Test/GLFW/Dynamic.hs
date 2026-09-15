@@ -44,6 +44,7 @@ import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session (NativeError (..), NativeFailure (..), NativeOutcome (..), ReportingThread (..), Reports (..), defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
+import Hetoimasia.Runtime.GLFW.Internal (HostHooks (..), allocWindowHostWith, noHostHooks)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (Recognition (..), Role (..), RuntimeControl, SupervisedStart (..), WorkerPolicy (..), startSupervised)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
@@ -64,9 +65,9 @@ spec = describe "GLFW dynamic windows" $ do
       (boundedExample testRollbackCleanupPoisons)
     it "keeps a window whose creation ticket nobody awaits enumerable, live through the drain, and disposed at shutdown"
       (boundedExample testDroppedCreationTicket)
-    it "propagates a cancellation during construction after rolling it back, handing nothing over"
+    it "rolls back a construction cancelled from another thread, registering nothing, reclaiming its capacity, and handing nothing over"
       (boundedExample testCancelledConstruction)
-    it "keeps a window registered when a cancellation lands after registration and before its result is published"
+    it "keeps a window registered and enumerable when a cancellation pending across its registration lands before its result is published"
       (boundedExample testCancelledPublication)
 
   describe "the close protocol" $ do
@@ -282,32 +283,13 @@ testDroppedCreationTicket = do
 
 testCancelledConstruction ∷ Expectation
 testCancelledConstruction = do
-  (killing, arm) ← armedOnce
-  seam ← newSeam defaultScript {scriptWindowSize = \_ → killing >>= \now → if now then throwIO ThreadKilled else pure (800, 600)}
-  requested ← newIORef Nothing
-  (cancelled, _) ←
-    caughtAs $
-      hosted seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control →
-        looping host control $ \turn → case turnNumber turn of
-          1 → do
-            arm
-            submit (hostCommandPort host) (createWindowCommand (windowNamed "cancelled")) >>= writeIORef requested . Just
-            pure Continue
-          _ → pure (Continue ∷ TurnStep ())
-  cancelled `shouldBe` ThreadKilled
-  ticket ← slot requested
-  disposition ticket >>= (`shouldSatisfy` interrupted)
-  atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
-  destroyed seam `shouldReturn` [2, 1]
-  seamLiveWindowCallbacks seam `shouldReturn` 0
-
-testCancelledPublication ∷ Expectation
-testCancelledPublication = do
   owner ← newIORef Nothing
   (killing, arm) ← armedOnce
-  -- The new window's initial sample runs inside its masked construction. It
-  -- asks another thread to cancel the owner and returns once that cancellation
-  -- is pending, so it lands as registration unmasks, before publication.
+  -- The new window's initial sample asks another thread to cancel the owner,
+  -- then yields until that cancellation is delivered. Construction runs with the
+  -- owner's own masking state, so it is delivered inside the sample; had
+  -- construction been masked, the cancelling thread would block instead, which
+  -- fails the example.
   seam ←
     newSeam
       defaultScript
@@ -316,7 +298,7 @@ testCancelledPublication = do
             when now $ do
               target ← slot owner
               killer ← forkIO (killThread target)
-              awaitThrowPending killer
+              awaitDelivery killer
             pure (800, 600)
         }
   requested ← newIORef Nothing
@@ -324,6 +306,55 @@ testCancelledPublication = do
   (cancelled, _) ←
     caughtAs $
       hosted seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
+        myThreadId >>= writeIORef owner . Just
+        outcome ←
+          try . looping host control $ \turn → case turnNumber turn of
+            1 → do
+              arm
+              submit (hostCommandPort host) (createWindowCommand (windowNamed "cancelled")) >>= writeIORef requested . Just
+              pure Continue
+            _ → pure (Continue ∷ TurnStep ())
+        case outcome of
+          Right () → unexpected "the loop finished"
+          Left (caught ∷ SomeException) → do
+            listed ← identities host
+            kept ← hostBookkeeping host
+            writeIORef enumerated (Just (length listed, bookkeepingMembers kept))
+            throwIO caught
+  cancelled `shouldBe` ThreadKilled
+  ticket ← slot requested
+  disposition ticket >>= (`shouldSatisfy` interrupted)
+  atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
+  (listed, members) ← slot enumerated
+  -- Rolled back before the loop saw the cancellation: no registry entry, and its
+  -- capacity reclaimed.
+  (listed, members) `shouldBe` (1, 1)
+  destroyed seam `shouldReturn` [2, 1]
+  seamLiveWindowCallbacks seam `shouldReturn` 0
+
+testCancelledPublication ∷ Expectation
+testCancelledPublication = do
+  owner ← newIORef Nothing
+  (killing, arm) ← armedOnce
+  -- The host's private hook runs at the end of the new window's registration,
+  -- masked. It asks another thread to cancel the owner and returns once that
+  -- cancellation is pending, so it lands after both registrations and before the
+  -- creation's result is published.
+  let hooks =
+        noHostHooks
+          { afterRegistration = do
+              now ← killing
+              when now $ do
+                target ← slot owner
+                killer ← forkIO (killThread target)
+                awaitThrowPending killer
+          }
+  seam ← newSeam defaultScript
+  requested ← newIORef Nothing
+  enumerated ← newIORef Nothing
+  (cancelled, _) ←
+    caughtAs $
+      hostedWith hooks seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
         myThreadId >>= writeIORef owner . Just
         outcome ←
           try . looping host control $ \turn → case turnNumber turn of
@@ -721,24 +752,26 @@ testShutdownWhileClosing = do
 
 -- | A busy window's port is refilled to capacity on every turn with commands
 -- that alternate between its own window and another, which its port rejects.
--- Beside it, a quiet window's port and the host's port each wait on one
--- command, then the quiet window closes and a new window is created and
--- commanded through its own port. With three ports and a budget of two, the
--- documented bound is two turns: every tracked command submitted during a
--- turn's update has settled by the update two turns later.
+-- Beside it, a quiet window's port waits on two commands and the host's port on
+-- one, then the quiet window closes and a new window is created and commanded
+-- through its own port. With at most four ports and a budget of two, the
+-- documented bound for a command at position @k@ of its port is @⌈4k / 2⌉@
+-- turns: every tracked command submitted during a turn's update, at the position
+-- it is tracked with or earlier, has settled by the update that many turns
+-- later.
 testFairDispatch ∷ Expectation
 testFairDispatch = do
   seam ← newSeam defaultScript
   busyTickets ← newIORef []
   alternation ← newIORef (0 ∷ Int)
-  tracked ← newIORef ([] ∷ [(Text, Natural, CompletionTicket)])
+  tracked ← newIORef ([] ∷ [(Text, Natural, Natural, CompletionTicket)])
   problems ← newIORef ([] ∷ [Text])
   budgets ← newIORef []
   held ← newIORef Nothing
   (settled, busySettled) ←
     hosted
       seam
-      (settings (map windowNamed ["busy", "quiet"])) {hostWindowLimit = 2, hostCommandCapacity = 4, hostCommandBudget = 2}
+      (settings (map windowNamed ["busy", "quiet"])) {hostWindowLimit = 3, hostCommandCapacity = 4, hostCommandBudget = 2}
       (\host _ → pure host)
       ( \host control →
           looping host control $ \turn → do
@@ -748,35 +781,37 @@ testFairDispatch = do
               windows ← clients host
               (,) <$> at windows 0 <*> at windows 1 >>= writeIORef held . Just
             (busy, quiet) ← slot held
-            readIORef tracked >>= mapM_ (\(label, submitted, ticket) → do
+            readIORef tracked >>= mapM_ (\(label, submitted, position, ticket) → do
               pending ← isNothing <$> disposition ticket
-              when (pending && number >= submitted + 2) (modifyIORef' problems (<> [label <> " waited past its bound"])))
+              when (pending && number >= submitted + bound position) (modifyIORef' problems (<> [label <> " waited past its bound"])))
             busyOrder ← readIORef busyTickets >>= mapM (fmap isJust . disposition)
             unless (and (zipWith (>=) busyOrder (drop 1 busyOrder))) (modifyIORef' problems (<> ["the busy port settled out of order"]))
-            let track label port command = do
+            let track label position port command = do
                   ticket ← submit port command
-                  modifyIORef' tracked (<> [(label, number, ticket)])
+                  modifyIORef' tracked (<> [(label, number, position, ticket)])
                   pure ticket
             case number of
               1 → do
-                void (track "quiet" (clientCommandPort quiet) (observeWindowCommand (clientWindow quiet)))
-                void (track "host" (hostCommandPort host) (observeWindowCommand (clientWindow busy)))
+                void (track "quiet" 1 (clientCommandPort quiet) (observeWindowCommand (clientWindow quiet)))
+                void (track "quiet second" 2 (clientCommandPort quiet) (observeWindowCommand (clientWindow quiet)))
+                void (track "host" 1 (hostCommandPort host) (observeWindowCommand (clientWindow busy)))
               3 → do
-                void (track "close" (clientCommandPort quiet) (closeWindowCommand (clientWindow quiet)))
-                void (track "create" (hostCommandPort host) (createWindowCommand (windowNamed "created")))
+                -- At most second in its port, behind the quiet window's second command.
+                void (track "close" 2 (clientCommandPort quiet) (closeWindowCommand (clientWindow quiet)))
+                void (track "create" 1 (hostCommandPort host) (createWindowCommand (windowNamed "created")))
               5 → do
-                creation ← readIORef tracked >>= \entries → case [ticket | ("create", _, ticket) ← entries] of
+                creation ← readIORef tracked >>= \entries → case [ticket | ("create", _, _, ticket) ← entries] of
                   ticket : _ → pure ticket
                   [] → unexpected "no creation was tracked"
                 client ← atomically (pollWindowClient creation) >>= maybe (unexpected "the creation handed nothing over") pure
-                void (track "created" (clientCommandPort client) (observeWindowCommand (clientWindow client)))
-              7 → void (track "host again" (hostCommandPort host) (observeWindowCommand (clientWindow busy)))
+                void (track "created" 1 (clientCommandPort client) (observeWindowCommand (clientWindow client)))
+              7 → void (track "host again" 1 (hostCommandPort host) (observeWindowCommand (clientWindow busy)))
               _ → pure ()
             refill busyTickets alternation busy quiet
             if number < 12
               then pure Continue
               else do
-                outcomes ← readIORef tracked >>= mapM (\(label, _, ticket) → (label,) . kind <$> disposition ticket)
+                outcomes ← readIORef tracked >>= mapM (\(label, _, _, ticket) → (label,) . kind <$> disposition ticket)
                 busyOutcomes ← readIORef busyTickets >>= mapM (fmap kind . disposition)
                 pure (Finish (outcomes, busyOutcomes))
       )
@@ -786,6 +821,7 @@ testFairDispatch = do
   drop 1 spent `shouldBe` replicate (length spent - 1) 2
   settled
     `shouldBe` [ ("quiet", "performed")
+               , ("quiet second", "performed")
                , ("host", "performed")
                , ("close", "close begun")
                , ("create", "created")
@@ -794,6 +830,10 @@ testFairDispatch = do
                ]
   "rejected" `elem` busySettled `shouldBe` True
   "performed" `elem` busySettled `shouldBe` True
+  where
+    -- ⌈k · P / B⌉ with at most P = 1 + hostWindowLimit = 4 ports and a budget B = 2.
+    bound ∷ Natural → Natural
+    bound position = (position * 4 + 1) `div` 2
 
 -- | Fill the busy window's port to capacity, alternating between a command for
 -- its own window and one for the quiet window.
@@ -821,6 +861,12 @@ hosted ∷ Seam → HostConfig → (WindowHost → RuntimeControl → IO s) → 
 hosted seam config startup action =
   asProcessMainThread seam $
     runWindowApplication lifetime "dynamic-example" (allocWindowHostIn (seamSession seam defaultSessionConfig) config) id startup action
+
+-- | 'hosted' with the host's private hooks.
+hostedWith ∷ HostHooks → Seam → HostConfig → (WindowHost → RuntimeControl → IO s) → (s → RuntimeControl → IO a) → IO a
+hostedWith hooks seam config startup action =
+  asProcessMainThread seam $
+    runWindowApplication lifetime "dynamic-example" (allocWindowHostWith hooks (seamSession seam defaultSessionConfig) config) id startup action
 
 -- | 'hosted', expecting the run to fail, and catching the failure on the bound
 -- thread itself: 'runInBoundThread' rethrows a failure without the context its
@@ -910,6 +956,14 @@ destroyed seam = (\calls → [key | DestroyWindow key ← calls]) <$> seamCalls 
 
 detachments ∷ Seam → IO [Int]
 detachments seam = (\calls → [key | DetachWindowCallbacks key ← calls]) <$> seamCalls seam
+
+-- | Yield until a cancelling thread's exception is delivered to the calling
+-- thread, which must be unmasked; a caller that is masked instead fails.
+awaitDelivery ∷ ThreadId → IO ()
+awaitDelivery thread =
+  threadStatus thread >>= \case
+    ThreadBlocked BlockedOnException → throwIO (userError "the cancellation was held back: the caller was masked")
+    _ → yield >> awaitDelivery thread
 
 -- | Wait until a thread is blocked delivering an exception to a masked thread.
 awaitThrowPending ∷ ThreadId → IO ()

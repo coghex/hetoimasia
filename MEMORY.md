@@ -354,7 +354,14 @@ not a verdict that Synarchy's design should be discarded.
   `WindowClosing` and `WindowDisposalFailed` (a part failed but release stayed
   certain), so a lexical window whose detach reports an error now ends
   `WindowDisposalFailed`. Dispatch is round-robin from a cursor over the host
-  port then window ports; bound `⌈P/B⌉` turns. Quiescence closes every port.
+  port then window ports; a command at queue position `k` is attempted within
+  `⌈k·P/B⌉` turns. Quiescence closes every port. Registration uses the
+  collection's additive `acquireMemberThen`: construction runs with the caller's
+  masking state (so an external cancellation rolls it back), and the host's
+  registry insertion is the masked handoff. The closing commit and the
+  `WindowClosing` publication share one STM transaction. The implementation lives
+  in the private `runtime-glfw-core` (`Hetoimasia.Runtime.GLFW.Internal`, with
+  test-only `HostHooks`); the public module re-exports it.
   Examples catching cleanup evidence must catch inside `asProcessMainThread`,
   because `runInBoundThread` drops exception context. Contract: `docs/glfw.md`,
   "Dynamic windows" and "Fair dispatch".
