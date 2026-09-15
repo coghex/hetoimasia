@@ -21,7 +21,8 @@
 --
 -- This component is public only so the root package's test suite can depend on
 -- it. It exposes no native handle, no session or window constructor, and no way
--- to deliver window callbacks or change a window's close intent: those drivers
+-- to deliver window or monitor callbacks, change the scripted monitors after
+-- entry, or change a window's close intent: those drivers
 -- live in the package's private @seam-core@ sublibrary and are used only by its
 -- own @glfw-window-examples@ executable.
 module Hetoimasia.GLFW.Seam
@@ -34,7 +35,16 @@ module Hetoimasia.GLFW.Seam
   , seamCalls
   , seamLiveCallbacks
   , seamLiveWindowCallbacks
+  , seamLiveMonitorCallbacks
   , featureUnavailableCode
+
+    -- * Scripted monitors
+  , MonitorTopology (..)
+  , ScriptedMonitor (..)
+  , NativeVideoMode (..)
+  , MonitorQuery (..)
+  , noMonitors
+  , scriptedMonitor
 
     -- * Thread identity
   , asProcessMainThread
@@ -53,9 +63,13 @@ module Hetoimasia.GLFW.Seam
   ) where
 
 import Hetoimasia.GLFW.Internal.Seam
-  ( NativeCall (..)
+  ( MonitorQuery (..)
+  , MonitorTopology (..)
+  , NativeCall (..)
+  , NativeVideoMode (..)
   , Reporter
   , Seam
+  , ScriptedMonitor (..)
   , SeamScript (..)
   , WindowAttribute (..)
   , WindowHint (..)
@@ -64,11 +78,14 @@ import Hetoimasia.GLFW.Internal.Seam
   , designateProcessMainThread
   , featureUnavailableCode
   , newSeam
+  , noMonitors
   , reportError
   , reportErrorFromOtherThread
   , reportErrorWithFailingIdentity
   , seamCalls
   , seamLiveCallbacks
+  , seamLiveMonitorCallbacks
   , seamLiveWindowCallbacks
   , seamSession
+  , scriptedMonitor
   )

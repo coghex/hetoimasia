@@ -249,7 +249,7 @@ testInitializationReportTerminates = do
                    , SetInitHints X11
                    , Initialize
                    ]
-      <> exitCalls
+      <> initializationExitCalls
   seamLiveCallbacks seam `shouldReturn` 0
 
 testBackendMismatchTerminates ∷ Expectation
@@ -258,7 +258,7 @@ testBackendMismatchTerminates = do
   (mismatch, caught) ← asProcessMainThread seam (caughtAs (entered seam defaultSessionConfig (\_ → pure ())))
   mismatch `shouldBe` BackendNotSelected X11 (Just Wayland)
   originOf caught `shouldBe` Just ("glfw", "verify backend", x11)
-  seamCalls seam `shouldReturn` entryCalls <> exitCalls
+  seamCalls seam `shouldReturn` initializationCalls <> initializationExitCalls
 
 testRollbackFailurePoisons ∷ Expectation
 testRollbackFailurePoisons = do
@@ -413,7 +413,7 @@ testBodyFailureWithUnsafeTeardown = do
           `shouldBe` Just (Reports [NativeError 0x00010008 "terminate reported" False ProcessMainThread] 0 0)
         originIn (failureEvidenceInContext context) `shouldBe` Just ("glfw", "terminate", x11)
     [] → expectationFailure "no cleanup evidence was retained"
-  let attempted = entryCalls <> [Terminate, DetachErrorCallback]
+  let attempted = entryCalls <> [DetachMonitorCallback, Terminate, DetachErrorCallback]
   seamCalls seam `shouldReturn` attempted
   seamLiveCallbacks seam `shouldReturn` 1
   (poisoned, _) ← asProcessMainThread seam (caughtAs (entered seam defaultSessionConfig (\_ → pure ())))
@@ -466,9 +466,15 @@ testOwnerOnlyOperations = do
 entered ∷ Seam → SessionConfig → (Session → IO r) → IO r
 entered seam config = withScoped (seamSession seam config)
 
--- | The native calls of a successful entry on the default script's platform.
+-- | The native calls of a successful entry on the default script's platform,
+-- which has no monitor.
 entryCalls ∷ [NativeCall]
-entryCalls =
+entryCalls = initializationCalls <> [CreateMonitorCallback, AttachMonitorCallback, QueryMonitors, QueryPrimaryMonitor]
+
+-- | The native calls of entry through the verified backend, before the monitor
+-- inventory's stages.
+initializationCalls ∷ [NativeCall]
+initializationCalls =
   [ QueryPlatformSupported X11
   , CreateErrorCallback
   , AttachErrorCallback
@@ -479,7 +485,12 @@ entryCalls =
 
 -- | The native calls of a complete, safe teardown.
 exitCalls ∷ [NativeCall]
-exitCalls = [Terminate, DetachErrorCallback, FreeErrorCallback]
+exitCalls = [DetachMonitorCallback, Terminate, DetachErrorCallback, FreeErrorCallback, FreeMonitorCallback]
+
+-- | The native calls of a safe teardown of a session whose entry failed before
+-- the monitor inventory's stages.
+initializationExitCalls ∷ [NativeCall]
+initializationExitCalls = [Terminate, DetachErrorCallback, FreeErrorCallback]
 
 x11 ∷ [(Text, Text)]
 x11 = [("backend", "x11")]

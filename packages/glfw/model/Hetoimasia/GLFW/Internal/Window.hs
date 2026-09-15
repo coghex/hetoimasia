@@ -253,6 +253,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , snapshotReader
   )
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
+import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..))
 import Hetoimasia.GLFW.Internal.Capture
   ( NativeError (..)
   , Reports (..)
@@ -397,16 +398,6 @@ data WindowPhase
 
 instance NFData WindowPhase
 
--- | One observed attribute.
-data Attribute a
-  = Observed !a
-    -- ^ The value the platform reported when sampled or called back.
-  | Unavailable
-    -- ^ The platform cannot provide this attribute.
-  deriving (Eq, Show, Generic)
-
-instance NFData a ⇒ NFData (Attribute a)
-
 -- | A size: logical in screen coordinates, or a framebuffer's in pixels.
 data Extent = Extent
   { extentWidth ∷ !Int
@@ -415,15 +406,6 @@ data Extent = Extent
   deriving (Eq, Show, Generic)
 
 instance NFData Extent
-
--- | The ratio between the platform's DPI and its default DPI, per axis.
-data ContentScale = ContentScale
-  { scaleX ∷ !Float
-  , scaleY ∷ !Float
-  }
-  deriving (Eq, Show, Generic)
-
-instance NFData ContentScale
 
 -- | The content area's upper-left corner in desktop screen coordinates.
 data Placement = Placement

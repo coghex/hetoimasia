@@ -28,6 +28,10 @@
 -- The buckets live in one 'IORef' updated with 'atomicModifyIORef'', so a
 -- callback invoked synchronously from inside an owner call, or concurrently
 -- from another thread, never blocks on the owner.
+--
+-- An owner operation that took reports made during its native call raises them
+-- with 'raiseReported' as a 'NativeFailure' attributed to the @glfw@ component,
+-- which the session, window, and monitor models share.
 module Hetoimasia.GLFW.Internal.Capture
   ( -- * Evidence
     NativeError (..)
@@ -36,6 +40,12 @@ module Hetoimasia.GLFW.Internal.Capture
   , hasReports
   , errorEvidenceCapacity
   , errorDescriptionLimit
+
+    -- * Failures raised from the evidence
+  , glfwComponent
+  , NativeOutcome (..)
+  , NativeFailure (..)
+  , raiseReported
 
     -- * Capture
   , ErrorCallback
@@ -47,7 +57,8 @@ module Hetoimasia.GLFW.Internal.Capture
   , takeOtherReports
   ) where
 
-import Control.Exception (SomeException, try, uninterruptibleMask_)
+import Control.Exception (Exception, SomeException, try, uninterruptibleMask_)
+import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Text (Text)
@@ -58,6 +69,8 @@ import Foreign.C.String (CString)
 import Foreign.C.Types (CInt)
 import Foreign.Ptr (nullPtr)
 import Foreign.Storable (peekByteOff)
+import Hetoimasia.Foundation.Failure (Operation, throwFailure)
+import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Numeric.Natural (Natural)
 
 -- | One report the native error callback made.
@@ -98,6 +111,34 @@ data Reports = Reports
 hasReports ∷ Reports → Bool
 hasReports reports =
   not (null (reportedErrors reports)) || reportsLost reports > 0 || callbackFaults reports > 0
+
+-- | The component every failure raised by this package is attributed to.
+glfwComponent ∷ Component
+glfwComponent = unsafeComponent "glfw"
+
+-- | Whether the native call itself signalled failure.
+data NativeOutcome
+  = NativeCallReturned
+    -- ^ The call returned normally, but errors were reported during it.
+  | NativeCallFailed
+    -- ^ The call returned its failure value.
+  deriving (Eq, Show)
+
+-- | A native call failed or reported errors on the owner thread while it ran.
+data NativeFailure = NativeFailure
+  { nativeOutcome ∷ !NativeOutcome
+  , nativeReports ∷ !Reports
+  }
+  deriving (Eq, Show)
+
+instance Exception NativeFailure
+
+-- | Raise reports taken after a native call as that operation's
+-- 'NativeFailure', if anything was reported.
+raiseReported ∷ Operation → [(Text, Text)] → NativeOutcome → Reports → IO ()
+raiseReported operationName identifiers outcome reports =
+  when (hasReports reports) $
+    throwFailure glfwComponent operationName identifiers (NativeFailure outcome reports)
 
 -- | How many reports each bucket keeps before counting the rest as lost.
 errorEvidenceCapacity ∷ Int

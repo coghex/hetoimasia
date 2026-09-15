@@ -5,8 +5,9 @@ synopsis: GLFW 3.4 native binding and main-thread session for Hetoimasia
 description:
     A small private binding to upstream GLFW 3.4 and one scoped session owned by
     the process main thread: exclusive initialization and termination, bounded
-    evidence of what the native error callback reported, scoped NoAPI
-    windows that publish what the platform observed through snapshots, and
+    evidence of what the native error callback reported, a monitor inventory
+    with disconnect-safe identities, scoped NoAPI windows that publish what the
+    platform observed through snapshots, and
     bounded window command admission with persistent completion tickets. Its
     main library depends on the foundation library and not on the runtime. The
     separate public runtime-glfw sublibrary composes a window host and its
@@ -34,9 +35,10 @@ common language
     default-extensions: UnicodeSyntax OverloadedStrings
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
 
--- The session and window models: exclusivity, thread checks, staged
--- construction and rollback, bounded error capture, window observations,
--- contained callbacks, and window command admission, execution, and completion,
+-- The session, window, and monitor models: exclusivity, thread checks, staged
+-- construction and rollback, bounded error capture, window observations, the
+-- monitor inventory and its identities, contained callbacks, and window command
+-- admission, execution, and completion,
 -- written over a table of native operations. It binds nothing, so the test seam
 -- can drive it without linking GLFW.
 library model
@@ -44,7 +46,9 @@ library model
     visibility: private
     hs-source-dirs: model
     exposed-modules:
+        Hetoimasia.GLFW.Internal.Attribute
         Hetoimasia.GLFW.Internal.Capture
+        Hetoimasia.GLFW.Internal.Monitor
         Hetoimasia.GLFW.Internal.Session
         Hetoimasia.GLFW.Internal.Window
         Hetoimasia.GLFW.Internal.Command
@@ -86,6 +90,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GLFW.Command
+        Hetoimasia.GLFW.Monitor
         Hetoimasia.GLFW.Session
         Hetoimasia.GLFW.Window
     build-depends:
@@ -147,8 +152,9 @@ library seam-core
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw:model
 
--- The window model, window command, and window host examples that use the
--- private window drivers and the private command executor. An executable rather than a
+-- The window model, window command, window host, and monitor inventory examples
+-- that use the private window and monitor drivers and the private command
+-- executor. An executable rather than a
 -- library, so its modules cannot be imported; hetoimasia-tests runs it from its
 -- GLFW group through build-tool-depends. It initializes no GLFW and opens no
 -- display.
@@ -159,6 +165,7 @@ executable glfw-window-examples
     other-modules:
         Test.GLFW.Command
         Test.GLFW.Host
+        Test.GLFW.Monitor
         Test.GLFW.Window
     ghc-options: -threaded
     build-depends:
@@ -169,6 +176,7 @@ executable glfw-window-examples
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw,
+        hetoimasia-glfw:model,
         hetoimasia-glfw:runtime-glfw,
         hetoimasia-glfw:seam-core
 
@@ -188,6 +196,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Fixture
         Test.GLFW.Native.Harness
         Test.GLFW.Native.Host
+        Test.GLFW.Native.Monitor
         Test.GLFW.Native.Private
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec

@@ -5,6 +5,11 @@
  * GLFW function: it answers whether the calling OS thread is the process main
  * thread, which a Haskell ThreadId or a bound thread cannot establish.
  *
+ * The monitor accessors only change the pointer types GLFW returns to the ones
+ * the generated import wrappers declare, and the video mode copier reads one
+ * GLFWvidmode through the header's own declaration, so the binding never
+ * assumes the structure's layout.
+ *
  * The close-request driver exists for the native examples only. It asks the
  * platform to close a window the way its close button would, so GLFW's own
  * close callback reports a real native request.
@@ -154,6 +159,37 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 }
 
 #endif
+
+void** hetoimasia_glfw_monitors(int* count)
+{
+    return (void**) glfwGetMonitors(count);
+}
+
+char* hetoimasia_glfw_monitor_name(GLFWmonitor* monitor)
+{
+    return (char*) glfwGetMonitorName(monitor);
+}
+
+void* hetoimasia_glfw_video_mode(GLFWmonitor* monitor)
+{
+    return (void*) glfwGetVideoMode(monitor);
+}
+
+void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count)
+{
+    return (void*) glfwGetVideoModes(monitor, count);
+}
+
+void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields)
+{
+    const GLFWvidmode* mode = &modes[index];
+    fields[0] = mode->width;
+    fields[1] = mode->height;
+    fields[2] = mode->redBits;
+    fields[3] = mode->greenBits;
+    fields[4] = mode->blueBits;
+    fields[5] = mode->refreshRate;
+}
 
 /* The production finite event wait, and what the native examples may observe
  * of it.

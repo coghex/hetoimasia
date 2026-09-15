@@ -2,14 +2,20 @@
 
 -- | The private binding to upstream GLFW 3.4, and the production native table.
 --
--- Only the operations the session and window models use are bound. Every function and
+-- Only the operations the session, window, and monitor models use are bound. Every function and
 -- constant is imported through @hetoimasia_glfw.h@, which includes the
 -- installed @GLFW/glfw3.h@, so the C compiler checks each declaration and every
 -- constant's value comes from the header rather than from a copied number. The
 -- production finite event wait is made through the shim's
 -- @hetoimasia_glfw_wait_events_timeout@, which records the waiting thread and a
 -- per-wait sequence number for the native examples, then calls
--- @glfwWaitEventsTimeout@. The exceptions to CAPI imports are @glfwSetErrorCallback@ and the window callback setters,
+-- @glfwWaitEventsTimeout@. The monitor enumeration, name, and video mode getters
+-- are reached through shim accessors that only restate GLFW's @const@ return
+-- types as the generated wrappers declare them, and video modes are copied
+-- field by field through @hetoimasia_glfw_video_mode_at@, so no structure
+-- layout is assumed, and
+-- every array and string GLFW returns is copied before the operation returns.
+-- The exceptions to CAPI imports are @glfwSetErrorCallback@, @glfwSetMonitorCallback@, and the window callback setters,
 -- imported with @ccall@: their argument is a function pointer whose C type the
 -- CAPI wrapper cannot spell, and it is passed and returned as a plain pointer.
 --
@@ -27,6 +33,7 @@ module Hetoimasia.GLFW.Internal.Native
   , glfwPlatformUnavailable
 
     -- * Native example drivers
+  , installedMonitorCallbackForCheck
   , setWindowSizeForCheck
   , pollEventsForCheck
   , waitEventsForCheck
@@ -42,13 +49,21 @@ import Control.Monad (void)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int32)
 import Data.Text (Text)
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt))
 import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
-import Foreign.Storable (Storable, peek)
+import Foreign.Storable (Storable, peek, peekElemOff)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
+import Hetoimasia.GLFW.Internal.Monitor
+  ( MonitorCallback
+  , MonitorCallbackStorage (MonitorCallbackStorage)
+  , MonitorNative (..)
+  , NativeMonitor
+  , NativeVideoMode (..)
+  )
 import Hetoimasia.GLFW.Internal.Session
   ( Backend (..)
   , CallbackStorage (CallbackStorage)
@@ -101,7 +116,79 @@ productionNative =
     , nativePollEvents = c_glfwPollEvents
     , nativeWaitEventsTimeout = c_waitEventsTimeout . CDouble
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
+    , nativeMonitor = productionMonitors
     }
+
+-- | The monitor operations, bound to GLFW.
+productionMonitors ∷ MonitorNative
+productionMonitors =
+  MonitorNative
+    { nativeMonitors = alloca $ \count → do
+        array ← c_glfwGetMonitors count
+        reported ← peek count
+        counted array reported (\copied → peekArray copied array)
+    , nativePrimaryMonitor = c_glfwGetPrimaryMonitor
+    , nativeMonitorName = \monitor → do
+        name ← c_glfwGetMonitorName monitor
+        if name == nullPtr
+          then pure Nothing
+          else Just . decodeUtf8Lenient <$> ByteString.packCString name
+    , nativeMonitorPosition = pairOf c_glfwGetMonitorPos id
+    , nativeMonitorWorkArea = \monitor →
+        alloca $ \x → alloca $ \y → alloca $ \width → alloca $ \height → do
+          c_glfwGetMonitorWorkarea monitor x y width height
+          (,,,) <$> peek x <*> peek y <*> peek width <*> peek height
+    , nativeMonitorPhysicalSize = pairOf c_glfwGetMonitorPhysicalSize id
+    , nativeMonitorContentScale = pairOf c_glfwGetMonitorContentScale id
+    , nativeMonitorCurrentMode = \monitor → do
+        mode ← c_glfwGetVideoMode monitor
+        if mode == nullPtr then pure Nothing else Just <$> videoModeAt mode 0
+    , nativeMonitorVideoModes = \monitor →
+        alloca $ \count → do
+          modes ← c_glfwGetVideoModes monitor count
+          reported ← peek count
+          counted modes reported (\copied → mapM (videoModeAt modes) [0 .. copied - 1])
+    , nativeNewMonitorCallback = fmap MonitorCallbackStorage . c_wrapMonitorCallback
+    , nativeAttachMonitorCallback = \(MonitorCallbackStorage callback) →
+        void (c_glfwSetMonitorCallback callback)
+    , nativeDetachMonitorCallback = void (c_glfwSetMonitorCallback nullFunPtr)
+    , nativeFreeMonitorCallback = \(MonitorCallbackStorage callback) → freeHaskellFunPtr callback
+    , nativeMonitorConnected = glfwConnected
+    , nativeMonitorDisconnected = glfwDisconnected
+    }
+
+-- | Copy a counted GLFW array: 'Nothing' for a negative count, or a positive
+-- count beside a null array.
+counted ∷ Ptr a → CInt → (Int → IO [b]) → IO (Maybe [b])
+counted array count copy
+  | count < 0 = pure Nothing
+  | count == 0 = pure (Just [])
+  | array == nullPtr = pure Nothing
+  | otherwise = Just <$> copy (fromIntegral count)
+
+-- | GLFW's video mode structure, only ever read through the shim.
+data VideoModes
+
+-- | Copy one video mode's fields.
+videoModeAt ∷ Ptr VideoModes → Int → IO NativeVideoMode
+videoModeAt modes index =
+  allocaArray 6 $ \fields → do
+    c_videoModeAt modes (fromIntegral index) fields
+    NativeVideoMode
+      <$> peekElemOff fields 0
+      <*> peekElemOff fields 1
+      <*> peekElemOff fields 2
+      <*> peekElemOff fields 3
+      <*> peekElemOff fields 4
+      <*> peekElemOff fields 5
+
+-- | The monitor callback GLFW currently holds, read by replacing it with none and
+-- restoring it, for the native examples only.
+installedMonitorCallbackForCheck ∷ IO MonitorCallbackStorage
+installedMonitorCallbackForCheck = do
+  installed ← c_glfwSetMonitorCallback nullFunPtr
+  _ ← c_glfwSetMonitorCallback installed
+  pure (MonitorCallbackStorage installed)
 
 -- | The exclusivity guard for this process's one GLFW instance.
 processGuard ∷ Guard
@@ -142,10 +229,10 @@ attributeCode MaximizedAttribute = glfwMaximized
 attributeCode VisibleAttribute = glfwVisible
 
 -- | Read a pair a GLFW getter writes through two out-pointers.
-pairOf ∷ Storable c ⇒ (Ptr NativeWindow → Ptr c → Ptr c → IO ()) → (c → a) → Ptr NativeWindow → IO (a, a)
-pairOf getter convert window =
+pairOf ∷ Storable c ⇒ (Ptr object → Ptr c → Ptr c → IO ()) → (c → a) → Ptr object → IO (a, a)
+pairOf getter convert object =
   alloca $ \first → alloca $ \second → do
-    getter window first second
+    getter object first second
     (,) <$> (convert <$> peek first) <*> (convert <$> peek second)
 
 type PairCallback = Ptr NativeWindow → CInt → CInt → IO ()
@@ -324,6 +411,43 @@ foreign import capi safe "hetoimasia_glfw.h glfwPollEvents"
 foreign import capi safe "hetoimasia_glfw.h glfwWaitEventsTimeout"
   c_glfwWaitEventsTimeout ∷ CDouble → IO ()
 
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_monitors"
+  c_glfwGetMonitors ∷ Ptr CInt → IO (Ptr (Ptr NativeMonitor))
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetPrimaryMonitor"
+  c_glfwGetPrimaryMonitor ∷ IO (Ptr NativeMonitor)
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_monitor_name"
+  c_glfwGetMonitorName ∷ Ptr NativeMonitor → IO CString
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetMonitorPos"
+  c_glfwGetMonitorPos ∷ Ptr NativeMonitor → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetMonitorWorkarea"
+  c_glfwGetMonitorWorkarea ∷ Ptr NativeMonitor → Ptr CInt → Ptr CInt → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetMonitorPhysicalSize"
+  c_glfwGetMonitorPhysicalSize ∷ Ptr NativeMonitor → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetMonitorContentScale"
+  c_glfwGetMonitorContentScale ∷ Ptr NativeMonitor → Ptr CFloat → Ptr CFloat → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_video_mode"
+  c_glfwGetVideoMode ∷ Ptr NativeMonitor → IO (Ptr VideoModes)
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_video_modes"
+  c_glfwGetVideoModes ∷ Ptr NativeMonitor → Ptr CInt → IO (Ptr VideoModes)
+
+-- The copier reads the structure and calls nothing.
+foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_video_mode_at"
+  c_videoModeAt ∷ Ptr VideoModes → CInt → Ptr CInt → IO ()
+
+foreign import ccall safe "glfwSetMonitorCallback"
+  c_glfwSetMonitorCallback ∷ FunPtr MonitorCallback → IO (FunPtr MonitorCallback)
+
+foreign import ccall "wrapper"
+  c_wrapMonitorCallback ∷ MonitorCallback → IO (FunPtr MonitorCallback)
+
 foreign import ccall "wrapper"
   c_wrapPairCallback ∷ PairCallback → IO (FunPtr PairCallback)
 
@@ -378,6 +502,8 @@ foreign import capi "hetoimasia_glfw.h value GLFW_FOCUS_ON_SHOW" glfwFocusOnShow
 foreign import capi "hetoimasia_glfw.h value GLFW_ICONIFIED" glfwIconified ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_MAXIMIZED" glfwMaximized ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_RESIZABLE" glfwResizable ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_CONNECTED" glfwConnected ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_DISCONNECTED" glfwDisconnected ∷ CInt
 
 -- | @GLFW_FEATURE_UNAVAILABLE@, the error a query reports for a property the
 -- platform cannot provide.
