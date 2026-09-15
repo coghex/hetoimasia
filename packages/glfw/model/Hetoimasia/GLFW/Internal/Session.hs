@@ -297,6 +297,11 @@ data Native = Native
   , nativeWindowPosition ∷ Ptr NativeWindow → IO (Int, Int)
     -- ^ The content area's upper-left corner in desktop screen coordinates.
   , nativeWindowAttribute ∷ Ptr NativeWindow → WindowAttribute → IO Bool
+  , nativePollEvents ∷ IO ()
+    -- ^ Process the events already pending, without waiting.
+  , nativeWaitEventsTimeout ∷ Double → IO ()
+    -- ^ Wait at most this many seconds for an event, then process every
+    -- pending event.
   , nativeFeatureUnavailable ∷ !Int
     -- ^ The error code a query reports for a property this platform cannot
     -- provide: @GLFW_FEATURE_UNAVAILABLE@.

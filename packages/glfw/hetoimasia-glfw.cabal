@@ -7,8 +7,12 @@ description:
     the process main thread: exclusive initialization and termination, bounded
     evidence of what the native error callback reported, scoped NoAPI
     windows that publish what the platform observed through snapshots, and
-    bounded window command admission with persistent completion tickets. It
-    depends on the foundation library and not on the runtime, and imports no game, scripting, logging, or rendering module.
+    bounded window command admission with persistent completion tickets. Its
+    main library depends on the foundation library and not on the runtime. The
+    separate public runtime-glfw sublibrary composes a window host and its
+    supervised owner loop with the runtime's application lifecycle, and no
+    library depends on it. No component imports a game, scripting,
+    or rendering module.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -90,6 +94,28 @@ library
         hetoimasia-glfw:model,
         hetoimasia-glfw:native
 
+-- The runtime integration: a window host built as a scoped application
+-- dependency, the supervised owner loop that processes native events and is the
+-- only production executor of its command port, and the host's quiescence
+-- action. It is the one library that depends on both the GLFW library and the
+-- runtime, and no library depends on it. It uses the private model for execution
+-- and event processing, and exports none of it.
+library runtime-glfw
+    import: language
+    visibility: public
+    hs-source-dirs: runtime-glfw
+    exposed-modules:
+        Hetoimasia.Runtime.GLFW
+    build-depends:
+        base >=4.21 && <4.22,
+        containers >=0.7 && <0.8,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-glfw,
+        hetoimasia-glfw:model
+
 -- The private test seam: the real session model over a scripted native
 -- library, for CPU examples that must not initialize GLFW. It is public only so
 -- the root package's test suite can depend on it; it exposes no native handle
@@ -121,8 +147,8 @@ library seam-core
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw:model
 
--- The window model and window command examples that use the private window
--- drivers and the private command executor. An executable rather than a
+-- The window model, window command, and window host examples that use the
+-- private window drivers and the private command executor. An executable rather than a
 -- library, so its modules cannot be imported; hetoimasia-tests runs it from its
 -- GLFW group through build-tool-depends. It initializes no GLFW and opens no
 -- display.
@@ -132,6 +158,7 @@ executable glfw-window-examples
     hs-source-dirs: window-examples
     other-modules:
         Test.GLFW.Command
+        Test.GLFW.Host
         Test.GLFW.Window
     ghc-options: -threaded
     build-depends:
@@ -140,7 +167,9 @@ executable glfw-window-examples
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw,
+        hetoimasia-glfw:runtime-glfw,
         hetoimasia-glfw:seam-core
 
 -- The native Hspec suite. The executable's process main thread owns one shared
@@ -158,6 +187,7 @@ test-suite glfw-native-tests
     other-modules:
         Test.GLFW.Native.Fixture
         Test.GLFW.Native.Harness
+        Test.GLFW.Native.Host
         Test.GLFW.Native.Private
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec
@@ -172,6 +202,8 @@ test-suite glfw-native-tests
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw,
         hetoimasia-glfw:model,
-        hetoimasia-glfw:native
+        hetoimasia-glfw:native,
+        hetoimasia-glfw:runtime-glfw

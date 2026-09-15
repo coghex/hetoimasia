@@ -1,19 +1,22 @@
 # GLFW session and windows
 
 Current behavior of `hetoimasia-glfw`, the package that owns the native binding
-to upstream GLFW 3.4, the one process-main-thread session over it, and the
-lexically scoped windows created in that session. The accepted direction and
-the later slices live in
-[the GLFW integration design](glfw_integration_design.md) (P-1 to P-7,
-P-11, D-5, D-6, D-8, D-9, D-11, D-13); this document describes what the code
-does today.
+to upstream GLFW 3.4, the one process-main-thread session over it, the
+lexically scoped windows created in that session, and the window host and owner
+loop that compose them with the runtime's application lifecycle. The accepted
+direction and the later slices live in
+[the GLFW integration design](glfw_integration_design.md) (P-1 to P-9, P-11,
+D-4, D-5, D-6, D-8, D-9, D-11, D-13, D-17); this document describes what the
+code does today.
 
 A session is entered, its asynchronous native error reports are read, windows
 are created in it, observed through read-only snapshots, asked for fresh
 observations through bounded window command ports, and released when their
-scopes end, and the session ends. Nothing drains those ports from an event loop
-yet, and there is no event loop, input feed, monitor inventory, manipulation or
-mode command, close policy, dynamic window collection, or rendering operation.
+scopes end, and the session ends. A window host owns those together as an
+application dependency, and its supervised owner loop processes native events,
+drains the ports, and surfaces close requests to application policy. There is
+no input feed, monitor inventory, manipulation or mode command, default close
+policy, dynamic window collection, or rendering operation.
 
 ## Package layout
 
@@ -22,13 +25,20 @@ mode command, close policy, dynamic window collection, or rendering operation.
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
 | `hetoimasia-glfw:model` | private | The session and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
+| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host, its supervised owner loop, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
-| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks and change close intent, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model and window command examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, and window examples on the platform it runs on |
+| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, and the private window command executor |
+| `glfw-window-examples` | executable, test-only | The window model, window command, and window host examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, window, and window host examples on the platform it runs on |
 
-The package depends on `hetoimasia-foundation` and not on
-`hetoimasia-runtime`. Its only logging import is `Component` from
+The main library and the `model`, `native`, `seam`, and `seam-core`
+sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
+`runtime-glfw` depends on both, and no library depends on it; only the
+package's own `glfw-window-examples` and `glfw-native-tests`, and
+`hetoimasia-tests`, use it. The runtime integration therefore inverts no
+dependency. It is a sublibrary with its own source root rather than a separate
+package because the native suite must depend on it, and Cabal refuses that as a
+cycle between packages. The package's only logging import is `Component` from
 `Hetoimasia.Foundation.Log`, for failure identifiers; it takes no logger and
 writes to no sink.
 
@@ -145,11 +155,48 @@ data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
 data WindowCommandMisuse = OwnerThreadWouldWait
 ```
 
+```haskell
+-- Hetoimasia.Runtime.GLFW, in hetoimasia-glfw:runtime-glfw
+data WindowHost
+allocWindowHost       ∷ HasCallStack ⇒ HostConfig → Scoped WindowHost
+allocWindowHostIn     ∷ HasCallStack ⇒ Scoped Session → HostConfig → Scoped WindowHost
+hostWindows           ∷ WindowHost → [Window]
+hostCommandPort       ∷ WindowHost → WindowCommandPort
+hostCommandStatistics ∷ WindowHost → STM CommandStatistics
+hostActivity          ∷ WindowHost → STM HostActivity
+quiesceWindowHost     ∷ WindowHost → STM ()
+data HostActivity = HostActivity { activityTurn ∷ Natural, activityWaiting ∷ Bool }
+
+data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
+                             , hostCommandCapacity ∷ Integer, hostCommandBudget, hostEventBudget ∷ Int
+                             , hostIdleWait ∷ Double }
+defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- capacity 64, budgets 16, idle wait 0.1 s
+validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
+data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | IdleWaitRejected Double
+hostComponent ∷ Component                   -- "glfw.runtime"
+
+runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
+data LoopHooks a = LoopHooks { loopEvent ∷ IO Bool, loopUpdate ∷ Turn → IO (TurnStep a) }
+noApplicationEvents ∷ IO Bool
+data Turn = Turn { turnNumber ∷ Natural, turnWaited ∷ Bool, turnCommands, turnEvents ∷ Int
+                 , turnCloseRequests ∷ [CloseRequest] }
+data TurnStep a = Continue | Finish a
+rejectHostCloseRequest ∷ WindowHost → CloseRequest → IO Bool
+
+runWindowApplication
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r) → Text → Scoped dependencies
+  → (dependencies → WindowHost)                     -- where the host is
+  → (dependencies → RuntimeControl → IO services)   -- startup
+  → (services → RuntimeControl → IO a)              -- the action
+  → IO a
+```
+
 `Session`, `Window`, `WindowObservation`, `WindowId`, `CloseRequest`,
-`WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`, `CommandOrigin`,
-`RequestId`, and `WindowCommand` are exported without their constructors, and
-their readers are functions rather than record fields, so no client can build or
-rewrite one. No public
+`WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
+`CommandOrigin`, `RequestId`, and `WindowCommand` are exported without their
+constructors, and their readers are functions rather than record fields, so no
+client can build or rewrite one. No public
 type holds a native pointer, and the snapshot publisher is never handed out:
 clients receive only the read endpoint. Nothing assumes a single or primary
 window.
@@ -160,9 +207,11 @@ operation (`enter session`, `initialize`, `verify backend`, `terminate`,
 `sample window`, `attach window callbacks`, `synchronize window`,
 `detach window callbacks`, `destroy window`, `new window command host`,
 `submit window command`, `await window command`, `execute window command`,
-`perform window command`), and identifiers such as `backend`, `title`,
-`window`, or `request`, so `failureEvidence` reads the origin back without a
-logger.
+`perform window command`, `process window events`, `reconcile window events`,
+`run owner loop`, `reject close request`), and identifiers such as `backend`,
+`title`, `window`, or `request`, so `failureEvidence` reads the origin back
+without a logger. A host configuration rejection is raised under the `glfw.runtime`
+component and the `construct window host` operation.
 
 ## Entry
 
@@ -189,7 +238,7 @@ logger.
    are set, so session configuration never changes the process working
    directory, and `glfwInit` runs. A false return is a `NativeFailure` carrying
    the reports GLFW made during the call. That is how an initialization error is
-   observed before any event polling exists.
+   observed before any event is polled.
 7. **Verification.** Reports from a successful initialization are raised only
    now, after termination has been registered, and `glfwGetPlatform` must name
    the selected backend, or entry is `BackendNotSelected`.
@@ -276,8 +325,9 @@ Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwDestroyWindow`, `glfwGetWindowSize`, `glfwGetFramebufferSize`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, and close callback setters. `glfwSetWindowSize` and `glfwPollEvents`
-are bound for the native examples only; no production path calls them.
+refresh, and close callback setters, and the owner loop's `glfwPollEvents` and
+`glfwWaitEventsTimeout`. `glfwSetWindowSize` and `glfwPostEmptyEvent` are called
+for the native examples only; no production path calls them.
 
 - Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
   installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
@@ -287,7 +337,15 @@ are bound for the native examples only; no production path calls them.
 - Every GLFW import is `safe`. Any of them may re-enter Haskell through the
   error callback, and a safe call lets other Haskell threads run while it is in
   C. The thread-identity shim calls nothing and is `unsafe`.
-- The C shim holds no state, queue, or game logic.
+- The production finite wait is made through the shim's
+  `hetoimasia_glfw_wait_events_timeout`, a `safe` import that records the
+  waiting OS thread and gives each wait an odd sequence number, then calls
+  `glfwWaitEventsTimeout`. That observation is the shim's only state, and no
+  production path reads it: the native examples' progress note lands only when
+  the same wait's sequence number surrounds a kernel report that the waiting
+  thread is blocked — `TH_STATE_WAITING` on macOS, state `S` in
+  `/proc/self/task/<tid>/stat` on Linux — so it lands only inside GLFW's own
+  wait. The shim holds no queue or game logic.
 
 The window callback setters are `ccall` imports for the same reason. Each
 callback wrapper only drops the window pointer and calls the model's callback,
@@ -389,8 +447,9 @@ ones are counted.
 Captures are reconciled on the owner thread at an owner boundary: at creation
 after the initial sampling, at `synchronizeWindow` after it samples, and after
 any private owner step's native calls return, whether that call was a setter or
-a poll. An observation request executes through the same boundary, and the
-event loop that arrives later will too. In order, a boundary:
+a poll. An observation request executes through the same boundary, and so
+does the window host's [owner loop](#the-window-host-and-owner-loop), which
+reconciles every window after each poll or wait. In order, a boundary:
 
 1. runs its native work, taking the reports made during it;
 2. reads the capture latch without clearing it and folds it, then any fresh
@@ -424,7 +483,9 @@ naming the window and a number issued in increasing order per window; several
 requests before one boundary coalesce into the newest. The model's private
 rejection transition clears a request only while it is still the latest, so
 rejecting an older request never erases a newer one. What a request means is the
-application's decision: there is no close policy and no close command.
+application's decision: the window host
+[surfaces it to application policy](#close-requests-in-the-owner-loop), which may
+reject it. There is no default close policy and no close command.
 
 ### Release
 
@@ -467,9 +528,9 @@ every one of them exactly once. It composes
 [the bounded FIFO channel](messaging.md#bounded-fifo-channels) and
 [prepared payloads](messaging.md#evaluation-guarantees) and adds the per-request
 completion both deliberately leave out. It is a window-service protocol, not
-generic request/reply machinery. This slice executes queued commands only
-through the test seam's private executor; the owner's event loop drains them in
-GLFW-3.
+generic request/reply machinery. The window host's
+[owner loop](#the-window-host-and-owner-loop) is its only production executor;
+the test seam's private executor drives the same protocol in CPU examples.
 
 ### Owner, thread, and lifetime
 
@@ -481,9 +542,9 @@ statistics, and direct performance. Clients receive the `WindowCommandPort`,
 which can only submit, and the tickets their submissions return; any thread may
 hold either. Neither carries a native handle, destruction authority, a channel
 endpoint, or a completion cell. Queued commands are claimed and settled only on
-the owner thread. A host lives while referenced; closing it before the
-session ends is the application's job until the runtime hook that closes
-admission before worker drain arrives with GLFW-4.
+the owner thread. A host lives while referenced. The window host closes its
+command host by quiescence, before the worker drain, and again when it is
+released; a command host created directly is closed by its application.
 
 ### Admission
 
@@ -556,8 +617,9 @@ where the request came from while the failure's origin stays at the operation
 that raised it. An asynchronous exception is rethrown unannotated. A settlement
 never replaces a disposition already settled.
 
-The executor protocol is private to the package. This slice drives it through
-the test seam's private executor, which executes queued commands against the
+The executor protocol is private to the package. Its one production caller is
+the window host's owner loop. The test seam's private executor also drives it:
+it executes queued commands against the
 seam windows it is given, can deliver an interruption immediately after the
 claim, and can replace execution with a scripted step for simulated effects or
 completion data that fails to prepare. It is a test seam, not a second
@@ -597,6 +659,158 @@ its execution. Closure is finite, never retries, and is idempotent. A raw
 channel close alone would keep the backlog, and a raw abort would discard it
 without settling tickets; there is no abort.
 
+## The window host and owner loop
+
+`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, composes a
+session, its windows, and their command bookkeeping with the runtime's
+[application lifecycle](resources.md#the-application-runner). It follows the
+[module authoring guide](logging.md#module-authoring-guide): it takes no logger
+and writes to no sink, and its failures are raised, never logged — a
+configuration rejection under `glfw.runtime` and `construct window host`, native
+failures under GLFW's own operations, and supervised failures as the runtime
+delivers them. The runner makes the one terminal report.
+
+### Construction and ownership
+
+A `WindowHost` is an application dependency, built by `allocWindowHost` as a
+`Scoped` value before supervision is entered, on the process main thread. It
+validates its `HostConfig` first — both budgets at least one, and an idle wait
+above zero and at most 60 seconds, so a NaN or infinite wait is refused — then
+enters the session, creates each configured window in order, and creates the
+command host. A failure at any stage releases what the earlier stages acquired
+through ordinary scoped release, before any worker exists. The host is never a
+service the startup callback returns: startup receives it among the
+dependencies and hands workers only client capabilities — `hostCommandPort`, a
+window's read-only observations, and `hostActivity` — transferring no native
+ownership. `allocWindowHostIn` builds the same host over a session scope the
+caller supplies, such as a test seam's or a borrowed session; the host then owns
+the session only if that scope does.
+
+`WindowHost` is exported without its constructor or fields. No session, command
+host, native handle, executor, or release authority can be taken from it. A
+window it lends carries no release authority, and its owner operations refuse
+other threads.
+
+### The owner turn
+
+`runOwnerLoop` runs on the session's owner thread — the application's action
+calls it on the process main thread — and refuses any other thread with
+`NotSessionOwner` before anything runs. Every turn performs, in order:
+
+1. `checkRuntime`;
+2. native event processing: `glfwPollEvents`, or on an idle turn
+   `glfwWaitEventsTimeout` with the configured bound;
+3. reconciliation of every window's captured callbacks at an owner boundary,
+   collecting the close requests not yet surfaced;
+4. `checkRuntime`;
+5. command work: at most `hostCommandBudget` queued commands claimed, executed,
+   and settled;
+6. `checkRuntime`;
+7. application event work: at most `hostEventBudget` calls of `loopEvent` that
+   dispatched something, ending at the first that found nothing ready;
+8. `checkRuntime`;
+9. the application's update opportunity, `loopUpdate`, which receives the turn's
+   `Turn` summary and answers `Continue` or `Finish`;
+10. `checkRuntime`, before a `Finish` result is returned or the next turn begins.
+
+A supervised failure latched at any point is rethrown by the next check, so no
+dispatch begins once a check has seen it. A native failure, a callback fault
+rethrown at reconciliation, a command's rethrown interruption, or a hook's
+failure also ends the loop and propagates.
+
+### Budgets
+
+Budgets count attempted dispatches, not time. A rejected command — addressed to
+a window the host does not serve, or to one that has ended — costs its attempt
+exactly as a performed one does. At most `max hostCommandBudget hostEventBudget`
+dispatch attempts separate two consecutive checks, however continuously the
+command queue and the application's event source are refilled. A budget does
+not bound one native call or one event handler; long work belongs in a worker.
+
+### Idle waits
+
+A turn is idle when the turn before it attempted no command and dispatched no
+application event, and no command is queued at its entry. Active turns poll.
+Idle turns wait at most `hostIdleWait` seconds, so a checkpoint follows even when
+no native input arrives. No wait is indefinite, a host with no windows waits on
+each idle turn instead of spinning, and the bound is a latency rather than a
+shutdown deadline. There is no wake-on-post: a command
+submitted during a wait waits for the wait to end, and the same turn's command
+work then serves it. Native waits are safe foreign calls, so background workers
+run while the owner is inside one. `hostActivity` publishes the current turn and
+whether its owner has begun its finite wait; the flag is set immediately before
+the native call and cleared once it returns, so it signals a wait starting or in
+progress rather than proving the call was entered.
+
+### Close requests in the owner loop
+
+A close request is captured by the window's own callbacks and reconciled into
+its observation, as [Close requests](#close-requests) describes; the host adds no
+second callback owner. After reconciliation, a request the host has not surfaced
+before appears once in `turnCloseRequests`. The application decides:
+`rejectHostCloseRequest` clears it while it is still that window's latest, and
+leaving it latched is equally a decision. The loop ends only when `loopUpdate`
+answers `Finish`, so a close request — the last window's included — ends neither
+the loop nor the runtime and destroys nothing. The host supplies no default that
+finishes on a close request.
+
+### Quiescence and shutdown order
+
+`quiesceWindowHost` is the host's quiescence action for
+[`runScopedApplicationWithQuiescence`](resources.md#quiescence), and
+`runWindowApplication` is that runner with the action installed. In one finite,
+non-retrying transaction it closes the command host's admission and settles
+every queued command as `NotExecuted`. It destroys nothing, pumps nothing, waits
+on nothing, and repeating it changes nothing. On every exit from the supervised
+region, the ordinary order is:
+
+1. quiescence: admission closes and queued callers settle as not executed;
+2. supervision asks every live worker to stop and drains them, with the host
+   live;
+3. the dependency scope unwinds: the host closes admission again, a no-op after
+   quiescence, destroys its windows, and then ends the session if it owns it;
+4. the terminal report, if the run failed, and the final flush.
+
+The runtime's two earlier orderings are unchanged: a fatal latch may request
+worker stops before quiescence, and a worker whose managed startup is abandoned
+or cancelled is drained before it. Quiescence neither precedes nor unblocks
+either.
+
+### What the owner and workers may wait on
+
+No public owner-thread operation blocks on work only the owner turn can do. On
+the owner thread, awaiting an unsettled ticket or capacity fails with
+`OwnerThreadWouldWait`, and `runOwnerLoop` and `rejectHostCloseRequest` refuse
+other threads. The owner may be starting or draining a worker instead of
+turning, so a worker's startup and cleanup — rollback and finalizers included —
+must not require a command's completion. A worker's acknowledged run action may
+submit commands while the loop runs, composing its wait with its stop request:
+
+```haskell
+awaitOrStop ∷ StopToken → CompletionTicket → IO (Maybe Disposition)
+awaitOrStop token ticket =
+  atomically $
+    (Just <$> (pollCompletion ticket >>= maybe retry pure))
+      `orElse` (Nothing <$ awaitStopRequest token)
+```
+
+These are obligations on application and worker code; the runtime's guarantee
+is not broadened.
+
+### CPU examples
+
+The host's CPU examples run whole applications over the test seam in
+`glfw-window-examples`. The seam's native table scripts the poll and the finite
+wait — recorded as `PollEvents` and `WaitEvents`, with `scriptPollEvents` and
+`scriptWaitEvents` steps — and its private `seamQueueEvents` driver leaves
+callback events, such as a close request, for the next poll or wait to deliver
+from inside that call. They prove the turn order and the poll or wait choice,
+the checks after saturated command and event batches, worker progress during a
+wait, settlement through the loop, the owner-thread refusals, close-request
+surfacing, quiescence, and the shutdown order on startup failure, action return,
+failure, and cancellation, a supervisor-detected failure, and an abandoned
+managed startup.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
@@ -620,6 +834,9 @@ without settling tickets; there is no abort.
 | Completion cell | Its tickets | Settled once; tickets read | Settle: owner; read: any | While a ticket references it | Never reset |
 | Admission flag | The command host | Closure sets it; direct performance reads it | Owner | The host | Never cleared |
 | Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
+| Host session and windows | The window host | Construction creates them; the owner loop pumps and reconciles them | Owner | The host's scope | Windows destroyed, then an owned session ended, when the scope unwinds |
+| Surfaced close requests | The window host | The owner loop records the latest request surfaced per window | Owner | The host | Replaced by a newer request; never reset |
+| Host activity | The window host | The owner loop writes it around each event step; clients read it | Write: owner; read: any | While referenced | Left at the last turn |
 
 The guard holds only occupancy and poison. None of this is application state.
 
@@ -752,6 +969,20 @@ The native examples cover:
   observation, release, terminal observation, and terminal handle;
 - two live windows with a stray hint reset before the second's creation;
 - a second window after a window's release in the same session;
+- a window host over the shared session running a whole application on the
+  process main thread: a supervised worker's observation request executed by
+  the real owner loop and settled with a published revision;
+- a supervised worker progressing while the owner is blocked inside the
+  production `glfwWaitEventsTimeout`: the worker's progress note lands only
+  inside GLFW's own wait, as [the binding](#the-binding) describes, and wakes
+  it with `glfwPostEmptyEvent`, and the loop reads back that a note landed in
+  the wait it just returned from. On the suite's single capability, a wait that
+  kept its capability would let no note land;
+- a real close request — `performClose:` on Cocoa, a `WM_DELETE_WINDOW` client
+  message on X11, sent by a test-only shim driver — reaching application policy
+  without destroying the only window, the loop and a worker still running two
+  turns later, and the window released only after that worker drained, with the
+  run returning normally;
 - in a private process, sessions entered and left in sequence, a real
   `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
   by a successful session, and a fault raised inside a real GLFW size callback,

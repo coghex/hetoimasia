@@ -11,11 +11,16 @@ lexically scoped NoAPI windows in that session, publishes what the platform
 observed through read-only snapshots, contains their native callbacks, and
 releases them when their scopes end. `Hetoimasia.GLFW.Command` admits prepared
 window commands through bounded ports and reports each through a persistent
-completion ticket; nothing drains them from an event loop yet, and there is no
-input operation.
+completion ticket. The public `runtime-glfw` sublibrary's
+`Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
+runs its supervised owner loop, which processes native events, drains those
+ports, and surfaces close requests to application policy. There is no input
+operation yet.
 
-The package depends on `hetoimasia-foundation`, not on the runtime, and imports
-no game, Lua, logger, or rendering module. Its native handles, foreign imports,
+Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
+the `runtime-glfw` sublibrary, among its libraries, depends on
+`hetoimasia-runtime`, and no library depends on it. No component imports a game, Lua, logger, or rendering
+module. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam `hetoimasia-tests` drives without initializing GLFW.
 

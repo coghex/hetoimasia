@@ -9,7 +9,8 @@
 --
 -- A session is entered, its asynchronous error reports read, windows created
 -- in it through "Hetoimasia.GLFW.Window" and commanded through
--- "Hetoimasia.GLFW.Command", and it ends. There is no public event loop or input
+-- "Hetoimasia.GLFW.Command", and it ends. The window host's owner loop in
+-- "Hetoimasia.Runtime.GLFW" processes its native events; there is no input
 -- operation yet.
 --
 -- @

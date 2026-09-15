@@ -1140,6 +1140,18 @@ admission and settles pending work before its owner asks it to stop: it is the
 application's transaction over its dependencies that closes admission and
 settles pending requests, so a waiting worker observes a refusal and can exit.
 
+**The window host is the worked example.** The GLFW package's
+[window host](glfw.md#the-window-host-and-owner-loop) is the dependency this seam
+exists for: its command port is executed only by the owner loop the action runs
+on the calling thread. Its `quiesceWindowHost` is the quiescence action — one
+transaction that closes the port's admission and settles every queued command
+as `NotExecuted`, destroying no window and pumping no event — and
+`runWindowApplication` installs it. A worker waiting on a command's ticket
+observes `NotExecuted` before supervision asks it to stop and is drained with the
+host's windows still live, and only then does the dependency scope destroy the
+windows and end the session. Its examples cover every exit below, and both
+earlier orderings.
+
 **When it runs.** The guard is entered immediately inside the supervised
 region, before the first checkpoint, and runs its action exactly once whenever
 that region exits: a startup callback failure, a checkpoint failure (including
@@ -1207,7 +1219,8 @@ run on the thread that called the runner. The action is never forked to race a
 monitor, and no arbitrary `IO` is interrupted: a worker failure reaches the
 application at a checkpoint or inside `awaitSupervised`, as
 [supervision.md](supervision.md#checkpoints-and-supervised-waits) describes.
-This keeps the process main thread for a future windowing owner.
+This keeps the process main thread for the windowing owner, such as the
+[window host's owner loop](glfw.md#the-window-host-and-owner-loop).
 
 **A composition.** The application declares its own types and builds them from
 the handles its components expose, under
