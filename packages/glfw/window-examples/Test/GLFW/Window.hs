@@ -1,5 +1,10 @@
 -- | Examples for scoped GLFW windows, driven through the private test seam.
 --
+-- They live in the package's @glfw-window-examples@ executable, not in a
+-- library, because they use the private window drivers of @seam-core@, which
+-- no package outside @hetoimasia-glfw@ may name. @hetoimasia-tests@ runs this
+-- executable from its @GLFW@ group.
+--
 -- Windows are created with the public "Hetoimasia.GLFW.Window" interface in a
 -- session over "Hetoimasia.GLFW.Seam"'s scripted native library, which creates
 -- nothing real: validation, hint handling, staged construction, observation,
@@ -12,7 +17,7 @@
 -- The scripted library answers every query with values deliberately different
 -- from every request, so an observation that copied its request would be seen.
 -- Threads are coordinated with 'MVar's, never with a sleep.
-module Test.Engine.GLFW.Window (spec) where
+module Test.GLFW.Window (spec) where
 
 import Control.Concurrent (ThreadId, forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -52,7 +57,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , readSnapshot
   )
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailures, withScoped)
-import Hetoimasia.GLFW.Seam
+import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
 import System.Timeout (timeout)

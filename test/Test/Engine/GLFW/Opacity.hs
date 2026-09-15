@@ -16,28 +16,19 @@
 -- observation endpoint, and every path it takes is refused before GLFW is
 -- initialized, so the example opens no display.
 --
--- The test seam is a public component so this suite can depend on it. Its
--- window drivers are therefore checked in process as well: a seam refuses to
--- drive, or to reject a close request on, any window it did not create, so no
--- client of the seam gains authority over another session's windows.
+-- The test seam is a public component so this suite can depend on it. Two more
+-- clients are compiled against it and must be rejected: one names the window
+-- drivers through the public seam, which does not export them, and one reaches
+-- for them in the seam's implementation, which belongs to the private
+-- @seam-core@ sublibrary. Only the package's own @glfw-window-examples@
+-- executable can use them.
 module Test.Engine.GLFW.Opacity (spec) where
 
-import Control.Exception (SomeException, fromException, try)
-import Hetoimasia.Foundation.Resource (withScoped)
-import Hetoimasia.GLFW.Seam
-import Hetoimasia.GLFW.Session (defaultSessionConfig)
-import Hetoimasia.GLFW.Window
-  ( WindowResult (..)
-  , hiddenTestWindowConfig
-  , observedCloseRequest
-  , synchronizeWindow
-  , withWindow
-  )
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
 import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, withPackageClient)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain, shouldReturn)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
 
 spec ∷ Spec
 spec = describe "GLFW session opacity across the package boundary" $ do
@@ -90,30 +81,26 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       rejectedBecause outcome "SnapshotPublisher"
       clientOutput outcome `shouldContain` "SnapshotReader"
 
-  it "refuses to drive or reject close requests on a window the seam did not create" $ do
-    owner ← newSeam defaultScript
-    stranger ← newSeam defaultScript
-    (driven, rejected, drivenByOwner, callsBefore, callsAfter) ←
-      asProcessMainThread owner $ withScoped (seamSession owner defaultSessionConfig) $ \session →
-        withWindow session (hiddenTestWindowConfig "owned" 64 48) $ \window → do
-          _ ← seamDrive owner window DuringPoll [CloseRequested]
-          synchronized ← synchronizeWindow window
-          let request = case synchronized of
-                WindowAvailable observation → observedCloseRequest observation
-                WindowEnded _ → Nothing
-          callsBefore ← length <$> seamCalls owner
-          driven ← refusal (seamDrive stranger window DuringPoll [RefreshRequested])
-          rejected ← case request of
-            Just latest → refusal (seamRejectCloseRequest stranger window latest)
-            Nothing → pure Nothing
-          callsAfter ← length <$> seamCalls owner
-          drivenByOwner ← seamDrive owner window DuringPoll []
-          pure (driven, rejected, drivenByOwner, callsBefore, callsAfter)
-    driven `shouldBe` Just ForeignSeamWindow
-    rejected `shouldBe` Just ForeignSeamWindow
-    callsAfter `shouldBe` callsBefore
-    show drivenByOwner `shouldBe` "WindowAvailable ()"
-    seamCalls stranger `shouldReturn` []
+  it "rejects a client that names a window driver through the public seam" $
+    withSeamClient "Client.hs" publicSeamDriverClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "seamDrive"
+      clientOutput outcome `shouldContain` "seamRejectCloseRequest"
+
+  it "rejects a client that reaches for the window drivers in the private seam implementation" $
+    withSeamClient "Client.hs" privateSeamDriverClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the window drivers are reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Seam"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "seam-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
 
   it "accepts and runs a client using only the public session and window interfaces, without initializing GLFW" $
     withClient "Main.hs" publicClient $ \compile → do
@@ -140,13 +127,36 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
                    ]
 
--- | The refusal a seam driver raised, or 'Nothing' if it did not raise one.
-refusal ∷ IO (WindowResult a) → IO (Maybe ForeignSeamWindow)
-refusal action = do
-  outcome ← try action
-  pure $ case outcome of
-    Left (caught ∷ SomeException) → fromException caught
-    Right _ → Nothing
+-- | Compile a client that can also see the public test seam, by its unit id.
+withSeamClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+withSeamClient =
+  withPackageClient
+    [ "base"
+    , "text"
+    , "stm"
+    , "hetoimasia-foundation"
+    , "hetoimasia-glfw-0.1.0.0-inplace"
+    , "hetoimasia-glfw-0.1.0.0-inplace-seam"
+    ]
+
+-- | A client naming the window drivers through the public seam.
+publicSeamDriverClient ∷ String
+publicSeamDriverClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Seam (seamDrive, seamRejectCloseRequest)"
+    ]
+
+-- | A client importing the window drivers from the seam's private
+-- implementation.
+privateSeamDriverClient ∷ String
+privateSeamDriverClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Seam (seamDrive, seamRejectCloseRequest)"
+    ]
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 -- The main library is named by its local unit id: its sublibraries share its

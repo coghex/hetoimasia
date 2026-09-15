@@ -250,7 +250,13 @@ not a verdict that Synarchy's design should be discarded.
   destroy, then free storage only if certain (else keep it and poison the
   session), then publish the terminal phase and close the snapshot in one
   transaction. The old private creation seam was removed. The seam's
-  `seamDrive`/`seamRejectCloseRequest` are private drivers, not commands.
+  implementation moved to the private `seam-core` sublibrary; its window drivers
+  (`seamDrive`, `seamDriveCancelledBeforeCommit`, `seamRejectCloseRequest`) are
+  not re-exported by the public `seam`, and only the package's
+  `glfw-window-examples` executable uses them. `hetoimasia-tests` runs that
+  executable from its `GLFW` group through `build-tool-depends`. The shared
+  opacity harness exposes `-inplace` unit ids with `-package-id`, because
+  sublibraries share their package's name.
   Contract: `docs/glfw.md`, "Windows".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.

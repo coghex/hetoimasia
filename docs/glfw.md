@@ -21,7 +21,9 @@ or rendering operation yet.
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session` and `Hetoimasia.GLFW.Window`, the supported interface |
 | `hetoimasia-glfw:model` | private | The session and window models over a table of native operations, and bounded error capture. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
-| `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real model over a scripted native library, with private window drivers, for CPU examples. Links no GLFW. |
+| `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
+| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks and change close intent |
+| `glfw-window-examples` | executable, test-only | The window model examples that use those drivers. `hetoimasia-tests` runs it. |
 | `glfw-native-check` | test suite | The real session on the platform it runs on |
 
 The package depends on `hetoimasia-foundation` and not on
@@ -472,16 +474,21 @@ therefore compiles `glfw-native-check` from a clean configuration without
 running it.
 
 - **The `GLFW` group** in `hetoimasia-tests` is headless and initializes nothing.
-  It proves the session and window models through the seam, checks the link
-  declarations, and compiles external clients against the package. The seam's
+  It proves the session model through the seam, checks the link declarations,
+  and compiles external clients against the package. It also runs the
+  `glfw-window-examples` executable, reached through the suite's
+  `build-tool-depends`, and fails with that executable's report if any window
+  model example fails. It runs in the `test.engine` validation group.
+- **`glfw-window-examples`** holds the window model examples, as an Hspec
+  executable that initializes no GLFW. They use the seam's private drivers:
   `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
   owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
   reconciliation's preparation point, and `seamRejectCloseRequest` is the
-  private close-request transition; none is a public command. Because the seam
-  is a public component, each refuses with `ForeignSeamWindow` any window whose
-  session was not entered over that seam's own native table. A production
-  window's session holds the process guard, which no seam shares. It runs in the `test.engine`
-  validation group.
+  private close-request transition. None is a public command. They live in the
+  private `seam-core` sublibrary, which the public seam does not re-export, so
+  no package outside `hetoimasia-glfw` can name them; the `GLFW` opacity
+  examples compile clients proving it. Each driver also refuses, with
+  `ForeignSeamWindow`, a window its own seam did not create.
 - **`glfw-native-check`** needs a windowing session: Cocoa locally, or an X11
   display. It is not part of `hetoimasia-tests`, the console smoke, or any
   validation group. GLFW-7 owns the display runner and the shared native

@@ -46,7 +46,7 @@ module Test.Engine.Resources.Opacity
   ) where
 
 import Control.Monad (filterM)
-import Data.List (isSuffixOf)
+import Data.List (isInfixOf)
 import Data.Version (showVersion)
 import System.Directory (doesDirectoryExist, findExecutable)
 import System.Environment (getExecutablePath)
@@ -343,7 +343,8 @@ withPackageClient packages name source use = do
 
 -- | The compiler arguments an external client is built with.
 --
--- A name ending in @-inplace@ is a local unit id and is exposed with
+-- A name containing @-inplace@ is a local unit id, the main library's or a
+-- sublibrary's, and is exposed with
 -- @-package-id@. A package with public or private sublibraries registers every
 -- one of them under the same package name, so @-package@ alone matches several
 -- units and GHC's choice among them is not stable; naming the main library's
@@ -365,7 +366,7 @@ arguments packages mode packageDatabase name =
       Link → [name, "-o", "client"]
   where
     exposing package
-      | "-inplace" `isSuffixOf` package = ["-package-id", package]
+      | "-inplace" `isInfixOf` package = ["-package-id", package]
       | otherwise = ["-package", package]
 
 -- | The package database this build wrote its local libraries into.
