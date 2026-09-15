@@ -22,7 +22,12 @@
 -- command or its size constraints through their constructors, or alters
 -- constraints through a field, outside the smart constructors and owner-thread
 -- validation, and one reaches for the control representation in the private
--- control module. One client must be accepted, linked, and run: it uses only the public
+-- control module. Four are rejected for the input feeds: one names the reader's,
+-- control's, event's, epoch's, and reset token's constructors; one coerces a
+-- number into an input epoch, so a token could be retargeted; one rewrites a
+-- token's epoch through record syntax; and one reaches for the feed, its
+-- producer, and its resumption through the public input module, and another
+-- in the private input module. One client must be accepted, linked, and run: it uses only the public
 -- session, monitor, window, and window command interfaces, including the
 -- read-only observation and inventory endpoints, identity resolution, a command
 -- port, every control command constructor, the capability description, and a
@@ -44,7 +49,8 @@
 -- window's client capabilities, or reads another window's port out of them,
 -- through the capability's constructor and fields. One client must be accepted,
 -- linked, and run: it uses the host's supported configuration, construction,
--- turn, window, and client capabilities, and every path it runs is refused
+-- turn, window, and client capabilities, including a window's input reader and
+-- admission control, and every path it runs is refused
 -- before GLFW is initialized.
 --
 -- The test seam is a public component so this suite can depend on it. Four more
@@ -181,6 +187,44 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so a control's representation is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Control"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that constructs an input reader, control, event, epoch, or reset token" $
+    withClient "Client.hs" inputConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      mapM_ (clientOutput outcome `shouldContain`) ["InputReader", "InputControl", "InputEvent", "InputEpoch", "ResetToken"]
+
+  it "rejects a client that coerces a number into an input epoch to retarget a reset" $
+    withClient "Client.hs" inputEpochCoercionClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Couldn't match representation"
+      clientOutput outcome `shouldContain` "InputEpoch"
+
+  it "rejects a client that rewrites a reset token's epoch through record syntax" $
+    withClient "Client.hs" inputTokenUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "resetEpoch"
+      clientOutput outcome `shouldContain` "record"
+
+  it "rejects a client that reaches for an input feed, its producer, or its resumption through the public input module" $
+    withClient "Client.hs" publicInputEndpointClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      mapM_ (clientOutput outcome `shouldContain`) ["InputFeed", "produceInput", "resumeInput"]
+
+  it "rejects a client that reaches for an input feed's producer or channel in the private input module" $
+    withClient "Client.hs" privateInputClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so an input producer is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Input"
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -441,6 +485,7 @@ hostClient =
     , "import Hetoimasia.Foundation.Messaging.Snapshot (readSnapshot)"
     , "import Hetoimasia.Foundation.Resource (withScoped)"
     , "import Hetoimasia.GLFW.Command"
+    , "import qualified Hetoimasia.GLFW.Input as Input"
     , "import Hetoimasia.GLFW.Session (SessionMisuse)"
     , "import Hetoimasia.GLFW.Window"
     , "import Hetoimasia.Runtime.GLFW"
@@ -482,6 +527,7 @@ hostClient =
     , "        case created of"
     , "          SubmitAccepted ticket → atomically (pollWindowClient ticket) >>= mapM_ (\\client → do"
     , "            _ ← atomically (readSnapshot (clientObservations client))"
+    , "            consume client"
     , "            submitWindowCommand (clientCommandPort client) [] (closeWindowCommand (clientWindow client)))"
     , "          _ → pure ()"
     , "        mapM_ (\\window → withHostWindow host window (\\_ → closeHostWindow host window)) identities"
@@ -491,6 +537,18 @@ hostClient =
     , "        atomically (quiesceWindowHost host)"
     , "        pure (if activityWaiting activity then Finish (turnCommands turn) else Continue)"
     , "    }"
+    , ""
+    , "consume ∷ WindowClient → IO ()"
+    , "consume client = do"
+    , "  let reader = clientInputReader client"
+    , "  _ ← atomically (Input.enableInput (clientInputControl client))"
+    , "  found ← atomically (Input.awaitInput reader)"
+    , "  case found of"
+    , "    Input.InputDelivered event → print (Input.inputWindow event, Input.epochNumber (Input.inputEpoch event), Input.inputPayload event)"
+    , "    Input.InputResetRequired token → atomically (Input.acknowledgeReset reader token) >>= either (\\misuse → print (misuse ∷ Input.InputMisuse)) print"
+    , "    _ → atomically (Input.inputStatistics reader) >>= print . Input.statisticsLastReset"
+    , "  _ ← atomically (Input.suspendInput (clientInputControl client))"
+    , "  pure ()"
     ]
 
 -- | Compile a client that can also see the public test seam, by its unit id.
@@ -631,6 +689,67 @@ controlInternalsClient =
     , ""
     , "forged ∷ WindowControl"
     , "forged = SizeControl 0 0"
+    ]
+
+-- | A client naming the input capabilities' and values' data constructors.
+inputConstructorClient ∷ String
+inputConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.GLFW.Input (InputControl (InputControl), InputEpoch (InputEpoch), InputEvent (InputEvent), InputReader (InputReader), ResetToken (ResetToken))"
+    , ""
+    , "forged ∷ Maybe (InputReader, InputControl, InputEvent, InputEpoch, ResetToken)"
+    , "forged = Nothing"
+    ]
+
+-- | A client coercing a number into an input epoch.
+inputEpochCoercionClient ∷ String
+inputEpochCoercionClient =
+  unlines
+    [ "module Client (retargeted) where"
+    , ""
+    , "import Data.Coerce (coerce)"
+    , "import Hetoimasia.GLFW.Input (InputEpoch)"
+    , "import Numeric.Natural (Natural)"
+    , ""
+    , "retargeted ∷ Natural → InputEpoch"
+    , "retargeted = coerce"
+    ]
+
+-- | A client rewriting a reset token's epoch as if its reader were a field.
+inputTokenUpdateClient ∷ String
+inputTokenUpdateClient =
+  unlines
+    [ "module Client (retargeted) where"
+    , ""
+    , "import Hetoimasia.GLFW.Input (InputEpoch, ResetToken, resetEpoch)"
+    , ""
+    , "retargeted ∷ InputEpoch → ResetToken → ResetToken"
+    , "retargeted epoch token = token {resetEpoch = epoch}"
+    ]
+
+-- | A client asking the public input module for the feed, its producer, and its
+-- resumption.
+publicInputEndpointClient ∷ String
+publicInputEndpointClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Input (InputFeed, produceInput, resumeInput)"
+    ]
+
+-- | A client importing the feed, its producer, and its reader construction from
+-- the private input module.
+privateInputClient ∷ String
+privateInputClient =
+  unlines
+    [ "module Client (produce) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Input (InputFeed, InputPayload (TextInput), Production, feedReader, produceInput)"
+    , ""
+    , "produce ∷ InputFeed → IO Production"
+    , "produce feed = feedReader feed `seq` produceInput feed (TextInput 'x')"
     ]
 
 -- | A client importing the window drivers from the seam's private

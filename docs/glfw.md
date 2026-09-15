@@ -6,7 +6,7 @@ lexically scoped windows created in that session, and the window host and owner
 loop that compose them with the runtime's application lifecycle. The accepted
 direction and the later slices live in
 [the GLFW integration design](glfw_integration_design.md) (P-1 to P-9, P-10's
-monitor identity rules, P-11, D-4 to D-9, D-11, D-13, D-17); this document
+monitor identity rules, P-11, P-13, D-4 to D-9, D-11 to D-13, D-17, D-19); this document
 describes what the code does today.
 
 A session is entered, its asynchronous native error reports are read, its
@@ -18,22 +18,23 @@ application dependency, and its supervised owner loop processes native events,
 drains the ports, refreshes the monitor inventory when monitors change, and
 surfaces close requests to application policy. Ordinary controls — title, size,
 position, size constraints, visibility, focus and attention requests, and
-minimize, maximize, and restore — settle with honest outcomes. There is no input
-feed, mode command, monitor selection, default close policy, or rendering
-operation.
+minimize, maximize, and restore — settle with honest outcomes. Each host window
+has a bounded, ordered input feed with an acknowledged reset after overflow or
+temporary suspension; no native input callback produces into it yet. There is no
+mode command, monitor selection, default close policy, or rendering operation.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
-| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, and the window command protocol, including execution and settlement. Binds nothing. |
+| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, and `Hetoimasia.GLFW.Input`, the supported interface |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, and the input feed model with its private producer, warning, resumption, and closure. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
+| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, monitor inventory, and input feed examples that use those drivers, that executor, and the private input producer. `hetoimasia-tests` runs it. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, and window host examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -43,9 +44,10 @@ package's own `glfw-window-examples` and `glfw-native-tests`, and
 `hetoimasia-tests`, use it. The runtime integration therefore inverts no
 dependency. It is a sublibrary with its own source root rather than a separate
 package because the native suite must depend on it, and Cabal refuses that as a
-cycle between packages. The package's only logging import is `Component` from
-`Hetoimasia.Foundation.Log`, for failure identifiers; it takes no logger and
-writes to no sink.
+cycle between packages. The package's logging imports are `Component`, for
+failure identifiers, and `Logger` with `logWarning`, which only the input feed's
+private overflow warning uses through a logger its owner injects; nothing else
+takes a logger or writes to a sink.
 
 ## Public interface
 
@@ -248,7 +250,70 @@ data WindowClient                            -- Show; read with:
 clientWindow       ∷ WindowClient → WindowId
 clientCommandPort  ∷ WindowClient → WindowCommandPort
 clientObservations ∷ WindowClient → SnapshotReader WindowObservation
+clientInputReader  ∷ WindowClient → InputReader
+clientInputControl ∷ WindowClient → InputControl
 pollWindowClient   ∷ CompletionTicket → STM (Maybe WindowClient)
+```
+
+```haskell
+-- Hetoimasia.GLFW.Input
+data InputReader                             -- no instances; read with:
+inputReaderWindow ∷ InputReader → WindowId
+readInput         ∷ InputReader → STM InputRead
+awaitInput        ∷ InputReader → STM InputRead   -- waits while empty or paused
+data InputRead = InputDelivered InputEvent | InputResetRequired ResetToken | InputPaused
+               | InputEmpty | InputClosed
+
+data InputEvent                              -- Eq, Show, NFData; read with:
+inputWindow  ∷ InputEvent → WindowId
+inputEpoch   ∷ InputEvent → InputEpoch
+inputPayload ∷ InputEvent → InputPayload
+data InputEpoch                              -- Eq, Ord, Show
+epochNumber  ∷ InputEpoch → Natural
+data InputPayload   = KeyInput KeyEvent | TextInput Char | ButtonInput ButtonEvent
+                    | ScrollInput ScrollEvent | FocusInput Bool
+data KeyEvent       = KeyEvent { keyCode, keyScancode ∷ Int, keyAction ∷ KeyAction, keyModifiers ∷ Modifiers }
+data KeyAction      = KeyPressed | KeyRepeated | KeyReleased
+data ButtonEvent    = ButtonEvent { buttonNumber ∷ Int, buttonAction ∷ ButtonAction
+                                  , buttonCursor ∷ Maybe CursorPosition, buttonModifiers ∷ Modifiers }
+data ButtonAction   = ButtonPressed | ButtonReleased
+data ScrollEvent    = ScrollEvent { scrollX, scrollY ∷ Double }
+data CursorPosition = CursorPosition { cursorX, cursorY ∷ Double }
+data Modifiers      = Modifiers { modifierShift, modifierControl, modifierAlt, modifierSuper
+                                , modifierCapsLock, modifierNumLock ∷ Bool }
+noModifiers ∷ Modifiers
+keyDomainLast, buttonDomainLast ∷ Int        -- 348 and 7
+
+data ResetToken                              -- Eq, Show; read with:
+resetWindow ∷ ResetToken → WindowId
+resetEpoch  ∷ ResetToken → InputEpoch        -- the epoch the reset reserved
+resetReason ∷ ResetToken → ResetReason
+data ResetReason     = InputOverflowed | AdmissionSuspended
+acknowledgeReset     ∷ InputReader → ResetToken → STM (Either InputMisuse Acknowledgement)
+data Acknowledgement = Acknowledged | AlreadyAcknowledged | StaleAcknowledgement | AcknowledgementClosed
+data InputMisuse     = ForeignResetToken { misuseTokenWindow, misuseFeedWindow ∷ WindowId }
+
+data InputControl                            -- no instances
+inputControlWindow ∷ InputControl → WindowId
+enableInput, suspendInput ∷ InputControl → STM AdmissionChange
+data AdmissionChange      = AdmissionOpened | AdmissionReset ResetToken | AdmissionClosedDuringReset
+                          | AdmissionUnchanged | AdmissionFeedClosed
+data ApplicationAdmission = AwaitingReadiness | InputEnabled | InputSuspended
+
+inputStatistics ∷ InputReader → STM InputStatistics
+data InputStatistics = InputStatistics
+  { statisticsFeedWindow ∷ WindowId, statisticsPhase ∷ InputPhase, statisticsEpoch ∷ InputEpoch
+  , statisticsAdmission ∷ ApplicationAdmission, statisticsFocused ∷ Bool
+  , statisticsCapacity, statisticsQueued, statisticsHeld, statisticsAdmitted, statisticsDelivered
+  , statisticsGated, statisticsUnpaired, statisticsSuppressed, statisticsOverflowed
+  , statisticsDiscardedByReset, statisticsDiscardedAtClose, statisticsResets, statisticsGenerations ∷ Natural
+  , statisticsLastReset ∷ Maybe ResetSummary }
+data InputPhase   = InputRunning | InputResetPending | InputResetAcknowledged | InputFeedClosed
+data ResetSummary = ResetSummary { summaryEpoch ∷ InputEpoch, summaryReason ∷ ResetReason
+                                 , summaryDiscarded, summaryUnadmitted, summarySuppressed ∷ Natural
+                                 , summaryWarning ∷ WarningState }
+data WarningState = NoWarningOwed | WarningOwed | WarningAttempting | WarningWritten
+                  | WarningFailed | WarningInterrupted
 ```
 
 ```haskell
@@ -276,12 +341,12 @@ data HostBookkeeping = HostBookkeeping { bookkeepingWindows, bookkeepingClosing,
                                        , bookkeepingSurfaced, bookkeepingBorrowed ∷ Int }
 
 data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
-                             , hostWindowLimit ∷ Int, hostCommandCapacity ∷ Integer
+                             , hostWindowLimit ∷ Int, hostCommandCapacity, hostInputCapacity ∷ Integer
                              , hostCommandBudget, hostEventBudget ∷ Int, hostIdleWait ∷ Double }
-defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacity 64, budgets 16, idle wait 0.1 s
+defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, budgets 16, idle wait 0.1 s
 validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
 data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | IdleWaitRejected Double
-                        | WindowLimitRejected Int
+                        | WindowLimitRejected Int | InputCapacityRejected Integer
 hostComponent ∷ Component                   -- "glfw.runtime"
 
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
@@ -303,12 +368,14 @@ runWindowApplication
 
 `Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
 `WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
-`CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, and `WindowClient` are exported
+`CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, `WindowClient`, `InputReader`,
+`InputControl`, `InputEvent`, `InputEpoch`, and `ResetToken` are exported
 without their constructors, and their readers are functions rather than record
 fields, so no client can build or rewrite one. No public
 type holds a native window or monitor pointer, and no snapshot publisher is
 handed out: clients receive only read endpoints. No public operation reaches the
-host's window collection, a collection member, or a release. Nothing assumes a
+host's window collection, a collection member, or a release, and none reaches an
+input feed's channel, state, or producer. Nothing assumes a
 single or primary window or monitor.
 
 Every failure is raised through `throwFailure` with the `glfw` component, the
@@ -1157,6 +1224,133 @@ nothing in this package does yet: the monitor-aware mode transitions of a later
 slice are to be its only producer, and the seam's private `seamSetModeTransition`
 drives it in the CPU examples. Controls define no saved windowed placement.
 
+## Input feeds
+
+`Hetoimasia.GLFW.Input` is the consumer's side of a window's ordered input. The
+implementation and its full contract are the private
+`Hetoimasia.GLFW.Internal.Input`; the window host creates one feed per window,
+and the native callbacks that will produce into it arrive with GLFW-12. Until
+then the only producer is the private one the CPU examples drive, which is the
+same admission, reset, warning, and resumption code a native producer will call.
+
+### Ownership and capabilities
+
+A feed belongs to its window's owner, which creates it, produces into it,
+attempts its overflow warning, resumes it, and closes it. Its one logical
+consumer receives an `InputReader` — `readInput`, `awaitInput`,
+`acknowledgeReset`, and `inputStatistics` — and the application an
+`InputControl` — `enableInput` and `suspendInput` — both through the window's
+`WindowClient`. Neither exposes the channel, its endpoints, the feed's state, or
+production. Copies of a reader are the same consumer: they observe one reset and
+one acknowledgement. Concurrent handlers over one feed need the application's
+own coordination.
+
+### Events and epochs
+
+A delivered `InputEvent` carries its window, its `InputEpoch`, and one payload:
+a key transition with its key code and scancode, a Unicode character, a button
+transition, scroll offsets on both axes, or a focus transition. Epochs start at
+one, advance by one per reset, and never wrap. A button transition carries the
+cursor position and modifiers captured when it was produced — the producer's
+latest cursor sample, which coalesces — so later cursor motion does not move a
+click already produced. Scroll, text, key and button transitions, and focus
+history are never coalesced. Each event is prepared to normal form in the
+producer's `IO` before admission; no transaction here evaluates a payload, makes
+a native call, logs, or runs a handler.
+
+### Phases and gates
+
+| Phase | Reads answer | Production | Leaves by |
+|---|---|---|---|
+| `InputRunning` | the next event, or `InputEmpty` | admitted through the gates below | overflow or suspension: `InputResetPending`; closure |
+| `InputResetPending` | `InputResetRequired token`, until acknowledged | suppressed and counted | acknowledgement: `InputResetAcknowledged`; closure |
+| `InputResetAcknowledged` | `InputPaused`; a wait keeps waiting | suppressed and counted | owner resumption into the reserved epoch: `InputRunning`; closure |
+| `InputFeedClosed` | `InputClosed`, at once | `ProductionClosed` | never |
+
+The phase is independent of the application's admission and of focus.
+Admission starts `AwaitingReadiness`: input produced then is gated, and
+`suspendInput` before readiness changes nothing. `enableInput` opens it. While
+running, ordinary input is admitted only with admission enabled and the window
+focused, and is otherwise counted as gated. A focus transition is admitted
+whenever admission is enabled, so the focus loss that closes the focus gate is
+itself delivered; while a reset is in progress a focus transition still updates
+the gate and is counted as suppressed.
+
+### Held state
+
+The producer keeps a held-state baseline over the native key domain
+`0 .. keyDomainLast` and button domain `0 .. buttonDomainLast`, never indexed by
+scancode. Only an admitted press establishes held state. A repeat or release of
+anything not held — a key outside the domain included — is suppressed as
+unpaired: a release never invents a press, and a repeat never becomes one. An
+admitted focus loss, every reset, and closure clear the baseline, so each epoch
+begins with nothing held and a key still down from before a reset produces
+nothing until it is pressed again. The consumer clears its own held keys,
+buttons, and gestures when it reads a focus loss, before acknowledging a reset,
+and at closure.
+
+### The reset
+
+An overflow of a running generation — the channel full when an event, a focus
+transition included, is admitted — commits one transaction that aborts the
+channel, records the backlog it discarded from the channel's depth counter apart
+from the one overflowing event never admitted, reserves the next epoch, clears
+the held baseline, drops the aborted channel, and installs a reset with reason
+`InputOverflowed` and an opaque token bound to the feed and that epoch. The
+foundation channel's own statistics keep their meanings.
+
+`suspendInput` after readiness, while running, makes the same transition with
+reason `AdmissionSuspended` and no unadmitted event. During a reset,
+`enableInput` and `suspendInput` change only the application gate: they neither
+replace the token nor advance the epoch, and never erase an overflow warning the
+episode owes. Production during the reset allocates nothing, advances nothing,
+replaces nothing, and owes no further warning; it only adds to counters.
+
+Events dequeued before the reset's transaction are in flight. The consumer
+finishes or abandons their handlers, clears its derived state, and acknowledges
+the exact token; the feed undoes nothing and replays nothing. Reading the token
+neither consumes nor acknowledges it, so a stalled or cancelled consumer leaves
+the feed paused and closable, with no timeout that resumes it.
+
+`acknowledgeReset` never retries, needs no command capacity, and allocates and
+runs nothing. It answers, in order: `Left ForeignResetToken` for another feed's
+token, whatever this feed's state; `AcknowledgementClosed` once the feed has
+closed, even for the pending token; `StaleAcknowledgement` for an older reset's
+token; `Acknowledged` for the pending token; and `AlreadyAcknowledged`, changing
+nothing, for a reset already acknowledged or resumed.
+
+### The overflow warning
+
+An overflow episode owes one structured `Warning`, message
+`Input overflowed; the feed was reset`, under the `glfw.input` component with
+`window`, `epoch`, `discarded`, and `unadmitted` fields. The owner claims and
+writes it with the private `attemptOverflowWarning` at a safe owner boundary,
+outside callbacks, transactions, and release, through a logger it injects. The
+obligation lives in the episode, apart from the queue, so an early
+acknowledgement or further production cannot lose it. A sink failure propagates
+to the caller, as every logging failure does, and a cancellation propagates as
+itself; the episode records `WarningFailed` or `WarningInterrupted`, and the sink
+is not tried again. A closed feed claims nothing, so a warning shutdown prevented
+stays `WarningOwed` in the final statistics. A suspension owes no warning.
+
+### Resumption and closure
+
+The owner's private `resumeInput` allocates one fresh channel in `IO` and
+installs it in one transaction only if the same reset is still acknowledged, no
+warning is owed or in progress, the feed is open, admission is enabled, and the
+window is focused; that transaction makes the reserved epoch running. Otherwise
+the candidate is never published. The window's close protocol and host
+quiescence close the feed, so an open feed belongs to a live window and host, and
+a closure committed before the install always wins.
+
+Closure is idempotent, finite, and never retries. It aborts a running channel,
+counting its discards apart from reset discards, clears the held baseline, and
+ends every read and wait at once — even during a reset, without first delivering
+the obsolete reset, and without awaiting any acknowledgement. The phase, epoch,
+counters, and last-reset summary then stay as they were, apart from an attempt
+already in progress recording how it ended. Statistics keep only that summary and
+cumulative counts, never a history of events, epochs, or channels.
+
 ## The window host and owner loop
 
 `Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, which
@@ -1174,17 +1368,21 @@ delivers them. The runner makes the one terminal report.
 A `WindowHost` is an application dependency, built by `allocWindowHost` as a
 `Scoped` value before supervision is entered, on the process main thread. It
 validates its `HostConfig` first — both budgets at least one, an idle wait above
-zero and at most 60 seconds, so a NaN or infinite wait is refused, and a
-live-window limit of at least one and at least the number of configured windows —
+zero and at most 60 seconds, so a NaN or infinite wait is refused, a
+live-window limit of at least one and at least the number of configured windows,
+and an input capacity between one and the channel's maximum —
 then enters the session, allocates a
 [scoped collection](resources.md#scoped-resource-collections) with that limit,
 creates the host's command port, and creates each configured window in order as
-a collection member with its own port. A failure at any stage releases what the
+a collection member with its own port and its own input feed of
+`hostInputCapacity`, focused if its initial observation observed focus. A failure at any stage releases what the
 earlier stages acquired through ordinary scoped release, before any worker
 exists. The host is never a service the startup callback returns: startup
 receives it among the dependencies and hands workers only client capabilities —
-`hostCommandPort`, a window's `WindowClient`, the monitor inventory's reader, and
-`hostActivity` — transferring no native ownership. `allocWindowHostIn` builds
+`hostCommandPort`, a window's `WindowClient` with its input reader and admission
+control, the monitor inventory's reader, and `hostActivity` — transferring no
+native ownership. The host owns no input producer and does not yet warn about
+or resume a feed: native input and that owner-loop integration are GLFW-12's. `allocWindowHostIn` builds
 the same host over a session scope the caller supplies, such as a test seam's or
 a borrowed session; the host then owns the session only if that scope does.
 
@@ -1379,12 +1577,14 @@ honours, a close request.
 [`runScopedApplicationWithQuiescence`](resources.md#quiescence), and
 `runWindowApplication` is that runner with the action installed. In one finite,
 non-retrying transaction it closes the admission of the host's port and of every
-window's port, and settles every command queued in any of them as `NotExecuted`.
-It destroys nothing, pumps nothing, waits on nothing, and repeating it changes
-nothing. On every exit from the supervised region, the ordinary order is:
+window's port, settles every command queued in any of them as `NotExecuted`, and
+closes every window's input feed, ending its reads even while a reset waits for
+an acknowledgement. It destroys nothing, pumps nothing, waits on nothing, and
+repeating it changes nothing. A window's close protocol closes that window's
+feed in its closing transaction the same way. On every exit from the supervised region, the ordinary order is:
 
-1. quiescence: every port's admission closes and queued callers settle as not
-   executed;
+1. quiescence: every port's admission closes, queued callers settle as not
+   executed, and every input feed closes;
 2. supervision asks every live worker to stop and drains them, with every window
    still registered — closing ones included — live;
 3. the dependency scope unwinds: the host closes every port's admission again, a
@@ -1466,7 +1666,41 @@ and closes racing it, every port closed before the drain and every window
 released once after it; and fair dispatch with a replenished, partly rejected
 port beside a waiting window port holding two commands and a host request,
 through closure and creation, each command within its documented bound and
-every turn within the budget.
+every turn within the budget. A host example closes one window while the other's
+feed has a suspension reset pending: the closed window's reads end at once, the
+other still requires its reset, and quiescence then ends it without an
+acknowledgement.
+
+### Input feed examples
+
+The input feed examples in `glfw-window-examples` drive the feed model through
+its private producer, with window identities from a seam session and no GLFW.
+Threads are coordinated with `MVar`s and STM; a wait is observed through
+`orElse`. They prove: distinct, uncoalesced key, text, button, scroll, and focus
+events tagged with window and epoch; gating before readiness and while
+unfocused, no reset for pre-readiness disablement, and a delivered focus loss
+that closes the focus gate; a click keeping its captured position after later
+cursor motion; focus loss clearing held state; one stable token across twenty
+thousand suppressed events with exact, non-wrapping counters and no channel,
+epoch, or warning added; exact discard accounting apart from the unadmitted
+event and delivered events; no old backlog after reset detection and no
+new-epoch input before acknowledgement and resumption; foreign, duplicate,
+stale, and closed acknowledgements; a consumer cancelled before acknowledging
+leaving the feed paused and closable; closure during a pending or acknowledged
+reset ending reads without the reset; resumption losing to a closure committed
+after the candidate was allocated, publishing no channel; a key and button held
+at a reset producing nothing in the new epoch until pressed again; two windows
+overflowing independently; one warning per episode through the injected logger
+blocking resumption until its attempt completes, a failing sink retained as
+`WarningFailed` and never retried, and an attempt cancelled by shutdown retained
+as `WarningInterrupted`, or left `WarningOwed` when shutdown came first; and, for
+suspension, press → suspend → suppressed release → enable leaving no backlog or
+held state and needing acknowledgement, resumption, and a fresh press,
+acknowledgement before or after re-enabling, repeated toggles keeping one token
+and epoch, suspension during an overflow reset keeping its token and warning
+obligation, no warning for suspension alone, and closure winning every
+suspension and resumption race while a suspension or focus loss leaves a
+candidate unpublished.
 
 ## State
 
@@ -1506,6 +1740,10 @@ every turn within the budget.
 | Dispatch cursor | The window host | Each dispatch attempt writes the port it served | Owner | The host | Never reset; may name a retired window's port |
 | Surfaced close requests | The window host | The owner loop records the latest request surfaced per window | Owner | The host | Replaced by a newer request; removed when the window is forgotten |
 | Host activity | The window host | The owner loop writes it around each event step; clients read it | Write: owner; read: any | While referenced | Left at the last turn |
+| Per-window input feeds | The window host, for each window | The owner produces, warns, resumes, and closes; the consumer reads and acknowledges; the application enables and suspends | Owner operations: owner; capabilities: any | Registration until the window is forgotten | Closed at the close protocol, quiescence, or host release; frozen, never reopened |
+| Input channel generation | The input feed | Production sends; reads receive; a reset or closure aborts and drops it; resumption installs the next | Produce and resume: owner; read: any | One generation | Aborted and dropped by a reset or closure |
+| Input phase, epoch, gates, held baseline, episode, and counters | The input feed | Production, admission changes, acknowledgement, warning, resumption, and closure write; statistics read | Any, through the owner operations and capabilities | The feed | Held baseline cleared by focus loss, reset, and closure; the rest frozen at closure; counters never reset |
+| Latest cursor sample | The input feed | The producer records it; button production copies it | Owner | The feed | Replaced by the next sample |
 
 The guard holds only occupancy and poison. None of this is application state.
 

@@ -22,8 +22,9 @@
 -- only the window host's owner loop in "Hetoimasia.Runtime.GLFW" performs them;
 -- every other executor rejects them. A successful creation settles as
 -- 'WindowCreated', and its ticket then hands over the new window's
--- 'WindowClient' through 'pollWindowClient': that window's own command port and
--- read-only observations, separate from the prepared completion data. The owner
+-- 'WindowClient' through 'pollWindowClient': that window's own command port,
+-- read-only observations, and "Hetoimasia.GLFW.Input" reader and admission
+-- control, separate from the prepared completion data. The owner
 -- thread never waits for a ticket or for capacity, since it is the thread that
 -- would have to provide either: there it uses 'performWindowCommand'.
 --
@@ -117,6 +118,8 @@ module Hetoimasia.GLFW.Command
   , clientWindow
   , clientCommandPort
   , clientObservations
+  , clientInputReader
+  , clientInputControl
   , pollWindowClient
 
     -- * Misuse
@@ -157,6 +160,8 @@ import Hetoimasia.GLFW.Internal.Command
   , awaitCompletion
   , awaitSubmitWindowCommand
   , clientCommandPort
+  , clientInputControl
+  , clientInputReader
   , clientObservations
   , clientWindow
   , closeWindowCommand

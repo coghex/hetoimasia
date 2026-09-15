@@ -239,6 +239,8 @@ module Hetoimasia.GLFW.Internal.Command
   , clientWindow
   , clientCommandPort
   , clientObservations
+  , clientInputReader
+  , clientInputControl
   , pollWindowClient
 
     -- * Misuse
@@ -316,6 +318,7 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
 import Hetoimasia.GLFW.Internal.Attribute (Extent (..), Placement (..))
 import Hetoimasia.GLFW.Internal.Capture (Reports, rnfReports)
+import Hetoimasia.GLFW.Internal.Input (InputControl, InputReader)
 import Hetoimasia.GLFW.Internal.Control
   ( ControlOutcome
   , ControlRejection
@@ -683,13 +686,16 @@ type Cell = TVar (Maybe Settlement)
 data Settlement = Settlement !(Prepared Disposition) !(Maybe WindowClient)
 
 -- | The capabilities a client holds for one window: its identity, its own
--- command port, and its read-only observations. Its representation is
--- private: it carries no native handle and no release, retirement, or creation
--- authority, and nothing in it reaches another window.
+-- command port, its read-only observations, and its input feed's reader and
+-- admission control. Its representation is private: it carries no native
+-- handle, no input producer, and no release, retirement, or creation authority,
+-- and nothing in it reaches another window.
 data WindowClient = WindowClient
   { clientIdentity ∷ !WindowId
   , clientPort ∷ !WindowCommandPort
   , clientReader ∷ !(SnapshotReader WindowObservation)
+  , clientInput ∷ !InputReader
+  , clientAdmission ∷ !InputControl
   }
 
 instance Show WindowClient where
@@ -711,8 +717,19 @@ clientCommandPort = clientPort
 clientObservations ∷ WindowClient → SnapshotReader WindowObservation
 clientObservations = clientReader
 
--- | Build the capabilities for a window from its own command host.
-newWindowClient ∷ WindowId → WindowCommandHost → SnapshotReader WindowObservation → WindowClient
+-- | The reader of the window's input feed: its one logical consumer's
+-- capability. Copies share one acknowledgement.
+clientInputReader ∷ WindowClient → InputReader
+clientInputReader = clientInput
+
+-- | The window's input admission control.
+clientInputControl ∷ WindowClient → InputControl
+clientInputControl = clientAdmission
+
+-- | Build the capabilities for a window from its own command host and input
+-- feed.
+newWindowClient
+  ∷ WindowId → WindowCommandHost → SnapshotReader WindowObservation → InputReader → InputControl → WindowClient
 newWindowClient identity host = WindowClient identity (hostPort host)
 
 -- | Which commands a host's executor serves.

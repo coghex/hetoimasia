@@ -29,6 +29,7 @@ import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Command
+import qualified Hetoimasia.GLFW.Input as Input
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Internal.Seam
@@ -113,6 +114,8 @@ spec = describe "GLFW window host" $ do
   describe "quiescence and shutdown" $ do
     it "closes admission and settles queued commands in one finite, idempotent transaction that executes nothing"
       (boundedExample testQuiescence)
+    it "closes a window's input feed with its close protocol, and every feed at quiescence, without awaiting a pending reset's acknowledgement"
+      (boundedExample testInputFeedsClosed)
     it "settles queued callers before the boundary drain when startup fails after a worker started"
       (boundedExample (testSettledBeforeDrain StartupFails))
     it "settles queued callers before the boundary drain when the action returns"
@@ -481,6 +484,38 @@ testQuiescence = do
   dispositions `shouldBe` replicate 3 (Just NotExecuted)
   late `shouldBe` SubmitClosed
   sampled `shouldBe` 0
+
+-- | Each window's client carries its own input feed. A window's close protocol
+-- closes that feed, and quiescence closes the rest, even while a reset waits for
+-- an acknowledgement no consumer will make.
+testInputFeedsClosed ∷ Expectation
+testInputFeedsClosed = do
+  validateHostConfig (settings []) {hostInputCapacity = 0} `shouldBe` Left (InputCapacityRejected 0)
+  seam ← newSeam defaultScript
+  (closedByClose, pending, closedByQuiescence, frozen) ←
+    hosted seam (settings [windowNamed "kept", windowNamed "closed"]) (\host _ → pure host) $ \host _ → do
+      (kept, closing) ←
+        atomically (mapM (hostWindowClient host) =<< hostWindowIdentities host) >>= \case
+          [Just kept, Just closing] → pure (kept, closing)
+          clients → unexpected ("expected two window clients, found " <> show clients)
+      Input.inputReaderWindow (clientInputReader kept) `shouldBe` clientWindow kept
+      atomically (Input.enableInput (clientInputControl kept)) `shouldReturn` Input.AdmissionOpened
+      token ←
+        atomically (Input.suspendInput (clientInputControl kept)) >>= \case
+          Input.AdmissionReset token → pure token
+          other → unexpected ("suspension began no reset: " <> show other)
+      closeHostWindow host (clientWindow closing) `shouldReturn` CloseStarted
+      closedByClose ← atomically (Input.readInput (clientInputReader closing))
+      pending ← atomically (Input.readInput (clientInputReader kept))
+      pending `shouldBe` Input.InputResetRequired token
+      atomically (quiesceWindowHost host)
+      closedByQuiescence ← atomically (Input.awaitInput (clientInputReader kept))
+      frozen ← atomically (Input.inputStatistics (clientInputReader kept))
+      pure (closedByClose, pending, closedByQuiescence, frozen)
+  closedByClose `shouldBe` Input.InputClosed
+  pending `shouldSatisfy` (/= Input.InputClosed)
+  closedByQuiescence `shouldBe` Input.InputClosed
+  (Input.statisticsPhase frozen, Input.statisticsResets frozen) `shouldBe` (Input.InputFeedClosed, 1)
 
 -- | How a run leaves the supervised region while a worker waits on a queued
 -- command.
