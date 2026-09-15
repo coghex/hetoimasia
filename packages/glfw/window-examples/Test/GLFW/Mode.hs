@@ -19,7 +19,7 @@
 module Test.GLFW.Mode (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (SomeException, fromException, throwIO, try)
+import Control.Exception (ErrorCall (ErrorCall), SomeException, fromException, throwIO, toException, try)
 import Control.Monad (forM, forM_, join, replicateM, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
@@ -31,7 +31,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (cleanupFailures)
 import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Control (ConstraintState (ConstraintsIndeterminate))
-import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), savedPlacement, windowedPlacement, windowedPlan)
+import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), abandonClaims, savedPlacement, windowedPlacement, windowedPlan)
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (monitorClaims, reconcileMonitorEvents)
 import Hetoimasia.GLFW.Internal.Window (reconcileWindowMode)
@@ -102,6 +102,10 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testUncertainClaims)
     it "switches monitors by reserving the destination first and releasing the source only after confirmed departure"
       (boundedExample testMonitorSwitch)
+    it "settles the claims of a fullscreen attempt interrupted by a raising native step as uncertain until reconciliation, and releases an unused reservation"
+      (boundedExample testInterruptedClaims)
+    it "prunes an ended monitor's claim after a refresh that commits and then rethrows a monitor callback fault"
+      (boundedExample testPruneOnCallbackFault)
 
   describe "eligibility" $ do
     it "applies the operation matrix after entering each mode, rejecting ineligible controls before any native setter"
@@ -901,6 +905,59 @@ testMonitorSwitch = do
     switched `shouldSatisfy` appliedCleanly
     claimsSwitched `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimHeld)]
     reclaimed `shouldSatisfy` appliedCleanly
+
+testInterruptedClaims ∷ Expectation
+testInterruptedClaims = do
+  raising ← newIORef False
+  let script =
+        tracked
+          { scriptWindowControl = \call _ → case call of
+              SetWindowMonitor 1 2 _ _ _ _ _ → readIORef raising >>= \on → when on (throwIO (userError "the monitor step raised"))
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \first → withWindowIn desk "second" $ \second → do
+    let right = deskRight desk
+        left = deskLeft desk
+        claims = monitorClaims (deskSession desk)
+    writeIORef raising True
+    ticket ← submit (windowCommandPort (deskHost desk)) (mode first (fullscreenOn right))
+    raised ← try @SomeException (seamExecuteNext (deskSeam desk) (deskHost desk) [first, second])
+    writeIORef raising False
+    settled ← atomically (pollCompletion ticket)
+    afterInterruption ← claims
+    busy ← execute desk [first, second] (mode second (fullscreenOn right))
+    reconciled ← reconcileWindowMode first
+    afterReconciliation ← claims
+    freed ← execute desk [first, second] (mode second (fullscreenOn right))
+    either (const True) (const False) raised `shouldBe` True
+    settled `shouldBe` Just (Interrupted (submittedRequest (ticketOrigin ticket)))
+    afterInterruption `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimUncertain)]
+    busy `shouldBe` Rejected (ModeRejected (windowIdentity second) (MonitorBusy right))
+    reconciled `shouldBe` WindowAvailable Nothing
+    afterReconciliation `shouldBe` Map.empty
+    freed `shouldSatisfy` appliedCleanly
+    -- An attempt interrupted before any native step releases only the
+    -- reservation it made, and never a claim it held before.
+    abandonClaims 1 (Just right) False (Map.fromList [(right, WindowClaim 1 ClaimReserved), (left, WindowClaim 2 ClaimHeld)])
+      `shouldBe` Map.fromList [(left, WindowClaim 2 ClaimHeld)]
+    abandonClaims 1 (Just right) False (Map.fromList [(right, WindowClaim 1 ClaimHeld)])
+      `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimHeld)]
+    abandonClaims 1 (Just right) True (Map.fromList [(right, WindowClaim 1 ClaimReserved), (left, WindowClaim 1 ClaimHeld)])
+      `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimUncertain), (left, WindowClaim 1 ClaimUncertain)]
+
+testPruneOnCallbackFault ∷ Expectation
+testPruneOnCallbackFault = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  owning ← execute desk [window] (mode window (fullscreenOn (deskLeft desk)))
+  before ← monitorClaims (deskSession desk)
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1, MonitorEventRaises 1 (toException (ErrorCall "the monitor callback raised"))]
+  faulted ← try @ErrorCall (synchronizeMonitors (deskSession desk))
+  after ← monitorClaims (deskSession desk)
+  owning `shouldSatisfy` appliedCleanly
+  before `shouldBe` Map.fromList [(deskLeft desk, WindowClaim 1 ClaimHeld)]
+  faulted `shouldSatisfy` either (== ErrorCall "the monitor callback raised") (const False)
+  after `shouldBe` Map.empty
 
 -- ---------------------------------------------------------------------------
 -- Eligibility

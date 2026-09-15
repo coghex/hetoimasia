@@ -1554,9 +1554,16 @@ window and whether the claim is reserved, held, or uncertain:
   until the window is observed off it, and after a failed switch keeps whichever
   claim is still observed, releasing only a destination observed unused;
 - iconifying a fullscreen window changes no claim;
+- an attempt interrupted by anything other than its own failure — a native call
+  that raises, a callback fault, or cancellation — releases a reservation it made
+  before any native step as proven unused; after a native step it makes every
+  claim of the window uncertain and its applied mode indeterminate, so the owner
+  loop's mode reconciliation resamples it and releases what the sample proves
+  unused;
 - a claim on an ended identity is dropped by every inventory refresh and
   resolution — `synchronizeMonitors`, `resolveMonitor`, the owner loop's monitor
-  step — and whenever claims are consulted, so a disconnect releases it at once
+  step — including one that commits and then rethrows a monitor callback fault,
+  and whenever claims are consulted, so a disconnect releases it at once
   and the claims never outnumber the current monitors;
 - a window's release drops its claims only when its disposal succeeded; any other
   release leaves them uncertain, and an uncertain claim is never available to
@@ -2378,8 +2385,9 @@ The native examples cover:
   and compared at that point with `windowFullscreenForCheck` and
   `windowStateForCheck`'s decoration, which GLFW sets synchronously, while size
   and position, which X11 applies asynchronously, are compared only once the
-  observation and the platform agree within the event-wait bound, and
-  restoration is checked against the platform's report; and a second window's
+  observation and the platform both reach the target within the event-wait
+  bound, an example failing rather than passing when they do not; and a second
+  window's
   request for the claimed monitor refused as `MonitorBusy` with the first
   window's fullscreen state, size, and the monitor's video mode unchanged, and an
   ordinary resize of the fullscreen window refused before its setter. The run

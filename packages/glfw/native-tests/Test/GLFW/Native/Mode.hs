@@ -18,9 +18,9 @@
 -- server's: X11 applies them asynchronously, so a query moments after the sample
 -- may already differ. A revision records what was sampled at that boundary, not
 -- the platform's eventual acknowledgement, so geometry is compared only once the
--- observation and the platform's report agree, within a bound of event waits,
--- and restoration is checked against the platform's report rather than the
--- request.
+-- observation and the platform's report both reach the target within a bound of
+-- event waits, and an example whose reports never reach it fails rather than
+-- passing on a timeout.
 --
 -- The run prints the exercised monitor topology. No automated run can attach or
 -- detach a display, so the record states that no hotplug transition was
@@ -119,8 +119,14 @@ spec shared = describe "window modes" $ do
         withModeWindows session $ \perform first second → do
           owning ← perform (mode first (fullscreenOn identity))
           _ ← namedCheck first owning
-          -- The display server applies the fullscreen geometry asynchronously.
-          _ ← convergeTo first =<< fullscreenGeometry monitor
+          -- The display server applies the fullscreen geometry asynchronously,
+          -- and a platform may switch to the closest mode it supports, so the
+          -- target is the monitor's current mode once the window is on it.
+          switched ←
+            resolveMonitor session identity >>= \case
+              MonitorAvailable description → pure description
+              MonitorDisconnected _ → failed "the selected monitor disconnected during the example"
+          _ ← convergeTo first =<< fullscreenGeometry switched
           before ← monitorFacts session identity first
           busy ← perform (mode second (modeRequest (fullscreenMode identity (otherPreference monitor)) noModeFallback))
           after ← monitorFacts session identity first
@@ -241,7 +247,8 @@ platformPlacement window = do
   (width, height) ← windowSizeForCheck (windowNativeHandle window)
   pure (Placement x y, Extent width height)
 
--- | The window's placement once its observation and the platform agree.
+-- | The window's placement once its observation and the platform agree; the
+-- example fails if they do not within the bound.
 settledPlacement ∷ Window → IO (Placement, Extent)
 settledPlacement window =
   converge window $ \observation → do
@@ -249,22 +256,21 @@ settledPlacement window =
     let observed = (observedPlacement observation, observedLogicalExtent observation)
     pure (observed == (Observed (fst platform), Observed (snd platform)), platform)
 
--- | The window's placement once both its sampled observation and the platform
--- report the target, or when the bound runs out. The platform is queried after
--- the sample, so requiring both rules out a platform that advanced past a stale
--- observation; the answer is the observation's placement when it and the
--- platform agree, and the platform's otherwise.
+-- | The target, once both the window's sampled observation and the platform
+-- report it. The platform is queried after the sample, so requiring both rules
+-- out a platform that advanced past a stale observation. The example fails, with
+-- both reports, if they do not within the bound.
 convergeTo ∷ Window → (Placement, Extent) → IO (Placement, Extent)
 convergeTo window target =
-  converge window $ \observation → do
+  target <$ converge window (\observation → do
     platform ← platformPlacement window
     let observed = (observedPlacement observation, observedLogicalExtent observation)
-        wanted = (Observed (fst target), Observed (snd target))
-    pure (observed == wanted && platform == target, if observed == (Observed (fst platform), Observed (snd platform)) then target else platform)
+    pure (observed == (Observed (fst target), Observed (snd target)) && platform == target, (observed, platform)))
 
 -- | Synchronize the window until the check holds, waiting for native events in
--- between, and answer the check's value from the last attempt either way.
-converge ∷ Window → (WindowObservation → IO (Bool, r)) → IO r
+-- between, and answer the check's value. Exhausting the bound fails the example
+-- with the last value, so a timeout never passes as convergence.
+converge ∷ Show r ⇒ Window → (WindowObservation → IO (Bool, r)) → IO r
 converge window check = attempt turnBound
   where
     attempt remaining = do
@@ -273,9 +279,11 @@ converge window check = attempt turnBound
           WindowAvailable observation → pure observation
           WindowEnded _ → failed "a live window answered as ended"
       (holds, value) ← check observation
-      if holds || remaining == 0
-        then pure value
-        else waitEventsForCheck 0.05 >> attempt (remaining - 1 ∷ Natural)
+      decide holds value remaining
+    decide holds value remaining
+      | holds = pure value
+      | remaining == 0 = failed ("the window did not converge within its bound; last report: " <> show value)
+      | otherwise = waitEventsForCheck 0.05 >> attempt (remaining - 1 ∷ Natural)
 
 -- | At most five seconds of 50 ms event waits.
 turnBound ∷ Natural

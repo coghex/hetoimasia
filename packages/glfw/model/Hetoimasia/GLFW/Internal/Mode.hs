@@ -108,8 +108,11 @@
 -- monitor: that monitor is held and every other claim of the window is released
 -- — its departure is confirmed, or its reservation proven unused; no fullscreen
 -- monitor releases them all; an unavailable report makes them all uncertain.
--- Iconification changes no claim. 'pruneClaims' drops the claims of ended
--- identities, and a window's release drops its claims only when disposal
+-- Iconification changes no claim. An attempt interrupted by an exception other
+-- than its own failure settles its claims with 'abandonClaims': a reservation it
+-- made before any native step is released as proven unused, and after a native
+-- step every claim of the window becomes uncertain. 'pruneClaims' drops the
+-- claims of ended identities, and a window's release drops its claims only when disposal
 -- succeeded ('disposeClaims'). An uncertain claim is never available to another
 -- window.
 --
@@ -190,6 +193,7 @@ module Hetoimasia.GLFW.Internal.Mode
   , pruneClaims
   , reserveClaim
   , settleClaims
+  , abandonClaims
   , disposeClaims
 
     -- * Outcomes
@@ -809,6 +813,19 @@ settleClaims window observed claims = case observed of
     hold = \case
       Just claim | claimWindow claim /= window → Just claim
       _ → Just (WindowClaim window ClaimHeld)
+
+-- | Settle a window's claims when an attempt was interrupted by something other
+-- than its own failure: before any native step, the monitor the attempt
+-- reserved, if it still holds only that reservation, is released as proven
+-- unused; after a native step, every claim of the window becomes uncertain.
+abandonClaims ∷ Natural → Maybe MonitorId → Bool → MonitorClaims → MonitorClaims
+abandonClaims window reserved stepped claims
+  | stepped = Map.map (\claim → if claimWindow claim == window then claim {claimState = ClaimUncertain} else claim) claims
+  | otherwise = maybe claims (\monitor → Map.update unused monitor claims) reserved
+  where
+    unused claim
+      | claimWindow claim == window && claimState claim == ClaimReserved = Nothing
+      | otherwise = Just claim
 
 -- | Settle a released window's claims: dropped when its disposal succeeded,
 -- uncertain otherwise.

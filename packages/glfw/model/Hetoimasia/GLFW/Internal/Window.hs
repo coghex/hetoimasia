@@ -155,6 +155,14 @@
 -- An attempt's constraint cleanup runs only when that attempt made a native step
 -- itself, so an attempt refused before any native call makes none.
 --
+-- An attempt interrupted by anything other than its own failure — a native call
+-- that raises, a callback fault, or cancellation — settles before the exception
+-- continues: a fullscreen reservation it made before any native step is released
+-- as proven unused, and after a native step every claim of the window becomes
+-- uncertain and its applied mode indeterminate in the owner's state, so the
+-- owner loop's mode reconciliation resamples it and releases what the sample
+-- proves unused.
+--
 -- The transition interval is that execution, from setting the marker to the
 -- settlement, on the owner thread. Nothing else executes a command inside it: the
 -- owner executes one command at a time, and callbacks only record. The marker
@@ -387,7 +395,7 @@ import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find)
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Data.Unique (Unique)
@@ -483,6 +491,7 @@ import Hetoimasia.GLFW.Internal.Mode
   , savedPlacement
   , selectVideoMode
   , settleClaims
+  , abandonClaims
   , disposeClaims
   , startupRequest
   , startupRequirement
@@ -1748,9 +1757,17 @@ modeAttempt window request kind =
         placement ← refused (windowedPlacement windowed (modeSavedPlacement record) (inventoryMonitors inventory))
         plan ← refused (windowedPlan native windowed placement)
         pure (plan, Nothing)
-    runModeSteps window disturbed pointer plan >>= \case
-      Right steps → (kind, steps) <$ samplePresentation True window (maybe id recordSaved leaving)
-      Left failure → samplePresentation True window id >> failWith failure
+    let reserved = listToMaybe [monitor | MonitorStep monitor _ _ ← planSteps plan]
+    attempted ∷ Either (ExceptionWithContext SomeException) (ModeAttemptKind, [ModeStep]) ←
+      tryWithContext $
+        runModeSteps window disturbed pointer plan >>= \case
+          Right steps → (kind, steps) <$ samplePresentation True window (maybe id recordSaved leaving)
+          Left failure → samplePresentation True window id >> failWith failure
+    case attempted of
+      Right value → pure value
+      Left caught@(ExceptionWithContext _ raised)
+        | Just (_ ∷ ModeAttemptFailure) ← fromException raised → rethrowIO caught
+        | otherwise → abandonAttempt window disturbed reserved >> rethrowIO caught
   where
     session = windowSession window
     local = windowLocalIdentity (windowId window)
@@ -1769,6 +1786,19 @@ modeAttempt window request kind =
     described monitor = \case
       Observed descriptions → find ((== monitor) . monitorIdentity) descriptions
       Unavailable → Nothing
+
+-- | Settle an attempt interrupted by something other than its own failure: its
+-- claims under 'abandonClaims', and, after a native step, an indeterminate
+-- applied mode in the owner's state, which the next mode reconciliation resamples
+-- and publishes.
+abandonAttempt ∷ Window → IORef Bool → Maybe MonitorId → IO ()
+abandonAttempt window disturbed reserved = do
+  stepped ← readIORef disturbed
+  atomicModifyIORef' (sessionClaims (windowSession window)) $ \claims →
+    (abandonClaims (windowLocalIdentity (windowId window)) reserved stepped claims, ())
+  when stepped $
+    atomicModifyIORef' (windowOwnerState window) $ \(OwnerState current issued) →
+      (OwnerState current {obsMode = recordApplied AppliedIndeterminate (obsMode current)} issued, ())
 
 -- | Make a plan's steps in order, stopping at the first that reports an error.
 -- The native constraint state is indeterminate from a constraint step's start

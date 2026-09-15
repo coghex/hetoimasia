@@ -193,7 +193,7 @@ module Hetoimasia.GLFW.Internal.Session
   ) where
 
 import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId)
-import Control.Exception (Exception, ExceptionWithContext, SomeException, onException, rethrowIO, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext, SomeException, finally, onException, rethrowIO, tryWithContext)
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import qualified Data.Map.Strict as Map
@@ -863,9 +863,8 @@ synchronizeMonitors session =
 -- since the last refresh: the owner loop's step after native events.
 reconcileMonitorEvents ∷ Session → IO ()
 reconcileMonitorEvents session =
-  ownerOperation session reconcileMonitorsOperation [] $ do
-    reconcileInventory (sessionMonitors session)
-    pruneSessionClaims session
+  ownerOperation session reconcileMonitorsOperation [] $
+    reconcileInventory (sessionMonitors session) `finally` pruneSessionClaims session
 
 -- | Re-resolve a monitor identity against the monitors GLFW reports now, and
 -- answer its fresh description, or 'MonitorDisconnected' for an identity whose
@@ -920,16 +919,18 @@ identifyWindowMonitor = identifyPointer . sessionMonitors
 -- | Refresh the inventory and answer it. The caller is already inside an owner
 -- operation.
 refreshMonitors ∷ Session → IO MonitorInventory
-refreshMonitors session = synchronizeInventory (sessionMonitors session) <* pruneSessionClaims session
+refreshMonitors session = synchronizeInventory (sessionMonitors session) `finally` pruneSessionClaims session
 
 -- | Refresh the inventory and answer the identity's description and the live
 -- pointer this boundary's enumeration returned, which must not outlive the
 -- calling boundary. The caller is already inside an owner operation.
 resolveMonitorPointer ∷ Session → MonitorId → IO (MonitorResult (MonitorDescription, Ptr NativeMonitor))
-resolveMonitorPointer session identity = resolveInventory (sessionMonitors session) identity <* pruneSessionClaims session
+resolveMonitorPointer session identity = resolveInventory (sessionMonitors session) identity `finally` pruneSessionClaims session
 
 -- | Drop the claims of identities the inventory no longer holds: every refresh
--- and resolution does, so a disconnected monitor's claim ends with its identity.
+-- and resolution does, whether it returns or rethrows a monitor callback fault
+-- after committing, so a disconnected monitor's claim ends with its identity.
+-- Pruning against identities a failed refresh left unchanged changes nothing.
 pruneSessionClaims ∷ Session → IO ()
 pruneSessionClaims session = do
   live ← liveIdentities (sessionMonitors session)
