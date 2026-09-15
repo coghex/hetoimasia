@@ -32,8 +32,9 @@ through the host's close protocol. `Hetoimasia.GLFW.Input` gives each host
 window one bounded, ordered input feed read by one consumer: key, text, button,
 scroll, and focus events tagged with a window and a non-wrapping epoch, and on
 overflow or temporary suspension a visible reset the consumer must acknowledge
-before the owner resumes a fresh epoch. No native input callback produces into
-it yet; the CPU examples drive its private producer.
+before the owner resumes a fresh epoch. Native key, character, button, cursor,
+and scroll callbacks copy a fixed payload and return; the owner boundary
+publishes ordered events into the feed.
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on

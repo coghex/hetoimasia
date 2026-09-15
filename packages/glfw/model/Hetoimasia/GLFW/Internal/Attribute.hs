@@ -1,8 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 
 -- | The observation vocabulary windows, window controls, and monitors share: an
--- attribute the platform observed or cannot provide, a content scale, and a
--- window's size and placement.
+-- attribute the platform observed or cannot provide, a content scale, a
+-- window's size and placement, and a cursor position.
 --
 -- It holds no state. "Hetoimasia.GLFW.Internal.Window" and
 -- "Hetoimasia.GLFW.Internal.Monitor" both publish observations built from these
@@ -13,6 +13,7 @@ module Hetoimasia.GLFW.Internal.Attribute
   , ContentScale (..)
   , Extent (..)
   , Placement (..)
+  , CursorPosition (..)
   ) where
 
 import Control.DeepSeq (NFData)
@@ -55,3 +56,12 @@ data Placement = Placement
   deriving (Eq, Show, Generic)
 
 instance NFData Placement
+
+-- | A cursor position in screen coordinates relative to the content area.
+data CursorPosition = CursorPosition
+  { cursorX ∷ !Double
+  , cursorY ∷ !Double
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData CursorPosition

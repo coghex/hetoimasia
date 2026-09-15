@@ -404,9 +404,23 @@ not a verdict that Synarchy's design should be discarded.
   resumption. The private producer (`produceInput`, `recordCursor`,
   `produceButton`), warning, and `resumeInputWith` are driven only by
   `glfw-window-examples`' `Test.GLFW.Input`. The window close protocol and host
-  quiescence close feeds; the host does not yet produce, warn, or resume — that
-  owner-loop and native callback wiring is GLFW-12 (#100). Contract:
-  `docs/glfw.md`, "Input feeds".
+  quiescence close feeds. GLFW-12 (#100) connects the native callbacks and the
+  owner loop. Contract: `docs/glfw.md`, "Input feeds".
+- GLFW-12 (#100) registered per-window key, character, mouse button, cursor
+  position, cursor enter/leave, and scroll callbacks as protected resources of
+  the window assembly, reusing GLFW-2's focus callback rather than a second
+  owner. Each callback copies a fixed payload and returns. Ordered events stage
+  in a bounded buffer of 256; overflow sets a loss latch that survives the
+  buffer being full, and the next owner boundary discards the batch and starts
+  the same `InputOverflowed` reset, with no prefix replayed. Cursor motion
+  coalesces into `observedCursorPosition` / `observedCursorInside` and the
+  feed's cursor sample. The host attaches each window's feed at registration
+  and, on `runOwnerLoop`, claims the overflow warning through `loopLogger` and
+  resumes acknowledged feeds after event reconciliation and after command
+  work, because setters can invoke callbacks. Native examples inject through
+  the registered C trampolines (`hetoimasia_glfw_inject_*_for_check`); hidden
+  test windows use that fixture owner-thread path, recorded with the suite.
+  Contract: `docs/glfw.md`.
 - GLFW-6 (#98) added window modes: the pure private model
   `Hetoimasia.GLFW.Internal.Mode` (requests, saved placement, `ModeRecord`,
   `AppliedMode` derived from sampled decoration, fullscreen monitor, and work-area

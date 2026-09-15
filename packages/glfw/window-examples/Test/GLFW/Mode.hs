@@ -25,7 +25,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
+import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (cleanupFailures)
@@ -1391,13 +1391,16 @@ hosted seam config =
 
 looping ∷ WindowHost → RuntimeControl → (Turn → IO (TurnStep a)) → IO a
 looping host control update =
-  runOwnerLoop host control . LoopHooks noApplicationEvents $ \turn →
+  runOwnerLoop host control . LoopHooks quietLogger noApplicationEvents $ \turn →
     if turnNumber turn > 400
       then unexpected "the example did not finish within its turn bound"
       else update turn
 
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 -- | @GLFW_PLATFORM_ERROR@.
 platformErrorCode ∷ Int

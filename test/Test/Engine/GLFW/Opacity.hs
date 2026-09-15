@@ -25,12 +25,13 @@
 -- control module. Two are rejected for the window modes: one names a mode's,
 -- saved placement's, or mode record's constructor, or sets a record's saved
 -- placement through a field, and one reaches for the mode representation and the
--- owner's record updates in the private mode module. Four are rejected for the input feeds: one names the reader's,
+-- owner's record updates in the private mode module. Five are rejected for the input feeds: one names the reader's,
 -- control's, event's, epoch's, and reset token's constructors; one coerces a
 -- number into an input epoch, so a token could be retargeted; one rewrites a
 -- token's epoch through record syntax; and one reaches for the feed, its
 -- producer, and its resumption through the public input module, and another
--- in the private input module. One client must be accepted, linked, and run: it uses only the public
+-- in the private input module, and one reaches for native callback injection.
+-- One client must be accepted, linked, and run: it uses only the public
 -- session, monitor, window, and window command interfaces, including the
 -- read-only observation and inventory endpoints, identity resolution, a command
 -- port, every control command constructor, the mode requests, a startup mode,
@@ -249,6 +250,19 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so an input producer is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Input"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that registers an input callback or injects an event through the private native table" $
+    withClient "Client.hs" inputCallbackClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so an input callback is reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Native"
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -507,6 +521,7 @@ hostClient =
     , "import Control.Concurrent.STM (atomically)"
     , "import Control.Exception (SomeException, fromException, try)"
     , "import qualified Data.Text as Text"
+    , "import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)"
     , "import Hetoimasia.Foundation.Messaging.Snapshot (readSnapshot)"
     , "import Hetoimasia.Foundation.Resource (withScoped)"
     , "import Hetoimasia.GLFW.Command"
@@ -541,7 +556,8 @@ hostClient =
     , "serve ∷ WindowHost → RuntimeControl → IO Int"
     , "serve host control ="
     , "  runOwnerLoop host control LoopHooks"
-    , "    { loopEvent = noApplicationEvents"
+    , "    { loopLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\\_ → pure ()))"
+    , "    , loopEvent = noApplicationEvents"
     , "    , loopUpdate = \\turn → do"
     , "        activity ← atomically (hostActivity host)"
     , "        _ ← atomically (readSnapshot (hostMonitors host))"
@@ -806,6 +822,21 @@ privateInputClient =
     , ""
     , "produce ∷ InputFeed → IO Production"
     , "produce feed = feedReader feed `seq` produceInput feed (TextInput 'x')"
+    ]
+
+-- | A client asking the private native table to inject an input event or to
+-- reach callback storage.
+inputCallbackClient ∷ String
+inputCallbackClient =
+  unlines
+    [ "module Client (inject) where"
+    , ""
+    , "import Foreign.Ptr (Ptr, nullPtr)"
+    , "import Hetoimasia.GLFW.Internal.Native (injectKeyForCheck)"
+    , "import Hetoimasia.GLFW.Internal.Session (NativeWindow)"
+    , ""
+    , "inject ∷ IO ()"
+    , "inject = injectKeyForCheck (nullPtr ∷ Ptr NativeWindow) 65 0 1 0"
     ]
 
 -- | A client importing the window drivers from the seam's private

@@ -339,6 +339,15 @@ data WindowEvent
   | MaximizeChanged Bool
   | RefreshRequested
   | CloseRequested
+  | KeyEventAt Int Int Int Int
+    -- ^ Physical key, scancode, action, and modifiers, as GLFW passes them.
+  | CharEventAt Int
+    -- ^ Unicode code point.
+  | ButtonEventAt Int Int Int
+    -- ^ Button, action, and modifiers.
+  | CursorMovedTo Double Double
+  | CursorEnterChanged Bool
+  | ScrollEventAt Double Double
   | CallbackRaises SomeException
     -- ^ A size callback whose payload raises the exception when copied.
 
@@ -631,6 +640,14 @@ deliverTo seam key events = do
       MaximizeChanged flag → onWindowMaximize callbacks (flagOf flag)
       RefreshRequested → onWindowRefresh callbacks
       CloseRequested → onWindowClose callbacks
+      KeyEventAt code scancode action mods →
+        onKey callbacks (fromIntegral code) (fromIntegral scancode) (fromIntegral action) (fromIntegral mods)
+      CharEventAt codepoint → onChar callbacks (fromIntegral codepoint)
+      ButtonEventAt button action mods →
+        onMouseButton callbacks (fromIntegral button) (fromIntegral action) (fromIntegral mods)
+      CursorMovedTo x y → onCursorPos callbacks (realToFrac x) (realToFrac y)
+      CursorEnterChanged entered → onCursorEnter callbacks (flagOf entered)
+      ScrollEventAt x y → onScroll callbacks (realToFrac x) (realToFrac y)
       CallbackRaises failure → onWindowSize callbacks (throw failure) 1
     flagOf flag = if flag then 1 else 0
 

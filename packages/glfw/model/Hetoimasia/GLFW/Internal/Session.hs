@@ -201,7 +201,7 @@ import Data.Int (Int32)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
-import Foreign.C.Types (CFloat, CInt)
+import Foreign.C.Types (CDouble, CFloat, CInt, CUInt)
 import Foreign.Ptr (FunPtr, Ptr)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
@@ -334,6 +334,15 @@ data WindowCallbacks = WindowCallbacks
   , onWindowMaximize ∷ CInt → IO ()
   , onWindowRefresh ∷ IO ()
   , onWindowClose ∷ IO ()
+  , onKey ∷ CInt → CInt → CInt → CInt → IO ()
+    -- ^ Physical key, scancode, action, and modifiers.
+  , onChar ∷ CUInt → IO ()
+    -- ^ Unicode code point.
+  , onMouseButton ∷ CInt → CInt → CInt → IO ()
+    -- ^ Button, action, and modifiers.
+  , onCursorPos ∷ CDouble → CDouble → IO ()
+  , onCursorEnter ∷ CInt → IO ()
+  , onScroll ∷ CDouble → CDouble → IO ()
   }
 
 -- | The storage behind one window's callback wrappers, one pointer per

@@ -247,6 +247,62 @@ char* hetoimasia_glfw_window_title(GLFWwindow* window)
     return (char*) glfwGetWindowTitle(window);
 }
 
+void hetoimasia_glfw_inject_key_for_check(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    GLFWkeyfun callback = glfwSetKeyCallback(window, NULL);
+    glfwSetKeyCallback(window, callback);
+    if (callback != NULL)
+        callback(window, key, scancode, action, mods);
+}
+
+void hetoimasia_glfw_inject_char_for_check(GLFWwindow* window, unsigned int codepoint)
+{
+    GLFWcharfun callback = glfwSetCharCallback(window, NULL);
+    glfwSetCharCallback(window, callback);
+    if (callback != NULL)
+        callback(window, codepoint);
+}
+
+void hetoimasia_glfw_inject_mouse_button_for_check(GLFWwindow* window, int button, int action, int mods)
+{
+    GLFWmousebuttonfun callback = glfwSetMouseButtonCallback(window, NULL);
+    glfwSetMouseButtonCallback(window, callback);
+    if (callback != NULL)
+        callback(window, button, action, mods);
+}
+
+void hetoimasia_glfw_inject_cursor_pos_for_check(GLFWwindow* window, double x, double y)
+{
+    GLFWcursorposfun callback = glfwSetCursorPosCallback(window, NULL);
+    glfwSetCursorPosCallback(window, callback);
+    if (callback != NULL)
+        callback(window, x, y);
+}
+
+void hetoimasia_glfw_inject_cursor_enter_for_check(GLFWwindow* window, int entered)
+{
+    GLFWcursorenterfun callback = glfwSetCursorEnterCallback(window, NULL);
+    glfwSetCursorEnterCallback(window, callback);
+    if (callback != NULL)
+        callback(window, entered);
+}
+
+void hetoimasia_glfw_inject_scroll_for_check(GLFWwindow* window, double x, double y)
+{
+    GLFWscrollfun callback = glfwSetScrollCallback(window, NULL);
+    glfwSetScrollCallback(window, callback);
+    if (callback != NULL)
+        callback(window, x, y);
+}
+
+void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused)
+{
+    GLFWwindowfocusfun callback = glfwSetWindowFocusCallback(window, NULL);
+    glfwSetWindowFocusCallback(window, callback);
+    if (callback != NULL)
+        callback(window, focused);
+}
+
 void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields)
 {
     const GLFWvidmode* mode = &modes[index];

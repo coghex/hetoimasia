@@ -20,7 +20,7 @@ import Control.Exception (Exception, throwIO, try)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocResource)
@@ -61,7 +61,8 @@ spec shared = describe "window host" $ do
           ( \host control →
               runOwnerLoop host control $
                 LoopHooks
-                  { loopEvent = noApplicationEvents
+                  { loopLogger = quietLogger
+                  , loopEvent = noApplicationEvents
                   , loopUpdate = \turn →
                       readTVarIO result >>= \case
                         Just (settled, revision) → do
@@ -89,7 +90,8 @@ spec shared = describe "window host" $ do
           ( \host control →
               runOwnerLoop host control $
                 LoopHooks
-                  { loopEvent = noApplicationEvents
+                  { loopLogger = quietLogger
+                  , loopEvent = noApplicationEvents
                   , loopUpdate = \turn → do
                       noted ←
                         if turnWaited turn
@@ -123,7 +125,8 @@ spec shared = describe "window host" $ do
                 window ← onlyWindow host
                 runOwnerLoop host control $
                   LoopHooks
-                    { loopEvent = noApplicationEvents
+                    { loopLogger = quietLogger
+                    , loopEvent = noApplicationEvents
                     , loopUpdate = \turn → do
                         when (turnNumber turn == 1) (requestCloseForCheck (windowNativeHandle window))
                         policy surfacedAt service window turn
@@ -229,7 +232,8 @@ testHeldPortClosed shared = do
         ( \(host, held) control →
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = noApplicationEvents
+                { loopLogger = quietLogger
+                , loopEvent = noApplicationEvents
                 , loopUpdate = \turn → do
                     ready ← readTVarIO holding
                     already ← readTVarIO closed
@@ -278,7 +282,8 @@ testHonouredCloseRequest shared = do
         answered ← newIORef Nothing
         runOwnerLoop host control $
           LoopHooks
-            { loopEvent = noApplicationEvents
+            { loopLogger = quietLogger
+            , loopEvent = noApplicationEvents
             , loopUpdate = \turn → do
                 when (turnNumber turn == 1) $
                   void (withHostWindow host (clientWindow closing) (requestCloseForCheck . windowNativeHandle))
@@ -314,7 +319,8 @@ testRemainingDisposedAfterDrain shared = do
               requested ← newIORef Nothing
               runOwnerLoop host control $
                 LoopHooks
-                  { loopEvent = noApplicationEvents
+                  { loopLogger = quietLogger
+                  , loopEvent = noApplicationEvents
                   , loopUpdate = \turn →
                       readIORef requested >>= \case
                         Nothing →
@@ -369,7 +375,8 @@ settleRequest token port command =
 untilReported ∷ TVar (Maybe r) → LoopHooks r
 untilReported result =
   LoopHooks
-    { loopEvent = noApplicationEvents
+    { loopLogger = quietLogger
+    , loopEvent = noApplicationEvents
     , loopUpdate = \turn →
         readTVarIO result >>= \case
           Just report → pure (Finish report)
@@ -475,7 +482,10 @@ untilStopped token = atomically (awaitStopRequest token)
 
 -- | A logging lifetime whose records go nowhere.
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 settings ∷ Text → HostConfig
 settings name = (defaultHostConfig [hiddenTestWindowConfig name 160 120]) {hostIdleWait = 0.1}

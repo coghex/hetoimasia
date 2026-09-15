@@ -24,7 +24,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
-import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
@@ -142,7 +142,8 @@ testPollThenWait = do
       queued ← newIORef Nothing
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → do
               modifyIORef' summaries (<> [summary turn])
               case turnNumber turn of
@@ -169,7 +170,8 @@ testNoWindowsWait = do
     hosted seam (settings []) {hostIdleWait = 0.5} (\host _ → pure host) $ \host control →
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → pure (if turnNumber turn == 4 then Finish (turnNumber turn) else Continue)
           }
   turns `shouldBe` 4
@@ -258,7 +260,8 @@ testPreemption trigger = do
         ( \host control →
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = do
+                { loopLogger = quietLogger
+                , loopEvent = do
                     when (trigger == AtApplicationEvent) once
                     modifyIORef' events (+ 1)
                     pure True
@@ -289,7 +292,8 @@ testMonitorReconciliation = do
       observed ← newIORef []
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → do
               inventory ← preparedValue . observedValue <$> atomically (readSnapshot (hostMonitors host))
               modifyIORef' observed (<> [(turnNumber turn, inventoryRevision inventory, inventoryMonitors inventory == Observed [])])
@@ -322,7 +326,8 @@ testProgressDuringWait = do
       ( \host control →
           runOwnerLoop host control $
             LoopHooks
-              { loopEvent = noApplicationEvents
+              { loopLogger = quietLogger
+              , loopEvent = noApplicationEvents
               , loopUpdate = \turn →
                   readTVarIO progress >>= \case
                     Just recorded | turnWaited turn → pure (Finish (recorded, turnNumber turn))
@@ -348,7 +353,8 @@ testObservationThroughLoop = do
       ( \host control →
           runOwnerLoop host control $
             LoopHooks
-              { loopEvent = noApplicationEvents
+              { loopLogger = quietLogger
+              , loopEvent = noApplicationEvents
               , loopUpdate = \_ →
                   readTVarIO result >>= \case
                     Nothing → pure Continue
@@ -367,7 +373,8 @@ testOwnerNeverWaits = do
     hosted seam (settings [windowNamed "owner"]) {hostCommandCapacity = 1} (\host _ → pure host) $ \host control →
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \_ → do
               window ← onlyWindow host
               let port = hostCommandPort host
@@ -376,7 +383,7 @@ testOwnerNeverWaits = do
               (submitMisuse, _) ← caughtAs (awaitSubmitWindowCommand port [] (observeOf window))
               (offOwner, _) ←
                 onThread forkIO . caughtAs $
-                  runOwnerLoop host control (LoopHooks noApplicationEvents (\_ → pure (Finish ())))
+                  runOwnerLoop host control (LoopHooks quietLogger noApplicationEvents (\_ → pure (Finish ())))
               pure (Finish (awaitMisuse, submitMisuse, offOwner))
           }
   awaitMisuse `shouldBe` OwnerThreadWouldWait
@@ -405,7 +412,8 @@ testCloseRequest = do
           outcome ←
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = noApplicationEvents
+                { loopLogger = quietLogger
+                , loopEvent = noApplicationEvents
                 , loopUpdate = \turn → do
                     modifyIORef' surfaced (<> [turnCloseRequests turn])
                     if turnNumber turn < 3
@@ -589,7 +597,8 @@ testSupervisorDetectedFailure = do
             first ← newIORef True
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = do
+                { loopLogger = quietLogger
+                , loopEvent = do
                     firstEvent ← atomicModifyIORef' first (\isFirst → (False, isFirst))
                     when firstEvent $ do
                       -- The requester's command is queued after this turn's
@@ -656,7 +665,10 @@ testAbandonedStartup = do
 
 -- | A logging lifetime whose records go nowhere.
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 hostOver ∷ Seam → HostConfig → Scoped WindowHost
 hostOver seam = allocWindowHostIn (seamSession seam defaultSessionConfig)

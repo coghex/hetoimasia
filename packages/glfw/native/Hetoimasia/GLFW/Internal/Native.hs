@@ -51,6 +51,13 @@ module Hetoimasia.GLFW.Internal.Native
   , windowFullscreenForCheck
   , WindowStateForCheck (..)
   , windowStateForCheck
+  , injectKeyForCheck
+  , injectCharForCheck
+  , injectMouseButtonForCheck
+  , injectCursorPosForCheck
+  , injectCursorEnterForCheck
+  , injectScrollForCheck
+  , injectFocusForCheck
   ) where
 
 import Control.Exception (onException)
@@ -60,7 +67,7 @@ import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Foreign.C.String (CString)
-import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt))
+import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt), CUInt (CUInt))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
@@ -285,6 +292,11 @@ type PairCallback = Ptr NativeWindow → CInt → CInt → IO ()
 type ScaleCallback = Ptr NativeWindow → CFloat → CFloat → IO ()
 type FlagCallback = Ptr NativeWindow → CInt → IO ()
 type PlainCallback = Ptr NativeWindow → IO ()
+type KeyCallback = Ptr NativeWindow → CInt → CInt → CInt → CInt → IO ()
+type CharCallback = Ptr NativeWindow → CUInt → IO ()
+type MouseButtonCallback = Ptr NativeWindow → CInt → CInt → CInt → IO ()
+type CursorPosCallback = Ptr NativeWindow → CDouble → CDouble → IO ()
+type ScrollCallback = Ptr NativeWindow → CDouble → CDouble → IO ()
 
 -- | Allocate one wrapper per callback, in 'WindowCallbacks' order. Each wrapper
 -- only drops the window pointer; the model's callback is already contained. A
@@ -303,6 +315,12 @@ newWindowCallbacks callbacks =
       , castFunPtr <$> c_wrapFlagCallback (\_ maximized → onWindowMaximize callbacks maximized)
       , castFunPtr <$> c_wrapPlainCallback (\_ → onWindowRefresh callbacks)
       , castFunPtr <$> c_wrapPlainCallback (\_ → onWindowClose callbacks)
+      , castFunPtr <$> c_wrapKeyCallback (\_ key scancode action mods → onKey callbacks key scancode action mods)
+      , castFunPtr <$> c_wrapCharCallback (\_ codepoint → onChar callbacks codepoint)
+      , castFunPtr <$> c_wrapMouseButtonCallback (\_ button action mods → onMouseButton callbacks button action mods)
+      , castFunPtr <$> c_wrapCursorPosCallback (\_ x y → onCursorPos callbacks x y)
+      , castFunPtr <$> c_wrapFlagCallback (\_ entered → onCursorEnter callbacks entered)
+      , castFunPtr <$> c_wrapScrollCallback (\_ x y → onScroll callbacks x y)
       ]
   where
     allocating done [] = pure done
@@ -311,7 +329,7 @@ newWindowCallbacks callbacks =
       allocating (pointer : done) rest
 
 attachWindowCallbacks ∷ Ptr NativeWindow → WindowCallbackStorage → IO ()
-attachWindowCallbacks window (WindowCallbackStorage [size, framebuffer, scale, position, focus, iconify, maximize, refresh, close]) = do
+attachWindowCallbacks window (WindowCallbackStorage [size, framebuffer, scale, position, focus, iconify, maximize, refresh, close, key, character, button, cursor, enter, scroll]) = do
   void (c_glfwSetWindowSizeCallback window (castFunPtr size))
   void (c_glfwSetFramebufferSizeCallback window (castFunPtr framebuffer))
   void (c_glfwSetWindowContentScaleCallback window (castFunPtr scale))
@@ -321,7 +339,13 @@ attachWindowCallbacks window (WindowCallbackStorage [size, framebuffer, scale, p
   void (c_glfwSetWindowMaximizeCallback window (castFunPtr maximize))
   void (c_glfwSetWindowRefreshCallback window (castFunPtr refresh))
   void (c_glfwSetWindowCloseCallback window (castFunPtr close))
-attachWindowCallbacks _ _ = ioError (userError "window callback storage does not hold nine wrappers")
+  void (c_glfwSetKeyCallback window (castFunPtr key))
+  void (c_glfwSetCharCallback window (castFunPtr character))
+  void (c_glfwSetMouseButtonCallback window (castFunPtr button))
+  void (c_glfwSetCursorPosCallback window (castFunPtr cursor))
+  void (c_glfwSetCursorEnterCallback window (castFunPtr enter))
+  void (c_glfwSetScrollCallback window (castFunPtr scroll))
+attachWindowCallbacks _ _ = ioError (userError "window callback storage does not hold fifteen wrappers")
 
 detachWindowCallbacks ∷ Ptr NativeWindow → IO ()
 detachWindowCallbacks window = do
@@ -334,6 +358,12 @@ detachWindowCallbacks window = do
   void (c_glfwSetWindowMaximizeCallback window nullFunPtr)
   void (c_glfwSetWindowRefreshCallback window nullFunPtr)
   void (c_glfwSetWindowCloseCallback window nullFunPtr)
+  void (c_glfwSetKeyCallback window nullFunPtr)
+  void (c_glfwSetCharCallback window nullFunPtr)
+  void (c_glfwSetMouseButtonCallback window nullFunPtr)
+  void (c_glfwSetCursorPosCallback window nullFunPtr)
+  void (c_glfwSetCursorEnterCallback window nullFunPtr)
+  void (c_glfwSetScrollCallback window nullFunPtr)
 
 -- | Resize a window: a callback-producing setter for the native examples only.
 setWindowSizeForCheck ∷ Ptr NativeWindow → Int → Int → IO ()
@@ -610,6 +640,21 @@ foreign import ccall "wrapper"
 foreign import ccall "wrapper"
   c_wrapPlainCallback ∷ PlainCallback → IO (FunPtr PlainCallback)
 
+foreign import ccall "wrapper"
+  c_wrapKeyCallback ∷ KeyCallback → IO (FunPtr KeyCallback)
+
+foreign import ccall "wrapper"
+  c_wrapCharCallback ∷ CharCallback → IO (FunPtr CharCallback)
+
+foreign import ccall "wrapper"
+  c_wrapMouseButtonCallback ∷ MouseButtonCallback → IO (FunPtr MouseButtonCallback)
+
+foreign import ccall "wrapper"
+  c_wrapCursorPosCallback ∷ CursorPosCallback → IO (FunPtr CursorPosCallback)
+
+foreign import ccall "wrapper"
+  c_wrapScrollCallback ∷ ScrollCallback → IO (FunPtr ScrollCallback)
+
 foreign import ccall safe "glfwSetWindowSizeCallback"
   c_glfwSetWindowSizeCallback ∷ Ptr NativeWindow → FunPtr PairCallback → IO (FunPtr PairCallback)
 
@@ -636,6 +681,71 @@ foreign import ccall safe "glfwSetWindowRefreshCallback"
 
 foreign import ccall safe "glfwSetWindowCloseCallback"
   c_glfwSetWindowCloseCallback ∷ Ptr NativeWindow → FunPtr PlainCallback → IO (FunPtr PlainCallback)
+
+foreign import ccall safe "glfwSetKeyCallback"
+  c_glfwSetKeyCallback ∷ Ptr NativeWindow → FunPtr KeyCallback → IO (FunPtr KeyCallback)
+
+foreign import ccall safe "glfwSetCharCallback"
+  c_glfwSetCharCallback ∷ Ptr NativeWindow → FunPtr CharCallback → IO (FunPtr CharCallback)
+
+foreign import ccall safe "glfwSetMouseButtonCallback"
+  c_glfwSetMouseButtonCallback ∷ Ptr NativeWindow → FunPtr MouseButtonCallback → IO (FunPtr MouseButtonCallback)
+
+foreign import ccall safe "glfwSetCursorPosCallback"
+  c_glfwSetCursorPosCallback ∷ Ptr NativeWindow → FunPtr CursorPosCallback → IO (FunPtr CursorPosCallback)
+
+foreign import ccall safe "glfwSetCursorEnterCallback"
+  c_glfwSetCursorEnterCallback ∷ Ptr NativeWindow → FunPtr FlagCallback → IO (FunPtr FlagCallback)
+
+foreign import ccall safe "glfwSetScrollCallback"
+  c_glfwSetScrollCallback ∷ Ptr NativeWindow → FunPtr ScrollCallback → IO (FunPtr ScrollCallback)
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_key_for_check"
+  c_injectKeyForCheck ∷ Ptr NativeWindow → CInt → CInt → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_char_for_check"
+  c_injectCharForCheck ∷ Ptr NativeWindow → CUInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_mouse_button_for_check"
+  c_injectMouseButtonForCheck ∷ Ptr NativeWindow → CInt → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_cursor_pos_for_check"
+  c_injectCursorPosForCheck ∷ Ptr NativeWindow → CDouble → CDouble → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_cursor_enter_for_check"
+  c_injectCursorEnterForCheck ∷ Ptr NativeWindow → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_scroll_for_check"
+  c_injectScrollForCheck ∷ Ptr NativeWindow → CDouble → CDouble → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_focus_for_check"
+  c_injectFocusForCheck ∷ Ptr NativeWindow → CInt → IO ()
+
+-- | Invoke the registered key callback through its C function pointer, for the
+-- native examples only. This is the actual trampoline GLFW holds, not the
+-- feed's private producer.
+injectKeyForCheck ∷ Ptr NativeWindow → Int → Int → Int → Int → IO ()
+injectKeyForCheck window key scancode action mods =
+  c_injectKeyForCheck window (fromIntegral key) (fromIntegral scancode) (fromIntegral action) (fromIntegral mods)
+
+injectCharForCheck ∷ Ptr NativeWindow → Int → IO ()
+injectCharForCheck window codepoint = c_injectCharForCheck window (fromIntegral codepoint)
+
+injectMouseButtonForCheck ∷ Ptr NativeWindow → Int → Int → Int → IO ()
+injectMouseButtonForCheck window button action mods =
+  c_injectMouseButtonForCheck window (fromIntegral button) (fromIntegral action) (fromIntegral mods)
+
+injectCursorPosForCheck ∷ Ptr NativeWindow → Double → Double → IO ()
+injectCursorPosForCheck window x y = c_injectCursorPosForCheck window (CDouble x) (CDouble y)
+
+injectCursorEnterForCheck ∷ Ptr NativeWindow → Bool → IO ()
+injectCursorEnterForCheck window entered = c_injectCursorEnterForCheck window (boolean entered)
+
+injectScrollForCheck ∷ Ptr NativeWindow → Double → Double → IO ()
+injectScrollForCheck window x y = c_injectScrollForCheck window (CDouble x) (CDouble y)
+
+injectFocusForCheck ∷ Ptr NativeWindow → Bool → IO ()
+injectFocusForCheck window focused = c_injectFocusForCheck window (boolean focused)
 
 foreign import capi "hetoimasia_glfw.h value GLFW_TRUE" glfwTrue ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FALSE" glfwFalse ∷ CInt

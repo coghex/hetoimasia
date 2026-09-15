@@ -38,6 +38,19 @@ void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fie
  * callback and destroys nothing. Call it on the session's owner thread. */
 void hetoimasia_glfw_request_close_for_check(GLFWwindow* window);
 
+/* Invoke the currently registered input callback through its C function
+ * pointer, for the native examples only. Each helper reads the pointer GLFW
+ * holds, restores it, and calls it, so the path is the trampoline the window
+ * attached rather than a Haskell producer. Call them on the session's owner
+ * thread. */
+void hetoimasia_glfw_inject_key_for_check(GLFWwindow* window, int key, int scancode, int action, int mods);
+void hetoimasia_glfw_inject_char_for_check(GLFWwindow* window, unsigned int codepoint);
+void hetoimasia_glfw_inject_mouse_button_for_check(GLFWwindow* window, int button, int action, int mods);
+void hetoimasia_glfw_inject_cursor_pos_for_check(GLFWwindow* window, double x, double y);
+void hetoimasia_glfw_inject_cursor_enter_for_check(GLFWwindow* window, int entered);
+void hetoimasia_glfw_inject_scroll_for_check(GLFWwindow* window, double x, double y);
+void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused);
+
 /* For the native examples only: the size limits the platform holds for a
  * window, read back from the platform itself — contentMinSize and contentMaxSize
  * on Cocoa, WM_NORMAL_HINTS on X11 — into limits as minimum width and height,

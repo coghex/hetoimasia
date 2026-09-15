@@ -27,8 +27,9 @@
 -- 2. native event processing: a poll, or on an idle turn a finite wait;
 -- 3. callback and state reconciliation: the session's monitor inventory, when
 --    its callback reported a change, then the retirement of every closing
---    window no borrow defers, then every window, and the collection of close
---    requests not yet surfaced for windows that are not closing;
+--    window no borrow defers, then every window, the collection of close
+--    requests not yet surfaced for windows that are not closing, and each
+--    window's overflow warning claim and input resumption;
 -- 4. a control check;
 -- 5. bounded command work: at most 'hostCommandBudget' commands claimed and
 --    settled, across every port;

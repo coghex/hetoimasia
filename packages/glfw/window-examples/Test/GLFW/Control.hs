@@ -14,7 +14,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Monad (forM, when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing, mapMaybe)
-import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
+import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, cursorRevision, observedCursor, observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command
@@ -475,13 +475,16 @@ hosted seam config =
 -- | The owner loop with no application events, failing past its turn bound.
 looping ∷ WindowHost → RuntimeControl → (Turn → IO (TurnStep a)) → IO a
 looping host control update =
-  runOwnerLoop host control . LoopHooks noApplicationEvents $ \turn →
+  runOwnerLoop host control . LoopHooks quietLogger noApplicationEvents $ \turn →
     if turnNumber turn > 400
       then unexpected "the example did not finish within its turn bound"
       else update turn
 
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 -- | @GLFW_PLATFORM_ERROR@.
 platformErrorCode ∷ Int
