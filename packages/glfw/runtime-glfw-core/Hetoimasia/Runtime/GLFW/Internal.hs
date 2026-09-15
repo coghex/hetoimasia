@@ -103,6 +103,7 @@ import Hetoimasia.GLFW.Internal.Command
   , newWindowClient
   , newWindowPortHost
   , controlDisposition
+  , modeDisposition
   , observeWindow
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
@@ -113,6 +114,7 @@ import Hetoimasia.GLFW.Internal.Window
   , beginWindowClosing
   , processWindowEvents
   , reconcileWindowEvents
+  , reconcileWindowMode
   , rejectCloseRequest
   , windowAssembly
   )
@@ -585,6 +587,12 @@ executeHostCommand host _ = \case
       Just entry
         | entryClosing entry → completed (Left (WindowIsClosing target))
         | otherwise → Settled <$> borrowWindow host target entry (controlDisposition target control)
+  ModeWindow target request →
+    readTVarIO (hostEntries host) >>= \entries → case Map.lookup target entries of
+      Nothing → completed (Left (WindowNotServed target))
+      Just entry
+        | entryClosing entry → completed (Left (WindowIsClosing target))
+        | otherwise → Settled <$> borrowWindow host target entry (modeDisposition target request)
   where
     completed = pure . Completed
 
@@ -695,6 +703,7 @@ runOwnerLoop host control hooks =
       let waited = idle && queued == 0
       processEvents host number waited
       reconcileMonitorEvents (hostSession host)
+      reconcileWindowModes host
       retirePending host
       closes ← surfaceCloseRequests host
       checkRuntime control
@@ -726,6 +735,16 @@ processEvents host number waited = do
     processing
       | waited = AwaitEventsFor (hostIdleWait (hostSettings host))
       | otherwise = ProcessPending
+
+-- | Reconcile the mode of every window the host holds that is not closing, in
+-- registration order, after the turn's monitor refresh: a window whose applied
+-- mode names an ended monitor takes its recorded fallback without another
+-- command.
+reconcileWindowModes ∷ WindowHost → IO ()
+reconcileWindowModes host = do
+  entries ← readTVarIO (hostEntries host)
+  forM_ (Map.toAscList entries) $ \(target, entry) →
+    if entryClosing entry then pure () else void (borrowWindow host target entry reconcileWindowMode)
 
 -- | Reconcile every window the host holds, and answer the close requests of
 -- windows not closing that were not surfaced before.

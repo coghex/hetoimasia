@@ -22,7 +22,10 @@
 -- command or its size constraints through their constructors, or alters
 -- constraints through a field, outside the smart constructors and owner-thread
 -- validation, and one reaches for the control representation in the private
--- control module. Four are rejected for the input feeds: one names the reader's,
+-- control module. Two are rejected for the window modes: one names a mode's,
+-- saved placement's, or mode record's constructor, or sets a record's saved
+-- placement through a field, and one reaches for the mode representation and the
+-- owner's record updates in the private mode module. Four are rejected for the input feeds: one names the reader's,
 -- control's, event's, epoch's, and reset token's constructors; one coerces a
 -- number into an input epoch, so a token could be retargeted; one rewrites a
 -- token's epoch through record syntax; and one reaches for the feed, its
@@ -30,7 +33,8 @@
 -- in the private input module. One client must be accepted, linked, and run: it uses only the public
 -- session, monitor, window, and window command interfaces, including the
 -- read-only observation and inventory endpoints, identity resolution, a command
--- port, every control command constructor, the capability description, and a
+-- port, every control command constructor, the mode requests, a startup mode,
+-- the mode record's accessors, the capability description, and a
 -- completion ticket, and every path
 -- it takes is refused before GLFW is initialized, so the example opens no
 -- display.
@@ -187,6 +191,26 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so a control's representation is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Control"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that constructs a mode, a saved placement, or a mode record, or sets a saved placement through a field" $
+    withClient "Client.hs" modeConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      mapM_ (clientOutput outcome `shouldContain`) ["WindowMode", "SavedPlacement", "ModeRecord"]
+
+  it "rejects a client that reaches for the mode representation or the owner's record updates in the private mode module" $
+    withClient "Client.hs" modeInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a mode's representation is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Mode"
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -373,7 +397,8 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "capacity = 16, description limit = 1024"
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
                    , "constraints = (Extent {extentWidth = 1, extentHeight = 1},Extent {extentWidth = 64, extentHeight = 48},Just (AspectRatio {aspectNumerator = 4, aspectDenominator = 3}))"
-                   , "wayland cannot perform = [SetPositionOperation,FocusOperation], report = [PlacementReport,IconifiedReport]"
+                   , "wayland cannot perform = [SetPositionOperation,FocusOperation,BorderlessOperation], report = [PlacementReport,IconifiedReport]"
+                   , "mode = (2,Just (Extent {extentWidth = 1920, extentHeight = 1080},Just 60),WindowedPresentation)"
                    ]
 
 -- | Compile a client that can also see the runtime and the window host's
@@ -691,6 +716,37 @@ controlInternalsClient =
     , "forged = SizeControl 0 0"
     ]
 
+-- | A client naming a mode's, a saved placement's, and a mode record's data
+-- constructors, and setting a record's saved placement through a field, rather
+-- than requesting a transition.
+modeConstructorClient ∷ String
+modeConstructorClient =
+  unlines
+    [ "module Client (forged, moved) where"
+    , ""
+    , "import Hetoimasia.GLFW.Mode (ModeRecord (ModeRecord, recSaved), SavedPlacement (SavedPlacement), WindowMode (FullscreenMode))"
+    , ""
+    , "forged ∷ Maybe WindowMode"
+    , "forged = Nothing"
+    , ""
+    , "moved ∷ SavedPlacement → ModeRecord → ModeRecord"
+    , "moved saved record = record {recSaved = Just saved}"
+    ]
+
+-- | A client reaching for the mode representation and the owner's record
+-- updates in the private mode module.
+modeInternalsClient ∷ String
+modeInternalsClient =
+  unlines
+    [ "module Client (moved) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Mode (ModeRecord, recordSaved, savedPlacement)"
+    , "import Hetoimasia.GLFW.Window (Extent (..), Placement (..))"
+    , ""
+    , "moved ∷ ModeRecord → ModeRecord"
+    , "moved = recordSaved (savedPlacement (Placement 0 0) (Extent 1 1))"
+    ]
+
 -- | A client naming the input capabilities' and values' data constructors.
 inputConstructorClient ∷ String
 inputConstructorClient =
@@ -860,6 +916,7 @@ publicClient =
     , "import Hetoimasia.Foundation.Messaging.Payload (preparedValue)"
     , "import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)"
     , "import Hetoimasia.GLFW.Command"
+    , "import Hetoimasia.GLFW.Mode"
     , "import Hetoimasia.GLFW.Monitor"
     , "import Hetoimasia.GLFW.Session"
     , "import Hetoimasia.GLFW.Window"
@@ -868,7 +925,7 @@ publicClient =
     , "main = do"
     , "  wayland ← try (withSession defaultSessionConfig {requestedBackend = Just Wayland} (\\_ → pure ()))"
     , "  report \"wayland\" wayland"
-    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → monitors session >> withWindow session (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) (request session) >> pure ()))"
+    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → monitors session >> withWindow session starting (request session) >> pure ()))"
     , "  report \"without the threaded runtime\" unthreaded"
     , "  putStrLn (\"capacity = \" <> show errorEvidenceCapacity <> \", description limit = \" <> show errorDescriptionLimit)"
     , "  putStrLn (\"zero width = \" <> either show (const \"accepted\") (validateWindowConfig (hiddenTestWindowConfig (Text.pack \"tool\") 0 48)))"
@@ -876,6 +933,14 @@ publicClient =
     , "  putStrLn (\"constraints = \" <> show (constraintMinimum constraints, constraintMaximum constraints, constraintAspectRatio constraints))"
     , "  let wayland = backendWindowCapabilities Wayland"
     , "  putStrLn (\"wayland cannot perform = \" <> show (map fst (unperformableOperations wayland)) <> \", report = \" <> show (map fst (unreportableAttributes wayland)))"
+    , "  putStrLn (\"mode = \" <> show (fallbackAttempts (windowedFallback 2), preferredVideoMode (exactVideoMode (Extent 1920 1080) (Just 60)), modePresentation windowedMode))"
+    , ""
+    , "starting ∷ WindowConfig"
+    , "starting = (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) {windowStartupMode = Just (startupMode (modeRequest windowedMode noModeFallback) ModeOptional)}"
+    , ""
+    , "recorded ∷ WindowObservation → (AppliedMode, Maybe Placement, Maybe ModeOutcome, Attribute (Maybe MonitorId), Attribute Bool)"
+    , "recorded observation = (modeApplied record, savedPosition <$> modeSavedPlacement record, modeLastOutcome record, observedFullscreenMonitor observation, observedDecorated observation)"
+    , "  where record = observedMode observation"
     , ""
     , "latest ∷ Window → IO (Attribute Extent)"
     , "latest window = observedFramebufferExtent . preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))"
@@ -905,6 +970,13 @@ publicClient =
     , "        , showWindowCommand target, hideWindowCommand target, requestFocusCommand target, requestAttentionCommand target"
     , "        , minimizeWindowCommand target, maximizeWindowCommand target, restoreWindowCommand target ]"
     , "  _ ← mapM (performWindowCommand host [window]) controls"
+    , "  observed ← atomically (readSnapshot (windowObservations window))"
+    , "  _ ← pure (recorded (preparedValue (observedValue observed)))"
+    , "  described ← synchronizeMonitors session"
+    , "  let modes = case inventoryMonitors described of"
+    , "        Observed (monitor : _) → [modeRequest (fullscreenMode (monitorIdentity monitor) currentVideoMode) (windowedFallback 1), modeRequest (borderlessMode (monitorIdentity monitor)) noModeFallback]"
+    , "        _ → [modeRequest windowedMode noModeFallback]"
+    , "  _ ← mapM (performWindowCommand host [window] . setWindowModeCommand target) modes"
     , "  _ ← pure (sessionWindowCapabilities session)"
     , "  submitted ← submitWindowCommand (windowCommandPort host) [(Text.pack \"client\", Text.pack \"tool\")] (observeWindowCommand target)"
     , "  case submitted of"
@@ -918,6 +990,7 @@ publicClient =
     , "describeSettled settled = case settled of"
     , "  Attempted (ControlAttempt _ ControlReturned (PostCallRevision _)) → settled"
     , "  Unsupported (UnsupportedControl _ _ _) → settled"
+    , "  Transitioned (ModeTransition _ ModeInert (PostCallRevision _)) → settled"
     , "  _ → settled"
     , ""
     , "report ∷ String → Either SomeException () → IO ()"

@@ -17,7 +17,11 @@ window commands through bounded ports and reports each through a persistent
 completion ticket; its control commands change a window's title, size,
 position, size constraints, visibility, focus and attention, and minimized or
 maximized state, validated on the owner thread and settled as rejected,
-unsupported, or attempted with the revision a post-call sample published. The public `runtime-glfw` sublibrary's
+unsupported, or attempted with the revision a post-call sample published.
+`Hetoimasia.GLFW.Mode` requests windowed, borderless, and fullscreen presentation
+on a selected monitor, keeping each window's windowed placement, arbitrating one
+fullscreen window per monitor, and falling back to windowed operation within a
+finite budget when a monitor disappears or a mode is unavailable. The public `runtime-glfw` sublibrary's
 `Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
 runs its supervised owner loop, which processes native events, drains those
 ports fairly, refreshes the monitor inventory when monitors change, and surfaces
@@ -41,7 +45,7 @@ test seam `hetoimasia-tests` drives without initializing GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
 monitor identity, observation, callback-containment, release-order, window
-command, window control, and input feed rules, is
+command, window control, window mode, and input feed rules, is
 [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with

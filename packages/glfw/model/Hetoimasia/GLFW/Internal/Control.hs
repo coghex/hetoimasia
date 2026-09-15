@@ -28,6 +28,19 @@
 --   currently observed logical size, which must therefore be known.
 --
 -- A refused control is a typed 'ControlRejection' and makes no native call.
+--
+-- = Eligibility by presentation
+--
+-- 'controlEligibility' decides, before validation, whether an operation may be
+-- attempted in the window's applied presentation. Windowed presentation admits
+-- every ordinary operation. Borderless presentation refuses size, position,
+-- constraints, and maximize, which would break the mode controller's monitor
+-- placement. Fullscreen presentation also refuses show and hide. An ineligible
+-- operation is 'ControlIneligibleInMode'. While the applied presentation is
+-- indeterminate, only an operation eligible in every presentation — title,
+-- focus, attention, minimize, and restore — is attempted; any other is
+-- 'ControlModeIndeterminate'. Neither the requested mode nor the previous
+-- presentation establishes eligibility.
 -- There is no clamping and no rounding: a size outside the constraints is never
 -- sent to the platform to adjust.
 --
@@ -66,6 +79,12 @@ module Hetoimasia.GLFW.Internal.Control
   , ConstraintState (..)
   , ControlRejection (..)
   , validateControl
+  , constraintsAdmit
+
+    -- * Eligibility by presentation
+  , PresentationKind (..)
+  , PresentationState (..)
+  , controlEligibility
 
     -- * Constraint updates
   , ConstraintCall (..)
@@ -146,6 +165,12 @@ data WindowOperation
   | MinimizeOperation
   | MaximizeOperation
   | RestoreOperation
+  | BorderlessOperation
+    -- ^ Placing an undecorated window over a monitor's work area: a mode
+    -- transition, never an ordinary control.
+  | FullscreenOperation
+    -- ^ Making a window fullscreen on a monitor: a mode transition, never an
+    -- ordinary control.
   deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
 instance NFData WindowOperation
@@ -178,6 +203,8 @@ controlOperationText = \case
   MinimizeOperation → "iconify window"
   MaximizeOperation → "maximize window"
   RestoreOperation → "restore window"
+  BorderlessOperation → "place borderless window"
+  FullscreenOperation → "make window fullscreen"
 
 -- ---------------------------------------------------------------------------
 -- Size constraints
@@ -254,6 +281,12 @@ data ControlRejection
     -- checked against it.
   | ModeTransitionInProgress
     -- ^ The window's mode is changing; ordinary controls wait for it to finish.
+  | ControlIneligibleInMode !PresentationKind
+    -- ^ The window's applied presentation does not admit the operation.
+  | ControlModeIndeterminate
+    -- ^ The window's applied presentation is indeterminate after a transition
+    -- that did not settle cleanly, and the operation is not eligible in every
+    -- presentation.
   deriving (Eq, Show, Generic)
 
 instance NFData ControlRejection
@@ -302,6 +335,9 @@ validateControl state current = \case
 
 -- | Whether constraints admit a size: within both bounds, and satisfying the
 -- aspect ratio exactly.
+constraintsAdmit ∷ SizeConstraints → Extent → Bool
+constraintsAdmit = admits
+
 admits ∷ SizeConstraints → Extent → Bool
 admits (SizeConstraints lower upper aspect) (Extent width height) =
   extentWidth lower <= width
@@ -319,6 +355,40 @@ dimension value = value >= 1 && toInteger value <= toInteger (maxBound ∷ Int32
 
 coordinate ∷ Int → Bool
 coordinate value = toInteger value >= toInteger (minBound ∷ Int32) && toInteger value <= toInteger (maxBound ∷ Int32)
+
+-- ---------------------------------------------------------------------------
+-- Eligibility by presentation
+
+-- | How a window is presented: the kind of its applied mode.
+data PresentationKind
+  = WindowedPresentation
+  | BorderlessPresentation
+  | FullscreenPresentation
+  deriving (Eq, Ord, Show, Enum, Bounded, Generic)
+
+instance NFData PresentationKind
+
+-- | What the owner knows about a window's applied presentation.
+data PresentationState
+  = PresentationKnown !PresentationKind
+  | PresentationIndeterminate
+  deriving (Eq, Show)
+
+-- | Whether an ordinary operation may be attempted in the applied presentation.
+controlEligibility ∷ PresentationState → WindowOperation → Either ControlRejection ()
+controlEligibility state wanted = case state of
+  PresentationKnown kind
+    | eligibleIn kind → Right ()
+    | otherwise → Left (ControlIneligibleInMode kind)
+  PresentationIndeterminate
+    | all eligibleIn [minBound .. maxBound] → Right ()
+    | otherwise → Left ControlModeIndeterminate
+  where
+    eligibleIn = \case
+      WindowedPresentation → True
+      BorderlessPresentation → wanted `notElem` [SetSizeOperation, SetPositionOperation, SetConstraintsOperation, MaximizeOperation]
+      FullscreenPresentation →
+        wanted `notElem` [SetSizeOperation, SetPositionOperation, SetConstraintsOperation, ShowOperation, HideOperation, MaximizeOperation]
 
 -- ---------------------------------------------------------------------------
 -- Constraint updates

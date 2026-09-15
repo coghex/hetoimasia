@@ -52,6 +52,7 @@ library model
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Control
         Hetoimasia.GLFW.Internal.Input
+        Hetoimasia.GLFW.Internal.Mode
         Hetoimasia.GLFW.Internal.Monitor
         Hetoimasia.GLFW.Internal.Session
         Hetoimasia.GLFW.Internal.Window
@@ -95,6 +96,7 @@ library
     exposed-modules:
         Hetoimasia.GLFW.Command
         Hetoimasia.GLFW.Input
+        Hetoimasia.GLFW.Mode
         Hetoimasia.GLFW.Monitor
         Hetoimasia.GLFW.Session
         Hetoimasia.GLFW.Window
@@ -189,6 +191,7 @@ executable glfw-window-examples
         Test.GLFW.Dynamic
         Test.GLFW.Host
         Test.GLFW.Input
+        Test.GLFW.Mode
         Test.GLFW.Monitor
         Test.GLFW.Window
     ghc-options: -threaded
@@ -223,6 +226,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Fixture
         Test.GLFW.Native.Harness
         Test.GLFW.Native.Host
+        Test.GLFW.Native.Mode
         Test.GLFW.Native.Monitor
         Test.GLFW.Native.Private
         Test.GLFW.Native.Session

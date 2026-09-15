@@ -273,7 +273,7 @@ testUnsupported = withTwo defaultScript {scriptWindowCapabilities = const (backe
   observation ← current first
   calls ← seamCalls seam
   let capabilities = sessionWindowCapabilities session
-  map fst (unperformableOperations capabilities) `shouldBe` [SetPositionOperation, FocusOperation]
+  map fst (unperformableOperations capabilities) `shouldBe` [SetPositionOperation, FocusOperation, BorderlessOperation]
   map fst (unreportableAttributes capabilities) `shouldBe` [PlacementReport, IconifiedReport]
   moved `shouldSatisfy` unsupportedWith target SetPositionOperation
   focused `shouldSatisfy` unsupportedWith target FocusOperation

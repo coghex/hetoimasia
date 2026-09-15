@@ -928,6 +928,8 @@ creationCalls title width height key =
   , QueryWindowAttribute IconifiedAttribute
   , QueryWindowAttribute MaximizedAttribute
   , QueryWindowAttribute VisibleAttribute
+  , QueryWindowAttribute DecoratedAttribute
+  , QueryWindowMonitor
   ]
 
 -- | The native calls of a certain window release.

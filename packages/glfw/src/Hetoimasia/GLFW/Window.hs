@@ -72,6 +72,9 @@ module Hetoimasia.GLFW.Window
   , observedMaximized
   , observedVisible
   , observedCloseRequest
+  , observedDecorated
+  , observedFullscreenMonitor
+  , observedMode
   , WindowPhase (..)
   , Attribute (..)
   , Extent (..)
@@ -119,6 +122,9 @@ import Hetoimasia.GLFW.Internal.Window
   , hiddenTestWindowConfig
   , observedCloseRequest
   , observedContentScale
+  , observedDecorated
+  , observedFullscreenMonitor
+  , observedMode
   , observedFocused
   , observedFramebufferExtent
   , observedIconified

@@ -88,6 +88,10 @@ module Hetoimasia.GLFW.Command
   , AspectRatio (..)
   , WindowOperation (..)
 
+    -- * Mode commands
+  , setWindowModeCommand
+  , ModeTransition (..)
+
     -- * Origins
   , RequestId
   , requestLocalIdentity
@@ -148,6 +152,7 @@ import Hetoimasia.GLFW.Internal.Command
   , CompletionTicket
   , ControlAttempt (..)
   , Disposition (..)
+  , ModeTransition (..)
   , RequestId
   , SubmitResult (..)
   , UnsupportedControl (..)
@@ -184,6 +189,7 @@ import Hetoimasia.GLFW.Internal.Command
   , setSizeConstraintsCommand
   , setWindowPositionCommand
   , setWindowSizeCommand
+  , setWindowModeCommand
   , setWindowTitleCommand
   , showWindowCommand
   , submitWindowCommand
