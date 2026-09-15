@@ -147,8 +147,9 @@ data WindowCommandMisuse = OwnerThreadWouldWait
 
 `Session`, `Window`, `WindowObservation`, `WindowId`, `CloseRequest`,
 `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`, `CommandOrigin`,
-`RequestId`, and `WindowCommand` are exported without their constructors, and observation readers are functions
-rather than record fields, so no client can build or rewrite one. No public
+`RequestId`, and `WindowCommand` are exported without their constructors, and
+their readers are functions rather than record fields, so no client can build or
+rewrite one. No public
 type holds a native pointer, and the snapshot publisher is never handed out:
 clients receive only the read endpoint. Nothing assumes a single or primary
 window.
@@ -674,13 +675,13 @@ running it.
   It proves the session model through the seam, checks the link declarations,
   and compiles external clients against the package, including clients refused
   for naming a command host's, port's, or ticket's constructor or reaching for
-  command execution, and a supported client that submits and awaits a command. It also runs the
-  `glfw-window-examples` executable, reached through the suite's
+  command execution, and a supported client that submits and awaits a command.
+  It also runs the `glfw-window-examples` executable, reached through the suite's
   `build-tool-depends`, and fails with that executable's report if any window
   model example fails. It runs in the `test.engine` validation group.
 - **`glfw-window-examples`** holds the window model and window command
-  examples, as an Hspec executable that initializes no GLFW. They use the seam's private drivers:
-  `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
+  examples, as an Hspec executable that initializes no GLFW. The window model
+  examples use the seam's private drivers: `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
   owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
   reconciliation's preparation point, and `seamRejectCloseRequest` is the
   private close-request transition. None is a public command. They live in the

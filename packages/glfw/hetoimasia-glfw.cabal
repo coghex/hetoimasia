@@ -8,8 +8,7 @@ description:
     evidence of what the native error callback reported, scoped NoAPI
     windows that publish what the platform observed through snapshots, and
     bounded window command admission with persistent completion tickets. It
-    depends on the foundation library and not on the
-    runtime, and imports no game, scripting, logging, or rendering module.
+    depends on the foundation library and not on the runtime, and imports no game, scripting, logging, or rendering module.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -34,8 +33,8 @@ common language
 -- The session and window models: exclusivity, thread checks, staged
 -- construction and rollback, bounded error capture, window observations,
 -- contained callbacks, and window command admission, execution, and completion,
--- written over a table of native operations. It binds nothing, so the test seam can drive it
--- without linking GLFW.
+-- written over a table of native operations. It binds nothing, so the test seam
+-- can drive it without linking GLFW.
 library model
     import: language
     visibility: private
