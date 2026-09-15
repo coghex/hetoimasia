@@ -288,7 +288,9 @@ never answers to an ended handle.
    window's configuration cannot leak into the next. When `glfwCreateWindow`
    returns a live pointer, its destruction is registered before any report
    from the same call is raised.
-5. **Callbacks.** Every callback is attached.
+5. **Callbacks.** The callbacks' detach is registered, and then every callback
+   is attached. An attachment that reports an error, raises part-way, or is
+   interrupted is therefore detached before the window is destroyed.
 6. **Initial observation.** Every attribute is sampled at that owner boundary,
    reconciled with anything captured since attachment, prepared, and published
    as revision zero of a fresh snapshot.
@@ -382,13 +384,17 @@ application's decision: this slice adds no close policy and no public command.
 
 | Order | Part | Release |
 |---|---|---|
-| 1 | `glfw window callbacks` | Marks the handle terminal, detaches every callback, then raises any report made during that call, or a callback fault nobody observed |
+| 1 | `glfw window callbacks` | Marks the handle terminal, takes any callback fault latched since the last boundary, detaches every callback, then raises any report made during that call |
 | 2 | `glfw window` | Destroys the native window, then raises any report made during that call |
 | 3 | `glfw window callback storage` | Frees the wrappers if release stayed certain; otherwise keeps them and poisons the session |
 | 4 | `glfw window observations` | Publishes the terminal observation and closes the snapshot in one transaction |
 
 Detaching before destruction, after every borrowing scope has ended, is the
-documented order. A release-time native error whose call returned is checked
+documented order. A callback fault nobody observed is taken before the detach,
+so no detach outcome can abandon it: after a detach that succeeded it is the
+release's own failure, and beside a detach that raised or reported an error it
+is retained as a `glfw window callback fault` cleanup failure while the detach's
+failure stays primary. A release-time native error whose call returned is checked
 after the call, without logging or pumping events, and retained through
 [the failure table](resources.md#the-failure-table); release stays certain.
 

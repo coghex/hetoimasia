@@ -26,6 +26,7 @@ import Control.Exception
   ( AsyncException (ThreadKilled)
   , ErrorCall (ErrorCall)
   , Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , IOException
   , SomeException
   , displayException
@@ -37,6 +38,8 @@ import Control.Exception
 import Control.Monad (forM)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
+import Data.List (sort)
+import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
@@ -56,7 +59,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , observedValue
   , readSnapshot
   )
-import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailures, withScoped)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures, withScoped)
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
@@ -109,8 +112,12 @@ spec = do
   describe "GLFW window release failures" $ do
     it "rolls back a failed initial sampling, then creates another window in the same session"
       (boundedExample testSamplingFailureRollsBack)
-    it "keeps callback storage and poisons the session when attaching callbacks raises"
+    it "detaches and releases a window whose callback attachment reported an error, without poisoning"
+      (boundedExample testAttachReportRollsBack)
+    it "detaches, keeps callback storage, and poisons the session when attaching callbacks raises"
       (boundedExample testAttachFailurePoisons)
+    it "retains a latched callback fault beside a detach that raises or reports an error"
+      (boundedExample testFaultBesideFailingDetach)
     it "keeps callback storage and poisons the session when detaching callbacks raises"
       (boundedExample (testUncertainRelease detachRaises "glfw window callbacks"))
     it "keeps callback storage and poisons the session when destroying the window raises"
@@ -567,9 +574,92 @@ testAttachFailurePoisons = do
     `shouldReturn` concat
       [ entryCalls
       , take 8 (creationCalls "unattached" 64 48 1)
-      , [DestroyWindow 1]
+      , [DetachWindowCallbacks 1, DestroyWindow 1]
       , [Terminate, DetachErrorCallback]
       ]
+
+testAttachReportRollsBack ∷ Expectation
+testAttachReportRollsBack = do
+  firstAttempt ← firstTimeOnly
+  seam ←
+    newSeam
+      defaultScript
+        { scriptAttachWindowCallbacks = \reporter → do
+            reporting ← firstAttempt
+            if reporting then reportError reporter 0x00010008 "attach reported" else pure ()
+        }
+  ((failure, caught), secondId) ← asProcessMainThread seam $ entered seam $ \session → do
+    rejected ← caughtAs (withWindow session (hiddenTestWindowConfig "reported" 64 48) (\_ → pure ()))
+    secondId ← withWindow session (hiddenTestWindowConfig "after" 64 48) (pure . windowIdentity)
+    pure (rejected, secondId)
+  failure
+    `shouldBe` NativeFailure NativeCallReturned (Reports [NativeError 0x00010008 "attach reported" False ProcessMainThread] 0 0)
+  originOf caught `shouldBe` Just ("glfw", "attach window callbacks", [("window", "1")])
+  map cleanupFailureLabel (cleanupFailures caught) `shouldBe` []
+  windowLocalIdentity secondId `shouldBe` 2
+  seamLiveWindowCallbacks seam `shouldReturn` 0
+  seamCalls seam
+    `shouldReturn` concat
+      [ entryCalls
+      , take 8 (creationCalls "reported" 64 48 1)
+      , releaseCalls 1
+      , creationCalls "after" 64 48 2
+      , releaseCalls 2
+      , exitCalls
+      ]
+
+testFaultBesideFailingDetach ∷ Expectation
+testFaultBesideFailingDetach = do
+  raised ← scenario detachRaises
+  case raised of
+    (primary, labels, fault, phase) → do
+      fmap displayException (fromException primary ∷ Maybe IOException) `shouldBe` Just "user error (release raised)"
+      labels `shouldBe` sort ["glfw window callback fault", "glfw window callbacks"]
+      fault `shouldBe` Just (ErrorCall "kept fault")
+      phase `shouldBe` WindowReleaseUncertain
+  firstAttempt ← firstTimeOnly
+  reported ←
+    scenario
+      defaultScript
+        { scriptDetachWindowCallbacks = \reporter → do
+            reporting ← firstAttempt
+            if reporting then reportError reporter 0x00010008 "detach reported" else pure ()
+        }
+  case reported of
+    (primary, labels, fault, phase) → do
+      fmap nativeOutcome (fromException primary) `shouldBe` Just NativeCallReturned
+      labels `shouldBe` sort ["glfw window callback fault", "glfw window callbacks"]
+      fault `shouldBe` Just (ErrorCall "kept fault")
+      phase `shouldBe` WindowReleased
+  where
+    scenario script = do
+      seam ← newSeam script
+      stash ← newIORef Nothing
+      asProcessMainThread seam $ entered seam $ \session → do
+        outcome ←
+          try $
+            withWindow session (hiddenTestWindowConfig "faulted" 64 48) $ \window → do
+              writeIORef stash (Just window)
+              -- A cancellation before the commit leaves the fault latched, and
+              -- nothing reaches another boundary before the scope ends.
+              cancelled ←
+                try (seamDriveCancelledBeforeCommit seam window [CallbackRaises (toException (ErrorCall "kept fault"))])
+              case cancelled of
+                Left ThreadKilled → pure ()
+                other → unexpected ("the drive was not cancelled: " <> either show show other)
+        primary ← either pure (\() → unexpected "the scope ended without a failure") outcome
+        window ← stashed stash
+        final ← current window
+        let retained = cleanupFailures primary
+            fault =
+              listToMaybe
+                [ caughtFault
+                | entry ← retained
+                , cleanupFailureLabel entry == "glfw window callback fault"
+                , ExceptionWithContext _ exception ← [cleanupFailureException entry]
+                , Just caughtFault ← [fromException exception]
+                ]
+        pure (primary, sort (map cleanupFailureLabel retained), fault, observedPhase final)
 
 detachRaises, destroyRaises ∷ SeamScript
 detachRaises = defaultScript {scriptDetachWindowCallbacks = \_ → throwIO (userError "release raised")}

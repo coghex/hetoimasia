@@ -36,7 +36,9 @@
 --    show are set explicitly, and the window is created. A live pointer's
 --    destruction is registered before any error its creation reported is
 --    raised.
--- 5. The callbacks are attached.
+-- 5. The callbacks' detach is registered, and then every callback is attached,
+--    so an attachment that reports an error or raises part-way is detached
+--    before the window is destroyed.
 -- 6. The initial observation is sampled at that owner boundary, reconciled
 --    with anything the callbacks captured since attachment, prepared, and
 --    becomes revision zero of a fresh snapshot.
@@ -99,7 +101,7 @@
 -- +---+-----------------------------------+------------------------------------------------+
 -- |   | Part                              | Release                                        |
 -- +===+===================================+================================================+
--- | 1 | @glfw window callbacks@           | Mark the handle terminal; detach every callback |
+-- | 1 | @glfw window callbacks@           | Mark terminal; take any latched fault; detach  |
 -- +---+-----------------------------------+------------------------------------------------+
 -- | 2 | @glfw window@                     | Destroy the native window                      |
 -- +---+-----------------------------------+------------------------------------------------+
@@ -113,7 +115,11 @@
 -- Each native release reads errors after its call returns, logs nothing, pumps
 -- no events, and waits for no other thread. A reported error whose call
 -- returned is retained as that part's cleanup failure and leaves release
--- certain, as does a callback fault nobody observed. A detach or destroy that
+-- certain, as does a callback fault nobody observed. That fault is taken before
+-- the detach: it is raised on its own after a detach that succeeded, and
+-- retained as a @glfw window callback fault@ cleanup failure beside a detach
+-- that raised or reported an error, whose failure stays primary. A detach or
+-- destroy that
 -- raises instead of returning, a release attempted off the owner thread or
 -- after the session ended, or an attachment that raised leaves callback
 -- reachability uncertain: the storage is then kept rather than freed beneath
@@ -240,7 +246,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , publish
   , snapshotReader
   )
-import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep)
+import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
 import Hetoimasia.GLFW.Internal.Capture
   ( NativeError (..)
   , Reports (..)
@@ -627,11 +633,15 @@ windowAssembly session config = do
       (createNative session request identifiers)
       (\(handle, _) → destroyNative session certain identifiers handle)
   restoredStep (raiseReported createWindowOperation identifiers NativeCallReturned created)
+  -- The detach is registered before any callback is attached, so an
+  -- attachment that reported an error, raised part-way, or was interrupted is
+  -- detached before the window is destroyed.
   acquirePart
     "glfw window callbacks"
     (releaseRank 0)
-    (attachCallbacks session certain identifiers handle storage)
+    (pure ())
     (\() → detachCallbacks session live certain captures identifiers handle)
+  restoredStep (attachCallbacks session certain identifiers handle storage)
   sample ← restoredStep (ownerOperation session sampleOperation identifiers (sampleAll session identifiers handle))
   pending ← restoredStep (takeCaptures captures)
   restoredStep (raiseFault identity pending)
@@ -719,13 +729,25 @@ detachCallbacks
   ∷ Session → IORef Bool → IORef Bool → IORef Captures → [(Text, Text)] → Ptr NativeWindow → IO ()
 detachCallbacks session live certain captures identifiers handle = do
   atomicWriteIORef live False
-  nativeRelease session certain detachOperation identifiers $
-    nativeDetachWindowCallbacks (sessionNative session) handle
-  -- A fault latched after the last boundary is still evidence.
+  -- A fault latched after the last boundary is taken before the detach, so
+  -- neither a detach that raises nor one that reports an error can abandon it.
   pending ← takeCaptures captures
-  case capturedFault pending of
-    Nothing → pure ()
-    Just fault → rethrowFault identifiers fault
+  detached ∷ Either (ExceptionWithContext SomeException) () ←
+    tryWithContext $
+      nativeRelease session certain detachOperation identifiers $
+        nativeDetachWindowCallbacks (sessionNative session) handle
+  case (detached, capturedFault pending) of
+    (Right (), Nothing) → pure ()
+    (Right (), Just fault) → rethrowFault identifiers fault
+    (Left failure, Nothing) → rethrowIO failure
+    -- The detach's failure stays primary and the fault is retained beside it
+    -- as a labelled cleanup failure, under the resource failure table.
+    (Left failure, Just fault) →
+      withResourceLabelled
+        "glfw window callback fault"
+        (pure ())
+        (\() → rethrowFault identifiers fault)
+        (\() → rethrowIO failure)
 
 destroyNative ∷ Session → IORef Bool → [(Text, Text)] → Ptr NativeWindow → IO ()
 destroyNative session certain identifiers handle =
