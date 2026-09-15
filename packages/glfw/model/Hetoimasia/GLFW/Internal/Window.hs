@@ -7,8 +7,10 @@
 -- composite that acquires the window's callback storage, its native window,
 -- the callbacks' registration, and the snapshot its observations are published
 -- through. It is lent to the enclosing scope and released when that scope ends.
--- Collection-backed construction reuses the same assembly as one member; there
--- is no second acquisition or cleanup path.
+-- Collection-backed construction — the window host's dynamic windows in
+-- "Hetoimasia.Runtime.GLFW" — reuses the same assembly as one member of a
+-- "Hetoimasia.Foundation.Resource.Collection"; there is no second acquisition or
+-- cleanup path.
 --
 -- = Owner, thread, and lifetime
 --
@@ -94,6 +96,28 @@
 -- cannot erase a newer one. What a close request means is the application's
 -- decision; this module adds no close policy and no public command.
 --
+-- = Lifecycle phases
+--
+-- An observation's 'WindowPhase' records where the window is in its lifetime:
+--
+-- * 'WindowOpen' from creation;
+-- * 'WindowClosing' once an owner has begun the window's close protocol with the
+--   private 'beginWindowClosing', published as its own revision in the same
+--   transaction as the owner's own record that closing began, so no
+--   cancellation can separate the two; reconciliation keeps the phase while
+--   callbacks are still attached;
+-- * exactly one terminal phase, published by release as the snapshot's last
+--   revision before it closes: 'WindowReleased' when every release part
+--   succeeded, 'WindowDisposalFailed' when a part failed but release stayed
+--   certain, and 'WindowReleaseUncertain' when release could not establish that
+--   callbacks and the native window ended safely.
+--
+-- The terminal phase is computed from two flags the release parts set, not from
+-- the exceptions they raise: nothing is formatted, logged, or retained in the
+-- observation, and the failures themselves stay on the release's failure path as
+-- cleanup evidence. A lexically scoped window never passes through
+-- 'WindowClosing'.
+--
 -- = Release
 --
 -- Release order is declared, not reversed:
@@ -128,7 +152,8 @@
 -- its guard is poisoned when it ends. The terminal observation keeps the last
 -- observed attributes without querying the destroyed window, and names
 -- 'WindowReleased' only when release stayed certain, 'WindowReleaseUncertain'
--- otherwise. Readers may still read it, and receive 'EndOfStream' after it.
+-- otherwise, or 'WindowDisposalFailed' when a part failed while release stayed
+-- certain. Readers may still read it, and receive 'EndOfStream' after it.
 --
 -- = State
 --
@@ -158,6 +183,10 @@
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 -- | Release certainty   | The window    | Uncertain parts clear it;  | Owner       | The window          | Read by the storage and  |
 -- |                     |               | later releases read it     |             |                     | observation releases     |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Release failure     | The window    | A failing part sets it;    | Owner       | The window          | Read by the observation  |
+-- |                     |               | the observation release    |             |                     | release                  |
+-- |                     |               | reads it                   |             |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 --
 -- None of this is application state.
@@ -215,11 +244,12 @@ module Hetoimasia.GLFW.Internal.Window
   , windowStepWith
   , windowSession
   , rejectCloseRequest
+  , beginWindowClosing
   , windowNativeHandle
   , windowCallbackOperation
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (STM, atomically)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
@@ -305,6 +335,10 @@ data WindowConfig = WindowConfig
   }
   deriving (Eq, Show)
 
+instance NFData WindowConfig where
+  rnf (WindowConfig title width height visible focused focusOnShow) =
+    rnf title `seq` rnf width `seq` rnf height `seq` rnf visible `seq` rnf focused `seq` rnf focusOnShow
+
 -- | A shown window that takes focus, of the given title and logical size.
 defaultWindowConfig ∷ Text → Int → Int → WindowConfig
 defaultWindowConfig title width height =
@@ -336,6 +370,10 @@ data WindowConfigRejected
   | WindowTitleRejected
     -- ^ The title contains a NUL, which C would truncate.
   deriving (Eq, Show)
+
+instance NFData WindowConfigRejected where
+  rnf (WindowExtentRejected width height) = rnf width `seq` rnf height
+  rnf WindowTitleRejected = ()
 
 instance Exception WindowConfigRejected
 
@@ -388,12 +426,18 @@ windowLocalIdentity (WindowId _ local) = local
 -- | Where a window is in its lifetime.
 data WindowPhase
   = WindowOpen
-    -- ^ Created and not yet released.
+    -- ^ Created, live, and not yet closing.
+  | WindowClosing
+    -- ^ Its owner has begun its close protocol; it is not yet released.
   | WindowReleased
-    -- ^ Released: callbacks detached and the native window destroyed.
+    -- ^ Disposed successfully: callbacks detached and the native window
+    -- destroyed, with no release part failing.
+  | WindowDisposalFailed
+    -- ^ Disposal failed: a release part failed, but release still established
+    -- that callbacks and the native window ended safely.
   | WindowReleaseUncertain
-    -- ^ Release could not establish that callbacks and the native window
-    -- ended safely.
+    -- ^ Disposal failed, and release could not establish that callbacks and the
+    -- native window ended safely.
   deriving (Eq, Show, Generic)
 
 instance NFData WindowPhase
@@ -608,18 +652,19 @@ windowAssembly session config = do
   live ← restoredStep (newIORef True)
   captures ← restoredStep (newIORef noCaptures)
   certain ← restoredStep (newIORef True)
+  failed ← restoredStep (newIORef False)
   storage ←
     acquirePart
       "glfw window callback storage"
       (releaseRank 2)
       (nativeNewWindowCallbacks native (windowCallbacks captures))
-      (freeStorage session certain)
+      (noteFailure failed . freeStorage session certain)
   (handle, created) ←
     acquirePart
       "glfw window"
       (releaseRank 1)
       (createNative session request identifiers)
-      (\(handle, _) → destroyNative session certain identifiers handle)
+      (\(handle, _) → noteFailure failed (destroyNative session certain identifiers handle))
   restoredStep (raiseReported createWindowOperation identifiers NativeCallReturned created)
   -- The detach is registered before any callback is attached, so an
   -- attachment that reported an error, raised part-way, or was interrupted is
@@ -628,7 +673,7 @@ windowAssembly session config = do
     "glfw window callbacks"
     (releaseRank 0)
     (pure ())
-    (\() → detachCallbacks session live certain captures identifiers handle)
+    (\() → noteFailure failed (detachCallbacks session live certain captures identifiers handle))
   restoredStep (attachCallbacks session certain identifiers handle storage)
   sample ← restoredStep (ownerOperation session sampleOperation identifiers (sampleAll session identifiers handle))
   pending ← restoredStep (takeCaptures captures)
@@ -641,7 +686,7 @@ windowAssembly session config = do
       "glfw window observations"
       (releaseRank 3)
       (newSnapshot prepared)
-      (closeObservations live certain ownerState)
+      (closeObservations live certain failed ownerState)
   pure
     Window
       { windowSession = session
@@ -745,6 +790,11 @@ destroyNative session certain identifiers handle =
   nativeRelease session certain True destroyWindowOperation identifiers $
     nativeDestroyWindow (sessionNative session) handle
 
+-- | Record that a release part failed, for the terminal phase, and let the
+-- failure continue on its path unchanged.
+noteFailure ∷ IORef Bool → IO () → IO ()
+noteFailure failed release = release `onException` atomicWriteIORef failed True
+
 freeStorage ∷ Session → IORef Bool → WindowCallbackStorage → IO ()
 freeStorage session certain storage = do
   safe ← readIORef certain
@@ -752,19 +802,25 @@ freeStorage session certain storage = do
     then nativeFreeWindowCallbacks (sessionNative session) storage
     else poisonSession session
 
-closeObservations ∷ IORef Bool → IORef Bool → IORef OwnerState → SnapshotPublisher WindowObservation → IO ()
-closeObservations live certain ownerState publisher = do
+closeObservations ∷ IORef Bool → IORef Bool → IORef Bool → IORef OwnerState → SnapshotPublisher WindowObservation → IO ()
+closeObservations live certain failed ownerState publisher = do
   atomicWriteIORef live False
   safe ← readIORef certain
+  failing ← readIORef failed
   OwnerState current issued ← readIORef ownerState
   let final =
         current
           { obsRevision = obsRevision current + 1
-          , obsPhase = if safe then WindowReleased else WindowReleaseUncertain
+          , obsPhase = terminalPhase safe failing
           }
   prepared ← prepare final
   atomically (publish publisher prepared >> closeSnapshot publisher)
   writeIORef ownerState (OwnerState final issued)
+  where
+    terminalPhase safe failing
+      | not safe = WindowReleaseUncertain
+      | failing = WindowDisposalFailed
+      | otherwise = WindowReleased
 
 -- ---------------------------------------------------------------------------
 -- Callbacks
@@ -1043,6 +1099,41 @@ rejectCloseRequest window request =
         mask_ (commitObservation window next issued prepared)
         pure True
       else pure False
+
+-- | Begin the window's close protocol: publish a revision whose phase is
+-- 'WindowClosing' in the same transaction as the owner's @commit@, then
+-- reconcile pending captures at the boundary.
+--
+-- The closing observation is prepared first, and @interruption@ runs after
+-- that preparation; production passes @pure ()@, and the examples use it to
+-- deliver a cancellation there. Until then nothing has changed. Then, masked and
+-- with no interruptible operation, one transaction runs @commit@ and, only if it
+-- answers 'True', publishes the closing observation, and the owner's current
+-- observation is recorded. So the owner's record that closing began and the
+-- published phase commit together or not at all. @commit@ must be finite and
+-- must never retry.
+--
+-- Answers whether closing began: 'False', with nothing published and @commit@
+-- not run, for a window that is not open, and 'False', with nothing published,
+-- when @commit@ declines. The window stays live, and its callbacks attached,
+-- until it is released.
+beginWindowClosing ∷ IO () → STM Bool → Window → IO (WindowResult Bool)
+beginWindowClosing interruption commit window =
+  atBoundary (pure ()) window (operation "begin window closing") $ do
+    OwnerState current issued ← readIORef (windowOwnerState window)
+    if obsPhase current /= WindowOpen
+      then pure False
+      else do
+        let next = current {obsRevision = obsRevision current + 1, obsPhase = WindowClosing}
+        prepared ← prepare next
+        interruption
+        mask_ $ do
+          committed ← atomically $ do
+            proceed ← commit
+            when proceed (void (publish (windowPublisher window) prepared))
+            pure proceed
+          when committed (writeIORef (windowOwnerState window) (OwnerState next issued))
+          pure committed
 
 -- | How an owner turn processes native events.
 data EventProcessing

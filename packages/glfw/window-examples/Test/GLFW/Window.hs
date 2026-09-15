@@ -35,7 +35,7 @@ module Test.GLFW.Window
 
 import Control.Concurrent (ThreadId, forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ErrorCall (ErrorCall)
@@ -74,6 +74,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , readSnapshot
   )
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures, withScoped)
+import qualified Hetoimasia.GLFW.Internal.Window as Internal
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
@@ -124,6 +125,12 @@ spec = do
       (boundedExample testIndependentWindows)
     it "rejects window operations from another thread before any native call"
       (boundedExample testOwnerOnly)
+
+  describe "GLFW window closing" $ do
+    it "changes nothing when cancelled before the closing commit, then commits the owner's record and the closing phase in one transaction, once"
+      (boundedExample testClosingCommit)
+    it "publishes nothing when the owner's commit declines"
+      (boundedExample testClosingDeclined)
 
   describe "GLFW window release failures" $ do
     it "rolls back a failed initial sampling, then creates another window in the same session"
@@ -624,6 +631,55 @@ testAttachReportRollsBack = do
       , exitCalls
       ]
 
+-- | The owner's record that closing began, as a host keeps it: a flag set once.
+closingRecord ∷ IO (STM Bool, STM Bool)
+closingRecord = do
+  record ← newTVarIO False
+  let commit = readTVar record >>= \closed → if closed then pure False else True <$ writeTVar record True
+  pure (commit, readTVar record)
+
+testClosingCommit ∷ Expectation
+testClosingCommit = do
+  seam ← newSeam defaultScript
+  (commit, recorded) ← closingRecord
+  (before, cancelled, (recordedAfterCancel, afterCancel), first, (together, closing), second, after) ←
+    asProcessMainThread seam $ entered seam $ \session →
+      withWindow session (hiddenTestWindowConfig "closing" 64 48) $ \window → do
+        before ← current window
+        cancelled ← try (Internal.beginWindowClosing (throwIO ThreadKilled) commit window)
+        afterCancel ← (,) <$> atomically recorded <*> current window
+        first ← Internal.beginWindowClosing (pure ()) commit window
+        -- One transaction reads the owner's record and the published phase.
+        together ←
+          atomically $ do
+            closed ← recorded
+            observation ← preparedValue . observedValue <$> readSnapshot (windowObservations window)
+            pure (closed, observation)
+        second ← Internal.beginWindowClosing (pure ()) commit window
+        after ← current window
+        pure (before, cancelled, afterCancel, first, together, second, after)
+  cancelled `shouldBe` Left ThreadKilled
+  recordedAfterCancel `shouldBe` False
+  afterCancel `shouldBe` before
+  first `shouldBe` WindowAvailable True
+  (together, observedPhase closing, observedRevision closing) `shouldBe` (True, WindowClosing, observedRevision before + 1)
+  second `shouldBe` WindowAvailable False
+  after `shouldBe` closing
+
+testClosingDeclined ∷ Expectation
+testClosingDeclined = do
+  seam ← newSeam defaultScript
+  (declined, before, after) ←
+    asProcessMainThread seam $ entered seam $ \session →
+      withWindow session (hiddenTestWindowConfig "declined" 64 48) $ \window → do
+        before ← current window
+        declined ← Internal.beginWindowClosing (pure ()) (pure False) window
+        after ← current window
+        pure (declined, before, after)
+  declined `shouldBe` WindowAvailable False
+  after `shouldBe` before
+  observedPhase after `shouldBe` WindowOpen
+
 testFaultBesideFailingDetach ∷ Expectation
 testFaultBesideFailingDetach = do
   raised ← scenario detachRaises
@@ -646,7 +702,8 @@ testFaultBesideFailingDetach = do
       fmap nativeOutcome (fromException primary) `shouldBe` Just NativeCallReturned
       labels `shouldBe` sort ["glfw window callback fault", "glfw window callbacks"]
       fault `shouldBe` Just (ErrorCall "kept fault")
-      phase `shouldBe` WindowReleased
+      -- The detach failed while release stayed certain.
+      phase `shouldBe` WindowDisposalFailed
   where
     scenario script = do
       seam ← newSeam script

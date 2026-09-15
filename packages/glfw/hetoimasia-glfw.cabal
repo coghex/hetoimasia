@@ -10,10 +10,10 @@ description:
     platform observed through snapshots, and
     bounded window command admission with persistent completion tickets. Its
     main library depends on the foundation library and not on the runtime. The
-    separate public runtime-glfw sublibrary composes a window host and its
-    supervised owner loop with the runtime's application lifecycle, and no
-    library depends on it. No component imports a game, scripting,
-    or rendering module.
+    separate public runtime-glfw sublibrary composes a window host, its
+    dynamically created and independently closed windows, and its supervised
+    owner loop with the runtime's application lifecycle, and no library depends
+    on it. No component imports a game, scripting, or rendering module.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -100,8 +100,9 @@ library
         hetoimasia-glfw:native
 
 -- The runtime integration: a window host built as a scoped application
--- dependency, the supervised owner loop that processes native events and is the
--- only production executor of its command port, and the host's quiescence
+-- dependency, owning its windows through a scoped collection and giving each
+-- its own command port, the supervised owner loop that processes native events
+-- and is the only production executor of those ports, and the host's quiescence
 -- action. It is the one library that depends on both the GLFW library and the
 -- runtime, and no library depends on it. It uses the private model for execution
 -- and event processing, and exports none of it.
@@ -111,6 +112,20 @@ library runtime-glfw
     hs-source-dirs: runtime-glfw
     exposed-modules:
         Hetoimasia.Runtime.GLFW
+    build-depends:
+        base >=4.21 && <4.22,
+        hetoimasia-glfw:runtime-glfw-core
+
+-- The runtime integration's implementation, including the test-only host hooks
+-- the dynamic window examples use to deliver a cancellation at a precise point.
+-- Private, so no package outside this one can name them; the public
+-- runtime-glfw sublibrary re-exports everything else.
+library runtime-glfw-core
+    import: language
+    visibility: private
+    hs-source-dirs: runtime-glfw-core
+    exposed-modules:
+        Hetoimasia.Runtime.GLFW.Internal
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
@@ -152,7 +167,8 @@ library seam-core
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw:model
 
--- The window model, window command, window host, and monitor inventory examples
+-- The window model, window command, window host, dynamic window, and monitor
+-- inventory examples
 -- that use the private window and monitor drivers and the private command
 -- executor. An executable rather than a
 -- library, so its modules cannot be imported; hetoimasia-tests runs it from its
@@ -164,6 +180,7 @@ executable glfw-window-examples
     hs-source-dirs: window-examples
     other-modules:
         Test.GLFW.Command
+        Test.GLFW.Dynamic
         Test.GLFW.Host
         Test.GLFW.Monitor
         Test.GLFW.Window
@@ -178,6 +195,7 @@ executable glfw-window-examples
         hetoimasia-glfw,
         hetoimasia-glfw:model,
         hetoimasia-glfw:runtime-glfw,
+        hetoimasia-glfw:runtime-glfw-core,
         hetoimasia-glfw:seam-core
 
 -- The native Hspec suite. The executable's process main thread owns one shared

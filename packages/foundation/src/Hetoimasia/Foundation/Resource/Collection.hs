@@ -12,7 +12,9 @@
 --
 -- 'allocCollection' allocates the collection for the rest of the enclosing
 -- scope. 'acquireMember' builds one member from an ordinary 'Assembly' and
--- returns an opaque 'Member' token; 'withMember' lends that member's value to a
+-- returns an opaque 'Member' token, and 'acquireMemberThen' also hands that
+-- token to an owner's registration before any cancellation can intervene;
+-- 'withMember' lends that member's value to a
 -- callback; 'retireMember' releases it early. Whatever is still live when the
 -- scope ends is released then, newest registration first, each member's parts
 -- in the order its 'Assembly' declared with
@@ -49,7 +51,10 @@
 -- On success the finished release is registered in the collection while still
 -- masked, with no interruptible operation in between, and only then is the
 -- token returned. A cancellation arriving at that handoff leaves a registered
--- member that the scope's exit releases.
+-- member that the scope's exit releases. An owner that must record the token in
+-- its own bookkeeping uses 'acquireMemberThen', whose handoff runs in that same
+-- masked step, so no cancellation separates the collection's registration from
+-- the owner's.
 --
 -- Retirement claims a member's release exactly once and makes the member
 -- terminal. Retiring it again returns 'AlreadyRetired' if the release
@@ -137,6 +142,7 @@ module Hetoimasia.Foundation.Resource.Collection
     -- * Members
   , Member
   , acquireMember
+  , acquireMemberThen
   , withMember
   , retireMember
   , Retirement (..)
@@ -326,7 +332,21 @@ liveMemberCount collection = do
 -- and no capacity is consumed. A rollback release that failed also poisons
 -- the collection. The token is returned only after registration.
 acquireMember ∷ Collection → Assembly a → IO (Member a)
-acquireMember collection assembly = mask $ \restore → do
+acquireMember collection assembly = acquireMemberThen collection assembly pure
+
+-- | 'acquireMember', then hand the token to @handoff@ before returning, in the
+-- masked step that registered it.
+--
+-- The assembly runs with the caller's masking state, exactly as in
+-- 'acquireMember', so a cancellation during construction rolls it back and
+-- registers nothing. Once the member is registered, @handoff@ runs masked with
+-- no interruptible operation before it, so an owner can record the token in its
+-- own bookkeeping without a cancellation landing between the two
+-- registrations. @handoff@ must not block: a blocking operation inside it is
+-- interruptible. It may borrow members. If it raises, the member stays
+-- registered, the collection's exit releases it, and the failure propagates.
+acquireMemberThen ∷ Collection → Assembly a → (Member a → IO b) → IO b
+acquireMemberThen collection assembly handoff = mask $ \restore → do
   requireOwner collection
   requireOpen collection
   requireNoBorrow collection
@@ -349,7 +369,7 @@ acquireMember collection assembly = mask $ \restore → do
       -- registered before the token exists.
       state ← newIORef (MemberHeld value ledger 0)
       modifyIORef' (collectionLive collection) (Map.insert identifier (LiveMember state))
-      pure (Member (collectionIdentity collection) identifier state)
+      handoff (Member (collectionIdentity collection) identifier state)
 
 -- | Lend a live member's value to a callback.
 --

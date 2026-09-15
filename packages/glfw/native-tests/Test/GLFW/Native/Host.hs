@@ -8,16 +8,21 @@
 -- owning it: its release closes admission and destroys its own window, and the
 -- fixture keeps the session. No example sleeps; a worker coordinates with the
 -- loop through STM, and every loop is bounded in turns.
+--
+-- The dynamic window examples build the host with no windows or a few, create
+-- and close windows through the loop, and read each window's terminal phase from
+-- the observations its client capabilities carry.
 module Test.GLFW.Native.Host (spec) where
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Monad (when)
+import Control.Exception (Exception, throwIO, try)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import Hetoimasia.GLFW.Command
@@ -39,7 +44,7 @@ import Hetoimasia.Runtime.Supervision
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
 import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 spec ∷ Shared → Spec
 spec shared = describe "window host" $ do
@@ -137,6 +142,263 @@ spec shared = describe "window host" $ do
     endedAfter `shouldBe` True
     finalPhase `shouldBe` WindowReleased
 
+  describe "dynamic windows" $ do
+    it "creates three windows through a worker's requests and closes them in the order B, A, C, the others still observing and executing" $
+      testCloseOrder shared [1, 0, 2]
+    it "creates three windows through a worker's requests and closes them in the order C, A, B, the others still observing and executing" $
+      testCloseOrder shared [2, 0, 1]
+    it "closes a window while a worker holds its port, which then answers closed while another window still executes" $
+      testHeldPortClosed shared
+    it "honours a real native close request through the close protocol, leaving the other window open" $
+      testHonouredCloseRequest shared
+    it "disposes every remaining window, a created one included, only after the drain and with no retained cleanup failure" $
+      testRemainingDisposedAfterDrain shared
+
+-- ---------------------------------------------------------------------------
+-- Dynamic windows
+
+-- | What one close in a worker's sequence produced: the close's settlement, the
+-- closed window's phase right after it, and the observations requested through
+-- every window still open.
+type CloseStep = (Disposition, WindowPhase, [Disposition])
+
+testCloseOrder ∷ Shared → [Int] → Expectation
+testCloseOrder shared order = do
+  report ←
+    owned shared $ \session → do
+      result ← newTVarIO Nothing
+      outcome ←
+        runWindowApplication lifetime "native dynamic" (allocWindowHostIn (pure session) (dynamicSettings [])) id
+          (\host control → startSupervised control (required Service) (creatingAndClosing host order result) >>= expectStarted >> pure host)
+          (\host control → runOwnerLoop host control (untilReported result))
+      case outcome of
+        Left message → pure (Left message)
+        Right (readers, steps) → Right . (steps,) <$> mapM readerPhase readers
+  case report of
+    Left message → expectationFailure message
+    Right (steps, finals) → do
+      map (\(_, _, observed) → length observed) steps `shouldBe` [2, 1, 0]
+      forM_ steps $ \(closed, phase, observed) → do
+        closed `shouldSatisfy` \case
+          Performed (WindowCloseBegun _) → True
+          _ → False
+        phase `shouldBe` WindowReleased
+        observed `shouldSatisfy` all performedObservation
+      finals `shouldBe` replicate 3 WindowReleased
+
+-- | A service that creates three windows through the host's port, closes them
+-- in the given order, and after each close observes every window still open
+-- through that window's own port, then runs until stopped.
+creatingAndClosing
+  ∷ WindowHost
+  → [Int]
+  → TVar (Maybe (Either String ([SnapshotReader WindowObservation], [CloseStep])))
+  → WorkerDefinition ()
+creatingAndClosing host order result =
+  workerDefinition "creating and closing" (\_ → pure ()) $ \token () → do
+    outcome ← try $ do
+      created ← forM ["first", "second", "third"] $ \name → do
+        (_, ticket) ← settleRequest token (hostCommandPort host) (createWindowCommand (hiddenTestWindowConfig name 160 120))
+        atomically (pollWindowClient ticket) >>= maybe (throwIO (Stopped "a creation handed nothing over")) pure
+      steps ← forM (zip [1 ..] order) $ \(position, index) → do
+        let closing = created !! index
+            closedSoFar = take position order
+        (closed, _) ← settleRequest token (hostCommandPort host) (closeWindowCommand (clientWindow closing))
+        phase ← readerPhase (clientObservations closing)
+        observed ←
+          forM [client | (candidate, client) ← zip [0 ..] created, candidate `notElem` closedSoFar] $ \client →
+            fst <$> settleRequest token (clientCommandPort client) (observeWindowCommand (clientWindow client))
+        pure (closed, phase, observed)
+      pure (map clientObservations created, steps)
+    atomically (writeTVar result (Just (either (\(Stopped message) → Left message) Right outcome)))
+    untilStopped token
+
+testHeldPortClosed ∷ Shared → Expectation
+testHeldPortClosed shared = do
+  report ←
+    owned shared $ \session → do
+      holding ← newTVarIO False
+      closed ← newTVarIO False
+      result ← newTVarIO Nothing
+      runWindowApplication lifetime "native dynamic" (allocWindowHostIn (pure session) (dynamicSettings ["kept", "held"])) id
+        ( \host control → do
+            (kept, held) ← twoClients host
+            _ ← startSupervised control (required Service) (holdingPort kept held holding closed result) >>= expectStarted
+            pure (host, held)
+        )
+        ( \(host, held) control →
+            runOwnerLoop host control $
+              LoopHooks
+                { loopEvent = noApplicationEvents
+                , loopUpdate = \turn → do
+                    ready ← readTVarIO holding
+                    already ← readTVarIO closed
+                    when (ready && not already) $ do
+                      started ← closeHostWindow host (clientWindow held)
+                      unless (started == CloseStarted) (failed ("the held window's close answered " <> show started))
+                      atomically (writeTVar closed True)
+                    untilReported result `loopUpdate` turn
+                }
+        )
+  case report of
+    Left message → expectationFailure message
+    Right (answer, phase, other) → do
+      answer `shouldBe` SubmitClosed
+      phase `shouldBe` WindowReleased
+      other `shouldSatisfy` performedObservation
+
+-- | A service that holds a window's port, signals that it does, and once the
+-- owner has closed that window submits through the retained port, reads the
+-- window's phase, and requests an observation of another window through that
+-- window's own port.
+holdingPort
+  ∷ WindowClient
+  → WindowClient
+  → TVar Bool
+  → TVar Bool
+  → TVar (Maybe (Either String (SubmitResult, WindowPhase, Disposition)))
+  → WorkerDefinition ()
+holdingPort kept held holding closed result =
+  workerDefinition "holding" (\_ → pure ()) $ \token () → do
+    atomically (writeTVar holding True)
+    proceed ← atomically ((True <$ (readTVar closed >>= check)) `orElse` (False <$ awaitStopRequest token))
+    when proceed $ do
+      answer ← submitWindowCommand (clientCommandPort held) [("client", "holding")] (observeWindowCommand (clientWindow held))
+      phase ← readerPhase (clientObservations held)
+      other ← try (fst <$> settleRequest token (clientCommandPort kept) (observeWindowCommand (clientWindow kept)))
+      atomically (writeTVar result (Just (either (\(Stopped message) → Left message) (\settled → Right (answer, phase, settled)) other)))
+    untilStopped token
+
+testHonouredCloseRequest ∷ Shared → Expectation
+testHonouredCloseRequest shared = do
+  (honoured, onlyKept, closingPhase, keptPhase) ←
+    owned shared $ \session →
+      runWindowApplication lifetime "native dynamic" (allocWindowHostIn (pure session) (dynamicSettings ["closing", "kept"])) id (\host _ → pure host) $ \host control → do
+        (closing, kept) ← twoClients host
+        answered ← newIORef Nothing
+        runOwnerLoop host control $
+          LoopHooks
+            { loopEvent = noApplicationEvents
+            , loopUpdate = \turn → do
+                when (turnNumber turn == 1) $
+                  void (withHostWindow host (clientWindow closing) (requestCloseForCheck . windowNativeHandle))
+                readIORef answered >>= \case
+                  Nothing → case [request | request ← turnCloseRequests turn, closeRequestWindow request == clientWindow closing] of
+                    request : _ → do
+                      honourHostCloseRequest host request >>= writeIORef answered . Just
+                      pure Continue
+                    []
+                      | turnNumber turn >= turnBound → failed "no native close request reached the application within the turn bound"
+                      | otherwise → pure Continue
+                  Just answer → do
+                    listed ← atomically (hostWindowIdentities host)
+                    closingPhase ← readerPhase (clientObservations closing)
+                    keptPhase ← readerPhase (clientObservations kept)
+                    pure (Finish (answer, listed == [clientWindow kept], closingPhase, keptPhase))
+            }
+  honoured `shouldBe` CloseStarted
+  onlyKept `shouldBe` True
+  closingPhase `shouldBe` WindowReleased
+  keptPhase `shouldBe` WindowOpen
+
+testRemainingDisposedAfterDrain ∷ Shared → Expectation
+testRemainingDisposedAfterDrain shared = do
+  (atDrain, finals) ←
+    owned shared $ \session → do
+      held ← newIORef []
+      journal ← newTVarIO Nothing
+      readers ←
+        runWindowApplication lifetime "native dynamic" (allocWindowHostIn (pure session) (dynamicSettings ["first", "second"])) id
+          (\host control → startSupervised control (required Service) (phasesAtRelease held journal) >>= expectStarted >> pure host)
+          ( \host control → do
+              requested ← newIORef Nothing
+              runOwnerLoop host control $
+                LoopHooks
+                  { loopEvent = noApplicationEvents
+                  , loopUpdate = \turn →
+                      readIORef requested >>= \case
+                        Nothing →
+                          submitWindowCommand (hostCommandPort host) [] (createWindowCommand (hiddenTestWindowConfig "created" 160 120)) >>= \case
+                            SubmitAccepted ticket → writeIORef requested (Just ticket) >> pure Continue
+                            other → failed ("the creation was not admitted: " <> show other)
+                        Just ticket →
+                          atomically (pollWindowClient ticket) >>= \case
+                            Nothing
+                              | turnNumber turn >= turnBound → failed "the creation did not settle within the turn bound"
+                              | otherwise → pure Continue
+                            Just _ → do
+                              listed ← atomically (hostWindowIdentities host)
+                              readers ← forM listed $ \window →
+                                atomically (hostWindowClient host window) >>= maybe (failed "a listed window has no client") (pure . clientObservations)
+                              writeIORef held readers
+                              pure (Finish readers)
+                  }
+          )
+      -- The run returned, so no cleanup failure was retained.
+      (,) <$> readTVarIO journal <*> mapM readerPhase readers
+  atDrain `shouldBe` Just (replicate 3 WindowOpen)
+  finals `shouldBe` replicate 3 WindowReleased
+
+-- | A service that runs until stopped and records, at its release, the phases
+-- of the windows the owner stored for it.
+phasesAtRelease ∷ IORef [SnapshotReader WindowObservation] → TVar (Maybe [WindowPhase]) → WorkerDefinition ()
+phasesAtRelease held journal =
+  workerDefinition
+    "phases at release"
+    (\_ → allocResource (pure ()) (\() → readIORef held >>= mapM readerPhase >>= atomically . writeTVar journal . Just))
+    (\token () → untilStopped token)
+
+-- | A worker's request ended before it settled.
+newtype Stopped = Stopped String
+  deriving (Show)
+
+instance Exception Stopped
+
+-- | Submit a command, waiting for capacity, and wait for its settlement composed
+-- with the worker's stop request.
+settleRequest ∷ StopToken → WindowCommandPort → WindowCommand → IO (Disposition, CompletionTicket)
+settleRequest token port command =
+  awaitSubmitWindowCommand port [("client", "native dynamic")] command >>= \case
+    WaitClosed → throwIO (Stopped "admission closed before the request was admitted")
+    WaitAccepted ticket →
+      atomically ((Just <$> (pollCompletion ticket >>= maybe retry pure)) `orElse` (Nothing <$ awaitStopRequest token)) >>= \case
+        Nothing → throwIO (Stopped "the worker was stopped before its request settled")
+        Just settled → pure (settled, ticket)
+
+-- | Finish with a worker's report once it has one, failing past the turn bound.
+untilReported ∷ TVar (Maybe r) → LoopHooks r
+untilReported result =
+  LoopHooks
+    { loopEvent = noApplicationEvents
+    , loopUpdate = \turn →
+        readTVarIO result >>= \case
+          Just report → pure (Finish report)
+          Nothing
+            | turnNumber turn >= turnBound → failed "the worker did not report within the turn bound"
+            | otherwise → pure Continue
+    }
+
+dynamicSettings ∷ [Text] → HostConfig
+dynamicSettings names =
+  (defaultHostConfig [hiddenTestWindowConfig name 160 120 | name ← names]) {hostWindowLimit = 3, hostIdleWait = 0.1}
+
+-- | The client capabilities of the host's two windows, in creation order.
+twoClients ∷ WindowHost → IO (WindowClient, WindowClient)
+twoClients host =
+  atomically (hostWindowIdentities host) >>= \case
+    [first, second] → (,) <$> clientOf first <*> clientOf second
+    windows → failed ("expected two windows, found " <> show (length windows))
+  where
+    clientOf window = atomically (hostWindowClient host window) >>= maybe (failed "a listed window has no client") pure
+
+readerPhase ∷ SnapshotReader WindowObservation → IO WindowPhase
+readerPhase reader = observedPhase . preparedValue . observedValue <$> atomically (readSnapshot reader)
+
+performedObservation ∷ Disposition → Bool
+performedObservation = \case
+  Performed (ObservationPublished {}) → True
+  _ → False
+
 -- | The close policy: note the first surfaced request with what the window
 -- looked like then, keep turning for two more turns, and finish with whether the
 -- worker is still running. It never rejects or acts on the request.
@@ -218,10 +480,16 @@ lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (ca
 settings ∷ Text → HostConfig
 settings name = (defaultHostConfig [hiddenTestWindowConfig name 160 120]) {hostIdleWait = 0.1}
 
+-- | The host's only window, on the owner thread. It is taken out of its borrow
+-- so an example can inspect its terminal state after the run; the examples only
+-- read it.
 onlyWindow ∷ WindowHost → IO Window
-onlyWindow host = case hostWindows host of
-  [window] → pure window
-  windows → failed ("expected one window, found " <> show (length windows))
+onlyWindow host =
+  atomically (hostWindowIdentities host) >>= \case
+    [identity] → withHostWindow host identity pure >>= \case
+      WindowAvailable window → pure window
+      WindowEnded _ → failed "the host's only window has ended"
+    windows → failed ("expected one window, found " <> show (length windows))
 
 required ∷ Role → WorkerPolicy
 required role = WorkerPolicy role Supervision.Required testComponent (\_ → pure Unrecognized)

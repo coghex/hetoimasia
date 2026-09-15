@@ -27,7 +27,8 @@ window collection, or rendering operation.
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
 | `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
-| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host, its supervised owner loop, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
+| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
+| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
 | `glfw-window-examples` | executable, test-only | The window model, window command, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
@@ -140,7 +141,7 @@ observedPlacement ∷ WindowObservation → Attribute Placement
 observedFocused, observedIconified, observedMaximized, observedVisible ∷ WindowObservation → Attribute Bool
 observedCloseRequest ∷ WindowObservation → Maybe CloseRequest
 
-data WindowPhase  = WindowOpen | WindowReleased | WindowReleaseUncertain
+data WindowPhase  = WindowOpen | WindowClosing | WindowReleased | WindowDisposalFailed | WindowReleaseUncertain
 data Attribute a  = Observed a | Unavailable
 data Extent       = Extent { extentWidth, extentHeight ∷ Int }
 data ContentScale = ContentScale { scaleX, scaleY ∷ Float }
@@ -168,13 +169,15 @@ data WaitedSubmission = WaitAccepted CompletionTicket | WaitClosed
 
 data WindowCommand                           -- Eq, Show, NFData
 observeWindowCommand ∷ WindowId → WindowCommand
-commandWindow        ∷ WindowCommand → WindowId
+closeWindowCommand   ∷ WindowId → WindowCommand
+createWindowCommand  ∷ WindowConfig → WindowCommand
+commandWindow        ∷ WindowCommand → Maybe WindowId      -- Nothing for a creation
 
 data RequestId                               -- Eq, Ord, Show
 requestLocalIdentity ∷ RequestId → Natural
 data CommandOrigin                           -- Eq, Show, NFData; read with:
 submittedRequest ∷ CommandOrigin → RequestId
-submittedWindow  ∷ CommandOrigin → WindowId
+submittedWindow  ∷ CommandOrigin → Maybe WindowId
 submittedAt      ∷ CommandOrigin → Maybe FailureSite
 submittedContext ∷ CommandOrigin → [(Text, Text)]
 
@@ -185,10 +188,23 @@ awaitCompletion ∷ HasCallStack ⇒ CompletionTicket → IO Disposition
 
 data Disposition      = Performed CommandResult | Rejected CommandRejection | NotExecuted | Interrupted RequestId
 data CommandResult    = ObservationPublished { publishedWindow ∷ WindowId, publishedRevision ∷ Natural }
+                      | WindowCreated { createdWindow ∷ WindowId }
+                      | WindowCloseBegun { closingWindow ∷ WindowId }
 data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
                       | WindowNativeFailure { failedWindow ∷ WindowId, failedOperation ∷ Maybe Text
                                             , failedOutcome ∷ NativeOutcome, failedReports ∷ Reports }
+                      | WindowIsClosing WindowId | CloseNotPermitted WindowId | CreationNotPermitted
+                      | WindowConfigInvalid WindowConfigRejected | WindowCapacityReached Int
+                      | WindowCreationPoisoned
+                      | WindowCreationFailed { creationOperation ∷ Maybe Text
+                                             , creationOutcome ∷ NativeOutcome, creationReports ∷ Reports }
 data WindowCommandMisuse = OwnerThreadWouldWait
+
+data WindowClient                            -- Show; read with:
+clientWindow       ∷ WindowClient → WindowId
+clientCommandPort  ∷ WindowClient → WindowCommandPort
+clientObservations ∷ WindowClient → SnapshotReader WindowObservation
+pollWindowClient   ∷ CompletionTicket → STM (Maybe WindowClient)
 ```
 
 ```haskell
@@ -196,7 +212,6 @@ data WindowCommandMisuse = OwnerThreadWouldWait
 data WindowHost
 allocWindowHost       ∷ HasCallStack ⇒ HostConfig → Scoped WindowHost
 allocWindowHostIn     ∷ HasCallStack ⇒ Scoped Session → HostConfig → Scoped WindowHost
-hostWindows           ∷ WindowHost → [Window]
 hostMonitors          ∷ WindowHost → SnapshotReader MonitorInventory
 hostCommandPort       ∷ WindowHost → WindowCommandPort
 hostCommandStatistics ∷ WindowHost → STM CommandStatistics
@@ -204,12 +219,24 @@ hostActivity          ∷ WindowHost → STM HostActivity
 quiesceWindowHost     ∷ WindowHost → STM ()
 data HostActivity = HostActivity { activityTurn ∷ Natural, activityWaiting ∷ Bool }
 
+hostWindowIdentities   ∷ WindowHost → STM [WindowId]
+hostWindowClient       ∷ WindowHost → WindowId → STM (Maybe WindowClient)
+withHostWindow         ∷ WindowHost → WindowId → (Window → IO r) → IO (WindowResult r)
+closeHostWindow        ∷ WindowHost → WindowId → IO CloseStart
+honourHostCloseRequest ∷ WindowHost → CloseRequest → IO CloseStart
+data CloseStart = CloseStarted | CloseAlreadyStarted | CloseNotServed | CloseRequestSuperseded
+hostBookkeeping        ∷ WindowHost → IO HostBookkeeping
+data HostBookkeeping = HostBookkeeping { bookkeepingWindows, bookkeepingClosing, bookkeepingMembers
+                                       , bookkeepingPorts ∷ Int, bookkeepingPendingCells ∷ Natural
+                                       , bookkeepingSurfaced, bookkeepingBorrowed ∷ Int }
+
 data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
-                             , hostCommandCapacity ∷ Integer, hostCommandBudget, hostEventBudget ∷ Int
-                             , hostIdleWait ∷ Double }
-defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- capacity 64, budgets 16, idle wait 0.1 s
+                             , hostWindowLimit ∷ Int, hostCommandCapacity ∷ Integer
+                             , hostCommandBudget, hostEventBudget ∷ Int, hostIdleWait ∷ Double }
+defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacity 64, budgets 16, idle wait 0.1 s
 validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
 data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | IdleWaitRejected Double
+                        | WindowLimitRejected Int
 hostComponent ∷ Component                   -- "glfw.runtime"
 
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
@@ -231,12 +258,13 @@ runWindowApplication
 
 `Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
 `WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
-`CommandOrigin`, `RequestId`, and `WindowCommand` are exported without their
-constructors, and their readers are functions rather than record fields, so no
-client can build or rewrite one. No public
+`CommandOrigin`, `RequestId`, `WindowCommand`, and `WindowClient` are exported
+without their constructors, and their readers are functions rather than record
+fields, so no client can build or rewrite one. No public
 type holds a native window or monitor pointer, and no snapshot publisher is
-handed out: clients receive only read endpoints. Nothing assumes a single or
-primary window or monitor.
+handed out: clients receive only read endpoints. No public operation reaches the
+host's window collection, a collection member, or a release. Nothing assumes a
+single or primary window or monitor.
 
 Every failure is raised through `throwFailure` with the `glfw` component, the
 operation (`enter session`, `initialize`, `verify backend`, `terminate`,
@@ -244,13 +272,16 @@ operation (`enter session`, `initialize`, `verify backend`, `terminate`,
 `detach monitor callback`, `sample monitors`, `synchronize monitors`,
 `resolve monitor`, `reconcile monitor events`, `monitor callback`, `create window`,
 `sample window`, `attach window callbacks`, `synchronize window`,
-`detach window callbacks`, `destroy window`, `new window command host`,
-`submit window command`, `await window command`, `execute window command`,
-`perform window command`, `process window events`, `reconcile window events`,
-`run owner loop`, `reject close request`), and identifiers such as `backend`,
-`title`, `monitor`, `window`, or `request`, so `failureEvidence` reads the origin back
-without a logger. A host configuration rejection is raised under the `glfw.runtime`
-component and the `construct window host` operation.
+`begin window closing`, `detach window callbacks`, `destroy window`,
+`new window command host`, `submit window command`, `await window command`,
+`execute window command`, `perform window command`, `process window events`,
+`reconcile window events`, `reject close request`), and identifiers such as
+`backend`, `title`, `monitor`, `window`, or `request`, so `failureEvidence` reads
+the origin back without a logger. The host's own failures are raised under the
+`glfw.runtime` component: a configuration rejection under
+`construct window host`, and an owner-thread refusal under `run owner loop`,
+`reject close request`, `borrow host window`, `close host window`,
+`honour close request`, or `read host bookkeeping`.
 
 ## Entry
 
@@ -556,12 +587,13 @@ long as a reader holds the endpoint.
 
 ## Windows
 
-A window is a lexical scoped resource: `allocWindow` creates it for the rest of
-the enclosing `withScoped` scope, and `withWindow` is that scope on its own. Any
-number may be live in one session. Dynamic creation and independent close order
-arrive with GLFW-9 on the [scoped collection](resources.md#scoped-resource-collections),
-which will take the same `Assembly` as one member; there is no second
-acquisition or cleanup path.
+`allocWindow` creates a window as a lexical scoped resource, for the rest of the
+enclosing `withScoped` scope, and `withWindow` is that scope on its own. Any
+number may be live in one session. The window host creates windows dynamically
+and closes them in any order as members of a
+[scoped collection](resources.md#scoped-resource-collections), acquiring each
+from the same `Assembly` as one member; there is no second acquisition or cleanup
+path. See [Dynamic windows](#dynamic-windows).
 
 ### Owner, thread, and lifetime
 
@@ -688,7 +720,8 @@ rejection transition clears a request only while it is still the latest, so
 rejecting an older request never erases a newer one. What a request means is the
 application's decision: the window host
 [surfaces it to application policy](#close-requests-in-the-owner-loop), which may
-reject it. There is no default close policy and no close command.
+reject it or honour it by beginning that window's close protocol. There is no
+default close policy, and no request closes a window by itself.
 
 ### Release
 
@@ -718,10 +751,31 @@ the session refuses further windows with `SessionPoisoned`, keeps its own error
 callback storage, and poisons its guard when it ends.
 
 The terminal observation keeps the last observed attributes without querying the
-destroyed window, advances the revision, and names `WindowReleased` only when
-release stayed certain, `WindowReleaseUncertain` otherwise. This happens on
-exceptional teardown as on normal teardown. Readers holding the endpoint can
-still read it and receive `EndOfStream` after it, under the snapshot contract.
+destroyed window, advances the revision, and names the disposal's outcome:
+`WindowReleased` when every part succeeded, `WindowDisposalFailed` when a part
+failed while release stayed certain, and `WindowReleaseUncertain` when release
+became uncertain. The phase is computed from two flags the parts set, never from
+their exceptions: nothing is formatted or logged, and the failures stay on the
+release's failure path as cleanup evidence. This happens on exceptional teardown
+as on normal teardown. Readers holding the endpoint can still read it and
+receive `EndOfStream` after it, under the snapshot contract.
+
+### Lifecycle phases
+
+| Phase | Published | Meaning |
+|---|---|---|
+| `WindowOpen` | At creation, revision zero | Live, not closing |
+| `WindowClosing` | When an owner begins the window's close protocol, as its own revision, in the transaction that closes the window's admission | Live, callbacks attached, admission closed; not yet released |
+| `WindowReleased` | By release, as the last revision | Disposed successfully |
+| `WindowDisposalFailed` | By release, as the last revision | Disposal failed; release stayed certain |
+| `WindowReleaseUncertain` | By release, as the last revision | Disposal failed; callback reachability unknown |
+
+Reconciliation keeps a closing window's phase while its callbacks are still
+attached. The terminal phase is always published before the snapshot closes, so
+a reader that skipped intermediate revisions still receives the disposal's
+outcome before `EndOfStream`. A lexically scoped window never passes through
+`WindowClosing`, and neither does a window the host disposes at shutdown
+without a close protocol having begun.
 
 ## Window commands
 
@@ -745,15 +799,17 @@ statistics, and direct performance. Clients receive the `WindowCommandPort`,
 which can only submit, and the tickets their submissions return; any thread may
 hold either. Neither carries a native handle, destruction authority, a channel
 endpoint, or a completion cell. Queued commands are claimed and settled only on
-the owner thread. A host lives while referenced. The window host closes its
-command host by quiescence, before the worker drain, and again when it is
+the owner thread. A host lives while referenced. The window host closes its own
+command host and every window's by quiescence, before the worker drain, a
+window's also when its close protocol begins, and all of them again when it is
 released; a command host created directly is closed by its application.
 
 ### Admission
 
-A `WindowCommand` is an immutable value addressed to one window. Submitting it
+A `WindowCommand` is an immutable value: a request to observe or close one
+window, or to create a window from a `WindowConfig`. Submitting it
 issues a request identity, records a `CommandOrigin` beside it — the request,
-the window, the submission site, and the caller's diagnostic context — and
+the window it addresses if any, the submission site, and the caller's diagnostic context — and
 prepares the message to normal form on the submitting thread. A failure raised
 while preparing propagates and admits nothing. The submission site is the
 outermost call-stack frame and the whole stack, under the failure module's
@@ -779,7 +835,7 @@ requests and do not order them; order is the order admissions committed.
 | Disposition | When | Effects |
 |---|---|---|
 | `Performed result` | The command was performed or requested from the window system | Applied; `result` was prepared before settlement |
-| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`), or a native call failed first (`WindowNativeFailure`) | None applied |
+| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`) or is closing (`WindowIsClosing`), a native call failed first (`WindowNativeFailure`), the executor or port cannot close or create (`CloseNotPermitted`, `CreationNotPermitted`), or a creation was refused (`WindowConfigInvalid`, `WindowCapacityReached`, `WindowCreationPoisoned`) or failed during construction (`WindowCreationFailed`) | None applied; a failed construction was rolled back |
 | `NotExecuted` | Closure settled it while it was still queued | None |
 | `Interrupted request` | Its execution, or the preparation of its completion data, raised | May have been applied; nothing is replayed or rolled back |
 
@@ -789,6 +845,30 @@ the call itself failed, and the reported codes and descriptions. An arbitrary
 Haskell exception is never serialized into a ticket. The ticket names only the
 interrupted request, and the exception propagates from the executor with its
 own type and context.
+
+### The creation handoff
+
+A creation that succeeds settles as `Performed (WindowCreated window)`: ordinary
+data, prepared like every other disposition. The new window's `WindowClient` —
+its own command port and its read-only observations — is not data. It is never
+prepared and never put inside a message; it is written beside the prepared
+disposition, in the settling transaction, and `pollWindowClient` reads it from
+the ticket as often as desired once the creation has settled. The executor hands
+it over only after the window was constructed, registered with its owner, and
+published its initial observation. A `WindowClient` carries no native handle and
+no release, retirement, or creation authority. A creation interrupted before
+settlement, even after registration, settles as `Interrupted` with no
+`WindowClient`, and its window's owner still owns it.
+
+### Port scope
+
+A host created with `newWindowCommandHost` serves every command. The window host
+also gives each of its windows a private command host of its own, whose port the
+window's `WindowClient` carries. That port can submit anything, but its executor
+settles a creation as `CreationNotPermitted` and a command addressed to another
+window as `WindowNotServed`, each without executing it, and each still costs its
+dispatch attempt. Holding one window's port therefore grants no authority over
+another window and none to create one.
 
 ### Tickets and waiting
 
@@ -830,7 +910,7 @@ production executor.
 
 ### The observation request
 
-`observeWindowCommand` is the only command. Executing it synchronizes the
+`observeWindowCommand` asks for an observation. Executing it synchronizes the
 addressed window at an owner boundary, which samples and publishes under the
 [observation contract](#observations). It completes with
 `ObservationPublished`, naming the revision of the committed observation that
@@ -842,6 +922,13 @@ is `WindowNotServed`, an ended window is `WindowAlreadyEnded` without a native
 call, and a sampling failure is `WindowNativeFailure` with nothing published.
 A callback fault rethrown at that boundary is not a sampling failure: it
 interrupts the command and propagates.
+
+`closeWindowCommand` and `createWindowCommand` change which windows exist, so
+only an executor that owns window lifetimes performs them: the window host's
+owner loop, under [Dynamic windows](#dynamic-windows). Every other executor —
+`performWindowCommand` and the test seam's, over lexically scoped windows —
+settles a close of a window it was given as `CloseNotPermitted`, a close of any
+other as `WindowNotServed`, and a creation as `CreationNotPermitted`.
 
 ### Bookkeeping and closure
 
@@ -864,7 +951,8 @@ without settling tickets; there is no abort.
 
 ## The window host and owner loop
 
-`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, composes a
+`Hetoimasia.Runtime.GLFW`, in the public `runtime-glfw` sublibrary, which
+re-exports the private `runtime-glfw-core` implementation, composes a
 session, its windows, and their command bookkeeping with the runtime's
 [application lifecycle](resources.md#the-application-runner). It follows the
 [module authoring guide](logging.md#module-authoring-guide): it takes no logger
@@ -877,22 +965,105 @@ delivers them. The runner makes the one terminal report.
 
 A `WindowHost` is an application dependency, built by `allocWindowHost` as a
 `Scoped` value before supervision is entered, on the process main thread. It
-validates its `HostConfig` first — both budgets at least one, and an idle wait
-above zero and at most 60 seconds, so a NaN or infinite wait is refused — then
-enters the session, creates each configured window in order, and creates the
-command host. A failure at any stage releases what the earlier stages acquired
-through ordinary scoped release, before any worker exists. The host is never a
-service the startup callback returns: startup receives it among the
-dependencies and hands workers only client capabilities — `hostCommandPort`, a
-window's read-only observations, and `hostActivity` — transferring no native
-ownership. `allocWindowHostIn` builds the same host over a session scope the
-caller supplies, such as a test seam's or a borrowed session; the host then owns
-the session only if that scope does.
+validates its `HostConfig` first — both budgets at least one, an idle wait above
+zero and at most 60 seconds, so a NaN or infinite wait is refused, and a
+live-window limit of at least one and at least the number of configured windows —
+then enters the session, allocates a
+[scoped collection](resources.md#scoped-resource-collections) with that limit,
+creates the host's command port, and creates each configured window in order as
+a collection member with its own port. A failure at any stage releases what the
+earlier stages acquired through ordinary scoped release, before any worker
+exists. The host is never a service the startup callback returns: startup
+receives it among the dependencies and hands workers only client capabilities —
+`hostCommandPort`, a window's `WindowClient`, the monitor inventory's reader, and
+`hostActivity` — transferring no native ownership. `allocWindowHostIn` builds
+the same host over a session scope the caller supplies, such as a test seam's or
+a borrowed session; the host then owns the session only if that scope does.
 
-`WindowHost` is exported without its constructor or fields. No session, command
-host, native handle, executor, or release authority can be taken from it. A
-window it lends carries no release authority, and its owner operations refuse
-other threads.
+`WindowHost` is exported without its constructor or fields. No session,
+collection, member, command host, native handle, executor, or release authority
+can be taken from it. The host holds its windows only through the collection:
+`withHostWindow` lends one to an owner-thread callback it must not escape, and
+the host's owner operations refuse other threads.
+
+### Dynamic windows
+
+The host's windows are created and closed while the application runs, in any
+order, with no primary window. The collection owns every window until it is
+retired or the host's scope ends, so a window's lifetime never escapes the host.
+
+**Creation.** A `createWindowCommand` submitted through `hostCommandPort` — the
+one port with creation authority — is executed by the owner loop. Before any
+native effect it checks the configuration (`WindowConfigInvalid`), the live-window
+limit (`WindowCapacityReached`, a typed rejection rather than a wait), and whether
+a release failure has poisoned creation (`WindowCreationPoisoned`). The window is
+then acquired through the window's own `Assembly` as a collection member, and,
+with nothing interruptible in between, registered with the host beside a port of
+its own. A native failure during construction is `WindowCreationFailed` once the
+construction has rolled back exactly what it acquired: nothing is registered and
+no capacity is consumed. Anything else raised during construction — a
+cancellation, a callback fault, any other exception — interrupts the command and
+propagates with its cleanup evidence on the host's failure path. A rollback
+whose own release failed poisons further creation, and the collection keeps that
+failure as evidence through its final exit. On success the ticket settles as
+`WindowCreated` and hands over the window's `WindowClient`, as
+[the creation handoff](#the-creation-handoff) describes.
+
+A dropped or unawaited creation ticket neither destroys nor relinquishes its
+window. `hostWindowIdentities` enumerates every window the host holds, in
+registration order and bounded by the limit, and `hostWindowClient` returns the
+capabilities of any of them; the host disposes every remaining window at
+shutdown. Identities are never reissued within a session, so a retired window's
+identity never names a later window.
+
+**The close protocol.** A `closeWindowCommand` executed by the loop, through the
+host's port or the window's own, `closeHostWindow` on the owner thread, and
+`honourHostCloseRequest` for a surfaced close request that is still its window's
+latest all begin the same protocol:
+
+1. the window's closing observation is prepared; nothing has changed yet, so a
+   cancellation here leaves the window open with its port admitting;
+2. in one transaction, the window is marked closing, its port's admission
+   closes, every command still queued there settles as `NotExecuted`, and its
+   observations publish the `WindowClosing` phase; that transaction and the
+   owner's record of the new observation run masked with nothing interruptible
+   between them, so no cancellation can close the port without publishing the
+   phase, or publish the phase without closing the port;
+3. once no owner-thread borrow is in progress, the window is retired through the
+   collection: callbacks detached, the native window destroyed, storage freed,
+   and the terminal phase published before its snapshot closes.
+
+A close command settles as `WindowCloseBegun` once step 2 has committed; its disposal is
+reported by the window's observations, never by the ticket, because closed
+admission alone proves nothing about native destruction. Beginning the protocol
+again answers `CloseAlreadyStarted`, or `WindowIsClosing` for a command, and a
+window the host no longer holds answers `CloseNotServed` or `WindowNotServed`.
+Closing a window stops neither the session, the loop, nor any other window, and
+closing the last window creates nothing and ends nothing.
+
+Retirement never waits. While `withHostWindow` lends the closing window, the
+collection answers the retirement as in use; while it lends another window, the
+host does not attempt it. Either way the window stays registered, still
+occupying its capacity, and every turn retries its retirement after native event
+processing, when no borrow is in progress. Retaining a client port is not a
+borrow and does not delay retirement. A retirement whose release fails is not
+retried, at shutdown or ever: the window is forgotten with its
+`WindowDisposalFailed` or `WindowReleaseUncertain` phase, and the collection
+latches the failure, poisoning creation and keeping the failure as evidence for
+its final exit.
+
+**Retained handles.** Once a window has been retired, its port answers
+`SubmitClosed`, and `WaitClosed` to a waiting submission; `withHostWindow`
+answers `WindowEnded`; `closeHostWindow` answers `CloseNotServed`; a command for
+it through the host's port is `WindowNotServed`; and its observation reader keeps
+the terminal observation, then `EndOfStream`. None of these touches native state.
+
+**Bookkeeping.** The host keeps one registry entry, one port, and at most one
+surfaced close request per window it holds, plus one dispatch cursor.
+`hostBookkeeping` reads those counts, the collection's live members, the
+completion cells held across every port, and the windows borrowed, on the owner
+thread. Every count is proportional to the live windows, never to how many were
+ever created.
 
 ### The owner turn
 
@@ -904,11 +1075,12 @@ calls it on the process main thread — and refuses any other thread with
 2. native event processing: `glfwPollEvents`, or on an idle turn
    `glfwWaitEventsTimeout` with the configured bound;
 3. reconciliation at owner boundaries: the monitor inventory, refreshed only
-   when its callback captured a change, then every window's captured callbacks,
-   collecting the close requests not yet surfaced;
+   when its callback captured a change, then the retirement of every closing
+   window no borrow defers, then every window's captured callbacks, collecting
+   the close requests not yet surfaced for windows that are not closing;
 4. `checkRuntime`;
 5. command work: at most `hostCommandBudget` queued commands claimed, executed,
-   and settled;
+   and settled, across every port;
 6. `checkRuntime`;
 7. application event work: at most `hostEventBudget` calls of `loopEvent` that
    dispatched something, ending at the first that found nothing ready;
@@ -925,11 +1097,42 @@ failure also ends the loop and propagates.
 ### Budgets
 
 Budgets count attempted dispatches, not time. A rejected command — addressed to
-a window the host does not serve, or to one that has ended — costs its attempt
-exactly as a performed one does. At most `max hostCommandBudget hostEventBudget`
+a window the host does not serve, one that has ended, one outside its port's
+scope, or a refused creation — costs its attempt exactly as a performed one
+does. At most `max hostCommandBudget hostEventBudget`
 dispatch attempts separate two consecutive checks, however continuously the
-command queue and the application's event source are refilled. A budget does
+command queues and the application's event source are refilled. A budget does
 not bound one native call or one event handler; long work belongs in a worker.
+
+### Fair dispatch
+
+Command work draws from several ports: the host's, and the port of every window
+the host holds that is not closing. They are ordered with the host's port first
+and then the windows' in registration order, and the host remembers the port
+its last attempt served. Each attempt claims the oldest command of the first
+port after that one, in cyclic order, that has a command queued. So:
+
+- **FIFO within a port.** A port's commands run in the order their admissions
+  committed. Nothing orders commands across ports.
+- **One budget.** A turn attempts at most `hostCommandBudget` commands across all
+  ports together, and a rejected attempt counts.
+- **No starvation.** No port is attempted twice while another port with a
+  command queued waits, however continuously the first is refilled.
+- **A service bound.** Let `P` be the most ports dispatched from while a command
+  waits, at most `1 + hostWindowLimit`, and `B` the budget. Each attempt on a
+  port is followed by at most `P - 1` attempts on other ports before that port's
+  next, so a command at position `k` of its port's queue when a turn's command
+  work begins — the oldest is position one — is attempted within `⌈k · P / B⌉`
+  turns' command work, counting that turn, assuming turns continue and every
+  dispatch returns. The oldest command of every port with one queued is
+  therefore attempted within `⌈P / B⌉` turns. A window created meanwhile takes
+  its place behind the host's port, which the creation just served, so it never
+  delays a port already waiting, and a closed window's port leaves the order.
+  This is a bound in turns, not a wall-clock deadline, and it is separate from
+  checkpoint reachability.
+
+The scheduler's only state is the cursor, so its bookkeeping stays bounded
+through creation, closure, and churn.
 
 ### Idle waits
 
@@ -952,28 +1155,41 @@ A close request is captured by the window's own callbacks and reconciled into
 its observation, as [Close requests](#close-requests) describes; the host adds no
 second callback owner. After reconciliation, a request the host has not surfaced
 before appears once in `turnCloseRequests`. The application decides:
-`rejectHostCloseRequest` clears it while it is still that window's latest, and
-leaving it latched is equally a decision. The loop ends only when `loopUpdate`
-answers `Finish`, so a close request — the last window's included — ends neither
-the loop nor the runtime and destroys nothing. The host supplies no default that
-finishes on a close request.
+`rejectHostCloseRequest` clears it while it is still that window's latest;
+`honourHostCloseRequest` begins that window's
+[close protocol](#dynamic-windows) while it is still the latest, answering
+`CloseRequestSuperseded` otherwise; and leaving it latched is equally a decision.
+A closing window's requests are not surfaced. The loop ends only when
+`loopUpdate` answers `Finish`, so a close request — the last window's included —
+ends neither the loop nor the runtime, and destroys nothing unless the
+application honours it. The host supplies no default that finishes on, or
+honours, a close request.
 
 ### Quiescence and shutdown order
 
 `quiesceWindowHost` is the host's quiescence action for
 [`runScopedApplicationWithQuiescence`](resources.md#quiescence), and
 `runWindowApplication` is that runner with the action installed. In one finite,
-non-retrying transaction it closes the command host's admission and settles
-every queued command as `NotExecuted`. It destroys nothing, pumps nothing, waits
-on nothing, and repeating it changes nothing. On every exit from the supervised
-region, the ordinary order is:
+non-retrying transaction it closes the admission of the host's port and of every
+window's port, and settles every command queued in any of them as `NotExecuted`.
+It destroys nothing, pumps nothing, waits on nothing, and repeating it changes
+nothing. On every exit from the supervised region, the ordinary order is:
 
-1. quiescence: admission closes and queued callers settle as not executed;
-2. supervision asks every live worker to stop and drains them, with the host
-   live;
-3. the dependency scope unwinds: the host closes admission again, a no-op after
-   quiescence, destroys its windows, and then ends the session if it owns it;
+1. quiescence: every port's admission closes and queued callers settle as not
+   executed;
+2. supervision asks every live worker to stop and drains them, with every window
+   still registered — closing ones included — live;
+3. the dependency scope unwinds: the host closes every port's admission again, a
+   no-op after quiescence; the collection's final exit releases each remaining
+   window exactly once, newest registration first, keeping every cleanup failure
+   — its latched ones included — under
+   [the failure table](resources.md#the-failure-table); and then the session ends
+   if the host owns it;
 4. the terminal report, if the run failed, and the final flush.
+
+A close queued behind quiescence settles as `NotExecuted`, and its window is
+disposed once, by the final exit. A window whose earlier retirement failed is
+not released again.
 
 The runtime's two earlier orderings are unchanged: a fatal latch may request
 worker stops before quiescence, and a worker whose managed startup is abandoned
@@ -1016,6 +1232,34 @@ only on the turn that delivered it, quiescence, and the shutdown order on
 startup failure, action return, failure, and cancellation, a
 supervisor-detected failure, and an abandoned managed startup.
 
+The dynamic window examples prove, over the same seam: the creation handoff —
+prepared `WindowCreated` data, capabilities readable only after settlement and
+after the initial observation, and a window port refused creation and other
+windows; capacity and configuration rejections before any native call; a failed
+construction rolled back with its native evidence and no consumed capacity; a
+rollback cleanup failure poisoning creation and surviving to final exit; an
+unawaited creation's window enumerable, live through the drain, and disposed at
+shutdown; a cancellation delivered from another thread during construction
+rolling it back with no registry entry and its capacity reclaimed, and one
+pending across registration delivered before publication, leaving the window
+registered and disposed; the middle of three
+windows closed while the others observe and execute; close orders A-B-C and
+C-A-B each disposing every window with callbacks detached before destruction;
+retained ports, borrows, closes, and readers of a disposed window answering
+typed terminal results with no native call; queued callers on a closing window
+settled as not executed after its earlier commands ran; retirement deferred by a
+borrow of the window and of another, with the closing phase and then the
+disposal published, a slow reader receiving the disposal before `EndOfStream`; a
+failed release latched as disposal failed, never retried, poisoning creation,
+and primary at final exit, and retained beside a failing body's own failure;
+bookkeeping bounded and identities never reissued across forty cycles of
+creation and an honoured native close request; shutdown with a window closing
+and closes racing it, every port closed before the drain and every window
+released once after it; and fair dispatch with a replenished, partly rejected
+port beside a waiting window port holding two commands and a host request,
+through closure and creation, each command within its documented bound and
+every turn within the budget.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
@@ -1044,8 +1288,13 @@ supervisor-detected failure, and an abandoned managed startup.
 | Completion cell | Its tickets | Settled once; tickets read | Settle: owner; read: any | While a ticket references it | Never reset |
 | Admission flag | The command host | Closure sets it; direct performance reads it | Owner | The host | Never cleared |
 | Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
-| Host session and windows | The window host | Construction creates them; the owner loop pumps and reconciles them | Owner | The host's scope | Windows destroyed, then an owned session ended, when the scope unwinds |
-| Surfaced close requests | The window host | The owner loop records the latest request surfaced per window | Owner | The host | Replaced by a newer request; never reset |
+| Release failure | The window | A failing release part sets it; the observation release reads it | Owner | The window | Read at release |
+| Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |
+| Window registry | The window host | Registration inserts; the close protocol marks closing; a retirement that succeeded or failed removes; ports, clients, and dispatch read | Write: owner; read: any | Registration until retirement | Emptied as windows retire; the collection's exit releases what remains |
+| Per-window command hosts | The window host, for each window | The window's port admits; the loop executes; the close protocol and quiescence close | Admit: any; execute and close: owner | Registration until the window is forgotten | Closed at the close protocol or quiescence; never reopened |
+| Borrow counts | The window host | `withHostWindow` and the loop's borrows raise and lower them; retirement reads them | Owner | The host | Each borrow drops its count on every exit |
+| Dispatch cursor | The window host | Each dispatch attempt writes the port it served | Owner | The host | Never reset; may name a retired window's port |
+| Surfaced close requests | The window host | The owner loop records the latest request surfaced per window | Owner | The host | Replaced by a newer request; removed when the window is forgotten |
 | Host activity | The window host | The owner loop writes it around each event step; clients read it | Write: owner; read: any | While referenced | Left at the last turn |
 
 The guard holds only occupancy and poison. None of this is application state.
@@ -1224,6 +1473,14 @@ The native examples cover:
   without destroying the only window, the loop and a worker still running two
   turns later, and the window released only after that worker drained, with the
   run returning normally;
+- dynamic windows through the real owner loop: three hidden windows created by a
+  worker's requests and closed in the orders B-A-C and C-A-B, each window still
+  open observing and executing through its own port after every close; a window
+  closed while a worker holds its port, which then answers closed while another
+  window executes; a real close request honoured by application policy through
+  the close protocol, leaving the other window open; and every remaining window,
+  a created one included, still open through the drain and disposed after it,
+  with the run returning normally and so retaining no cleanup failure;
 - in a private process, sessions entered and left in sequence, a real
   `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
   by a successful session, and a fault raised inside a real GLFW size callback,

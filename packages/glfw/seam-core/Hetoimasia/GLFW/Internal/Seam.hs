@@ -136,6 +136,7 @@ import Hetoimasia.GLFW.Internal.Command
   , CommandOrigin
   , CommandRejection
   , CommandResult
+  , Execution (..)
   , ExecutionStep (..)
   , WindowCommand
   , WindowCommandHost
@@ -571,7 +572,7 @@ seamExecuteNextScripted
   → IO ExecutionStep
 seamExecuteNextScripted seam host work = do
   requireSeamHost seam host
-  executeNextWith (pure ()) host work
+  executeNextWith (pure ()) host (\origin command → Completed <$> work origin command)
 
 -- | Refuse a host whose session was not entered over this seam's native table.
 requireSeamHost ∷ Seam → WindowCommandHost → IO ()

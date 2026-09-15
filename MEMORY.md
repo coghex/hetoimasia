@@ -336,6 +336,35 @@ not a verdict that Synarchy's design should be discarded.
   Xvfb exposes one 1280x1024 monitor; hotplug is model-tested, and the native
   hotplug example is pending unless `HETOIMASIA_MONITOR_HOTPLUG_SECONDS` is set.
   Contract: `docs/glfw.md`, "Monitors".
+- GLFW-9 (#95) made the host's windows dynamic. `WindowHost` owns them through
+  GLFW-10's `Collection` (limit `hostWindowLimit`, default 16, validated as
+  `WindowLimitRejected`); configured and created windows alike are members built
+  from `windowAssembly`, each with a private per-window `WindowCommandHost`
+  (`PortScope` `WindowScope`: creation and other windows are rejected at
+  execution, costing budget). `hostWindows` was removed: `withHostWindow` lends a
+  window, `hostWindowIdentities`/`hostWindowClient` enumerate. Commands gained
+  `createWindowCommand`/`closeWindowCommand`; `commandWindow` and
+  `submittedWindow` are now `Maybe`. A completion cell holds a `Settlement`: the
+  prepared disposition plus, beside it, a created window's `WindowClient` (port
+  and reader), read with `pollWindowClient`. The close protocol (command,
+  `closeHostWindow`, `honourHostCloseRequest`) closes the window's port and
+  settles its queue in one transaction, publishes `WindowClosing`, and retires
+  unless a borrow is in progress (retried at turn step 3); a failed release is
+  forgotten, never retried, and latched by the collection. `WindowPhase` gained
+  `WindowClosing` and `WindowDisposalFailed` (a part failed but release stayed
+  certain), so a lexical window whose detach reports an error now ends
+  `WindowDisposalFailed`. Dispatch is round-robin from a cursor over the host
+  port then window ports; a command at queue position `k` is attempted within
+  `⌈k·P/B⌉` turns. Quiescence closes every port. Registration uses the
+  collection's additive `acquireMemberThen`: construction runs with the caller's
+  masking state (so an external cancellation rolls it back), and the host's
+  registry insertion is the masked handoff. The closing commit and the
+  `WindowClosing` publication share one STM transaction. The implementation lives
+  in the private `runtime-glfw-core` (`Hetoimasia.Runtime.GLFW.Internal`, with
+  test-only `HostHooks`); the public module re-exports it.
+  Examples catching cleanup evidence must catch inside `asProcessMainThread`,
+  because `runInBoundThread` drops exception context. Contract: `docs/glfw.md`,
+  "Dynamic windows" and "Fair dispatch".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

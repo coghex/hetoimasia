@@ -64,6 +64,7 @@ import Hetoimasia.Foundation.Resource.Collection
   , MemberStatus (..)
   , Retirement (..)
   , acquireMember
+  , acquireMemberThen
   , allocCollection
   , liveMemberCount
   , memberStatus
@@ -97,6 +98,12 @@ spec = do
       (boundedExample testCancelledDuringAssembly)
     it "registers a member whose acquisition returns with a cancellation pending, and releases it at exit"
       (boundedExample testCancellationPendingAtRegistration)
+    it "rolls back a member cancelled during its assembly before its handoff runs"
+      (boundedExample testHandoffCancelledDuringAssembly)
+    it "runs the handoff masked in the registering step, delivering a pending cancellation only after it"
+      (boundedExample testHandoffBeforePendingCancellation)
+    it "keeps a member registered when its handoff raises, releasing it at exit"
+      testHandoffFailure
 
   describe "Resource collection borrowing and retirement" $ do
     it "retires a middle member while its neighbours stay live"
@@ -424,6 +431,86 @@ testCancellationPendingAtRegistration = do
                    , "release earlier"
                    ]
       occurrences "release pending" performed `shouldBe` 1
+
+testHandoffCancelledDuringAssembly ∷ Expectation
+testHandoffCancelledDuringAssembly = do
+  events ← newTrail
+  reached ← newEmptyMVar
+  blocker ← newEmptyMVar
+  (owner, outcome) ← forkOwner $
+    withScoped (allocCollection 2) $ \collection → do
+      _ ← acquireMember collection (tracked events "earlier")
+      acquireMemberThen
+        collection
+        ( do
+            _ ← tracked events "cancelled"
+            restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+        )
+        (\_ → record events "handoff")
+  takeMVar reached
+  killThread owner
+  takeMVar outcome >>= \case
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      fromException propagated `shouldBe` Just ThreadKilled
+      trail events
+        `shouldReturn` [ "acquire earlier"
+                       , "acquire cancelled"
+                       , "release cancelled"
+                       , "release earlier"
+                       ]
+
+testHandoffBeforePendingCancellation ∷ Expectation
+testHandoffBeforePendingCancellation = do
+  events ← newTrail
+  handing ← newEmptyMVar
+  killerSlot ← newEmptyMVar
+  neverFilled ← newEmptyMVar
+  masking ← newEmptyMVar
+  (owner, outcome) ← forkOwner $
+    withScoped (allocCollection 2) $ \collection → do
+      _ ←
+        acquireMemberThen collection (tracked events "pending") $ \member → do
+          getMaskingState >>= putMVar masking
+          record events "handoff"
+          putMVar handing ()
+          -- Waiting for the killer is itself uninterruptible; the check that its
+          -- cancellation is pending is not a blocking operation.
+          uninterruptibleMask_ (readMVar killerSlot) >>= awaitPendingThrow
+          liveMemberCount collection >>= record events . ("handoff saw " <>) . Text.pack . show
+          withMember collection member (record events . ("handoff borrowed " <>))
+      -- Not reached: the pending cancellation is delivered once the handoff
+      -- returns and the acquisition restores the caller's masking state.
+      record events "body resumed"
+      takeMVar neverFilled
+  takeMVar handing
+  killer ← forkIO (throwTo owner ThreadKilled)
+  putMVar killerSlot killer
+  takeMVar outcome >>= \case
+    Right () → expectationFailure "expected the cancellation to propagate"
+    Left propagated → do
+      fromException propagated `shouldBe` Just ThreadKilled
+      takeMVar masking `shouldReturn` MaskedInterruptible
+      trail events
+        `shouldReturn` [ "acquire pending"
+                       , "handoff"
+                       , "handoff saw 1"
+                       , "handoff borrowed pending"
+                       , "release pending"
+                       ]
+
+testHandoffFailure ∷ Expectation
+testHandoffFailure = do
+  events ← newTrail
+  outcome ←
+    try . withScoped (allocCollection 2) $ \collection → do
+      _ ← acquireMemberThen collection (tracked events "kept") (\_ → throwIO (ErrorCall "handoff failed") ∷ IO ())
+      liveMemberCount collection >>= record events . ("live after " <>) . Text.pack . show
+  case outcome of
+    Right () → expectationFailure "expected the handoff's failure to propagate"
+    Left (ErrorCall message) → message `shouldBe` "handoff failed"
+  -- The failure left the body before its count; the member was released at exit.
+  trail events `shouldReturn` ["acquire kept", "release kept"]
 
 -- Borrowing and retirement ---------------------------------------------------
 

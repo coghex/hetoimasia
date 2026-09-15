@@ -185,7 +185,7 @@ testOriginSurvives = withCommands defaultScript 2 $ \seam host window → do
   (origin, received) ← readIORef claimed >>= maybe (unexpected "nothing was executed") pure
   origin `shouldBe` ticketOrigin ticket
   received `shouldBe` command
-  submittedWindow origin `shouldBe` windowIdentity window
+  submittedWindow origin `shouldBe` Just (windowIdentity window)
   requestLocalIdentity (submittedRequest origin) `shouldBe` 1
   submittedContext origin `shouldBe` context
   fmap (sourceFunction . siteLocation) (submittedAt origin) `shouldBe` Just "submitWindowCommand"

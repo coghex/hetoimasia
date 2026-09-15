@@ -17,8 +17,11 @@ window commands through bounded ports and reports each through a persistent
 completion ticket. The public `runtime-glfw` sublibrary's
 `Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
 runs its supervised owner loop, which processes native events, drains those
-ports, refreshes the monitor inventory when monitors change, and surfaces close
-requests to application policy. There is no input
+ports fairly, refreshes the monitor inventory when monitors change, and surfaces
+close requests to application policy. The host owns its windows through a scoped
+collection: applications create windows while running, receive each one's own
+command port and observations, and close them independently in any order
+through the host's close protocol. There is no input
 operation yet.
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
