@@ -17,34 +17,37 @@
 
 #include <stdatomic.h>
 
-/* The probed wait's state: 0 outside it, 1 inside it, 2 inside it after a
- * progress note. Only the wait enters and leaves it, and a note moves 1 to 2
- * in one compare-and-swap, so a note counts only if it landed strictly between
- * the wait's entry and its return. */
-static atomic_int probed_wait_state = 0;
-
-int hetoimasia_glfw_wait_events_probed_for_check(double timeout)
-{
-    atomic_store(&probed_wait_state, 1);
-    glfwWaitEventsTimeout(timeout);
-    return atomic_exchange(&probed_wait_state, 0) == 2;
-}
-
-int hetoimasia_glfw_note_progress_for_check(void)
-{
-    int inside = 1;
-    if (!atomic_compare_exchange_strong(&probed_wait_state, &inside, 2))
-        return 0;
-    glfwPostEmptyEvent();
-    return 1;
-}
+/* Platform facts the wait's observation needs: which OS thread is waiting, and
+ * whether that thread is blocked in the kernel. Defined per platform below. */
+static void record_waiting_thread(void);
+static int waiting_thread_blocked(void);
 
 #if defined(__APPLE__)
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
+#include <mach/mach.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+
+static atomic_uint waiting_thread = MACH_PORT_NULL;
+
+static void record_waiting_thread(void)
+{
+    atomic_store(&waiting_thread, pthread_mach_thread_np(pthread_self()));
+}
+
+/* Blocked, not merely descheduled: the kernel reports the thread waiting. */
+static int waiting_thread_blocked(void)
+{
+    mach_port_t thread = atomic_load(&waiting_thread);
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread == MACH_PORT_NULL
+        || thread_info(thread, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS)
+        return 0;
+    return info.run_state == TH_STATE_WAITING;
+}
 
 int hetoimasia_glfw_is_process_main_thread(void)
 {
@@ -64,9 +67,34 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
 #include <dlfcn.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+static atomic_int waiting_thread = 0;
+
+static void record_waiting_thread(void)
+{
+    atomic_store(&waiting_thread, (int) syscall(SYS_gettid));
+}
+
+/* Blocked in an interruptible sleep, as poll(2) inside GLFW's wait is: the
+ * state letter that follows the parenthesized command name is S. */
+static int waiting_thread_blocked(void)
+{
+    char path[64];
+    char stat[512];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", atomic_load(&waiting_thread));
+    FILE* file = fopen(path, "r");
+    if (file == NULL)
+        return 0;
+    size_t length = fread(stat, 1, sizeof stat - 1, file);
+    fclose(file);
+    stat[length] = '\0';
+    char* name_end = strrchr(stat, ')');
+    return name_end != NULL && name_end[1] == ' ' && name_end[2] == 'S';
+}
 
 /* The initial thread's kernel thread id is the process id. */
 int hetoimasia_glfw_is_process_main_thread(void)
@@ -111,9 +139,62 @@ int hetoimasia_glfw_is_process_main_thread(void)
     return 0;
 }
 
+static void record_waiting_thread(void)
+{
+}
+
+static int waiting_thread_blocked(void)
+{
+    return 0;
+}
+
 void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 {
     (void) window;
 }
 
 #endif
+
+/* The production finite event wait, and what the native examples may observe
+ * of it.
+ *
+ * wait_sequence is odd while an owner is inside this call and even otherwise,
+ * so each wait has its own odd number. A progress note names the wait it landed
+ * in, and the wait reports, as it returns, whether a note named it. Nothing here
+ * changes what GLFW does, and the production path never reads the note. */
+static atomic_ulong wait_sequence = 0;
+static atomic_ulong noted_wait = 0;
+static atomic_int last_wait_noted = 0;
+
+void hetoimasia_glfw_wait_events_timeout(double timeout)
+{
+    record_waiting_thread();
+    unsigned long entered = atomic_fetch_add(&wait_sequence, 1) + 1;
+    glfwWaitEventsTimeout(timeout);
+    atomic_fetch_add(&wait_sequence, 1);
+    atomic_store(&last_wait_noted, atomic_exchange(&noted_wait, 0) == entered);
+}
+
+/* A note lands only when the same wait's odd sequence number is read on both
+ * sides of observing the waiting thread blocked in the kernel. The shim does no
+ * blocking work before calling glfwWaitEventsTimeout, so that thread is blocked
+ * inside GLFW's own wait, not in the call's entry. A stale note left by a wait
+ * that has already returned is overwritten. */
+int hetoimasia_glfw_note_progress_for_check(void)
+{
+    unsigned long sequence = atomic_load(&wait_sequence);
+    if ((sequence & 1) == 0 || !waiting_thread_blocked() || atomic_load(&wait_sequence) != sequence)
+        return 0;
+    unsigned long seen = atomic_load(&noted_wait);
+    while (seen != sequence)
+        if (atomic_compare_exchange_weak(&noted_wait, &seen, sequence)) {
+            glfwPostEmptyEvent();
+            return 1;
+        }
+    return 0;
+}
+
+int hetoimasia_glfw_take_wait_noted_for_check(void)
+{
+    return atomic_exchange(&last_wait_noted, 0);
+}

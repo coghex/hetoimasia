@@ -55,11 +55,14 @@
 -- polls; an idle turn waits at most 'hostIdleWait' seconds for a native event,
 -- so a checkpoint follows even when no native input arrives. No wait is
 -- indefinite, and a host with no windows waits on each idle turn rather than
--- spinning. The bound is a latency, not a shutdown deadline. A command
--- submitted during a wait is served by the turn after it: there is no
--- wake-on-post. Native waits are safe foreign calls, so background workers run
--- while the owner is inside one; 'hostActivity' reports the turn and whether its
--- owner is waiting.
+-- spinning. The bound is a latency, not a shutdown deadline. There is no
+-- wake-on-post: a command submitted during a wait waits for the wait to end, and
+-- the same turn's command work then serves it. Native waits are safe foreign
+-- calls, so background workers run while the owner is inside one.
+-- 'hostActivity' reports the turn and whether its owner has begun its finite
+-- wait: the flag is set immediately before the native call and cleared once it
+-- returns, so it is a hint that a wait is starting or in progress, not proof that
+-- the call has been entered.
 --
 -- = Close requests
 --
@@ -326,7 +329,8 @@ data HostActivity = HostActivity
   { activityTurn ∷ !Natural
     -- ^ The turn whose event step last began; zero before the first.
   , activityWaiting ∷ !Bool
-    -- ^ Whether the owner is inside that turn's finite native wait.
+    -- ^ Whether the owner has begun that turn's finite native wait: set
+    -- immediately before the native call and cleared once it returns.
   }
   deriving (Eq, Show)
 

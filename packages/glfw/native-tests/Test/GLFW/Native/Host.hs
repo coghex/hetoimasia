@@ -8,26 +8,21 @@
 -- owning it: its release closes admission and destroys its own window, and the
 -- fixture keeps the session. No example sleeps; a worker coordinates with the
 -- loop through STM, and every loop is bounded in turns.
---
--- 'nativeWaitScenario' needs a session over a native table of its own, so
--- "Test.GLFW.Native.Private" runs it in a child process.
-module Test.GLFW.Native.Host (spec, nativeWaitScenario) where
+module Test.GLFW.Native.Host (spec) where
 
 import Control.Concurrent (yield)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVarIO, retry, writeTVar)
-import Control.Monad (unless, when)
+import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
+import Control.Monad (when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (allocComposite, allocResource)
+import Hetoimasia.Foundation.Resource (allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import Hetoimasia.GLFW.Command
-import Hetoimasia.GLFW.Internal.Native (noteProgressForCheck, productionNative, requestCloseForCheck, waitEventsProbedForCheck)
-import Hetoimasia.GLFW.Internal.Session (Native (..), sessionAssembly)
+import Hetoimasia.GLFW.Internal.Native (noteProgressForCheck, requestCloseForCheck, takeWaitNotedForCheck)
 import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
-import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
@@ -78,6 +73,32 @@ spec shared = describe "window host" $ do
       Just (Performed (ObservationPublished published publishedRevision)) →
         published == window && publishedRevision <= revision
       _ → False
+
+  it "lets a supervised worker progress while the owner is blocked inside the production native wait" $ do
+    waits ←
+      owned shared $ \session → do
+        confirmed ← newTVarIO False
+        waited ← newIORef (0 ∷ Int)
+        runWindowApplication lifetime "native host" (allocWindowHostIn (pure session) (settings "waiting") {hostIdleWait = 1}) id
+          (\host control → startSupervised control (required Service) (notingInsideWait host confirmed) >>= expectStarted >> pure host)
+          ( \host control →
+              runOwnerLoop host control $
+                LoopHooks
+                  { loopEvent = noApplicationEvents
+                  , loopUpdate = \turn → do
+                      noted ←
+                        if turnWaited turn
+                          then modifyIORef' waited (+ 1) >> takeWaitNotedForCheck
+                          else pure False
+                      if noted
+                        then atomically (writeTVar confirmed True) >> Finish <$> readIORef waited
+                        else
+                          if turnNumber turn >= turnBound
+                            then failed "no progress landed inside a production native wait within the turn bound"
+                            else pure Continue
+                  }
+          )
+    waits `shouldSatisfy` (>= 1)
 
   it "surfaces a real native close request to application policy without destroying the window, keeps the runtime running, and releases the host only after the drain" $ do
     (request, window, (endedAtSurface, phaseAtSurface, liveAfter), releasedWhileLive, endedAfter, finalPhase) ←
@@ -160,61 +181,22 @@ observer host window result =
       observation ← readSnapshot (windowObservations window)
       pure (Just disposition, observedRevision (preparedValue (observedValue observation)))
 
--- | The private-session scenario: a host over a session whose native table
--- probes its finite wait in C, and a supervised worker that may record progress
--- only while the owner is inside that native call.
---
--- The worker learns from 'hostActivity' that a wait is about to begin, then
--- tries 'noteProgressForCheck', which succeeds only in a compare-and-swap made
--- between the wait's entry into C and its return, and wakes the wait. The loop
--- finishes once a wait reports such a note. The suite runs on one capability,
--- so a native wait that kept its capability would leave the worker unable to run
--- until the wait had returned, and no note could ever land inside it.
-nativeWaitScenario ∷ IO String
-nativeWaitScenario = do
-  outcomes ← newIORef []
-  let probed =
-        productionNative
-          { nativeWaitEventsTimeout = \seconds →
-              waitEventsProbedForCheck seconds >>= \noted → modifyIORef' outcomes (<> [noted])
-          }
-  waits ←
-    runWindowApplication
-      lifetime
-      "native wait"
-      (allocWindowHostIn (allocComposite (sessionAssembly probed defaultSessionConfig)) (settings "waiting") {hostIdleWait = 1})
-      id
-      (\host control → startSupervised control (required Service) (notingInsideWait host) >>= expectStarted >> pure host)
-      ( \host control →
-          runOwnerLoop host control $
-            LoopHooks
-              { loopEvent = noApplicationEvents
-              , loopUpdate = \turn → do
-                  recorded ← readIORef outcomes
-                  if or recorded
-                    then pure (Finish recorded)
-                    else
-                      if turnNumber turn >= turnBound
-                        then failed "no worker progress landed inside a native wait within the turn bound"
-                        else pure Continue
-              }
-      )
-  pure ("progress landed inside native wait " <> show (length (takeWhile not waits) + 1) <> " of " <> show (length waits))
-
--- | A service that, whenever the owner is about to wait or waiting, tries to
--- record progress inside the native wait until one attempt lands, then runs
--- until stopped. Every wait is composed with its stop request.
-notingInsideWait ∷ WindowHost → WorkerDefinition ()
-notingInsideWait host =
+-- | A service that, whenever the owner has begun or is about to begin a finite
+-- wait, tries to record progress inside it until the owner confirms that a note
+-- landed, then runs until stopped. Every wait is composed with its stop request.
+notingInsideWait ∷ WindowHost → TVar Bool → WorkerDefinition ()
+notingInsideWait host confirmed =
   workerDefinition "noting" (\_ → pure ()) $ \token () →
     let attempt = do
-          stopping ←
+          next ←
             atomically $
-              (True <$ awaitStopRequest token)
-                `orElse` (False <$ (hostActivity host >>= check . activityWaiting))
-          unless stopping $ do
-            noted ← noteProgressForCheck
-            if noted then untilStopped token else yield >> attempt
+              (Nothing <$ awaitStopRequest token)
+                `orElse` (Just True <$ (readTVar confirmed >>= check))
+                `orElse` (Just False <$ (hostActivity host >>= check . activityWaiting))
+          case next of
+            Nothing → pure ()
+            Just True → untilStopped token
+            Just False → noteProgressForCheck >> yield >> attempt
      in attempt
 
 -- | A service that runs until stopped, and records at its release whether its
@@ -257,8 +239,8 @@ isLive ∷ WorkerStatus → Bool
 isLive WorkerLive = True
 isLive _ = False
 
--- | The most turns an example waits for what it is waiting on: about thirty
--- seconds at the 0.1-second idle bound, and bounded by the one-second bound in
--- the wait scenario, whose successful note wakes the wait at once.
+-- | The most turns an example waits for what it is waiting on. Idle turns wait at
+-- most 0.1 seconds, or one second in the wait example, whose landed note wakes
+-- the wait at once.
 turnBound ∷ Natural
 turnBound = 300

@@ -20,13 +20,18 @@ int hetoimasia_glfw_is_process_main_thread(void);
  * callback and destroys nothing. Call it on the session's owner thread. */
 void hetoimasia_glfw_request_close_for_check(GLFWwindow* window);
 
-/* glfwWaitEventsTimeout, bracketed for the native examples only: non-zero when
- * hetoimasia_glfw_note_progress_for_check succeeded while this call was inside
- * the wait. Call it on the session's owner thread. */
-int hetoimasia_glfw_wait_events_probed_for_check(double timeout);
+/* The production finite event wait: glfwWaitEventsTimeout, recording which OS
+ * thread waits and a sequence number for each wait, which only the native
+ * examples read. Call it on the session's owner thread. */
+void hetoimasia_glfw_wait_events_timeout(double timeout);
 
-/* Record progress only while the owner is inside the probed wait, and wake that
- * wait; non-zero when it did. Any thread may call it during a session. */
+/* For the native examples only: record progress in the wait in progress, only
+ * while its thread is blocked inside GLFW's wait, and wake that wait. Non-zero
+ * when a note landed. Any thread may call it during a session. */
 int hetoimasia_glfw_note_progress_for_check(void);
+
+/* For the native examples only: whether a progress note landed in the most
+ * recent wait to return, cleared by reading it. */
+int hetoimasia_glfw_take_wait_noted_for_check(void);
 
 #endif

@@ -13,8 +13,9 @@
 -- destroys the window: what it means is the application's decision.
 --
 -- Callbacks only record. Their captures are reconciled on the owner thread at
--- an owner boundary — creation, and 'synchronizeWindow' — and a fault raised
--- inside a callback is rethrown there. When the scope ends, callbacks are
+-- an owner boundary — creation, 'synchronizeWindow', and the window host's
+-- owner loop in "Hetoimasia.Runtime.GLFW" after each poll or finite wait — and
+-- a fault raised inside a callback is rethrown there. When the scope ends, callbacks are
 -- detached, the native window is destroyed, and the snapshot is closed holding
 -- the terminal observation. The handle is then terminal: 'synchronizeWindow'
 -- answers 'WindowEnded' without a native call, and the session can create

@@ -2,9 +2,8 @@
 --
 -- GLFW allows one session per process, and the shared fixture holds that one
 -- for the whole run, so entering and leaving sessions in sequence, a forced
--- initialization failure and its rollback, a session over a faulting native
--- table, and a window host over a native table whose wait is probed each need a
--- process of their own. Each example here starts this same
+-- initialization failure and its rollback, and a session over a faulting native
+-- table each need a process of their own. Each example here starts this same
 -- executable as a child with 'privateSessionFlag' and a scenario name; the
 -- child runs that scenario's checks in order on its own process main thread,
 -- prints one line per check, and exits non-zero if any failed. A dry run or a
@@ -45,7 +44,6 @@ import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Process (readProcessWithExitCode)
-import Test.GLFW.Native.Host (nativeWaitScenario)
 import Test.GLFW.Native.Support (hostBackend)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldContain)
 
@@ -60,9 +58,6 @@ spec = describe "private sessions in a child process" $ do
 
   it "rethrows a fault raised inside a real native callback at the owner boundary" $
     privateScenario "callback-fault"
-
-  it "lets a supervised worker progress strictly inside the window host's real native wait" $
-    privateScenario "host-native-wait"
 
 privateScenario ∷ String → IO ()
 privateScenario name = do
@@ -99,9 +94,6 @@ scenarios =
     )
   , ( "callback-fault"
     , [("rethrows a fault raised inside a real native callback at the owner boundary", callbackFault)]
-    )
-  , ( "host-native-wait"
-    , [("lets a supervised worker progress strictly inside the window host's real native wait", nativeWaitScenario)]
     )
   ]
 

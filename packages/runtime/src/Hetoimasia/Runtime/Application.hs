@@ -105,7 +105,9 @@
 -- all run on the thread that called the runner. Nothing forks the action to
 -- race it against a monitor, and nothing promises to interrupt arbitrary 'IO': a
 -- worker failure reaches the application at a checkpoint or a supervised
--- wait. This keeps the process main thread for a future windowing owner.
+-- wait. This keeps the process main thread for a windowing owner, such as the
+-- window host's owner loop in @hetoimasia-glfw@'s @runtime-glfw@ sublibrary,
+-- which the action runs there.
 --
 -- __Outcomes.__
 --

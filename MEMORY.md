@@ -244,7 +244,8 @@ not a verdict that Synarchy's design should be discarded.
   `WindowObservation` through a snapshot (separate logical, framebuffer, scale,
   placement; `Unavailable` for a `GLFW_FEATURE_UNAVAILABLE`-only query). Nine
   callbacks are contained at the trampoline and reconciled at owner boundaries
-  (creation, `synchronizeWindow`, the private `windowStep`), where a latched
+  (creation, `synchronizeWindow`, the private `windowStep`, and since GLFW-3
+  the owner loop's `reconcileWindowEvents` after each poll or wait), where a latched
   fault is rethrown with `window callback` context; close requests latch with
   per-window numbers and never destroy. Release: mark terminal and detach, then
   destroy, then free storage only if certain (else keep it and poison the

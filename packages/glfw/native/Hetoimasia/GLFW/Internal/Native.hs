@@ -6,7 +6,10 @@
 -- constant is imported through @hetoimasia_glfw.h@, which includes the
 -- installed @GLFW/glfw3.h@, so the C compiler checks each declaration and every
 -- constant's value comes from the header rather than from a copied number. The
--- exceptions are @glfwSetErrorCallback@ and the window callback setters,
+-- production finite event wait is made through the shim's
+-- @hetoimasia_glfw_wait_events_timeout@, which records the waiting thread and a
+-- per-wait sequence number for the native examples, then calls
+-- @glfwWaitEventsTimeout@. The exceptions to CAPI imports are @glfwSetErrorCallback@ and the window callback setters,
 -- imported with @ccall@: their argument is a function pointer whose C type the
 -- CAPI wrapper cannot spell, and it is passed and returned as a plain pointer.
 --
@@ -28,8 +31,8 @@ module Hetoimasia.GLFW.Internal.Native
   , pollEventsForCheck
   , waitEventsForCheck
   , requestCloseForCheck
-  , waitEventsProbedForCheck
   , noteProgressForCheck
+  , takeWaitNotedForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
   ) where
@@ -96,7 +99,7 @@ productionNative =
     , nativeWindowAttribute = \window attribute →
         (/= glfwFalse) <$> c_glfwGetWindowAttrib window (attributeCode attribute)
     , nativePollEvents = c_glfwPollEvents
-    , nativeWaitEventsTimeout = c_glfwWaitEventsTimeout . CDouble
+    , nativeWaitEventsTimeout = c_waitEventsTimeout . CDouble
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     }
 
@@ -222,17 +225,16 @@ waitEventsForCheck seconds = c_glfwWaitEventsTimeout (CDouble seconds)
 requestCloseForCheck ∷ Ptr NativeWindow → IO ()
 requestCloseForCheck = c_requestCloseForCheck
 
--- | 'waitEventsForCheck', bracketed in C for the native examples only: 'True'
--- when 'noteProgressForCheck' succeeded strictly between the wait's entry into
--- C and its return.
-waitEventsProbedForCheck ∷ Double → IO Bool
-waitEventsProbedForCheck seconds = (/= 0) <$> c_waitEventsProbedForCheck (CDouble seconds)
-
--- | Record progress only while the owner is inside 'waitEventsProbedForCheck',
--- and wake that wait with an empty event, for the native examples only. 'False'
--- when no probed wait was in progress.
+-- | Record progress in the production finite wait in progress, only while the
+-- thread making it is blocked inside GLFW's wait, and wake that wait with an
+-- empty event, for the native examples only. 'False' when no note landed.
 noteProgressForCheck ∷ IO Bool
 noteProgressForCheck = (/= 0) <$> c_noteProgressForCheck
+
+-- | Whether a 'noteProgressForCheck' landed in the most recent production wait
+-- to return, cleared by reading it, for the native examples only.
+takeWaitNotedForCheck ∷ IO Bool
+takeWaitNotedForCheck = (/= 0) <$> c_takeWaitNotedForCheck
 
 -- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
@@ -254,11 +256,16 @@ foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_is_process_main_th
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_request_close_for_check"
   c_requestCloseForCheck ∷ Ptr NativeWindow → IO ()
 
-foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wait_events_probed_for_check"
-  c_waitEventsProbedForCheck ∷ CDouble → IO CInt
+-- The production finite wait goes through the shim, which records what the
+-- native examples observe of it and then calls glfwWaitEventsTimeout.
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wait_events_timeout"
+  c_waitEventsTimeout ∷ CDouble → IO ()
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_progress_for_check"
   c_noteProgressForCheck ∷ IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_take_wait_noted_for_check"
+  c_takeWaitNotedForCheck ∷ IO CInt
 
 foreign import capi safe "hetoimasia_glfw.h glfwPlatformSupported"
   c_glfwPlatformSupported ∷ CInt → IO CInt

@@ -325,8 +325,9 @@ Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwDestroyWindow`, `glfwGetWindowSize`, `glfwGetFramebufferSize`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, and close callback setters. `glfwSetWindowSize` and `glfwPollEvents`
-are bound for the native examples only; no production path calls them.
+refresh, and close callback setters, and the owner loop's `glfwPollEvents` and
+`glfwWaitEventsTimeout`. `glfwSetWindowSize` and `glfwPostEmptyEvent` are called
+for the native examples only; no production path calls them.
 
 - Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
   installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
@@ -336,7 +337,15 @@ are bound for the native examples only; no production path calls them.
 - Every GLFW import is `safe`. Any of them may re-enter Haskell through the
   error callback, and a safe call lets other Haskell threads run while it is in
   C. The thread-identity shim calls nothing and is `unsafe`.
-- The C shim holds no state, queue, or game logic.
+- The production finite wait is made through the shim's
+  `hetoimasia_glfw_wait_events_timeout`, a `safe` import that records the
+  waiting OS thread and gives each wait an odd sequence number, then calls
+  `glfwWaitEventsTimeout`. That observation is the shim's only state, and no
+  production path reads it: the native examples' progress note lands only when
+  the same wait's sequence number surrounds a kernel report that the waiting
+  thread is blocked — `TH_STATE_WAITING` on macOS, state `S` in
+  `/proc/self/task/<tid>/stat` on Linux — so it lands only inside GLFW's own
+  wait. The shim holds no queue or game logic.
 
 The window callback setters are `ccall` imports for the same reason. Each
 callback wrapper only drops the window pointer and calls the model's callback,
@@ -725,10 +734,13 @@ application event, and no command is queued at its entry. Active turns poll.
 Idle turns wait at most `hostIdleWait` seconds, so a checkpoint follows even when
 no native input arrives. No wait is indefinite, a host with no windows waits on
 each idle turn instead of spinning, and the bound is a latency rather than a
-shutdown deadline. There is no wake-on-post: a command submitted during a wait
-is served by the next turn. Native waits are safe foreign calls, so background
-workers run while the owner waits, and `hostActivity` publishes the current turn
-and whether its owner is inside the wait.
+shutdown deadline. There is no wake-on-post: a command
+submitted during a wait waits for the wait to end, and the same turn's command
+work then serves it. Native waits are safe foreign calls, so background workers
+run while the owner is inside one. `hostActivity` publishes the current turn and
+whether its owner has begun its finite wait; the flag is set immediately before
+the native call and cleared once it returns, so it signals a wait starting or in
+progress rather than proving the call was entered.
 
 ### Close requests in the owner loop
 
@@ -930,7 +942,7 @@ test environment.
 | Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
 | Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and a window host over a native table whose wait is probed cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. |
 | Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
@@ -960,6 +972,12 @@ The native examples cover:
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;
+- a supervised worker progressing while the owner is blocked inside the
+  production `glfwWaitEventsTimeout`: the worker's progress note lands only
+  inside GLFW's own wait, as [the binding](#the-binding) describes, and wakes
+  it with `glfwPostEmptyEvent`, and the loop reads back that a note landed in
+  the wait it just returned from. On the suite's single capability, a wait that
+  kept its capability would let no note land;
 - a real close request — `performClose:` on Cocoa, a `WM_DELETE_WINDOW` client
   message on X11, sent by a test-only shim driver — reaching application policy
   without destroying the only window, the loop and a worker still running two
@@ -973,14 +991,7 @@ The native examples cover:
   X11 delivers it after a round trip to the server, so later boundaries wait
   for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
   within a bound of 100 boundaries of at most 50 ms — until the fault is
-  rethrown;
-- in a private process, a supervised worker progressing strictly inside the
-  window host's real native wait. The session's native table brackets
-  `glfwWaitEventsTimeout` in a test-only shim function, and the worker's
-  progress note is a compare-and-swap that succeeds only between that call's
-  entry into C and its return, then wakes the wait with `glfwPostEmptyEvent`.
-  On the suite's single capability, a wait that kept its capability would let
-  no note land inside it.
+  rethrown.
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct
