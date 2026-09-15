@@ -861,20 +861,28 @@ produceButton feed button action modifiers = do
 -- | Begin the overflow reset because native staging overflowed, without
 -- presenting an event to the channel. @lost@ is the exact number of staged
 -- and unstaged callbacks that were never admitted: the discarded prefix plus
--- every callback that arrived after the loss latch. The protocol is the same
--- as a full send. Already resetting or closed feeds do not begin another
--- episode; while resetting, @lost@ is counted as suppressed.
-resetFromStagingOverflow ∷ InputFeed → Natural → IO Production
-resetFromStagingOverflow feed lost = atomically $ do
+-- every callback that arrived after the loss latch. @focus@ is the coalesced
+-- focus flag from the same capture, applied in this transaction so the gate
+-- stays current without counting a second event. Already resetting or closed
+-- feeds do not begin another episode; while resetting, @lost@ is counted as
+-- suppressed.
+resetFromStagingOverflow ∷ InputFeed → Natural → Maybe Bool → IO Production
+resetFromStagingOverflow feed lost focus = atomically $ do
   state ← readTVar (feedState feed)
-  case statePhase state of
+  let gated = withFocus focus state
+  case statePhase gated of
     InputFeedClosed → pure ProductionClosed
-    InputRunning → ProductionOverflowed . tokenOf feed <$> beginReset feed InputOverflowed lost state
+    InputRunning → ProductionOverflowed . tokenOf feed <$> beginReset feed InputOverflowed lost gated
     _ → do
       writeTVar (feedState feed) $
         modifyCounters (\counts → counts {countSuppressed = countSuppressed counts + lost}) $
-          state {stateEpisode = (\summary → summary {summarySuppressed = summarySuppressed summary + lost}) <$> stateEpisode state}
+          gated {stateEpisode = (\summary → summary {summarySuppressed = summarySuppressed summary + lost}) <$> stateEpisode gated}
       pure ProductionSuppressed
+  where
+    withFocus update current = case update of
+      Nothing → current
+      Just True → current {stateFocused = True}
+      Just False → current {stateFocused = False, stateHeldKeys = IntSet.empty, stateHeldButtons = IntSet.empty}
 
 -- | The admission transaction. 'Nothing' when the running epoch is no longer the
 -- one the event was prepared for.

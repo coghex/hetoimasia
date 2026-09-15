@@ -58,6 +58,8 @@ module Hetoimasia.GLFW.Internal.Native
   , injectCursorEnterForCheck
   , injectScrollForCheck
   , injectFocusForCheck
+  , inputCallbacksClearedForCheck
+  , takeInputCallbacksClearedForCheck
   ) where
 
 import Control.Exception (onException)
@@ -119,7 +121,9 @@ productionNative =
     , nativeResetWindowHints = c_glfwDefaultWindowHints
     , nativeSetWindowHint = setWindowHint
     , nativeCreateWindow = createWindow
-    , nativeDestroyWindow = c_glfwDestroyWindow
+    , nativeDestroyWindow = \window → do
+        c_noteInputCallbacksBeforeDestroy window
+        c_glfwDestroyWindow window
     , nativeNewWindowCallbacks = newWindowCallbacks
     , nativeAttachWindowCallbacks = attachWindowCallbacks
     , nativeDetachWindowCallbacks = detachWindowCallbacks
@@ -746,6 +750,21 @@ injectScrollForCheck window x y = c_injectScrollForCheck window (CDouble x) (CDo
 
 injectFocusForCheck ∷ Ptr NativeWindow → Bool → IO ()
 injectFocusForCheck window focused = c_injectFocusForCheck window (boolean focused)
+
+inputCallbacksClearedForCheck ∷ Ptr NativeWindow → IO Bool
+inputCallbacksClearedForCheck window = (/= 0) <$> c_inputCallbacksClearedForCheck window
+
+takeInputCallbacksClearedForCheck ∷ IO Bool
+takeInputCallbacksClearedForCheck = (/= 0) <$> c_takeInputCallbacksClearedForCheck
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_input_callbacks_cleared_for_check"
+  c_inputCallbacksClearedForCheck ∷ Ptr NativeWindow → IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_input_callbacks_before_destroy"
+  c_noteInputCallbacksBeforeDestroy ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_take_input_callbacks_cleared_for_check"
+  c_takeInputCallbacksClearedForCheck ∷ IO CInt
 
 foreign import capi "hetoimasia_glfw.h value GLFW_TRUE" glfwTrue ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FALSE" glfwFalse ∷ CInt

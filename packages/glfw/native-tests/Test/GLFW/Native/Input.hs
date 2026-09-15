@@ -33,10 +33,12 @@ import Hetoimasia.GLFW.Internal.Native
   , injectKeyForCheck
   , injectMouseButtonForCheck
   , injectScrollForCheck
+  , inputCallbacksClearedForCheck
   , requestCloseForCheck
+  , takeInputCallbacksClearedForCheck
   )
 import Hetoimasia.GLFW.Internal.Session (NativeWindow)
-import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity, windowStep)
+import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity, windowNativeHandle, windowStep)
 import Hetoimasia.GLFW.Window
   ( Window
   , WindowResult (..)
@@ -204,15 +206,21 @@ spec shared = describe "native input callbacks" $ do
     close `shouldSatisfy` isJust
 
   it "removes every input callback before the window is destroyed, with no retained cleanup failure" $ do
-    ended ←
+    (liveCleared, ended, destroyedCleared) ←
       owned shared $ \session → do
-        window ←
+        _ ← takeInputCallbacksClearedForCheck
+        (liveCleared, window) ←
           withWindow session (hiddenTestWindowConfig "native teardown" 160 120) $ \live → do
             _ ← liveFeed live 4
             inject live $ \handle → injectCharForCheck handle (fromEnum 'q')
-            pure live
-        windowEnded window
+            cleared ← inputCallbacksClearedForCheck (windowNativeHandle live)
+            pure (cleared, live)
+        ended ← windowEnded window
+        destroyedCleared ← takeInputCallbacksClearedForCheck
+        pure (liveCleared, ended, destroyedCleared)
+    liveCleared `shouldBe` False
     ended `shouldBe` True
+    destroyedCleared `shouldBe` True
 
   it "delivers focus loss and gain in native order through the existing focus callback" $ do
     payloads ←

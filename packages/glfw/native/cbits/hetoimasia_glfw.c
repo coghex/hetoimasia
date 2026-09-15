@@ -303,6 +303,37 @@ void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused)
         callback(window, focused);
 }
 
+static atomic_int last_input_callbacks_cleared = 0;
+
+int hetoimasia_glfw_input_callbacks_cleared_for_check(GLFWwindow* window)
+{
+    GLFWkeyfun key = glfwSetKeyCallback(window, NULL);
+    glfwSetKeyCallback(window, key);
+    GLFWcharfun character = glfwSetCharCallback(window, NULL);
+    glfwSetCharCallback(window, character);
+    GLFWmousebuttonfun button = glfwSetMouseButtonCallback(window, NULL);
+    glfwSetMouseButtonCallback(window, button);
+    GLFWcursorposfun cursor = glfwSetCursorPosCallback(window, NULL);
+    glfwSetCursorPosCallback(window, cursor);
+    GLFWcursorenterfun enter = glfwSetCursorEnterCallback(window, NULL);
+    glfwSetCursorEnterCallback(window, enter);
+    GLFWscrollfun scroll = glfwSetScrollCallback(window, NULL);
+    glfwSetScrollCallback(window, scroll);
+    return key == NULL && character == NULL && button == NULL
+        && cursor == NULL && enter == NULL && scroll == NULL;
+}
+
+void hetoimasia_glfw_note_input_callbacks_before_destroy(GLFWwindow* window)
+{
+    atomic_store(&last_input_callbacks_cleared,
+        hetoimasia_glfw_input_callbacks_cleared_for_check(window));
+}
+
+int hetoimasia_glfw_take_input_callbacks_cleared_for_check(void)
+{
+    return atomic_exchange(&last_input_callbacks_cleared, 0);
+}
+
 void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields)
 {
     const GLFWvidmode* mode = &modes[index];

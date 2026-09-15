@@ -809,6 +809,10 @@ testStagingOverflowFocus =
       readNow feed >>= \case
         InputResetRequired reset → pure reset
         other → unexpected ("staging overflow did not reset: " <> show other)
+    summary ← statisticsLastReset <$> statisticsOf feed
+    fmap summaryUnadmitted summary `shouldBe` Just (fromIntegral (inputStagingCapacity + 1))
+    fmap summarySuppressed summary `shouldBe` Just 0
+    statisticsFocused <$> statisticsOf feed `shouldReturn` False
     atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
     _ ← attemptOverflowWarning quietLogger feed
     resumeInput feed `shouldReturn` ResumeUnfocused

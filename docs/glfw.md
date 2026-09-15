@@ -886,8 +886,8 @@ full. At the next owner boundary the latch is checked before any staged prefix
 is published: the ambiguous batch is discarded and the attached feed begins
 the same overflow reset a full channel would, with `unadmitted` equal to the
 discarded prefix plus every callback that arrived after the latch. Coalesced
-focus still updates the feed's gate, so resumption cannot reopen an unfocused
-window. A window with no feed attached discards staged input at that boundary
+focus is applied in that same reset transaction, so resumption cannot reopen
+an unfocused window and the focus callback is not counted twice. A window with no feed attached discards staged input at that boundary
 without a reset. Publication of a captured batch is uninterruptible, so a
 cancellation cannot admit a prefix and drop the rest.
 

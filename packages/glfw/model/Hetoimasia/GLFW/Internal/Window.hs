@@ -1560,12 +1560,7 @@ publishCapturedInput window pending = do
     if capturedInputLoss pending
       then do
         let lost = capturedInputLost pending + fromIntegral (capturedInputCount pending)
-        void (resetFromStagingOverflow attached lost)
-        -- The discarded batch is not replayed, but coalesced focus still
-        -- updates the feed's gate so resumption cannot reopen an unfocused
-        -- window.
-        forM_ (capturedFocused pending) $ \focused →
-          void (produceInput attached (FocusInput focused))
+        void (resetFromStagingOverflow attached lost (capturedFocused pending))
       else mapM_ (admitStaged attached) (reverse (capturedInput pending))
   where
     admitStaged feed = \case

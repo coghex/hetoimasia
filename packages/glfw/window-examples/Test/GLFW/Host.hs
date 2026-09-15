@@ -24,7 +24,18 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
-import Hetoimasia.Foundation.Log (Component, Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
+import Hetoimasia.Foundation.Log
+  ( Component
+  , LogEntry (..)
+  , LogLevel (Warning)
+  , Logger
+  , callbackSink
+  , componentText
+  , defaultLogFilter
+  , mkLoggerWith
+  , systemMetadata
+  , unsafeComponent
+  )
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
@@ -38,7 +49,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , Seam
   , SeamMonitorEvent (MonitorDetached)
   , SeamScript (..)
-  , WindowEvent (CloseRequested)
+  , WindowEvent (CharEventAt, CloseRequested, FocusChanged)
   , asProcessMainThread
   , defaultScript
   , designateProcessMainThread
@@ -116,6 +127,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testQuiescence)
     it "closes a window's input feed with its close protocol, and every feed at quiescence, without awaiting a pending reset's acknowledgement"
       (boundedExample testInputFeedsClosed)
+    it "claims the overflow warning through the injected loop logger and resumes after acknowledgement at the owner-loop recovery boundary"
+      (boundedExample testOwnerLoopRecoversFeed)
     it "settles queued callers before the boundary drain when startup fails after a worker started"
       (boundedExample (testSettledBeforeDrain StartupFails))
     it "settles queued callers before the boundary drain when the action returns"
@@ -492,6 +505,63 @@ testQuiescence = do
   dispositions `shouldBe` replicate 3 (Just NotExecuted)
   late `shouldBe` SubmitClosed
   sampled `shouldBe` 0
+
+-- | Overflow from queued callbacks is warned through loopLogger and resumed by
+-- recoverFeeds after acknowledgement, without the example calling
+-- attemptOverflowWarning or resumeInput itself.
+testOwnerLoopRecoversFeed ∷ Expectation
+testOwnerLoopRecoversFeed = do
+  seam ← newSeam defaultScript
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (entry :)))
+  (messages, phase, epoch) ←
+    hosted seam ((settings [windowNamed "input"]) {hostInputCapacity = 2}) (\host _ → pure host) $ \host control →
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn →
+              case turnNumber turn of
+                1 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.enableInput (clientInputControl client)) `shouldReturn` Input.AdmissionOpened
+                  seamQueueEvents
+                    seam
+                    window
+                    (FocusChanged True : replicate 3 (CharEventAt (fromEnum 'x')))
+                  pure Continue
+                2 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.readInput (clientInputReader client)) >>= \case
+                    Input.InputResetRequired token → do
+                      atomically (Input.acknowledgeReset (clientInputReader client) token) `shouldReturn` Right Input.Acknowledged
+                      pure Continue
+                    other → unexpected ("expected a reset after overflow: " <> show other)
+                3 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  statistics ← atomically (Input.inputStatistics (clientInputReader client))
+                  logged ← reverse <$> readIORef warnings
+                  map entryLevel logged `shouldBe` [Warning]
+                  map (componentText . entryComponent) logged `shouldBe` ["glfw.input"]
+                  pure
+                    ( Finish
+                        ( map entryMessage logged
+                        , Input.statisticsPhase statistics
+                        , Input.epochNumber (Input.statisticsEpoch statistics)
+                        )
+                    )
+                _ → unexpected "the recovery did not finish within three turns"
+          }
+  messages `shouldBe` ["Input overflowed; the feed was reset"]
+  phase `shouldBe` Input.InputRunning
+  epoch `shouldBe` 2
+
+windowClient ∷ WindowHost → Window → IO WindowClient
+windowClient host window =
+  atomically (hostWindowClient host (windowIdentity window)) >>= maybe (unexpected "the host window has no client") pure
 
 -- | Each window's client carries its own input feed. A window's close protocol
 -- closes that feed, and quiescence closes the rest, even while a reset waits for

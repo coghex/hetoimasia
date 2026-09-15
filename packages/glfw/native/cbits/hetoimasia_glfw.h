@@ -51,6 +51,12 @@ void hetoimasia_glfw_inject_cursor_enter_for_check(GLFWwindow* window, int enter
 void hetoimasia_glfw_inject_scroll_for_check(GLFWwindow* window, double x, double y);
 void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused);
 
+/* Non-zero when every input callback slot is empty. The destroy path records
+ * this immediately before glfwDestroyWindow; the native examples read it. */
+int hetoimasia_glfw_input_callbacks_cleared_for_check(GLFWwindow* window);
+void hetoimasia_glfw_note_input_callbacks_before_destroy(GLFWwindow* window);
+int hetoimasia_glfw_take_input_callbacks_cleared_for_check(void);
+
 /* For the native examples only: the size limits the platform holds for a
  * window, read back from the platform itself — contentMinSize and contentMaxSize
  * on Cocoa, WM_NORMAL_HINTS on X11 — into limits as minimum width and height,
