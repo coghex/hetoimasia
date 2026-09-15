@@ -47,6 +47,7 @@ module Hetoimasia.GLFW.Internal.Native
   , windowSizeForCheck
   , windowPositionForCheck
   , windowTitleForCheck
+  , sizeLimitsForCheck
   , WindowStateForCheck (..)
   , windowStateForCheck
   ) where
@@ -377,6 +378,21 @@ windowTitleForCheck window = do
   title ← c_windowTitle window
   if title == nullPtr then pure Nothing else Just . decodeUtf8Lenient <$> ByteString.packCString title
 
+-- | The size limits the platform itself holds for the window — minimum width and
+-- height, then maximum width and height, 'Nothing' for a bound it does not
+-- hold — for the native examples only. 'Nothing' when they could not be read.
+sizeLimitsForCheck ∷ Ptr NativeWindow → IO (Maybe (Maybe Int, Maybe Int, Maybe Int, Maybe Int))
+sizeLimitsForCheck window =
+  allocaArray 4 $ \limits → do
+    answered ← c_sizeLimitsForCheck window limits
+    if answered == 0
+      then pure Nothing
+      else do
+        [minimumWidth, minimumHeight, maximumWidth, maximumHeight] ← map bound <$> peekArray 4 limits
+        pure (Just (minimumWidth, minimumHeight, maximumWidth, maximumHeight))
+  where
+    bound value = if value < 0 then Nothing else Just (fromIntegral value)
+
 -- | The window state attributes GLFW reports now, for the native examples only.
 data WindowStateForCheck = WindowStateForCheck
   { checkVisible ∷ Bool
@@ -474,6 +490,9 @@ foreign import capi safe "hetoimasia_glfw.h glfwSetWindowTitle"
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_window_title"
   c_windowTitle ∷ Ptr NativeWindow → IO CString
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_size_limits_for_check"
+  c_sizeLimitsForCheck ∷ Ptr NativeWindow → Ptr CInt → IO CInt
 
 foreign import capi safe "hetoimasia_glfw.h glfwSetWindowPos"
   c_glfwSetWindowPos ∷ Ptr NativeWindow → CInt → CInt → IO ()

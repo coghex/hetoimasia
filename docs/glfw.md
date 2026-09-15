@@ -1141,8 +1141,10 @@ Where a control is performable, the platform still decides its result. Focus is
 a request a window manager or compositor may decline, and attention may be a
 flash or a bounce. An X11 window manager applies size, position, visibility,
 and state asynchronously, so the post-call sample may not yet show them; a later
-observation will. A hidden window may ignore minimize or maximize, and the Cocoa
-backend shows a window it is asked to focus. The observations report what
+observation will. Cocoa's content size limits bound only the user's resizing,
+so a programmatic resize there is not clamped. A hidden window may ignore
+minimize or maximize, and the Cocoa backend shows a window it is asked to
+focus. The observations report what
 happened.
 
 ### Mode transitions
@@ -1694,13 +1696,16 @@ The native examples cover:
 - ordinary window controls on private hidden windows, performed on the owner
   thread with `performWindowCommand` and checked against the test-only
   owner-thread queries `windowSizeForCheck`, `windowPositionForCheck`,
-  `windowTitleForCheck`, and `windowStateForCheck`, never against public
-  commands: a title, a valid size, a position, and constraints applied to the
-  addressed window while a second window stays unchanged; showing and then
-  hiding reflected in observations; after constraints are installed, a public
-  out-of-constraint size refused, and the test-only native stimulus
-  `setWindowSizeForCheck` resizing out of range, with the observation reporting
-  the platform's actual size; minimize, maximize, and restore each followed by
+  `windowTitleForCheck`, `sizeLimitsForCheck`, and `windowStateForCheck`, never
+  against public commands: a title, a valid size, a position, and constraints
+  applied to the addressed window while a second window stays unchanged;
+  showing and then hiding reflected in observations; after constraints are
+  installed, the platform holding exactly those limits for the addressed window
+  and not for the other, a public out-of-constraint size refused, and the
+  test-only native stimulus `setWindowSizeForCheck` resizing out of range, with
+  the observation reporting the platform's actual size — clamped into the limits
+  where the platform clamps programmatic resizes, or the unclamped request on
+  Cocoa, whose content limits bound only the user's resizing; minimize, maximize, and restore each followed by
   an observation matching what the platform reports; focus and attention
   requests settling by their native call outcome without asserting that either
   was granted; and post-call revisions ordered while the latest snapshot has

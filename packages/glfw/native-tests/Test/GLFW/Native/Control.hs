@@ -5,7 +5,12 @@
 -- 'performWindowCommand'. What the platform reports is read through the
 -- test-only owner-thread queries of "Hetoimasia.GLFW.Internal.Native", never
 -- through a public command. The out-of-range resize is the test-only native
--- stimulus 'setWindowSizeForCheck', distinct from the public command path.
+-- stimulus 'setWindowSizeForCheck', distinct from the public command path, and
+-- the installed limits are read back from the platform with
+-- 'sizeLimitsForCheck'. Whether a programmatic resize is clamped is the
+-- platform's decision: Cocoa's content limits bound only the user's resizing,
+-- so its reported size may be the unclamped request, while an X11 window
+-- manager may clamp to the size hints.
 --
 -- Window managers apply requests asynchronously, so an example waits for native
 -- events between observations, within a bound of turns, and compares the
@@ -19,6 +24,7 @@ import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Native
   ( WindowStateForCheck (..)
   , setWindowSizeForCheck
+  , sizeLimitsForCheck
   , waitEventsForCheck
   , windowPositionForCheck
   , windowSizeForCheck
@@ -71,25 +77,36 @@ spec shared = describe "window controls" $ do
     shown `shouldBe` Observed True
     hidden `shouldBe` Observed False
 
-  it "observes the platform's actual size after a test-only out-of-range resize under constraints, admitting no public out-of-constraint size" $ do
-    (installed, refused, (observed, reported)) ←
+  it "installs size limits on the addressed window only, refuses a public out-of-constraint size, and observes the platform's actual size after a test-only out-of-range resize" $ do
+    (installed, refused, (addressedLimits, untouchedLimits), (observed, reported)) ←
       owned shared $ \session →
-        withTwo session $ \perform window _ → do
+        withTwo session $ \perform window untouched → do
           let target = windowIdentity window
               constraints = sizeConstraints (Extent 200 150) (Extent 400 300) Nothing
           installed ← perform (setSizeConstraintsCommand target constraints)
           refused ← perform (setWindowSizeCommand target (Extent 1000 1000))
+          limits ← (,) <$> sizeLimitsForCheck (windowNativeHandle window) <*> sizeLimitsForCheck (windowNativeHandle untouched)
           setWindowSizeForCheck (windowNativeHandle window) 1000 1000
           agreed ← converge window $ \observation → do
             (width, height) ← windowSizeForCheck (windowNativeHandle window)
             let reported = Observed (Extent width height)
             pure (observedLogicalExtent observation == reported && reported /= Observed (Extent 320 240), (observedLogicalExtent observation, reported))
-          pure (installed, refused, agreed)
+          pure (installed, refused, limits, agreed)
     installed `shouldSatisfy` returnedWithRevision
     refused `shouldSatisfy` \case
       Rejected (ControlRejected _ (SizeOutsideConstraints (Extent 1000 1000) _)) → True
       _ → False
+    -- The platform itself holds the installed limits for the addressed window,
+    -- and not for the other one.
+    addressedLimits `shouldBe` Just (Just 200, Just 150, Just 400, Just 300)
+    untouchedLimits `shouldSatisfy` (/= addressedLimits)
     observed `shouldBe` reported
+    -- The size is the platform's: clamped into the limits by a platform that
+    -- clamps programmatic resizes, or the unclamped request where the limits
+    -- bound only the user's resizing, as on Cocoa. Nothing else.
+    reported `shouldSatisfy` \case
+      Observed (Extent width height) → within width height || (width, height) == (1000, 1000)
+      Unavailable → False
 
   it "follows minimize, maximize, and restore each with an observation checked against what the platform reports" $ do
     steps ←
@@ -139,6 +156,10 @@ spec shared = describe "window controls" $ do
         second `shouldSatisfy` (> first)
         newest `shouldSatisfy` (>= second)
       other → failed ("the titles named no post-call revisions: " <> show other)
+
+-- | Whether a size lies within the clamping example's installed limits.
+within ∷ Int → Int → Bool
+within width height = width >= 200 && width <= 400 && height >= 150 && height <= 300
 
 -- | Two private hidden windows in the shared session and a direct executor over
 -- them.
