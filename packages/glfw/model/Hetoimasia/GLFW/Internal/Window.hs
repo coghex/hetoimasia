@@ -151,8 +151,8 @@
 -- it is over, from its latest sampled decoration and fullscreen monitor, so a
 -- window manager that places it later is reflected without another sample.
 --
--- An attempt's constraint cleanup runs only when that attempt made a constraint
--- step itself, so an attempt refused before any native call makes none.
+-- An attempt's constraint cleanup runs only when that attempt made a native step
+-- itself, so an attempt refused before any native call makes none.
 --
 -- The transition interval is that execution, from setting the marker to the
 -- settlement, on the owner thread. Nothing else executes a command inside it: the
@@ -173,7 +173,8 @@
 -- A 'WindowConfig' may carry a startup mode, transitioned during creation after
 -- the initial observation seeded the saved placement. A required startup mode
 -- that fails fails creation, which rolls back; an optional one leaves the window
--- in whatever presentation it reached, with its outcome recorded.
+-- in whatever presentation it reached, with its outcome recorded — a refusal or an
+-- unsupported target included, recorded as a failed target attempt.
 --
 -- A window's release drops its monitor claims when disposal succeeded, and
 -- makes them uncertain otherwise.
@@ -937,8 +938,7 @@ windowAssembly session config = do
           , windowControl = control
           , windowPublisher = publisher
           }
-  forM_ (windowStartupMode config) $ \startup →
-    restoredStep (void (transitionAt window (startupRequirement startup) (startupRequest startup)))
+  forM_ (windowStartupMode config) (restoredStep . startWindowMode window)
   pure window
   where
     native = sessionNative session
@@ -1775,7 +1775,7 @@ runModeSteps window disturbed pointer (ModePlan steps after) = go [] steps
     handle = windowHandle window
     go returned [] = Right (reverse returned) <$ mapM_ (setNativeConstraints window) after
     go returned (step : rest) = do
-      when (constraintStep step) (writeIORef disturbed True)
+      writeIORef disturbed True
       when (isJust after && constraintStep step) (setNativeConstraints window NativeIndeterminate)
       reports ← reportsDuring (windowSession window) (call step)
       if hasReports reports
@@ -1835,7 +1835,23 @@ samplePresentation forced window adjust =
         (settleClaims (windowLocalIdentity (windowId window)) observed (pruneClaims live claims), ())
     withRecord change observation = observation {obsMode = change (obsMode observation)}
 
--- | An attempt's cleanup: when the attempt made a constraint step, restore the
+-- | Transition a window to its startup mode during creation. An optional
+-- startup request refused before any native call, or whose target the
+-- platform cannot perform, with no fallback to take, is recorded as a failed
+-- target attempt, so the degradation stays observable.
+startWindowMode ∷ Window → StartupMode → IO ()
+startWindowMode window startup =
+  transitionAt window (startupRequirement startup) request >>= \case
+    WindowAvailable (ModeRefused rejection) → recordStartup (RefusedBeforeMutation rejection)
+    WindowAvailable (ModeUnsupported reason) → recordStartup (UnsupportedTarget reason)
+    _ → pure ()
+  where
+    request = startupRequest startup
+    recordStartup how =
+      void . atBoundary (pure ()) window transitionOperation $
+        samplePresentation True window (recordSettled request (ModeFailed [ModeAttemptFailure TargetAttempt how]))
+
+-- | An attempt's cleanup: when the attempt made a native step, restore the
 -- preserved windowed constraints of a window it left windowed with its native
 -- constraints suspended or indeterminate. A call that reports an error fails
 -- the cleanup.

@@ -1499,9 +1499,10 @@ placement is reachable. The derived placement is never saved.
 
 An attempt's cleanup restores the preserved windowed constraints of a window the
 attempt left windowed while its native constraints were suspended or
-indeterminate, and only when that attempt made a constraint step itself: an
-attempt refused before any native call runs no cleanup call, whatever state an
-earlier transition left. A restoration call that reports an error fails the cleanup, and,
+indeterminate, and only when that attempt made a native step itself — so a
+windowed return that decorated the window but failed to place it still restores
+them, while an attempt refused before any native call runs no cleanup call,
+whatever state an earlier transition left. A restoration call that reports an error fails the cleanup, and,
 as the recovery contract requires, a failure carrying cleanup evidence is never
 retried: the transition settles as `ModeRecoveryStopped`, with every attempt and
 the cleanup's reports, and no further native call is made. A cleanup that raises
@@ -1517,7 +1518,9 @@ and the command settles as `Interrupted`.
 | `ModeRecoveryStopped attempts reports` | An attempt's constraint restoration failed, so recovery stopped |
 
 A request through a command is optional: exhaustion is recorded and settled as
-data, and the application keeps running. A `ModeRequired` startup mode follows
+data, and the application keeps running. An optional startup mode refused before
+any native call, or whose target the platform cannot perform, with no fallback,
+creates the window and records the refusal as a failed target attempt. A `ModeRequired` startup mode follows
 the required-service policy instead: exhaustion, an unrecognized failure, or a
 cleanup failure propagates the failure with its context and recovery history,
 and the window's creation rolls back.

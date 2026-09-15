@@ -81,7 +81,9 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testCleanupStopsRecovery)
     it "propagates a cleanup that raises instead of reporting, settling its command as interrupted rather than as data"
       (boundedExample testRaisingCleanup)
-    it "fails a required startup mode under the required policy, rolling the window back, and records an optional one"
+    it "restores suspended windowed constraints when a windowed return decorates the window but fails to place it"
+      (boundedExample testPartialWindowedReturn)
+    it "fails a required startup mode under the required policy, rolling the window back, and records an optional one, refused or not"
       (boundedExample testStartupRequirement)
 
   describe "fullscreen claims" $ do
@@ -458,6 +460,12 @@ testUnsupportedBorderless =
       settersAfter ← modeCalls desk
       observation ← current window
       withFallback ← run (mode window (modeRequest (borderlessMode (deskRight desk)) (windowedFallback 1)))
+      let startup = (hiddenTestWindowConfig "startup" 800 600) {windowStartupMode = Just (startupMode (borderlessOn (deskRight desk)) ModeOptional)}
+      startedRecord ← withWindow (deskSession desk) startup recordOf
+      modeLastOutcome startedRecord `shouldSatisfy` \case
+        Just (ModeFailed [ModeAttemptFailure TargetAttempt (UnsupportedTarget reason)]) → reason /= ""
+        _ → False
+      modeApplied startedRecord `shouldBe` AppliedWindowed
       unsupported `shouldSatisfy` \case
         Unsupported (UnsupportedControl window' BorderlessOperation reason) → window' == target && reason /= ""
         _ → False
@@ -576,6 +584,52 @@ testRaisingCleanup = do
     settled `shouldBe` Just (Interrupted (submittedRequest (ticketOrigin ticket)))
     filter (\case SetWindowMonitor {} → True; _ → False) calls `shouldBe` []
 
+testPartialWindowedReturn ∷ Expectation
+testPartialWindowedReturn = do
+  failing ← newIORef False
+  let script =
+        tracked
+          { scriptWindowControl = \call reporter → case call of
+              SetWindowMonitor _ 0 40 30 _ _ _ →
+                readIORef failing >>= \on → when on (reportError reporter platformErrorCode "The window could not be placed")
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    let run = execute desk [window]
+        target = windowIdentity window
+        constraints = sizeConstraints (Extent 400 300) (Extent 1600 1200) (Just (AspectRatio 4 3))
+    installed ← run (setSizeConstraintsCommand target constraints)
+    borderless ← run (mode window (borderlessOn (deskLeft desk)))
+    writeIORef failing True
+    beforeReturn ← length <$> seamCalls (deskSeam desk)
+    partial ← run (mode window windowed)
+    writeIORef failing False
+    returnCalls ← filter isModeCall . drop beforeReturn <$> seamCalls (deskSeam desk)
+    record ← recordOf window
+    admitted ← run (setWindowSizeCommand target (Extent 1024 768))
+    outside ← run (setWindowSizeCommand target (Extent 1000 1000))
+    installed `shouldSatisfy` attempted
+    borderless `shouldSatisfy` appliedCleanly
+    partial `shouldSatisfy` stoppedPartwayAfter [DecorationStep True] (PlacementStep (Placement 40 30) (Extent 800 600)) ["The window could not be placed"] . withoutUnattempted
+    -- The cleanup restored the preserved constraints of the window it left
+    -- windowed.
+    returnCalls
+      `shouldBe` [ SetWindowDecorated 1 True
+                 , SetWindowMonitor 1 0 40 30 800 600 Nothing
+                 , SetWindowSizeLimits 1 400 300 1600 1200
+                 , SetWindowAspectRatio 1 (Just (4, 3))
+                 ]
+    modeApplied record `shouldBe` AppliedWindowed
+    admitted `shouldSatisfy` attempted
+    outside `shouldBe` Rejected (ControlRejected target (SizeOutsideConstraints (Extent 1000 1000) constraints))
+  where
+    -- The steps not attempted after the placement are the restoration the
+    -- cleanup then made.
+    withoutUnattempted = \case
+      Transitioned (ModeTransition window' (ModeFailed [ModeAttemptFailure TargetAttempt (StoppedPartway returned at _ reports)]) observation) →
+        Transitioned (ModeTransition window' (ModeFailed [ModeAttemptFailure TargetAttempt (StoppedPartway returned at [] reports)]) observation)
+      other → other
+
 testStartupRequirement ∷ Expectation
 testStartupRequirement = withDesk tracked $ \desk → do
   let seam = deskSeam desk
@@ -589,11 +643,20 @@ testStartupRequirement = withDesk tracked $ \desk → do
   calls ← seamCalls seam
   live ← seamLiveWindowCallbacks seam
   recorded ← withWindow (deskSession desk) optional recordOf
+  refusedStartup ← withWindow (deskSession desk) required {windowStartupMode = Just (startupMode (fullscreenOn left) ModeOptional)} recordOf
+  invalidStartup ←
+    withWindow (deskSession desk) required {windowStartupMode = Just (startupMode (modeRequest windowedMode (windowedFallback 0)) ModeOptional)} recordOf
   failure `shouldBe` ModeAttemptFailure TargetAttempt (RefusedBeforeMutation (ModeMonitorDisconnected left))
   originOf caught `shouldBe` Just ("glfw", "transition window mode", [("window", "1")])
   filter isModeCall calls `shouldBe` []
   (DestroyWindow 1 `elem` calls) `shouldBe` True
   live `shouldBe` 0
+  modeRequested refusedStartup `shouldBe` fullscreenMode left currentVideoMode
+  modeApplied refusedStartup `shouldBe` AppliedWindowed
+  modeLastOutcome refusedStartup
+    `shouldBe` Just (ModeFailed [ModeAttemptFailure TargetAttempt (RefusedBeforeMutation (ModeMonitorDisconnected left))])
+  modeLastOutcome invalidStartup
+    `shouldBe` Just (ModeFailed [ModeAttemptFailure TargetAttempt (RefusedBeforeMutation (FallbackAttemptsRejected 0))])
   modeLastOutcome recorded
     `shouldBe` Just
       ( ModeApplied
