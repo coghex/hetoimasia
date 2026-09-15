@@ -305,6 +305,7 @@ data Native = Native
 --
 -- It holds only occupancy and poison, and nothing about the session holding it.
 newtype Guard = Guard (IORef Occupancy)
+  deriving (Eq)
 
 data Occupancy = Vacant | Occupied | Poisoned
 

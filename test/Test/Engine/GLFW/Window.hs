@@ -92,6 +92,8 @@ spec = do
   describe "GLFW window callback containment" $ do
     it "rethrows a fault raised during a setter or a poll at the owner boundary with its context"
       (boundedExample testCallbackFaults)
+    it "keeps every capture latched and the snapshot coherent when cancelled before the commit"
+      (boundedExample testCancellationBeforeCommit)
 
   describe "GLFW window lifetime" $ do
     it "keeps two live windows independent and never lets a later window answer to an ended handle"
@@ -318,9 +320,9 @@ testCloseIntent = do
         second ← current window
         older ← requestOf first
         newer ← requestOf second
-        rejectedOlder ← seamRejectCloseRequest window older
+        rejectedOlder ← seamRejectCloseRequest seam window older
         kept ← current window
-        rejectedNewer ← seamRejectCloseRequest window newer
+        rejectedNewer ← seamRejectCloseRequest seam window newer
         cleared ← current window
         _ ← seamDrive seam window DuringPoll [CloseRequested, CloseRequested]
         coalesced ← current window
@@ -394,6 +396,46 @@ testCallbackFaults = do
   recovered `shouldBe` WindowAvailable ()
   observedLogicalExtent afterRecovery `shouldBe` Observed (Extent 10 10)
 
+testCancellationBeforeCommit ∷ Expectation
+testCancellationBeforeCommit = do
+  seam ← newSeam defaultScript
+  ((cancelled, cancelledCaught), (unchanged, unchangedCursor), (fault, _), (after, afterCursor), idle) ←
+    asProcessMainThread seam $ entered seam $ \session →
+      withWindow session (hiddenTestWindowConfig "cancelled" 64 48) $ \window → do
+        cancellation ←
+          caughtAs
+            ( seamDriveCancelledBeforeCommit
+                seam
+                window
+                [ ResizedTo 300 200
+                , CloseRequested
+                , CallbackRaises (toException (ErrorCall "kept fault"))
+                ]
+            )
+        unchanged ← withCursor window
+        -- The next boundary finds every capture, the fault included, still latched.
+        latched ← caughtAs (seamDrive seam window DuringPoll [])
+        after ← withCursor window
+        idle ← seamDrive seam window DuringPoll []
+        pure (cancellation, unchanged, latched, after, idle)
+  cancelled `shouldBe` ThreadKilled
+  contextsOf cancelledCaught `shouldBe` []
+  observedRevision unchanged `shouldBe` 0
+  unchangedCursor `shouldBe` 0
+  observedLogicalExtent unchanged `shouldBe` Observed (Extent 800 600)
+  observedCloseRequest unchanged `shouldBe` Nothing
+  fault `shouldBe` ErrorCall "kept fault"
+  observedRevision after `shouldBe` 1
+  afterCursor `shouldBe` 1
+  observedLogicalExtent after `shouldBe` Observed (Extent 300 200)
+  fmap closeRequestNumber (observedCloseRequest after) `shouldBe` Just 1
+  -- The fault was rethrown once and is no longer latched.
+  idle `shouldBe` WindowAvailable ()
+  where
+    withCursor window = do
+      observation ← atomically (readSnapshot (windowObservations window))
+      pure (preparedValue (observedValue observation), cursorRevision (observedCursor observation))
+
 -- ---------------------------------------------------------------------------
 -- Lifetime
 
@@ -426,7 +468,7 @@ testIndependentWindows = do
           withWindow session (hiddenTestWindowConfig "later" 16 12) $ \later → do
             afterLater ← synchronizeWindow inner
             afterLater `shouldBe` WindowEnded (windowIdentity inner)
-            rejection ← seamRejectCloseRequest later innerRequest
+            rejection ← seamRejectCloseRequest seam later innerRequest
             pure (windowIdentity later, rejection)
         pure
           ( windowIdentity outer

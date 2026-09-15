@@ -15,13 +15,29 @@
 -- uses only the public session and window interfaces, including the read-only
 -- observation endpoint, and every path it takes is refused before GLFW is
 -- initialized, so the example opens no display.
+--
+-- The test seam is a public component so this suite can depend on it. Its
+-- window drivers are therefore checked in process as well: a seam refuses to
+-- drive, or to reject a close request on, any window it did not create, so no
+-- client of the seam gains authority over another session's windows.
 module Test.Engine.GLFW.Opacity (spec) where
 
+import Control.Exception (SomeException, fromException, try)
+import Hetoimasia.Foundation.Resource (withScoped)
+import Hetoimasia.GLFW.Seam
+import Hetoimasia.GLFW.Session (defaultSessionConfig)
+import Hetoimasia.GLFW.Window
+  ( WindowResult (..)
+  , hiddenTestWindowConfig
+  , observedCloseRequest
+  , synchronizeWindow
+  , withWindow
+  )
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
 import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, withPackageClient)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain, shouldReturn)
 
 spec ∷ Spec
 spec = describe "GLFW session opacity across the package boundary" $ do
@@ -74,6 +90,31 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       rejectedBecause outcome "SnapshotPublisher"
       clientOutput outcome `shouldContain` "SnapshotReader"
 
+  it "refuses to drive or reject close requests on a window the seam did not create" $ do
+    owner ← newSeam defaultScript
+    stranger ← newSeam defaultScript
+    (driven, rejected, drivenByOwner, callsBefore, callsAfter) ←
+      asProcessMainThread owner $ withScoped (seamSession owner defaultSessionConfig) $ \session →
+        withWindow session (hiddenTestWindowConfig "owned" 64 48) $ \window → do
+          _ ← seamDrive owner window DuringPoll [CloseRequested]
+          synchronized ← synchronizeWindow window
+          let request = case synchronized of
+                WindowAvailable observation → observedCloseRequest observation
+                WindowEnded _ → Nothing
+          callsBefore ← length <$> seamCalls owner
+          driven ← refusal (seamDrive stranger window DuringPoll [RefreshRequested])
+          rejected ← case request of
+            Just latest → refusal (seamRejectCloseRequest stranger window latest)
+            Nothing → pure Nothing
+          callsAfter ← length <$> seamCalls owner
+          drivenByOwner ← seamDrive owner window DuringPoll []
+          pure (driven, rejected, drivenByOwner, callsBefore, callsAfter)
+    driven `shouldBe` Just ForeignSeamWindow
+    rejected `shouldBe` Just ForeignSeamWindow
+    callsAfter `shouldBe` callsBefore
+    show drivenByOwner `shouldBe` "WindowAvailable ()"
+    seamCalls stranger `shouldReturn` []
+
   it "accepts and runs a client using only the public session and window interfaces, without initializing GLFW" $
     withClient "Main.hs" publicClient $ \compile → do
       outcome ← compile Link
@@ -98,6 +139,14 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "capacity = 16, description limit = 1024"
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
                    ]
+
+-- | The refusal a seam driver raised, or 'Nothing' if it did not raise one.
+refusal ∷ IO (WindowResult a) → IO (Maybe ForeignSeamWindow)
+refusal action = do
+  outcome ← try action
+  pure $ case outcome of
+    Left (caught ∷ SomeException) → fromException caught
+    Right _ → Nothing
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 -- The main library is named by its local unit id: its sublibraries share its

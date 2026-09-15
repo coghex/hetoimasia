@@ -71,7 +71,12 @@
 -- coalesce to their latest values, so a snapshot preserves no event history. A
 -- refresh or a close request always publishes a new revision, even when every
 -- sampled attribute is unchanged. Preparation runs in 'IO', outside the
--- trampoline and outside 'STM'. Once the observation is published, a latched
+-- trampoline and outside 'STM'. Nothing changes until the commit: after
+-- preparation, the captures are cleared, the observation published, and the
+-- owner's state written in one masked step with no interruptible operation, so
+-- a cancellation before it leaves every capture latched and nothing can
+-- separate the three writes. A latched fault is taken and rethrown in one
+-- masked step as well, so a cancellation cannot discard it. Once the observation is published, a latched
 -- callback fault is rethrown with its original type and context, annotated
 -- with the @window callback@ operation, the callback, and the window. An
 -- asynchronous exception is rethrown unannotated, so cancellation stays
@@ -195,6 +200,8 @@ module Hetoimasia.GLFW.Internal.Window
 
     -- * Private owner-boundary drivers
   , windowStep
+  , windowStepWith
+  , windowSession
   , rejectCloseRequest
   , windowNativeHandle
   , windowCallbackOperation
@@ -207,13 +214,14 @@ import Control.Exception
   , ExceptionWithContext
   , SomeException
   , evaluate
+  , mask_
   , onException
   , rethrowIO
   , try
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import qualified Data.Text as Text
@@ -223,7 +231,7 @@ import Foreign.C.Types (CInt)
 import Foreign.Ptr (Ptr, nullPtr)
 import GHC.Generics (Generic)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot
   ( SnapshotPublisher
   , SnapshotReader
@@ -554,6 +562,9 @@ data Captures = Captures
   , capturedRefresh ∷ !Bool
   , capturedCloses ∷ !Natural
   , capturedFault ∷ !(Maybe CallbackFault)
+  , capturedGeneration ∷ !Natural
+    -- ^ Advanced by every record, so a commit can tell whether a callback
+    -- recorded anything since the captures it folded were read.
   }
 
 -- | The first fault a callback raised since the last boundary, the callback it
@@ -561,7 +572,7 @@ data Captures = Captures
 data CallbackFault = CallbackFault !Text !(ExceptionWithContext SomeException) !Natural
 
 noCaptures ∷ Captures
-noCaptures = Captures Nothing Nothing Nothing Nothing Nothing Nothing Nothing False 0 Nothing
+noCaptures = Captures Nothing Nothing Nothing Nothing Nothing Nothing Nothing False 0 Nothing 0
 
 -- | Samples taken together at one boundary.
 data Sample = Sample
@@ -796,7 +807,10 @@ windowCallbacks captures =
           latched ← try (record (latchFault name caught))
           either (\(_ ∷ SomeException) → pure ()) pure latched
 
-    record change = atomicModifyIORef' captures (\latched → (change latched, ()))
+    record change =
+      atomicModifyIORef' captures $ \latched →
+        let changed = change latched
+         in (changed {capturedGeneration = capturedGeneration latched + 1}, ())
 
     extentOf width height = Extent <$> evaluate (fromIntegral width) <*> evaluate (fromIntegral height)
     placementOf x y = Placement <$> evaluate (fromIntegral x) <*> evaluate (fromIntegral y)
@@ -811,7 +825,9 @@ latchFault name caught latched = case capturedFault latched of
     latched {capturedFault = Just (CallbackFault first kept (later + 1))}
 
 takeCaptures ∷ IORef Captures → IO Captures
-takeCaptures captures = atomicModifyIORef' captures (\latched → (noCaptures, latched))
+takeCaptures captures =
+  atomicModifyIORef' captures $ \latched →
+    (noCaptures {capturedGeneration = capturedGeneration latched}, latched)
 
 raiseFault ∷ WindowId → Captures → IO ()
 raiseFault identity pending = mapM_ (rethrowFault (windowIdentifiers identity)) (capturedFault pending)
@@ -895,39 +911,75 @@ reconciled identity sample pending current issued =
           , obsVisible = sampleVisible taken
           }
 
--- | Take the captures, fold them and an optional sample into the current
+-- | Fold the latched captures, and a sample if one was taken, into the current
 -- observation, and publish a new revision if anything changed or a refresh or
--- close request was captured. The fault, if any, is returned rather than
--- raised, so publication always happens first.
-reconcileWindow ∷ Window → Maybe Sample → IO (Maybe CallbackFault)
-reconcileWindow window sample = do
-  pending ← takeCaptures (windowCaptures window)
+-- close request was captured.
+--
+-- Nothing is mutated until the commit. The captures are read, not taken, and
+-- the next observation is computed and prepared. Only then, masked and with no
+-- interruptible operation, are the captures cleared, the snapshot published,
+-- and the owner state written, so a cancellation or a failure before the commit
+-- leaves the captures latched and the snapshot and owner state as they were,
+-- and nothing can land between the three writes. If a callback recorded
+-- anything between the read and the commit, the fold starts again from the
+-- newer captures. A latched fault stays latched for 'raiseLatchedFault'.
+--
+-- @interruption@ runs at the preparation point, after preparation and before
+-- the commit. Production passes @pure ()@; the test seam uses it to deliver a
+-- cancellation exactly there.
+reconcileWindow ∷ IO () → Window → Maybe Sample → IO ()
+reconcileWindow interruption window sample = do
+  pending ← readIORef (windowCaptures window)
   OwnerState current issued ← readIORef (windowOwnerState window)
-  let (next, issued') = reconciled (windowId window) sample pending current issued
+  let (folded, issued') = reconciled (windowId window) sample pending current issued
       signalled = capturedRefresh pending || capturedCloses pending > 0
-  when (next /= current || signalled) $
-    publishObservation window next {obsRevision = obsRevision current + 1} issued'
-  pure (capturedFault pending)
+      next = folded {obsRevision = obsRevision current + 1}
+  prepared ← if folded /= current || signalled then Just <$> prepare next else pure Nothing
+  interruption
+  committed ← mask_ $ do
+    cleared ← atomicModifyIORef' (windowCaptures window) $ \latched →
+      if capturedGeneration latched == capturedGeneration pending
+        then
+          ( noCaptures
+              { capturedGeneration = capturedGeneration latched
+              , capturedFault = capturedFault latched
+              }
+          , True
+          )
+        else (latched, False)
+    when cleared $ forM_ prepared (commitObservation window next issued')
+    pure cleared
+  unless committed (reconcileWindow interruption window sample)
 
-publishObservation ∷ Window → WindowObservation → Natural → IO ()
-publishObservation window next issued = do
-  prepared ← prepare next
+-- | Publish a prepared observation and record it as the owner's current one.
+-- The caller must be masked: neither write is interruptible, so the two cannot
+-- be separated.
+commitObservation ∷ Window → WindowObservation → Natural → Prepared WindowObservation → IO ()
+commitObservation window next issued prepared = do
   _ ← atomically (publish (windowPublisher window) prepared)
   writeIORef (windowOwnerState window) (OwnerState next issued)
+
+-- | Take a latched callback fault and rethrow it, in one masked step, so a
+-- cancellation cannot discard the fault between the take and the rethrow.
+raiseLatchedFault ∷ Window → IO ()
+raiseLatchedFault window = mask_ $ do
+  fault ← atomicModifyIORef' (windowCaptures window) $ \latched →
+    (latched {capturedFault = Nothing}, capturedFault latched)
+  mapM_ (rethrowFault (windowIdentifiers (windowId window))) fault
 
 -- | Run owner work at a boundary: answer 'WindowEnded' without a native call
 -- once the window has ended, check the owner and liveness, run the work, then
 -- reconcile the captures and rethrow any latched callback fault. If the work
 -- raises, its failure propagates and the captures stay latched.
-atBoundary ∷ Window → Operation → IO a → IO (WindowResult a)
-atBoundary window operationName work = do
+atBoundary ∷ IO () → Window → Operation → IO a → IO (WindowResult a)
+atBoundary interruption window operationName work = do
   live ← readIORef (windowLive window)
   if not live
     then pure (WindowEnded (windowId window))
     else ownerOperation (windowSession window) operationName identifiers $ do
       value ← work
-      fault ← reconcileWindow window Nothing
-      mapM_ (rethrowFault identifiers) fault
+      reconcileWindow interruption window Nothing
+      raiseLatchedFault window
       pure (WindowAvailable value)
   where
     identifiers = windowIdentifiers (windowId window)
@@ -935,10 +987,10 @@ atBoundary window operationName work = do
 -- | Sample the window at an owner boundary and publish what changed.
 synchronizeWindow ∷ Window → IO (WindowResult WindowObservation)
 synchronizeWindow window =
-  atBoundary window synchronizeOperation $ do
+  atBoundary (pure ()) window synchronizeOperation $ do
     sample ← sampleAll (windowSession window) (windowIdentifiers (windowId window)) (windowHandle window)
-    fault ← reconcileWindow window (Just sample)
-    mapM_ (rethrowFault (windowIdentifiers (windowId window))) fault
+    reconcileWindow (pure ()) window (Just sample)
+    raiseLatchedFault window
     OwnerState current _ ← readIORef (windowOwnerState window)
     pure current
 
@@ -946,8 +998,13 @@ synchronizeWindow window =
 -- driver setters, polls, and tests use. Errors reported during the step fail
 -- it; captures are reconciled after it returns.
 windowStep ∷ Window → Operation → (Ptr NativeWindow → IO a) → IO (WindowResult a)
-windowStep window operationName step =
-  atBoundary window operationName $ do
+windowStep = windowStepWith (pure ())
+
+-- | 'windowStep', running @interruption@ at the reconciliation's preparation
+-- point, after preparation and before the commit.
+windowStepWith ∷ IO () → Window → Operation → (Ptr NativeWindow → IO a) → IO (WindowResult a)
+windowStepWith interruption window operationName step =
+  atBoundary interruption window operationName $ do
     settleStrayOwnerReports capture
     value ← step (windowHandle window)
     reports ← takeOwnerReports capture
@@ -962,13 +1019,15 @@ windowStep window operationName step =
 -- newer request. Answers whether it was cleared.
 rejectCloseRequest ∷ Window → CloseRequest → IO (WindowResult Bool)
 rejectCloseRequest window request =
-  atBoundary window (operation "reject close request") $ do
-    fault ← reconcileWindow window Nothing
-    mapM_ (rethrowFault (windowIdentifiers (windowId window))) fault
+  atBoundary (pure ()) window (operation "reject close request") $ do
+    reconcileWindow (pure ()) window Nothing
+    raiseLatchedFault window
     OwnerState current issued ← readIORef (windowOwnerState window)
     if obsCloseRequest current == Just request
       then do
-        publishObservation window current {obsRevision = obsRevision current + 1, obsCloseRequest = Nothing} issued
+        let next = current {obsRevision = obsRevision current + 1, obsCloseRequest = Nothing}
+        prepared ← prepare next
+        mask_ (commitObservation window next issued prepared)
         pure True
       else pure False
 

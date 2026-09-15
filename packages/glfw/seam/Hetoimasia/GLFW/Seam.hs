@@ -23,7 +23,12 @@
 -- callbacks the model attached to it, and delivers scripted 'WindowEvent's to
 -- them from inside an owner-boundary step, as GLFW would from inside a setter
 -- or a poll: 'seamDrive'. 'seamRejectCloseRequest' is the private close-request
--- transition. Neither is a public command.
+-- transition. Neither is a public command, and neither has authority over a
+-- window the seam did not create: each refuses, with 'ForeignSeamWindow' and
+-- before anything else, a window whose session was not entered over this
+-- seam's own native table. A production window's session holds the process
+-- guard, which no seam shares, so no client of this component can inject
+-- callbacks into, or clear close requests on, a real window.
 --
 -- The seam exposes no native handle and no session or window constructor.
 module Hetoimasia.GLFW.Seam
@@ -42,7 +47,9 @@ module Hetoimasia.GLFW.Seam
   , WindowEvent (..)
   , DriveOrigin (..)
   , seamDrive
+  , seamDriveCancelledBeforeCommit
   , seamRejectCloseRequest
+  , ForeignSeamWindow (..)
 
     -- * Thread identity
   , asProcessMainThread
@@ -62,7 +69,8 @@ module Hetoimasia.GLFW.Seam
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, runInBoundThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, finally, throw, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, throw, throwIO, try)
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
@@ -86,13 +94,15 @@ import Hetoimasia.GLFW.Internal.Session
   , WindowHint (..)
   , newGuard
   , sessionAssembly
+  , sessionNative
   )
 import Hetoimasia.GLFW.Internal.Window
   ( CloseRequest
   , Window
   , WindowResult
   , rejectCloseRequest
-  , windowStep
+  , windowSession
+  , windowStepWith
   )
 
 -- | One native operation the model asked for, in the order it asked.
@@ -247,21 +257,44 @@ seamLiveCallbacks seam = length <$> readIORef (seamCallbacks seam)
 seamLiveWindowCallbacks ∷ Seam → IO Int
 seamLiveWindowCallbacks seam = length <$> readIORef (seamWindowCallbacks seam)
 
+-- | A seam driver was handed a window its seam did not create.
+data ForeignSeamWindow = ForeignSeamWindow
+  deriving (Eq, Show)
+
+instance Exception ForeignSeamWindow
+
+-- | Refuse a window whose session was not entered over this seam's native table.
+requireSeamWindow ∷ Seam → Window → IO ()
+requireSeamWindow seam window =
+  unless (nativeGuard (sessionNative (windowSession window)) == seamGuard seam) $
+    throwIO ForeignSeamWindow
+
 -- | Deliver events to a window's attached callbacks from inside one owner
 -- boundary step, then let the model reconcile them. An ended window answers
 -- without a native step; events for a window with no callbacks attached are
 -- dropped, as GLFW drops them.
 seamDrive ∷ Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
-seamDrive seam window origin events =
-  windowStep window (operation (originName origin)) $ \handle → do
+seamDrive seam window origin = driveWith (pure ()) seam window (originName origin)
+  where
+    originName DuringSetter = "seam setter"
+    originName DuringPoll = "seam poll"
+
+-- | 'seamDrive' from inside a poll, with a cancellation delivered to the owner
+-- at the reconciliation's preparation point: after the captures were folded and
+-- the next observation prepared, before anything is committed.
+seamDriveCancelledBeforeCommit ∷ Seam → Window → [WindowEvent] → IO (WindowResult ())
+seamDriveCancelledBeforeCommit seam window = driveWith (throwIO ThreadKilled) seam window "seam poll"
+
+driveWith ∷ IO () → Seam → Window → Text → [WindowEvent] → IO (WindowResult ())
+driveWith interruption seam window originName events = do
+  requireSeamWindow seam window
+  windowStepWith interruption window (operation originName) $ \handle → do
     attached ← readIORef (seamAttachedWindows seam)
     stored ← readIORef (seamWindowCallbacks seam)
     case lookup (windowKey handle) attached >>= (`lookup` stored) of
       Nothing → pure ()
       Just callbacks → mapM_ (deliver callbacks) events
   where
-    originName DuringSetter = "seam setter"
-    originName DuringPoll = "seam poll"
     deliver callbacks event = case event of
       ResizedTo width height → onWindowSize callbacks (fromIntegral width) (fromIntegral height)
       FramebufferResizedTo width height → onFramebufferSize callbacks (fromIntegral width) (fromIntegral height)
@@ -275,9 +308,12 @@ seamDrive seam window origin events =
       CallbackRaises failure → onWindowSize callbacks (throw failure) 1
     flagOf flag = if flag then 1 else 0
 
--- | Reject a close request through the model's private transition.
-seamRejectCloseRequest ∷ Window → CloseRequest → IO (WindowResult Bool)
-seamRejectCloseRequest = rejectCloseRequest
+-- | Reject a close request through the model's private transition, on a window
+-- this seam created.
+seamRejectCloseRequest ∷ Seam → Window → CloseRequest → IO (WindowResult Bool)
+seamRejectCloseRequest seam window request = do
+  requireSeamWindow seam window
+  rejectCloseRequest window request
 
 -- | Treat the calling Haskell thread as the process main thread.
 designateProcessMainThread ∷ Seam → IO ()

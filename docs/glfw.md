@@ -343,13 +343,23 @@ a poll. The same boundary serves the command service and event loop that
 arrive later. In order, a boundary:
 
 1. runs its native work, taking the reports made during it;
-2. takes the capture latch and folds it, then any fresh sample, into the current
-   observation;
-3. prepares and publishes a new revision if anything changed, or if a refresh or
-   a close request was captured, even when every attribute is unchanged;
-4. rethrows a latched callback fault with its original type and context,
-   annotated with the `window callback` operation and the `window`, `callback`,
-   and `later-faults` identifiers.
+2. reads the capture latch without clearing it and folds it, then any fresh
+   sample, into the current observation;
+3. prepares a new revision if anything changed, or if a refresh or a close
+   request was captured, even when every attribute is unchanged;
+4. commits: clears the captures it folded, publishes the revision, and records
+   it as the owner's current observation, in one masked step with no
+   interruptible operation;
+5. takes and rethrows a latched callback fault in one masked step, with its
+   original type and context, annotated with the `window callback` operation
+   and the `window`, `callback`, and `later-faults` identifiers.
+
+A cancellation or failure before the commit leaves every capture, the fault
+included, latched for the next boundary, and the snapshot and owner state
+unchanged; nothing can land between the commit's three writes, so an
+observation's revision always equals its snapshot cursor's. If a callback
+recorded anything between the read and the commit, the fold starts again from
+the newer captures.
 
 An asynchronous exception is rethrown unannotated, so cancellation stays
 cancellation. If the native work itself fails, its failure propagates and the
@@ -465,8 +475,12 @@ running it.
   It proves the session and window models through the seam, checks the link
   declarations, and compiles external clients against the package. The seam's
   `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
-  owner step, and `seamRejectCloseRequest` is the private close-request
-  transition; neither is a public command. It runs in the `test.engine`
+  owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
+  reconciliation's preparation point, and `seamRejectCloseRequest` is the
+  private close-request transition; none is a public command. Because the seam
+  is a public component, each refuses with `ForeignSeamWindow` any window whose
+  session was not entered over that seam's own native table. A production
+  window's session holds the process guard, which no seam shares. It runs in the `test.engine`
   validation group.
 - **`glfw-native-check`** needs a windowing session: Cocoa locally, or an X11
   display. It is not part of `hetoimasia-tests`, the console smoke, or any
