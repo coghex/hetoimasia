@@ -58,6 +58,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , scriptedMonitor
   , seamCalls
   , seamLiveWindowCallbacks
+  , seamQueueControlEvents
   , seamQueueEvents
   , seamQueueMonitorEvents
   , seamSession
@@ -129,6 +130,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testInputFeedsClosed)
     it "claims the overflow warning through the injected loop logger and resumes after acknowledgement at the owner-loop recovery boundary"
       (boundedExample testOwnerLoopRecoversFeed)
+    it "recovers a feed overflowed by command-triggered callbacks at the post-command boundary"
+      (boundedExample testOwnerLoopRecoversFeedAfterCommand)
     it "settles queued callers before the boundary drain when startup fails after a worker started"
       (boundedExample (testSettledBeforeDrain StartupFails))
     it "settles queued callers before the boundary drain when the action returns"
@@ -554,6 +557,57 @@ testOwnerLoopRecoversFeed = do
                         )
                     )
                 _ → unexpected "the recovery did not finish within three turns"
+          }
+  messages `shouldBe` ["Input overflowed; the feed was reset"]
+  phase `shouldBe` Input.InputRunning
+  epoch `shouldBe` 2
+
+testOwnerLoopRecoversFeedAfterCommand ∷ Expectation
+testOwnerLoopRecoversFeedAfterCommand = do
+  seam ← newSeam defaultScript
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (entry :)))
+  (messages, phase, epoch) ←
+    hosted seam ((settings [windowNamed "input"]) {hostInputCapacity = 2}) (\host _ → pure host) $ \host control →
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn →
+              case turnNumber turn of
+                1 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.enableInput (clientInputControl client)) `shouldReturn` Input.AdmissionOpened
+                  seamQueueControlEvents
+                    seam
+                    window
+                    (FocusChanged True : replicate 3 (CharEventAt (fromEnum 'x')))
+                  _ ← submitWindowCommand (clientCommandPort client) [] (setWindowTitleCommand (windowIdentity window) "renamed") >>= admitted
+                  pure Continue
+                2 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.readInput (clientInputReader client)) >>= \case
+                    Input.InputResetRequired token → do
+                      atomically (Input.acknowledgeReset (clientInputReader client) token) `shouldReturn` Right Input.Acknowledged
+                      logged ← reverse <$> readIORef warnings
+                      map entryMessage logged `shouldBe` ["Input overflowed; the feed was reset"]
+                      pure Continue
+                    other → unexpected ("expected a reset after a command setter: " <> show other)
+                3 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  statistics ← atomically (Input.inputStatistics (clientInputReader client))
+                  logged ← reverse <$> readIORef warnings
+                  pure
+                    ( Finish
+                        ( map entryMessage logged
+                        , Input.statisticsPhase statistics
+                        , Input.epochNumber (Input.statisticsEpoch statistics)
+                        )
+                    )
+                _ → unexpected "the command recovery did not finish within three turns"
           }
   messages `shouldBe` ["Input overflowed; the feed was reset"]
   phase `shouldBe` Input.InputRunning

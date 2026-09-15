@@ -112,6 +112,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , seamDriveWith
   , seamDriveCancelledBeforeCommit
   , seamQueueEvents
+  , seamQueueControlEvents
   , seamRejectCloseRequest
   , seamSetModeTransition
   , ForeignSeamWindow (..)
@@ -144,7 +145,7 @@ module Hetoimasia.GLFW.Internal.Seam
 import Control.Concurrent (ThreadId, forkIO, myThreadId, runInBoundThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, throw, throwIO, try)
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
@@ -457,6 +458,9 @@ data Seam = Seam
     -- ^ Window key to the callback storage key attached to it.
   , seamQueuedEvents ∷ IORef [(Int, [WindowEvent])]
     -- ^ Events for the next poll or wait to deliver, by window key, oldest first.
+  , seamQueuedControlEvents ∷ IORef [(Int, [WindowEvent])]
+    -- ^ Events the next owner-thread control of that window delivers from
+    -- inside the setter, as GLFW can invoke callbacks during a setter.
   , seamTopology ∷ IORef MonitorTopology
   , seamMonitorCallbacks ∷ IORef [(Int, MonitorCallback)]
     -- ^ Allocated and not yet freed monitor callback storage, by key.
@@ -496,6 +500,7 @@ newSeam script =
     <*> newIORef 1
     <*> newIORef Nothing
     <*> newIORef 1
+    <*> newIORef []
     <*> newIORef []
     <*> newIORef []
     <*> newIORef []
@@ -621,6 +626,42 @@ seamQueueEvents seam window events = do
   requireSeamWindow seam window
   let key = windowKey (windowNativeHandle window)
   atomicModifyIORef' (seamQueuedEvents seam) (\queued → (queued <> [(key, events)], ()))
+
+-- | Queue events for a window's attached callbacks. The next ordinary control
+-- of that window over this seam's native table delivers them from inside the
+-- setter, as GLFW can invoke callbacks during a setter.
+seamQueueControlEvents ∷ Seam → Window → [WindowEvent] → IO ()
+seamQueueControlEvents seam window events = do
+  requireSeamWindow seam window
+  let key = windowKey (windowNativeHandle window)
+  atomicModifyIORef' (seamQueuedControlEvents seam) (\queued → (queued <> [(key, events)], ()))
+
+deliverQueuedControl ∷ Seam → Int → IO ()
+deliverQueuedControl seam key = do
+  events ← atomicModifyIORef' (seamQueuedControlEvents seam) $ \queued →
+    ( [(k, es) | (k, es) ← queued, k /= key]
+    , concat [es | (k, es) ← queued, k == key]
+    )
+  deliverTo seam key events
+
+controlWindowKey ∷ NativeCall → Maybe Int
+controlWindowKey = \case
+  SetWindowTitle key _ → Just key
+  SetWindowSize key _ _ → Just key
+  SetWindowPosition key _ _ → Just key
+  SetWindowSizeLimits key _ _ _ _ → Just key
+  SetWindowAspectRatio key _ → Just key
+  ShowWindow key → Just key
+  HideWindow key → Just key
+  FocusWindow key → Just key
+  RequestWindowAttention key → Just key
+  IconifyWindow key → Just key
+  MaximizeWindow key → Just key
+  RestoreWindow key → Just key
+  SetWindowMonitor key _ _ _ _ _ _ → Just key
+  SetWindowDecorated key _ → Just key
+  ClearWindowSizeLimits key → Just key
+  _ → Nothing
 
 -- | Deliver events to the callbacks attached to a window key. Events for a
 -- window with no callbacks attached are dropped, as GLFW drops them.
@@ -910,6 +951,7 @@ seamNative seam =
       record call
       before ← readIORef (seamReported seam)
       scriptWindowControl script call reporter
+      forM_ (controlWindowKey call) (deliverQueuedControl seam)
       after ← readIORef (seamReported seam)
       when (before == after) (effect call)
     -- What a control or mode step that reported no error changes.
