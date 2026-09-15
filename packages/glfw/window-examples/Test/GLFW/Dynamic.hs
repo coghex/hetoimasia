@@ -985,6 +985,7 @@ kind = \case
   Just (Interrupted _) → "interrupted"
   Just (Unsupported _) → "unsupported"
   Just (Attempted _) → "attempted"
+  Just (Transitioned _) → "transitioned"
 
 interrupted ∷ Maybe Disposition → Bool
 interrupted = \case

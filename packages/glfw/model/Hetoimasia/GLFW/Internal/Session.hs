@@ -106,6 +106,11 @@
 -- | callback latch     |                   | Internal.Monitor"    | inside      | closes             |                       |
 -- |                    |                   |                      | owner calls |                    |                       |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Monitor claims     | The session       | Fullscreen           | Owner       | The session        | Ended identities'     |
+-- |                    |                   | transitions reserve  |             |                    | claims pruned; at     |
+-- |                    |                   | and settle; window   |             |                    | most one per current  |
+-- |                    |                   | release disposes     |             |                    | monitor               |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 -- | Monitor callback   | The session       | Installed at entry;  | Owner       | Through the last   | Freed after a safe    |
 -- | storage            |                   | detached before      |             | native call        | teardown; leaked when |
 -- |                    |                   | termination          |             |                    | poisoned              |
@@ -142,6 +147,7 @@ module Hetoimasia.GLFW.Internal.Session
   , resolveMonitor
   , reconcileMonitorEvents
   , withResolvedMonitor
+  , monitorClaims
 
     -- * Window capabilities
   , sessionWindowCapabilities
@@ -155,6 +161,12 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionCapture
   , sessionIdentity
   , sessionOwner
+  , sessionClaims
+  , liveMonitors
+  , currentSessionMonitors
+  , identifyWindowMonitor
+  , refreshMonitors
+  , resolveMonitorPointer
   , nextWindowIdentity
   , requireUnpoisoned
   , poisonSession
@@ -184,6 +196,7 @@ import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, onException, rethrowIO, tryWithContext)
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
+import qualified Data.Map.Strict as Map
 import Data.Int (Int32)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -193,6 +206,7 @@ import Foreign.Ptr (FunPtr, Ptr)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
+import Hetoimasia.GLFW.Internal.Attribute (Attribute)
 import Hetoimasia.GLFW.Internal.Capture
   ( Capture
   , ErrorCallback
@@ -219,6 +233,7 @@ import Hetoimasia.GLFW.Internal.Control
   , fullWindowCapabilities
   , windowCapabilities
   )
+import Hetoimasia.GLFW.Internal.Mode (MonitorClaims)
 import Hetoimasia.GLFW.Internal.Monitor
   ( MonitorDescription
   , MonitorId
@@ -231,6 +246,9 @@ import Hetoimasia.GLFW.Internal.Monitor
   , NativeMonitor
   , assembleMonitors
   , closeInventory
+  , currentMonitors
+  , identifyPointer
+  , liveIdentities
   , monitorCallback
   , monitorLocalIdentity
   , monitorsReader
@@ -295,6 +313,9 @@ data WindowAttribute
   | IconifiedAttribute
   | MaximizedAttribute
   | VisibleAttribute
+  | DecoratedAttribute
+    -- ^ The decoration GLFW holds for the window, which it applies whenever the
+    -- window is not on a monitor.
   deriving (Eq, Show)
 
 -- | The Haskell side of one window's native callbacks, as the model builds them.
@@ -378,6 +399,15 @@ data Native = Native
   , nativeIconifyWindow ∷ Ptr NativeWindow → IO ()
   , nativeMaximizeWindow ∷ Ptr NativeWindow → IO ()
   , nativeRestoreWindow ∷ Ptr NativeWindow → IO ()
+  , nativeWindowMonitor ∷ Ptr NativeWindow → IO (Ptr NativeMonitor)
+    -- ^ The monitor a fullscreen window is on; null for any other window.
+  , nativeSetWindowMonitor ∷ Ptr NativeWindow → Ptr NativeMonitor → Int32 → Int32 → Int32 → Int32 → Maybe Int32 → IO ()
+    -- ^ Put the window on a monitor, or, given null, take it off any monitor at
+    -- this content position: the position, then the width and height, then the
+    -- refresh rate, 'Nothing' for @GLFW_DONT_CARE@.
+  , nativeSetWindowDecorated ∷ Ptr NativeWindow → Bool → IO ()
+  , nativeClearWindowSizeLimits ∷ Ptr NativeWindow → IO ()
+    -- ^ Every size limit @GLFW_DONT_CARE@.
   , nativeWindowCapabilities ∷ Backend → WindowCapabilities
     -- ^ What windows cannot do or report on a backend.
   , nativeFeatureUnavailable ∷ !Int
@@ -417,6 +447,8 @@ data Session = Session
     -- ^ The monitor inventory, its identities, and its callback's latch.
   , sessionCapabilities ∷ !WindowCapabilities
     -- ^ What windows cannot do or report on the selected backend.
+  , sessionClaims ∷ !(IORef MonitorClaims)
+    -- ^ The fullscreen claims on the current monitors, by window.
   }
 
 -- | The backend the session initialized.
@@ -432,14 +464,15 @@ sessionWindowCapabilities = sessionCapabilities
 -- perform every ordinary control and report every attribute a window observes.
 -- Wayland, which no session selects, is described anyway so its restrictions
 -- stay explicit rather than emulated: it gives clients no global position to set
--- or read, lets only the compositor move input focus, and reports no reliable
--- iconified state.
+-- or read, and so cannot place a borderless window over a monitor, lets only the
+-- compositor move input focus, and reports no reliable iconified state.
 backendWindowCapabilities ∷ Backend → WindowCapabilities
 backendWindowCapabilities = \case
   Wayland →
     windowCapabilities
       [ (SetPositionOperation, noGlobalPosition)
       , (FocusOperation, "Wayland lets only the compositor move input focus")
+      , (BorderlessOperation, noGlobalPosition)
       ]
       [ (PlacementReport, noGlobalPosition)
       , (IconifiedReport, "Wayland reports no reliable iconified state")
@@ -556,6 +589,7 @@ sessionAssembly native config = do
   live ← restoredStep (newIORef True)
   identity ← restoredStep newUnique
   windows ← restoredStep (newIORef 1)
+  claims ← restoredStep (newIORef Map.empty)
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native))
   acquirePart
     "glfw session occupancy"
@@ -615,6 +649,7 @@ sessionAssembly native config = do
       , sessionTeardown = teardown
       , sessionMonitors = assembleMonitors source cell publisher
       , sessionCapabilities = nativeWindowCapabilities native backend
+      , sessionClaims = claims
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -859,6 +894,37 @@ withResolvedMonitor session operationName identity action =
   where
     capture = sessionCapture session
     identifiers = monitorIdentifiers identity
+
+-- | The session's fullscreen monitor claims, read on the owner thread.
+monitorClaims ∷ Session → IO MonitorClaims
+monitorClaims session =
+  ownerOperation session (operation "read monitor claims") [] (readIORef (sessionClaims session))
+
+-- | The monitor identities the last committed refresh observed. The caller is
+-- already inside an owner operation.
+liveMonitors ∷ Session → IO [MonitorId]
+liveMonitors = liveIdentities . sessionMonitors
+
+-- | The current inventory's monitors, without a refresh. The caller is already
+-- inside an owner operation.
+currentSessionMonitors ∷ Session → IO (Attribute [MonitorDescription])
+currentSessionMonitors = currentMonitors . sessionMonitors
+
+-- | The identity of the monitor pointer a window query just returned. The caller
+-- is already inside an owner operation.
+identifyWindowMonitor ∷ Session → Ptr NativeMonitor → IO (Attribute (Maybe MonitorId))
+identifyWindowMonitor = identifyPointer . sessionMonitors
+
+-- | Refresh the inventory and answer it. The caller is already inside an owner
+-- operation.
+refreshMonitors ∷ Session → IO MonitorInventory
+refreshMonitors = synchronizeInventory . sessionMonitors
+
+-- | Refresh the inventory and answer the identity's description and the live
+-- pointer this boundary's enumeration returned, which must not outlive the
+-- calling boundary. The caller is already inside an owner operation.
+resolveMonitorPointer ∷ Session → MonitorId → IO (MonitorResult (MonitorDescription, Ptr NativeMonitor))
+resolveMonitorPointer = resolveInventory . sessionMonitors
 
 monitorIdentifiers ∷ MonitorId → [(Text, Text)]
 monitorIdentifiers identity = [("monitor", Text.pack (show (monitorLocalIdentity identity)))]

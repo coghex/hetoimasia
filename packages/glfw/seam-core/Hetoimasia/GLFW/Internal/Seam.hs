@@ -63,6 +63,16 @@
 -- next poll or finite wait to deliver from inside that call. Like the window
 -- drivers, they are private to this sublibrary.
 --
+-- Mode steps are recorded like controls — setting a window's monitor, its
+-- decoration, and clearing its size limits — and run 'scriptWindowControl' too.
+-- The seam keeps each window's decoration and monitor, which a step that reported
+-- no error changes, and GLFW's own handling of a disconnected monitor: delivering
+-- its disconnection takes every window on it off the monitor at the desktop
+-- origin. With 'scriptTrackWindows' it also keeps each window's size and position,
+-- answering queries from them instead of the script: creation starts a window at
+-- its requested size at (40, 30), a setter or a delivered move or resize changes
+-- them, and a fullscreen window takes its monitor's position and mode size.
+--
 -- The seam exposes no native handle and no session or window constructor.
 module Hetoimasia.GLFW.Internal.Seam
   ( -- * Seams
@@ -129,7 +139,7 @@ module Hetoimasia.GLFW.Internal.Seam
 import Control.Concurrent (ThreadId, forkIO, myThreadId, runInBoundThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, throw, throwIO, try)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
@@ -242,6 +252,12 @@ data NativeCall
   | IconifyWindow Int
   | MaximizeWindow Int
   | RestoreWindow Int
+  | QueryWindowMonitor
+  | SetWindowMonitor Int Int Int32 Int32 Int32 Int32 (Maybe Int32)
+    -- ^ The window key, the monitor's scripted address or zero for none, the
+    -- position, the size, and the refresh rate.
+  | SetWindowDecorated Int Bool
+  | ClearWindowSizeLimits Int
   deriving (Eq, Show)
 
 -- | Which monitor query was made.
@@ -366,6 +382,11 @@ data SeamScript = SeamScript
     -- ^ Runs inside each ordinary control call, given the call as recorded.
   , scriptWindowCapabilities ∷ Backend → WindowCapabilities
     -- ^ What windows cannot do or report on the session's backend.
+  , scriptWindowMonitor ∷ Reporter → IO ()
+    -- ^ Runs inside each query of a window's monitor, before it answers.
+  , scriptTrackWindows ∷ Bool
+    -- ^ Whether window size and position queries answer the geometry the seam
+    -- tracks instead of the script.
   }
 
 -- | A platform supporting X11 on which every step succeeds silently.
@@ -394,6 +415,8 @@ defaultScript =
     , scriptMonitorEnumeration = \_ → pure ()
     , scriptWindowControl = \_ _ → pure ()
     , scriptWindowCapabilities = backendWindowCapabilities
+    , scriptWindowMonitor = \_ → pure ()
+    , scriptTrackWindows = False
     }
 
 -- | The code the scripted library reports for a property it cannot provide.
@@ -426,6 +449,18 @@ data Seam = Seam
   , seamAttachedMonitor ∷ IORef (Maybe Int)
   , seamQueuedMonitorEvents ∷ IORef [SeamMonitorEvent]
     -- ^ Monitor events for the next poll or wait to deliver, oldest first.
+  , seamTracked ∷ IORef [(Int, Tracked)]
+    -- ^ What the seam keeps of each live window, by window key.
+  , seamReported ∷ IORef Int
+    -- ^ How many errors scripted steps have reported.
+  }
+
+-- | A window's tracked decoration, monitor address, size, and position.
+data Tracked = Tracked
+  { trackedDecorated ∷ Bool
+  , trackedMonitor ∷ Int
+  , trackedSize ∷ (Int, Int)
+  , trackedPosition ∷ (Int, Int)
   }
 
 -- | What a scripted step reports errors through.
@@ -451,6 +486,8 @@ newSeam script =
     <*> newIORef []
     <*> newIORef Nothing
     <*> newIORef []
+    <*> newIORef []
+    <*> newIORef 0
 
 -- | Enter a session over this seam's native table.
 seamSession ∷ Seam → SessionConfig → Scoped Session
@@ -484,11 +521,18 @@ seamDeliverMonitorEvents ∷ Seam → [SeamMonitorEvent] → IO ()
 seamDeliverMonitorEvents seam events = do
   attached ← readIORef (seamAttachedMonitor seam)
   stored ← readIORef (seamMonitorCallbacks seam)
-  case attached >>= (`lookup` stored) of
-    Nothing → pure ()
-    Just callback → mapM_ (deliver callback) events
+  mapM_ (deliver (attached >>= (`lookup` stored))) events
   where
+    -- As GLFW does, a disconnection first takes every window on the monitor off
+    -- it, at the desktop origin, and then invokes the callback.
     deliver callback = \case
+      MonitorAttached key → mapM_ (\invoke → invoke (monitorPointer key) glfwConnectedCode) callback
+      MonitorDetached key → do
+        atomicModifyIORef' (seamTracked seam) $ \tracked →
+          ([(window, if trackedMonitor state == key then state {trackedMonitor = 0, trackedPosition = (0, 0)} else state) | (window, state) ← tracked], ())
+        mapM_ (\invoke → invoke (monitorPointer key) glfwDisconnectedCode) callback
+      other → mapM_ (\invoke → deliverOther invoke other) callback
+    deliverOther callback = \case
       MonitorAttached key → callback (monitorPointer key) glfwConnectedCode
       MonitorDetached key → callback (monitorPointer key) glfwDisconnectedCode
       MonitorEventCode key code → callback (monitorPointer key) code
@@ -562,8 +606,12 @@ deliverTo seam key events = do
   stored ← readIORef (seamWindowCallbacks seam)
   case lookup key attached >>= (`lookup` stored) of
     Nothing → pure ()
-    Just callbacks → mapM_ (deliver callbacks) events
+    Just callbacks → mapM_ (\event → track event >> deliver callbacks event) events
   where
+    track = \case
+      ResizedTo width height | scriptTrackWindows (seamScript seam) → trackWindow seam key (\state → state {trackedSize = (width, height)})
+      MovedTo x y | scriptTrackWindows (seamScript seam) → trackWindow seam key (\state → state {trackedPosition = (x, y)})
+      _ → pure ()
     deliver callbacks event = case event of
       ResizedTo width height → onWindowSize callbacks (fromIntegral width) (fromIntegral height)
       FramebufferResizedTo width height → onFramebufferSize callbacks (fromIntegral width) (fromIntegral height)
@@ -635,6 +683,7 @@ asProcessMainThread seam action = runInBoundThread (designateProcessMainThread s
 -- as GLFW drops it.
 reportError ∷ Reporter → Int → ByteString → IO ()
 reportError (Reporter seam) code description = do
+  atomicModifyIORef' (seamReported seam) (\count → (count + 1, ()))
   attached ← readIORef (seamAttached seam)
   callbacks ← readIORef (seamCallbacks seam)
   case attached >>= (`lookup` callbacks) of
@@ -658,6 +707,11 @@ reportErrorWithFailingIdentity ∷ Reporter → Int → ByteString → IO ()
 reportErrorWithFailingIdentity reporter@(Reporter seam) code description = do
   atomicWriteIORef (seamIdentityFails seam) True
   reportError reporter code description `finally` atomicWriteIORef (seamIdentityFails seam) False
+
+-- | Change what the seam tracks of a window.
+trackWindow ∷ Seam → Int → (Tracked → Tracked) → IO ()
+trackWindow seam key change =
+  atomicModifyIORef' (seamTracked seam) (\tracked → ([(window, if window == key then change state else state) | (window, state) ← tracked], ()))
 
 -- | The scripted key a seam window handle stands for.
 windowKey ∷ Ptr NativeWindow → Int
@@ -708,11 +762,14 @@ seamNative seam =
         if live
           then do
             handle ← atomicModifyIORef' (seamNextWindow seam) (\next → (next + 1, next))
+            atomicModifyIORef' (seamTracked seam) $ \tracked →
+              ((handle, Tracked True 0 (fromIntegral width, fromIntegral height) (40, 30)) : tracked, ())
             pure (intPtrToPtr (fromIntegral handle))
           else pure nullPtr
     , nativeDestroyWindow = \handle → do
         record (DestroyWindow (windowKey handle))
         scriptDestroyWindow script reporter
+        atomicModifyIORef' (seamTracked seam) (\tracked → (filter ((/= windowKey handle) . fst) tracked, ()))
     , nativeNewWindowCallbacks = \callbacks → do
         record CreateWindowCallbacks
         key ← atomicModifyIORef' (seamNextKey seam) (\next → (next + 1, next))
@@ -732,13 +789,22 @@ seamNative seam =
         record FreeWindowCallbacks
         atomicModifyIORef' (seamWindowCallbacks seam) $ \stored →
           (filter ((/= storageKey storage) . fst) stored, ())
-    , nativeWindowSize = \_ → record QueryWindowSize >> scriptWindowSize script reporter
+    , nativeWindowSize = \handle → do
+        record QueryWindowSize
+        scripted ← scriptWindowSize script reporter
+        tracking handle trackedSize scripted
     , nativeFramebufferSize = \_ → record QueryFramebufferSize >> scriptFramebufferSize script reporter
     , nativeContentScale = \_ → record QueryContentScale >> scriptContentScale script reporter
-    , nativeWindowPosition = \_ → record QueryWindowPosition >> scriptWindowPosition script reporter
-    , nativeWindowAttribute = \_ attribute → do
+    , nativeWindowPosition = \handle → do
+        record QueryWindowPosition
+        scripted ← scriptWindowPosition script reporter
+        tracking handle trackedPosition scripted
+    , nativeWindowAttribute = \handle attribute → do
         record (QueryWindowAttribute attribute)
-        scriptWindowAttribute script attribute reporter
+        scripted ← scriptWindowAttribute script attribute reporter
+        case attribute of
+          DecoratedAttribute → maybe True trackedDecorated . lookup (windowKey handle) <$> readIORef (seamTracked seam)
+          _ → pure scripted
     , nativePollEvents = do
         record PollEvents
         scriptPollEvents script reporter
@@ -760,6 +826,14 @@ seamNative seam =
     , nativeIconifyWindow = control . IconifyWindow . windowKey
     , nativeMaximizeWindow = control . MaximizeWindow . windowKey
     , nativeRestoreWindow = control . RestoreWindow . windowKey
+    , nativeWindowMonitor = \handle → do
+        record QueryWindowMonitor
+        scriptWindowMonitor script reporter
+        monitorPointer . maybe 0 trackedMonitor . lookup (windowKey handle) <$> readIORef (seamTracked seam)
+    , nativeSetWindowMonitor = \handle monitor x y width height refresh →
+        control (SetWindowMonitor (windowKey handle) (monitorKey monitor) x y width height refresh)
+    , nativeSetWindowDecorated = \handle decorated → control (SetWindowDecorated (windowKey handle) decorated)
+    , nativeClearWindowSizeLimits = control . ClearWindowSizeLimits . windowKey
     , nativeWindowCapabilities = scriptWindowCapabilities script
     , nativeFeatureUnavailable = featureUnavailableCode
     , nativeMonitor =
@@ -800,7 +874,28 @@ seamNative seam =
   where
     control call = do
       record call
+      before ← readIORef (seamReported seam)
       scriptWindowControl script call reporter
+      after ← readIORef (seamReported seam)
+      when (before == after) (effect call)
+    -- What a control or mode step that reported no error changes.
+    effect = \case
+      SetWindowSize key width height
+        | scriptTrackWindows script → trackWindow seam key (\state → state {trackedSize = (fromIntegral width, fromIntegral height)})
+      SetWindowPosition key x y
+        | scriptTrackWindows script → trackWindow seam key (\state → state {trackedPosition = (fromIntegral x, fromIntegral y)})
+      SetWindowMonitor key monitor x y width height _ → do
+        topology ← readIORef (seamTopology seam)
+        let position
+              | monitor == 0 = (fromIntegral x, fromIntegral y)
+              | otherwise = maybe (0, 0) (\(mx, my) → (fromIntegral mx, fromIntegral my)) (scriptedPosition <$> (lookup monitor =<< topologyMonitors topology))
+        trackWindow seam key (\state → state {trackedMonitor = monitor, trackedPosition = position, trackedSize = (fromIntegral width, fromIntegral height)})
+      SetWindowDecorated key decorated → trackWindow seam key (\state → state {trackedDecorated = decorated})
+      _ → pure ()
+    tracking ∷ Ptr NativeWindow → (Tracked → (Int, Int)) → (Int, Int) → IO (Int, Int)
+    tracking handle field scripted
+      | scriptTrackWindows script = maybe scripted field . lookup (windowKey handle) <$> readIORef (seamTracked seam)
+      | otherwise = pure scripted
     deliverQueued = do
       atomicModifyIORef' (seamQueuedEvents seam) (\queued → ([], queued))
         >>= mapM_ (uncurry (deliverTo seam))

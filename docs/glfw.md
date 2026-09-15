@@ -126,7 +126,8 @@ synchronizeWindow  ∷ Window → IO (WindowResult WindowObservation)
 data WindowResult a = WindowAvailable a | WindowEnded WindowId
 
 data WindowConfig = WindowConfig { windowTitle ∷ Text, windowWidth, windowHeight ∷ Int
-                                 , windowVisible, windowFocused, windowFocusOnShow ∷ Bool }
+                                 , windowVisible, windowFocused, windowFocusOnShow ∷ Bool
+                                 , windowStartupMode ∷ Maybe StartupMode }
 defaultWindowConfig, hiddenTestWindowConfig ∷ Text → Int → Int → WindowConfig
 validateWindowConfig ∷ WindowConfig → Either WindowConfigRejected ()
 data WindowConfigRejected = WindowExtentRejected { rejectedWidth, rejectedHeight ∷ Int }
@@ -144,6 +145,9 @@ observedContentScale ∷ WindowObservation → Attribute ContentScale
 observedPlacement ∷ WindowObservation → Attribute Placement
 observedFocused, observedIconified, observedMaximized, observedVisible ∷ WindowObservation → Attribute Bool
 observedCloseRequest ∷ WindowObservation → Maybe CloseRequest
+observedDecorated ∷ WindowObservation → Attribute Bool
+observedFullscreenMonitor ∷ WindowObservation → Attribute (Maybe MonitorId)
+observedMode ∷ WindowObservation → ModeRecord
 
 data WindowPhase  = WindowOpen | WindowClosing | WindowReleased | WindowDisposalFailed | WindowReleaseUncertain
 data Attribute a  = Observed a | Unavailable
@@ -162,6 +166,7 @@ unreportableAttributes    ∷ WindowCapabilities → [(WindowReport, Text)]
 data WindowOperation = SetTitleOperation | SetSizeOperation | SetPositionOperation | SetConstraintsOperation
                      | ShowOperation | HideOperation | FocusOperation | AttentionOperation
                      | MinimizeOperation | MaximizeOperation | RestoreOperation
+                     | BorderlessOperation | FullscreenOperation
 data WindowReport    = LogicalExtentReport | FramebufferExtentReport | ContentScaleReport | PlacementReport
                      | FocusedReport | IconifiedReport | MaximizedReport | VisibleReport
 ```
@@ -199,6 +204,7 @@ sizeConstraints       ∷ Extent → Extent → Maybe AspectRatio → SizeConstr
 constraintMinimum, constraintMaximum ∷ SizeConstraints → Extent
 constraintAspectRatio ∷ SizeConstraints → Maybe AspectRatio
 data AspectRatio = AspectRatio { aspectNumerator, aspectDenominator ∷ Int }
+setWindowModeCommand ∷ WindowId → ModeRequest → WindowCommand
 
 data RequestId                               -- Eq, Ord, Show
 requestLocalIdentity ∷ RequestId → Natural
@@ -214,7 +220,7 @@ pollCompletion  ∷ CompletionTicket → STM (Maybe Disposition)
 awaitCompletion ∷ HasCallStack ⇒ CompletionTicket → IO Disposition
 
 data Disposition      = Performed CommandResult | Rejected CommandRejection | Unsupported UnsupportedControl
-                      | Attempted ControlAttempt | NotExecuted | Interrupted RequestId
+                      | Attempted ControlAttempt | Transitioned ModeTransition | NotExecuted | Interrupted RequestId
 data CommandResult    = ObservationPublished { publishedWindow ∷ WindowId, publishedRevision ∷ Natural }
                       | WindowCreated { createdWindow ∷ WindowId }
                       | WindowCloseBegun { closingWindow ∷ WindowId }
@@ -226,12 +232,15 @@ data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
                       | WindowCreationPoisoned
                       | WindowCreationFailed { creationOperation ∷ Maybe Text
                                              , creationOutcome ∷ NativeOutcome, creationReports ∷ Reports }
-                      | ControlRejected WindowId ControlRejection
+                      | ControlRejected WindowId ControlRejection | ModeRejected WindowId ModeRejection
 data ControlRejection = ControlExtentRejected Int Int | ControlPlacementRejected Int Int | ControlTitleRejected
                       | SizeOutsideConstraints Extent SizeConstraints | ActiveConstraintsIndeterminate
                       | ConstraintBoundRejected Extent Extent | ConstraintBoundsInverted Extent Extent
                       | AspectRatioRejected Int Int | ConstraintsExcludeCurrentSize Extent SizeConstraints
                       | CurrentSizeUnavailable | ModeTransitionInProgress
+                      | ControlIneligibleInMode PresentationKind | ControlModeIndeterminate
+data ModeTransition   = ModeTransition { transitionedWindow ∷ WindowId, transitionOutcome ∷ ModeOutcome
+                                       , transitionObservation ∷ PostCallObservation }
 data UnsupportedControl = UnsupportedControl { unsupportedWindow ∷ WindowId, unsupportedOperation ∷ WindowOperation
                                              , unsupportedReason ∷ Text }
 data ControlAttempt   = ControlAttempt { attemptedWindow ∷ WindowId, attemptedOutcome ∷ ControlOutcome
@@ -253,6 +262,71 @@ clientObservations ∷ WindowClient → SnapshotReader WindowObservation
 clientInputReader  ∷ WindowClient → InputReader
 clientInputControl ∷ WindowClient → InputControl
 pollWindowClient   ∷ CompletionTicket → STM (Maybe WindowClient)
+```
+
+```haskell
+-- Hetoimasia.GLFW.Mode
+data WindowMode                              -- Eq, Show, NFData; built and read with:
+windowedMode        ∷ WindowMode
+borderlessMode      ∷ MonitorId → WindowMode
+fullscreenMode      ∷ MonitorId → VideoModePreference → WindowMode
+modePresentation    ∷ WindowMode → PresentationKind
+modeMonitor         ∷ WindowMode → Maybe MonitorId
+modeVideoPreference ∷ WindowMode → Maybe VideoModePreference
+data PresentationKind = WindowedPresentation | BorderlessPresentation | FullscreenPresentation
+
+data VideoModePreference                     -- Eq, Show, NFData; built and read with:
+currentVideoMode   ∷ VideoModePreference
+exactVideoMode     ∷ Extent → Maybe Int → VideoModePreference
+preferredVideoMode ∷ VideoModePreference → Maybe (Extent, Maybe Int)
+
+data ModeFallback                            -- Eq, Show, NFData; built and read with:
+noModeFallback          ∷ ModeFallback
+windowedFallback        ∷ Int → ModeFallback  -- fallback attempts, 1 .. maximumFallbackAttempts
+fallbackAttempts        ∷ ModeFallback → Int
+maximumFallbackAttempts ∷ Int                 -- 4
+
+data ModeRequest                             -- Eq, Show, NFData; built and read with:
+modeRequest       ∷ WindowMode → ModeFallback → ModeRequest
+requestedMode     ∷ ModeRequest → WindowMode
+requestedFallback ∷ ModeRequest → ModeFallback
+
+data StartupMode                             -- Eq, Show, NFData; built and read with:
+startupMode        ∷ ModeRequest → ModeRequirement → StartupMode
+startupRequest     ∷ StartupMode → ModeRequest
+startupRequirement ∷ StartupMode → ModeRequirement
+data ModeRequirement = ModeRequired | ModeOptional
+
+data ModeRecord                              -- Eq, Show, NFData; read with:
+modeRequested      ∷ ModeRecord → WindowMode
+modeFallback       ∷ ModeRecord → ModeFallback
+modeApplied        ∷ ModeRecord → AppliedMode
+modeSavedPlacement ∷ ModeRecord → Maybe SavedPlacement
+modeLastOutcome    ∷ ModeRecord → Maybe ModeOutcome
+data AppliedMode = AppliedWindowed | AppliedBorderless MonitorId | AppliedFullscreen MonitorId | AppliedIndeterminate
+data SavedPlacement                          -- Eq, Show, NFData; read with:
+savedPosition ∷ SavedPlacement → Placement
+savedExtent   ∷ SavedPlacement → Extent
+
+data ModeRejection = TransitionAlreadyInProgress | FallbackAttemptsRejected Int
+                   | VideoModeRejected Int Int (Maybe Int) | ModeMonitorDisconnected MonitorId
+                   | MonitorBusy MonitorId | VideoModeUnavailable MonitorId VideoModePreference
+                   | WorkAreaUnavailable MonitorId | PlacementUnrepresentable Placement Extent
+                   | NoReachablePlacement | PlacementExcluded Extent SizeConstraints
+                   | WindowedConstraintsIndeterminate
+data ModeStep      = ClearSizeLimitsStep | ClearAspectRatioStep | DecorationStep Bool
+                   | PlacementStep Placement Extent | MonitorStep MonitorId Extent (Maybe Int)
+                   | SizeLimitsStep Extent Extent | AspectRatioStep (Maybe AspectRatio)
+data ModeAttemptKind    = TargetAttempt | WindowedFallbackAttempt
+data ModeFailure        = RefusedBeforeMutation ModeRejection | UnsupportedTarget Text
+                        | StoppedPartway { stoppedReturned ∷ [ModeStep], stoppedAt ∷ ModeStep
+                                         , stoppedUnattempted ∷ [ModeStep], stoppedReports ∷ Reports }
+data ModeAttemptFailure = ModeAttemptFailure { failedAttempt ∷ ModeAttemptKind, failedHow ∷ ModeFailure }
+data ModeOutcome        = ModeInert
+                        | ModeApplied { appliedBy ∷ ModeAttemptKind, appliedSteps ∷ [ModeStep]
+                                      , appliedAfter ∷ [ModeAttemptFailure] }
+                        | ModeFailed { failedAttempts ∷ [ModeAttemptFailure] }
+                        | ModeRecoveryStopped { stoppedAttempts ∷ [ModeAttemptFailure], stoppedCleanup ∷ Reports }
 ```
 
 ```haskell
@@ -1097,14 +1171,18 @@ order:
    client holds.
 3. **Mode transition.** A window whose mode transition marker is set is
    `ControlRejected ModeTransitionInProgress`.
-4. **Capability.** An operation the session's `WindowCapabilities` names as
+4. **Presentation.** An operation the window's applied presentation does not
+   admit is `ControlRejected (ControlIneligibleInMode kind)`, or
+   `ControlRejected ControlModeIndeterminate` while the applied presentation is
+   indeterminate; see [Ordinary controls by presentation](#ordinary-controls-by-presentation).
+5. **Capability.** An operation the session's `WindowCapabilities` names as
    unperformable is `Unsupported`, with the operation and a reason.
-5. **Validation**, below, refusing with `ControlRejected` and a typed
+6. **Validation**, below, refusing with `ControlRejected` and a typed
    `ControlRejection`.
 
 Then the control's native calls are made, each bracketed by the error capture,
 and every attribute is sampled and published as a new revision, even when
-nothing changed. Settlements from the first five steps carry no revision,
+nothing changed. Settlements from the first six steps carry no revision,
 because nothing was called or sampled. A control never changes the window's
 applied mode.
 
@@ -1122,10 +1200,14 @@ applied mode.
 | Constraints | An aspect ratio term is outside `1 .. 2147483647` | `AspectRatioRejected` |
 | Constraints | The window's logical size is `Unavailable` | `CurrentSizeUnavailable` |
 | Constraints | They do not admit the window's currently observed logical size, bounds and aspect ratio alike | `ConstraintsExcludeCurrentSize` |
-| Show, hide, focus, attention, minimize, maximize, restore | Only by addressing, a mode transition, or capability | — |
+| Show, hide, focus, attention, minimize, maximize, restore | Only by addressing, a mode transition, presentation, or capability | — |
 
 The currently observed size is the owner's latest observation, reconciled when
-the command executes. A window starts in the fully known unconstrained state, in
+the command executes. A size is checked against the window's preserved windowed
+constraints only while the native constraints follow them; while a mode
+transition has suspended them, or a suspension or restoration stopped part-way,
+every size is `ActiveConstraintsIndeterminate`. A window starts in the fully
+known unconstrained state, in
 which a size needs only to be positive and representable. A size outside the
 constraints is refused; it is never sent for the platform to clamp, and a caller
 that wants tighter constraints resizes first. Every constraint set has both a
@@ -1194,7 +1276,7 @@ with a reason, as `backendWindowCapabilities` defines:
 | Backend | Cannot perform | Cannot report |
 |---|---|---|
 | X11, Cocoa | — | — |
-| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus | `PlacementReport`: no global window position; `IconifiedReport`: no reliable iconified state |
+| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus; `BorderlessOperation`: no global window position to place over a monitor | `PlacementReport`: no global window position; `IconifiedReport`: no reliable iconified state |
 
 No session selects Wayland. Its description keeps its restrictions explicit
 rather than emulated, and the CPU examples model it through the seam. An
@@ -1216,13 +1298,289 @@ happened.
 
 ### Mode transitions
 
-Each window carries a private, owner-internal mode transition marker, set and
-cleared only by the model's private `setModeTransition`. While it is set, every
-control is `ControlRejected ModeTransitionInProgress` with no native call;
-observation and close commands are unaffected. No public command sets it, and
-nothing in this package does yet: the monitor-aware mode transitions of a later
-slice are to be its only producer, and the seam's private `seamSetModeTransition`
-drives it in the CPU examples. Controls define no saved windowed placement.
+Each window carries a private, owner-internal mode transition marker. A mode
+transition sets it for its interval, and the seam's private
+`seamSetModeTransition` sets it in the CPU examples; no public command does.
+While it is set, every control is `ControlRejected ModeTransitionInProgress`
+with no native call, and observation and close commands are unaffected. A
+control never changes the saved windowed placement. See
+[Window modes](#window-modes).
+
+## Window modes
+
+`Hetoimasia.GLFW.Mode` and `setWindowModeCommand` move an existing window
+between windowed presentation, borderless placement over a selected monitor's
+work area, and fullscreen on a selected monitor. The model is the private
+`Hetoimasia.GLFW.Internal.Mode`, which is pure, and the window model's
+`transitionWindow`, which executes a request on the owner thread; the session
+holds the monitor claims. None of it assumes a primary window or a primary
+monitor at the desktop origin.
+
+### Requests
+
+A `ModeRequest` is a `WindowMode` and a `ModeFallback`:
+
+| Value | Built with | Meaning |
+|---|---|---|
+| `WindowMode` | `windowedMode` | Decorated, at the window's saved windowed placement |
+| | `borderlessMode monitor` | Undecorated, placed over the monitor's work area, on no monitor |
+| | `fullscreenMode monitor preference` | On the monitor, at a video mode |
+| `VideoModePreference` | `currentVideoMode` | The monitor's current mode and refresh rate |
+| | `exactVideoMode extent refresh` | A mode of exactly that size, and of that refresh rate if one is given, which the monitor reports |
+| `ModeFallback` | `noModeFallback` | Settle with the failure |
+| | `windowedFallback attempts` | After a recognized failure, return to windowed presentation at a reachable placement, at most `attempts` times, `1 .. maximumFallbackAttempts` (4) |
+| `StartupMode` | `startupMode request requirement` | A request a window transitions to during creation, `ModeRequired` or `ModeOptional` |
+
+None exports a constructor, and neither does the `ModeRecord` or the
+`SavedPlacement` a window observation carries, so a client can neither build a
+request that skips validation nor set a saved placement. Every request is
+validated when it executes, against the window and the monitors reported then.
+
+### Owner, thread, and the transition interval
+
+A request executes at an owner boundary on the session's owner thread, from the
+host's port, the window's own port, or `performWindowCommand`, like a control.
+In order:
+
+1. Pending callback captures are reconciled. A window whose close protocol has
+   begun is `WindowIsClosing`, and an ended one `WindowAlreadyEnded`.
+2. A window whose mode transition marker is set refuses with
+   `ModeRejected TransitionAlreadyInProgress`.
+3. The request's fallback budget and video mode preference are checked.
+4. The marker is set, and stays set until the transition settles.
+5. The window is sampled, and its applied mode and monitor claims are
+   reconciled with the sample.
+6. An inert request settles at once as `ModeInert`.
+7. Otherwise the target is attempted under `Hetoimasia.Foundation.Recovery`'s
+   `recover`, with a budget of one attempt plus the fallback's attempts; see
+   [Recovery and fallback](#recovery-and-fallback).
+8. The window is sampled again, the request and its outcome are recorded in
+   the window's mode record, a new revision is published, and the command
+   settles as `Transitioned`, naming that revision.
+
+A request refused before any native call with no fallback to take settles as
+`Rejected (ModeRejected window rejection)`, and a target the platform cannot
+perform with no fallback as `Unsupported` with `BorderlessOperation` or
+`FullscreenOperation`; neither is recorded.
+
+The transition interval is steps 4 through 8, on the owner thread. Nothing else
+executes a command inside it: the owner executes one command at a time, and
+callbacks only record. The marker therefore guards owner work re-entered from
+inside a native step. The CPU examples drive exactly that from a scripted step:
+an ordinary control there is `ModeTransitionInProgress`, another mode request
+`TransitionAlreadyInProgress`, and a command for another window is served; once
+the transition settles, the window's controls are eligible again under its new
+presentation.
+
+A native call that raises instead of returning, a callback fault rethrown at a
+boundary, a native failure a monitor refresh raises, and cancellation propagate,
+and the command settles as `Interrupted`.
+
+### Validation
+
+Before any native call, a transition or one of its attempts refuses with a
+typed `ModeRejection`:
+
+| Refused when | `ModeRejection` |
+|---|---|
+| The marker is set | `TransitionAlreadyInProgress` |
+| The fallback budget is outside `1 .. 4` | `FallbackAttemptsRejected` |
+| A preferred width, height, or refresh rate is outside `1 .. 2147483647` | `VideoModeRejected` |
+| The selected monitor's identity has ended, re-resolved immediately before use | `ModeMonitorDisconnected` |
+| Another window claims the fullscreen monitor | `MonitorBusy` |
+| The monitor does not report the preferred video mode | `VideoModeUnavailable` |
+| The monitor's work area is unavailable or empty | `WorkAreaUnavailable` |
+| A placement coordinate is outside the native `int` range, or a dimension outside `1 .. 2147483647` | `PlacementUnrepresentable` |
+| There is no saved placement, or no current monitor with a nonempty work area | `NoReachablePlacement` |
+| The preserved windowed constraints do not admit the windowed placement's size, bounds and aspect ratio alike | `PlacementExcluded` |
+| A borderless entry, or a windowed return that must restore constraints, while the preserved windowed constraints are indeterminate | `WindowedConstraintsIndeterminate` |
+
+The monitor is re-resolved through the inventory's own resolution, and a
+fullscreen step receives the pointer that resolution's enumeration returned in
+the same boundary. Negative desktop coordinates are valid. A fullscreen monitor
+is reserved last, after every other check has passed.
+
+### Plans and native steps
+
+| Target | Steps, in order |
+|---|---|
+| Windowed | `DecorationStep True` (`glfwSetWindowAttrib` `GLFW_DECORATED`); `PlacementStep` (`glfwSetWindowMonitor` with no monitor, at the placement); then, when the native constraints do not follow the preserved windowed set, `SizeLimitsStep` and `AspectRatioStep` restoring it, or the two clearing steps when it has none |
+| Borderless | `ClearSizeLimitsStep` and `ClearAspectRatioStep` (`GLFW_DONT_CARE`) unless there is nothing to suspend; `DecorationStep False`; `PlacementStep` at the work area's origin and size |
+| Fullscreen | `MonitorStep` (`glfwSetWindowMonitor` on the monitor at the selected mode's size, and its refresh rate or `GLFW_DONT_CARE`) |
+
+Decoration is set before placement because a platform may keep a window's frame
+and change its content area when decoration changes. GLFW stores decoration set
+on a fullscreen window and applies it when the window leaves the monitor, and
+it ignores size limits while a window is on a monitor, so a fullscreen plan
+leaves them installed. Each step is bracketed by the error capture and the plan
+stops at the first step that reports an error, which settles the attempt as
+`StoppedPartway` naming the steps that returned, the step that reported, the
+steps not attempted, and the copied reports. Nothing is rolled back.
+
+### Saved placement and inert requests
+
+A window's saved placement is its windowed content position and logical size:
+
+- seeded from the window's initial observation, before any startup transition;
+- cached from the observed placement when a transition leaves an applied
+  windowed presentation, and only once every step of that attempt returned
+  without a report;
+- never overwritten by a return to windowed, a change between borderless and
+  fullscreen, a failed or partial attempt, or a fallback's derived placement.
+
+A request is inert only when it equals the recorded request completely — the
+monitor identity and the video mode preference included — its last outcome
+settled cleanly at the target, and the applied mode reconciled in step 5 still
+matches it: windowed with its constraints applied, borderless exactly over that
+monitor's work area, or fullscreen on that monitor. An inert request makes no
+native call, so it never restores stale geometry over a window the user moved.
+A request after a disconnect, a failure, or a fallback is never inert.
+
+### Applied mode and observations
+
+Every window sample now also reads the decoration GLFW holds for the window
+and the monitor GLFW reports a fullscreen window on. `observedDecorated` and
+`observedFullscreenMonitor` publish them; the monitor pointer is only compared
+with the inventory's current connections, never refreshed there, so a monitor
+no current identity names, or one whose change the callback captured but no
+refresh folded, is `Unavailable`.
+
+`observedMode` is the window's `ModeRecord`: `modeRequested` and `modeFallback`,
+the last request that executed; `modeApplied`, an `AppliedMode`; the
+`modeSavedPlacement`; and `modeLastOutcome`. The applied mode is derived from
+the sample and never copied from a request:
+
+| Sampled | `AppliedMode` |
+|---|---|
+| A fullscreen monitor | `AppliedFullscreen monitor` |
+| No fullscreen monitor, decorated | `AppliedWindowed` |
+| No fullscreen monitor, undecorated, content origin inside a current monitor's work area | `AppliedBorderless monitor`, the first such monitor |
+| Anything else, or a sample that reported errors | `AppliedIndeterminate` |
+
+A `Transitioned` settlement's `PostCallRevision` names the revision its final
+sample published, which carries the applied mode and geometry actually sampled
+then. That records the boundary, not a window manager's eventual
+acknowledgement: an X11 window manager may apply placement later, and a later
+observation reports it. A final sample that reports errors is
+`PostCallSampleFailed`; the record's change is still published, without a
+sample. Snapshots keep only their latest value, so a client that must inspect the
+named revision itself reads the snapshot on the owner thread before any later
+boundary, as the native examples do.
+
+Minimize, temporary focus loss, and a zero framebuffer extent during or after a
+transition are ordinary observations, not failures.
+
+### Recovery and fallback
+
+Each attempt is one complete owned operation under `recover`. The target attempt
+plans, reserves, runs its steps, and samples; a `windowedFallback` attempt does
+the same for a windowed return at a reachable placement, from whatever state the
+previous attempt left, reconciled by its sample. An attempt that does not
+complete fails with a `ModeAttemptFailure`, which the classifier recognizes — and
+answers with the windowed fallback, while the budget lasts — when it is a refusal
+other than `MonitorBusy` or `TransitionAlreadyInProgress`, an unsupported target,
+or a stopped step. Every other failure propagates.
+
+The reachable placement is the documented deterministic policy: the saved
+placement as it is when its content origin lies inside a current monitor's work
+area; otherwise its size, centred — clamped to the work area's origin when larger
+— in the work area of the monitor the platform designates primary, or of the
+first enumerated monitor with a nonempty work area when none is. With no saved
+placement or no such monitor, including an empty or inconsistent inventory, no
+placement is reachable. The derived placement is never saved.
+
+An attempt's cleanup restores the preserved windowed constraints of a window the
+attempt left windowed while its native constraints were suspended or
+indeterminate. A restoration call that reports an error fails the cleanup, and,
+as the recovery contract requires, a failure carrying cleanup evidence is never
+retried: the transition settles as `ModeRecoveryStopped`, with every attempt and
+the cleanup's reports, and no further native call is made.
+
+| `ModeOutcome` | Meaning |
+|---|---|
+| `ModeInert` | The request matched the applied mode; no native call |
+| `ModeApplied by steps earlier` | Every step of the `TargetAttempt` or `WindowedFallbackAttempt` returned; `earlier` lists the attempts that failed before it |
+| `ModeFailed attempts` | No attempt completed: no fallback, or the budget was exhausted |
+| `ModeRecoveryStopped attempts reports` | An attempt's constraint restoration failed, so recovery stopped |
+
+A request through a command is optional: exhaustion is recorded and settled as
+data, and the application keeps running. A `ModeRequired` startup mode follows
+the required-service policy instead: exhaustion, an unrecognized failure, or a
+cleanup failure propagates the failure with its context and recovery history,
+and the window's creation rolls back.
+
+After the owner loop refreshes the monitor inventory, it reconciles every window
+that is not closing. A window whose applied mode names an ended monitor identity
+takes its recorded windowed fallback at once, with no further command, and its
+outcome is recorded; with no fallback it is only resampled. GLFW itself takes a
+fullscreen window off a disconnected monitor. A window whose applied mode is
+indeterminate is resampled. If no placement is reachable the fallback reports
+exhaustion and the saved placement is preserved.
+
+### Fullscreen claims
+
+The session holds at most one claim per monitor identity, recording the claiming
+window and whether the claim is reserved, held, or uncertain:
+
+- a fullscreen attempt reserves its monitor after every other check and before
+  its first native call; a monitor another window claims — reserved, held, or
+  uncertain — is `MonitorBusy`, and nothing is called;
+- after every sample of a window, its claims are reconciled with its observed
+  fullscreen monitor: that monitor is held and the window's other claims are
+  released, because departure from them is confirmed or their reservation is
+  proven unused; no fullscreen monitor releases them all; an unavailable report
+  makes them all uncertain;
+- switching monitors therefore reserves the destination first, keeps the source
+  until the window is observed off it, and after a failed switch keeps whichever
+  claim is still observed, releasing only a destination observed unused;
+- iconifying a fullscreen window changes no claim;
+- a claim on an ended identity is dropped whenever claims are consulted, so the
+  claims never outnumber the current monitors;
+- a window's release drops its claims only when its disposal succeeded; any other
+  release leaves them uncertain, and an uncertain claim is never available to
+  another window.
+
+Borderless windows claim nothing.
+
+### Ordinary controls by presentation
+
+After a transition settles, which ordinary controls are attempted depends on the
+applied presentation:
+
+| Applied | Refused with `ControlIneligibleInMode` | Eligible where supported |
+|---|---|---|
+| Windowed | — | Every control, validated as before |
+| Borderless | Size, position, constraints, maximize | Title, show, hide, focus, attention, minimize, restore |
+| Fullscreen | Size, position, constraints, show, hide, maximize | Title, focus, attention, minimize, restore |
+| Indeterminate | Everything above as `ControlModeIndeterminate` | Title, focus, attention, minimize, restore |
+
+A refused control makes no native call, so an ordinary resize never changes a
+fullscreen monitor's video mode; geometry and video mode changes in borderless
+or fullscreen presentation go through a mode request. Neither the requested mode
+nor the previous presentation establishes eligibility: an indeterminate window
+becomes eligible again once a later sample establishes its presentation.
+
+### Windowed constraints
+
+The window keeps its preserved windowed constraints apart from what the native
+constraints currently hold. Only a windowed ordinary constraint update changes
+the preserved set, under the controls' indeterminate-state rule. A borderless
+entry suspends the native limits and aspect ratio for its own geometry, and a
+windowed return restores the preserved set after placing the window, validated
+against the placement first. While a suspension or restoration is incomplete,
+sizes are refused as indeterminate, and a failed restoration is never reported as
+a restored configuration: its steps and reports are the outcome, and a later
+complete restoration or constraint update re-establishes known constraints.
+
+### Platform restrictions
+
+GLFW performs every transition on X11 and Cocoa. Wayland, which no session
+selects, gives clients no global position, so `backendWindowCapabilities Wayland`
+names `BorderlessOperation` unperformable: a borderless request settles as
+`Unsupported`, or takes its configured windowed fallback, and is never reported
+as fullscreen. On Cocoa and X11 alike, the platform decides what a request
+achieves: a window manager may place a borderless window differently or later,
+and the observations report what it did.
 
 ## Input feeds
 
@@ -1724,7 +2082,10 @@ candidate unpublished.
 | Observation snapshot | The window | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed at release; never reopened |
 | Window liveness | The window | Release clears it; every operation reads it | Owner; `windowEnded` any | The window | Never set again |
 | Window constraint state | The window | Constraint updates write it; size and constraint validation read it | Owner | The window | Known and unconstrained at creation; indeterminate from an update's first call until the update completes |
-| Mode transition marker | The window | The private `setModeTransition` writes it; controls read it | Owner | The window | Clear at creation; no public command sets it |
+| Mode transition marker | The window | A transition sets and clears it; controls and transitions read it | Owner | The window | Clear at creation; no public command sets it |
+| Preserved windowed and native constraint states | The window | Windowed constraint updates write the preserved set; transitions suspend and restore the native constraints; size validation reads both | Owner | The window | Known, unconstrained, and followed at creation |
+| Mode record | The window | Transitions, their samples, and mode reconciliation write it; observations publish it | Owner | The window | Seeded at creation; the final value retained in the closed snapshot |
+| Monitor claims | The session | Fullscreen attempts reserve; samples settle; window release disposes | Owner | The session | Claims of ended identities dropped when consulted; at most one per current monitor |
 | Release certainty | The window | Uncertain parts clear it; the storage and observation releases read it | Owner | The window | Read at release |
 | Command channel | The command host | Ports admit; the executor claims; closure drains | Admit: any; claim and close: owner | While referenced | Closed by closure with its backlog settled; never reopened |
 | Pending completion cells | The command host | Admission reserves; settlement and closure remove | Reserve: any; settle: owner | Admission until settlement | Removed at settlement |
@@ -1803,9 +2164,12 @@ running it.
   inventory or reaching for a native monitor pointer, and for naming the monitor
   drivers through the public seam, and for constructing a control command or its
   size constraints through their constructors or reaching for the private
-  control representation, and a supported client that submits and awaits a
+  control representation, for naming a mode's, saved placement's, or mode
+  record's constructor or reaching for the private mode module, and a supported
+  client that submits and awaits a
   command, performs every control command constructor, reads the capability
-  descriptions, and resolves monitors.
+  descriptions, requests modes and a startup mode, reads a mode record, and
+  resolves monitors.
   It also runs the `glfw-window-examples` executable, reached through the suite's
   `build-tool-depends`, and fails with that executable's report if any window
   model example fails. It runs in the `test.engine` validation group.
@@ -1855,6 +2219,38 @@ running it.
   update failures naming their calls, refusing sizes while indeterminate, and a
   complete update restoring known state; and post-call revisions ordered while
   the latest snapshot moves beyond them.
+- **The window mode examples** in the same executable submit mode requests to the
+  private command executor and to the window host's owner loop over seam
+  sessions whose native table tracks each window's decoration, monitor, size, and
+  position, and takes windows off a disconnected monitor as GLFW does. Two
+  monitors are scripted, one at a negative desktop origin with a work area offset
+  from both origins. Without sleeps, they prove repeated requests inert with no
+  native call, never restoring stale placement over a moved window; the saved
+  placement kept across windowed, fullscreen, borderless, and windowed; seeding
+  before a startup transition straight into fullscreen; a long chain ending at
+  the original placement; a user's move and resize surviving a transition and
+  return; inertness only on complete equality with a cleanly applied target;
+  unrepresentable preferences, budgets, and placements and unreported video modes
+  refused before any setter, with negative coordinates accepted; a disconnected
+  selected monitor refused, or falling back to the windowed placement; a
+  disconnect after fullscreen was applied falling back through the owner loop
+  with no further command to a derived reachable placement while the off-screen
+  saved placement is kept; exhaustion with no monitor left; borderless placement
+  settling as unsupported on the modeled Wayland backend; a partial failure
+  naming its steps with the saved placement unchanged; a failed constraint
+  restoration stopping recovery; a required startup mode failing and rolling the
+  window back while an optional one records its fallback; `MonitorBusy` for a
+  second window without native effect, including while the first is iconified;
+  independent claims released in both close orders; a claim invalidated by
+  disconnect; claims kept uncertain after an unobserved transition and a failed
+  disposal until reconciliation proves release; monitor switching reserving the
+  destination first and releasing the source only after departure; the operation
+  matrix after entering each mode with no setter for a refused control; controls
+  refused while the presentation is indeterminate until reconciliation; commands
+  refused inside a transition's interval, entered from a scripted native step,
+  while another window is served; windowed constraints suspended and restored
+  with a placement they exclude refused; and the named revision carrying the
+  applied mode and geometry.
 - **The monitor inventory examples** in the same executable use the seam's
   private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
   and `seamQueueMonitorEvents` — over scripted monitors whose native pointers
@@ -1951,6 +2347,20 @@ The native examples cover:
   observations, within 100 waits of at most 50 ms. On Cocoa, showing or focusing
   a window makes it briefly visible. Interactive focus, attention, and minimize
   behavior on a live desktop is optional evidence, not asserted;
+- window modes on private hidden windows over the display server's primary
+  monitor, performed on the owner thread with `performWindowCommand`: fullscreen
+  and back restoring the observed windowed placement; borderless over the
+  selected monitor's work area and back; fullscreen to borderless keeping the
+  saved placement; each completion's named revision read from the snapshot on
+  the owner thread before any event is processed, checked to be that revision,
+  and compared with `windowFullscreenForCheck`, `windowStateForCheck`'s
+  decoration, and the platform's size and position at that point, with
+  restoration then awaited within the event-wait bound; and a second window's
+  request for the claimed monitor refused as `MonitorBusy` with the first
+  window's fullscreen state, size, and the monitor's video mode unchanged, and an
+  ordinary resize of the fullscreen window refused before its setter. The run
+  prints the exercised monitor topology and records that no hotplug transition
+  was exercised;
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;

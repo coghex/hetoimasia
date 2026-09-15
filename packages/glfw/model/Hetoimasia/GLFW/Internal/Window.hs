@@ -98,21 +98,72 @@
 -- 2. a window whose close protocol has begun attempts nothing;
 -- 3. a window whose mode transition marker is set refuses the control with
 --    'ModeTransitionInProgress';
--- 4. an operation the session's 'WindowCapabilities' names as unperformable
+-- 4. an operation the window's applied presentation does not admit is refused,
+--    under "Hetoimasia.GLFW.Internal.Control"'s eligibility rules;
+-- 5. an operation the session's 'WindowCapabilities' names as unperformable
 --    settles as unsupported, with its reason;
--- 5. the control is validated against the window's constraint state and latest
---    observed logical size, under "Hetoimasia.GLFW.Internal.Control"'s rules.
+-- 6. the control is validated against the window's effective constraint state
+--    and latest observed logical size, under "Hetoimasia.GLFW.Internal.Control"'s
+--    rules.
 --
 -- Then the native calls are made, each bracketed by the error capture so its
 -- reports belong to this control alone, and afterwards every attribute is
 -- sampled and a new revision is published even if nothing changed, so the
 -- revision the result names was produced by a sample taken after the call. It
 -- promises nothing about the window manager's convergence. A control changes no
--- mode and the window's mode transition marker, set only through the private
--- 'setModeTransition', is never changed by one.
+-- mode and never changes the window's mode transition marker.
 --
--- A constraint update marks the window's constraint state indeterminate before
--- its first call and known only after every call returned without a report.
+-- A constraint update marks the window's preserved windowed constraints
+-- indeterminate before its first call and known only after every call returned
+-- without a report. A size is validated against those constraints only while
+-- the native constraints follow them; while a transition has suspended them, or
+-- a suspension or restoration stopped part-way, sizes are refused as
+-- indeterminate.
+--
+-- = Window modes
+--
+-- 'transitionWindow' executes a mode request at an owner boundary under
+-- "Hetoimasia.GLFW.Internal.Mode"'s contract. In order: pending captures are
+-- reconciled; a closing window attempts nothing; a window whose mode transition
+-- marker is set refuses with 'TransitionAlreadyInProgress'; the request is
+-- validated; the marker is set, and stays set until the transition settles; the
+-- window is sampled, and its applied mode and monitor claims are reconciled with
+-- that sample; an inert request settles at once; otherwise the target is
+-- attempted under "Hetoimasia.Foundation.Recovery"'s 'recover', whose budget is
+-- one attempt plus the request's fallback attempts. Each attempt is one complete
+-- owned operation. It validates and plans before any native call, reserves a
+-- fullscreen monitor last, makes its steps — each bracketed by the error capture,
+-- stopping at the first that reports — and samples, reconciles, and publishes
+-- before it returns or fails. Its cleanup restores the preserved windowed
+-- constraints of a window the attempt left windowed with its native constraints
+-- suspended or indeterminate; a cleanup that reports an error stops recovery. The
+-- transition settles after one more sample, whose revision it names, with the
+-- request and its outcome recorded. A request refused before any native call,
+-- with no fallback to take, records nothing.
+--
+-- The transition interval is that execution, from setting the marker to the
+-- settlement, on the owner thread. Nothing else executes a command inside it: the
+-- owner executes one command at a time, and callbacks only record. The marker
+-- therefore guards owner work re-entered from inside a native step, which the CPU
+-- examples drive from a scripted step: an ordinary control there is refused with
+-- 'ModeTransitionInProgress', another mode request with
+-- 'TransitionAlreadyInProgress', and other windows are unaffected.
+--
+-- Every sample queries the window's decoration and fullscreen monitor beside its
+-- other attributes, and the monitor pointer is compared with the inventory's
+-- current connections without a refresh. 'reconcileWindowMode' is the owner
+-- loop's step after its monitor refresh: a window whose applied mode names an
+-- ended monitor identity takes its recorded windowed fallback without another
+-- command, or is resampled when it has none; a window whose applied mode is
+-- indeterminate is resampled.
+--
+-- A 'WindowConfig' may carry a startup mode, transitioned during creation after
+-- the initial observation seeded the saved placement. A required startup mode
+-- that fails fails creation, which rolls back; an optional one leaves the window
+-- in whatever presentation it reached, with its outcome recorded.
+--
+-- A window's release drops its monitor claims when disposal succeeded, and
+-- makes them uncertain otherwise.
 --
 -- = Close requests
 --
@@ -215,11 +266,18 @@
 -- |                     |               | the observation release    |             |                     | release                  |
 -- |                     |               | reads it                   |             |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
--- | Constraint state    | The window    | Constraint updates write;  | Owner       | The window          | Known and unconstrained  |
--- |                     |               | controls read              |             |                     | at creation              |
+-- | Windowed and native | The window    | Constraint updates and     | Owner       | The window          | Known, unconstrained,    |
+-- | constraint states   |               | transitions write;         |             |                     | and followed at creation |
+-- |                     |               | controls and transitions   |             |                     |                          |
+-- |                     |               | read                       |             |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
--- | Mode transition     | The window    | 'setModeTransition'        | Owner       | The window          | Clear at creation        |
--- | marker              |               | writes; controls read      |             |                     |                          |
+-- | Mode transition     | The window    | Transitions set and clear  | Owner       | The window          | Clear at creation        |
+-- | marker              |               | it; controls and           |             |                     |                          |
+-- |                     |               | transitions read           |             |                     |                          |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Mode record         | The window    | Transitions and their      | Owner       | The window          | Seeded at creation;      |
+-- |                     |               | samples write; the         |             |                     | final value retained in  |
+-- |                     |               | observation publishes it   |             |                     | the closed snapshot      |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 --
 -- None of this is application state.
@@ -258,6 +316,9 @@ module Hetoimasia.GLFW.Internal.Window
   , observedMaximized
   , observedVisible
   , observedCloseRequest
+  , observedDecorated
+  , observedFullscreenMonitor
+  , observedMode
   , WindowPhase (..)
   , Attribute (..)
   , Extent (..)
@@ -270,6 +331,10 @@ module Hetoimasia.GLFW.Internal.Window
     -- * Ordinary controls
   , controlWindow
   , setModeTransition
+
+    -- * Window modes
+  , transitionWindow
+  , reconcileWindowMode
 
     -- * Private owner-turn operations
   , EventProcessing (..)
@@ -291,8 +356,11 @@ import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
   , ExceptionWithContext (ExceptionWithContext)
+  , SomeAsyncException
   , SomeException
+  , bracket_
   , evaluate
+  , fromException
   , mask_
   , onException
   , rethrowIO
@@ -303,6 +371,8 @@ import Control.Exception
 import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
+import Data.List (find)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe, maybeToList)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Data.Unique (Unique)
@@ -319,7 +389,17 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , publish
   , snapshotReader
   )
-import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
+import qualified Hetoimasia.Foundation.Recovery as Recovery
+import Hetoimasia.Foundation.Resource
+  ( Assembly
+  , CleanupFailure
+  , acquirePart
+  , cleanupFailureException
+  , cleanupFailuresInContext
+  , releaseRank
+  , restoredStep
+  , withResourceLabelled
+  )
 import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..), Extent (..), Placement (..))
 import Hetoimasia.GLFW.Internal.Control
   ( AspectRatio (..)
@@ -329,20 +409,73 @@ import Hetoimasia.GLFW.Internal.Control
   , ControlRejection (..)
   , ControlResult (..)
   , PostCallObservation (..)
+  , PresentationKind (..)
   , SizeConstraints
   , WindowCapabilities
   , WindowControl (..)
+  , WindowOperation (..)
   , WindowReport (..)
   , constraintAspectRatio
   , constraintCallOrder
   , constraintMaximum
   , constraintMinimum
+  , controlEligibility
   , controlOperation
   , controlOperationText
   , operationGap
   , reportable
   , validateControl
   )
+import Hetoimasia.GLFW.Internal.Mode
+  ( AppliedMode (..)
+  , ModeAttemptFailure (..)
+  , ModeAttemptKind (..)
+  , ModeFailure (..)
+  , ModeOutcome (..)
+  , ModePlan (..)
+  , ModeRecord
+  , ModeRejection (..)
+  , ModeRequest
+  , ModeRequirement (..)
+  , ModeResult (..)
+  , ModeStep (..)
+  , NativeConstraints (..)
+  , StartupMode
+  , appliedPresentation
+  , borderlessPlacement
+  , borderlessPlan
+  , deriveApplied
+  , effectiveConstraints
+  , fallbackAttempts
+  , fullscreenPlan
+  , inertRequest
+  , initialModeRecord
+  , modeApplied
+  , modeFallback
+  , modeMonitor
+  , modePresentation
+  , modeRequest
+  , modeRequested
+  , modeSavedPlacement
+  , modeVideoPreference
+  , pruneClaims
+  , recordApplied
+  , recordSaved
+  , recordSettled
+  , requestedFallback
+  , requestedMode
+  , reserveClaim
+  , savedPlacement
+  , selectVideoMode
+  , settleClaims
+  , disposeClaims
+  , startupRequest
+  , startupRequirement
+  , validateRequest
+  , windowedPlacement
+  , windowedPlan
+  )
+import Hetoimasia.GLFW.Internal.Monitor (MonitorId, MonitorResult (..), NativeMonitor, inventoryMonitors, monitorIdentity)
 import Hetoimasia.GLFW.Internal.Capture
   ( NativeError (..)
   , Reports (..)
@@ -361,14 +494,20 @@ import Hetoimasia.GLFW.Internal.Session
   , WindowCallbacks (..)
   , WindowHint (..)
   , createWindowOperation
+  , currentSessionMonitors
   , destroyWindowOperation
   , glfwComponent
+  , identifyWindowMonitor
+  , liveMonitors
   , nextWindowIdentity
   , ownerOperation
   , poisonSession
   , raiseReported
+  , refreshMonitors
   , requireUnpoisoned
+  , resolveMonitorPointer
   , sessionCapture
+  , sessionClaims
   , sessionIdentity
   , sessionNative
   , sessionWindowCapabilities
@@ -392,12 +531,15 @@ data WindowConfig = WindowConfig
     -- ^ Whether a window shown at creation requests input focus.
   , windowFocusOnShow ∷ !Bool
     -- ^ Whether showing the window later requests input focus.
+  , windowStartupMode ∷ !(Maybe StartupMode)
+    -- ^ A mode the window transitions to during creation, after its initial
+    -- observation seeded its saved placement.
   }
   deriving (Eq, Show)
 
 instance NFData WindowConfig where
-  rnf (WindowConfig title width height visible focused focusOnShow) =
-    rnf title `seq` rnf width `seq` rnf height `seq` rnf visible `seq` rnf focused `seq` rnf focusOnShow
+  rnf (WindowConfig title width height visible focused focusOnShow startup) =
+    rnf title `seq` rnf width `seq` rnf height `seq` rnf visible `seq` rnf focused `seq` rnf focusOnShow `seq` rnf startup
 
 -- | A shown window that takes focus, of the given title and logical size.
 defaultWindowConfig ∷ Text → Int → Int → WindowConfig
@@ -409,6 +551,7 @@ defaultWindowConfig title width height =
     , windowVisible = True
     , windowFocused = True
     , windowFocusOnShow = True
+    , windowStartupMode = Nothing
     }
 
 -- | The test configuration: hidden, not focused, and not focused when shown.
@@ -532,6 +675,9 @@ data WindowObservation = WindowObservation
   , obsMaximized ∷ !(Attribute Bool)
   , obsVisible ∷ !(Attribute Bool)
   , obsCloseRequest ∷ !(Maybe CloseRequest)
+  , obsDecorated ∷ !(Attribute Bool)
+  , obsMonitor ∷ !(Attribute (Maybe MonitorId))
+  , obsMode ∷ !ModeRecord
   }
   deriving (Eq, Show)
 
@@ -549,6 +695,9 @@ instance NFData WindowObservation where
       `seq` rnf (obsMaximized observation)
       `seq` rnf (obsVisible observation)
       `seq` rnf (obsCloseRequest observation)
+      `seq` rnf (obsDecorated observation)
+      `seq` rnf (obsMonitor observation)
+      `seq` rnf (obsMode observation)
 
 -- | The window observed.
 observedWindow ∷ WindowObservation → WindowId
@@ -593,6 +742,23 @@ observedVisible = obsVisible
 observedCloseRequest ∷ WindowObservation → Maybe CloseRequest
 observedCloseRequest = obsCloseRequest
 
+-- | The decoration GLFW holds for the window, which it applies whenever the
+-- window is not on a monitor.
+observedDecorated ∷ WindowObservation → Attribute Bool
+observedDecorated = obsDecorated
+
+-- | The monitor GLFW reports a fullscreen window on: 'Observed' 'Nothing' for a
+-- window on no monitor, and 'Unavailable' for a monitor no current identity
+-- names.
+observedFullscreenMonitor ∷ WindowObservation → Attribute (Maybe MonitorId)
+observedFullscreenMonitor = obsMonitor
+
+-- | The owner's mode record as of this observation: the requested mode, the
+-- applied mode reconciled from what was sampled, the saved windowed placement,
+-- and the last outcome.
+observedMode ∷ WindowObservation → ModeRecord
+observedMode = obsMode
+
 -- ---------------------------------------------------------------------------
 -- Windows
 
@@ -631,9 +797,14 @@ windowEnded window = not <$> readIORef (windowLive window)
 -- | The owner's current observation and the last close request number issued.
 data OwnerState = OwnerState !WindowObservation !Natural
 
--- | What the owner knows about the window's active size constraints, and whether
--- its mode transition marker is set.
-data ControlState = ControlState !ConstraintState !Bool
+-- | What the owner knows about the window's preserved windowed constraints, what
+-- the native constraints hold relative to them, and whether its mode transition
+-- marker is set.
+data ControlState = ControlState
+  { stateWindowed ∷ !ConstraintState
+  , stateNative ∷ !NativeConstraints
+  , stateTransition ∷ !Bool
+  }
 
 -- | What the callbacks recorded since the last boundary took it.
 data Captures = Captures
@@ -669,6 +840,8 @@ data Sample = Sample
   , sampleIconified ∷ !(Attribute Bool)
   , sampleMaximized ∷ !(Attribute Bool)
   , sampleVisible ∷ !(Attribute Bool)
+  , sampleDecorated ∷ !(Attribute Bool)
+  , sampleMonitor ∷ !(Attribute (Maybe MonitorId))
   }
 
 synchronizeOperation, sampleOperation, attachOperation, detachOperation ∷ Operation
@@ -698,7 +871,7 @@ windowAssembly session config = do
       identifiers = windowIdentifiers identity
   live ← restoredStep (newIORef True)
   captures ← restoredStep (newIORef noCaptures)
-  control ← restoredStep (newIORef (ControlState (ConstraintsKnown Nothing) False))
+  control ← restoredStep (newIORef (ControlState (ConstraintsKnown Nothing) NativeFollowsWindowed False))
   certain ← restoredStep (newIORef True)
   failed ← restoredStep (newIORef False)
   storage ←
@@ -726,7 +899,12 @@ windowAssembly session config = do
   sample ← restoredStep (ownerOperation session sampleOperation identifiers (sampleAll session identifiers handle))
   pending ← restoredStep (takeCaptures captures)
   restoredStep (raiseFault identity pending)
-  let (initial, issued) = reconciled identity (Just sample) pending (blankObservation identity sample) 0
+  monitors ← restoredStep (currentSessionMonitors session)
+  let seeded = case (samplePlacement sample, sampleLogical sample) of
+        (Observed position, Observed extent) → Just (savedPlacement position extent)
+        _ → Nothing
+      record = initialModeRecord (deriveApplied monitors (sampleMonitor sample) (sampleDecorated sample) (samplePlacement sample)) seeded
+      (initial, issued) = reconciled identity (Just sample) pending (blankObservation identity sample record) 0
   prepared ← restoredStep (prepare initial)
   ownerState ← restoredStep (newIORef (OwnerState initial issued))
   publisher ←
@@ -734,24 +912,27 @@ windowAssembly session config = do
       "glfw window observations"
       (releaseRank 3)
       (newSnapshot prepared)
-      (closeObservations live certain failed ownerState)
-  pure
-    Window
-      { windowSession = session
-      , windowId = identity
-      , windowHandle = handle
-      , windowLive = live
-      , windowCaptures = captures
-      , windowOwnerState = ownerState
-      , windowControl = control
-      , windowPublisher = publisher
-      }
+      (closeObservations session local live certain failed ownerState)
+  let window =
+        Window
+          { windowSession = session
+          , windowId = identity
+          , windowHandle = handle
+          , windowLive = live
+          , windowCaptures = captures
+          , windowOwnerState = ownerState
+          , windowControl = control
+          , windowPublisher = publisher
+          }
+  forM_ (windowStartupMode config) $ \startup →
+    restoredStep (void (transitionAt window (startupRequirement startup) (startupRequest startup)))
+  pure window
   where
     native = sessionNative session
     titled = [("title", windowTitle config)]
 
-blankObservation ∷ WindowId → Sample → WindowObservation
-blankObservation identity sample =
+blankObservation ∷ WindowId → Sample → ModeRecord → WindowObservation
+blankObservation identity sample record =
   WindowObservation
     { obsWindow = identity
     , obsRevision = 0
@@ -765,6 +946,9 @@ blankObservation identity sample =
     , obsMaximized = sampleMaximized sample
     , obsVisible = sampleVisible sample
     , obsCloseRequest = Nothing
+    , obsDecorated = sampleDecorated sample
+    , obsMonitor = sampleMonitor sample
+    , obsMode = record
     }
 
 createNative ∷ Session → Request → [(Text, Text)] → IO (Ptr NativeWindow, Reports)
@@ -851,11 +1035,13 @@ freeStorage session certain storage = do
     then nativeFreeWindowCallbacks (sessionNative session) storage
     else poisonSession session
 
-closeObservations ∷ IORef Bool → IORef Bool → IORef Bool → IORef OwnerState → SnapshotPublisher WindowObservation → IO ()
-closeObservations live certain failed ownerState publisher = do
+closeObservations
+  ∷ Session → Natural → IORef Bool → IORef Bool → IORef Bool → IORef OwnerState → SnapshotPublisher WindowObservation → IO ()
+closeObservations session local live certain failed ownerState publisher = do
   atomicWriteIORef live False
   safe ← readIORef certain
   failing ← readIORef failed
+  atomicModifyIORef' (sessionClaims session) (\claims → (disposeClaims local (safe && not failing) claims, ()))
   OwnerState current issued ← readIORef ownerState
   let final =
         current
@@ -981,7 +1167,13 @@ sampleAll session identifiers handle =
     <*> gated IconifiedReport (nativeWindowAttribute native handle IconifiedAttribute)
     <*> gated MaximizedReport (nativeWindowAttribute native handle MaximizedAttribute)
     <*> gated VisibleReport (nativeWindowAttribute native handle VisibleAttribute)
+    <*> sampled (nativeWindowAttribute native handle DecoratedAttribute)
+    <*> (sampled (nativeWindowMonitor native handle) >>= identified)
   where
+    identified ∷ Attribute (Ptr NativeMonitor) → IO (Attribute (Maybe MonitorId))
+    identified = \case
+      Observed pointer → identifyWindowMonitor session pointer
+      Unavailable → pure Unavailable
     native = sessionNative session
     capture = sessionCapture session
     gated ∷ WindowReport → IO a → IO (Attribute a)
@@ -1036,6 +1228,8 @@ reconciled identity sample pending current issued =
           , obsIconified = sampleIconified taken
           , obsMaximized = sampleMaximized taken
           , obsVisible = sampleVisible taken
+          , obsDecorated = sampleDecorated taken
+          , obsMonitor = sampleMonitor taken
           }
 
 -- | Fold the latched captures, and a sample if one was taken, into the current
@@ -1060,10 +1254,17 @@ reconcileWindow = reconcileWith False
 -- | 'reconcileWindow', publishing a new revision even when nothing changed if
 -- @forced@ holds.
 reconcileWith ∷ Bool → IO () → Window → Maybe Sample → IO ()
-reconcileWith forced interruption window sample = do
+reconcileWith forced = reconcileAdjusted forced id
+
+-- | 'reconcileWith', applying @adjust@ to the folded observation before it is
+-- compared and prepared: how a transition publishes its mode record beside the
+-- sample it was reconciled with.
+reconcileAdjusted ∷ Bool → (WindowObservation → WindowObservation) → IO () → Window → Maybe Sample → IO ()
+reconcileAdjusted forced adjust interruption window sample = do
   pending ← readIORef (windowCaptures window)
   OwnerState current issued ← readIORef (windowOwnerState window)
-  let (folded, issued') = reconciled (windowId window) sample pending current issued
+  let (reconciledObservation, issued') = reconciled (windowId window) sample pending current issued
+      folded = adjust reconciledObservation
       signalled = capturedRefresh pending || capturedCloses pending > 0
       next = folded {obsRevision = obsRevision current + 1}
   prepared ← if forced || folded /= current || signalled then Just <$> prepare next else pure Nothing
@@ -1081,7 +1282,7 @@ reconcileWith forced interruption window sample = do
         else (latched, False)
     when cleared $ forM_ prepared (commitObservation window next issued')
     pure cleared
-  unless committed (reconcileWith forced interruption window sample)
+  unless committed (reconcileAdjusted forced adjust interruption window sample)
 
 -- | Publish a prepared observation and record it as the owner's current one.
 -- The caller must be masked: neither write is interruptible, so the two cannot
@@ -1214,13 +1415,15 @@ controlWindow window control =
     reconcileWindow (pure ()) window Nothing
     raiseLatchedFault window
     OwnerState current _ ← readIORef (windowOwnerState window)
-    ControlState constraints transition ← readIORef (windowControl window)
-    decide current constraints transition
+    ControlState windowed native transition ← readIORef (windowControl window)
+    decide current (effectiveConstraints native windowed) transition
   where
     wanted = controlOperation control
     decide current constraints transition
       | obsPhase current /= WindowOpen = pure ControlWindowClosing
       | transition = pure (ControlRefused ModeTransitionInProgress)
+      | Left rejected ← controlEligibility (appliedPresentation (modeApplied (obsMode current))) wanted =
+          pure (ControlRefused rejected)
       | Just reason ← operationGap (sessionWindowCapabilities (windowSession window)) wanted =
           pure (ControlUnsupported wanted reason)
       | Left rejected ← validateControl constraints (obsLogical current) control =
@@ -1282,9 +1485,15 @@ applyConstraints window constraints = do
         (\(AspectRatio numerator denominator) → (fromIntegral numerator, fromIntegral denominator))
           <$> constraintAspectRatio constraints
 
+-- | Record the preserved windowed constraints an ordinary update established,
+-- which the native constraints then follow.
 setConstraintState ∷ Window → ConstraintState → IO ()
 setConstraintState window state =
-  atomicModifyIORef' (windowControl window) (\(ControlState _ transition) → (ControlState state transition, ()))
+  atomicModifyIORef' (windowControl window) (\current → (current {stateWindowed = state, stateNative = NativeFollowsWindowed}, ()))
+
+setNativeConstraints ∷ Window → NativeConstraints → IO ()
+setNativeConstraints window native =
+  atomicModifyIORef' (windowControl window) (\current → (current {stateNative = native}, ()))
 
 -- | The reports made on the owner thread during one native call.
 reportsDuring ∷ Session → IO () → IO Reports
@@ -1310,11 +1519,339 @@ postCallObservation window =
       pure (PostCallRevision (obsRevision current))
 
 -- | Set or clear the window's mode transition marker: the private, owner-internal
--- state ordinary controls are refused under while it is set. No public command
--- sets it; a mode transition is its only intended producer.
+-- state ordinary controls and other transitions are refused under while it is
+-- set. A transition sets it for its interval, and the seam's private driver
+-- sets it in the CPU examples; no public command does.
 setModeTransition ∷ Window → Bool → IO ()
 setModeTransition window transition =
-  atomicModifyIORef' (windowControl window) (\(ControlState constraints _) → (ControlState constraints transition, ()))
+  atomicModifyIORef' (windowControl window) (\current → (current {stateTransition = transition}, ()))
+
+-- ---------------------------------------------------------------------------
+-- Window modes
+
+transitionOperation, windowedFallbackOperation, reconcileModeOperation, restoreConstraintsOperation ∷ Operation
+transitionOperation = operation "transition window mode"
+windowedFallbackOperation = operation "fall back to windowed mode"
+reconcileModeOperation = operation "reconcile window mode"
+restoreConstraintsOperation = operation "restore window constraints"
+
+-- | Execute an optional mode request at an owner boundary, under the module's
+-- window mode contract. An ended window answers 'WindowEnded' without a native
+-- call. A callback fault rethrown at a boundary, a native call that raises
+-- instead of returning, a native failure a monitor refresh raises, and
+-- cancellation propagate.
+transitionWindow ∷ Window → ModeRequest → IO (WindowResult ModeResult)
+transitionWindow window = transitionAt window ModeOptional
+
+transitionAt ∷ Window → ModeRequirement → ModeRequest → IO (WindowResult ModeResult)
+transitionAt window requirement request =
+  atBoundary (pure ()) window transitionOperation $ do
+    reconcileWindow (pure ()) window Nothing
+    raiseLatchedFault window
+    OwnerState current _ ← readIORef (windowOwnerState window)
+    ControlState _ _ transition ← readIORef (windowControl window)
+    decide current transition
+  where
+    decide current transition
+      | obsPhase current /= WindowOpen = pure ModeWindowClosing
+      | transition = pure (ModeRefused TransitionAlreadyInProgress)
+      | Left rejected ← validateRequest request = case requirement of
+          ModeRequired →
+            throwFailure
+              glfwComponent
+              transitionOperation
+              (windowIdentifiers (windowId window))
+              (ModeAttemptFailure TargetAttempt (RefusedBeforeMutation rejected))
+          ModeOptional → pure (ModeRefused rejected)
+      | otherwise = runTransition window requirement request TargetAttempt
+
+-- | Run a validated request, with the marker set, starting from the given
+-- attempt.
+runTransition ∷ Window → ModeRequirement → ModeRequest → ModeAttemptKind → IO ModeResult
+runTransition window requirement request first =
+  bracket_ (setModeTransition window True) (setModeTransition window False) $ do
+    _ ← samplePresentation False window id
+    OwnerState current _ ← readIORef (windowOwnerState window)
+    ControlState _ native _ ← readIORef (windowControl window)
+    monitors ← currentSessionMonitors (windowSession window)
+    let inert =
+          first == TargetAttempt
+            && inertRequest (obsMode current) native monitors (obsPlacement current) (obsLogical current) (requestedMode request)
+    outcome ← if inert then pure ModeInert else recovering window requirement request first
+    case outcome of
+      ModeFailed [ModeAttemptFailure TargetAttempt (RefusedBeforeMutation rejection)]
+        | withoutFallback → pure (ModeRefused rejection)
+      ModeFailed [ModeAttemptFailure TargetAttempt (UnsupportedTarget reason)]
+        | withoutFallback → pure (ModeUnsupported reason)
+      _ → ModeSettled outcome <$> samplePresentation True window (recordSettled request outcome)
+  where
+    withoutFallback = fallbackAttempts (requestedFallback request) == 0
+
+-- | Attempt the request under the recovery boundary, turning its result into an
+-- outcome. Cancellation, and anything a required request does not recover,
+-- propagates.
+recovering ∷ Window → ModeRequirement → ModeRequest → ModeAttemptKind → IO ModeOutcome
+recovering window requirement request first = do
+  recovered ∷ Either (ExceptionWithContext SomeException) (Recovery.Outcome (ModeAttemptKind, [ModeStep])) ←
+    tryWithContext (Recovery.recover transitionOperation policy (modeAttempt window request first))
+  case recovered of
+    Right (Recovery.Available available) →
+      let (kind, steps) = Recovery.recoveredValue available
+       in pure (ModeApplied kind steps (attemptFailures (Recovery.recoveredFailures available)))
+    Right (Recovery.Unavailable unavailable) →
+      pure (ModeFailed (attemptFailures (Recovery.unavailableEarlier unavailable <> [Recovery.unavailableReason unavailable])))
+    Left caught@(ExceptionWithContext context raised)
+      | requirement == ModeOptional
+      , Nothing ← (fromException raised ∷ Maybe SomeAsyncException) →
+          case cleanupFailuresInContext context of
+            [] → maybe (rethrowIO caught) (\latest → pure (ModeFailed (earlier context <> [latest]))) (fromException raised)
+            cleanups → pure (ModeRecoveryStopped (earlier context <> maybeToList (fromException raised)) (cleanupReports cleanups))
+      | otherwise → rethrowIO caught
+  where
+    fallback = requestedFallback request
+    earlier context = concatMap (attemptFailures . Recovery.historyAttempts) (take 1 (Recovery.recoveryHistoryInContext context))
+    policy =
+      Recovery.RecoveryPolicy
+        { Recovery.policyDisposition = case requirement of
+            ModeRequired → Recovery.Required
+            ModeOptional → Recovery.Optional
+        , Recovery.policyBudget = 1 + fallbackAttempts fallback
+        , Recovery.policyClassifier = pure . classify
+        , Recovery.policyWait = const (pure ())
+        }
+    classify attempted = case Recovery.attemptException attempted of
+      ExceptionWithContext _ raised
+        | fallbackAttempts fallback > 0
+        , Just (ModeAttemptFailure _ how) ← fromException raised
+        , recognized how →
+            Just (Recovery.Fallback windowedFallbackOperation (modeAttempt window request WindowedFallbackAttempt))
+      _ → Nothing
+    -- A busy monitor and a transition already in progress are refusals, never
+    -- reasons to move the window.
+    recognized = \case
+      RefusedBeforeMutation TransitionAlreadyInProgress → False
+      RefusedBeforeMutation (MonitorBusy _) → False
+      RefusedBeforeMutation _ → True
+      UnsupportedTarget _ → True
+      StoppedPartway {} → True
+
+attemptFailures ∷ [Recovery.AttemptFailure] → [ModeAttemptFailure]
+attemptFailures = mapMaybe $ \attempted → case Recovery.attemptException attempted of
+  ExceptionWithContext _ raised → fromException raised
+
+-- | The reports of the first cleanup failure that was a native failure.
+cleanupReports ∷ [CleanupFailure] → Reports
+cleanupReports cleanups =
+  fromMaybe (Reports [] 0 0) . listToMaybe $
+    [ nativeReports failure
+    | cleanup ← cleanups
+    , ExceptionWithContext _ raised ← [cleanupFailureException cleanup]
+    , Just failure ← [fromException raised]
+    ]
+
+-- | One complete owned attempt: validate and plan, make the steps, and sample,
+-- answering the steps or failing with a 'ModeAttemptFailure'. Its cleanup
+-- restores the preserved windowed constraints of a window it left windowed
+-- with them suspended.
+modeAttempt ∷ Window → ModeRequest → ModeAttemptKind → IO (ModeAttemptKind, [ModeStep])
+modeAttempt window request kind =
+  withResourceLabelled "glfw window constraint restoration" (pure ()) (\() → restoreLeftWindowed window) $ \() → do
+    OwnerState current _ ← readIORef (windowOwnerState window)
+    ControlState windowed native _ ← readIORef (windowControl window)
+    let record = obsMode current
+        leaving = case (modeApplied record, obsPlacement current, obsLogical current) of
+          (AppliedWindowed, Observed position, Observed extent)
+            | target /= WindowedPresentation → Just (savedPlacement position extent)
+          _ → Nothing
+    (plan, pointer) ← case (target, modeMonitor mode, modeVideoPreference mode) of
+      (BorderlessPresentation, Just monitor, _) → do
+        unsupported BorderlessOperation
+        inventory ← refreshMonitors session
+        description ← maybe (refuse (ModeMonitorDisconnected monitor)) pure (described monitor (inventoryMonitors inventory))
+        placement ← refused (borderlessPlacement description)
+        plan ← refused (borderlessPlan native windowed placement)
+        pure (plan, Nothing)
+      (FullscreenPresentation, Just monitor, Just preference) → do
+        unsupported FullscreenOperation
+        resolveMonitorPointer session monitor >>= \case
+          MonitorDisconnected _ → refuse (ModeMonitorDisconnected monitor)
+          MonitorAvailable (description, resolved) → do
+            (extent, refresh) ← refused (selectVideoMode preference description)
+            live ← liveMonitors session
+            reserved ← atomicModifyIORef' (sessionClaims session) $ \claims →
+              case reserveClaim local monitor (pruneClaims live claims) of
+                Left busy → (claims, Left busy)
+                Right next → (next, Right ())
+            either (refuse . MonitorBusy) pure reserved
+            pure (fullscreenPlan monitor extent refresh, Just resolved)
+      _ → do
+        inventory ← refreshMonitors session
+        placement ← refused (windowedPlacement windowed (modeSavedPlacement record) (inventoryMonitors inventory))
+        plan ← refused (windowedPlan native windowed placement)
+        pure (plan, Nothing)
+    runModeSteps window pointer plan >>= \case
+      Right steps → (kind, steps) <$ samplePresentation True window (maybe id recordSaved leaving)
+      Left failure → samplePresentation True window id >> failWith failure
+  where
+    session = windowSession window
+    local = windowLocalIdentity (windowId window)
+    mode = requestedMode request
+    target = case kind of
+      WindowedFallbackAttempt → WindowedPresentation
+      TargetAttempt → modePresentation mode
+    failWith ∷ ModeFailure → IO a
+    failWith how =
+      throwFailure glfwComponent transitionOperation (windowIdentifiers (windowId window)) (ModeAttemptFailure kind how)
+    refuse ∷ ModeRejection → IO a
+    refuse = failWith . RefusedBeforeMutation
+    refused ∷ Either ModeRejection b → IO b
+    refused = either refuse pure
+    unsupported wanted = mapM_ (failWith . UnsupportedTarget) (operationGap (sessionWindowCapabilities session) wanted)
+    described monitor = \case
+      Observed descriptions → find ((== monitor) . monitorIdentity) descriptions
+      Unavailable → Nothing
+
+-- | Make a plan's steps in order, stopping at the first that reports an error.
+-- The native constraint state is indeterminate from a constraint step's start
+-- until every step has returned.
+runModeSteps ∷ Window → Maybe (Ptr NativeMonitor) → ModePlan → IO (Either ModeFailure [ModeStep])
+runModeSteps window pointer (ModePlan steps after) = go [] steps
+  where
+    native = sessionNative (windowSession window)
+    handle = windowHandle window
+    go returned [] = Right (reverse returned) <$ mapM_ (setNativeConstraints window) after
+    go returned (step : rest) = do
+      when (isJust after && constraintStep step) (setNativeConstraints window NativeIndeterminate)
+      reports ← reportsDuring (windowSession window) (call step)
+      if hasReports reports
+        then pure (Left (StoppedPartway (reverse returned) step rest reports))
+        else go (step : returned) rest
+    constraintStep = \case
+      ClearSizeLimitsStep → True
+      ClearAspectRatioStep → True
+      SizeLimitsStep _ _ → True
+      AspectRatioStep _ → True
+      _ → False
+    call = \case
+      ClearSizeLimitsStep → nativeClearWindowSizeLimits native handle
+      ClearAspectRatioStep → nativeSetWindowAspectRatio native handle Nothing
+      DecorationStep decorated → nativeSetWindowDecorated native handle decorated
+      PlacementStep (Placement x y) (Extent width height) →
+        nativeSetWindowMonitor native handle nullPtr (fromIntegral x) (fromIntegral y) (fromIntegral width) (fromIntegral height) Nothing
+      -- A fullscreen plan always carries the pointer its resolution returned in
+      -- this boundary.
+      MonitorStep _ (Extent width height) refresh →
+        nativeSetWindowMonitor native handle (fromMaybe nullPtr pointer) 0 0 (fromIntegral width) (fromIntegral height) (fromIntegral <$> refresh)
+      SizeLimitsStep lower upper →
+        nativeSetWindowSizeLimits
+          native
+          handle
+          (fromIntegral (extentWidth lower))
+          (fromIntegral (extentHeight lower))
+          (fromIntegral (extentWidth upper))
+          (fromIntegral (extentHeight upper))
+      AspectRatioStep ratio →
+        nativeSetWindowAspectRatio native handle ((\(AspectRatio numerator denominator) → (fromIntegral numerator, fromIntegral denominator)) <$> ratio)
+
+-- | Sample the window, reconcile its applied mode and its monitor claims with
+-- the sample, apply @adjust@ to its mode record, and publish: a new revision even
+-- when nothing changed if @forced@ holds. A sample that reports errors leaves
+-- the applied mode indeterminate and the window's claims uncertain, publishes
+-- the record without a sample, and is answered as data.
+samplePresentation ∷ Bool → Window → (ModeRecord → ModeRecord) → IO PostCallObservation
+samplePresentation forced window adjust =
+  tryWithContext (sampleAll session identifiers (windowHandle window)) >>= \case
+    Left (ExceptionWithContext _ failure) → do
+      settle Unavailable
+      reconcileAdjusted forced (withRecord (adjust . recordApplied AppliedIndeterminate)) (pure ()) window Nothing
+      raiseLatchedFault window
+      pure (PostCallSampleFailed (nativeOutcome failure) (nativeReports failure))
+    Right sample → do
+      monitors ← currentSessionMonitors session
+      settle (sampleMonitor sample)
+      let applied = deriveApplied monitors (sampleMonitor sample) (sampleDecorated sample) (samplePlacement sample)
+      reconcileAdjusted forced (withRecord (adjust . recordApplied applied)) (pure ()) window (Just sample)
+      raiseLatchedFault window
+      OwnerState current _ ← readIORef (windowOwnerState window)
+      pure (PostCallRevision (obsRevision current))
+  where
+    session = windowSession window
+    identifiers = windowIdentifiers (windowId window)
+    settle observed = do
+      live ← liveMonitors session
+      atomicModifyIORef' (sessionClaims session) $ \claims →
+        (settleClaims (windowLocalIdentity (windowId window)) observed (pruneClaims live claims), ())
+    withRecord change observation = observation {obsMode = change (obsMode observation)}
+
+-- | An attempt's cleanup: restore the preserved windowed constraints of a window
+-- left windowed with its native constraints suspended or indeterminate. A call
+-- that reports an error fails the cleanup.
+restoreLeftWindowed ∷ Window → IO ()
+restoreLeftWindowed window = do
+  OwnerState current _ ← readIORef (windowOwnerState window)
+  ControlState windowed native _ ← readIORef (windowControl window)
+  case (modeApplied (obsMode current), native, windowed) of
+    (AppliedWindowed, NativeSuspended, ConstraintsKnown preserved) → restore preserved
+    (AppliedWindowed, NativeIndeterminate, ConstraintsKnown preserved) → restore preserved
+    _ → pure ()
+  where
+    session = windowSession window
+    nativeTable = sessionNative session
+    handle = windowHandle window
+    restore preserved = do
+      setNativeConstraints window NativeIndeterminate
+      mapM_ restoring (calls preserved)
+      setNativeConstraints window NativeFollowsWindowed
+    restoring call = do
+      reports ← reportsDuring session call
+      when (hasReports reports) $
+        throwFailure
+          glfwComponent
+          restoreConstraintsOperation
+          (windowIdentifiers (windowId window))
+          (NativeFailure NativeCallReturned reports)
+    calls = \case
+      Nothing → [nativeClearWindowSizeLimits nativeTable handle, nativeSetWindowAspectRatio nativeTable handle Nothing]
+      Just preserved →
+        [ nativeSetWindowSizeLimits
+            nativeTable
+            handle
+            (fromIntegral (extentWidth (constraintMinimum preserved)))
+            (fromIntegral (extentHeight (constraintMinimum preserved)))
+            (fromIntegral (extentWidth (constraintMaximum preserved)))
+            (fromIntegral (extentHeight (constraintMaximum preserved)))
+        , nativeSetWindowAspectRatio nativeTable handle $
+            (\(AspectRatio numerator denominator) → (fromIntegral numerator, fromIntegral denominator))
+              <$> constraintAspectRatio preserved
+        ]
+
+-- | Reconcile a window's mode after a monitor refresh, at an owner boundary: take
+-- the recorded windowed fallback when the applied mode names an ended monitor
+-- identity, answering its outcome, or resample when there is no fallback or the
+-- applied mode is indeterminate. A closing window, and one inside a transition,
+-- are left alone.
+reconcileWindowMode ∷ Window → IO (WindowResult (Maybe ModeOutcome))
+reconcileWindowMode window =
+  atBoundary (pure ()) window reconcileModeOperation $ do
+    OwnerState current _ ← readIORef (windowOwnerState window)
+    ControlState _ _ transition ← readIORef (windowControl window)
+    live ← liveMonitors (windowSession window)
+    let record = obsMode current
+        ended = any (`notElem` live) (appliedMonitor (modeApplied record))
+    if obsPhase current /= WindowOpen || transition
+      then pure Nothing
+      else
+        if ended && fallbackAttempts (modeFallback record) > 0
+          then
+            runTransition window ModeOptional (modeRequest (modeRequested record) (modeFallback record)) WindowedFallbackAttempt >>= \case
+              ModeSettled outcome _ → pure (Just outcome)
+              _ → pure Nothing
+          else Nothing <$ when (ended || modeApplied record == AppliedIndeterminate) (void (samplePresentation False window id))
+  where
+    appliedMonitor = \case
+      AppliedBorderless monitor → Just monitor
+      AppliedFullscreen monitor → Just monitor
+      _ → Nothing
 
 -- | How an owner turn processes native events.
 data EventProcessing

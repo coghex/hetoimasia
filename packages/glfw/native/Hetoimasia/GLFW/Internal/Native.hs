@@ -48,6 +48,7 @@ module Hetoimasia.GLFW.Internal.Native
   , windowPositionForCheck
   , windowTitleForCheck
   , sizeLimitsForCheck
+  , windowFullscreenForCheck
   , WindowStateForCheck (..)
   , windowStateForCheck
   ) where
@@ -145,6 +146,19 @@ productionNative =
     , nativeIconifyWindow = c_glfwIconifyWindow
     , nativeMaximizeWindow = c_glfwMaximizeWindow
     , nativeRestoreWindow = c_glfwRestoreWindow
+    , nativeWindowMonitor = c_glfwGetWindowMonitor
+    , nativeSetWindowMonitor = \window monitor x y width height refresh →
+        c_glfwSetWindowMonitor
+          window
+          monitor
+          (fromIntegral x)
+          (fromIntegral y)
+          (fromIntegral width)
+          (fromIntegral height)
+          (maybe glfwDontCare fromIntegral refresh)
+    , nativeSetWindowDecorated = \window decorated → c_glfwSetWindowAttrib window glfwDecorated (boolean decorated)
+    , nativeClearWindowSizeLimits = \window →
+        c_glfwSetWindowSizeLimits window glfwDontCare glfwDontCare glfwDontCare glfwDontCare
     , nativeWindowCapabilities = backendWindowCapabilities
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     , nativeMonitor = productionMonitors
@@ -258,6 +272,7 @@ attributeCode FocusedAttribute = glfwFocused
 attributeCode IconifiedAttribute = glfwIconified
 attributeCode MaximizedAttribute = glfwMaximized
 attributeCode VisibleAttribute = glfwVisible
+attributeCode DecoratedAttribute = glfwDecorated
 
 -- | Read a pair a GLFW getter writes through two out-pointers.
 pairOf ∷ Storable c ⇒ (Ptr object → Ptr c → Ptr c → IO ()) → (c → a) → Ptr object → IO (a, a)
@@ -393,12 +408,18 @@ sizeLimitsForCheck window =
   where
     bound value = if value < 0 then Nothing else Just (fromIntegral value)
 
+-- | Whether GLFW reports the window on a monitor now, for the native examples
+-- only.
+windowFullscreenForCheck ∷ Ptr NativeWindow → IO Bool
+windowFullscreenForCheck window = (/= nullPtr) <$> c_glfwGetWindowMonitor window
+
 -- | The window state attributes GLFW reports now, for the native examples only.
 data WindowStateForCheck = WindowStateForCheck
   { checkVisible ∷ Bool
   , checkIconified ∷ Bool
   , checkMaximized ∷ Bool
   , checkFocused ∷ Bool
+  , checkDecorated ∷ Bool
   }
   deriving (Eq, Show)
 
@@ -409,6 +430,7 @@ windowStateForCheck window =
     <*> attribute glfwIconified
     <*> attribute glfwMaximized
     <*> attribute glfwFocused
+    <*> attribute glfwDecorated
   where
     attribute code = (/= glfwFalse) <$> c_glfwGetWindowAttrib window code
 
@@ -524,6 +546,15 @@ foreign import capi safe "hetoimasia_glfw.h glfwMaximizeWindow"
 foreign import capi safe "hetoimasia_glfw.h glfwRestoreWindow"
   c_glfwRestoreWindow ∷ Ptr NativeWindow → IO ()
 
+foreign import capi safe "hetoimasia_glfw.h glfwGetWindowMonitor"
+  c_glfwGetWindowMonitor ∷ Ptr NativeWindow → IO (Ptr NativeMonitor)
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowMonitor"
+  c_glfwSetWindowMonitor ∷ Ptr NativeWindow → Ptr NativeMonitor → CInt → CInt → CInt → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowAttrib"
+  c_glfwSetWindowAttrib ∷ Ptr NativeWindow → CInt → CInt → IO ()
+
 foreign import capi safe "hetoimasia_glfw.h glfwPollEvents"
   c_glfwPollEvents ∷ IO ()
 
@@ -621,6 +652,7 @@ foreign import capi "hetoimasia_glfw.h value GLFW_FOCUS_ON_SHOW" glfwFocusOnShow
 foreign import capi "hetoimasia_glfw.h value GLFW_ICONIFIED" glfwIconified ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_MAXIMIZED" glfwMaximized ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_RESIZABLE" glfwResizable ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_DECORATED" glfwDecorated ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_DONT_CARE" glfwDontCare ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_CONNECTED" glfwConnected ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_DISCONNECTED" glfwDisconnected ∷ CInt
