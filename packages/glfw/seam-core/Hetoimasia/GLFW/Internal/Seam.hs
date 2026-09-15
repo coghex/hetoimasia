@@ -34,6 +34,17 @@
 -- else, a window whose session was not entered over this seam's own native
 -- table.
 --
+-- The seam's private command executor drives the window command protocol of
+-- "Hetoimasia.GLFW.Internal.Command" — admission, FIFO claim, protected
+-- execution and settlement, and closure — over seam windows on the CPU:
+-- 'seamExecuteNext' executes the oldest queued command against the windows it
+-- is given, 'seamExecuteNextInterrupted' delivers an interruption immediately
+-- after the claim, and 'seamExecuteNextScripted' replaces the execution with a
+-- scripted one, for simulated effects and completion data that fails to
+-- prepare. It is a test seam, not a second production executor; with the
+-- admission hooks re-exported beside it, it is private to this package in the
+-- same way as the window drivers.
+--
 -- The seam exposes no native handle and no session or window constructor.
 module Hetoimasia.GLFW.Internal.Seam
   ( -- * Seams
@@ -54,6 +65,15 @@ module Hetoimasia.GLFW.Internal.Seam
   , seamDriveCancelledBeforeCommit
   , seamRejectCloseRequest
   , ForeignSeamWindow (..)
+
+    -- * Executing window commands
+  , ExecutionStep (..)
+  , seamExecuteNext
+  , seamExecuteNextInterrupted
+  , seamExecuteNextScripted
+  , AdmissionHooks (..)
+  , noAdmissionHooks
+  , submitWith
 
     -- * Thread identity
   , asProcessMainThread
@@ -84,6 +104,20 @@ import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr,
 import Hetoimasia.Foundation.Failure (operation)
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
+import Hetoimasia.GLFW.Internal.Command
+  ( AdmissionHooks (..)
+  , CommandOrigin
+  , CommandRejection
+  , CommandResult
+  , ExecutionStep (..)
+  , WindowCommand
+  , WindowCommandHost
+  , commandHostSession
+  , executeCommand
+  , executeNextWith
+  , noAdmissionHooks
+  , submitWith
+  )
 import Hetoimasia.GLFW.Internal.Session
   ( Backend (..)
   , CallbackStorage (CallbackStorage)
@@ -318,6 +352,35 @@ seamRejectCloseRequest ∷ Seam → Window → CloseRequest → IO (WindowResult
 seamRejectCloseRequest seam window request = do
   requireSeamWindow seam window
   rejectCloseRequest window request
+
+-- | Execute the oldest queued command against the given windows, on a host this
+-- seam's session created.
+seamExecuteNext ∷ Seam → WindowCommandHost → [Window] → IO ExecutionStep
+seamExecuteNext seam host = seamExecuteNextInterrupted seam host (pure ())
+
+-- | 'seamExecuteNext', running @afterClaim@ immediately after the claim, inside
+-- the protection that settles an interrupted command.
+seamExecuteNextInterrupted ∷ Seam → WindowCommandHost → IO () → [Window] → IO ExecutionStep
+seamExecuteNextInterrupted seam host afterClaim windows = do
+  requireSeamHost seam host
+  executeNextWith afterClaim host (executeCommand windows)
+
+-- | Claim the oldest queued command and settle it with a scripted execution in
+-- place of the real one, under the same protection.
+seamExecuteNextScripted
+  ∷ Seam
+  → WindowCommandHost
+  → (CommandOrigin → WindowCommand → IO (Either CommandRejection CommandResult))
+  → IO ExecutionStep
+seamExecuteNextScripted seam host work = do
+  requireSeamHost seam host
+  executeNextWith (pure ()) host work
+
+-- | Refuse a host whose session was not entered over this seam's native table.
+requireSeamHost ∷ Seam → WindowCommandHost → IO ()
+requireSeamHost seam host =
+  unless (nativeGuard (sessionNative (commandHostSession host)) == seamGuard seam) $
+    throwIO ForeignSeamWindow
 
 -- | Treat the calling Haskell thread as the process main thread.
 designateProcessMainThread ∷ Seam → IO ()

@@ -9,8 +9,10 @@ initialization and termination, bounded evidence of native error reports, and
 poisoning when teardown cannot finish safely. `Hetoimasia.GLFW.Window` creates
 lexically scoped NoAPI windows in that session, publishes what the platform
 observed through read-only snapshots, contains their native callbacks, and
-releases them when their scopes end. There is no window command, event loop, or
-input operation yet.
+releases them when their scopes end. `Hetoimasia.GLFW.Command` admits prepared
+window commands through bounded ports and reports each through a persistent
+completion ticket; nothing drains them from an event loop yet, and there is no
+input operation.
 
 The package depends on `hetoimasia-foundation`, not on the runtime, and imports
 no game, Lua, logger, or rendering module. Its native handles, foreign imports,
@@ -18,7 +20,8 @@ and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam `hetoimasia-tests` drives without initializing GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
-observation, callback-containment, and release-order rules, is [docs/glfw.md](../../docs/glfw.md).
+observation, callback-containment, release-order, and window command rules, is
+[docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with
 `python3 tools/native/native.py build` and

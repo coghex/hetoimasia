@@ -4,26 +4,27 @@ Current behavior of `hetoimasia-glfw`, the package that owns the native binding
 to upstream GLFW 3.4, the one process-main-thread session over it, and the
 lexically scoped windows created in that session. The accepted direction and
 the later slices live in
-[the GLFW integration design](glfw_integration_design.md) (P-1 to P-5, P-7,
+[the GLFW integration design](glfw_integration_design.md) (P-1 to P-7,
 P-11, D-5, D-6, D-8, D-9, D-11, D-13); this document describes what the code
 does today.
 
 A session is entered, its asynchronous native error reports are read, windows
-are created in it, observed through read-only snapshots, and released when their
-scopes end, and the session ends. There is no window command, event loop, input
-feed, monitor inventory, mode change, close policy, dynamic window collection,
-or rendering operation yet.
+are created in it, observed through read-only snapshots, asked for fresh
+observations through bounded window command ports, and released when their
+scopes end, and the session ends. Nothing drains those ports from an event loop
+yet, and there is no event loop, input feed, monitor inventory, manipulation or
+mode command, close policy, dynamic window collection, or rendering operation.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
-| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session` and `Hetoimasia.GLFW.Window`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session and window models over a table of native operations, and bounded error capture. Binds nothing. |
+| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
+| `hetoimasia-glfw:model` | private | The session and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
-| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks and change close intent |
-| `glfw-window-examples` | executable, test-only | The window model examples that use those drivers. `hetoimasia-tests` runs it. |
+| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks and change close intent, and the private window command executor |
+| `glfw-window-examples` | executable, test-only | The window model and window command examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
 | `glfw-native-check` | test suite | The real session on the platform it runs on |
 
 The package depends on `hetoimasia-foundation` and not on
@@ -103,8 +104,50 @@ closeRequestWindow ∷ CloseRequest → WindowId
 closeRequestNumber ∷ CloseRequest → Natural
 ```
 
-`Session`, `Window`, `WindowObservation`, `WindowId`, and `CloseRequest` are
-exported without their constructors, and observation readers are functions
+```haskell
+-- Hetoimasia.GLFW.Command
+data WindowCommandHost
+newWindowCommandHost ∷ HasCallStack ⇒ Session → Integer → IO WindowCommandHost
+windowCommandPort    ∷ WindowCommandHost → WindowCommandPort
+closeWindowCommands  ∷ WindowCommandHost → STM Natural
+commandStatistics    ∷ WindowCommandHost → STM CommandStatistics
+performWindowCommand ∷ WindowCommandHost → [Window] → WindowCommand → IO Disposition
+data CommandStatistics = CommandStatistics { commandsCapacity, commandsQueued, commandsActive, commandsPending ∷ Natural }
+
+data WindowCommandPort
+submitWindowCommand      ∷ HasCallStack ⇒ WindowCommandPort → [(Text, Text)] → WindowCommand → IO SubmitResult
+awaitSubmitWindowCommand ∷ HasCallStack ⇒ WindowCommandPort → [(Text, Text)] → WindowCommand → IO WaitedSubmission
+data SubmitResult     = SubmitAccepted CompletionTicket | SubmitFull | SubmitClosed
+data WaitedSubmission = WaitAccepted CompletionTicket | WaitClosed
+
+data WindowCommand                           -- Eq, Show, NFData
+observeWindowCommand ∷ WindowId → WindowCommand
+commandWindow        ∷ WindowCommand → WindowId
+
+data RequestId                               -- Eq, Ord, Show
+requestLocalIdentity ∷ RequestId → Natural
+data CommandOrigin                           -- Eq, Show, NFData; read with:
+submittedRequest ∷ CommandOrigin → RequestId
+submittedWindow  ∷ CommandOrigin → WindowId
+submittedAt      ∷ CommandOrigin → Maybe FailureSite
+submittedContext ∷ CommandOrigin → [(Text, Text)]
+
+data CompletionTicket                        -- Eq, Show
+ticketOrigin    ∷ CompletionTicket → CommandOrigin
+pollCompletion  ∷ CompletionTicket → STM (Maybe Disposition)
+awaitCompletion ∷ HasCallStack ⇒ CompletionTicket → IO Disposition
+
+data Disposition      = Performed CommandResult | Rejected CommandRejection | NotExecuted | Interrupted RequestId
+data CommandResult    = ObservationPublished { publishedWindow ∷ WindowId, publishedRevision ∷ Natural }
+data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
+                      | WindowNativeFailure { failedWindow ∷ WindowId, failedOperation ∷ Maybe Text
+                                            , failedOutcome ∷ NativeOutcome, failedReports ∷ Reports }
+data WindowCommandMisuse = OwnerThreadWouldWait
+```
+
+`Session`, `Window`, `WindowObservation`, `WindowId`, `CloseRequest`,
+`WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`, `CommandOrigin`,
+`RequestId`, and `WindowCommand` are exported without their constructors, and observation readers are functions
 rather than record fields, so no client can build or rewrite one. No public
 type holds a native pointer, and the snapshot publisher is never handed out:
 clients receive only the read endpoint. Nothing assumes a single or primary
@@ -114,8 +157,10 @@ Every failure is raised through `throwFailure` with the `glfw` component, the
 operation (`enter session`, `initialize`, `verify backend`, `terminate`,
 `detach error callback`, `take asynchronous reports`, `create window`,
 `sample window`, `attach window callbacks`, `synchronize window`,
-`detach window callbacks`, `destroy window`), and identifiers such as `backend`,
-`title`, or `window`, so `failureEvidence` reads the origin back without a
+`detach window callbacks`, `destroy window`, `new window command host`,
+`submit window command`, `await window command`, `execute window command`,
+`perform window command`), and identifiers such as `backend`, `title`,
+`window`, or `request`, so `failureEvidence` reads the origin back without a
 logger.
 
 ## Entry
@@ -343,8 +388,8 @@ ones are counted.
 Captures are reconciled on the owner thread at an owner boundary: at creation
 after the initial sampling, at `synchronizeWindow` after it samples, and after
 any private owner step's native calls return, whether that call was a setter or
-a poll. The same boundary serves the command service and event loop that
-arrive later. In order, a boundary:
+a poll. An observation request executes through the same boundary, and the
+event loop that arrives later will too. In order, a boundary:
 
 1. runs its native work, taking the reports made during it;
 2. reads the capture latch without clearing it and folds it, then any fresh
@@ -378,7 +423,7 @@ naming the window and a number issued in increasing order per window; several
 requests before one boundary coalesce into the newest. The model's private
 rejection transition clears a request only while it is still the latest, so
 rejecting an older request never erases a newer one. What a request means is the
-application's decision: this slice adds no close policy and no public command.
+application's decision: there is no close policy and no close command.
 
 ### Release
 
@@ -413,6 +458,144 @@ release stayed certain, `WindowReleaseUncertain` otherwise. This happens on
 exceptional teardown as on normal teardown. Readers holding the endpoint can
 still read it and receive `EndOfStream` after it, under the snapshot contract.
 
+## Window commands
+
+`Hetoimasia.GLFW.Command` admits prepared window commands through a bounded
+port, gives each admitted command a persistent completion ticket, and settles
+every one of them exactly once. It composes
+[the bounded FIFO channel](messaging.md#bounded-fifo-channels) and
+[prepared payloads](messaging.md#evaluation-guarantees) and adds the per-request
+completion both deliberately leave out. It is a window-service protocol, not
+generic request/reply machinery. This slice executes queued commands only
+through the test seam's private executor; the owner's event loop drains them in
+GLFW-3.
+
+### Owner, thread, and lifetime
+
+`newWindowCommandHost` checks, before anything else, that it runs on the
+session's owner (`NotSessionOwner`) and that the session is live
+(`SessionEnded`), then creates the host's channel, refusing a capacity
+`newChannel` refuses. The owner keeps the `WindowCommandHost`: closure,
+statistics, and direct performance. Clients receive the `WindowCommandPort`,
+which can only submit, and the tickets their submissions return; any thread may
+hold either. Neither carries a native handle, destruction authority, a channel
+endpoint, or a completion cell. Queued commands are claimed and settled only on
+the owner thread. A host lives while referenced; closing it before the
+session ends is the application's job until the runtime hook that closes
+admission before worker drain arrives with GLFW-4.
+
+### Admission
+
+A `WindowCommand` is an immutable value addressed to one window. Submitting it
+issues a request identity, records a `CommandOrigin` beside it — the request,
+the window, the submission site, and the caller's diagnostic context — and
+prepares the message to normal form on the submitting thread. A failure raised
+while preparing propagates and admits nothing. The submission site is the
+outermost call-stack frame and the whole stack, under the failure module's
+[caller attribution](failures.md#caller-attribution) policy.
+
+`submitWindowCommand` never waits. It answers `SubmitAccepted` with a ticket,
+`SubmitFull` when capacity commands are queued, or `SubmitClosed` once admission
+has ended, and `SubmitClosed` takes precedence. `awaitSubmitWindowCommand` is
+the separate wait for capacity. Cancelling it with an asynchronous exception
+admits nothing, and closure ends it with `WaitClosed`.
+
+The message and its completion cell are added in one transaction: the message
+to the channel, and the cell, keyed by request, to the host's pending map. The
+cell is never inside the message. `SubmitFull`, `SubmitClosed`, a rolled-back
+admission, and a cancellation before that transaction commits leave neither. A
+cancellation after it commits withdraws nothing: the command stays queued and
+settles even if its caller never received the ticket. Request identities are
+never reissued, even for a submission that was not admitted. They identify
+requests and do not order them; order is the order admissions committed.
+
+### Dispositions
+
+| Disposition | When | Effects |
+|---|---|---|
+| `Performed result` | The command was performed or requested from the window system | Applied; `result` was prepared before settlement |
+| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`), or a native call failed first (`WindowNativeFailure`) | None applied |
+| `NotExecuted` | Closure settled it while it was still queued | None |
+| `Interrupted request` | Its execution, or the preparation of its completion data, raised | May have been applied; nothing is replayed or rolled back |
+
+A settled ticket never changes, and an admitted command never disappears. A
+native failure is carried as copied data: the operation that raised it, whether
+the call itself failed, and the reported codes and descriptions. An arbitrary
+Haskell exception is never serialized into a ticket. The ticket names only the
+interrupted request, and the exception propagates from the executor with its
+own type and context.
+
+### Tickets and waiting
+
+`pollCompletion` reads a ticket in `STM` without waiting, as often as desired.
+`awaitCompletion` waits for settlement and may be repeated; cancelling the wait
+affects only the wait, and dropping a ticket cancels nothing. A ticket stays
+readable after its cell has left the host's bookkeeping, and after closure.
+
+The owner thread is the only thread that executes commands, so no public
+operation waits for one there. On the owner thread, `awaitCompletion` of an
+unsettled ticket and `awaitSubmitWindowCommand` on a full host fail with
+`OwnerThreadWouldWait` instead of blocking; a settled ticket answers at once.
+The owner uses `performWindowCommand`, the direct checked execution operation.
+It checks the owner and liveness, involves no queue, cell, or ticket, answers
+`NotExecuted` after closure, and lets a Haskell exception propagate unchanged.
+
+### Execution
+
+An executor claims queued commands in the order their admissions committed. A
+claim receives the command and marks it active in one transaction, and its
+protection begins with the claim, so no interruption can separate them. The
+whole claimed lifetime is protected, including the preparation of completion
+data. If anything raises, synchronous or asynchronous, the command settles as
+`Interrupted` with its request identity before the original exception is
+rethrown with its context. A synchronous failure gains the
+`execute window command` operation context with the `request`, `window`,
+`submitted-at`, and caller-context identifiers, so crossing the queue keeps
+where the request came from while the failure's origin stays at the operation
+that raised it. An asynchronous exception is rethrown unannotated. A settlement
+never replaces a disposition already settled.
+
+The executor protocol is private to the package. This slice drives it through
+the test seam's private executor, which executes queued commands against the
+seam windows it is given, can deliver an interruption immediately after the
+claim, and can replace execution with a scripted step for simulated effects or
+completion data that fails to prepare. It is a test seam, not a second
+production executor.
+
+### The observation request
+
+`observeWindowCommand` is the only command. Executing it synchronizes the
+addressed window at an owner boundary, which samples and publishes under the
+[observation contract](#observations). It completes with
+`ObservationPublished`, naming the revision of the committed observation that
+followed the sample: a new revision if sampling changed anything, and otherwise
+the published observation the sample matched. Publication commits before
+settlement, so a reader that sees the disposition can already read that
+revision. It never samples another window. A window the executor was not given
+is `WindowNotServed`, an ended window is `WindowAlreadyEnded` without a native
+call, and a sampling failure is `WindowNativeFailure` with nothing published.
+A callback fault rethrown at that boundary is not a sampling failure: it
+interrupts the command and propagates.
+
+### Bookkeeping and closure
+
+The pending map holds one cell per queued or active command and nothing else,
+so it never holds more than the capacity plus the commands being executed.
+Settlement writes a cell and removes it in one transaction, and a cell is always
+settled before it is removed. There is no result queue and no request history.
+`commandStatistics` reads the capacity and the queued, active, and pending
+counts in one transaction.
+
+`closeWindowCommands` ends admission and, in the same transaction, settles every
+command still queued at its commit as `NotExecuted` and removes it, returning how
+many it settled. No queued command runs afterwards, every waiter on those
+tickets wakes, blocked capacity waits end with `WaitClosed`, and later
+submissions answer `SubmitClosed`. A command already claimed is active work:
+closure neither waits for it nor reports it unexecuted, and it settles through
+its execution. Closure is finite, never retries, and is idempotent. A raw
+channel close alone would keep the backlog, and a raw abort would discard it
+without settling tickets; there is no abort.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
@@ -430,6 +613,12 @@ still read it and receive `EndOfStream` after it, under the snapshot contract.
 | Observation snapshot | The window | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed at release; never reopened |
 | Window liveness | The window | Release clears it; every operation reads it | Owner; `windowEnded` any | The window | Never set again |
 | Release certainty | The window | Uncertain parts clear it; the storage and observation releases read it | Owner | The window | Read at release |
+| Command channel | The command host | Ports admit; the executor claims; closure drains | Admit: any; claim and close: owner | While referenced | Closed by closure with its backlog settled; never reopened |
+| Pending completion cells | The command host | Admission reserves; settlement and closure remove | Reserve: any; settle: owner | Admission until settlement | Removed at settlement |
+| Active command count | The command host | Claims raise it; settlements lower it | Owner | The host | Zero whenever nothing is executing |
+| Completion cell | Its tickets | Settled once; tickets read | Settle: owner; read: any | While a ticket references it | Never reset |
+| Admission flag | The command host | Closure sets it; direct performance reads it | Owner | The host | Never cleared |
+| Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
 
 The guard holds only occupancy and poison. None of this is application state.
 
@@ -483,12 +672,14 @@ running it.
 
 - **The `GLFW` group** in `hetoimasia-tests` is headless and initializes nothing.
   It proves the session model through the seam, checks the link declarations,
-  and compiles external clients against the package. It also runs the
+  and compiles external clients against the package, including clients refused
+  for naming a command host's, port's, or ticket's constructor or reaching for
+  command execution, and a supported client that submits and awaits a command. It also runs the
   `glfw-window-examples` executable, reached through the suite's
   `build-tool-depends`, and fails with that executable's report if any window
   model example fails. It runs in the `test.engine` validation group.
-- **`glfw-window-examples`** holds the window model examples, as an Hspec
-  executable that initializes no GLFW. They use the seam's private drivers:
+- **`glfw-window-examples`** holds the window model and window command
+  examples, as an Hspec executable that initializes no GLFW. They use the seam's private drivers:
   `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
   owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
   reconciliation's preparation point, and `seamRejectCloseRequest` is the
@@ -497,6 +688,21 @@ running it.
   no package outside `hetoimasia-glfw` can name them; the `GLFW` opacity
   examples compile clients proving it. Each driver also refuses, with
   `ForeignSeamWindow`, a window its own seam did not create.
+- **The window command examples** in the same executable drive the private
+  command executor — `seamExecuteNext`, `seamExecuteNextInterrupted`, and
+  `seamExecuteNextScripted` — and the admission hooks of `submitWith`, both
+  also private to `seam-core`. Without sleeps, they prove immediate
+  `SubmitFull` and `SubmitClosed`; cancellable capacity waits; FIFO claim in
+  committed admission order; one disposition for repeated, cancelled, and
+  owner-thread reads, after removal from the bookkeeping; closure settling queued
+  commands and leaving a claimed one to its execution; interruptions after the
+  claim, after effects, in preparation, and by cancellation, none replayed;
+  bookkeeping bounded by capacity plus active work across repeated cycles;
+  admission rollback and cancellation on both sides of the commit; origin
+  metadata intact across the queue; a native failure as prepared data beside a
+  Haskell exception with its context; owner-thread waits refused rather than
+  blocking; and the observation request settling with a revision published
+  first, while unserved and ended windows are rejected.
 - **`glfw-native-check`** needs a windowing session: Cocoa locally, or an X11
   display. It is not part of `hetoimasia-tests`, the console smoke, or any
   validation group. GLFW-7 owns the display runner and the shared native
