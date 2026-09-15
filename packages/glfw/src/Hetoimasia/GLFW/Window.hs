@@ -5,6 +5,11 @@
 -- is that scope on its own. Any number of windows may be live at once; nothing
 -- here assumes a single or primary window.
 --
+-- 'sessionWindowCapabilities' names what windows cannot do or report on the
+-- session's backend: a control of an unperformable operation settles as
+-- unsupported, and an unreportable attribute is always 'Unavailable'. Windows
+-- are changed through "Hetoimasia.GLFW.Command"'s control commands.
+--
 -- A window publishes one immutable 'WindowObservation' at a time through a
 -- latest-value snapshot, read with 'windowObservations' and the operations of
 -- "Hetoimasia.Foundation.Messaging.Snapshot". Every attribute is what the
@@ -75,10 +80,26 @@ module Hetoimasia.GLFW.Window
   , CloseRequest
   , closeRequestWindow
   , closeRequestNumber
+
+    -- * Capabilities
+  , WindowCapabilities
+  , sessionWindowCapabilities
+  , backendWindowCapabilities
+  , unperformableOperations
+  , unreportableAttributes
+  , WindowOperation (..)
+  , WindowReport (..)
   ) where
 
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite, withScoped)
-import Hetoimasia.GLFW.Internal.Session (Session)
+import Hetoimasia.GLFW.Internal.Control
+  ( WindowCapabilities
+  , WindowOperation (..)
+  , WindowReport (..)
+  , unperformableOperations
+  , unreportableAttributes
+  )
+import Hetoimasia.GLFW.Internal.Session (Session, backendWindowCapabilities, sessionWindowCapabilities)
 import Hetoimasia.GLFW.Internal.Window
   ( Attribute (..)
   , CloseRequest

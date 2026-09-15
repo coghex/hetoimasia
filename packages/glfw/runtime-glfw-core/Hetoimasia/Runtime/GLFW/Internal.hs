@@ -20,6 +20,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , quiesceWindowHost
   , HostActivity (..)
   , hostActivity
+  , hostWindowCapabilities
 
     -- * Windows
   , hostWindowIdentities
@@ -100,9 +101,11 @@ import Hetoimasia.GLFW.Internal.Command
   , nativeRejectionOf
   , newWindowClient
   , newWindowPortHost
+  , controlDisposition
   , observeWindow
   )
-import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents)
+import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
+import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents, sessionWindowCapabilities)
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
   , beginWindowClosing
@@ -329,6 +332,11 @@ hostCommandPort = windowCommandPort . hostCommands
 hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostCommandStatistics = commandStatistics . hostCommands
 
+-- | What the host session's windows cannot do or report on its backend. Any
+-- thread may read it.
+hostWindowCapabilities ∷ WindowHost → WindowCapabilities
+hostWindowCapabilities = sessionWindowCapabilities . hostSession
+
 -- | What the owner loop is doing.
 hostActivity ∷ WindowHost → STM HostActivity
 hostActivity = readTVar . hostActivityState
@@ -550,6 +558,12 @@ executeHostCommand host _ = \case
       Just entry
         | entryClosing entry → completed (Left (WindowIsClosing target))
         | otherwise → Completed <$> borrowWindow host target entry (observeWindow target)
+  ControlWindow target control →
+    readTVarIO (hostEntries host) >>= \entries → case Map.lookup target entries of
+      Nothing → completed (Left (WindowNotServed target))
+      Just entry
+        | entryClosing entry → completed (Left (WindowIsClosing target))
+        | otherwise → Settled <$> borrowWindow host target entry (controlDisposition target control)
   where
     completed = pure . Completed
 

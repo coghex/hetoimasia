@@ -15,6 +15,8 @@
 -- field by field through @hetoimasia_glfw_video_mode_at@, so no structure
 -- layout is assumed, and
 -- every array and string GLFW returns is copied before the operation returns.
+-- The window title getter, used only by the native examples, is reached the
+-- same way through @hetoimasia_glfw_window_title@.
 -- The exceptions to CAPI imports are @glfwSetErrorCallback@, @glfwSetMonitorCallback@, and the window callback setters,
 -- imported with @ccall@: their argument is a function pointer whose C type the
 -- CAPI wrapper cannot spell, and it is passed and returned as a plain pointer.
@@ -42,6 +44,12 @@ module Hetoimasia.GLFW.Internal.Native
   , takeWaitNotedForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
+  , windowSizeForCheck
+  , windowPositionForCheck
+  , windowTitleForCheck
+  , sizeLimitsForCheck
+  , WindowStateForCheck (..)
+  , windowStateForCheck
   ) where
 
 import Control.Exception (onException)
@@ -74,6 +82,7 @@ import Hetoimasia.GLFW.Internal.Session
   , WindowCallbackStorage (WindowCallbackStorage)
   , WindowCallbacks (..)
   , WindowHint (..)
+  , backendWindowCapabilities
   , newGuard
   )
 import System.IO.Unsafe (unsafePerformIO)
@@ -115,6 +124,28 @@ productionNative =
         (/= glfwFalse) <$> c_glfwGetWindowAttrib window (attributeCode attribute)
     , nativePollEvents = c_glfwPollEvents
     , nativeWaitEventsTimeout = c_waitEventsTimeout . CDouble
+    , nativeSetWindowTitle = \window title →
+        ByteString.useAsCString (encodeUtf8 title) (c_glfwSetWindowTitle window)
+    , nativeSetWindowSize = \window width height → c_glfwSetWindowSize window (fromIntegral width) (fromIntegral height)
+    , nativeSetWindowPosition = \window x y → c_glfwSetWindowPos window (fromIntegral x) (fromIntegral y)
+    , nativeSetWindowSizeLimits = \window minimumWidth minimumHeight maximumWidth maximumHeight →
+        c_glfwSetWindowSizeLimits
+          window
+          (fromIntegral minimumWidth)
+          (fromIntegral minimumHeight)
+          (fromIntegral maximumWidth)
+          (fromIntegral maximumHeight)
+    , nativeSetWindowAspectRatio = \window ratio → case ratio of
+        Just (numerator, denominator) → c_glfwSetWindowAspectRatio window (fromIntegral numerator) (fromIntegral denominator)
+        Nothing → c_glfwSetWindowAspectRatio window glfwDontCare glfwDontCare
+    , nativeShowWindow = c_glfwShowWindow
+    , nativeHideWindow = c_glfwHideWindow
+    , nativeFocusWindow = c_glfwFocusWindow
+    , nativeRequestWindowAttention = c_glfwRequestWindowAttention
+    , nativeIconifyWindow = c_glfwIconifyWindow
+    , nativeMaximizeWindow = c_glfwMaximizeWindow
+    , nativeRestoreWindow = c_glfwRestoreWindow
+    , nativeWindowCapabilities = backendWindowCapabilities
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     , nativeMonitor = productionMonitors
     }
@@ -332,6 +363,55 @@ leakResizableHintForCheck = c_glfwWindowHint glfwResizable glfwFalse
 windowResizableForCheck ∷ Ptr NativeWindow → IO Bool
 windowResizableForCheck window = (/= glfwFalse) <$> c_glfwGetWindowAttrib window glfwResizable
 
+-- | The window's logical size as GLFW reports it now, for the native examples
+-- only: the test-only query they compare observations with.
+windowSizeForCheck ∷ Ptr NativeWindow → IO (Int, Int)
+windowSizeForCheck = pairOf c_glfwGetWindowSize fromIntegral
+
+-- | The window's position as GLFW reports it now, for the native examples only.
+windowPositionForCheck ∷ Ptr NativeWindow → IO (Int, Int)
+windowPositionForCheck = pairOf c_glfwGetWindowPos fromIntegral
+
+-- | The title GLFW holds for the window, copied, for the native examples only.
+windowTitleForCheck ∷ Ptr NativeWindow → IO (Maybe Text)
+windowTitleForCheck window = do
+  title ← c_windowTitle window
+  if title == nullPtr then pure Nothing else Just . decodeUtf8Lenient <$> ByteString.packCString title
+
+-- | The size limits the platform itself holds for the window — minimum width and
+-- height, then maximum width and height, 'Nothing' for a bound it does not
+-- hold — for the native examples only. 'Nothing' when they could not be read.
+sizeLimitsForCheck ∷ Ptr NativeWindow → IO (Maybe (Maybe Int, Maybe Int, Maybe Int, Maybe Int))
+sizeLimitsForCheck window =
+  allocaArray 4 $ \limits → do
+    answered ← c_sizeLimitsForCheck window limits
+    if answered == 0
+      then pure Nothing
+      else do
+        [minimumWidth, minimumHeight, maximumWidth, maximumHeight] ← map bound <$> peekArray 4 limits
+        pure (Just (minimumWidth, minimumHeight, maximumWidth, maximumHeight))
+  where
+    bound value = if value < 0 then Nothing else Just (fromIntegral value)
+
+-- | The window state attributes GLFW reports now, for the native examples only.
+data WindowStateForCheck = WindowStateForCheck
+  { checkVisible ∷ Bool
+  , checkIconified ∷ Bool
+  , checkMaximized ∷ Bool
+  , checkFocused ∷ Bool
+  }
+  deriving (Eq, Show)
+
+windowStateForCheck ∷ Ptr NativeWindow → IO WindowStateForCheck
+windowStateForCheck window =
+  WindowStateForCheck
+    <$> attribute glfwVisible
+    <*> attribute glfwIconified
+    <*> attribute glfwMaximized
+    <*> attribute glfwFocused
+  where
+    attribute code = (/= glfwFalse) <$> c_glfwGetWindowAttrib window code
+
 createWindow ∷ Int32 → Int32 → Text → IO (Ptr NativeWindow)
 createWindow width height title =
   ByteString.useAsCString (encodeUtf8 title) $ \native →
@@ -404,6 +484,45 @@ foreign import capi safe "hetoimasia_glfw.h glfwGetWindowAttrib"
 
 foreign import capi safe "hetoimasia_glfw.h glfwSetWindowSize"
   c_glfwSetWindowSize ∷ Ptr NativeWindow → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowTitle"
+  c_glfwSetWindowTitle ∷ Ptr NativeWindow → CString → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_window_title"
+  c_windowTitle ∷ Ptr NativeWindow → IO CString
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_size_limits_for_check"
+  c_sizeLimitsForCheck ∷ Ptr NativeWindow → Ptr CInt → IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowPos"
+  c_glfwSetWindowPos ∷ Ptr NativeWindow → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowSizeLimits"
+  c_glfwSetWindowSizeLimits ∷ Ptr NativeWindow → CInt → CInt → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowAspectRatio"
+  c_glfwSetWindowAspectRatio ∷ Ptr NativeWindow → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwShowWindow"
+  c_glfwShowWindow ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwHideWindow"
+  c_glfwHideWindow ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwFocusWindow"
+  c_glfwFocusWindow ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwRequestWindowAttention"
+  c_glfwRequestWindowAttention ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwIconifyWindow"
+  c_glfwIconifyWindow ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwMaximizeWindow"
+  c_glfwMaximizeWindow ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwRestoreWindow"
+  c_glfwRestoreWindow ∷ Ptr NativeWindow → IO ()
 
 foreign import capi safe "hetoimasia_glfw.h glfwPollEvents"
   c_glfwPollEvents ∷ IO ()
@@ -502,6 +621,7 @@ foreign import capi "hetoimasia_glfw.h value GLFW_FOCUS_ON_SHOW" glfwFocusOnShow
 foreign import capi "hetoimasia_glfw.h value GLFW_ICONIFIED" glfwIconified ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_MAXIMIZED" glfwMaximized ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_RESIZABLE" glfwResizable ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_DONT_CARE" glfwDontCare ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_CONNECTED" glfwConnected ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_DISCONNECTED" glfwDisconnected ∷ CInt
 

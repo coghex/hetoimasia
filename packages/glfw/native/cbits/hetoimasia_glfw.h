@@ -24,6 +24,10 @@ char* hetoimasia_glfw_monitor_name(GLFWmonitor* monitor);
 void* hetoimasia_glfw_video_mode(GLFWmonitor* monitor);
 void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count);
 
+/* glfwGetWindowTitle, returning the pointer type the Haskell import's generated
+ * wrapper declares. GLFW owns the string; the native examples copy it at once. */
+char* hetoimasia_glfw_window_title(GLFWwindow* window);
+
 /* Copy the six fields of modes[index] — width, height, red, green, and blue
  * bits, and refresh rate, in that order — into fields. It calls no GLFW
  * function; the caller supplies an index below the count GLFW reported. */
@@ -33,6 +37,13 @@ void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fie
  * native examples only. GLFW reports the request through the window's close
  * callback and destroys nothing. Call it on the session's owner thread. */
 void hetoimasia_glfw_request_close_for_check(GLFWwindow* window);
+
+/* For the native examples only: the size limits the platform holds for a
+ * window, read back from the platform itself — contentMinSize and contentMaxSize
+ * on Cocoa, WM_NORMAL_HINTS on X11 — into limits as minimum width and height,
+ * then maximum width and height, with -1 for a bound the platform does not
+ * hold. Non-zero when they were read. Call it on the session's owner thread. */
+int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits);
 
 /* The production finite event wait: glfwWaitEventsTimeout, recording which OS
  * thread waits and a sequence number for each wait, which only the native

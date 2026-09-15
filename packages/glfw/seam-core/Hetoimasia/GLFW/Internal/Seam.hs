@@ -4,8 +4,9 @@
 -- This module belongs to the private @seam-core@ sublibrary. No package outside
 -- @hetoimasia-glfw@ can import it. The public "Hetoimasia.GLFW.Seam" re-exports
 -- everything here except the window drivers — 'seamDrive',
--- 'seamDriveCancelledBeforeCommit', and 'seamRejectCloseRequest' — which only
--- the package's own @glfw-window-examples@ executable uses.
+-- 'seamDriveCancelledBeforeCommit', 'seamRejectCloseRequest', and
+-- 'seamSetModeTransition' — which only the package's own
+-- @glfw-window-examples@ executable uses.
 --
 -- A 'Seam' is a native table that initializes nothing. It records every native
 -- operation the session model asks for as a 'NativeCall', answers each from a
@@ -31,7 +32,14 @@
 -- or a poll: 'seamDrive'. 'seamQueueEvents' instead leaves events for the next
 -- poll or finite wait an owner turn makes, which delivers them from inside that
 -- native call. 'seamRejectCloseRequest' is the private close-request
--- transition. None of them is a public command, and none is exported by the
+-- transition, and 'seamSetModeTransition' sets or clears the window's private
+-- mode transition marker, which only a mode transition would otherwise set.
+--
+-- Every ordinary control call the window model makes is recorded — its window
+-- key and its arguments in native types — and runs the script's
+-- 'scriptWindowControl' step, which may report errors. The script's
+-- 'scriptWindowCapabilities' describes what windows cannot do or report on the
+-- session's backend, so an example can model a platform no session selects. None of them is a public command, and none is exported by the
 -- public seam. Each also refuses, with 'ForeignSeamWindow' and before anything
 -- else, a window whose session was not entered over this seam's own native
 -- table.
@@ -90,6 +98,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , seamDriveCancelledBeforeCommit
   , seamQueueEvents
   , seamRejectCloseRequest
+  , seamSetModeTransition
   , ForeignSeamWindow (..)
 
     -- * Executing window commands
@@ -131,6 +140,7 @@ import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr,
 import Hetoimasia.Foundation.Failure (operation)
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
+import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
 import Hetoimasia.GLFW.Internal.Command
   ( AdmissionHooks (..)
   , CommandOrigin
@@ -165,6 +175,7 @@ import Hetoimasia.GLFW.Internal.Session
   , WindowCallbackStorage (WindowCallbackStorage)
   , WindowCallbacks (..)
   , WindowHint (..)
+  , backendWindowCapabilities
   , newGuard
   , sessionAssembly
   , sessionNative
@@ -174,6 +185,7 @@ import Hetoimasia.GLFW.Internal.Window
   , Window
   , WindowResult
   , rejectCloseRequest
+  , setModeTransition
   , windowNativeHandle
   , windowSession
   , windowStepWith
@@ -215,6 +227,21 @@ data NativeCall
   | QueryPrimaryMonitor
   | QueryMonitor Int MonitorQuery
     -- ^ A query targeting the monitor at a scripted address.
+  | SetWindowTitle Int Text
+    -- ^ An ordinary control of the window with this key, and each below.
+  | SetWindowSize Int Int32 Int32
+  | SetWindowPosition Int Int32 Int32
+  | SetWindowSizeLimits Int Int32 Int32 Int32 Int32
+    -- ^ Minimum width and height, then maximum width and height.
+  | SetWindowAspectRatio Int (Maybe (Int32, Int32))
+    -- ^ 'Nothing' clears the ratio.
+  | ShowWindow Int
+  | HideWindow Int
+  | FocusWindow Int
+  | RequestWindowAttention Int
+  | IconifyWindow Int
+  | MaximizeWindow Int
+  | RestoreWindow Int
   deriving (Eq, Show)
 
 -- | Which monitor query was made.
@@ -335,6 +362,10 @@ data SeamScript = SeamScript
     -- ^ Runs inside each query targeting a monitor, before it answers.
   , scriptMonitorEnumeration ∷ Reporter → IO ()
     -- ^ Runs inside each enumeration, before it answers.
+  , scriptWindowControl ∷ NativeCall → Reporter → IO ()
+    -- ^ Runs inside each ordinary control call, given the call as recorded.
+  , scriptWindowCapabilities ∷ Backend → WindowCapabilities
+    -- ^ What windows cannot do or report on the session's backend.
   }
 
 -- | A platform supporting X11 on which every step succeeds silently.
@@ -361,6 +392,8 @@ defaultScript =
     , scriptMonitorTopology = noMonitors
     , scriptMonitorQuery = \_ _ _ → pure ()
     , scriptMonitorEnumeration = \_ → pure ()
+    , scriptWindowControl = \_ _ → pure ()
+    , scriptWindowCapabilities = backendWindowCapabilities
     }
 
 -- | The code the scripted library reports for a property it cannot provide.
@@ -551,6 +584,13 @@ seamRejectCloseRequest seam window request = do
   requireSeamWindow seam window
   rejectCloseRequest window request
 
+-- | Set or clear the window's private mode transition marker, on a window this
+-- seam created.
+seamSetModeTransition ∷ Seam → Window → Bool → IO ()
+seamSetModeTransition seam window transition = do
+  requireSeamWindow seam window
+  setModeTransition window transition
+
 -- | Execute the oldest queued command against the given windows, on a host this
 -- seam's session created.
 seamExecuteNext ∷ Seam → WindowCommandHost → [Window] → IO ExecutionStep
@@ -707,6 +747,20 @@ seamNative seam =
         record (WaitEvents seconds)
         scriptWaitEvents script seconds reporter
         deliverQueued
+    , nativeSetWindowTitle = \handle title → control (SetWindowTitle (windowKey handle) title)
+    , nativeSetWindowSize = \handle width height → control (SetWindowSize (windowKey handle) width height)
+    , nativeSetWindowPosition = \handle x y → control (SetWindowPosition (windowKey handle) x y)
+    , nativeSetWindowSizeLimits = \handle minimumWidth minimumHeight maximumWidth maximumHeight →
+        control (SetWindowSizeLimits (windowKey handle) minimumWidth minimumHeight maximumWidth maximumHeight)
+    , nativeSetWindowAspectRatio = \handle ratio → control (SetWindowAspectRatio (windowKey handle) ratio)
+    , nativeShowWindow = control . ShowWindow . windowKey
+    , nativeHideWindow = control . HideWindow . windowKey
+    , nativeFocusWindow = control . FocusWindow . windowKey
+    , nativeRequestWindowAttention = control . RequestWindowAttention . windowKey
+    , nativeIconifyWindow = control . IconifyWindow . windowKey
+    , nativeMaximizeWindow = control . MaximizeWindow . windowKey
+    , nativeRestoreWindow = control . RestoreWindow . windowKey
+    , nativeWindowCapabilities = scriptWindowCapabilities script
     , nativeFeatureUnavailable = featureUnavailableCode
     , nativeMonitor =
         MonitorNative
@@ -744,6 +798,9 @@ seamNative seam =
           }
     }
   where
+    control call = do
+      record call
+      scriptWindowControl script call reporter
     deliverQueued = do
       atomicModifyIORef' (seamQueuedEvents seam) (\queued → ([], queued))
         >>= mapM_ (uncurry (deliverTo seam))

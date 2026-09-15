@@ -143,6 +143,10 @@ module Hetoimasia.GLFW.Internal.Session
   , reconcileMonitorEvents
   , withResolvedMonitor
 
+    -- * Window capabilities
+  , sessionWindowCapabilities
+  , backendWindowCapabilities
+
     -- * What window operations share with the session
   , WindowAttribute (..)
   , WindowCallbacks (..)
@@ -207,6 +211,13 @@ import Hetoimasia.GLFW.Internal.Capture
   , settleStrayOwnerReports
   , takeOtherReports
   , takeOwnerReports
+  )
+import Hetoimasia.GLFW.Internal.Control
+  ( WindowCapabilities
+  , WindowOperation (..)
+  , WindowReport (..)
+  , fullWindowCapabilities
+  , windowCapabilities
   )
 import Hetoimasia.GLFW.Internal.Monitor
   ( MonitorDescription
@@ -351,6 +362,24 @@ data Native = Native
   , nativeWaitEventsTimeout ∷ Double → IO ()
     -- ^ Wait at most this many seconds for an event, then process every
     -- pending event.
+  , nativeSetWindowTitle ∷ Ptr NativeWindow → Text → IO ()
+  , nativeSetWindowSize ∷ Ptr NativeWindow → Int32 → Int32 → IO ()
+    -- ^ The content area's logical width and height.
+  , nativeSetWindowPosition ∷ Ptr NativeWindow → Int32 → Int32 → IO ()
+    -- ^ The content area's upper-left corner in desktop screen coordinates.
+  , nativeSetWindowSizeLimits ∷ Ptr NativeWindow → Int32 → Int32 → Int32 → Int32 → IO ()
+    -- ^ The minimum width and height, then the maximum width and height.
+  , nativeSetWindowAspectRatio ∷ Ptr NativeWindow → Maybe (Int32, Int32) → IO ()
+    -- ^ A numerator and denominator; 'Nothing' clears the ratio.
+  , nativeShowWindow ∷ Ptr NativeWindow → IO ()
+  , nativeHideWindow ∷ Ptr NativeWindow → IO ()
+  , nativeFocusWindow ∷ Ptr NativeWindow → IO ()
+  , nativeRequestWindowAttention ∷ Ptr NativeWindow → IO ()
+  , nativeIconifyWindow ∷ Ptr NativeWindow → IO ()
+  , nativeMaximizeWindow ∷ Ptr NativeWindow → IO ()
+  , nativeRestoreWindow ∷ Ptr NativeWindow → IO ()
+  , nativeWindowCapabilities ∷ Backend → WindowCapabilities
+    -- ^ What windows cannot do or report on a backend.
   , nativeFeatureUnavailable ∷ !Int
     -- ^ The error code a query reports for a property this platform cannot
     -- provide: @GLFW_FEATURE_UNAVAILABLE@.
@@ -386,11 +415,39 @@ data Session = Session
     -- that native ownership and callback registration ended safely.
   , sessionMonitors ∷ !Monitors
     -- ^ The monitor inventory, its identities, and its callback's latch.
+  , sessionCapabilities ∷ !WindowCapabilities
+    -- ^ What windows cannot do or report on the selected backend.
   }
 
 -- | The backend the session initialized.
 sessionBackend ∷ Session → Backend
 sessionBackend = sessionSelected
+
+-- | What windows in the session cannot do or report on its backend. Any thread
+-- may ask; it never changes during the session.
+sessionWindowCapabilities ∷ Session → WindowCapabilities
+sessionWindowCapabilities = sessionCapabilities
+
+-- | What GLFW 3.4 windows cannot do or report on a backend. X11 and Cocoa
+-- perform every ordinary control and report every attribute a window observes.
+-- Wayland, which no session selects, is described anyway so its restrictions
+-- stay explicit rather than emulated: it gives clients no global position to set
+-- or read, lets only the compositor move input focus, and reports no reliable
+-- iconified state.
+backendWindowCapabilities ∷ Backend → WindowCapabilities
+backendWindowCapabilities = \case
+  Wayland →
+    windowCapabilities
+      [ (SetPositionOperation, noGlobalPosition)
+      , (FocusOperation, "Wayland lets only the compositor move input focus")
+      ]
+      [ (PlacementReport, noGlobalPosition)
+      , (IconifiedReport, "Wayland reports no reliable iconified state")
+      ]
+  X11 → fullWindowCapabilities
+  Cocoa → fullWindowCapabilities
+  where
+    noGlobalPosition = "Wayland gives clients no global window position"
 
 -- | Misuse rejected before any native state changes.
 data SessionMisuse
@@ -557,6 +614,7 @@ sessionAssembly native config = do
       , sessionWindows = windows
       , sessionTeardown = teardown
       , sessionMonitors = assembleMonitors source cell publisher
+      , sessionCapabilities = nativeWindowCapabilities native backend
       }
 
 admit ∷ Native → SessionConfig → IO Backend

@@ -18,10 +18,15 @@
 -- private modules. Two more are rejected for the window commands: one
 -- names the command host's, port's, and completion ticket's constructors, and
 -- one reaches for command execution and admission hooks in the private command
--- module. One client must be accepted, linked, and run: it uses only the public
+-- module. Two are rejected for the window controls: one constructs a control
+-- command or its size constraints through their constructors, or alters
+-- constraints through a field, outside the smart constructors and owner-thread
+-- validation, and one reaches for the control representation in the private
+-- control module. One client must be accepted, linked, and run: it uses only the public
 -- session, monitor, window, and window command interfaces, including the
 -- read-only observation and inventory endpoints, identity resolution, a command
--- port, and a completion ticket, and every path
+-- port, every control command constructor, the capability description, and a
+-- completion ticket, and every path
 -- it takes is refused before GLFW is initialized, so the example opens no
 -- display.
 --
@@ -155,6 +160,27 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so command execution is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Command"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that constructs or alters a control command or its size constraints outside the smart constructors" $
+    withClient "Client.hs" controlConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "WindowCommand"
+      clientOutput outcome `shouldContain` "SizeConstraints"
+
+  it "rejects a client that reaches for the control representation in the private control module" $
+    withClient "Client.hs" controlInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a control's representation is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Control"
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -302,6 +328,8 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "without the threaded runtime = NotProcessMainThread, raised by glfw enter session"
                    , "capacity = 16, description limit = 1024"
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
+                   , "constraints = (Extent {extentWidth = 1, extentHeight = 1},Extent {extentWidth = 64, extentHeight = 48},Just (AspectRatio {aspectNumerator = 4, aspectDenominator = 3}))"
+                   , "wayland cannot perform = [SetPositionOperation,FocusOperation], report = [PlacementReport,IconifiedReport]"
                    ]
 
 -- | Compile a client that can also see the runtime and the window host's
@@ -459,6 +487,7 @@ hostClient =
     , "        mapM_ (\\window → withHostWindow host window (\\_ → closeHostWindow host window)) identities"
     , "        mapM_ (honourHostCloseRequest host) (turnCloseRequests turn)"
     , "        _ ← hostBookkeeping host"
+    , "        _ ← pure (unperformableOperations (hostWindowCapabilities host))"
     , "        atomically (quiesceWindowHost host)"
     , "        pure (if activityWaiting activity then Finish (turnCommands turn) else Continue)"
     , "    }"
@@ -571,6 +600,37 @@ commandInternalsClient =
     , ""
     , "settle ∷ WindowCommandHost → IO ExecutionStep"
     , "settle host = noAdmissionHooks `seq` executeNextWith (pure ()) host (\\_ _ → pure (Left undefined))"
+    ]
+
+-- | A client building a control command and its size constraints through their
+-- data constructors, and altering constraints through a record field, rather
+-- than through the smart constructors.
+controlConstructorClient ∷ String
+controlConstructorClient =
+  unlines
+    [ "module Client (forged, altered) where"
+    , ""
+    , "import Hetoimasia.GLFW.Command (SizeConstraints (SizeConstraints, constraintsMinimum), WindowCommand (ControlWindow))"
+    , "import Hetoimasia.GLFW.Window (Extent (..))"
+    , ""
+    , "forged ∷ Maybe WindowCommand"
+    , "forged = Nothing"
+    , ""
+    , "altered ∷ SizeConstraints → SizeConstraints"
+    , "altered constraints = constraints {constraintsMinimum = Extent 0 0}"
+    ]
+
+-- | A client reaching for the control representation, which commands carry,
+-- in the private control module.
+controlInternalsClient ∷ String
+controlInternalsClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Control (WindowControl (..), validateControl)"
+    , ""
+    , "forged ∷ WindowControl"
+    , "forged = SizeControl 0 0"
     ]
 
 -- | A client importing the window drivers from the seam's private
@@ -693,6 +753,10 @@ publicClient =
     , "  report \"without the threaded runtime\" unthreaded"
     , "  putStrLn (\"capacity = \" <> show errorEvidenceCapacity <> \", description limit = \" <> show errorDescriptionLimit)"
     , "  putStrLn (\"zero width = \" <> either show (const \"accepted\") (validateWindowConfig (hiddenTestWindowConfig (Text.pack \"tool\") 0 48)))"
+    , "  let constraints = sizeConstraints (Extent 1 1) (Extent 64 48) (Just (AspectRatio 4 3))"
+    , "  putStrLn (\"constraints = \" <> show (constraintMinimum constraints, constraintMaximum constraints, constraintAspectRatio constraints))"
+    , "  let wayland = backendWindowCapabilities Wayland"
+    , "  putStrLn (\"wayland cannot perform = \" <> show (map fst (unperformableOperations wayland)) <> \", report = \" <> show (map fst (unreportableAttributes wayland)))"
     , ""
     , "latest ∷ Window → IO (Attribute Extent)"
     , "latest window = observedFramebufferExtent . preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))"
@@ -713,13 +777,29 @@ publicClient =
     , "request ∷ Session → Window → IO (Maybe Disposition)"
     , "request session window = do"
     , "  _ ← latest window"
-    , "  host ← newWindowCommandHost session 4"
-    , "  submitted ← submitWindowCommand (windowCommandPort host) [(Text.pack \"client\", Text.pack \"tool\")] (observeWindowCommand (windowIdentity window))"
+    , "  host ← newWindowCommandHost session 16"
+    , "  let target = windowIdentity window"
+    , "      constraints = sizeConstraints (Extent 1 1) (Extent 64 48) Nothing"
+    , "      controls ="
+    , "        [ setWindowTitleCommand target (Text.pack \"renamed\"), setWindowSizeCommand target (Extent 64 48)"
+    , "        , setWindowPositionCommand target (Placement 0 0), setSizeConstraintsCommand target constraints"
+    , "        , showWindowCommand target, hideWindowCommand target, requestFocusCommand target, requestAttentionCommand target"
+    , "        , minimizeWindowCommand target, maximizeWindowCommand target, restoreWindowCommand target ]"
+    , "  _ ← mapM (performWindowCommand host [window]) controls"
+    , "  _ ← pure (sessionWindowCapabilities session)"
+    , "  submitted ← submitWindowCommand (windowCommandPort host) [(Text.pack \"client\", Text.pack \"tool\")] (observeWindowCommand target)"
     , "  case submitted of"
     , "    SubmitAccepted ticket → do"
     , "      _ ← atomically (closeWindowCommands host)"
-    , "      Just <$> awaitCompletion ticket"
+    , "      settled ← awaitCompletion ticket"
+    , "      pure (Just (describeSettled settled))"
     , "    _ → pure Nothing"
+    , ""
+    , "describeSettled ∷ Disposition → Disposition"
+    , "describeSettled settled = case settled of"
+    , "  Attempted (ControlAttempt _ ControlReturned (PostCallRevision _)) → settled"
+    , "  Unsupported (UnsupportedControl _ _ _) → settled"
+    , "  _ → settled"
     , ""
     , "report ∷ String → Either SomeException () → IO ()"
     , "report label outcome = case outcome of"

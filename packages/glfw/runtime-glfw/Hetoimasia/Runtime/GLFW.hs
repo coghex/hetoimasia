@@ -10,8 +10,8 @@
 -- returns. Workers receive only client capabilities from the host the
 -- application already owns — 'hostCommandPort', a window's
 -- 'Hetoimasia.GLFW.Command.WindowClient', the monitor inventory's read endpoint
--- 'hostMonitors', and 'hostActivity' — and startup transfers no native
--- ownership to anyone.
+-- 'hostMonitors', 'hostActivity', and 'hostWindowCapabilities' — and startup
+-- transfers no native ownership to anyone.
 --
 -- 'runOwnerLoop' is the owner loop. The application's action runs it on the
 -- process main thread, the session's owner, while background workers use the
@@ -248,6 +248,7 @@ module Hetoimasia.Runtime.GLFW
   , quiesceWindowHost
   , HostActivity (..)
   , hostActivity
+  , hostWindowCapabilities
 
     -- * Windows
   , hostWindowIdentities

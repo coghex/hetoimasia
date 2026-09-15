@@ -10,7 +10,8 @@
  * GLFWvidmode through the header's own declaration, so the binding never
  * assumes the structure's layout.
  *
- * The close-request driver exists for the native examples only. It asks the
+ * The close-request driver and the size-limit query exist for the native
+ * examples only. It asks the
  * platform to close a window the way its close button would, so GLFW's own
  * close callback reports a real native request.
  */
@@ -34,6 +35,7 @@ static int waiting_thread_blocked(void);
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <float.h>
 
 static atomic_uint waiting_thread = MACH_PORT_NULL;
 
@@ -68,9 +70,33 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
         ((void (*)(id, SEL, id)) objc_msgSend)(handle, sel_registerName("performClose:"), nil);
 }
 
+/* NSSize is two CGFloats, doubles on every 64-bit Cocoa platform, and both
+ * arm64 and x86_64 return it in registers through plain objc_msgSend. */
+typedef struct { double width; double height; } content_size;
+
+static int content_bound(double value)
+{
+    return value <= 0 || value >= FLT_MAX ? -1 : (int) value;
+}
+
+int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
+{
+    id handle = glfwGetCocoaWindow(window);
+    if (handle == nil)
+        return 0;
+    content_size minimum = ((content_size (*)(id, SEL)) objc_msgSend)(handle, sel_registerName("contentMinSize"));
+    content_size maximum = ((content_size (*)(id, SEL)) objc_msgSend)(handle, sel_registerName("contentMaxSize"));
+    limits[0] = content_bound(minimum.width);
+    limits[1] = content_bound(minimum.height);
+    limits[2] = content_bound(maximum.width);
+    limits[3] = content_bound(maximum.height);
+    return 1;
+}
+
 #elif defined(__linux__)
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
+#include <X11/Xutil.h>
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
@@ -136,6 +162,35 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
     dlclose(xlib);
 }
 
+/* Read WM_NORMAL_HINTS through the same run-time libX11 the close driver uses. */
+int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
+{
+    Display* display = glfwGetX11Display();
+    Window handle = glfwGetX11Window(window);
+    void* xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (xlib == NULL)
+        return 0;
+    XSizeHints* (*allocHints)(void) = dlsym(xlib, "XAllocSizeHints");
+    Status (*getHints)(Display*, Window, XSizeHints*, long*) = dlsym(xlib, "XGetWMNormalHints");
+    int (*release)(void*) = dlsym(xlib, "XFree");
+    int answered = 0;
+    if (display != NULL && handle != None && allocHints != NULL && getHints != NULL && release != NULL) {
+        XSizeHints* hints = allocHints();
+        long supplied = 0;
+        if (hints != NULL && getHints(display, handle, hints, &supplied)) {
+            limits[0] = (hints->flags & PMinSize) ? hints->min_width : -1;
+            limits[1] = (hints->flags & PMinSize) ? hints->min_height : -1;
+            limits[2] = (hints->flags & PMaxSize) ? hints->max_width : -1;
+            limits[3] = (hints->flags & PMaxSize) ? hints->max_height : -1;
+            answered = 1;
+        }
+        if (hints != NULL)
+            release(hints);
+    }
+    dlclose(xlib);
+    return answered;
+}
+
 #else
 
 /* No supported platform: no thread is accepted as the session owner. */
@@ -158,6 +213,13 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
     (void) window;
 }
 
+int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
+{
+    (void) window;
+    (void) limits;
+    return 0;
+}
+
 #endif
 
 void** hetoimasia_glfw_monitors(int* count)
@@ -178,6 +240,11 @@ void* hetoimasia_glfw_video_mode(GLFWmonitor* monitor)
 void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count)
 {
     return (void*) glfwGetVideoModes(monitor, count);
+}
+
+char* hetoimasia_glfw_window_title(GLFWwindow* window)
+{
+    return (char*) glfwGetWindowTitle(window);
 }
 
 void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields)

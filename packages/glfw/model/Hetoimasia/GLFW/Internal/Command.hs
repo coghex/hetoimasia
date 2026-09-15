@@ -10,8 +10,8 @@
 --
 -- = Admission
 --
--- A 'WindowCommand' is an immutable value: a request to observe or close one
--- window, or to create a window from a 'WindowConfig'. Submitting
+-- A 'WindowCommand' is an immutable value: a request to observe, control, or
+-- close one window, or to create a window from a 'WindowConfig'. Submitting
 -- one issues a request identity, records the submission site and the caller's
 -- diagnostic context beside it as a 'CommandOrigin', and prepares the message
 -- to normal form on the submitting thread before anything is admitted.
@@ -38,8 +38,15 @@
 -- * 'Performed', with prepared 'CommandResult' data;
 -- * 'Rejected', with a typed 'CommandRejection', when nothing was applied — a
 --   window the executor does not serve, a window that has ended or is closing,
---   a command outside the port's scope, a creation refused before any native
---   effect, or a native failure, carried as copied code and description data;
+--   a command outside the port's scope, a creation or control refused before any
+--   native effect, or a native failure, carried as copied code and description
+--   data;
+-- * 'Unsupported', when the platform cannot perform a control, with its reason
+--   and no native call;
+-- * 'Attempted', when a control's native calls were made: whether they returned,
+--   reported errors, or stopped part-way through a constraint update, and the
+--   revision the sample taken after them published. A returned call is never
+--   reported as the state the window reached;
 -- * 'NotExecuted', when closure settled it while it was still queued;
 -- * 'Interrupted', with its request identity, when its execution or the
 --   preparation of its completion data raised. Effects may have been applied;
@@ -112,6 +119,10 @@
 -- the revision of the committed observation that followed: a new revision when
 -- sampling changed anything, and otherwise the published one the sample
 -- matched. It never samples another window.
+--
+-- A control command executes "Hetoimasia.GLFW.Internal.Window"'s
+-- 'controlWindow' on the addressed window and settles as rejected, unsupported,
+-- or attempted.
 --
 -- 'closeWindowCommand' and 'createWindowCommand' change which windows exist, so
 -- only an executor that owns window lifetimes performs them: the window host's
@@ -190,6 +201,19 @@ module Hetoimasia.GLFW.Internal.Command
   , createWindowCommand
   , commandWindow
 
+    -- * Control commands
+  , setWindowTitleCommand
+  , setWindowSizeCommand
+  , setWindowPositionCommand
+  , setSizeConstraintsCommand
+  , showWindowCommand
+  , hideWindowCommand
+  , requestFocusCommand
+  , requestAttentionCommand
+  , minimizeWindowCommand
+  , maximizeWindowCommand
+  , restoreWindowCommand
+
     -- * Origins
   , RequestId
   , requestLocalIdentity
@@ -207,6 +231,8 @@ module Hetoimasia.GLFW.Internal.Command
   , Disposition (..)
   , CommandResult (..)
   , CommandRejection (..)
+  , UnsupportedControl (..)
+  , ControlAttempt (..)
 
     -- * Window clients
   , WindowClient
@@ -228,6 +254,7 @@ module Hetoimasia.GLFW.Internal.Command
   , executeNextWith
   , executeCommand
   , observeWindow
+  , controlDisposition
   , nativeRejectionOf
 
     -- * Private window ports
@@ -287,7 +314,17 @@ import Hetoimasia.Foundation.Messaging.Channel
   )
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
-import Hetoimasia.GLFW.Internal.Capture (NativeError (..), Reports (..))
+import Hetoimasia.GLFW.Internal.Attribute (Extent (..), Placement (..))
+import Hetoimasia.GLFW.Internal.Capture (Reports, rnfReports)
+import Hetoimasia.GLFW.Internal.Control
+  ( ControlOutcome
+  , ControlRejection
+  , ControlResult (..)
+  , PostCallObservation
+  , SizeConstraints
+  , WindowControl (..)
+  , WindowOperation
+  )
 import Hetoimasia.GLFW.Internal.Session
   ( NativeFailure (..)
   , NativeOutcome
@@ -303,6 +340,7 @@ import Hetoimasia.GLFW.Internal.Window
   , WindowId
   , WindowObservation
   , WindowResult (..)
+  , controlWindow
   , observedRevision
   , synchronizeWindow
   , windowCallbackOperation
@@ -320,12 +358,14 @@ data WindowCommand
   = ObserveWindow !WindowId
   | CloseWindow !WindowId
   | CreateWindow !WindowConfig
+  | ControlWindow !WindowId !WindowControl
   deriving (Eq, Show)
 
 instance NFData WindowCommand where
   rnf (ObserveWindow window) = rnf window
   rnf (CloseWindow window) = rnf window
   rnf (CreateWindow config) = rnf config
+  rnf (ControlWindow window control) = rnf window `seq` rnf control
 
 -- | Ask the owner to sample the window and publish a fresh observation of it at
 -- its next safe boundary.
@@ -348,6 +388,47 @@ commandWindow ∷ WindowCommand → Maybe WindowId
 commandWindow (ObserveWindow window) = Just window
 commandWindow (CloseWindow window) = Just window
 commandWindow (CreateWindow _) = Nothing
+commandWindow (ControlWindow window _) = Just window
+
+-- | Ask the owner to set the window's title. A title containing a NUL is
+-- rejected when the command executes.
+setWindowTitleCommand ∷ WindowId → Text → WindowCommand
+setWindowTitleCommand window = ControlWindow window . TitleControl
+
+-- | Ask the owner to set the window's logical size. A size that is not positive,
+-- not representable, or outside the window's fully known active constraints is
+-- rejected when the command executes, and never sent for the platform to clamp.
+setWindowSizeCommand ∷ WindowId → Extent → WindowCommand
+setWindowSizeCommand window (Extent width height) = ControlWindow window (SizeControl width height)
+
+-- | Ask the owner to move the window's content area to a desktop position.
+setWindowPositionCommand ∷ WindowId → Placement → WindowCommand
+setWindowPositionCommand window (Placement x y) = ControlWindow window (PositionControl x y)
+
+-- | Ask the owner to replace the window's size constraints. The whole set is
+-- validated, against the window's latest observed size too, when the command
+-- executes.
+setSizeConstraintsCommand ∷ WindowId → SizeConstraints → WindowCommand
+setSizeConstraintsCommand window = ControlWindow window . ConstraintsControl
+
+showWindowCommand, hideWindowCommand, requestFocusCommand, requestAttentionCommand ∷ WindowId → WindowCommand
+-- | Ask the owner to show the window.
+showWindowCommand window = ControlWindow window ShowControl
+-- | Ask the owner to hide the window.
+hideWindowCommand window = ControlWindow window HideControl
+-- | Ask the platform to give the window input focus. The request may be
+-- declined; the window's observations report what happened.
+requestFocusCommand window = ControlWindow window FocusControl
+-- | Ask the platform to draw the user's attention to the window.
+requestAttentionCommand window = ControlWindow window AttentionControl
+
+minimizeWindowCommand, maximizeWindowCommand, restoreWindowCommand ∷ WindowId → WindowCommand
+-- | Ask the owner to minimize (iconify) the window.
+minimizeWindowCommand window = ControlWindow window MinimizeControl
+-- | Ask the owner to maximize the window.
+maximizeWindowCommand window = ControlWindow window MaximizeControl
+-- | Ask the owner to restore a minimized or maximized window.
+restoreWindowCommand window = ControlWindow window RestoreControl
 
 -- | A request's identity: its host's identity and a local number that host never
 -- reissues. Only the local number is displayed.
@@ -446,6 +527,11 @@ data Disposition
     -- ^ Performed, or requested from the window system.
   | Rejected !CommandRejection
     -- ^ Not performed, for a typed reason; nothing was applied.
+  | Unsupported !UnsupportedControl
+    -- ^ The platform cannot perform the control; no native call was made.
+  | Attempted !ControlAttempt
+    -- ^ The control's native calls were made. Whether the window reached the
+    -- requested state is what its observations report.
   | NotExecuted
     -- ^ Closure settled it while it was still queued.
   | Interrupted !RequestId
@@ -456,8 +542,34 @@ data Disposition
 instance NFData Disposition where
   rnf (Performed result) = rnf result
   rnf (Rejected rejection) = rnf rejection
+  rnf (Unsupported unsupported) = rnf unsupported
+  rnf (Attempted attempt) = rnf attempt
   rnf NotExecuted = ()
   rnf (Interrupted request) = rnf request
+
+-- | A control the platform cannot perform.
+data UnsupportedControl = UnsupportedControl
+  { unsupportedWindow ∷ !WindowId
+  , unsupportedOperation ∷ !WindowOperation
+  , unsupportedReason ∷ !Text
+  }
+  deriving (Eq, Show)
+
+instance NFData UnsupportedControl where
+  rnf (UnsupportedControl window wanted reason) = rnf window `seq` rnf wanted `seq` rnf reason
+
+-- | A control whose native calls were made.
+data ControlAttempt = ControlAttempt
+  { attemptedWindow ∷ !WindowId
+  , attemptedOutcome ∷ !ControlOutcome
+    -- ^ How the native calls returned.
+  , attemptedObservation ∷ !PostCallObservation
+    -- ^ The revision the sample taken after them published, or why none was.
+  }
+  deriving (Eq, Show)
+
+instance NFData ControlAttempt where
+  rnf (ControlAttempt window outcome observation) = rnf window `seq` rnf outcome `seq` rnf observation
 
 -- | What a performed command produced.
 data CommandResult
@@ -524,6 +636,8 @@ data CommandRejection
     -- acquired was rolled back, no window was registered, and no capacity was
     -- consumed; a rollback's own cleanup failures poison creation and stay with
     -- the owner as evidence.
+  | ControlRejected !WindowId !ControlRejection
+    -- ^ A control was refused before any native call.
   deriving (Eq, Show)
 
 instance NFData CommandRejection where
@@ -539,19 +653,7 @@ instance NFData CommandRejection where
   rnf WindowCreationPoisoned = ()
   rnf (WindowCreationFailed failed outcome reports) =
     rnf failed `seq` outcome `seq` rnfReports reports
-
-rnfReports ∷ Reports → ()
-rnfReports reports =
-  foldr (seq . rnfError) () (reportedErrors reports)
-    `seq` rnf (reportsLost reports)
-    `seq` rnf (callbackFaults reports)
-  where
-    rnfError reported =
-      rnf (nativeErrorCode reported)
-        `seq` rnf (nativeErrorDescription reported)
-        `seq` nativeErrorTruncated reported
-        `seq` nativeErrorThread reported
-        `seq` ()
+  rnf (ControlRejected window rejection) = rnf window `seq` rnf rejection
 
 -- | A command operation that would wait for work only the waiting thread can
 -- do.
@@ -931,6 +1033,7 @@ data ExecutionStep
 -- capabilities, from which the executor prepares 'WindowCreated' itself.
 data Execution
   = Completed !(Either CommandRejection CommandResult)
+  | Settled !Disposition
   | Created !WindowClient
 
 -- | Claim the oldest queued command, execute it with @work@, prepare its
@@ -962,6 +1065,7 @@ executeNextWith afterClaim host work =
               execution ← maybe (work origin command) (pure . Completed . Left) (outOfScope host command)
               case execution of
                 Completed result → (`Settlement` Nothing) <$> prepare (either Rejected Performed result)
+                Settled disposition → (`Settlement` Nothing) <$> prepare disposition
                 Created client → (`Settlement` Just client) <$> prepare (Performed (WindowCreated (clientIdentity client)))
         case outcome of
           Right settlement → Executed origin <$> atomically (finish origin cell settlement)
@@ -987,15 +1091,30 @@ executeNextWith afterClaim host work =
 -- | Execute a command against the lexically scoped windows an executor serves.
 -- They cannot be closed early or added to.
 executeCommand ∷ [Window] → CommandOrigin → WindowCommand → IO Execution
-executeCommand windows _ = fmap Completed . runCommand windows
+executeCommand windows _ = fmap Settled . runCommand windows
 
-runCommand ∷ [Window] → WindowCommand → IO (Either CommandRejection CommandResult)
+runCommand ∷ [Window] → WindowCommand → IO Disposition
 runCommand windows = \case
-  ObserveWindow target → maybe (pure (Left (WindowNotServed target))) (observeWindow target) (served target)
-  CloseWindow target → pure (Left (maybe (WindowNotServed target) (const (CloseNotPermitted target)) (served target)))
-  CreateWindow _ → pure (Left CreationNotPermitted)
+  ObserveWindow target → maybe (notServed target) (fmap (either Rejected Performed) . observeWindow target) (served target)
+  CloseWindow target → pure (Rejected (maybe (WindowNotServed target) (const (CloseNotPermitted target)) (served target)))
+  CreateWindow _ → pure (Rejected CreationNotPermitted)
+  ControlWindow target control → maybe (notServed target) (controlDisposition target control) (served target)
   where
     served target = find ((== target) . windowIdentity) windows
+    notServed = pure . Rejected . WindowNotServed
+
+-- | Execute a control on one window at an owner boundary and settle it: an
+-- ended window as 'WindowAlreadyEnded', a closing one as 'WindowIsClosing', and
+-- otherwise as rejected, unsupported, or attempted. A callback fault rethrown at
+-- the boundary, and anything else raised, propagates.
+controlDisposition ∷ WindowId → WindowControl → Window → IO Disposition
+controlDisposition target control window =
+  controlWindow window control >>= \case
+    WindowEnded _ → pure (Rejected (WindowAlreadyEnded target))
+    WindowAvailable ControlWindowClosing → pure (Rejected (WindowIsClosing target))
+    WindowAvailable (ControlRefused rejection) → pure (Rejected (ControlRejected target rejection))
+    WindowAvailable (ControlUnsupported wanted reason) → pure (Unsupported (UnsupportedControl target wanted reason))
+    WindowAvailable (ControlAttempted outcome observation) → pure (Attempted (ControlAttempt target outcome observation))
 
 -- | Synchronize one window at an owner boundary and answer the revision that
 -- followed. A native failure raised by the sampling is a typed rejection; a
@@ -1044,7 +1163,7 @@ performWindowCommand host windows command =
     if closed
       then pure NotExecuted
       else do
-        result ← maybe (runCommand windows command) (pure . Left) (outOfScope host command)
-        preparedValue <$> prepare (either Rejected Performed result)
+        result ← maybe (runCommand windows command) (pure . Rejected) (outOfScope host command)
+        preparedValue <$> prepare result
   where
     identifiers = maybe [] (\window → [("window", Text.pack (show (windowLocalIdentity window)))]) (commandWindow command)

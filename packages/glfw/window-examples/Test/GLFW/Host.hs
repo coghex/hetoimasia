@@ -702,6 +702,8 @@ kind = \case
   Just (Rejected _) → "rejected"
   Just NotExecuted → "not executed"
   Just (Interrupted _) → "interrupted"
+  Just (Unsupported _) → "unsupported"
+  Just (Attempted _) → "attempted"
 
 isLive ∷ WorkerStatus → Bool
 isLive WorkerLive = True
