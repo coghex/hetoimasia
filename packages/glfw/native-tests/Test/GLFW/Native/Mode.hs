@@ -249,13 +249,18 @@ settledPlacement window =
     let observed = (observedPlacement observation, observedLogicalExtent observation)
     pure (observed == (Observed (fst platform), Observed (snd platform)), platform)
 
--- | The platform's placement once it reaches the target, or when the bound runs
--- out.
+-- | The window's placement once both its sampled observation and the platform
+-- report the target, or when the bound runs out. The platform is queried after
+-- the sample, so requiring both rules out a platform that advanced past a stale
+-- observation; the answer is the observation's placement when it and the
+-- platform agree, and the platform's otherwise.
 convergeTo ∷ Window → (Placement, Extent) → IO (Placement, Extent)
 convergeTo window target =
-  converge window $ \_ → do
+  converge window $ \observation → do
     platform ← platformPlacement window
-    pure (platform == target, platform)
+    let observed = (observedPlacement observation, observedLogicalExtent observation)
+        wanted = (Observed (fst target), Observed (snd target))
+    pure (observed == wanted && platform == target, if observed == (Observed (fst platform), Observed (snd platform)) then target else platform)
 
 -- | Synchronize the window until the check holds, waiting for native events in
 -- between, and answer the check's value from the last attempt either way.
