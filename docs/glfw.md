@@ -1559,7 +1559,10 @@ window and whether the claim is reserved, held, or uncertain:
   before any native step as proven unused; after a native step it makes every
   claim of the window uncertain and its applied mode indeterminate, so the owner
   loop's mode reconciliation resamples it and releases what the sample proves
-  unused;
+  unused; that protection is in place before the attempt plans, and a
+  reservation commits together with the attempt's record of it, so a cancellation
+  arriving at any point after the reservation, before the first native step
+  included, releases it;
 - a claim on an ended identity is dropped by every inventory refresh and
   resolution — `synchronizeMonitors`, `resolveMonitor`, the owner loop's monitor
   step — including one that commits and then rethrows a monitor callback fault,

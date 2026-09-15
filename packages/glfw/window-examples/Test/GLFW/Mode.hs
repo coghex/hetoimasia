@@ -19,7 +19,7 @@
 module Test.GLFW.Mode (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), SomeException, fromException, throwIO, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, throwIO, toException, try)
 import Control.Monad (forM, forM_, join, replicateM, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
@@ -34,7 +34,7 @@ import Hetoimasia.GLFW.Internal.Control (ConstraintState (ConstraintsIndetermina
 import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), abandonClaims, savedPlacement, windowedPlacement, windowedPlan)
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (monitorClaims, reconcileMonitorEvents)
-import Hetoimasia.GLFW.Internal.Window (reconcileWindowMode)
+import Hetoimasia.GLFW.Internal.Window (reconcileWindowMode, transitionWindowWith)
 import Hetoimasia.GLFW.Mode
 import Hetoimasia.GLFW.Monitor
 import Hetoimasia.GLFW.Session
@@ -106,6 +106,8 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testInterruptedClaims)
     it "prunes an ended monitor's claim after a refresh that commits and then rethrows a monitor callback fault"
       (boundedExample testPruneOnCallbackFault)
+    it "releases a fullscreen reservation cancelled after it was committed and before the first native step"
+      (boundedExample testCancelledAfterReservation)
 
   describe "eligibility" $ do
     it "applies the operation matrix after entering each mode, rejecting ineligible controls before any native setter"
@@ -944,6 +946,24 @@ testInterruptedClaims = do
       `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimHeld)]
     abandonClaims 1 (Just right) True (Map.fromList [(right, WindowClaim 1 ClaimReserved), (left, WindowClaim 1 ClaimHeld)])
       `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimUncertain), (left, WindowClaim 1 ClaimUncertain)]
+
+testCancelledAfterReservation ∷ Expectation
+testCancelledAfterReservation = withDesk tracked $ \desk → withWindowIn desk "first" $ \first → withWindowIn desk "second" $ \second → do
+  let right = deskRight desk
+  reservedWhenCancelled ← newIORef Map.empty
+  -- The cancellation arrives exactly once the reservation has committed, before
+  -- any native step.
+  let cancel = monitorClaims (deskSession desk) >>= writeIORef reservedWhenCancelled >> throwIO ThreadKilled
+  cancelled ← try @AsyncException (transitionWindowWith cancel first (fullscreenOn right))
+  atCancellation ← readIORef reservedWhenCancelled
+  afterCancellation ← monitorClaims (deskSession desk)
+  setters ← setterCalls desk
+  taken ← execute desk [first, second] (mode second (fullscreenOn right))
+  cancelled `shouldBe` Left ThreadKilled
+  atCancellation `shouldBe` Map.fromList [(right, WindowClaim 1 ClaimReserved)]
+  afterCancellation `shouldBe` Map.empty
+  setters `shouldBe` []
+  taken `shouldSatisfy` appliedCleanly
 
 testPruneOnCallbackFault ∷ Expectation
 testPruneOnCallbackFault = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
