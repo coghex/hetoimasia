@@ -756,7 +756,11 @@ The native examples cover:
   `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
   by a successful session, and a fault raised inside a real GLFW size callback,
   driven by `glfwSetWindowSize` and `glfwPollEvents`, rethrown at the owner
-  boundary with its context.
+  boundary with its context. Cocoa calls that callback inside the resize, while
+  X11 delivers it after a round trip to the server, so later boundaries wait
+  for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
+  within a bound of 100 boundaries of at most 50 ms — until the fault is
+  rethrown.
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct

@@ -34,6 +34,7 @@ import Hetoimasia.GLFW.Internal.Native
   , pollEventsForCheck
   , productionNative
   , setWindowSizeForCheck
+  , waitEventsForCheck
   )
 import Hetoimasia.GLFW.Internal.Session (Native (..), WindowCallbacks (..), sessionAssembly)
 import Hetoimasia.GLFW.Internal.Window (windowStep)
@@ -117,6 +118,12 @@ enterAndLeave = do
 
 -- | A production table whose size callback copies a payload that raises, so the
 -- fault is raised inside the model's trampoline while GLFW is calling it.
+--
+-- Cocoa calls the size callback inside the resize itself; X11 delivers it once
+-- the server's configure event arrives. So after the resizing step, later owner
+-- boundaries wait for events — returning as soon as one arrives — until the
+-- callback has run and its fault is rethrown, within a bound of 'deliveryAttempts'
+-- boundaries of at most 'deliveryWaitSeconds' each.
 callbackFault ∷ IO String
 callbackFault = do
   let faulting =
@@ -131,12 +138,24 @@ callbackFault = do
           }
   withScoped (allocComposite (sessionAssembly faulting defaultSessionConfig)) $ \session →
     withWindow session (hiddenTestWindowConfig "faulting" 200 150) $ \window → do
-      outcome ←
-        try $
-          windowStep window (operation "resize for check") $ \handle → do
-            setWindowSizeForCheck handle 260 190
-            pollEventsForCheck
-      caught ← either pure (\result → failCheck ("the boundary completed with " <> show result)) outcome
+      let resize =
+            windowStep window (operation "resize for check") $ \handle → do
+              setWindowSizeForCheck handle 260 190
+              pollEventsForCheck
+          deliver attempt step = do
+            outcome ← try step
+            case outcome of
+              Right (WindowAvailable ())
+                | attempt < deliveryAttempts →
+                    deliver (attempt + 1) $
+                      windowStep window (operation "deliver events for check") (\_ → waitEventsForCheck deliveryWaitSeconds)
+              _ → pure (attempt, outcome)
+      (boundaries, outcome) ← deliver (0 ∷ Int) resize
+      caught ←
+        either
+          pure
+          (\result → failCheck ("after " <> show (boundaries + 1) <> " boundaries the last completed with " <> show result))
+          outcome
       case fromException caught of
         Just (ErrorCall message) → do
           let contexts =
@@ -149,7 +168,7 @@ callbackFault = do
           case after of
             WindowAvailable _ → pure ()
             WindowEnded _ → failCheck "the window ended after a contained fault"
-          pure ("rethrown " <> show message <> " with " <> show contexts)
+          pure ("rethrown " <> show message <> " at boundary " <> show (boundaries + 1) <> " with " <> show contexts)
         Nothing → failCheck ("unexpected failure: " <> displayException caught)
 
 -- | Request a backend this platform's GLFW was not built with, past the model's
@@ -188,6 +207,14 @@ initializationError = do
             <> concatMap (Text.unpack . nativeErrorDescription) matching
         )
     NativeCause → failCheck "the failure carries no engine origin"
+
+-- | How many owner boundaries may wait for a callback the platform has yet to
+-- deliver, and the most each waits for an event.
+deliveryAttempts ∷ Int
+deliveryAttempts = 100
+
+deliveryWaitSeconds ∷ Double
+deliveryWaitSeconds = 0.05
 
 failCheck ∷ String → IO a
 failCheck = ioError . userError
