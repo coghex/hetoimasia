@@ -30,7 +30,8 @@ import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (cleanupFailures)
 import Hetoimasia.GLFW.Command
-import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), WindowClaim (..))
+import Hetoimasia.GLFW.Internal.Control (ConstraintState (ConstraintsIndeterminate))
+import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), savedPlacement, windowedPlacement, windowedPlan)
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (monitorClaims, reconcileMonitorEvents)
 import Hetoimasia.GLFW.Internal.Window (reconcileWindowMode)
@@ -111,6 +112,8 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testTransitionInterval)
     it "suspends windowed constraints for borderless, restores them on return, and refuses a placement they exclude"
       (boundedExample testConstraintSuspension)
+    it "refuses every transition, and any windowed return, before a setter while a partial constraint update left the constraints indeterminate"
+      (boundedExample testIndeterminateConstraints)
 
   describe "observations" $
     it "names the revision its final sample published, which reports the applied mode and geometry observed"
@@ -1065,6 +1068,47 @@ testConstraintSuspension = withDesk tracked $ \desk → withWindowIn desk "first
   settersAfterRefusal `shouldBe` []
   modeApplied record `shouldBe` AppliedFullscreen (deskRight desk)
   placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 801 600)
+
+testIndeterminateConstraints ∷ Expectation
+testIndeterminateConstraints = do
+  failing ← newIORef False
+  let script =
+        tracked
+          { scriptWindowControl = \call reporter → case call of
+              SetWindowAspectRatio {} →
+                readIORef failing >>= \on → when on (reportError reporter platformErrorCode "The aspect ratio could not be set")
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    let run = execute desk [window]
+        target = windowIdentity window
+        refused = Rejected (ModeRejected target WindowedConstraintsIndeterminate)
+        indeterminate = RefusedBeforeMutation WindowedConstraintsIndeterminate
+    writeIORef failing True
+    partial ← run (setSizeConstraintsCommand target (sizeConstraints (Extent 400 300) (Extent 1600 1200) (Just (AspectRatio 4 3))))
+    writeIORef failing False
+    beforeTransitions ← length <$> seamCalls (deskSeam desk)
+    fullscreen ← run (mode window (fullscreenOn (deskRight desk)))
+    fullscreenWithFallback ← run (mode window (modeRequest (fullscreenMode (deskRight desk) currentVideoMode) (windowedFallback 1)))
+    borderless ← run (mode window (borderlessOn (deskLeft desk)))
+    setters ← filter isSetter . drop beforeTransitions <$> seamCalls (deskSeam desk)
+    record ← recordOf window
+    monitors ← inventoryMonitors <$> synchronizeMonitors (deskSession desk)
+    let saved = savedPlacement (Placement 40 30) (Extent 800 600)
+    partial `shouldSatisfy` \case
+      Attempted (ControlAttempt _ (ConstraintUpdateFailed [SizeLimitsCall] AspectRatioCall [] _) _) → True
+      _ → False
+    fullscreen `shouldBe` refused
+    outcomeOf fullscreenWithFallback
+      `shouldBe` Just (ModeFailed [ModeAttemptFailure TargetAttempt indeterminate, ModeAttemptFailure WindowedFallbackAttempt indeterminate])
+    borderless `shouldBe` refused
+    setters `shouldBe` []
+    modeApplied record `shouldBe` AppliedWindowed
+    -- A windowed return is refused whatever the native constraints hold, so no
+    -- window placed by the mode controller escapes validation.
+    windowedPlacement ConstraintsIndeterminate (Just saved) monitors `shouldBe` Left WindowedConstraintsIndeterminate
+    windowedPlan NativeFollowsWindowed ConstraintsIndeterminate saved `shouldBe` Left WindowedConstraintsIndeterminate
+    windowedPlan NativeSuspended ConstraintsIndeterminate saved `shouldBe` Left WindowedConstraintsIndeterminate
 
 -- ---------------------------------------------------------------------------
 -- Observations

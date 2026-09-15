@@ -76,9 +76,11 @@
 -- that is unavailable or empty; a placement whose coordinates are outside the
 -- native @int@ range or whose size is outside @1 .. 2147483647@; a windowed
 -- placement the preserved windowed constraints do not admit, bounds and aspect
--- ratio alike; a borderless entry, or a windowed return needing restoration,
--- while the windowed constraints are indeterminate; and a fullscreen monitor
--- another window claims. Negative desktop coordinates are valid.
+-- ratio alike; a borderless or fullscreen entry, or a windowed return, while the
+-- preserved windowed constraints are indeterminate after a partial update, so
+-- no placement is ever made without proving the constraints admit it and no
+-- window leaves windowed presentation it could not validly return to; and a
+-- fullscreen monitor another window claims. Negative desktop coordinates are valid.
 --
 -- = Plans
 --
@@ -544,8 +546,9 @@ data ModeRejection
   | PlacementExcluded !Extent !SizeConstraints
     -- ^ The preserved windowed constraints do not admit the placement's size.
   | WindowedConstraintsIndeterminate
-    -- ^ The preserved windowed constraints are indeterminate, so they can be
-    -- neither suspended safely nor restored.
+    -- ^ The preserved windowed constraints are indeterminate, so no windowed
+    -- placement can be validated against them, and they can be neither
+    -- suspended safely nor restored.
   deriving (Eq, Show)
 
 instance NFData ModeRejection where
@@ -622,6 +625,7 @@ windowedPlacement constraints saved monitors = do
   case constraints of
     ConstraintsKnown (Just preserved)
       | not (constraintsAdmit preserved extent) → Left (PlacementExcluded extent preserved)
+    ConstraintsIndeterminate → Left WindowedConstraintsIndeterminate
     _ → Right placement
   where
     described = case monitors of
@@ -726,7 +730,9 @@ data ModePlan = ModePlan
 -- | Return to windowed presentation at a validated placement.
 windowedPlan ∷ NativeConstraints → ConstraintState → SavedPlacement → Either ModeRejection ModePlan
 windowedPlan native windowed (SavedPlacement position extent) = case native of
-  NativeFollowsWindowed → Right (ModePlan placing Nothing)
+  NativeFollowsWindowed
+    | windowed == ConstraintsIndeterminate → Left WindowedConstraintsIndeterminate
+    | otherwise → Right (ModePlan placing Nothing)
   _ → case windowed of
     ConstraintsKnown (Just preserved) →
       Right

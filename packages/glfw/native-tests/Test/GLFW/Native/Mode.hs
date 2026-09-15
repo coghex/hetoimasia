@@ -12,11 +12,15 @@
 -- revision by reading the snapshot on the owner thread immediately after the
 -- command settles, before any event is processed: the owner is the only
 -- publisher, so nothing can have replaced it, and the example checks that the
--- revision read is the one named. The test-only queries made at that same point
--- are what the platform reports for that sample. A revision records what was
--- sampled at that boundary, not the window manager's eventual acknowledgement,
--- so placement restoration is then awaited separately, within a bound of event
--- waits, and compared with the platform's report rather than the request.
+-- revision read is the one named. At that same point it compares the state GLFW
+-- itself sets synchronously — whether the window is on a monitor, and its
+-- decoration — with the test-only queries. Size and position are the display
+-- server's: X11 applies them asynchronously, so a query moments after the sample
+-- may already differ. A revision records what was sampled at that boundary, not
+-- the platform's eventual acknowledgement, so geometry is compared only once the
+-- observation and the platform's report agree, within a bound of event waits,
+-- and restoration is checked against the platform's report rather than the
+-- request.
 --
 -- The run prints the exercised monitor topology. No automated run can attach or
 -- detach a display, so the record states that no hotplug transition was
@@ -115,6 +119,8 @@ spec shared = describe "window modes" $ do
         withModeWindows session $ \perform first second → do
           owning ← perform (mode first (fullscreenOn identity))
           _ ← namedCheck first owning
+          -- The display server applies the fullscreen geometry asynchronously.
+          _ ← convergeTo first =<< fullscreenGeometry monitor
           before ← monitorFacts session identity first
           busy ← perform (mode second (modeRequest (fullscreenMode identity (otherPreference monitor)) noModeFallback))
           after ← monitorFacts session identity first
@@ -138,8 +144,6 @@ data NamedCheck = NamedCheck
   , checkPlatformFullscreen ∷ Bool
   , checkObservedDecorated ∷ Attribute Bool
   , checkPlatformDecorated ∷ Bool
-  , checkObservedGeometry ∷ (Attribute Placement, Attribute Extent)
-  , checkPlatformGeometry ∷ (Placement, Extent)
   , checkApplied ∷ AppliedMode
   }
   deriving (Show)
@@ -153,7 +157,6 @@ namedCheck window settled = do
   observation ← currentObservation window
   fullscreen ← windowFullscreenForCheck handle
   state ← windowStateForCheck handle
-  platform ← platformPlacement window
   pure
     NamedCheck
       { checkNamedRevision = revision
@@ -164,8 +167,6 @@ namedCheck window settled = do
       , checkPlatformFullscreen = fullscreen
       , checkObservedDecorated = observedDecorated observation
       , checkPlatformDecorated = checkDecorated state
-      , checkObservedGeometry = (observedPlacement observation, observedLogicalExtent observation)
-      , checkPlatformGeometry = platform
       , checkApplied = modeApplied (observedMode observation)
       }
   where
@@ -176,7 +177,6 @@ checkAgrees check = do
   checkObservedRevision check `shouldBe` checkNamedRevision check
   checkObservedFullscreen check `shouldBe` Just (checkPlatformFullscreen check)
   checkObservedDecorated check `shouldBe` Observed (checkPlatformDecorated check)
-  checkObservedGeometry check `shouldBe` (\(position, extent) → (Observed position, Observed extent)) (checkPlatformGeometry check)
 
 -- | Two private hidden windows in the shared session and a direct executor over
 -- them.
@@ -194,6 +194,12 @@ selectedMonitor session =
     Observed monitors@(firstMonitor : _) → pure (maybe firstMonitor id (find ((== Observed True) . monitorPrimary) monitors))
     Observed [] → failed "the display server exposes no monitor"
     Unavailable → failed "the platform's monitor enumeration was inconsistent"
+
+-- | The geometry a fullscreen window in the monitor's current mode takes.
+fullscreenGeometry ∷ MonitorDescription → IO (Placement, Extent)
+fullscreenGeometry monitor = case (monitorPosition monitor, monitorCurrentMode monitor) of
+  (Observed (MonitorPosition x y), Observed current) → pure (Placement x y, Extent (modeWidth current) (modeHeight current))
+  _ → failed "the selected monitor reports no position or current mode"
 
 workAreaOf ∷ MonitorDescription → IO (Placement, Extent)
 workAreaOf monitor = case monitorWorkArea monitor of

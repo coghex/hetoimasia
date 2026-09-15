@@ -1395,7 +1395,7 @@ typed `ModeRejection`:
 | A placement coordinate is outside the native `int` range, or a dimension outside `1 .. 2147483647` | `PlacementUnrepresentable` |
 | There is no saved placement, or no current monitor with a nonempty work area | `NoReachablePlacement` |
 | The preserved windowed constraints do not admit the windowed placement's size, bounds and aspect ratio alike | `PlacementExcluded` |
-| A borderless entry, or a windowed return that must restore constraints, while the preserved windowed constraints are indeterminate | `WindowedConstraintsIndeterminate` |
+| A borderless or fullscreen entry, or a windowed return or fallback, while a partial constraint update left the preserved windowed constraints indeterminate: no placement is made without proving the constraints admit it, and no window leaves windowed presentation it could not validly return to | `WindowedConstraintsIndeterminate` |
 
 The monitor is re-resolved through the inventory's own resolution, and a
 fullscreen step receives the pointer that resolution's enumeration returned in
@@ -2375,9 +2375,11 @@ The native examples cover:
   selected monitor's work area and back; fullscreen to borderless keeping the
   saved placement; each completion's named revision read from the snapshot on
   the owner thread before any event is processed, checked to be that revision,
-  and compared with `windowFullscreenForCheck`, `windowStateForCheck`'s
-  decoration, and the platform's size and position at that point, with
-  restoration then awaited within the event-wait bound; and a second window's
+  and compared at that point with `windowFullscreenForCheck` and
+  `windowStateForCheck`'s decoration, which GLFW sets synchronously, while size
+  and position, which X11 applies asynchronously, are compared only once the
+  observation and the platform agree within the event-wait bound, and
+  restoration is checked against the platform's report; and a second window's
   request for the claimed monitor refused as `MonitorBusy` with the first
   window's fullscreen state, size, and the monitor's video mode unchanged, and an
   ordinary resize of the fullscreen window refused before its setter. The run

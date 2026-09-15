@@ -1729,6 +1729,9 @@ modeAttempt window request kind =
         pure (plan, Nothing)
       (FullscreenPresentation, Just monitor, Just preference) → do
         unsupported FullscreenOperation
+        -- A window whose windowed constraints are indeterminate could never be
+        -- validly returned to windowed presentation, so it does not leave it.
+        when (windowed == ConstraintsIndeterminate) (refuse WindowedConstraintsIndeterminate)
         resolveMonitorPointer session monitor >>= \case
           MonitorDisconnected _ → refuse (ModeMonitorDisconnected monitor)
           MonitorAvailable (description, resolved) → do
