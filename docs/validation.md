@@ -35,7 +35,8 @@ python3 tools/validation/plan.py --catalog-check
 | `--request-file` | A file holding a pull-request body; its `validation-request` block is read from there. |
 | `--catalog` | A catalog path read from the filesystem instead of the default. Fixture catalogs use this, with planning and with `--catalog-check` alike. |
 | `--repo-root` | The repository to plan for. Defaults to the enclosing checkout. |
-| `--catalog-check` | Validate the catalog and exit; takes no revisions and no request. |
+| `--worker NAME=CLASS[+CLASS]:GROUP[,GROUP]` | A worker, the runner classes it declares, and the groups it owns. Repeatable. Without any, the plan describes selection only and nothing may execute against it; see [Runner classes and workers](#runner-classes-and-workers). |
+| `--catalog-check` | Validate the catalog and exit; takes no revisions, request, or workers. |
 | `--json` | Emit the plan as JSON rather than prose. |
 
 `tools/validation/range.py` resolves the two revisions CI passes to `--base` and
@@ -80,7 +81,7 @@ Each group declares:
 | `component` | string or null | `null`, the reserved value `"all"`, or `"package:kind:name"` with `kind` one of `lib`, `exe`, `test`. It must resolve in the local package graph. |
 | `inputs` | array of strings | Explicit non-Haskell inputs. An entry ending in `/` is a directory prefix; any other entry is an exact repository-relative path. |
 | `framework` | string | `hspec` or `none`. Hspec membership is declared here, independently of `optional`, so `all-hspec` never infers it from an identifier or a command substring. |
-| `runner` | string | `cpu`. |
+| `runner` | string | `cpu` or `display`: the [runner class](#runner-classes-and-workers) a worker must declare before it may execute the group. |
 | `timeout_seconds` | integer | Positive. |
 | `category` | string | `build`, `test`, `smoke`, or `probe`. |
 | `optional` | boolean | Required. An optional group runs only when explicitly requested. |
@@ -114,10 +115,25 @@ identifier lists are sorted.
 | `test.engine` | `cabal test hetoimasia-tests --test-show-details=direct` | no | yes |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
+| `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
 
-`test.workflow` runs only when affected or requested. No optional group is
-registered yet; optional handling is proven with fixture catalogs in
-`workflow-tests`.
+`test.workflow` runs only when affected or requested.
+
+`test.glfw-native` is the native GLFW Hspec group: the shared main-thread
+fixture and its small, stable session, thread, and window examples, described in
+[docs/glfw.md](glfw.md#the-native-suite). It requires the `display` runner class,
+so only the [display worker](#the-display-worker) may execute it, and like
+`test.workflow` it is outside the mandatory floor and runs only when affected or
+requested. Its inputs are the native suite's Cabal closure — the suite, the GLFW
+package, and the foundation library — plus `tools/display/`, `tools/native/`,
+and `tools/ci-image/`, so a change to the display setup, the native recipe, or
+the image recipe selects it; the image's digest and native manifest are already
+part of every Linux candidate's identity.
+
+No optional group is registered yet. Interactive and lengthy desktop probes,
+when they are declared, are optional groups that run only on request; optional
+handling, including an optional display probe whose inputs changed, is proven
+with fixture catalogs in `workflow-tests`.
 
 ## How a group's inputs are derived
 
@@ -305,8 +321,64 @@ planner reads the text from `--request-file`.
 | `request` | The request `source`, its literal `ids`, its `all_hspec` flag, and the `resolved` identifier set. |
 | `changed_paths` | Each path with its Git `status`, its `classification`, and its `consumers`. |
 | `unknown_inputs` | The unclassified paths, sorted. |
-| `groups` | Every catalog group with `selected`, `inputs_changed`, `reason`, and its declared metadata. |
+| `groups` | Every catalog group with `selected`, `inputs_changed`, `reason`, and its declared metadata, including `runner`. |
 | `selected` | The selected identifiers, in catalog order. |
+| `workers` | The validated worker assignment — each worker's `name`, sorted `runner_classes`, and `groups` in catalog order, workers sorted by name — or `null` for a plan resolved without `--worker`, which no tool will execute, reuse, or aggregate against. |
+
+## Runner classes and workers
+
+A group declares the runner class it needs, and a worker declares the runner
+classes it provides. Nothing is inferred from a worker's name, and the planner
+is the only place the routing between them is written down:
+
+| Class | What a worker declaring it provides |
+| --- | --- |
+| `cpu` | An ordinary headless worker: builds, Hspec suites, and the console smoke. |
+| `display` | A windowing session — on Linux, an isolated X11 display established for each group it runs. |
+
+Each worker is declared once, to the planner:
+
+```bash
+python3 tools/validation/plan.py --base origin/master --head HEAD \
+  --worker haskell-engine=cpu:build.all,test.engine,smoke.console \
+  --worker haskell-workflow=cpu:test.workflow \
+  --worker glfw-native=display:test.glfw-native
+```
+
+Before producing a plan, the planner refuses — naming every problem — a worker
+declared twice or with an invalid name, an unknown runner class, a group the
+catalog does not register, a group assigned to two workers, a group whose runner
+class its worker does not declare, and a selected group no worker owns. A
+`display` group routed to a CPU-only worker is therefore a planning error, not
+an execution that later fails or silently runs somewhere it cannot. The
+validated assignment is recorded in the plan's `workers` and is part of its
+[plan identity](#receipts), so the same selection routed differently is a
+different plan.
+
+A plan resolved without any `--worker` still explains selection, and the prose
+output says so, but it names nobody who could run what it selected: `run.py`,
+`reuse.py`, `aggregate.py`, and `ci_image.py` all refuse it.
+
+Every later consumer reads the assignment back out of the plan rather than
+keeping a copy of its own:
+
+- `run.py` takes the executing worker's `--worker` name and the
+  `--runner-class` values that worker provides, and refuses — before executing
+  anything — a group whose runner class the execution does not declare, a
+  declaration that differs from the classes the plan recorded for that worker,
+  and a group the plan assigns to another worker. Its receipt records the
+  `worker` and the `runner_class`.
+- `reuse.py` reports each plan worker's `run-<name>`, `groups-<name>`, and
+  `assigned-<name>` outputs from the assignment, and refuses an earlier receipt
+  recorded by another worker or for another runner class.
+- `aggregate.py` takes each worker's job result and the groups it owns from the
+  plan. A worker owing selected work that reported no result, or did not
+  succeed, fails the verdict whatever the other workers did, and a fresh or
+  reused receipt from another route satisfies nothing.
+
+`reuse.py` and `aggregate.py` still accept a worker's group list beside its name,
+but only as a restatement: a name the plan does not declare, or a list that is
+not exactly the plan's assignment, is a conflicting route and exits `2`.
 
 ## Running validation on GitHub
 
@@ -365,21 +437,26 @@ interpret it. A push carries no body and therefore no request.
 The job then runs [the reuse lookup](#reusing-an-earlier-execution), which needs
 the `actions: read` permission and nothing else, and uploads `plan.json` and
 `applicability.json` together as one artifact. It publishes the selected group
-IDs, the groups that still have to execute, the candidate's input identity, and
-one boolean per worker as job outputs. A planner error fails the job with the
+IDs, the groups that still have to execute, the candidate's input identity, and,
+for each worker, whether it still has work and every group the plan assigns it,
+as job outputs. The worker declarations are passed to the planner once, in the
+`Resolve the plan` step; no other step restates them. A planner error fails the job with the
 planner's own diagnostic; a reuse lookup that fails does not fail the job, it
 publishes an applicability document that reuses nothing.
 
 ### Workers
 
-Two workers run in parallel, each with a 45-minute timeout, each inside the
+Three workers run in parallel, each with a 45-minute timeout, each inside the
 [Linux CI image](#the-linux-ci-image) the plan names by exact digest, and each
-**skipped entirely** when the plan selected none of the groups it owns:
+**skipped entirely** when the plan selected none of the groups it owns. Each
+runs exactly the groups the plan assigns it, and passes its own name and runner
+class to every execution:
 
-| Job | Groups, in order |
-| --- | --- |
-| `haskell-engine` | `build.all`, `test.engine`, `smoke.console` |
-| `haskell-workflow` | `test.workflow` |
+| Job | Runner class | Groups, in order |
+| --- | --- | --- |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `smoke.console` |
+| `haskell-workflow` | `cpu` | `test.workflow` |
+| `glfw-native` | `display` | `test.glfw-native` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest
@@ -421,13 +498,54 @@ and both keyed on inputs a Markdown edit cannot change; see
 
 A cache miss costs time and can never change a result.
 
+### The display worker
+
+`glfw-native` is the only worker declaring the `display` runner class, and the
+only job that ever starts a display. Its steps are the CPU workers' — verify
+the image, link a native consumer, restore caches keyed separately as
+`dist-newstyle-native-…` — except that it runs each group through the display
+helper:
+
+```bash
+bash tools/display/x11.sh --summary "$GITHUB_STEP_SUMMARY" -- \
+  python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
+  --worker glfw-native --runner-class display --toolchain ...
+```
+
+`tools/display/x11.sh` establishes an isolated X11 display for that one command
+and stops it afterwards. It starts the image's `Xvfb` with `-displayfd`, so the
+server itself reports the free display number once it accepts connections;
+queries the server with `xdpyinfo`; starts the `openbox` window manager and waits
+— for at most ten seconds — for it to announce itself on the root window; removes
+`WAYLAND_DISPLAY`, sets `XDG_SESSION_TYPE=x11`, and exports the new `DISPLAY`.
+It records the display, the server vendor, and the window manager in the job
+summary. The native suite then refuses any session that is not X11 on that
+display, so neither a dummy or null platform nor an XWayland session nor an
+accidental backend fallback can stand in for it.
+
+A missing server or window manager, a server that exits before reporting a
+display, one that does not answer, and a window manager that exits or never
+takes the display each end the helper with status `1` before the command
+starts. The group then writes no receipt and the job fails, and `build-test`
+reports both the worker's failure and the missing receipt. Nothing retries it,
+skips it, or makes it optional, and another worker's success does not hide it.
+Receipts carry the runner OS this worker recorded, so a macOS run's receipt
+never satisfies the Linux candidate, or the other way around.
+
+A documentation-only candidate selects no display group and never starts this
+job. A documentation-only push *following* a code change to the native inputs
+still selects the group against the merge base, as described under
+[Reasons and `inputs_changed`](#reasons-and-inputs_changed), and the job is
+skipped through valid receipt reuse instead.
+
 ### Receipts
 
 `tools/validation/run.py` executes one group and writes `<group-id>.json` into
 its receipts directory. The resolved plan is its only authority:
 
 ```bash
-python3 -I tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
+python3 -I tools/validation/run.py <group-id> --plan plan.json --receipts <dir> \
+  --worker <worker> --runner-class <class>
 ```
 
 `-I` is required, not a nicety: the runner refuses to start without it. See
@@ -438,6 +556,8 @@ python3 -I tools/validation/run.py <group-id> --plan plan.json --receipts <dir>
 | `--plan` | The resolved plan this execution belongs to. Required: a group's command, its timeout, and the plan identity its receipt must name all come from here, so a runner never infers a request-dependent selection from an ID and a checkout. |
 | `--receipts` | The directory the receipt is written to. |
 | `--repo-root` | The checkout to execute in. Defaults to the working directory. |
+| `--worker` | The executing worker's name. Required; the plan must assign the group to it. |
+| `--runner-class` | A runner class the executing worker provides. Required and repeatable; the set must equal the classes the plan recorded for that worker and include the group's class. |
 | `--toolchain NAME=VERSION` | A toolchain version to record. Repeatable; the runner always records its own Python version. |
 
 There is **no option that sets the executed revision**. The runner reads it from
@@ -452,7 +572,8 @@ The receipt records the group, the exact command, the outcome, the exit status,
 start and end timestamps, the duration, the declared timeout, the plan identity,
 the candidate's input identity and policy identity, the pull request's head
 commit, the commit and tree that actually executed, the runner's OS and
-architecture, the toolchain versions, and the run it can be read back from. The
+architecture, the worker that executed it and the runner class it required, the
+toolchain versions, and the run it can be read back from. The
 head and the executed revision are recorded separately because a pull request is
 validated on an integration candidate that is neither endpoint; a receipt must
 not imply that the head itself ran.
@@ -709,7 +830,7 @@ python3 tools/validation/reuse.py --plan plan.json --repo <owner/name> --output 
 | --- | --- |
 | `--plan`, `--repo`, `--output` | The resolved plan, the repository to read evidence from, and the applicability document to write. |
 | `--workflow` | The workflow whose runs may produce reusable evidence. Defaults to `.github/workflows/validation.yml`. |
-| `--worker NAME=GROUP[,GROUP...]` | A worker job and the groups it owns, so the step can report whether that job still has work. Repeatable. |
+| `--worker NAME[=GROUP,...]` | Restate one of the plan's workers, and optionally its groups, which must agree with the plan's assignment exactly. Repeatable. Every plan worker's `run-`, `groups-`, and `assigned-` outputs are printed either way. |
 | `--budget-seconds` | The whole lookup's budget. Defaults to 120. |
 | `--gh` | The GitHub CLI executable to read through. |
 | `--summary` | A Markdown file the reuse table is appended to. |
@@ -747,6 +868,8 @@ That artifact is accepted only when all of this holds:
   execution nobody has looked at;
 - the receipt records the command the plan selected, and matches the
   candidate's `input_identity`, `policy_version`, `toolchain`, and `runner_os`;
+- the receipt records the runner class the group requires and the worker the
+  plan assigns it;
 - the receipt records `passed` with exit status `0`.
 
 Everything else is an obstacle, never a pass. An expired, missing, malformed,
@@ -775,7 +898,7 @@ comparison here.
 
 ### The aggregate and `build-test`
 
-`build-test` runs after the plan and both workers with `if: always()`, so the
+`build-test` runs after the plan and every worker with `if: always()`, so the
 required check reaches a conclusion whatever happened upstream — a skipped
 required workflow is not a verdict, and a documentation candidate gets its
 status through exactly this path. It downloads the artifacts, writes per-job
@@ -789,7 +912,7 @@ python3 tools/validation/aggregate.py --plan plan.json --receipts <dir>
 | --- | --- |
 | `--plan`, `--receipts` | The plan the verdict is about, and the collected receipts. |
 | `--applicability` | The document recording earlier executions that still apply. |
-| `--worker NAME=RESULT:GROUP[,GROUP...]` | A worker job, its result, and the groups it owns. Repeatable. |
+| `--worker NAME=RESULT[:GROUP,...]` | One of the plan's workers and its job result, optionally restating the groups the plan assigns it, which must agree exactly. Repeatable. |
 | `--expect-head`, `--expect-base` | The pull request's current head and merge base. |
 | `--expect-request-file` | A file holding the pull request's current body. |
 | `--summary` | A Markdown file the verdict table is appended to. |
@@ -799,12 +922,14 @@ this plan's identity, names this plan's head, records the command the plan
 selected, records an execution of **this plan's candidate** commit and tree, and
 agrees with the candidate on every compatibility field — `input_identity`,
 `policy_version`, `toolchain`, and `runner_os` — that a reused execution is
-already held to. A group the plan explained away as `unaffected` or
+already held to, and was produced by the worker and runner class the plan routes
+that group to. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
 than a failure. Everything else fails: a missing receipt, a failed or timed-out
 one, a malformed one, one belonging to another plan, head, or candidate, one
 recording inputs or a platform this plan was not resolved for, and **any worker
-that did not conclude `success` while its groups were asked to execute**. A
+that did not conclude `success`, or reported no result at all, while its groups
+were asked to execute**. A
 selected gate nothing vouched for has not been satisfied, however green the rest
 of the run looks.
 
@@ -888,8 +1013,11 @@ Linux workers install nothing. They run inside one published image,
   [native recipe](#the-native-glfw-recipe) and exported through
   `PKG_CONFIG_PATH`.
 
-It carries no project source, project build output, captures, display server,
-window manager, or Vulkan SDK. It embeds its recipe fingerprint and native
+It also carries the `xvfb`, `openbox`, and `x11-utils` packages the
+[display worker](#the-display-worker)'s helper uses. Nothing in the image starts
+them: only that helper does, inside the display worker, for one group at a
+time. It carries no project source, project build output, captures, or Vulkan
+SDK. It embeds its recipe fingerprint and native
 manifest hash in `/opt/hetoimasia/image.json` and in its labels, and never its
 own digest, which does not exist until it is pushed.
 
@@ -1115,11 +1243,28 @@ run with the same map:
 native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native" --json > plan.json
+  --toolchain "$native" \
+  --worker local=cpu+display:build.all,test.engine,smoke.console,test.workflow,test.glfw-native \
+  --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native"
 ```
+
+On macOS a local worker provides the `display` class through Cocoa, so the same
+plan executes the native group directly — no display helper, since Cocoa is the
+windowing session:
+
+```bash
+python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
+  --toolchain "$native"
+```
+
+That receipt records `Darwin` as its runner OS, and remote CI never runs macOS,
+so it is local evidence only: it can never satisfy a Linux plan.
 
 ## The review gate
 
@@ -1513,10 +1658,15 @@ candidate whose checks have not passed reports `BLOCKED`.
 
 ## What the hosted platform cannot cover
 
-Both workers run on GitHub's hosted `ubuntu-latest` runners, inside the CI image: headless Linux,
-CPU only, with no GPU and no Vulkan loader. Everything currently registered in
-the catalog is a CPU build, an Hspec suite, or a console smoke run, so the
-hosted platform covers all of it. It cannot cover rendering: once a renderer
+Every worker runs on GitHub's hosted `ubuntu-latest` runners, inside the CI
+image: Linux, CPU only, with no GPU and no Vulkan loader. The CPU workers are
+headless, and the display worker's only display is the isolated Xvfb X11 server
+it starts itself, so native evidence from CI is X11 on a virtual framebuffer: it
+covers the session, thread, and window lifecycle, not Wayland, macOS, physical
+monitors, or real desktop interaction, which stay local or optional.
+Everything currently registered in the catalog is a CPU build, an Hspec suite,
+a console smoke run, or that X11 group, so the hosted platform covers all of
+it. It cannot cover rendering: once a renderer
 exists, its evidence is offscreen capture produced somewhere with a GPU, and a
 headless success will not stand in for it. `runner` is declared per group in the
 catalog precisely so an unsupported runner becomes a visible requirement rather
@@ -1787,5 +1937,36 @@ refused and the manifest identity changes, and that restoring the configuration
 restores the identity; and that an absent prefix beside a visible system GLFW, a
 prefix whose metadata was replaced by a system GLFW, generated link requirement
 drift, and a missing `pkg-config` are each refused.
+
+Runner classes and worker routing have their own examples, driven through the
+real planner, runner, reuse lookup, and aggregate against fixture catalogs that
+register display groups beside CPU ones. Planning refuses a display group
+routed to a CPU-only worker, an unknown group, an unknown runner class, a group
+owned twice, and a selected group nobody owns, and a catalog accepts `display`
+while naming an unknown class. A changed native input selects the display group
+while an affected optional display probe stays unselected, and a
+documentation-only candidate selects no display work and passes with the
+display worker skipped. Execution refuses a group on a worker that does not
+declare its class, one claiming a class the plan did not record, and one the
+plan did not assign it, and records the worker and class on the receipt it
+writes when routed correctly. A plan resolved without worker declarations is
+refused at execution, at reuse, and at the verdict. The verdict fails for a
+selected display group with no receipt, whether the display worker failed or
+reported no result at all, and for a fresh display receipt from another
+operating system or another route; a restated worker assignment that conflicts
+with the plan is refused by the aggregate and by the reuse lookup. The reuse
+examples accept an unchanged display group's earlier receipt and skip the
+display worker, execute the group again once its native input changes, and
+refuse a display receipt from another operating system, another runner class,
+or another worker; changing the native manifest in the toolchain or the display
+setup moves the candidate's identity, so earlier display evidence cannot cross
+either.
+
+The display helper is driven with a `PATH` holding only ordinary utilities and
+stub display programs: the command runs inside the display the helper
+established, with `WAYLAND_DISPLAY` removed and the server stopped afterwards;
+a missing X server, one that exits before reporting a display, and a window
+manager that exits each stop the run with status `1` before the command
+starts; and the command's own status is returned once it ran.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

@@ -30,5 +30,9 @@ Build and check, after preparing the native prefix on macOS with
 ```bash
 cabal build all
 cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
-cabal test glfw-native-check --test-show-details=direct
+cabal test glfw-native-tests --test-show-details=direct
 ```
+
+`glfw-native-tests` runs the real session through the shared native fixture and
+needs a windowing session: Cocoa locally, or on Linux an isolated X11 display
+from `tools/display/x11.sh`. See [docs/glfw.md](../../docs/glfw.md#the-native-suite).

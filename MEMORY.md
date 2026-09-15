@@ -232,9 +232,9 @@ not a verdict that Synarchy's design should be discarded.
   Linking is `pkgconfig-depends` plus per-OS `frameworks`/`extra-libraries`,
   checked against the manifest by the `GLFW` Hspec group; the planner accepts
   those link-only `if os(...)` blocks and follows `package:library` deps.
-  `glfw-native-check` runs a real session locally and is built, not run, by
-  `cabal build all` (`tests: True` for that package only). Contract:
-  `docs/glfw.md`.
+  Its first real-session check was folded into GLFW-7's `glfw-native-tests`,
+  which `cabal build all` builds but does not run (`tests: True` for that
+  package only). Contract: `docs/glfw.md`.
 - GLFW-2 (#90) added `Hetoimasia.GLFW.Window`: `allocWindow`/`withWindow`
   build a window in a live session from a validated `WindowConfig` through one
   `Assembly` (`Hetoimasia.GLFW.Internal.Window.windowAssembly`) that
@@ -278,6 +278,22 @@ not a verdict that Synarchy's design should be discarded.
   (`seamExecuteNext*`) drives it until GLFW-3's owner loop drains ports. Its
   examples live in `glfw-window-examples`. Contract: `docs/glfw.md`,
   "Window commands".
+- GLFW-7 (#93) delivered TEST-2's first shared native fixture and the
+  `display` runner class. `glfw-native-tests` (`packages/glfw/native-tests/`)
+  makes the process main thread the owner of one lazily acquired production
+  session (`Test.GLFW.Native.Fixture.runOwned`) and runs Hspec on a worker that
+  `dispatch`es operations to it; dry runs and unreached selections acquire
+  nothing, examples use private windows (none is shared yet), lifecycles that
+  need their own session run in a `--private-session` child process, and thread
+  identity is checked at setup, per operation, and around release. The catalog's
+  `test.glfw-native` group (runner `display`, outside the floor) runs only on the
+  `glfw-native` CI worker, each group inside `tools/display/x11.sh` (Xvfb plus
+  Openbox, X11 forced, Wayland removed); the image carries those packages but
+  starts nothing. Workers are declared once to `plan.py --worker
+  NAME=CLASS:GROUPS`; the plan (schema 3) records the validated assignment, a
+  worker-less plan is inspection-only, and `run.py`, `reuse.py`, and
+  `aggregate.py` consume the plan's routing (receipt schema 3 records `worker`
+  and `runner_class`). Contract: `docs/validation.md`, `docs/glfw.md`.
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to
@@ -435,7 +451,8 @@ not a verdict that Synarchy's design should be discarded.
   repair (#47 / PR #48) or TEST-1 (#50 / PR #51). Local checks passed 145 engine
   and 262 workflow examples, build, smoke, and the three focused component
   selections; an empty selector fails. Logging, Runtime, and Resources now
-  compose through `Test.Engine.Spec`. Graphics fixtures remain deferred TEST-2;
-  no backend implementation exists yet. Earlier bootstrap entries above are
+  compose through `Test.Engine.Spec`. Graphics fixtures were then deferred
+  TEST-2; GLFW-7 (#93) has since delivered the first shared native fixture,
+  and Vulkan fixtures remain the Vulkan arc's work. Earlier bootstrap entries above are
   historical snapshots, not the present resource implementation inventory.
 - No engine save format or game migration commitment exists yet.

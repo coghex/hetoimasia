@@ -23,7 +23,7 @@ module Hetoimasia.GLFW.Internal.Native
     -- * Error codes
   , glfwPlatformUnavailable
 
-    -- * Native check drivers
+    -- * Native example drivers
   , setWindowSizeForCheck
   , pollEventsForCheck
   , leakResizableHintForCheck
@@ -193,20 +193,20 @@ detachWindowCallbacks window = do
   void (c_glfwSetWindowRefreshCallback window nullFunPtr)
   void (c_glfwSetWindowCloseCallback window nullFunPtr)
 
--- | Resize a window: a callback-producing setter for the native check only.
+-- | Resize a window: a callback-producing setter for the native examples only.
 setWindowSizeForCheck ∷ Ptr NativeWindow → Int → Int → IO ()
 setWindowSizeForCheck window width height = c_glfwSetWindowSize window (fromIntegral width) (fromIntegral height)
 
--- | Process pending events once, for the native check only.
+-- | Process pending events once, for the native examples only.
 pollEventsForCheck ∷ IO ()
 pollEventsForCheck = c_glfwPollEvents
 
--- | Set a creation hint no window configuration sets, so the native check can
+-- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
 leakResizableHintForCheck ∷ IO ()
 leakResizableHintForCheck = c_glfwWindowHint glfwResizable glfwFalse
 
--- | Whether a window is resizable, for the native check only.
+-- | Whether a window is resizable, for the native examples only.
 windowResizableForCheck ∷ Ptr NativeWindow → IO Bool
 windowResizableForCheck window = (/= glfwFalse) <$> c_glfwGetWindowAttrib window glfwResizable
 

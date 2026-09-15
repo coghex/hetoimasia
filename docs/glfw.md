@@ -25,7 +25,7 @@ mode command, close policy, dynamic window collection, or rendering operation.
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks and change close intent, and the private window command executor |
 | `glfw-window-examples` | executable, test-only | The window model and window command examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
-| `glfw-native-check` | test suite | The real session on the platform it runs on |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, and window examples on the platform it runs on |
 
 The package depends on `hetoimasia-foundation` and not on
 `hetoimasia-runtime`. Its only logging import is `Component` from
@@ -277,7 +277,7 @@ Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
 refresh, and close callback setters. `glfwSetWindowSize` and `glfwPollEvents`
-are bound for the native check only; no production path calls them.
+are bound for the native examples only; no production path calls them.
 
 - Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
   installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
@@ -664,11 +664,11 @@ Then:
 ```bash
 cabal build all
 cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
-cabal test glfw-native-check --test-show-details=direct
+cabal test glfw-native-tests --test-show-details=direct
 ```
 
 `cabal.project` sets `tests: True` for this package alone. `cabal build all`
-therefore compiles `glfw-native-check` from a clean configuration without
+therefore compiles `glfw-native-tests` from a clean configuration without
 running it.
 
 - **The `GLFW` group** in `hetoimasia-tests` is headless and initializes nothing.
@@ -704,25 +704,69 @@ running it.
   Haskell exception with its context; owner-thread waits refused rather than
   blocking; and the observation request settling with a revision published
   first, while unserved and ended windows are rejected.
-- **`glfw-native-check`** needs a windowing session: Cocoa locally, or an X11
-  display. It is not part of `hetoimasia-tests`, the console smoke, or any
-  validation group. GLFW-7 owns the display runner and the shared native
-  fixture.
+- **`glfw-native-tests`** needs a windowing session: Cocoa locally, or an
+  isolated X11 display. It is not part of `hetoimasia-tests` or the console
+  smoke; it is the `test.glfw-native` validation group, which only the display
+  worker runs. See [The native suite](#the-native-suite).
 
-It is a plain executable rather than an Hspec suite, because Hspec runs examples
-off the main thread. Its checks cover:
+## The native suite
 
-- entering and leaving a real session, and a sequential second session;
-- nested entry, and entry from a bound worker and an unbound thread;
-- owner-only use from another thread;
+GLFW requires the process main thread, and Hspec runs examples on threads of its
+own, so `glfw-native-tests` makes its process main thread the owner of one
+shared production session and runs Hspec on a worker thread. An example reaches
+the session through the test-only dispatcher in `Test.GLFW.Native.Fixture`: it
+submits an operation, the main thread runs that operation against the session,
+and the result or the original failure comes back to the example. This is a
+test adapter over the production session, not a second supervisor or a general
+test environment.
+
+| Rule | How it holds |
+| --- | --- |
+| Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
+| Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
+| Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
+| Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
+| Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. |
+| Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
+
+The fixture's settlement rules are proven against a scripted owner that records
+its acquisition and release — lazy single acquisition, nothing acquired by a dry
+run or an empty selection, a deliberately failing nested example, a cancelled
+borrower with one operation in flight and one queued, an owner that fails while
+a borrower waits, and an acquisition failure — and the failing and cancelled
+cases again against the real shared session. Every deliberate failure is inside
+a nested run or a forked borrower and is asserted as expected, so the suite
+itself passes.
+
+The native examples cover:
+
+- the platform's backend selected explicitly, on an isolated X11 display under
+  Linux;
+- operations running on the bound process main thread that entered the session,
+  never on the Hspec worker, and a single acquisition;
+- nested entry on the owner thread, entry from a bound worker and from an
+  unbound thread, and owner-only use from the Hspec worker, each rejected while
+  the shared session keeps serving;
 - a hidden non-focusing window's creation, nondegenerate initial framebuffer
   observation, release, terminal observation, and terminal handle;
 - two live windows with a stray hint reset before the second's creation;
 - a second window after a window's release in the same session;
-- a fault raised inside a real GLFW size callback, driven by `glfwSetWindowSize`
-  and `glfwPollEvents`, rethrown at the owner boundary with its context;
-- a real `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling,
-  followed by a successful session.
+- in a private process, sessions entered and left in sequence, a real
+  `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
+  by a successful session, and a fault raised inside a real GLFW size callback,
+  driven by `glfwSetWindowSize` and `glfwPollEvents`, rethrown at the owner
+  boundary with its context.
+
+```bash
+cabal test glfw-native-tests --test-show-details=direct
+cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
+cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
+```
+
+On Linux, run it inside the display helper, exactly as the display worker does:
+`bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct`.
+See [validation.md](validation.md#the-display-worker).
 
 Record native evidence with the manifest and compiler identities it ran under:
 
