@@ -294,6 +294,25 @@ not a verdict that Synarchy's design should be discarded.
   worker-less plan is inspection-only, and `run.py`, `reuse.py`, and
   `aggregate.py` consume the plan's routing (receipt schema 3 records `worker`
   and `runner_class`). Contract: `docs/validation.md`, `docs/glfw.md`.
+- GLFW-3 (#94) added the public `hetoimasia-glfw:runtime-glfw` sublibrary
+  (`Hetoimasia.Runtime.GLFW`), the only component depending on both GLFW and the
+  runtime. A separate `packages/runtime-glfw/` package was tried and rejected:
+  Cabal's solver refuses the package cycle once `glfw-native-tests` depends on
+  it, through `build-depends` or `build-tool-depends`. `allocWindowHost` builds a
+  `WindowHost` (session, windows, command host) as a `Scoped` dependency;
+  `runOwnerLoop` runs bounded turns (check, poll or finite `hostIdleWait` wait,
+  reconcile, check, at most `hostCommandBudget` commands, check, at most
+  `hostEventBudget` application events, check, `loopUpdate`, check) and is the
+  only production command executor. A turn is idle when the previous one
+  dispatched nothing and no command is queued. Close requests surface once in
+  `turnCloseRequests`, and nothing finishes on them by default.
+  `quiesceWindowHost` closes admission and settles `NotExecuted`, and
+  `runWindowApplication` installs it. The native table gained
+  `nativePollEvents`/`nativeWaitEventsTimeout` (seam `PollEvents`/`WaitEvents`,
+  private `seamQueueEvents`), and the shim gained the test-only
+  `requestCloseForCheck` (Cocoa `performClose:`; X11 `WM_DELETE_WINDOW` through
+  a `dlopen`ed libX11, so no link requirement changes). Contract:
+  `docs/glfw.md`, "The window host and owner loop".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

@@ -1,5 +1,5 @@
--- | Runs the GLFW window model examples from the package's own
--- @glfw-window-examples@ executable.
+-- | Runs the GLFW window model, window command, and window host examples from
+-- the package's own @glfw-window-examples@ executable.
 --
 -- Those examples drive windows through the test seam's private window
 -- drivers — scripted callbacks, a cancellation at the reconciliation's

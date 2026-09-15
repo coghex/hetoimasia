@@ -205,6 +205,11 @@ module Hetoimasia.GLFW.Internal.Window
   , closeRequestWindow
   , closeRequestNumber
 
+    -- * Private owner-turn operations
+  , EventProcessing (..)
+  , processWindowEvents
+  , reconcileWindowEvents
+
     -- * Private owner-boundary drivers
   , windowStep
   , windowStepWith
@@ -1056,6 +1061,50 @@ rejectCloseRequest window request =
         mask_ (commitObservation window next issued prepared)
         pure True
       else pure False
+
+-- | How an owner turn processes native events.
+data EventProcessing
+  = ProcessPending
+    -- ^ Process the events already pending, without waiting.
+  | AwaitEventsFor !Double
+    -- ^ Wait at most this many seconds for an event, then process every
+    -- pending event.
+  deriving (Eq, Show)
+
+processEventsOperation, reconcileEventsOperation ∷ Operation
+processEventsOperation = operation "process window events"
+reconcileEventsOperation = operation "reconcile window events"
+
+-- | Process native events once on the owner thread: the one event pump the
+-- private owner turn uses.
+--
+-- The owner and liveness are checked first. Callbacks GLFW makes inside the call
+-- only record into their windows' capture latches, so nothing is reconciled
+-- here: each window's captures are reconciled at its next owner boundary, such
+-- as 'reconcileWindowEvents'. An error reported on the owner thread during the
+-- call fails it with 'NativeFailure', attributed to @process window events@.
+processWindowEvents ∷ Session → EventProcessing → IO ()
+processWindowEvents session processing =
+  ownerOperation session processEventsOperation identifiers $ do
+    settleStrayOwnerReports capture
+    case processing of
+      ProcessPending → nativePollEvents native
+      AwaitEventsFor seconds → nativeWaitEventsTimeout native seconds
+    reports ← takeOwnerReports capture
+    raiseReported processEventsOperation identifiers NativeCallReturned reports
+  where
+    native = sessionNative session
+    capture = sessionCapture session
+    identifiers = case processing of
+      ProcessPending → [("events", "poll")]
+      AwaitEventsFor seconds → [("events", "wait"), ("seconds", Text.pack (show seconds))]
+
+-- | Reconcile what a window's callbacks captured since its last boundary,
+-- publishing a new revision if anything changed, and rethrow a latched callback
+-- fault: an owner boundary with no native step of its own. An ended window
+-- answers 'WindowEnded'.
+reconcileWindowEvents ∷ Window → IO (WindowResult ())
+reconcileWindowEvents window = atBoundary (pure ()) window reconcileEventsOperation (pure ())
 
 -- | The native window, for the private drivers in this package only.
 windowNativeHandle ∷ Window → Ptr NativeWindow

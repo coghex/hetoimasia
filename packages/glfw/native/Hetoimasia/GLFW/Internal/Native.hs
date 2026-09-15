@@ -27,6 +27,7 @@ module Hetoimasia.GLFW.Internal.Native
   , setWindowSizeForCheck
   , pollEventsForCheck
   , waitEventsForCheck
+  , requestCloseForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
   ) where
@@ -92,6 +93,8 @@ productionNative =
     , nativeWindowPosition = pairOf c_glfwGetWindowPos fromIntegral
     , nativeWindowAttribute = \window attribute →
         (/= glfwFalse) <$> c_glfwGetWindowAttrib window (attributeCode attribute)
+    , nativePollEvents = c_glfwPollEvents
+    , nativeWaitEventsTimeout = c_glfwWaitEventsTimeout . CDouble
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     }
 
@@ -209,6 +212,14 @@ pollEventsForCheck = c_glfwPollEvents
 waitEventsForCheck ∷ Double → IO ()
 waitEventsForCheck seconds = c_glfwWaitEventsTimeout (CDouble seconds)
 
+-- | Ask the platform to close a window, as its close button would, for the
+-- native examples only: @performClose:@ on Cocoa, and a @WM_DELETE_WINDOW@
+-- client message on X11. GLFW reports the request through the window's close
+-- callback — inside this call on Cocoa, and from a later event poll on X11 —
+-- and destroys nothing.
+requestCloseForCheck ∷ Ptr NativeWindow → IO ()
+requestCloseForCheck = c_requestCloseForCheck
+
 -- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
 leakResizableHintForCheck ∷ IO ()
@@ -225,6 +236,9 @@ createWindow width height title =
 
 foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_is_process_main_thread"
   c_isProcessMainThread ∷ IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_request_close_for_check"
+  c_requestCloseForCheck ∷ Ptr NativeWindow → IO ()
 
 foreign import capi safe "hetoimasia_glfw.h glfwPlatformSupported"
   c_glfwPlatformSupported ∷ CInt → IO CInt

@@ -28,8 +28,10 @@
 -- in a seam session. The seam hands each a scripted native handle, keeps the
 -- callbacks the model attached to it, and delivers scripted 'WindowEvent's to
 -- them from inside an owner-boundary step, as GLFW would from inside a setter
--- or a poll: 'seamDrive'. 'seamRejectCloseRequest' is the private close-request
--- transition. Neither is a public command, and neither is exported by the
+-- or a poll: 'seamDrive'. 'seamQueueEvents' instead leaves events for the next
+-- poll or finite wait an owner turn makes, which delivers them from inside that
+-- native call. 'seamRejectCloseRequest' is the private close-request
+-- transition. None of them is a public command, and none is exported by the
 -- public seam. Each also refuses, with 'ForeignSeamWindow' and before anything
 -- else, a window whose session was not entered over this seam's own native
 -- table.
@@ -63,6 +65,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , DriveOrigin (..)
   , seamDrive
   , seamDriveCancelledBeforeCommit
+  , seamQueueEvents
   , seamRejectCloseRequest
   , ForeignSeamWindow (..)
 
@@ -139,6 +142,7 @@ import Hetoimasia.GLFW.Internal.Window
   , Window
   , WindowResult
   , rejectCloseRequest
+  , windowNativeHandle
   , windowSession
   , windowStepWith
   )
@@ -168,6 +172,9 @@ data NativeCall
   | QueryContentScale
   | QueryWindowPosition
   | QueryWindowAttribute WindowAttribute
+  | PollEvents
+  | WaitEvents Double
+    -- ^ A finite wait, with its bound in seconds.
   deriving (Eq, Show)
 
 -- | A native event the seam delivers to a window's attached callbacks.
@@ -213,6 +220,11 @@ data SeamScript = SeamScript
   , scriptContentScale ∷ Reporter → IO (Float, Float)
   , scriptWindowPosition ∷ Reporter → IO (Int, Int)
   , scriptWindowAttribute ∷ WindowAttribute → Reporter → IO Bool
+  , scriptPollEvents ∷ Reporter → IO ()
+    -- ^ Runs inside a poll, before the events queued for it are delivered.
+  , scriptWaitEvents ∷ Double → Reporter → IO ()
+    -- ^ Runs inside a finite wait, given its bound, before the events queued
+    -- for it are delivered. It may block, as a native wait does.
   }
 
 -- | A platform supporting X11 on which every step succeeds silently.
@@ -234,6 +246,8 @@ defaultScript =
     , scriptContentScale = \_ → pure (2, 2)
     , scriptWindowPosition = \_ → pure (40, 30)
     , scriptWindowAttribute = \_ _ → pure False
+    , scriptPollEvents = \_ → pure ()
+    , scriptWaitEvents = \_ _ → pure ()
     }
 
 -- | The code the scripted library reports for a property it cannot provide.
@@ -258,6 +272,8 @@ data Seam = Seam
     -- ^ Allocated and not yet freed window callback storage, by key.
   , seamAttachedWindows ∷ IORef [(Int, Int)]
     -- ^ Window key to the callback storage key attached to it.
+  , seamQueuedEvents ∷ IORef [(Int, [WindowEvent])]
+    -- ^ Events for the next poll or wait to deliver, by window key, oldest first.
   }
 
 -- | What a scripted step reports errors through.
@@ -276,6 +292,7 @@ newSeam script =
     <*> newIORef 1
     <*> newIORef Nothing
     <*> newIORef 1
+    <*> newIORef []
     <*> newIORef []
     <*> newIORef []
 
@@ -326,12 +343,27 @@ seamDriveCancelledBeforeCommit seam window = driveWith (throwIO ThreadKilled) se
 driveWith ∷ IO () → Seam → Window → Text → [WindowEvent] → IO (WindowResult ())
 driveWith interruption seam window originName events = do
   requireSeamWindow seam window
-  windowStepWith interruption window (operation originName) $ \handle → do
-    attached ← readIORef (seamAttachedWindows seam)
-    stored ← readIORef (seamWindowCallbacks seam)
-    case lookup (windowKey handle) attached >>= (`lookup` stored) of
-      Nothing → pure ()
-      Just callbacks → mapM_ (deliver callbacks) events
+  windowStepWith interruption window (operation originName) $ \handle →
+    deliverTo seam (windowKey handle) events
+
+-- | Queue events for a window's attached callbacks. The next poll or finite
+-- wait over this seam's native table delivers them from inside that call, as
+-- GLFW delivers events from inside a poll; nothing is delivered before it.
+seamQueueEvents ∷ Seam → Window → [WindowEvent] → IO ()
+seamQueueEvents seam window events = do
+  requireSeamWindow seam window
+  let key = windowKey (windowNativeHandle window)
+  atomicModifyIORef' (seamQueuedEvents seam) (\queued → (queued <> [(key, events)], ()))
+
+-- | Deliver events to the callbacks attached to a window key. Events for a
+-- window with no callbacks attached are dropped, as GLFW drops them.
+deliverTo ∷ Seam → Int → [WindowEvent] → IO ()
+deliverTo seam key events = do
+  attached ← readIORef (seamAttachedWindows seam)
+  stored ← readIORef (seamWindowCallbacks seam)
+  case lookup key attached >>= (`lookup` stored) of
+    Nothing → pure ()
+    Just callbacks → mapM_ (deliver callbacks) events
   where
     deliver callbacks event = case event of
       ResizedTo width height → onWindowSize callbacks (fromIntegral width) (fromIntegral height)
@@ -501,9 +533,20 @@ seamNative seam =
     , nativeWindowAttribute = \_ attribute → do
         record (QueryWindowAttribute attribute)
         scriptWindowAttribute script attribute reporter
+    , nativePollEvents = do
+        record PollEvents
+        scriptPollEvents script reporter
+        deliverQueued
+    , nativeWaitEventsTimeout = \seconds → do
+        record (WaitEvents seconds)
+        scriptWaitEvents script seconds reporter
+        deliverQueued
     , nativeFeatureUnavailable = featureUnavailableCode
     }
   where
+    deliverQueued =
+      atomicModifyIORef' (seamQueuedEvents seam) (\queued → ([], queued))
+        >>= mapM_ (uncurry (deliverTo seam))
     script = seamScript seam
     reporter = Reporter seam
     record call = atomicModifyIORef' (seamLog seam) (\calls → (call : calls, ()))

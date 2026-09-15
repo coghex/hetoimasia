@@ -21,6 +21,17 @@
 -- it takes is refused before GLFW is initialized, so the example opens no
 -- display.
 --
+-- The window host from the public @runtime-glfw@ sublibrary is compiled against
+-- as well, exposing @hetoimasia-runtime@ and that sublibrary beside the rest.
+-- This suite does not import the sublibrary: it is built and registered because
+-- @glfw-window-examples@, one of this suite's build tools, depends on it.
+-- Three clients must be rejected: one names the host's constructor, one asks
+-- the host for its session, windows' command host, and settings, and one
+-- reaches for the owner loop's executor and event processing in the private
+-- modules the sublibrary uses. One client must be accepted, linked, and run: it
+-- uses the host's supported configuration, construction, turn, and client
+-- capabilities, and every path it runs is refused before GLFW is initialized.
+--
 -- The test seam is a public component so this suite can depend on it. Four more
 -- clients are compiled against it and must be rejected: two name the window
 -- drivers and the private command executor through the public seam, which
@@ -150,6 +161,57 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "seam-core"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that names the window host's constructor" $
+    withHostClient "Client.hs" hostConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "WindowHost"
+
+  it "rejects a client that asks the window host for its session or command host" $
+    withHostClient "Client.hs" hostAuthorityClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "hostSession"
+      clientOutput outcome `shouldContain` "hostCommands"
+
+  it "rejects a client holding a window host that reaches for the owner loop's executor or event processing" $
+    withHostClient "Client.hs" hostInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the owner loop's executor is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Command"
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Window"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "accepts and runs a client using the window host's supported capabilities, without initializing GLFW" $
+    withHostClient "Main.hs" hostClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the supported host client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "default = Right ()"
+                   , "zero budget = CommandBudgetRejected 0"
+                   , "without the threaded runtime = NotProcessMainThread"
+                   ]
+
   it "accepts and runs a client using only the public session, window, and command interfaces, without initializing GLFW" $
     withClient "Main.hs" publicClient $ \compile → do
       outcome ← compile Link
@@ -174,6 +236,113 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "capacity = 16, description limit = 1024"
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
                    ]
+
+-- | Compile a client that can also see the runtime and the window host's
+-- sublibrary, by its unit id.
+withHostClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+withHostClient =
+  withPackageClient
+    [ "base"
+    , "text"
+    , "stm"
+    , "hetoimasia-foundation"
+    , "hetoimasia-runtime"
+    , "hetoimasia-glfw-0.1.0.0-inplace"
+    , "hetoimasia-glfw-0.1.0.0-inplace-runtime-glfw"
+    ]
+
+-- | A client naming the window host's data constructor.
+hostConstructorClient ∷ String
+hostConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW (WindowHost (WindowHost))"
+    , ""
+    , "forged ∷ Maybe WindowHost"
+    , "forged = Nothing"
+    ]
+
+-- | A client asking the host for the session and command host it owns.
+hostAuthorityClient ∷ String
+hostAuthorityClient =
+  unlines
+    [ "module Client (session) where"
+    , ""
+    , "import Hetoimasia.GLFW.Session (Session)"
+    , "import Hetoimasia.Runtime.GLFW (WindowHost, hostCommands, hostSession)"
+    , ""
+    , "session ∷ WindowHost → Session"
+    , "session = hostSession"
+    ]
+
+-- | A client holding a host that reaches for the owner loop's executor and
+-- event processing in the private modules.
+hostInternalsClient ∷ String
+hostInternalsClient =
+  unlines
+    [ "module Client (pump) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Command (executeNextWith)"
+    , "import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)"
+    , "import Hetoimasia.Runtime.GLFW (WindowHost)"
+    , ""
+    , "pump ∷ Maybe WindowHost → EventProcessing"
+    , "pump _ = ProcessPending"
+    ]
+
+-- | A client using the host's supported capabilities. Every path it runs is
+-- refused before GLFW is initialized: a budget of zero before the session, and
+-- a session entered without the threaded runtime.
+hostClient ∷ String
+hostClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Control.Concurrent.STM (atomically)"
+    , "import Control.Exception (SomeException, fromException, try)"
+    , "import qualified Data.Text as Text"
+    , "import Hetoimasia.Foundation.Resource (withScoped)"
+    , "import Hetoimasia.GLFW.Command"
+    , "import Hetoimasia.GLFW.Session (SessionMisuse)"
+    , "import Hetoimasia.GLFW.Window"
+    , "import Hetoimasia.Runtime.GLFW"
+    , "import Hetoimasia.Runtime.Logging (LoggingLifetime)"
+    , "import Hetoimasia.Runtime.Supervision (RuntimeControl)"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  let config = defaultHostConfig [hiddenTestWindowConfig (Text.pack \"tool\") 64 48]"
+    , "  putStrLn (\"default = \" <> show (validateHostConfig config))"
+    , "  rejected ← try (withScoped (allocWindowHost config {hostCommandBudget = 0}) (atomically . hostCommandStatistics))"
+    , "  putStrLn (\"zero budget = \" <> describe rejected)"
+    , "  unthreaded ← try (withScoped (allocWindowHost config) (atomically . hostCommandStatistics))"
+    , "  putStrLn (\"without the threaded runtime = \" <> describe unthreaded)"
+    , ""
+    , "describe ∷ Either SomeException CommandStatistics → String"
+    , "describe outcome = case outcome of"
+    , "  Right statistics → \"built \" <> show statistics"
+    , "  Left caught"
+    , "    | Just rejection ← fromException caught → show (rejection ∷ HostConfigRejected)"
+    , "    | Just misuse ← fromException caught → show (misuse ∷ SessionMisuse)"
+    , "    | otherwise → \"unexpected \" <> show caught"
+    , ""
+    , "application ∷ (∀ r. (LoggingLifetime → IO r) → IO r) → IO Int"
+    , "application enter ="
+    , "  runWindowApplication enter (Text.pack \"tool\") (allocWindowHost (defaultHostConfig [])) id (\\host _ → pure host) serve"
+    , ""
+    , "serve ∷ WindowHost → RuntimeControl → IO Int"
+    , "serve host control ="
+    , "  runOwnerLoop host control LoopHooks"
+    , "    { loopEvent = noApplicationEvents"
+    , "    , loopUpdate = \\turn → do"
+    , "        activity ← atomically (hostActivity host)"
+    , "        mapM_ (rejectHostCloseRequest host) (turnCloseRequests turn)"
+    , "        mapM_ (\\window → submitWindowCommand (hostCommandPort host) [] (observeWindowCommand (windowIdentity window))) (hostWindows host)"
+    , "        atomically (quiesceWindowHost host)"
+    , "        pure (if activityWaiting activity then Finish (turnCommands turn) else Continue)"
+    , "    }"
+    ]
 
 -- | Compile a client that can also see the public test seam, by its unit id.
 withSeamClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
