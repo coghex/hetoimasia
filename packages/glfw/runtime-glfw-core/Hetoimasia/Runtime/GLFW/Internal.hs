@@ -64,6 +64,7 @@ import qualified Data.Text as Text
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
+import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
@@ -105,6 +106,7 @@ import Hetoimasia.GLFW.Internal.Command
   , observeWindow
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
+import Hetoimasia.GLFW.Internal.Input (InputFeed, closeInputFeed, feedControl, feedReader, newInputFeed)
 import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents, sessionWindowCapabilities)
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
@@ -117,13 +119,15 @@ import Hetoimasia.GLFW.Internal.Window
 import Hetoimasia.GLFW.Monitor (MonitorInventory, monitorInventory)
 import Hetoimasia.GLFW.Session (Session, SessionConfig, SessionMisuse (SessionPoisoned), allocSession, defaultSessionConfig)
 import Hetoimasia.GLFW.Window
-  ( CloseRequest
+  ( Attribute (Observed)
+  , CloseRequest
   , Window
   , WindowConfig
   , WindowId
   , WindowResult (..)
   , closeRequestWindow
   , observedCloseRequest
+  , observedFocused
   , validateWindowConfig
   , windowIdentity
   , windowLocalIdentity
@@ -150,6 +154,9 @@ data HostConfig = HostConfig
   , hostCommandCapacity ∷ !Integer
     -- ^ How many commands the host's port, and each window's own port, holds
     -- queued.
+  , hostInputCapacity ∷ !Integer
+    -- ^ How many input events each window's feed holds queued. At least one,
+    -- and at most 'Hetoimasia.Foundation.Messaging.Channel.maximumCapacity'.
   , hostCommandBudget ∷ !Int
     -- ^ The most commands one turn attempts, across every port. At least one.
   , hostEventBudget ∷ !Int
@@ -161,7 +168,8 @@ data HostConfig = HostConfig
   deriving (Eq, Show)
 
 -- | The platform's own session, the given windows, a limit of 16 live windows,
--- a capacity of 64, budgets of 16, and a 0.1-second idle wait.
+-- a command capacity of 64, an input capacity of 256, budgets of 16, and a
+-- 0.1-second idle wait.
 defaultHostConfig ∷ [WindowConfig] → HostConfig
 defaultHostConfig windows =
   HostConfig
@@ -169,6 +177,7 @@ defaultHostConfig windows =
     , hostWindowConfigs = windows
     , hostWindowLimit = 16
     , hostCommandCapacity = 64
+    , hostInputCapacity = 256
     , hostCommandBudget = 16
     , hostEventBudget = 16
     , hostIdleWait = 0.1
@@ -181,6 +190,7 @@ data HostConfigRejected
   | IdleWaitRejected !Double
   | WindowLimitRejected !Int
     -- ^ The limit is below one, or below the number of configured windows.
+  | InputCapacityRejected !Integer
   deriving (Eq, Show)
 
 instance Exception HostConfigRejected
@@ -189,8 +199,9 @@ instance Exception HostConfigRejected
 maximumIdleWait ∷ Double
 maximumIdleWait = 60
 
--- | Check the budgets, the idle wait, and the window limit. The session,
--- window, and capacity settings are checked by the operations they configure.
+-- | Check the budgets, the idle wait, the window limit, and the input capacity.
+-- The session, window, and command capacity settings are checked by the
+-- operations they configure.
 validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
 validateHostConfig config
   | hostCommandBudget config < 1 = Left (CommandBudgetRejected (hostCommandBudget config))
@@ -198,10 +209,12 @@ validateHostConfig config
   -- Written so a NaN, which fails every comparison, is refused too.
   | not (wait > 0 && wait <= maximumIdleWait) = Left (IdleWaitRejected wait)
   | limit < 1 || limit < length (hostWindowConfigs config) = Left (WindowLimitRejected limit)
+  | input < 1 || input > maximumCapacity = Left (InputCapacityRejected input)
   | otherwise = Right ()
   where
     wait = hostIdleWait config
     limit = hostWindowLimit config
+    input = hostInputCapacity config
 
 -- | The component a host's own failures are attributed to.
 hostComponent ∷ Component
@@ -251,11 +264,13 @@ data HostHooks = HostHooks
 noHostHooks ∷ HostHooks
 noHostHooks = HostHooks (pure ())
 
--- | One registered window: its collection member, its own command host, the
--- capabilities handed to clients, and whether its close protocol has begun.
+-- | One registered window: its collection member, its own command host, its
+-- input feed, the capabilities handed to clients, and whether its close protocol
+-- has begun.
 data HostEntry = HostEntry
   { entryMember ∷ !(Member Window)
   , entryCommands ∷ !WindowCommandHost
+  , entryInput ∷ !InputFeed
   , entryClient ∷ !WindowClient
   , entryClosing ∷ !Bool
   }
@@ -341,17 +356,17 @@ hostWindowCapabilities = sessionWindowCapabilities . hostSession
 hostActivity ∷ WindowHost → STM HostActivity
 hostActivity = readTVar . hostActivityState
 
--- | Close the admission of the host's port and of every window's port, and
--- settle every queued command as not executed, in the calling transaction.
--- Finite, non-retrying, and idempotent; it destroys nothing, pumps nothing, and
--- waits on nothing.
+-- | Close the admission of the host's port and of every window's port, settle
+-- every queued command as not executed, and close every window's input feed, in
+-- the calling transaction. Finite, non-retrying, and idempotent; it destroys
+-- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
 quiesceWindowHost ∷ WindowHost → STM ()
 quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host)
 
 closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → STM ()
 closeAdmission commands entries = do
   void (closeWindowCommands commands)
-  readTVar entries >>= mapM_ (void . closeWindowCommands . entryCommands)
+  readTVar entries >>= mapM_ (\entry → void (closeWindowCommands (entryCommands entry)) >> closeInputFeed (entryInput entry))
 
 -- ---------------------------------------------------------------------------
 -- Windows
@@ -434,7 +449,8 @@ honourHostCloseRequest host request =
 -- 1. the window's closing observation is prepared, and nothing has changed yet;
 -- 2. in one transaction, masked and with nothing interruptible after it, the
 --    window is marked closing, its port's admission closes, its queued commands
---    settle as not executed, and the 'Hetoimasia.GLFW.Window.WindowClosing'
+--    settle as not executed, its input feed closes without awaiting any
+--    acknowledgement, and the 'Hetoimasia.GLFW.Window.WindowClosing'
 --    phase is published, so a cancellation can never leave the port closed
 --    with the phase unpublished, or the reverse;
 -- 3. it is retired through the collection, unless it or another window is
@@ -453,15 +469,16 @@ beginClose host target =
             WindowAvailable False → pure CloseAlreadyStarted
             WindowEnded _ → pure CloseNotServed
 
--- | The host's half of step 2: mark the window closing, close its port, and
--- settle its queue, answering whether it was still open. Finite and never
--- retries.
+-- | The host's half of step 2: mark the window closing, close its port, settle
+-- its queue, and close its input feed, answering whether it was still open.
+-- Finite and never retries.
 commitClosing ∷ WindowHost → WindowId → STM Bool
 commitClosing host target =
   Map.lookup target <$> readTVar (hostEntries host) >>= \case
     Just entry | not (entryClosing entry) → do
       modifyTVar' (hostEntries host) (Map.insert target entry {entryClosing = True})
       void (closeWindowCommands (entryCommands entry))
+      closeInputFeed (entryInput entry)
       pure True
     _ → pure False
 
@@ -495,7 +512,9 @@ retirePending host = do
   forM_ (Map.toAscList entries) $ \(target, entry) →
     if entryClosing entry then retireClosing host target entry else pure ()
 
--- | Acquire a window as a collection member and register it with its own port.
+-- | Acquire a window as a collection member and register it with its own port
+-- and input feed. The feed starts focused if the window's initial observation
+-- observed focus.
 --
 -- The window's construction runs with the caller's masking state, so a
 -- cancellation during it rolls construction back and registers nothing. The
@@ -508,9 +527,11 @@ registerWindow host config =
   acquireMemberThen (hostCollection host) (windowAssembly (hostSession host) config) $ \member → do
     (identity, reader) ←
       withMember (hostCollection host) member (\window → pure (windowIdentity window, windowObservations window))
+    focused ← (== Observed True) . observedFocused . preparedValue . observedValue <$> atomically (readSnapshot reader)
     commands ← newWindowPortHost (hostSession host) (hostCommandCapacity (hostSettings host)) identity
-    let client = newWindowClient identity commands reader
-    atomically (modifyTVar' (hostEntries host) (Map.insert identity (HostEntry member commands client False)))
+    feed ← newInputFeed identity (hostInputCapacity (hostSettings host)) focused
+    let client = newWindowClient identity commands reader (feedReader feed) (feedControl feed)
+    atomically (modifyTVar' (hostEntries host) (Map.insert identity (HostEntry member commands feed client False)))
     afterRegistration (hostHooks host)
     pure client
 

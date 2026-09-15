@@ -387,6 +387,26 @@ not a verdict that Synarchy's design should be discarded.
   test-only queries (`windowSizeForCheck`, `windowPositionForCheck`,
   `windowTitleForCheck`, `windowStateForCheck`). Contract: `docs/glfw.md`,
   "Window controls".
+- GLFW-8 (#99) added `Hetoimasia.GLFW.Input` over the private
+  `Hetoimasia.GLFW.Internal.Input` (model sublibrary). Each host window owns one
+  `InputFeed` (`hostInputCapacity`, default 256, `InputCapacityRejected`), handed
+  out through `WindowClient` as an opaque `InputReader` (read, wait, acknowledge,
+  statistics) and `InputControl` (`enableInput`/`suspendInput`). The feed's whole
+  state is one `TVar`: phase (running, reset pending, reset acknowledged,
+  closed), running epoch, current channel generation, application admission
+  (`AwaitingReadiness`, `InputEnabled`, `InputSuspended`), focus gate, held
+  key/button `IntSet`s bounded to GLFW's domains, the latest episode as a
+  `ResetSummary`, and `Natural` counters. Overflow or post-readiness suspension
+  aborts and drops the channel in one transaction, reserving `epoch + 1`; the
+  token carries the feed's `Unique` and that epoch. An overflow episode owes a
+  `glfw.input` warning claimed by the private `attemptOverflowWarning`; a failed
+  or cancelled attempt is recorded and not retried, and counts as complete for
+  resumption. The private producer (`produceInput`, `recordCursor`,
+  `produceButton`), warning, and `resumeInputWith` are driven only by
+  `glfw-window-examples`' `Test.GLFW.Input`. The window close protocol and host
+  quiescence close feeds; the host does not yet produce, warn, or resume — that
+  owner-loop and native callback wiring is GLFW-12 (#100). Contract:
+  `docs/glfw.md`, "Input feeds".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

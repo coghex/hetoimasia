@@ -8,8 +8,9 @@ description:
     evidence of what the native error callback reported, a monitor inventory
     with disconnect-safe identities, scoped NoAPI windows that publish what the
     platform observed through snapshots, and
-    bounded window command admission with persistent completion tickets. Its
-    main library depends on the foundation library and not on the runtime. The
+    bounded window command admission with persistent completion tickets, and
+    bounded per-window input feeds with an acknowledged reset. Its main library
+    depends on the foundation library and not on the runtime. The
     separate public runtime-glfw sublibrary composes a window host, its
     dynamically created and independently closed windows, and its supervised
     owner loop with the runtime's application lifecycle, and no library depends
@@ -37,8 +38,9 @@ common language
 
 -- The session, window, and monitor models: exclusivity, thread checks, staged
 -- construction and rollback, bounded error capture, window observations, the
--- monitor inventory and its identities, contained callbacks, and window command
--- admission, execution, and completion,
+-- monitor inventory and its identities, contained callbacks, window command
+-- admission, execution, and completion, and bounded input feeds with their
+-- acknowledged reset,
 -- written over a table of native operations. It binds nothing, so the test seam
 -- can drive it without linking GLFW.
 library model
@@ -49,6 +51,7 @@ library model
         Hetoimasia.GLFW.Internal.Attribute
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Control
+        Hetoimasia.GLFW.Internal.Input
         Hetoimasia.GLFW.Internal.Monitor
         Hetoimasia.GLFW.Internal.Session
         Hetoimasia.GLFW.Internal.Window
@@ -91,6 +94,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GLFW.Command
+        Hetoimasia.GLFW.Input
         Hetoimasia.GLFW.Monitor
         Hetoimasia.GLFW.Session
         Hetoimasia.GLFW.Window
@@ -184,11 +188,13 @@ executable glfw-window-examples
         Test.GLFW.Control
         Test.GLFW.Dynamic
         Test.GLFW.Host
+        Test.GLFW.Input
         Test.GLFW.Monitor
         Test.GLFW.Window
     ghc-options: -threaded
     build-depends:
         base >=4.21 && <4.22,
+        containers >=0.7 && <0.8,
         hspec >=2.11 && <3,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,

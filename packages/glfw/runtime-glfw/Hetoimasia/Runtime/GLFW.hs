@@ -9,7 +9,8 @@
 -- release before any worker exists. It is never a service the startup callback
 -- returns. Workers receive only client capabilities from the host the
 -- application already owns — 'hostCommandPort', a window's
--- 'Hetoimasia.GLFW.Command.WindowClient', the monitor inventory's read endpoint
+-- 'Hetoimasia.GLFW.Command.WindowClient' with its "Hetoimasia.GLFW.Input" reader
+-- and admission control, the monitor inventory's read endpoint
 -- 'hostMonitors', 'hostActivity', and 'hostWindowCapabilities' — and startup
 -- transfers no native ownership to anyone.
 --
@@ -83,8 +84,11 @@
 -- The host holds its windows as members of a collection allocated with the
 -- fixed, validated 'hostWindowLimit'. Every window, configured or created later,
 -- is acquired through "Hetoimasia.GLFW.Window"'s one assembly and registered
--- beside a command port of its own, with nothing interruptible between the two
--- registrations. 'withHostWindow' lends a window to an owner-thread callback it
+-- beside a command port and an input feed of its own, of 'hostInputCapacity'
+-- and focused if its initial observation observed focus, with nothing
+-- interruptible between the two registrations. The host owns no input producer
+-- and neither warns about nor resumes a feed; native input and that owner-loop
+-- integration arrive with GLFW-12. 'withHostWindow' lends a window to an owner-thread callback it
 -- must not escape; no public operation returns a window or reaches the
 -- collection.
 --
@@ -101,7 +105,8 @@
 -- The close protocol — begun by a close command through any port serving the
 -- window, 'closeHostWindow', or 'honourHostCloseRequest' — prepares the closing
 -- observation, then in one transaction marks the window closing, closes its
--- port, settles its queued commands as not executed, and publishes the
+-- port, settles its queued commands as not executed, closes its input feed
+-- without awaiting any reset acknowledgement, and publishes the
 -- 'Hetoimasia.GLFW.Window.WindowClosing' phase, with nothing interruptible
 -- after it, and retires the window through the collection once no owner-thread borrow is
 -- in progress; a turn retries a deferred retirement, and retirement never waits.
@@ -143,14 +148,17 @@
 -- 'quiesceWindowHost' is the host's quiescence action for
 -- 'Hetoimasia.Runtime.Application.runScopedApplicationWithQuiescence', which
 -- 'runWindowApplication' installs. In one finite, non-retrying transaction it
--- closes the admission of the host's port and of every window's port, and
--- settles every queued command as 'Hetoimasia.GLFW.Command.NotExecuted'. It
--- destroys nothing, pumps nothing, waits on nothing, and is idempotent. The
+-- closes the admission of the host's port and of every window's port, settles
+-- every queued command as 'Hetoimasia.GLFW.Command.NotExecuted', and closes every
+-- window's input feed, ending its reads without awaiting any reset
+-- acknowledgement. It destroys nothing, pumps nothing, waits on nothing, and is
+-- idempotent. The
 -- runner runs it on every exit from the supervised region before supervision's
 -- boundary drain, so a worker awaiting a ticket is released to observe its stop
 -- request. The ordinary boundary order is therefore:
 --
--- 1. quiescence: every port's admission closes and queued callers settle;
+-- 1. quiescence: every port's admission closes, queued callers settle, and every
+--    input feed closes;
 -- 2. supervision requests every live worker to stop and drains them;
 -- 3. the dependency scope unwinds: the host's own release closes every port's
 --    admission again (a no-op after quiescence), the collection's final exit
@@ -211,6 +219,11 @@
 -- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
 -- | Borrow counts            | The host  | Borrows raise and lower them;    | Owner                | The host              | Dropped on every exit from a     |
 -- |                          |           | retirement reads them            |                      |                       | borrow                           |
+-- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
+-- | Input feeds: one per     | The host  | The consumer reads and           | Owner operations:    | A window's until it is| Closed by the close protocol,    |
+-- | window                   |           | acknowledges; the application    | owner; capabilities: | forgotten             | quiescence, or release; never    |
+-- |                          |           | enables and suspends; closure    | any                  |                       | reopened                         |
+-- |                          |           | ends reads                       |                      |                       |                                  |
 -- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
 -- | Dispatch cursor          | The host  | Each dispatch attempt writes the | Owner                | The host              | Never reset                      |
 -- |                          |           | port it served                   |                      |                       |                                  |

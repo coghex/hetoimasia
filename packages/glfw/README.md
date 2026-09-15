@@ -24,19 +24,24 @@ ports fairly, refreshes the monitor inventory when monitors change, and surfaces
 close requests to application policy. The host owns its windows through a scoped
 collection: applications create windows while running, receive each one's own
 command port and observations, and close them independently in any order
-through the host's close protocol. There is no input
-operation yet.
+through the host's close protocol. `Hetoimasia.GLFW.Input` gives each host
+window one bounded, ordered input feed read by one consumer: key, text, button,
+scroll, and focus events tagged with a window and a non-wrapping epoch, and on
+overflow or temporary suspension a visible reset the consumer must acknowledge
+before the owner resumes a fresh epoch. No native input callback produces into
+it yet; the CPU examples drive its private producer.
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on
-`hetoimasia-runtime`, and no library depends on it. No component imports a game, Lua, logger, or rendering
-module. Its native handles, foreign imports,
+`hetoimasia-runtime`, and no library depends on it. No component imports a game, Lua, or rendering
+module, and only the input feed's overflow warning takes a logger, injected by
+its owner. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam `hetoimasia-tests` drives without initializing GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
 monitor identity, observation, callback-containment, release-order, window
-command, and window control rules, is
+command, window control, and input feed rules, is
 [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with
