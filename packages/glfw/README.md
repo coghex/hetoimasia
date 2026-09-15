@@ -14,7 +14,10 @@ lexically scoped NoAPI windows in that session, publishes what the platform
 observed through read-only snapshots, contains their native callbacks, and
 releases them when their scopes end. `Hetoimasia.GLFW.Command` admits prepared
 window commands through bounded ports and reports each through a persistent
-completion ticket. The public `runtime-glfw` sublibrary's
+completion ticket; its control commands change a window's title, size,
+position, size constraints, visibility, focus and attention, and minimized or
+maximized state, validated on the owner thread and settled as rejected,
+unsupported, or attempted with the revision a post-call sample published. The public `runtime-glfw` sublibrary's
 `Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
 runs its supervised owner loop, which processes native events, drains those
 ports fairly, refreshes the monitor inventory when monitors change, and surfaces
@@ -32,8 +35,8 @@ and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam `hetoimasia-tests` drives without initializing GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
-monitor identity, observation, callback-containment, release-order, and window
-command rules, is
+monitor identity, observation, callback-containment, release-order, window
+command, and window control rules, is
 [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with

@@ -365,6 +365,28 @@ not a verdict that Synarchy's design should be discarded.
   Examples catching cleanup evidence must catch inside `asProcessMainThread`,
   because `runInBoundThread` drops exception context. Contract: `docs/glfw.md`,
   "Dynamic windows" and "Fair dispatch".
+- GLFW-5 (#96) added ordinary window controls: the private model module
+  `Hetoimasia.GLFW.Internal.Control` (pure validation, constraint call order,
+  outcomes, capabilities; `Extent`/`Placement` moved to `Internal.Attribute`),
+  `controlWindow` in the window model, and eleven smart constructors in
+  `Hetoimasia.GLFW.Command` over a private `ControlWindow` command. Validation
+  runs on the owner thread after reconciling captures and before any native
+  call; out-of-constraint sizes are refused, never clamped, and sizes must meet
+  an aspect ratio by exact cross-multiplication. `Disposition` gained
+  `Unsupported` and `Attempted` (outcome plus `PostCallRevision`, a revision the
+  forced post-call sample published); `CommandRejection` gained
+  `ControlRejected`. Constraint updates call size limits then aspect ratio,
+  mark the state indeterminate first, and report `ConstraintUpdateFailed` with
+  returned, failed, and unattempted calls; sizes are refused while
+  indeterminate. The `Native` table gained the control setters and
+  `nativeWindowCapabilities`; `backendWindowCapabilities Wayland` names position
+  and focus unperformable and placement and iconified unreportable, and
+  unreportable attributes are neither queried nor captured. A private per-window
+  mode transition marker (`setModeTransition`, seam `seamSetModeTransition`)
+  refuses controls; GLFW-6 is to be its only producer. Native checks use
+  test-only queries (`windowSizeForCheck`, `windowPositionForCheck`,
+  `windowTitleForCheck`, `windowStateForCheck`). Contract: `docs/glfw.md`,
+  "Window controls".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

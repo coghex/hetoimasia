@@ -24,6 +24,10 @@ char* hetoimasia_glfw_monitor_name(GLFWmonitor* monitor);
 void* hetoimasia_glfw_video_mode(GLFWmonitor* monitor);
 void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count);
 
+/* glfwGetWindowTitle, returning the pointer type the Haskell import's generated
+ * wrapper declares. GLFW owns the string; the native examples copy it at once. */
+char* hetoimasia_glfw_window_title(GLFWwindow* window);
+
 /* Copy the six fields of modes[index] — width, height, red, green, and blue
  * bits, and refresh rate, in that order — into fields. It calls no GLFW
  * function; the caller supplies an index below the count GLFW reported. */

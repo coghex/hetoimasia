@@ -3,12 +3,13 @@
 --
 -- The fixture harness examples prove the dispatcher's settlement rules, first
 -- against a scripted owner and then against the real shared session; the
--- session, window, monitor inventory, and window host examples use that shared
--- session; the
+-- session, window, window control, monitor inventory, and window host examples
+-- use that shared session; the
 -- private-session examples run lifecycles no shared session can host in a child
 -- process.
 module Test.GLFW.Native.Spec (spec) where
 
+import qualified Test.GLFW.Native.Control as Control
 import qualified Test.GLFW.Native.Harness as Harness
 import qualified Test.GLFW.Native.Host as Host
 import qualified Test.GLFW.Native.Monitor as Monitor
@@ -23,6 +24,7 @@ spec shared = describe "GLFW native" $ do
   Harness.spec shared
   Session.spec shared
   Window.spec shared
+  Control.spec shared
   Monitor.spec shared
   Host.spec shared
   Private.spec

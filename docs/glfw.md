@@ -12,27 +12,29 @@ describes what the code does today.
 A session is entered, its asynchronous native error reports are read, its
 monitor inventory is published with disconnect-safe identities, windows are
 created in it, observed through read-only snapshots, asked for fresh
-observations through bounded window command ports, and released when their
-scopes end, and the session ends. A window host owns those together as an
+observations and changed through bounded window command ports, and released
+when their scopes end, and the session ends. A window host owns those together as an
 application dependency, and its supervised owner loop processes native events,
 drains the ports, refreshes the monitor inventory when monitors change, and
-surfaces close requests to application policy. There is no input feed,
-manipulation or mode command, monitor selection, default close policy, dynamic
-window collection, or rendering operation.
+surfaces close requests to application policy. Ordinary controls — title, size,
+position, size constraints, visibility, focus and attention requests, and
+minimize, maximize, and restore — settle with honest outcomes. There is no input
+feed, mode command, monitor selection, default close policy, or rendering
+operation.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model, window command, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, and window host examples on the platform it runs on |
+| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, and window host examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
@@ -149,6 +151,17 @@ data Placement    = Placement { placementX, placementY ∷ Int }
 data CloseRequest                            -- Eq, Ord, Show
 closeRequestWindow ∷ CloseRequest → WindowId
 closeRequestNumber ∷ CloseRequest → Natural
+
+data WindowCapabilities                      -- Eq, Show; read with:
+sessionWindowCapabilities ∷ Session → WindowCapabilities
+backendWindowCapabilities ∷ Backend → WindowCapabilities
+unperformableOperations   ∷ WindowCapabilities → [(WindowOperation, Text)]
+unreportableAttributes    ∷ WindowCapabilities → [(WindowReport, Text)]
+data WindowOperation = SetTitleOperation | SetSizeOperation | SetPositionOperation | SetConstraintsOperation
+                     | ShowOperation | HideOperation | FocusOperation | AttentionOperation
+                     | MinimizeOperation | MaximizeOperation | RestoreOperation
+data WindowReport    = LogicalExtentReport | FramebufferExtentReport | ContentScaleReport | PlacementReport
+                     | FocusedReport | IconifiedReport | MaximizedReport | VisibleReport
 ```
 
 ```haskell
@@ -173,6 +186,18 @@ closeWindowCommand   ∷ WindowId → WindowCommand
 createWindowCommand  ∷ WindowConfig → WindowCommand
 commandWindow        ∷ WindowCommand → Maybe WindowId      -- Nothing for a creation
 
+setWindowTitleCommand     ∷ WindowId → Text → WindowCommand
+setWindowSizeCommand      ∷ WindowId → Extent → WindowCommand
+setWindowPositionCommand  ∷ WindowId → Placement → WindowCommand
+setSizeConstraintsCommand ∷ WindowId → SizeConstraints → WindowCommand
+showWindowCommand, hideWindowCommand, requestFocusCommand, requestAttentionCommand,
+  minimizeWindowCommand, maximizeWindowCommand, restoreWindowCommand ∷ WindowId → WindowCommand
+data SizeConstraints                         -- Eq, Show, NFData; built and read with:
+sizeConstraints       ∷ Extent → Extent → Maybe AspectRatio → SizeConstraints
+constraintMinimum, constraintMaximum ∷ SizeConstraints → Extent
+constraintAspectRatio ∷ SizeConstraints → Maybe AspectRatio
+data AspectRatio = AspectRatio { aspectNumerator, aspectDenominator ∷ Int }
+
 data RequestId                               -- Eq, Ord, Show
 requestLocalIdentity ∷ RequestId → Natural
 data CommandOrigin                           -- Eq, Show, NFData; read with:
@@ -186,7 +211,8 @@ ticketOrigin    ∷ CompletionTicket → CommandOrigin
 pollCompletion  ∷ CompletionTicket → STM (Maybe Disposition)
 awaitCompletion ∷ HasCallStack ⇒ CompletionTicket → IO Disposition
 
-data Disposition      = Performed CommandResult | Rejected CommandRejection | NotExecuted | Interrupted RequestId
+data Disposition      = Performed CommandResult | Rejected CommandRejection | Unsupported UnsupportedControl
+                      | Attempted ControlAttempt | NotExecuted | Interrupted RequestId
 data CommandResult    = ObservationPublished { publishedWindow ∷ WindowId, publishedRevision ∷ Natural }
                       | WindowCreated { createdWindow ∷ WindowId }
                       | WindowCloseBegun { closingWindow ∷ WindowId }
@@ -198,6 +224,24 @@ data CommandRejection = WindowNotServed WindowId | WindowAlreadyEnded WindowId
                       | WindowCreationPoisoned
                       | WindowCreationFailed { creationOperation ∷ Maybe Text
                                              , creationOutcome ∷ NativeOutcome, creationReports ∷ Reports }
+                      | ControlRejected WindowId ControlRejection
+data ControlRejection = ControlExtentRejected Int Int | ControlPlacementRejected Int Int | ControlTitleRejected
+                      | SizeOutsideConstraints Extent SizeConstraints | ActiveConstraintsIndeterminate
+                      | ConstraintBoundRejected Extent Extent | ConstraintBoundsInverted Extent Extent
+                      | AspectRatioRejected Int Int | ConstraintsExcludeCurrentSize Extent SizeConstraints
+                      | CurrentSizeUnavailable | ModeTransitionInProgress
+data UnsupportedControl = UnsupportedControl { unsupportedWindow ∷ WindowId, unsupportedOperation ∷ WindowOperation
+                                             , unsupportedReason ∷ Text }
+data ControlAttempt   = ControlAttempt { attemptedWindow ∷ WindowId, attemptedOutcome ∷ ControlOutcome
+                                       , attemptedObservation ∷ PostCallObservation }
+data ControlOutcome   = ControlReturned
+                      | ControlNativeError { controlFailedOperation ∷ Text, controlReports ∷ Reports }
+                      | ConstraintUpdateFailed { constraintsReturned ∷ [ConstraintCall], constraintsFailed ∷ ConstraintCall
+                                               , constraintsUnattempted ∷ [ConstraintCall], constraintReports ∷ Reports }
+data ConstraintCall   = SizeLimitsCall | AspectRatioCall
+constraintCallOrder   ∷ [ConstraintCall]                     -- [SizeLimitsCall, AspectRatioCall]
+data PostCallObservation = PostCallRevision Natural
+                         | PostCallSampleFailed { sampleOutcome ∷ NativeOutcome, sampleReports ∷ Reports }
 data WindowCommandMisuse = OwnerThreadWouldWait
 
 data WindowClient                            -- Show; read with:
@@ -218,6 +262,7 @@ hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostActivity          ∷ WindowHost → STM HostActivity
 quiesceWindowHost     ∷ WindowHost → STM ()
 data HostActivity = HostActivity { activityTurn ∷ Natural, activityWaiting ∷ Bool }
+hostWindowCapabilities ∷ WindowHost → WindowCapabilities
 
 hostWindowIdentities   ∷ WindowHost → STM [WindowId]
 hostWindowClient       ∷ WindowHost → WindowId → STM (Maybe WindowClient)
@@ -258,7 +303,7 @@ runWindowApplication
 
 `Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
 `WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
-`CommandOrigin`, `RequestId`, `WindowCommand`, and `WindowClient` are exported
+`CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, and `WindowClient` are exported
 without their constructors, and their readers are functions rather than record
 fields, so no client can build or rewrite one. No public
 type holds a native window or monitor pointer, and no snapshot publisher is
@@ -275,7 +320,7 @@ operation (`enter session`, `initialize`, `verify backend`, `terminate`,
 `begin window closing`, `detach window callbacks`, `destroy window`,
 `new window command host`, `submit window command`, `await window command`,
 `execute window command`, `perform window command`, `process window events`,
-`reconcile window events`, `reject close request`), and identifiers such as
+`reconcile window events`, `reject close request`, `control window`), and identifiers such as
 `backend`, `title`, `monitor`, `window`, or `request`, so `failureEvidence` reads
 the origin back without a logger. The host's own failures are raised under the
 `glfw.runtime` component: a configuration rejection under
@@ -806,8 +851,8 @@ released; a command host created directly is closed by its application.
 
 ### Admission
 
-A `WindowCommand` is an immutable value: a request to observe or close one
-window, or to create a window from a `WindowConfig`. Submitting it
+A `WindowCommand` is an immutable value: a request to observe, control, or close
+one window, or to create a window from a `WindowConfig`. Submitting it
 issues a request identity, records a `CommandOrigin` beside it — the request,
 the window it addresses if any, the submission site, and the caller's diagnostic context — and
 prepares the message to normal form on the submitting thread. A failure raised
@@ -836,6 +881,9 @@ requests and do not order them; order is the order admissions committed.
 |---|---|---|
 | `Performed result` | The command was performed or requested from the window system | Applied; `result` was prepared before settlement |
 | `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`) or is closing (`WindowIsClosing`), a native call failed first (`WindowNativeFailure`), the executor or port cannot close or create (`CloseNotPermitted`, `CreationNotPermitted`), or a creation was refused (`WindowConfigInvalid`, `WindowCapacityReached`, `WindowCreationPoisoned`) or failed during construction (`WindowCreationFailed`) | None applied; a failed construction was rolled back |
+| `Rejected (ControlRejected window reason)` | A [window control](#window-controls) was refused by its mode transition or its validation | None applied |
+| `Unsupported control` | The platform cannot perform a window control | None applied |
+| `Attempted attempt` | A window control's native calls were made | Requested from the window system; its observations report what happened |
 | `NotExecuted` | Closure settled it while it was still queued | None |
 | `Interrupted request` | Its execution, or the preparation of its completion data, raised | May have been applied; nothing is replayed or rolled back |
 
@@ -948,6 +996,164 @@ closure neither waits for it nor reports it unexecuted, and it settles through
 its execution. Closure is finite, never retries, and is idempotent. A raw
 channel close alone would keep the backlog, and a raw abort would discard it
 without settling tickets; there is no abort.
+
+## Window controls
+
+The control commands of `Hetoimasia.GLFW.Command` change an existing window:
+its title; its logical size; its desktop position; its size constraints, a
+minimum and a maximum logical size with an optional aspect ratio; showing and
+hiding it; requesting input focus or the user's attention; and minimizing,
+maximizing, and restoring it. Each is a prepared, immutable `WindowCommand`
+addressed to one `WindowId`, admitted like any other command, and executed on
+the owner thread: by the window host's [owner loop](#the-window-host-and-owner-loop)
+from the host's port or the window's own, or directly by `performWindowCommand`.
+None assumes a primary window. A control's representation lives in the private
+`Hetoimasia.GLFW.Internal.Control`, and `SizeConstraints` is exported without its
+constructor or fields, so a client builds a control only through the smart
+constructors, and nothing it holds reaches a native window. The smart
+constructors accept any values: validation happens when the command executes,
+against the window's state at that moment.
+
+### Execution
+
+Executing a control makes no native call until each of these has passed, in
+order:
+
+1. **Addressing.** The window host answers `WindowNotServed` for a window it does
+   not hold, never held or already retired, and `WindowIsClosing` for one whose
+   close protocol has begun; a lexical executor answers `WindowNotServed` for a
+   window it was not given. An ended window is `WindowAlreadyEnded`. The model
+   also answers `WindowIsClosing` for a window whose observed phase is no longer
+   `WindowOpen`.
+2. **Reconciliation.** Pending callback captures are reconciled at the owner
+   boundary, so validation reads the owner's latest observation, never one a
+   client holds.
+3. **Mode transition.** A window whose mode transition marker is set is
+   `ControlRejected ModeTransitionInProgress`.
+4. **Capability.** An operation the session's `WindowCapabilities` names as
+   unperformable is `Unsupported`, with the operation and a reason.
+5. **Validation**, below, refusing with `ControlRejected` and a typed
+   `ControlRejection`.
+
+Then the control's native calls are made, each bracketed by the error capture,
+and every attribute is sampled and published as a new revision, even when
+nothing changed. Settlements from the first five steps carry no revision,
+because nothing was called or sampled. A control never changes the window's
+applied mode.
+
+### Validation
+
+| Control | Refused when | `ControlRejection` |
+|---|---|---|
+| Title | It contains a NUL, which the native UTF-8 C string would truncate | `ControlTitleRejected` |
+| Size | A dimension is outside `1 .. 2147483647` | `ControlExtentRejected` |
+| Size | The active constraints are indeterminate | `ActiveConstraintsIndeterminate` |
+| Size | It lies outside the known minimum or maximum, or does not satisfy their aspect ratio exactly: width × denominator = height × numerator, compared without overflow | `SizeOutsideConstraints` |
+| Position | A coordinate is outside the native `int` range | `ControlPlacementRejected` |
+| Constraints | A minimum or maximum dimension is outside `1 .. 2147483647` | `ConstraintBoundRejected` |
+| Constraints | The minimum exceeds the maximum in either dimension | `ConstraintBoundsInverted` |
+| Constraints | An aspect ratio term is outside `1 .. 2147483647` | `AspectRatioRejected` |
+| Constraints | The window's logical size is `Unavailable` | `CurrentSizeUnavailable` |
+| Constraints | They do not admit the window's currently observed logical size, bounds and aspect ratio alike | `ConstraintsExcludeCurrentSize` |
+| Show, hide, focus, attention, minimize, maximize, restore | Only by addressing, a mode transition, or capability | — |
+
+The currently observed size is the owner's latest observation, reconciled when
+the command executes. A window starts in the fully known unconstrained state, in
+which a size needs only to be positive and representable. A size outside the
+constraints is refused; it is never sent for the platform to clamp, and a caller
+that wants tighter constraints resizes first. Every constraint set has both a
+minimum and a maximum.
+
+### Outcomes and observations
+
+An attempted control settles as `Attempted` with a `ControlAttempt`:
+
+| `attemptedOutcome` | Meaning |
+|---|---|
+| `ControlReturned` | Every native call returned without a report |
+| `ControlNativeError` | The call returned but reported errors: the native operation's name and the copied reports |
+| `ConstraintUpdateFailed` | A constraint update stopped at a call that reported errors; see below |
+
+None of these says the window manager honoured the request. A native call that
+raises instead of returning, or a callback fault rethrown at the boundary,
+interrupts the command, which settles `Interrupted` while the exception
+propagates from the executor.
+
+`attemptedObservation` is `PostCallRevision revision`: the revision the sample
+taken after the calls published. Because a new revision is published even when
+nothing changed, the revision proves that the sample followed the call. It does
+not promise that the window manager converged or that the requested state was
+reached. A sample that reports errors publishes nothing and is
+`PostCallSampleFailed` with the copied outcome and reports. Snapshots keep only
+their latest value, so a client may find the snapshot already beyond the named
+revision, and the named revision itself is not retrievable: compare revision
+order and read the latest sampled state.
+
+Reports made on the owner thread during a control's own native call belong to
+that control, and its ticket's origin names the request, window, submission
+site, and caller context. Reports from another thread, or from outside the call,
+stay asynchronous under [the error capture](#native-error-evidence) and are never
+attributed to whichever command is executing.
+
+### Constraint updates and recovery
+
+A constraint set is validated whole before its first call and applied in the
+documented order `constraintCallOrder`: `glfwSetWindowSizeLimits` with the
+minimum and maximum, then `glfwSetWindowAspectRatio` with the ratio, or
+`GLFW_DONT_CARE` for none. The owner marks the window's constraint state
+indeterminate before the first call, stops at the first call that reports an
+error, and marks the set known only once every call has returned without a
+report.
+
+A call that reports an error settles as `ConstraintUpdateFailed`:
+`constraintsReturned` lists the calls that returned before it, in order,
+`constraintsFailed` names the call that reported, `constraintsUnattempted` lists
+the calls not made, and `constraintReports` carries the reports. With calls
+returned before the failure, it is a partial update. Nothing is rolled back, and
+nothing claims the complete set was applied or that an earlier call was undone.
+A call that raises leaves the state indeterminate as well.
+
+While the state is indeterminate, every size control is refused with
+`ActiveConstraintsIndeterminate` and no native call. A constraint update stays
+admissible, and one that completes re-establishes a fully known state, after
+which valid sizes are admitted again.
+
+### Capabilities and platform restrictions
+
+`sessionWindowCapabilities`, and the window host's `hostWindowCapabilities`,
+describe what windows cannot perform or report on the session's backend, each
+with a reason, as `backendWindowCapabilities` defines:
+
+| Backend | Cannot perform | Cannot report |
+|---|---|---|
+| X11, Cocoa | — | — |
+| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus | `PlacementReport`: no global window position; `IconifiedReport`: no reliable iconified state |
+
+No session selects Wayland. Its description keeps its restrictions explicit
+rather than emulated, and the CPU examples model it through the seam. An
+unperformable operation is `Unsupported`. An unreportable attribute is always
+`Unavailable`: it is not queried, and its callback records nothing, so no
+position, iconified state, or other value is fabricated. A query reporting
+`GLFW_FEATURE_UNAVAILABLE` is `Unavailable` under the
+[observation contract](#observations) as before.
+
+Where a control is performable, the platform still decides its result. Focus is
+a request a window manager or compositor may decline, and attention may be a
+flash or a bounce. An X11 window manager applies size, position, visibility,
+and state asynchronously, so the post-call sample may not yet show them; a later
+observation will. A hidden window may ignore minimize or maximize, and the Cocoa
+backend shows a window it is asked to focus. The observations report what
+happened.
+
+### Mode transitions
+
+Each window carries a private, owner-internal mode transition marker, set and
+cleared only by the model's private `setModeTransition`. While it is set, every
+control is `ControlRejected ModeTransitionInProgress` with no native call;
+observation and close commands are unaffected. No public command sets it, and
+nothing in this package does yet: the monitor-aware mode transitions of a later
+slice are to be its only producer, and the seam's private `seamSetModeTransition`
+drives it in the CPU examples. Controls define no saved windowed placement.
 
 ## The window host and owner loop
 
@@ -1281,6 +1487,8 @@ every turn within the budget.
 | Current observation and close counter | The window | Boundaries fold, then publish | Owner | The window | Final value retained in the closed snapshot |
 | Observation snapshot | The window | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed at release; never reopened |
 | Window liveness | The window | Release clears it; every operation reads it | Owner; `windowEnded` any | The window | Never set again |
+| Window constraint state | The window | Constraint updates write it; size and constraint validation read it | Owner | The window | Known and unconstrained at creation; indeterminate from an update's first call until the update completes |
+| Mode transition marker | The window | The private `setModeTransition` writes it; controls read it | Owner | The window | Clear at creation; no public command sets it |
 | Release certainty | The window | Uncertain parts clear it; the storage and observation releases read it | Owner | The window | Read at release |
 | Command channel | The command host | Ports admit; the executor claims; closure drains | Admit: any; claim and close: owner | While referenced | Closed by closure with its backlog settled; never reopened |
 | Pending completion cells | The command host | Admission reserves; settlement and closure remove | Reserve: any; settle: owner | Admission until settlement | Removed at settlement |
@@ -1353,8 +1561,11 @@ running it.
   for naming a command host's, port's, or ticket's constructor or reaching for
   command execution, for constructing a monitor identity, description, or
   inventory or reaching for a native monitor pointer, and for naming the monitor
-  drivers through the public seam, and a supported client that submits and
-  awaits a command and resolves monitors.
+  drivers through the public seam, and for constructing a control command or its
+  size constraints through their constructors or reaching for the private
+  control representation, and a supported client that submits and awaits a
+  command, performs every control command constructor, reads the capability
+  descriptions, and resolves monitors.
   It also runs the `glfw-window-examples` executable, reached through the suite's
   `build-tool-depends`, and fails with that executable's report if any window
   model example fails. It runs in the `test.engine` validation group.
@@ -1383,6 +1594,27 @@ running it.
   Haskell exception with its context; owner-thread waits refused rather than
   blocking; and the observation request settling with a revision published
   first, while unserved and ended windows are rejected.
+- **The window control examples** in the same executable submit the public
+  control commands to the private command executor and to the window host's
+  owner loop over seam sessions, whose native table records every control call
+  with its window key and arguments and runs a scripted `scriptWindowControl`
+  step. Without sleeps, they prove every invalid argument class — zero, negative,
+  and overflowing sizes, unrepresentable positions, a NUL title, non-positive,
+  overflowing, inverted, and degenerate constraints, constraints excluding the
+  current size, and sizes outside known constraints or their exact aspect ratio
+  — rejected with no native call and no revision; controls for unknown, closing,
+  and closed windows rejected without native effect; every control, attention
+  included, dispatched through the owner loop to its addressed window, each call
+  followed by a sample and a strictly later revision, while a second window
+  stays untouched, and a closed window's later control not served; controls
+  refused during a mode transition set by `seamSetModeTransition`; the modeled
+  Wayland capabilities settling position and focus as unsupported with a reason
+  and keeping placement and iconified state `Unavailable` even after callbacks;
+  a native error attributed to its own command and submission context while
+  another thread's report stays asynchronous; partial and first-call constraint
+  update failures naming their calls, refusing sizes while indeterminate, and a
+  complete update restoring known state; and post-call revisions ordered while
+  the latest snapshot moves beyond them.
 - **The monitor inventory examples** in the same executable use the seam's
   private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
   and `seamQueueMonitorEvents` — over scripted monitors whose native pointers
@@ -1459,6 +1691,23 @@ The native examples cover:
   observation, release, terminal observation, and terminal handle;
 - two live windows with a stray hint reset before the second's creation;
 - a second window after a window's release in the same session;
+- ordinary window controls on private hidden windows, performed on the owner
+  thread with `performWindowCommand` and checked against the test-only
+  owner-thread queries `windowSizeForCheck`, `windowPositionForCheck`,
+  `windowTitleForCheck`, and `windowStateForCheck`, never against public
+  commands: a title, a valid size, a position, and constraints applied to the
+  addressed window while a second window stays unchanged; showing and then
+  hiding reflected in observations; after constraints are installed, a public
+  out-of-constraint size refused, and the test-only native stimulus
+  `setWindowSizeForCheck` resizing out of range, with the observation reporting
+  the platform's actual size; minimize, maximize, and restore each followed by
+  an observation matching what the platform reports; focus and attention
+  requests settling by their native call outcome without asserting that either
+  was granted; and post-call revisions ordered while the latest snapshot has
+  advanced beyond them. Each example waits for native events between
+  observations, within 100 waits of at most 50 ms. On Cocoa, showing or focusing
+  a window makes it briefly visible. Interactive focus, attention, and minimize
+  behavior on a live desktop is optional evidence, not asserted;
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;

@@ -10,7 +10,14 @@
 -- admission and settles everything still queued as 'NotExecuted'.
 --
 -- 'observeWindowCommand' asks the owner to sample a window and publish a fresh
--- observation of it; its result names the committed revision.
+-- observation of it; its result names the committed revision. The control
+-- commands — title, size, position, size constraints, show, hide, focus and
+-- attention requests, and minimize, maximize, and restore — are validated on
+-- the owner thread before any native call and settle as 'Rejected',
+-- 'Unsupported', or 'Attempted', naming the revision a sample taken after the
+-- call published. A returned native call is never reported as the state the
+-- window reached, and a size outside the window's constraints is never sent to
+-- the platform to clamp.
 -- 'closeWindowCommand' and 'createWindowCommand' change which windows exist, so
 -- only the window host's owner loop in "Hetoimasia.Runtime.GLFW" performs them;
 -- every other executor rejects them. A successful creation settles as
@@ -60,6 +67,26 @@ module Hetoimasia.GLFW.Command
   , createWindowCommand
   , commandWindow
 
+    -- * Control commands
+  , setWindowTitleCommand
+  , setWindowSizeCommand
+  , setWindowPositionCommand
+  , setSizeConstraintsCommand
+  , showWindowCommand
+  , hideWindowCommand
+  , requestFocusCommand
+  , requestAttentionCommand
+  , minimizeWindowCommand
+  , maximizeWindowCommand
+  , restoreWindowCommand
+  , SizeConstraints
+  , sizeConstraints
+  , constraintMinimum
+  , constraintMaximum
+  , constraintAspectRatio
+  , AspectRatio (..)
+  , WindowOperation (..)
+
     -- * Origins
   , RequestId
   , requestLocalIdentity
@@ -77,6 +104,13 @@ module Hetoimasia.GLFW.Command
   , Disposition (..)
   , CommandResult (..)
   , CommandRejection (..)
+  , UnsupportedControl (..)
+  , ControlAttempt (..)
+  , ControlRejection (..)
+  , ControlOutcome (..)
+  , ConstraintCall (..)
+  , constraintCallOrder
+  , PostCallObservation (..)
 
     -- * Window clients
   , WindowClient
@@ -89,15 +123,31 @@ module Hetoimasia.GLFW.Command
   , WindowCommandMisuse (..)
   ) where
 
+import Hetoimasia.GLFW.Internal.Control
+  ( AspectRatio (..)
+  , ConstraintCall (..)
+  , ControlOutcome (..)
+  , ControlRejection (..)
+  , PostCallObservation (..)
+  , SizeConstraints
+  , WindowOperation (..)
+  , constraintAspectRatio
+  , constraintCallOrder
+  , constraintMaximum
+  , constraintMinimum
+  , sizeConstraints
+  )
 import Hetoimasia.GLFW.Internal.Command
   ( CommandOrigin
   , CommandRejection (..)
   , CommandResult (..)
   , CommandStatistics (..)
   , CompletionTicket
+  , ControlAttempt (..)
   , Disposition (..)
   , RequestId
   , SubmitResult (..)
+  , UnsupportedControl (..)
   , WaitedSubmission (..)
   , WindowCommand
   , WindowCommandHost
@@ -114,12 +164,23 @@ import Hetoimasia.GLFW.Internal.Command
   , commandStatistics
   , commandWindow
   , createWindowCommand
+  , hideWindowCommand
+  , maximizeWindowCommand
+  , minimizeWindowCommand
   , newWindowCommandHost
   , observeWindowCommand
   , performWindowCommand
   , pollCompletion
   , pollWindowClient
+  , requestAttentionCommand
+  , requestFocusCommand
   , requestLocalIdentity
+  , restoreWindowCommand
+  , setSizeConstraintsCommand
+  , setWindowPositionCommand
+  , setWindowSizeCommand
+  , setWindowTitleCommand
+  , showWindowCommand
   , submitWindowCommand
   , submittedAt
   , submittedContext

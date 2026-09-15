@@ -87,6 +87,33 @@
 -- cancellation. If the operation's own native step fails first, its failure
 -- propagates and the captures and fault stay latched for the next boundary.
 --
+-- = Ordinary controls
+--
+-- 'controlWindow' executes one ordinary control — title, size, position, size
+-- constraints, visibility, focus, attention, minimize, maximize, or restore — at
+-- an owner boundary. In order, and before any native call:
+--
+-- 1. pending captures are reconciled, so validation reads the owner's latest
+--    observation rather than one a client holds;
+-- 2. a window whose close protocol has begun attempts nothing;
+-- 3. a window whose mode transition marker is set refuses the control with
+--    'ModeTransitionInProgress';
+-- 4. an operation the session's 'WindowCapabilities' names as unperformable
+--    settles as unsupported, with its reason;
+-- 5. the control is validated against the window's constraint state and latest
+--    observed logical size, under "Hetoimasia.GLFW.Internal.Control"'s rules.
+--
+-- Then the native calls are made, each bracketed by the error capture so its
+-- reports belong to this control alone, and afterwards every attribute is
+-- sampled and a new revision is published even if nothing changed, so the
+-- revision the result names was produced by a sample taken after the call. It
+-- promises nothing about the window manager's convergence. A control changes no
+-- mode and the window's mode transition marker, set only through the private
+-- 'setModeTransition', is never changed by one.
+--
+-- A constraint update marks the window's constraint state indeterminate before
+-- its first call and known only after every call returned without a report.
+--
 -- = Close requests
 --
 -- A native close request never destroys the window and never exits. It is
@@ -188,6 +215,12 @@
 -- |                     |               | the observation release    |             |                     | release                  |
 -- |                     |               | reads it                   |             |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Constraint state    | The window    | Constraint updates write;  | Owner       | The window          | Known and unconstrained  |
+-- |                     |               | controls read              |             |                     | at creation              |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Mode transition     | The window    | 'setModeTransition'        | Owner       | The window          | Clear at creation        |
+-- | marker              |               | writes; controls read      |             |                     |                          |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 --
 -- None of this is application state.
 module Hetoimasia.GLFW.Internal.Window
@@ -234,6 +267,10 @@ module Hetoimasia.GLFW.Internal.Window
   , closeRequestWindow
   , closeRequestNumber
 
+    -- * Ordinary controls
+  , controlWindow
+  , setModeTransition
+
     -- * Private owner-turn operations
   , EventProcessing (..)
   , processWindowEvents
@@ -253,7 +290,7 @@ import Control.Concurrent.STM (STM, atomically)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
-  , ExceptionWithContext
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , evaluate
   , mask_
@@ -283,7 +320,29 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , snapshotReader
   )
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
-import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..))
+import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..), Extent (..), Placement (..))
+import Hetoimasia.GLFW.Internal.Control
+  ( AspectRatio (..)
+  , ConstraintCall (..)
+  , ConstraintState (..)
+  , ControlOutcome (..)
+  , ControlRejection (..)
+  , ControlResult (..)
+  , PostCallObservation (..)
+  , SizeConstraints
+  , WindowCapabilities
+  , WindowControl (..)
+  , WindowReport (..)
+  , constraintAspectRatio
+  , constraintCallOrder
+  , constraintMaximum
+  , constraintMinimum
+  , controlOperation
+  , controlOperationText
+  , operationGap
+  , reportable
+  , validateControl
+  )
 import Hetoimasia.GLFW.Internal.Capture
   ( NativeError (..)
   , Reports (..)
@@ -312,6 +371,7 @@ import Hetoimasia.GLFW.Internal.Session
   , sessionCapture
   , sessionIdentity
   , sessionNative
+  , sessionWindowCapabilities
   )
 import Numeric.Natural (Natural)
 
@@ -442,24 +502,6 @@ data WindowPhase
 
 instance NFData WindowPhase
 
--- | A size: logical in screen coordinates, or a framebuffer's in pixels.
-data Extent = Extent
-  { extentWidth ∷ !Int
-  , extentHeight ∷ !Int
-  }
-  deriving (Eq, Show, Generic)
-
-instance NFData Extent
-
--- | The content area's upper-left corner in desktop screen coordinates.
-data Placement = Placement
-  { placementX ∷ !Int
-  , placementY ∷ !Int
-  }
-  deriving (Eq, Show, Generic)
-
-instance NFData Placement
-
 -- | One native close request, numbered in increasing order per window.
 data CloseRequest = CloseRequest !WindowId !Natural
   deriving (Eq, Ord, Show)
@@ -562,6 +604,7 @@ data Window = Window
   , windowLive ∷ !(IORef Bool)
   , windowCaptures ∷ !(IORef Captures)
   , windowOwnerState ∷ !(IORef OwnerState)
+  , windowControl ∷ !(IORef ControlState)
   , windowPublisher ∷ !(SnapshotPublisher WindowObservation)
   }
 
@@ -587,6 +630,10 @@ windowEnded window = not <$> readIORef (windowLive window)
 
 -- | The owner's current observation and the last close request number issued.
 data OwnerState = OwnerState !WindowObservation !Natural
+
+-- | What the owner knows about the window's active size constraints, and whether
+-- its mode transition marker is set.
+data ControlState = ControlState !ConstraintState !Bool
 
 -- | What the callbacks recorded since the last boundary took it.
 data Captures = Captures
@@ -651,13 +698,14 @@ windowAssembly session config = do
       identifiers = windowIdentifiers identity
   live ← restoredStep (newIORef True)
   captures ← restoredStep (newIORef noCaptures)
+  control ← restoredStep (newIORef (ControlState (ConstraintsKnown Nothing) False))
   certain ← restoredStep (newIORef True)
   failed ← restoredStep (newIORef False)
   storage ←
     acquirePart
       "glfw window callback storage"
       (releaseRank 2)
-      (nativeNewWindowCallbacks native (windowCallbacks captures))
+      (nativeNewWindowCallbacks native (windowCallbacks (sessionWindowCapabilities session) captures))
       (noteFailure failed . freeStorage session certain)
   (handle, created) ←
     acquirePart
@@ -695,6 +743,7 @@ windowAssembly session config = do
       , windowLive = live
       , windowCaptures = captures
       , windowOwnerState = ownerState
+      , windowControl = control
       , windowPublisher = publisher
       }
   where
@@ -825,36 +874,38 @@ closeObservations live certain failed ownerState publisher = do
 -- ---------------------------------------------------------------------------
 -- Callbacks
 
--- | The contained callbacks recording into one window's capture latch.
-windowCallbacks ∷ IORef Captures → WindowCallbacks
-windowCallbacks captures =
+-- | The contained callbacks recording into one window's capture latch. A
+-- callback for an attribute the platform cannot report records nothing, so no
+-- observation of it is fabricated.
+windowCallbacks ∷ WindowCapabilities → IORef Captures → WindowCallbacks
+windowCallbacks capabilities captures =
   WindowCallbacks
     { onWindowSize = \width height →
-        contained "window size" $ do
+        reported LogicalExtentReport . contained "window size" $ do
           extent ← extentOf width height
           pure (\latched → latched {capturedSize = Just extent})
     , onFramebufferSize = \width height →
-        contained "framebuffer size" $ do
+        reported FramebufferExtentReport . contained "framebuffer size" $ do
           extent ← extentOf width height
           pure (\latched → latched {capturedFramebuffer = Just extent})
     , onContentScale = \x y →
-        contained "content scale" $ do
+        reported ContentScaleReport . contained "content scale" $ do
           scale ← scaleOf x y
           pure (\latched → latched {capturedScale = Just scale})
     , onWindowPosition = \x y →
-        contained "window position" $ do
+        reported PlacementReport . contained "window position" $ do
           placement ← placementOf x y
           pure (\latched → latched {capturedPlacement = Just placement})
     , onWindowFocus = \focused →
-        contained "window focus" $ do
+        reported FocusedReport . contained "window focus" $ do
           flag ← flagOf focused
           pure (\latched → latched {capturedFocused = Just flag})
     , onWindowIconify = \iconified →
-        contained "window iconify" $ do
+        reported IconifiedReport . contained "window iconify" $ do
           flag ← flagOf iconified
           pure (\latched → latched {capturedIconified = Just flag})
     , onWindowMaximize = \maximized →
-        contained "window maximize" $ do
+        reported MaximizedReport . contained "window maximize" $ do
           flag ← flagOf maximized
           pure (\latched → latched {capturedMaximized = Just flag})
     , onWindowRefresh =
@@ -863,6 +914,8 @@ windowCallbacks captures =
         contained "window close" (pure (\latched → latched {capturedCloses = capturedCloses latched + 1}))
     }
   where
+    reported report callback = when (reportable capabilities report) callback
+
     -- The trampoline. The payload is copied, and every field forced, inside
     -- the handler; the record is one non-blocking update. Anything raised is
     -- latched with its context rather than unwinding into C, and a failure to
@@ -915,21 +968,26 @@ rethrowFault identifiers (CallbackFault name caught later) =
 -- ---------------------------------------------------------------------------
 -- Owner boundaries
 
--- | Sample every attribute, each query bracketed by the error capture.
+-- | Sample every attribute, each query bracketed by the error capture. An
+-- attribute the platform cannot report is 'Unavailable' without a query.
 sampleAll ∷ Session → [(Text, Text)] → Ptr NativeWindow → IO Sample
 sampleAll session identifiers handle =
   Sample
-    <$> sampled (uncurry Extent <$> nativeWindowSize native handle)
-    <*> sampled (uncurry Extent <$> nativeFramebufferSize native handle)
-    <*> sampled (uncurry ContentScale <$> nativeContentScale native handle)
-    <*> sampled (uncurry Placement <$> nativeWindowPosition native handle)
-    <*> sampled (nativeWindowAttribute native handle FocusedAttribute)
-    <*> sampled (nativeWindowAttribute native handle IconifiedAttribute)
-    <*> sampled (nativeWindowAttribute native handle MaximizedAttribute)
-    <*> sampled (nativeWindowAttribute native handle VisibleAttribute)
+    <$> gated LogicalExtentReport (uncurry Extent <$> nativeWindowSize native handle)
+    <*> gated FramebufferExtentReport (uncurry Extent <$> nativeFramebufferSize native handle)
+    <*> gated ContentScaleReport (uncurry ContentScale <$> nativeContentScale native handle)
+    <*> gated PlacementReport (uncurry Placement <$> nativeWindowPosition native handle)
+    <*> gated FocusedReport (nativeWindowAttribute native handle FocusedAttribute)
+    <*> gated IconifiedReport (nativeWindowAttribute native handle IconifiedAttribute)
+    <*> gated MaximizedReport (nativeWindowAttribute native handle MaximizedAttribute)
+    <*> gated VisibleReport (nativeWindowAttribute native handle VisibleAttribute)
   where
     native = sessionNative session
     capture = sessionCapture session
+    gated ∷ WindowReport → IO a → IO (Attribute a)
+    gated report query
+      | reportable (sessionWindowCapabilities session) report = sampled query
+      | otherwise = pure Unavailable
     sampled ∷ IO a → IO (Attribute a)
     sampled query = do
       settleStrayOwnerReports capture
@@ -997,13 +1055,18 @@ reconciled identity sample pending current issued =
 -- the commit. Production passes @pure ()@; the test seam uses it to deliver a
 -- cancellation exactly there.
 reconcileWindow ∷ IO () → Window → Maybe Sample → IO ()
-reconcileWindow interruption window sample = do
+reconcileWindow = reconcileWith False
+
+-- | 'reconcileWindow', publishing a new revision even when nothing changed if
+-- @forced@ holds.
+reconcileWith ∷ Bool → IO () → Window → Maybe Sample → IO ()
+reconcileWith forced interruption window sample = do
   pending ← readIORef (windowCaptures window)
   OwnerState current issued ← readIORef (windowOwnerState window)
   let (folded, issued') = reconciled (windowId window) sample pending current issued
       signalled = capturedRefresh pending || capturedCloses pending > 0
       next = folded {obsRevision = obsRevision current + 1}
-  prepared ← if folded /= current || signalled then Just <$> prepare next else pure Nothing
+  prepared ← if forced || folded /= current || signalled then Just <$> prepare next else pure Nothing
   interruption
   committed ← mask_ $ do
     cleared ← atomicModifyIORef' (windowCaptures window) $ \latched →
@@ -1018,7 +1081,7 @@ reconcileWindow interruption window sample = do
         else (latched, False)
     when cleared $ forM_ prepared (commitObservation window next issued')
     pure cleared
-  unless committed (reconcileWindow interruption window sample)
+  unless committed (reconcileWith forced interruption window sample)
 
 -- | Publish a prepared observation and record it as the owner's current one.
 -- The caller must be masked: neither write is interruptible, so the two cannot
@@ -1134,6 +1197,124 @@ beginWindowClosing interruption commit window =
             pure proceed
           when committed (writeIORef (windowOwnerState window) (OwnerState next issued))
           pure committed
+
+-- ---------------------------------------------------------------------------
+-- Ordinary controls
+
+controlWindowOperation ∷ Operation
+controlWindowOperation = operation "control window"
+
+-- | Execute one ordinary control at an owner boundary, under the module's
+-- ordinary control contract. An ended window answers 'WindowEnded' without a
+-- native call. A callback fault rethrown at the boundary, and a native call that
+-- raises instead of returning, propagate.
+controlWindow ∷ Window → WindowControl → IO (WindowResult ControlResult)
+controlWindow window control =
+  atBoundary (pure ()) window controlWindowOperation $ do
+    reconcileWindow (pure ()) window Nothing
+    raiseLatchedFault window
+    OwnerState current _ ← readIORef (windowOwnerState window)
+    ControlState constraints transition ← readIORef (windowControl window)
+    decide current constraints transition
+  where
+    wanted = controlOperation control
+    decide current constraints transition
+      | obsPhase current /= WindowOpen = pure ControlWindowClosing
+      | transition = pure (ControlRefused ModeTransitionInProgress)
+      | Just reason ← operationGap (sessionWindowCapabilities (windowSession window)) wanted =
+          pure (ControlUnsupported wanted reason)
+      | Left rejected ← validateControl constraints (obsLogical current) control =
+          pure (ControlRefused rejected)
+      | otherwise = do
+          outcome ← applyControl window control
+          ControlAttempted outcome <$> postCallObservation window
+
+-- | Make a validated control's native calls.
+applyControl ∷ Window → WindowControl → IO ControlOutcome
+applyControl window control = case control of
+  TitleControl title → single (nativeSetWindowTitle native handle title)
+  SizeControl width height → single (nativeSetWindowSize native handle (fromIntegral width) (fromIntegral height))
+  PositionControl x y → single (nativeSetWindowPosition native handle (fromIntegral x) (fromIntegral y))
+  ConstraintsControl constraints → applyConstraints window constraints
+  ShowControl → single (nativeShowWindow native handle)
+  HideControl → single (nativeHideWindow native handle)
+  FocusControl → single (nativeFocusWindow native handle)
+  AttentionControl → single (nativeRequestWindowAttention native handle)
+  MinimizeControl → single (nativeIconifyWindow native handle)
+  MaximizeControl → single (nativeMaximizeWindow native handle)
+  RestoreControl → single (nativeRestoreWindow native handle)
+  where
+    native = sessionNative (windowSession window)
+    handle = windowHandle window
+    single call = do
+      reports ← reportsDuring (windowSession window) call
+      pure $
+        if hasReports reports
+          then ControlNativeError (controlOperationText (controlOperation control)) reports
+          else ControlReturned
+
+-- | Apply a validated constraint set in 'constraintCallOrder', stopping at the
+-- first call that reports an error. The constraint state is indeterminate from
+-- before the first call until every call has returned without a report.
+applyConstraints ∷ Window → SizeConstraints → IO ControlOutcome
+applyConstraints window constraints = do
+  setConstraintState window ConstraintsIndeterminate
+  apply [] constraintCallOrder
+  where
+    native = sessionNative (windowSession window)
+    handle = windowHandle window
+    apply _ [] = ControlReturned <$ setConstraintState window (ConstraintsKnown (Just constraints))
+    apply returned (call : rest) = do
+      reports ← reportsDuring (windowSession window) (nativeCall call)
+      if hasReports reports
+        then pure (ConstraintUpdateFailed (reverse returned) call rest reports)
+        else apply (call : returned) rest
+    nativeCall SizeLimitsCall =
+      nativeSetWindowSizeLimits
+        native
+        handle
+        (fromIntegral (extentWidth (constraintMinimum constraints)))
+        (fromIntegral (extentHeight (constraintMinimum constraints)))
+        (fromIntegral (extentWidth (constraintMaximum constraints)))
+        (fromIntegral (extentHeight (constraintMaximum constraints)))
+    nativeCall AspectRatioCall =
+      nativeSetWindowAspectRatio native handle $
+        (\(AspectRatio numerator denominator) → (fromIntegral numerator, fromIntegral denominator))
+          <$> constraintAspectRatio constraints
+
+setConstraintState ∷ Window → ConstraintState → IO ()
+setConstraintState window state =
+  atomicModifyIORef' (windowControl window) (\(ControlState _ transition) → (ControlState state transition, ()))
+
+-- | The reports made on the owner thread during one native call.
+reportsDuring ∷ Session → IO () → IO Reports
+reportsDuring session call = do
+  settleStrayOwnerReports capture
+  call
+  takeOwnerReports capture
+  where
+    capture = sessionCapture session
+
+-- | Sample the window after an attempted control and publish a new revision,
+-- answering it. A sample that reports errors publishes nothing and is answered
+-- as data; a callback fault rethrown at the boundary propagates.
+postCallObservation ∷ Window → IO PostCallObservation
+postCallObservation window =
+  tryWithContext (sampleAll (windowSession window) (windowIdentifiers (windowId window)) (windowHandle window)) >>= \case
+    Left (ExceptionWithContext _ failure) →
+      pure (PostCallSampleFailed (nativeOutcome failure) (nativeReports failure))
+    Right sample → do
+      reconcileWith True (pure ()) window (Just sample)
+      raiseLatchedFault window
+      OwnerState current _ ← readIORef (windowOwnerState window)
+      pure (PostCallRevision (obsRevision current))
+
+-- | Set or clear the window's mode transition marker: the private, owner-internal
+-- state ordinary controls are refused under while it is set. No public command
+-- sets it; a mode transition is its only intended producer.
+setModeTransition ∷ Window → Bool → IO ()
+setModeTransition window transition =
+  atomicModifyIORef' (windowControl window) (\(ControlState constraints _) → (ControlState constraints transition, ()))
 
 -- | How an owner turn processes native events.
 data EventProcessing

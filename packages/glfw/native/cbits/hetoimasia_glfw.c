@@ -180,6 +180,11 @@ void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count)
     return (void*) glfwGetVideoModes(monitor, count);
 }
 
+char* hetoimasia_glfw_window_title(GLFWwindow* window)
+{
+    return (char*) glfwGetWindowTitle(window);
+}
+
 void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields)
 {
     const GLFWvidmode* mode = &modes[index];

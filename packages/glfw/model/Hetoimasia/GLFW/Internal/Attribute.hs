@@ -1,7 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 
--- | The observation vocabulary windows and monitors share: an attribute the
--- platform observed or cannot provide, and a content scale.
+-- | The observation vocabulary windows, window controls, and monitors share: an
+-- attribute the platform observed or cannot provide, a content scale, and a
+-- window's size and placement.
 --
 -- It holds no state. "Hetoimasia.GLFW.Internal.Window" and
 -- "Hetoimasia.GLFW.Internal.Monitor" both publish observations built from these
@@ -10,6 +11,8 @@
 module Hetoimasia.GLFW.Internal.Attribute
   ( Attribute (..)
   , ContentScale (..)
+  , Extent (..)
+  , Placement (..)
   ) where
 
 import Control.DeepSeq (NFData)
@@ -34,3 +37,21 @@ data ContentScale = ContentScale
   deriving (Eq, Show, Generic)
 
 instance NFData ContentScale
+
+-- | A size: logical in screen coordinates, or a framebuffer's in pixels.
+data Extent = Extent
+  { extentWidth ∷ !Int
+  , extentHeight ∷ !Int
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData Extent
+
+-- | The content area's upper-left corner in desktop screen coordinates.
+data Placement = Placement
+  { placementX ∷ !Int
+  , placementY ∷ !Int
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData Placement

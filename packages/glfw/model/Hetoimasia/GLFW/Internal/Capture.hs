@@ -38,6 +38,7 @@ module Hetoimasia.GLFW.Internal.Capture
   , ReportingThread (..)
   , Reports (..)
   , hasReports
+  , rnfReports
   , errorEvidenceCapacity
   , errorDescriptionLimit
 
@@ -57,6 +58,7 @@ module Hetoimasia.GLFW.Internal.Capture
   , takeOtherReports
   ) where
 
+import Control.DeepSeq (rnf)
 import Control.Exception (Exception, SomeException, try, uninterruptibleMask_)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
@@ -111,6 +113,20 @@ data Reports = Reports
 hasReports ∷ Reports → Bool
 hasReports reports =
   not (null (reportedErrors reports)) || reportsLost reports > 0 || callbackFaults reports > 0
+
+-- | Evaluate reports fully, for the prepared data that carries them.
+rnfReports ∷ Reports → ()
+rnfReports reports =
+  foldr (seq . rnfError) () (reportedErrors reports)
+    `seq` rnf (reportsLost reports)
+    `seq` rnf (callbackFaults reports)
+  where
+    rnfError reported =
+      rnf (nativeErrorCode reported)
+        `seq` rnf (nativeErrorDescription reported)
+        `seq` nativeErrorTruncated reported
+        `seq` nativeErrorThread reported
+        `seq` ()
 
 -- | The component every failure raised by this package is attributed to.
 glfwComponent ∷ Component
