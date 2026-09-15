@@ -7,8 +7,9 @@
 -- in prose in @docs/glfw.md@, for the entry order, the owner-thread rules,
 -- native error attribution, teardown, and poisoning.
 --
--- This slice has no public window, event, or input operation. A session is
--- entered, its asynchronous error reports read, and it ends.
+-- A session is entered, its asynchronous error reports read, windows created
+-- in it through "Hetoimasia.GLFW.Window", and it ends. There is no public event
+-- loop, input, or window command operation yet.
 --
 -- @
 -- main ∷ IO ()

@@ -120,6 +120,7 @@ test-suite hetoimasia-tests
         Test.Engine.GLFW.Opacity
         Test.Engine.GLFW.Session
         Test.Engine.GLFW.Spec
+        Test.Engine.GLFW.WindowModel
         Test.Engine.Logging.Component
         Test.Engine.Logging.Configuration
         Test.Engine.Logging.Context
@@ -159,7 +160,7 @@ test-suite hetoimasia-tests
     -- -T keeps the runtime's allocation statistics available, which the
     -- cleanup-evidence inspection cost examples read.
     ghc-options: -threaded -rtsopts -with-rtsopts=-T
-    build-tool-depends: hetoimasia:hetoimasia
+    build-tool-depends: hetoimasia:hetoimasia, hetoimasia-glfw:glfw-window-examples
     build-depends:
         base >=4.21 && <4.22,
         bytestring >=0.12 && <0.13,

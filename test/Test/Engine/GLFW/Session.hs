@@ -44,11 +44,11 @@ import Hetoimasia.Foundation.Resource
   ( cleanupFailureException
   , cleanupFailureLabel
   , cleanupFailures
-  , withComposite
   , withScoped
   )
 import Hetoimasia.GLFW.Seam
 import Hetoimasia.GLFW.Session
+import Hetoimasia.GLFW.Window (hiddenTestWindowConfig, withWindow)
 import System.Timeout (timeout)
 import Test.Hspec
   ( Expectation
@@ -111,12 +111,6 @@ spec = do
   describe "GLFW owner-only operations" $ do
     it "rejects use from another thread and after the session ended, before any native call"
       (boundedExample testOwnerOnlyOperations)
-
-  describe "GLFW window creation seam" $ do
-    it "resets hints and sets NoAPI, and the hidden-window focus hints, before every window"
-      (boundedExample testCreationHints)
-    it "destroys a live window before raising an error its creation reported, and never a null one"
-      (boundedExample testCreationErrors)
 
 -- ---------------------------------------------------------------------------
 -- Entry
@@ -452,11 +446,11 @@ testReleaseErrorWithoutPoison = do
 testOwnerOnlyOperations ∷ Expectation
 testOwnerOnlyOperations = do
   seam ← newSeam defaultScript
-  let request = WindowRequest 64 48 "elsewhere" HiddenTestWindow
+  let config = hiddenTestWindowConfig "elsewhere" 64 48
   (reportsElsewhere, windowElsewhere, afterEnd) ← asProcessMainThread seam $ do
     (reportsElsewhere, windowElsewhere, session) ← entered seam defaultSessionConfig $ \session → do
       reportsElsewhere ← onThread forkOS (fst <$> caughtAs (takeAsynchronousReports session))
-      windowElsewhere ← onThread forkOS (fst <$> caughtAs (withComposite (seamWindow seam session request) pure))
+      windowElsewhere ← onThread forkOS (fst <$> caughtAs (withWindow session config (\_ → pure ())))
       pure (reportsElsewhere, windowElsewhere, session)
     -- Deliberate misuse: the session escaped its scope to prove it is refused.
     (afterEnd, _) ← caughtAs (takeAsynchronousReports session)
@@ -465,46 +459,6 @@ testOwnerOnlyOperations = do
   windowElsewhere `shouldBe` NotSessionOwner
   afterEnd `shouldBe` SessionEnded
   seamCalls seam `shouldReturn` entryCalls <> exitCalls
-
--- ---------------------------------------------------------------------------
--- Creation seam
-
-testCreationHints ∷ Expectation
-testCreationHints = do
-  seam ← newSeam defaultScript
-  asProcessMainThread seam $ entered seam defaultSessionConfig $ \session → do
-    withComposite (seamWindow seam session (WindowRequest 64 48 "hidden" HiddenTestWindow)) pure
-    withComposite (seamWindow seam session (WindowRequest 32 24 "shown" ShownWindow)) pure
-  seamCalls seam
-    `shouldReturn` concat
-      [ entryCalls
-      , hiddenHints
-      , [CreateWindow 64 48 "hidden", DestroyWindow]
-      , [ResetWindowHints, SetWindowHint NoClientApi, CreateWindow 32 24 "shown", DestroyWindow]
-      , exitCalls
-      ]
-
-testCreationErrors ∷ Expectation
-testCreationErrors = do
-  live ←
-    newSeam
-      defaultScript
-        { scriptCreateWindow = \reporter → reportError reporter 0x00010008 "created with an error" >> pure True
-        }
-  (failure, caught) ← asProcessMainThread live $ entered live defaultSessionConfig $ \session →
-    caughtAs (withComposite (seamWindow live session (WindowRequest 64 48 "reported" HiddenTestWindow)) pure)
-  nativeOutcome failure `shouldBe` NativeCallReturned
-  originOf caught `shouldBe` Just ("glfw", "create window", [("title", "reported")])
-  seamCalls live
-    `shouldReturn` concat [entryCalls, hiddenHints, [CreateWindow 64 48 "reported", DestroyWindow], exitCalls]
-
-  refused ←
-    newSeam defaultScript {scriptCreateWindow = \reporter → reportError reporter 0x00010004 "invalid" >> pure False}
-  (nullFailure, _) ← asProcessMainThread refused $ entered refused defaultSessionConfig $ \session →
-    caughtAs (withComposite (seamWindow refused session (WindowRequest 0 48 "refused" HiddenTestWindow)) pure)
-  nativeOutcome nullFailure `shouldBe` NativeCallFailed
-  map nativeErrorCode (reportedErrors (nativeReports nullFailure)) `shouldBe` [0x00010004]
-  seamCalls refused `shouldReturn` concat [entryCalls, hiddenHints, [CreateWindow 0 48 "refused"], exitCalls]
 
 -- ---------------------------------------------------------------------------
 -- Support
@@ -526,15 +480,6 @@ entryCalls =
 -- | The native calls of a complete, safe teardown.
 exitCalls ∷ [NativeCall]
 exitCalls = [Terminate, DetachErrorCallback, FreeErrorCallback]
-
-hiddenHints ∷ [NativeCall]
-hiddenHints =
-  [ ResetWindowHints
-  , SetWindowHint NoClientApi
-  , SetWindowHint NotVisible
-  , SetWindowHint NotFocused
-  , SetWindowHint NoFocusOnShow
-  ]
 
 x11 ∷ [(Text, Text)]
 x11 = [("backend", "x11")]

@@ -46,6 +46,7 @@ module Test.Engine.Resources.Opacity
   ) where
 
 import Control.Monad (filterM)
+import Data.List (isInfixOf)
 import Data.Version (showVersion)
 import System.Directory (doesDirectoryExist, findExecutable)
 import System.Environment (getExecutablePath)
@@ -341,6 +342,13 @@ withPackageClient packages name source use = do
             expectationFailure ("ghc could not be interrogated (" <> show status <> "): " <> err)
 
 -- | The compiler arguments an external client is built with.
+--
+-- A name containing @-inplace@ is a local unit id, the main library's or a
+-- sublibrary's, and is exposed with
+-- @-package-id@. A package with public or private sublibraries registers every
+-- one of them under the same package name, so @-package@ alone matches several
+-- units and GHC's choice among them is not stable; naming the main library's
+-- unit id exposes exactly that library.
 arguments ∷ [String] → Mode → FilePath → FilePath → [String]
 arguments packages mode packageDatabase name =
   [ "-XGHC2024"
@@ -351,11 +359,15 @@ arguments packages mode packageDatabase name =
   , packageDatabase
   , "-hide-all-packages"
   ]
-    <> concatMap (\package → ["-package", package]) packages
+    <> concatMap exposing packages
     <> ["-fdiagnostics-color=never"]
     <> case mode of
       Typecheck → ["-fno-code", name]
       Link → [name, "-o", "client"]
+  where
+    exposing package
+      | "-inplace" `isInfixOf` package = ["-package-id", package]
+      | otherwise = ["-package", package]
 
 -- | The package database this build wrote its local libraries into.
 --

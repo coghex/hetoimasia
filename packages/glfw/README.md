@@ -6,16 +6,19 @@ Owns the small private binding to upstream GLFW 3.4 and the one scoped session
 over it. `Hetoimasia.GLFW.Session` enters a session on the process main thread:
 backend selection (X11 on Linux, Cocoa on macOS, never Wayland), exclusive
 initialization and termination, bounded evidence of native error reports, and
-poisoning when teardown cannot finish safely. There is no public window, event,
-or input operation yet.
+poisoning when teardown cannot finish safely. `Hetoimasia.GLFW.Window` creates
+lexically scoped NoAPI windows in that session, publishes what the platform
+observed through read-only snapshots, contains their native callbacks, and
+releases them when their scopes end. There is no window command, event loop, or
+input operation yet.
 
 The package depends on `hetoimasia-foundation`, not on the runtime, and imports
 no game, Lua, logger, or rendering module. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam `hetoimasia-tests` drives without initializing GLFW.
 
-The contract, including owner, thread, lifetime, poison, and error-evidence
-rules, is [docs/glfw.md](../../docs/glfw.md).
+The contract, including owner, thread, lifetime, poison, error-evidence,
+observation, callback-containment, and release-order rules, is [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with
 `python3 tools/native/native.py build` and

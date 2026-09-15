@@ -2,8 +2,8 @@
 --
 -- A 'Session' is the one scoped owner of GLFW's process-wide state: its
 -- initialization, the error callback and the bookkeeping behind it, the
--- creation seam, and final termination. 'sessionAssembly' constructs it in
--- stages under 'Hetoimasia.Foundation.Resource.withComposite''s staged
+-- identities of the windows created in it, and final termination.
+-- 'sessionAssembly' constructs it in stages under 'Hetoimasia.Foundation.Resource.withComposite''s staged
 -- protection, so a failure at any stage releases exactly what was acquired
 -- before it, keeping the triggering failure primary and every cleanup failure
 -- beside it.
@@ -35,9 +35,9 @@
 --
 -- = Owner-only operations
 --
--- 'takeAsynchronousReports' and the creation seam check, before any native
--- call, that they run on the thread that entered the session
--- ('NotSessionOwner') and that the session has not ended ('SessionEnded').
+-- 'takeAsynchronousReports' and the window operations of
+-- "Hetoimasia.GLFW.Internal.Window" check, before any native call, that they
+-- run on the thread that entered the session ('NotSessionOwner') and that the session has not ended ('SessionEnded').
 --
 -- = Native errors
 --
@@ -68,7 +68,9 @@
 -- teardown step raises instead of returning — termination, detaching the
 -- callback, or a release attempted from another thread — the storage is
 -- deliberately leaked and the guard is poisoned, so every later entry fails
--- with 'SessionPoisoned' before any native call. A native error reported by a
+-- with 'SessionPoisoned' before any native call. A window release that leaves
+-- its callbacks' reachability uncertain poisons the session the same way, and
+-- the live session then refuses further windows. A native error reported by a
 -- release whose call returned does not poison: it is retained as that
 -- release's cleanup failure.
 --
@@ -89,9 +91,9 @@
 -- |                    |                   | freed at teardown    |             |                    | detach; leaked when   |
 -- |                    |                   |                      |             |                    | poisoned              |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
--- | Teardown safety    | The session       | Releases clear it;   | Owner       | The session        | Read once by the      |
--- |                    |                   | the guard release    |             |                    | guard release         |
--- |                    |                   | reads it             |             |                    |                       |
+-- | Teardown safety    | The session       | Unsafe releases      | Owner       | The session        | Read once by the      |
+-- |                    |                   | clear it; the guard  |             |                    | guard release         |
+-- |                    |                   | release reads it     |             |                    |                       |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 -- | Liveness           | The session       | Termination clears   | Owner       | The session        | Never set again       |
 -- |                    |                   | it; operations read  |             |                    |                       |
@@ -122,11 +124,20 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionBackend
   , takeAsynchronousReports
 
-    -- * The private window creation seam
-  , WindowRequest (..)
-  , WindowVisibility (..)
-  , nativeWindowAssembly
-  , windowAssemblyThrough
+    -- * What window operations share with the session
+  , WindowAttribute (..)
+  , WindowCallbacks (..)
+  , WindowCallbackStorage (..)
+  , sessionNative
+  , sessionCapture
+  , sessionIdentity
+  , nextWindowIdentity
+  , requireUnpoisoned
+  , poisonSession
+  , ownerOperation
+  , raiseReported
+  , createWindowOperation
+  , destroyWindowOperation
 
     -- * Failures
   , glfwComponent
@@ -151,7 +162,9 @@ import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Int (Int32)
 import Data.Text (Text)
-import Foreign.Ptr (FunPtr, Ptr, nullPtr)
+import Data.Unique (Unique, newUnique)
+import Foreign.C.Types (CFloat, CInt)
+import Foreign.Ptr (FunPtr, Ptr)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep)
@@ -170,6 +183,7 @@ import Hetoimasia.GLFW.Internal.Capture
   , takeOtherReports
   , takeOwnerReports
   )
+import Numeric.Natural (Natural)
 
 -- | A GLFW platform backend.
 data Backend
@@ -205,13 +219,44 @@ data NativeWindow
 -- | The storage behind an installed error callback.
 newtype CallbackStorage = CallbackStorage (FunPtr ErrorCallback)
 
--- | The creation hints the seam sets.
+-- | The creation hints a window sets after resetting every hint to its default.
 data WindowHint
   = NoClientApi
-  | NotVisible
-  | NotFocused
-  | NoFocusOnShow
+    -- ^ @GLFW_CLIENT_API = GLFW_NO_API@.
+  | VisibleHint !Bool
+  | FocusedHint !Bool
+  | FocusOnShowHint !Bool
   deriving (Eq, Show)
+
+-- | The boolean window attributes an observation samples.
+data WindowAttribute
+  = FocusedAttribute
+  | IconifiedAttribute
+  | MaximizedAttribute
+  | VisibleAttribute
+  deriving (Eq, Show)
+
+-- | The Haskell side of one window's native callbacks, as the model builds them.
+--
+-- Each takes exactly the fixed payload GLFW passes after the window pointer,
+-- so the binding's wrapper only drops that pointer. Every one of them is
+-- already contained by the model: it copies its payload, records it, and
+-- returns, and nothing it raises reaches the native caller.
+data WindowCallbacks = WindowCallbacks
+  { onWindowSize ∷ CInt → CInt → IO ()
+  , onFramebufferSize ∷ CInt → CInt → IO ()
+  , onContentScale ∷ CFloat → CFloat → IO ()
+  , onWindowPosition ∷ CInt → CInt → IO ()
+  , onWindowFocus ∷ CInt → IO ()
+  , onWindowIconify ∷ CInt → IO ()
+  , onWindowMaximize ∷ CInt → IO ()
+  , onWindowRefresh ∷ IO ()
+  , onWindowClose ∷ IO ()
+  }
+
+-- | The storage behind one window's callback wrappers, one pointer per
+-- callback in the order 'WindowCallbacks' declares them.
+newtype WindowCallbackStorage = WindowCallbackStorage [FunPtr ()]
 
 -- | Every native operation a session performs, as the model sees it.
 data Native = Native
@@ -235,13 +280,32 @@ data Native = Native
   , nativeResetWindowHints ∷ IO ()
   , nativeSetWindowHint ∷ WindowHint → IO ()
   , nativeCreateWindow ∷ Int32 → Int32 → Text → IO (Ptr NativeWindow)
+    -- ^ Returns null when creation failed.
   , nativeDestroyWindow ∷ Ptr NativeWindow → IO ()
+  , nativeNewWindowCallbacks ∷ WindowCallbacks → IO WindowCallbackStorage
+    -- ^ Allocate callback wrappers; changes no native state.
+  , nativeAttachWindowCallbacks ∷ Ptr NativeWindow → WindowCallbackStorage → IO ()
+  , nativeDetachWindowCallbacks ∷ Ptr NativeWindow → IO ()
+    -- ^ Replace every callback 'nativeAttachWindowCallbacks' set with none.
+  , nativeFreeWindowCallbacks ∷ WindowCallbackStorage → IO ()
+  , nativeWindowSize ∷ Ptr NativeWindow → IO (Int, Int)
+    -- ^ The content area's size in screen coordinates.
+  , nativeFramebufferSize ∷ Ptr NativeWindow → IO (Int, Int)
+    -- ^ The framebuffer's size in pixels.
+  , nativeContentScale ∷ Ptr NativeWindow → IO (Float, Float)
+  , nativeWindowPosition ∷ Ptr NativeWindow → IO (Int, Int)
+    -- ^ The content area's upper-left corner in desktop screen coordinates.
+  , nativeWindowAttribute ∷ Ptr NativeWindow → WindowAttribute → IO Bool
+  , nativeFeatureUnavailable ∷ !Int
+    -- ^ The error code a query reports for a property this platform cannot
+    -- provide: @GLFW_FEATURE_UNAVAILABLE@.
   }
 
 -- | Which session, if any, holds a native library's process-wide state.
 --
 -- It holds only occupancy and poison, and nothing about the session holding it.
 newtype Guard = Guard (IORef Occupancy)
+  deriving (Eq)
 
 data Occupancy = Vacant | Occupied | Poisoned
 
@@ -256,6 +320,13 @@ data Session = Session
   , sessionSelected ∷ !Backend
   , sessionCapture ∷ !Capture
   , sessionLive ∷ !(IORef Bool)
+  , sessionIdentity ∷ !Unique
+    -- ^ Distinguishes this session's windows from any other session's.
+  , sessionWindows ∷ !(IORef Natural)
+    -- ^ The next window's local identity. Never reissued.
+  , sessionTeardown ∷ !(IORef Bool)
+    -- ^ Cleared once any teardown, a window's included, could not establish
+    -- that native ownership and callback registration ended safely.
   }
 
 -- | The backend the session initialized.
@@ -367,6 +438,8 @@ sessionAssembly native config = do
   owner ← restoredStep myThreadId
   teardown ← restoredStep (newIORef True)
   live ← restoredStep (newIORef True)
+  identity ← restoredStep newUnique
+  windows ← restoredStep (newIORef 1)
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native))
   acquirePart
     "glfw session occupancy"
@@ -396,6 +469,9 @@ sessionAssembly native config = do
       , sessionSelected = backend
       , sessionCapture = capture
       , sessionLive = live
+      , sessionIdentity = identity
+      , sessionWindows = windows
+      , sessionTeardown = teardown
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -535,60 +611,22 @@ takeAsynchronousReports session =
     settleStrayOwnerReports (sessionCapture session)
     takeOtherReports (sessionCapture session)
 
--- | Whether a seam window may be shown.
-data WindowVisibility
-  = HiddenTestWindow
-    -- ^ Hidden, unfocused, and not focused when shown.
-  | ShownWindow
-  deriving (Eq, Show)
+-- | Issue the next local window identity. Identities start at one and are never
+-- reissued within a session.
+nextWindowIdentity ∷ Session → IO Natural
+nextWindowIdentity session =
+  atomicModifyIORef' (sessionWindows session) (\next → (next + 1, next))
 
--- | A NoAPI window the creation seam constructs.
-data WindowRequest = WindowRequest
-  { windowWidth ∷ !Int32
-  , windowHeight ∷ !Int32
-  , windowTitle ∷ !Text
-  , windowVisibility ∷ !WindowVisibility
-  }
-  deriving (Eq, Show)
+-- | Refuse an operation on a session whose teardown safety has already been
+-- lost, with the misuse a later entry would see.
+requireUnpoisoned ∷ Session → Operation → [(Text, Text)] → IO ()
+requireUnpoisoned session operationName identifiers = do
+  safe ← readIORef (sessionTeardown session)
+  unless safe $
+    throwFailure glfwComponent operationName identifiers SessionPoisoned
 
--- | Construct a NoAPI window in a live session, through the session's own
--- native table.
-nativeWindowAssembly ∷ Session → WindowRequest → Assembly (Ptr NativeWindow)
-nativeWindowAssembly session = windowAssemblyThrough (sessionNative session) session
-
--- | Construct a NoAPI window through the given native table.
---
--- Creation hints are reset before every window and NoAPI is set explicitly; a
--- hidden test window also disables focus and focus on show. A live handle's
--- destruction is registered before any error reported during its creation is
--- raised, so a creation that returned a handle and reported an error destroys
--- that handle while unwinding.
-windowAssemblyThrough ∷ Native → Session → WindowRequest → Assembly (Ptr NativeWindow)
-windowAssemblyThrough native session request = do
-  (window, reports) ← acquirePart "glfw window" (releaseRank 0) create destroy
-  restoredStep (raiseReported createWindowOperation identifiers NativeCallReturned reports)
-  pure window
-  where
-    capture = sessionCapture session
-    identifiers = [("title", windowTitle request)]
-
-    create = ownerOperation session createWindowOperation identifiers $ do
-      settleStrayOwnerReports capture
-      nativeResetWindowHints native
-      mapM_ (nativeSetWindowHint native) (windowHints (windowVisibility request))
-      window ←
-        nativeCreateWindow native (windowWidth request) (windowHeight request) (windowTitle request)
-      reports ← takeOwnerReports capture
-      when (window == nullPtr) $
-        throwFailure glfwComponent createWindowOperation identifiers (NativeFailure NativeCallFailed reports)
-      pure (window, reports)
-
-    destroy (window, _) = ownerOperation session destroyWindowOperation identifiers $ do
-      settleStrayOwnerReports capture
-      nativeDestroyWindow native window
-      reports ← takeOwnerReports capture
-      raiseReported destroyWindowOperation identifiers NativeCallReturned reports
-
-windowHints ∷ WindowVisibility → [WindowHint]
-windowHints HiddenTestWindow = [NoClientApi, NotVisible, NotFocused, NoFocusOnShow]
-windowHints ShownWindow = [NoClientApi]
+-- | Record that a teardown could not establish it ended safely. The session
+-- refuses further windows, keeps its error callback storage, and poisons the
+-- guard when it ends.
+poisonSession ∷ Session → IO ()
+poisonSession session = atomicWriteIORef (sessionTeardown session) False

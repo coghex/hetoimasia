@@ -2,13 +2,13 @@
 
 -- | The private binding to upstream GLFW 3.4, and the production native table.
 --
--- Only the operations the session model uses are bound. Every function and
+-- Only the operations the session and window models use are bound. Every function and
 -- constant is imported through @hetoimasia_glfw.h@, which includes the
 -- installed @GLFW/glfw3.h@, so the C compiler checks each declaration and every
 -- constant's value comes from the header rather than from a copied number. The
--- one exception is @glfwSetErrorCallback@, imported with @ccall@: its argument
--- is a function pointer whose C type the CAPI wrapper cannot spell, and it is
--- passed and returned as a plain pointer.
+-- exceptions are @glfwSetErrorCallback@ and the window callback setters,
+-- imported with @ccall@: their argument is a function pointer whose C type the
+-- CAPI wrapper cannot spell, and it is passed and returned as a plain pointer.
 --
 -- Every GLFW function is a @safe@ import. Any of them may report an error
 -- through the callback, which re-enters Haskell and is only permitted from a
@@ -22,16 +22,25 @@ module Hetoimasia.GLFW.Internal.Native
 
     -- * Error codes
   , glfwPlatformUnavailable
+
+    -- * Native check drivers
+  , setWindowSizeForCheck
+  , pollEventsForCheck
+  , leakResizableHintForCheck
+  , windowResizableForCheck
   ) where
 
+import Control.Exception (onException)
 import Control.Monad (void)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8)
 import Foreign.C.String (CString)
-import Foreign.C.Types (CInt (CInt))
-import Foreign.Ptr (FunPtr, Ptr, freeHaskellFunPtr, nullFunPtr, nullPtr)
+import Foreign.C.Types (CFloat (CFloat), CInt (CInt))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
+import Foreign.Storable (Storable, peek)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
 import Hetoimasia.GLFW.Internal.Session
   ( Backend (..)
@@ -39,6 +48,9 @@ import Hetoimasia.GLFW.Internal.Session
   , Guard
   , Native (..)
   , NativeWindow
+  , WindowAttribute (..)
+  , WindowCallbackStorage (WindowCallbackStorage)
+  , WindowCallbacks (..)
   , WindowHint (..)
   , newGuard
   )
@@ -69,6 +81,17 @@ productionNative =
     , nativeSetWindowHint = setWindowHint
     , nativeCreateWindow = createWindow
     , nativeDestroyWindow = c_glfwDestroyWindow
+    , nativeNewWindowCallbacks = newWindowCallbacks
+    , nativeAttachWindowCallbacks = attachWindowCallbacks
+    , nativeDetachWindowCallbacks = detachWindowCallbacks
+    , nativeFreeWindowCallbacks = \(WindowCallbackStorage pointers) → mapM_ freeHaskellFunPtr pointers
+    , nativeWindowSize = pairOf c_glfwGetWindowSize fromIntegral
+    , nativeFramebufferSize = pairOf c_glfwGetFramebufferSize fromIntegral
+    , nativeContentScale = pairOf c_glfwGetWindowContentScale realToFrac
+    , nativeWindowPosition = pairOf c_glfwGetWindowPos fromIntegral
+    , nativeWindowAttribute = \window attribute →
+        (/= glfwFalse) <$> c_glfwGetWindowAttrib window (attributeCode attribute)
+    , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     }
 
 -- | The exclusivity guard for this process's one GLFW instance.
@@ -96,9 +119,96 @@ platformBackend code
 
 setWindowHint ∷ WindowHint → IO ()
 setWindowHint NoClientApi = c_glfwWindowHint glfwClientApi glfwNoApi
-setWindowHint NotVisible = c_glfwWindowHint glfwVisible glfwFalse
-setWindowHint NotFocused = c_glfwWindowHint glfwFocused glfwFalse
-setWindowHint NoFocusOnShow = c_glfwWindowHint glfwFocusOnShow glfwFalse
+setWindowHint (VisibleHint visible) = c_glfwWindowHint glfwVisible (boolean visible)
+setWindowHint (FocusedHint focused) = c_glfwWindowHint glfwFocused (boolean focused)
+setWindowHint (FocusOnShowHint focusOnShow) = c_glfwWindowHint glfwFocusOnShow (boolean focusOnShow)
+
+boolean ∷ Bool → CInt
+boolean flag = if flag then glfwTrue else glfwFalse
+
+attributeCode ∷ WindowAttribute → CInt
+attributeCode FocusedAttribute = glfwFocused
+attributeCode IconifiedAttribute = glfwIconified
+attributeCode MaximizedAttribute = glfwMaximized
+attributeCode VisibleAttribute = glfwVisible
+
+-- | Read a pair a GLFW getter writes through two out-pointers.
+pairOf ∷ Storable c ⇒ (Ptr NativeWindow → Ptr c → Ptr c → IO ()) → (c → a) → Ptr NativeWindow → IO (a, a)
+pairOf getter convert window =
+  alloca $ \first → alloca $ \second → do
+    getter window first second
+    (,) <$> (convert <$> peek first) <*> (convert <$> peek second)
+
+type PairCallback = Ptr NativeWindow → CInt → CInt → IO ()
+type ScaleCallback = Ptr NativeWindow → CFloat → CFloat → IO ()
+type FlagCallback = Ptr NativeWindow → CInt → IO ()
+type PlainCallback = Ptr NativeWindow → IO ()
+
+-- | Allocate one wrapper per callback, in 'WindowCallbacks' order. Each wrapper
+-- only drops the window pointer; the model's callback is already contained. A
+-- failure part-way frees the wrappers already allocated.
+newWindowCallbacks ∷ WindowCallbacks → IO WindowCallbackStorage
+newWindowCallbacks callbacks =
+  WindowCallbackStorage . reverse
+    <$> allocating
+      []
+      [ castFunPtr <$> c_wrapPairCallback (\_ width height → onWindowSize callbacks width height)
+      , castFunPtr <$> c_wrapPairCallback (\_ width height → onFramebufferSize callbacks width height)
+      , castFunPtr <$> c_wrapScaleCallback (\_ x y → onContentScale callbacks x y)
+      , castFunPtr <$> c_wrapPairCallback (\_ x y → onWindowPosition callbacks x y)
+      , castFunPtr <$> c_wrapFlagCallback (\_ focused → onWindowFocus callbacks focused)
+      , castFunPtr <$> c_wrapFlagCallback (\_ iconified → onWindowIconify callbacks iconified)
+      , castFunPtr <$> c_wrapFlagCallback (\_ maximized → onWindowMaximize callbacks maximized)
+      , castFunPtr <$> c_wrapPlainCallback (\_ → onWindowRefresh callbacks)
+      , castFunPtr <$> c_wrapPlainCallback (\_ → onWindowClose callbacks)
+      ]
+  where
+    allocating done [] = pure done
+    allocating done (next : rest) = do
+      pointer ← next `onException` mapM_ freeHaskellFunPtr done
+      allocating (pointer : done) rest
+
+attachWindowCallbacks ∷ Ptr NativeWindow → WindowCallbackStorage → IO ()
+attachWindowCallbacks window (WindowCallbackStorage [size, framebuffer, scale, position, focus, iconify, maximize, refresh, close]) = do
+  void (c_glfwSetWindowSizeCallback window (castFunPtr size))
+  void (c_glfwSetFramebufferSizeCallback window (castFunPtr framebuffer))
+  void (c_glfwSetWindowContentScaleCallback window (castFunPtr scale))
+  void (c_glfwSetWindowPosCallback window (castFunPtr position))
+  void (c_glfwSetWindowFocusCallback window (castFunPtr focus))
+  void (c_glfwSetWindowIconifyCallback window (castFunPtr iconify))
+  void (c_glfwSetWindowMaximizeCallback window (castFunPtr maximize))
+  void (c_glfwSetWindowRefreshCallback window (castFunPtr refresh))
+  void (c_glfwSetWindowCloseCallback window (castFunPtr close))
+attachWindowCallbacks _ _ = ioError (userError "window callback storage does not hold nine wrappers")
+
+detachWindowCallbacks ∷ Ptr NativeWindow → IO ()
+detachWindowCallbacks window = do
+  void (c_glfwSetWindowSizeCallback window nullFunPtr)
+  void (c_glfwSetFramebufferSizeCallback window nullFunPtr)
+  void (c_glfwSetWindowContentScaleCallback window nullFunPtr)
+  void (c_glfwSetWindowPosCallback window nullFunPtr)
+  void (c_glfwSetWindowFocusCallback window nullFunPtr)
+  void (c_glfwSetWindowIconifyCallback window nullFunPtr)
+  void (c_glfwSetWindowMaximizeCallback window nullFunPtr)
+  void (c_glfwSetWindowRefreshCallback window nullFunPtr)
+  void (c_glfwSetWindowCloseCallback window nullFunPtr)
+
+-- | Resize a window: a callback-producing setter for the native check only.
+setWindowSizeForCheck ∷ Ptr NativeWindow → Int → Int → IO ()
+setWindowSizeForCheck window width height = c_glfwSetWindowSize window (fromIntegral width) (fromIntegral height)
+
+-- | Process pending events once, for the native check only.
+pollEventsForCheck ∷ IO ()
+pollEventsForCheck = c_glfwPollEvents
+
+-- | Set a creation hint no window configuration sets, so the native check can
+-- show that the next window's creation resets it.
+leakResizableHintForCheck ∷ IO ()
+leakResizableHintForCheck = c_glfwWindowHint glfwResizable glfwFalse
+
+-- | Whether a window is resizable, for the native check only.
+windowResizableForCheck ∷ Ptr NativeWindow → IO Bool
+windowResizableForCheck window = (/= glfwFalse) <$> c_glfwGetWindowAttrib window glfwResizable
 
 createWindow ∷ Int32 → Int32 → Text → IO (Ptr NativeWindow)
 createWindow width height title =
@@ -141,6 +251,66 @@ foreign import capi safe "hetoimasia_glfw.h glfwCreateWindow"
 foreign import capi safe "hetoimasia_glfw.h glfwDestroyWindow"
   c_glfwDestroyWindow ∷ Ptr NativeWindow → IO ()
 
+foreign import capi safe "hetoimasia_glfw.h glfwGetWindowSize"
+  c_glfwGetWindowSize ∷ Ptr NativeWindow → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetFramebufferSize"
+  c_glfwGetFramebufferSize ∷ Ptr NativeWindow → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetWindowContentScale"
+  c_glfwGetWindowContentScale ∷ Ptr NativeWindow → Ptr CFloat → Ptr CFloat → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetWindowPos"
+  c_glfwGetWindowPos ∷ Ptr NativeWindow → Ptr CInt → Ptr CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwGetWindowAttrib"
+  c_glfwGetWindowAttrib ∷ Ptr NativeWindow → CInt → IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h glfwSetWindowSize"
+  c_glfwSetWindowSize ∷ Ptr NativeWindow → CInt → CInt → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwPollEvents"
+  c_glfwPollEvents ∷ IO ()
+
+foreign import ccall "wrapper"
+  c_wrapPairCallback ∷ PairCallback → IO (FunPtr PairCallback)
+
+foreign import ccall "wrapper"
+  c_wrapScaleCallback ∷ ScaleCallback → IO (FunPtr ScaleCallback)
+
+foreign import ccall "wrapper"
+  c_wrapFlagCallback ∷ FlagCallback → IO (FunPtr FlagCallback)
+
+foreign import ccall "wrapper"
+  c_wrapPlainCallback ∷ PlainCallback → IO (FunPtr PlainCallback)
+
+foreign import ccall safe "glfwSetWindowSizeCallback"
+  c_glfwSetWindowSizeCallback ∷ Ptr NativeWindow → FunPtr PairCallback → IO (FunPtr PairCallback)
+
+foreign import ccall safe "glfwSetFramebufferSizeCallback"
+  c_glfwSetFramebufferSizeCallback ∷ Ptr NativeWindow → FunPtr PairCallback → IO (FunPtr PairCallback)
+
+foreign import ccall safe "glfwSetWindowContentScaleCallback"
+  c_glfwSetWindowContentScaleCallback ∷ Ptr NativeWindow → FunPtr ScaleCallback → IO (FunPtr ScaleCallback)
+
+foreign import ccall safe "glfwSetWindowPosCallback"
+  c_glfwSetWindowPosCallback ∷ Ptr NativeWindow → FunPtr PairCallback → IO (FunPtr PairCallback)
+
+foreign import ccall safe "glfwSetWindowFocusCallback"
+  c_glfwSetWindowFocusCallback ∷ Ptr NativeWindow → FunPtr FlagCallback → IO (FunPtr FlagCallback)
+
+foreign import ccall safe "glfwSetWindowIconifyCallback"
+  c_glfwSetWindowIconifyCallback ∷ Ptr NativeWindow → FunPtr FlagCallback → IO (FunPtr FlagCallback)
+
+foreign import ccall safe "glfwSetWindowMaximizeCallback"
+  c_glfwSetWindowMaximizeCallback ∷ Ptr NativeWindow → FunPtr FlagCallback → IO (FunPtr FlagCallback)
+
+foreign import ccall safe "glfwSetWindowRefreshCallback"
+  c_glfwSetWindowRefreshCallback ∷ Ptr NativeWindow → FunPtr PlainCallback → IO (FunPtr PlainCallback)
+
+foreign import ccall safe "glfwSetWindowCloseCallback"
+  c_glfwSetWindowCloseCallback ∷ Ptr NativeWindow → FunPtr PlainCallback → IO (FunPtr PlainCallback)
+
 foreign import capi "hetoimasia_glfw.h value GLFW_TRUE" glfwTrue ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FALSE" glfwFalse ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_PLATFORM" glfwPlatformHint ∷ CInt
@@ -153,6 +323,13 @@ foreign import capi "hetoimasia_glfw.h value GLFW_NO_API" glfwNoApi ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_VISIBLE" glfwVisible ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FOCUSED" glfwFocused ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FOCUS_ON_SHOW" glfwFocusOnShow ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_ICONIFIED" glfwIconified ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_MAXIMIZED" glfwMaximized ∷ CInt
+foreign import capi "hetoimasia_glfw.h value GLFW_RESIZABLE" glfwResizable ∷ CInt
+
+-- | @GLFW_FEATURE_UNAVAILABLE@, the error a query reports for a property the
+-- platform cannot provide.
+foreign import capi "hetoimasia_glfw.h value GLFW_FEATURE_UNAVAILABLE" glfwFeatureUnavailable ∷ CInt
 
 -- | @GLFW_PLATFORM_UNAVAILABLE@, the error an initialization requesting a
 -- platform this library was not built with reports.

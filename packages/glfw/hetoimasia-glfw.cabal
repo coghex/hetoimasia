@@ -5,8 +5,8 @@ synopsis: GLFW 3.4 native binding and main-thread session for Hetoimasia
 description:
     A small private binding to upstream GLFW 3.4 and one scoped session owned by
     the process main thread: exclusive initialization and termination, bounded
-    evidence of what the native error callback reported, and a private NoAPI
-    window creation seam. It depends on the foundation library and not on the
+    evidence of what the native error callback reported, and scoped NoAPI
+    windows that publish what the platform observed through snapshots. It depends on the foundation library and not on the
     runtime, and imports no game, scripting, logging, or rendering module.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -29,8 +29,9 @@ common language
     default-extensions: UnicodeSyntax OverloadedStrings
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
 
--- The session model: exclusivity, thread checks, staged construction and
--- rollback, bounded error capture, and the creation seam, written over a table
+-- The session and window models: exclusivity, thread checks, staged
+-- construction and rollback, bounded error capture, window observations, and
+-- contained callbacks, written over a table
 -- of native operations. It binds nothing, so the test seam can drive it
 -- without linking GLFW.
 library model
@@ -40,9 +41,12 @@ library model
     exposed-modules:
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Session
+        Hetoimasia.GLFW.Internal.Window
     build-depends:
         base >=4.21 && <4.22,
         bytestring >=0.12 && <0.13,
+        deepseq >=1.5.1 && <1.6,
+        stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0
 
@@ -75,6 +79,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GLFW.Session
+        Hetoimasia.GLFW.Window
     build-depends:
         base >=4.21 && <4.22,
         hetoimasia-foundation ==0.1.0.0,
@@ -93,10 +98,43 @@ library seam
         Hetoimasia.GLFW.Seam
     build-depends:
         base >=4.21 && <4.22,
+        hetoimasia-glfw:seam-core
+
+-- The seam's implementation, including the window drivers that deliver
+-- scripted callbacks and change close intent. Private, so no package outside
+-- this one can name the drivers; the public seam re-exports everything else.
+library seam-core
+    import: language
+    visibility: private
+    hs-source-dirs: seam-core
+    exposed-modules:
+        Hetoimasia.GLFW.Internal.Seam
+    build-depends:
+        base >=4.21 && <4.22,
         bytestring >=0.12 && <0.13,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw:model
+
+-- The window model examples that use the private window drivers. An executable
+-- rather than a library, so its modules cannot be imported; hetoimasia-tests
+-- runs it from its GLFW group through build-tool-depends. It initializes no
+-- GLFW and opens no display.
+executable glfw-window-examples
+    import: language
+    main-is: Main.hs
+    hs-source-dirs: window-examples
+    other-modules:
+        Test.GLFW.Window
+    ghc-options: -threaded
+    build-depends:
+        base >=4.21 && <4.22,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw,
+        hetoimasia-glfw:seam-core
 
 -- The native session check. It runs a real session on the process main
 -- thread, so it is a plain executable rather than an Hspec suite, and it is
@@ -109,6 +147,7 @@ test-suite glfw-native-check
     ghc-options: -threaded
     build-depends:
         base >=4.21 && <4.22,
+        stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw,
