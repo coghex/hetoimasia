@@ -33,6 +33,7 @@ extra-source-files:
     tools/ci-image/registry.py
     tools/ci-image/toolchain.pin
     tools/docs_land.sh
+    tools/display/x11.sh
     tools/docs_land_paths.py
     tools/native/glfw.pin
     tools/native/native.py
@@ -90,6 +91,7 @@ test-suite workflow-tests
         ApprovalProvenance
         CiImage
         DismissalStep
+        Display
         Execution
         Json
         Packaging

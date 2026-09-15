@@ -1,7 +1,9 @@
 # The Linux CI image: pinned GHC and Cabal, the C build prerequisites, the X11
-# development and runtime libraries GLFW needs, and the compiled private GLFW
-# prefix. It carries no project source, project build output, captures, display
-# server, window manager, or Vulkan SDK.
+# development and runtime libraries GLFW needs, the compiled private GLFW
+# prefix, and the Xvfb server and Openbox window manager the native worker's
+# display helper starts for its own runs. Nothing in the image starts a display,
+# and it carries no project source, project build output, captures, or Vulkan
+# SDK.
 #
 # Build it only through the ci-image builder, which stages exactly the recipe
 # inputs the fingerprint covers as the build context and supplies that

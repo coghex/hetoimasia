@@ -63,8 +63,15 @@ jobs:
       execute: ${{ steps.reuse.outputs.execute }}
       reused: ${{ steps.reuse.outputs.reused }}
       identity: ${{ steps.reuse.outputs.input_identity }}
+      # Routing outputs per worker, read back from the plan's validated
+      # assignment rather than restated here: whether the job still has work,
+      # and every group the plan assigns it.
       engine: ${{ steps.reuse.outputs.run-haskell-engine }}
+      engine-groups: ${{ steps.reuse.outputs.assigned-haskell-engine }}
       workflow: ${{ steps.reuse.outputs.run-haskell-workflow }}
+      workflow-groups: ${{ steps.reuse.outputs.assigned-haskell-workflow }}
+      native: ${{ steps.reuse.outputs.run-glfw-native }}
+      native-groups: ${{ steps.reuse.outputs.assigned-glfw-native }}
       base: ${{ steps.range.outputs.base }}
       head: ${{ steps.range.outputs.head }}
       # Selection uses the merge-base range, but every job executes this one
@@ -138,6 +145,13 @@ jobs:
           arguments=(--base "$BASE" --head "$HEAD" --candidate "$CANDIDATE" --json)
           arguments+=(--toolchain "ghc=$GHC_VERSION" --toolchain "cabal=$CABAL_VERSION")
           arguments+=(--runner-os "$WORKER_OS")
+          # Every worker, the runner classes it provides, and the groups it owns,
+          # declared once. The planner refuses a routing no worker could honour —
+          # a display group on a CPU-only worker, or a group owned twice or by
+          # nobody — and every later step reads the assignment out of the plan.
+          arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,smoke.console")
+          arguments+=(--worker "haskell-workflow=cpu:test.workflow")
+          arguments+=(--worker "glfw-native=display:test.glfw-native")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
             arguments+=(--request-file request.txt)
@@ -202,8 +216,6 @@ jobs:
             --repo "$REPOSITORY" \
             --output applicability.json \
             --budget-seconds 120 \
-            --worker "haskell-engine=build.all,test.engine,smoke.console" \
-            --worker "haskell-workflow=test.workflow" \
             --summary "$GITHUB_STEP_SUMMARY" \
             > reuse.out; then
             echo "::warning::the reuse lookup failed; every selected group will execute"
@@ -212,8 +224,6 @@ jobs:
               --repo "$REPOSITORY" \
               --output applicability.json \
               --offline \
-              --worker "haskell-engine=build.all,test.engine,smoke.console" \
-              --worker "haskell-workflow=test.workflow" \
               > reuse.out || exit 1
           fi
           cat reuse.out >> "$GITHUB_OUTPUT"
@@ -402,6 +412,7 @@ jobs:
         env:
           SELECTED: ${{ needs.plan.outputs.selected }}
           EXECUTE: ${{ needs.plan.outputs.execute }}
+          ASSIGNED: ${{ needs.plan.outputs.engine-groups }}
         run: |
           set -uo pipefail
           mkdir -p receipts
@@ -414,8 +425,9 @@ jobs:
           # a receipt for each of them rather than inferring the rest from the
           # first failure. A group the plan selected but an earlier execution
           # already covered is announced as reused rather than as unselected:
-          # the two are different facts and the log must not conflate them.
-          for group in build.all test.engine smoke.console; do
+          # the two are different facts and the log must not conflate them. The
+          # groups are exactly the ones the plan assigns this worker.
+          for group in $ASSIGNED; do
             case " $EXECUTE " in
               *" $group "*) ;;
               *)
@@ -429,6 +441,8 @@ jobs:
             python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
+              --worker haskell-engine \
+              --runner-class cpu \
               "${toolchain[@]}" || status=1
           done
           exit "$status"
@@ -601,6 +615,7 @@ jobs:
         env:
           SELECTED: ${{ needs.plan.outputs.selected }}
           EXECUTE: ${{ needs.plan.outputs.execute }}
+          ASSIGNED: ${{ needs.plan.outputs.workflow-groups }}
         run: |
           set -uo pipefail
           mkdir -p receipts
@@ -609,7 +624,7 @@ jobs:
             toolchain+=(--toolchain "$entry")
           done < "$RUNNER_TEMP/toolchain.txt"
           status=0
-          for group in test.workflow; do
+          for group in $ASSIGNED; do
             case " $EXECUTE " in
               *" $group "*) ;;
               *)
@@ -623,6 +638,8 @@ jobs:
             python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \
+              --worker haskell-workflow \
+              --runner-class cpu \
               "${toolchain[@]}" || status=1
           done
           exit "$status"
@@ -659,6 +676,181 @@ jobs:
         with:
           name: receipt-test.workflow-${{ needs.plan.outputs.identity }}
           path: receipts/test.workflow.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
+  glfw-native:
+    needs: plan
+    # The only worker declaring the display runner class. Its display exists
+    # only inside its own group executions, so no CPU worker's path starts,
+    # waits for, or depends on one.
+    if: needs.plan.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.plan.outputs.image }}
+      # An init process as PID 1 reaps orphaned descendants, as the hosted
+      # runner's own init does. Without it a process group the runner killed
+      # on a timeout leaves zombies that still answer a liveness probe.
+      options: --init
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Confirm the pinned candidate
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          # The container runs as root over a workspace the runner's user owns,
+          # which Git refuses as dubious ownership. The exception is recorded in
+          # the job's global configuration, so the runner's later Git reads of
+          # this same checkout are answered too.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$CANDIDATE" ]; then
+            echo "::error::this job checked out $actual rather than the planned candidate $CANDIDATE"
+            exit 1
+          fi
+
+      - name: Download the plan
+        uses: actions/download-artifact@v8
+        with:
+          name: validation-plan
+
+      - name: Verify the execution environment
+        env:
+          ENVIRONMENT: ${{ needs.plan.outputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 tools/validation/ci_image.py verify-worker \
+            --plan plan.json --toolchain-file "$RUNNER_TEMP/toolchain.txt" | tee "$RUNNER_TEMP/verify.out"
+          declared="$(sed -n 's/^environment=//p' "$RUNNER_TEMP/verify.out")"
+          if [ "$declared" != "$ENVIRONMENT" ]; then
+            echo "::error::this worker's verified environment $declared is not the planned $ENVIRONMENT"
+            exit 1
+          fi
+
+      - name: Link a native consumer against the image's GLFW
+        run: python3 tools/native/native.py link-check
+
+      - name: Restore the package store
+        id: store
+        uses: actions/cache/restore@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          restore-keys: |
+            cabal-store-${{ needs.plan.outputs.environment }}-
+
+      - name: Restore the build tree
+        id: tree
+        uses: actions/cache/restore@v6
+        with:
+          path: dist-newstyle
+          key: dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-native-${{ needs.plan.outputs.environment }}-
+
+      - name: Record the cache results
+        env:
+          SCOPE: ${{ github.ref }}
+          STORE_HIT: ${{ steps.store.outputs.cache-hit }}
+          STORE_KEY: ${{ steps.store.outputs.cache-primary-key }}
+          STORE_MATCHED: ${{ steps.store.outputs.cache-matched-key }}
+          TREE_HIT: ${{ steps.tree.outputs.cache-hit }}
+          TREE_KEY: ${{ steps.tree.outputs.cache-primary-key }}
+          TREE_MATCHED: ${{ steps.tree.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          result() { if [ "$1" = "true" ]; then echo hit; elif [ -n "$2" ]; then echo partial; else echo miss; fi; }
+          {
+            echo "## glfw-native caches"
+            echo
+            echo "Scope \`$SCOPE\`."
+            echo
+            echo "| Cache | Result | Key | Restored from |"
+            echo "| --- | --- | --- | --- |"
+            echo "| package store | $(result "$STORE_HIT" "$STORE_MATCHED") | \`$STORE_KEY\` | \`${STORE_MATCHED:-none}\` |"
+            echo "| build tree | $(result "$TREE_HIT" "$TREE_MATCHED") | \`$TREE_KEY\` | \`${TREE_MATCHED:-none}\` |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the groups this candidate still needs
+        env:
+          SELECTED: ${{ needs.plan.outputs.selected }}
+          EXECUTE: ${{ needs.plan.outputs.execute }}
+          ASSIGNED: ${{ needs.plan.outputs.native-groups }}
+        run: |
+          set -uo pipefail
+          mkdir -p receipts
+          toolchain=()
+          while IFS= read -r entry; do
+            toolchain+=(--toolchain "$entry")
+          done < "$RUNNER_TEMP/toolchain.txt"
+          status=0
+          # Each group runs inside an isolated X11 display started for it alone
+          # and stopped after it. A display that cannot be established ends the
+          # group before it starts, writes no receipt, and fails this job, which
+          # the aggregate then reports: it is never skipped, retried, or excused.
+          for group in $ASSIGNED; do
+            case " $EXECUTE " in
+              *" $group "*) ;;
+              *)
+                case " $SELECTED " in
+                  *" $group "*) echo "skipping $group: an earlier execution already covers it" ;;
+                  *) echo "skipping $group: the plan did not select it" ;;
+                esac
+                continue
+                ;;
+            esac
+            bash tools/display/x11.sh --summary "$GITHUB_STEP_SUMMARY" -- \
+              python3 -I tools/validation/run.py "$group" \
+              --plan plan.json \
+              --receipts receipts \
+              --worker glfw-native \
+              --runner-class display \
+              "${toolchain[@]}" || status=1
+          done
+          exit "$status"
+
+      - name: Save the package store
+        if: ${{ !cancelled() && steps.store.outcome == 'success' && steps.store.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: ${{ steps.store.outputs.cache-primary-key }}
+
+      - name: Save the build tree
+        if: ${{ !cancelled() && steps.tree.outcome == 'success' && steps.tree.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: dist-newstyle
+          key: ${{ steps.tree.outputs.cache-primary-key }}
+
+      - name: Upload the receipts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-receipts-glfw-native
+          path: receipts/
+          if-no-files-found: warn
+
+      - name: Publish the test.glfw-native receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/test.glfw-native.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.glfw-native-${{ needs.plan.outputs.identity }}
+          path: receipts/test.glfw-native.json
           if-no-files-found: error
           # A re-run of this same run would otherwise collide with the attempt
           # before it; the newest attempt is the one that should stand.
@@ -739,7 +931,7 @@ jobs:
           key: ${{ steps.store.outputs.cache-primary-key }}
 
   build-test:
-    needs: [plan, haskell-engine, haskell-workflow]
+    needs: [plan, haskell-engine, haskell-workflow, glfw-native]
     # This is the required check, so it must reach a conclusion whatever
     # happened upstream. A skipped required workflow is not a verdict, and a
     # documentation candidate reaches its status through exactly this path.
@@ -848,8 +1040,12 @@ jobs:
           set -uo pipefail
           arguments=(--plan plan.json --receipts receipts --summary "$GITHUB_STEP_SUMMARY")
           arguments+=(--applicability applicability.json)
-          arguments+=(--worker "haskell-engine=${{ needs['haskell-engine'].result }}:build.all,test.engine,smoke.console")
-          arguments+=(--worker "haskell-workflow=${{ needs['haskell-workflow'].result }}:test.workflow")
+          # Each worker's job result. The groups each one owns come from the
+          # plan, and a worker that owes selected work but reports no result, or
+          # did not succeed, fails the verdict whatever the others did.
+          arguments+=(--worker "haskell-engine=${{ needs['haskell-engine'].result }}")
+          arguments+=(--worker "haskell-workflow=${{ needs['haskell-workflow'].result }}")
+          arguments+=(--worker "glfw-native=${{ needs['glfw-native'].result }}")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             arguments+=(--expect-head "$(cat current-head.txt)")
             arguments+=(--expect-base "$(cat current-merge-base.txt)")

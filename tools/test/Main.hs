@@ -10,6 +10,7 @@ import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
 import qualified ApprovalProvenance
 import qualified CiImage
 import qualified DismissalStep
+import qualified Display
 import qualified Execution
 import qualified Packaging
 import qualified Reuse
@@ -82,6 +83,7 @@ main = hspec $ do
   DismissalStep.spec
   ApprovalProvenance.spec
   CiImage.spec
+  Display.spec
   Packaging.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a

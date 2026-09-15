@@ -31,6 +31,7 @@ consumed ∷ [(FilePath, String)]
 consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
+  , ("tools/display/x11.sh", "Display.hs runs it")
   , ("tools/validation/plan.py", "Validation.hs, Execution.hs, Reuse.hs, TimingStep.hs, and CiImage.hs run it")
   , ("tools/validation/ci_image.py", "CiImage.hs runs it, and plan.py and run.py load it")
   , ("tools/ci-image/builder.py", "CiImage.hs runs it")
