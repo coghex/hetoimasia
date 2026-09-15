@@ -102,8 +102,10 @@
 --
 -- * 'WindowOpen' from creation;
 -- * 'WindowClosing' once an owner has begun the window's close protocol with the
---   private 'beginWindowClosing', published as its own revision; reconciliation
---   keeps the phase while callbacks are still attached;
+--   private 'beginWindowClosing', published as its own revision in the same
+--   transaction as the owner's own record that closing began, so no
+--   cancellation can separate the two; reconciliation keeps the phase while
+--   callbacks are still attached;
 -- * exactly one terminal phase, published by release as the snapshot's last
 --   revision before it closes: 'WindowReleased' when every release part
 --   succeeded, 'WindowDisposalFailed' when a part failed but release stayed
@@ -247,7 +249,7 @@ module Hetoimasia.GLFW.Internal.Window
   , windowCallbackOperation
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (STM, atomically)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
@@ -1098,13 +1100,25 @@ rejectCloseRequest window request =
         pure True
       else pure False
 
--- | Begin the window's close protocol in its observations: reconcile pending
--- captures, then publish a revision whose phase is 'WindowClosing'. Answers
--- whether this call changed the phase; a window already closing answers 'False'
--- and publishes nothing. The window stays live, and its callbacks attached,
+-- | Begin the window's close protocol: publish a revision whose phase is
+-- 'WindowClosing' in the same transaction as the owner's @commit@, then
+-- reconcile pending captures at the boundary.
+--
+-- The closing observation is prepared first, and @interruption@ runs after
+-- that preparation; production passes @pure ()@, and the examples use it to
+-- deliver a cancellation there. Until then nothing has changed. Then, masked and
+-- with no interruptible operation, one transaction runs @commit@ and, only if it
+-- answers 'True', publishes the closing observation, and the owner's current
+-- observation is recorded. So the owner's record that closing began and the
+-- published phase commit together or not at all. @commit@ must be finite and
+-- must never retry.
+--
+-- Answers whether closing began: 'False', with nothing published and @commit@
+-- not run, for a window that is not open, and 'False', with nothing published,
+-- when @commit@ declines. The window stays live, and its callbacks attached,
 -- until it is released.
-beginWindowClosing ∷ Window → IO (WindowResult Bool)
-beginWindowClosing window =
+beginWindowClosing ∷ IO () → STM Bool → Window → IO (WindowResult Bool)
+beginWindowClosing interruption commit window =
   atBoundary (pure ()) window (operation "begin window closing") $ do
     OwnerState current issued ← readIORef (windowOwnerState window)
     if obsPhase current /= WindowOpen
@@ -1112,8 +1126,14 @@ beginWindowClosing window =
       else do
         let next = current {obsRevision = obsRevision current + 1, obsPhase = WindowClosing}
         prepared ← prepare next
-        mask_ (commitObservation window next issued prepared)
-        pure True
+        interruption
+        mask_ $ do
+          committed ← atomically $ do
+            proceed ← commit
+            when proceed (void (publish (windowPublisher window) prepared))
+            pure proceed
+          when committed (writeIORef (windowOwnerState window) (OwnerState next issued))
+          pure committed
 
 -- | How an owner turn processes native events.
 data EventProcessing

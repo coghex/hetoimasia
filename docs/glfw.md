@@ -764,7 +764,7 @@ receive `EndOfStream` after it, under the snapshot contract.
 | Phase | Published | Meaning |
 |---|---|---|
 | `WindowOpen` | At creation, revision zero | Live, not closing |
-| `WindowClosing` | When an owner begins the window's close protocol, as its own revision | Live, callbacks attached, admission closed; not yet released |
+| `WindowClosing` | When an owner begins the window's close protocol, as its own revision, in the transaction that closes the window's admission | Live, callbacks attached, admission closed; not yet released |
 | `WindowReleased` | By release, as the last revision | Disposed successfully |
 | `WindowDisposalFailed` | By release, as the last revision | Disposal failed; release stayed certain |
 | `WindowReleaseUncertain` | By release, as the last revision | Disposal failed; callback reachability unknown |
@@ -1019,14 +1019,19 @@ host's port or the window's own, `closeHostWindow` on the owner thread, and
 `honourHostCloseRequest` for a surfaced close request that is still its window's
 latest all begin the same protocol:
 
-1. in one transaction, the window is marked closing, its port's admission
-   closes, and every command still queued there settles as `NotExecuted`;
-2. the window's observations publish the `WindowClosing` phase;
+1. the window's closing observation is prepared; nothing has changed yet, so a
+   cancellation here leaves the window open with its port admitting;
+2. in one transaction, the window is marked closing, its port's admission
+   closes, every command still queued there settles as `NotExecuted`, and its
+   observations publish the `WindowClosing` phase; that transaction and the
+   owner's record of the new observation run masked with nothing interruptible
+   between them, so no cancellation can close the port without publishing the
+   phase, or publish the phase without closing the port;
 3. once no owner-thread borrow is in progress, the window is retired through the
    collection: callbacks detached, the native window destroyed, storage freed,
    and the terminal phase published before its snapshot closes.
 
-A close command settles as `WindowCloseBegun` once step 1 has run; its disposal is
+A close command settles as `WindowCloseBegun` once step 2 has committed; its disposal is
 reported by the window's observations, never by the ticket, because closed
 admission alone proves nothing about native destruction. Beginning the protocol
 again answers `CloseAlreadyStarted`, or `WindowIsClosing` for a command, and a

@@ -95,10 +95,11 @@
 -- the host disposes it at shutdown.
 --
 -- The close protocol — begun by a close command through any port serving the
--- window, 'closeHostWindow', or 'honourHostCloseRequest' — marks the window
--- closing, closes its port and settles its queued commands as not executed in
--- one transaction, publishes the 'Hetoimasia.GLFW.Window.WindowClosing' phase,
--- and retires the window through the collection once no owner-thread borrow is
+-- window, 'closeHostWindow', or 'honourHostCloseRequest' — prepares the closing
+-- observation, then in one transaction marks the window closing, closes its
+-- port, settles its queued commands as not executed, and publishes the
+-- 'Hetoimasia.GLFW.Window.WindowClosing' phase, with nothing interruptible
+-- after it, and retires the window through the collection once no owner-thread borrow is
 -- in progress; a turn retries a deferred retirement, and retirement never waits.
 -- A window stays registered, and occupies capacity, until its retirement is
 -- attempted. A retirement whose release fails is never attempted again: the
@@ -628,31 +629,39 @@ honourHostCloseRequest host request =
 
 -- | The close protocol, on the owner thread:
 --
--- 1. in one transaction, mark the window closing, close its port's admission,
---    and settle its queued commands as not executed;
--- 2. publish the 'Hetoimasia.GLFW.Window.WindowClosing' phase in its
---    observations;
--- 3. retire it through the collection, unless it or another window is
+-- 1. the window's closing observation is prepared, and nothing has changed yet;
+-- 2. in one transaction, masked and with nothing interruptible after it, the
+--    window is marked closing, its port's admission closes, its queued commands
+--    settle as not executed, and the 'Hetoimasia.GLFW.Window.WindowClosing'
+--    phase is published, so a cancellation can never leave the port closed
+--    with the phase unpublished, or the reverse;
+-- 3. it is retired through the collection, unless it or another window is
 --    borrowed, in which case a later turn retries.
 beginClose ∷ WindowHost → WindowId → IO CloseStart
-beginClose host target = do
-  started ← atomically $
-    Map.lookup target <$> readTVar (hostEntries host) >>= \case
-      Nothing → pure Nothing
-      Just entry
-        | entryClosing entry → pure (Just Nothing)
-        | otherwise → do
-            let closing = entry {entryClosing = True}
-            modifyTVar' (hostEntries host) (Map.insert target closing)
-            void (closeWindowCommands (entryCommands entry))
-            pure (Just (Just closing))
-  case started of
+beginClose host target =
+  Map.lookup target <$> readTVarIO (hostEntries host) >>= \case
     Nothing → pure CloseNotServed
-    Just Nothing → pure CloseAlreadyStarted
-    Just (Just entry) → do
-      void (borrowWindow host target entry beginWindowClosing)
-      retireClosing host target entry
-      pure CloseStarted
+    Just entry
+      | entryClosing entry → pure CloseAlreadyStarted
+      | otherwise →
+          borrowWindow host target entry (beginWindowClosing (pure ()) (commitClosing host target)) >>= \case
+            WindowAvailable True → do
+              retireClosing host target entry
+              pure CloseStarted
+            WindowAvailable False → pure CloseAlreadyStarted
+            WindowEnded _ → pure CloseNotServed
+
+-- | The host's half of step 2: mark the window closing, close its port, and
+-- settle its queue, answering whether it was still open. Finite and never
+-- retries.
+commitClosing ∷ WindowHost → WindowId → STM Bool
+commitClosing host target =
+  Map.lookup target <$> readTVar (hostEntries host) >>= \case
+    Just entry | not (entryClosing entry) → do
+      modifyTVar' (hostEntries host) (Map.insert target entry {entryClosing = True})
+      void (closeWindowCommands (entryCommands entry))
+      pure True
+    _ → pure False
 
 -- | Attempt a closing window's retirement. A borrow of another window defers it
 -- without calling the collection, and a borrow of this one defers it with the
