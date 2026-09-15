@@ -30,7 +30,17 @@ import Control.Exception
   )
 import Control.Monad (replicateM, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Hetoimasia.Foundation.Resource (allocResource, cleanupFailureException, cleanupFailures)
+import Hetoimasia.Foundation.Failure
+  ( FailureCause (EngineOrigin)
+  , FailureOrigin (originOperation)
+  , failureCause
+  , failureEvidence
+  , operation
+  , operationText
+  , throwFailure
+  )
+import Hetoimasia.Foundation.Log (unsafeComponent)
+import Hetoimasia.Foundation.Resource (allocResource, cleanupFailureException, cleanupFailures, withResource)
 import Hetoimasia.GLFW.Session (sessionBackend)
 import System.Exit (ExitCode (ExitSuccess))
 import Test.GLFW.Native.Fixture
@@ -71,6 +81,24 @@ spec shared = describe "the shared fixture" $ do
       reportServed report `shouldBe` 3
       noOwnerFailure report
       events script `shouldReturn` ["acquired", "borrower finished", "owner settled", "released"]
+
+    it "rethrows a dispatched operation's failure with its failure evidence and retained cleanup failures" $ do
+      script ← newScript False False
+      (outcome, report) ←
+        runOwned (scripted script) $ \fixture →
+          try . dispatch fixture $ \_ →
+            withResource
+              (pure ())
+              (\() → throwIO ReleaseFailed)
+              (\() → throwFailure (unsafeComponent "fixture") (operation "scripted operation") [] AcquisitionFailed)
+      caught ← either throwIO pure outcome >>= either pure (\() → failed "the operation returned")
+      fromException caught `shouldBe` Just AcquisitionFailed
+      case failureCause (failureEvidence caught) of
+        EngineOrigin origin → operationText (originOperation origin) `shouldBe` "scripted operation"
+        _ → failed "the failure lost its engine origin crossing the dispatcher"
+      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures caught)]
+      map fromException retained `shouldBe` [Just ReleaseFailed]
+      noOwnerFailure report
 
     it "acquires nothing when no operation is dispatched" $ do
       script ← newScript False False

@@ -21,6 +21,8 @@
 --   leaves the owner to finish that operation, whose reply is then dropped.
 -- * An acquisition failure is the answer to every request, and is never
 --   retried.
+-- * A failure crossing between the two sides is rethrown with the context it
+--   was raised with, so failure evidence and retained cleanup failures survive.
 -- * The owner releases the resource only once the borrower has finished — after
 --   normal completion, cancellation, and the owner's own failure alike — and
 --   settles whatever is still queued unexecuted first. Release goes through
@@ -77,13 +79,15 @@ import Control.Concurrent.STM
   )
 import Control.Exception
   ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException (SomeAsyncException)
   , SomeException
   , catch
   , fromException
   , mask
   , onException
-  , throwIO
+  , rethrowIO
+  , someExceptionContext
   , toException
   , try
   , tryJust
@@ -158,7 +162,8 @@ awaitQueued fixture wanted = atomically (readTVar (fixtureQueued fixture) >>= ch
 
 -- | Run an operation on the owner thread and wait for its result.
 --
--- A synchronous failure inside the operation is rethrown here unchanged. If the
+-- A synchronous failure inside the operation is rethrown here unchanged, with
+-- the exception context it carried. If the
 -- owner stops serving first, the owner's own failure is thrown, or
 -- 'OwnerFinished'; if the request was settled unrun, 'NotExecuted'. Cancelling
 -- the waiting thread abandons the request.
@@ -181,7 +186,7 @@ dispatch fixture action = do
         modifyTVar' (fixtureQueued fixture) (+ 1)
       restore (atomically (takeTMVar reply `orElse` (Left <$> readTMVar (fixtureEnded fixture))))
         `onException` atomically (writeTVar abandoned True)
-  either throwIO pure outcome
+  either rethrow pure outcome
 
 data Next r = BorrowerFinished | Serve (Request r)
 
@@ -216,7 +221,7 @@ runOwned owner borrower = do
         atomically (void (tryPutTMVar (fixtureEnded fixture) reason))
         void (atomically (readTMVar finished))
         drain
-      held resource first = serving `catch` \failure → stopServing failure >> throwIO (failure ∷ SomeException)
+      held resource first = serving `catch` \failure → stopServing failure >> rethrow failure
         where
           serving = perform resource first >> loop
           loop =
@@ -264,6 +269,12 @@ runOwned owner borrower = do
       <*> readIORef declined
       <*> pure failure
   pure (borrowed, report)
+
+-- | Rethrow a failure caught on one side on the other, keeping the context it
+-- was raised with rather than starting a fresh one, so failure evidence and
+-- retained cleanup failures cross the dispatcher intact.
+rethrow ∷ SomeException → IO a
+rethrow failure = rethrowIO (ExceptionWithContext (someExceptionContext failure) failure)
 
 -- | Everything but an asynchronous exception, which belongs to the thread it
 -- was aimed at rather than to the operation that happened to be running.
