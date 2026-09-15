@@ -2,8 +2,9 @@
 --
 -- GLFW allows one session per process, and the shared fixture holds that one
 -- for the whole run, so entering and leaving sessions in sequence, a forced
--- initialization failure and its rollback, and a session over a faulting native
--- table each need a process of their own. Each example here starts this same
+-- initialization failure and its rollback, a session over a faulting or tracing
+-- native table, and a monitor identity carried from one session into the next
+-- each need a process of their own. Each example here starts this same
 -- executable as a child with 'privateSessionFlag' and a scenario name; the
 -- child runs that scenario's checks in order on its own process main thread,
 -- prints one line per check, and exits non-zero if any failed. A dry run or a
@@ -14,9 +15,11 @@ module Test.GLFW.Native.Private
   , runScenario
   ) where
 
+import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
 import Control.Monad (unless, when)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Foreign.Ptr (nullFunPtr)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
@@ -28,16 +31,21 @@ import Hetoimasia.Foundation.Failure
   , operationText
   )
 import Hetoimasia.Foundation.Log (componentText)
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocComposite, withScoped)
 import Hetoimasia.GLFW.Internal.Native
   ( glfwPlatformUnavailable
+  , installedMonitorCallbackForCheck
   , pollEventsForCheck
   , productionNative
   , setWindowSizeForCheck
   , waitEventsForCheck
   )
+import Hetoimasia.GLFW.Internal.Monitor (MonitorCallbackStorage (..), MonitorNative (..))
 import Hetoimasia.GLFW.Internal.Session (Native (..), WindowCallbacks (..), sessionAssembly)
 import Hetoimasia.GLFW.Internal.Window (windowStep)
+import Hetoimasia.GLFW.Monitor
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
 import System.Environment (getExecutablePath)
@@ -58,6 +66,9 @@ spec = describe "private sessions in a child process" $ do
 
   it "rethrows a fault raised inside a real native callback at the owner boundary" $
     privateScenario "callback-fault"
+
+  it "detaches the real monitor callback before termination, frees it last, and never resolves an ended session's identity" $
+    privateScenario "monitor-lifecycle"
 
 privateScenario ∷ String → IO ()
 privateScenario name = do
@@ -94,6 +105,11 @@ scenarios =
     )
   , ( "callback-fault"
     , [("rethrows a fault raised inside a real native callback at the owner boundary", callbackFault)]
+    )
+  , ( "monitor-lifecycle"
+    , [ ("detaches the installed monitor callback before termination and frees it after the last native call", monitorTeardown)
+      , ("never resolves a monitor identity from a completed session in a later session", monitorAcrossSessions)
+      ]
     )
   ]
 
@@ -170,6 +186,68 @@ callbackFault = do
             WindowEnded _ → failCheck "the window ended after a contained fault"
           pure ("rethrown " <> show message <> " at boundary " <> show (boundaries + 1) <> " with " <> show contexts)
         Nothing → failCheck ("unexpected failure: " <> displayException caught)
+
+-- | A production table tracing the session's teardown: whether the callback GLFW
+-- holds is the monitor callback's own storage when it is detached, whether GLFW
+-- holds none afterwards, and where termination, the error callback's detach,
+-- and the monitor callback's free fall around it.
+monitorTeardown ∷ IO String
+monitorTeardown = do
+  trace ← newIORef []
+  storage ← newIORef Nothing
+  let note event = modifyIORef' trace (<> [event])
+      monitors = nativeMonitor productionNative
+      traced =
+        productionNative
+          { nativeTerminate = note "terminate" >> nativeTerminate productionNative
+          , nativeDetachErrorCallback = note "detach error callback" >> nativeDetachErrorCallback productionNative
+          , nativeMonitor =
+              monitors
+                { nativeNewMonitorCallback = \callback → do
+                    allocated ← nativeNewMonitorCallback monitors callback
+                    writeIORef storage (Just allocated)
+                    pure allocated
+                , nativeDetachMonitorCallback = do
+                    installed ← installedMonitorCallbackForCheck
+                    allocated ← readIORef storage
+                    note (if Just installed == allocated then "detach installed callback" else "detach another callback")
+                    nativeDetachMonitorCallback monitors
+                    remaining ← installedMonitorCallbackForCheck
+                    note (if remaining == MonitorCallbackStorage nullFunPtr then "none installed" else "still installed")
+                , nativeFreeMonitorCallback = \allocated → note "free monitor callback" >> nativeFreeMonitorCallback monitors allocated
+                }
+          }
+  (reader, count) ←
+    withScoped (allocComposite (sessionAssembly traced defaultSessionConfig)) $ \session → do
+      inventory ← synchronizeMonitors session
+      pure (monitorInventory session, either (const 0) length (monitorList inventory))
+  closed ← preparedValue . observedValue <$> atomically (readSnapshot reader)
+  traced' ← readIORef trace
+  let expected = ["detach installed callback", "none installed", "terminate", "detach error callback", "free monitor callback"]
+  unless (traced' == expected) $ failCheck ("the teardown ran " <> show traced')
+  unless (inventoryPhase closed == InventoryClosed) $ failCheck ("the inventory was left " <> show (inventoryPhase closed))
+  pure (show count <> " monitor(s); teardown " <> intercalate' traced' <> "; closed at revision " <> show (inventoryRevision closed))
+  where
+    monitorList inventory = case inventoryMonitors inventory of
+      Observed descriptions → Right descriptions
+      Unavailable → Left ()
+    intercalate' = foldr1 (\event rest → event <> ", " <> rest)
+
+-- | Carry every identity from one real session into the next.
+monitorAcrossSessions ∷ IO String
+monitorAcrossSessions = do
+  earlier ← withSession defaultSessionConfig (fmap identitiesOf . synchronizeMonitors)
+  when (null earlier) $ failCheck "the first session enumerated no monitor to carry into the next"
+  (later, resolved) ←
+    withSession defaultSessionConfig $ \session →
+      (,) <$> (identitiesOf <$> synchronizeMonitors session) <*> mapM (resolveMonitor session) earlier
+  unless (resolved == map MonitorDisconnected earlier) $
+    failCheck ("an earlier session's identity resolved: " <> show resolved)
+  pure ("identities " <> show earlier <> " answered disconnected in a session enumerating " <> show later)
+  where
+    identitiesOf inventory = case inventoryMonitors inventory of
+      Observed descriptions → map monitorIdentity descriptions
+      Unavailable → []
 
 -- | Request a backend this platform's GLFW was not built with, past the model's
 -- own refusal, so that GLFW's initialization itself fails and reports why.

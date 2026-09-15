@@ -591,7 +591,7 @@ testAttachFailurePoisons = do
       [ entryCalls
       , take 8 (creationCalls "unattached" 64 48 1)
       , [DetachWindowCallbacks 1, DestroyWindow 1]
-      , [Terminate, DetachErrorCallback]
+      , [DetachMonitorCallback, Terminate, DetachErrorCallback]
       ]
 
 testAttachReportRollsBack ∷ Expectation
@@ -704,7 +704,7 @@ testUncertainRelease script label = do
       [ entryCalls
       , creationCalls "uncertain" 64 48 1
       , [DetachWindowCallbacks 1, DestroyWindow 1]
-      , [Terminate, DetachErrorCallback]
+      , [DetachMonitorCallback, Terminate, DetachErrorCallback]
       ]
 
 testDestroyReportUncertain ∷ Expectation
@@ -734,7 +734,7 @@ testDestroyReportUncertain = do
       [ entryCalls
       , creationCalls "reported" 64 48 1
       , [DetachWindowCallbacks 1, DestroyWindow 1]
-      , [Terminate, DetachErrorCallback]
+      , [DetachMonitorCallback, Terminate, DetachErrorCallback]
       ]
 
 testCreationFailures ∷ Expectation
@@ -831,7 +831,8 @@ sameAttributes left right =
   where
     flags = [observedFocused, observedIconified, observedMaximized, observedVisible]
 
--- | The native calls of a successful entry on the default script's platform.
+-- | The native calls of a successful entry on the default script's platform,
+-- which has no monitor.
 entryCalls ∷ [NativeCall]
 entryCalls =
   [ QueryPlatformSupported X11
@@ -840,11 +841,15 @@ entryCalls =
   , SetInitHints X11
   , Initialize
   , QueryPlatform
+  , CreateMonitorCallback
+  , AttachMonitorCallback
+  , QueryMonitors
+  , QueryPrimaryMonitor
   ]
 
 -- | The native calls of a complete, safe session teardown.
 exitCalls ∷ [NativeCall]
-exitCalls = [Terminate, DetachErrorCallback, FreeErrorCallback]
+exitCalls = [DetachMonitorCallback, Terminate, DetachErrorCallback, FreeErrorCallback, FreeMonitorCallback]
 
 -- | The native calls of a successful hidden window's creation, through its
 -- initial sampling.

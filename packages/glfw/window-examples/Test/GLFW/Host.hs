@@ -29,20 +29,29 @@ import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Command
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Internal.Seam
-  ( NativeCall (..)
+  ( MonitorTopology (..)
+  , NativeCall (..)
   , Seam
+  , SeamMonitorEvent (MonitorDetached)
   , SeamScript (..)
   , WindowEvent (CloseRequested)
   , asProcessMainThread
   , defaultScript
   , designateProcessMainThread
   , newSeam
+  , noMonitors
+  , scriptedMonitor
   , seamCalls
   , seamLiveWindowCallbacks
   , seamQueueEvents
+  , seamQueueMonitorEvents
   , seamSession
+  , seamSetMonitorTopology
   )
+import Hetoimasia.GLFW.Monitor (inventoryMonitors, inventoryRevision)
 import Hetoimasia.GLFW.Session (SessionMisuse (..), defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
@@ -92,6 +101,10 @@ spec = describe "GLFW window host" $ do
       (boundedExample testObservationThroughLoop)
     it "rejects owner-thread waits on its own loop, and refuses the loop to another thread"
       (boundedExample testOwnerNeverWaits)
+
+  describe "monitors" $
+    it "refreshes the monitor inventory after native events only when the monitor callback reported a change"
+      (boundedExample testMonitorReconciliation)
 
   describe "close requests" $
     it "surfaces a close request once to application policy, destroying nothing and keeping the loop and workers running"
@@ -255,6 +268,39 @@ testPreemption trigger = do
   map kind dispositions `shouldBe` dispatched <> replicate (6 - length dispatched) "not executed"
   readIORef events `shouldReturn` (if trigger == AtApplicationEvent then 2 else 0)
   readIORef updates `shouldReturn` 0
+
+-- ---------------------------------------------------------------------------
+-- Monitors
+
+-- | A monitor disconnects during turn two's update. Turn three's native event
+-- processing delivers the callback, and its reconciliation refreshes the
+-- inventory before the update sees it; the idle turns before made no refresh.
+testMonitorReconciliation ∷ Expectation
+testMonitorReconciliation = do
+  seam ←
+    newSeam
+      defaultScript
+        {scriptMonitorTopology = MonitorTopology (Just [(1, scriptedMonitor "only" (0, 0) (1280, 1024))]) 1}
+  seen ←
+    hosted seam (settings []) (\host _ → pure host) $ \host control → do
+      observed ← newIORef []
+      runOwnerLoop host control $
+        LoopHooks
+          { loopEvent = noApplicationEvents
+          , loopUpdate = \turn → do
+              inventory ← preparedValue . observedValue <$> atomically (readSnapshot (hostMonitors host))
+              modifyIORef' observed (<> [(turnNumber turn, inventoryRevision inventory, inventoryMonitors inventory == Observed [])])
+              case turnNumber turn of
+                2 → do
+                  seamSetMonitorTopology seam noMonitors
+                  seamQueueMonitorEvents seam [MonitorDetached 1]
+                  pure Continue
+                3 → Finish <$> readIORef observed
+                _ → pure Continue
+          }
+  seen `shouldBe` [(1, 0, False), (2, 0, False), (3, 1, True)]
+  calls ← seamCalls seam
+  length [() | QueryMonitors ← calls] `shouldBe` 2
 
 -- ---------------------------------------------------------------------------
 -- Workers and the owner

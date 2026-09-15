@@ -7,7 +7,8 @@
 -- construction failure rolls back through ordinary scoped release before any
 -- worker exists. It is never a service the startup callback returns. Workers
 -- receive only client capabilities from the host the application already owns
--- — 'hostCommandPort', a window's read-only observations, and 'hostActivity' —
+-- — 'hostCommandPort', a window's read-only observations, the monitor
+-- inventory's read endpoint 'hostMonitors', and 'hostActivity' —
 -- and startup transfers no native ownership to anyone.
 --
 -- 'runOwnerLoop' is the owner loop. The application's action runs it on the
@@ -21,7 +22,8 @@
 --
 -- 1. a supervised control check, 'checkRuntime';
 -- 2. native event processing: a poll, or on an idle turn a finite wait;
--- 3. callback and state reconciliation for every window, and the collection of
+-- 3. callback and state reconciliation: the session's monitor inventory, when
+--    its callback reported a change, then every window, and the collection of
 --    close requests not yet surfaced;
 -- 4. a control check;
 -- 5. bounded command work: at most 'hostCommandBudget' commands claimed and
@@ -36,7 +38,9 @@
 --     begins.
 --
 -- A latched supervised failure is rethrown by the first check after it latched,
--- so no further dispatch begins once a check has seen it.
+-- so no further dispatch begins once a check has seen it. A monitor callback
+-- fault is rethrown at step 3, once the inventory refresh it forced has
+-- committed.
 --
 -- = Budgets
 --
@@ -164,6 +168,7 @@ module Hetoimasia.Runtime.GLFW
   , allocWindowHost
   , allocWindowHostIn
   , hostWindows
+  , hostMonitors
   , hostCommandPort
   , hostCommandStatistics
   , quiesceWindowHost
@@ -203,7 +208,7 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.GLFW.Command
   ( CommandStatistics (..)
@@ -215,13 +220,14 @@ import Hetoimasia.GLFW.Command
   , windowCommandPort
   )
 import Hetoimasia.GLFW.Internal.Command (ExecutionStep (..), executeCommand, executeNextWith)
-import Hetoimasia.GLFW.Internal.Session (ownerOperation)
+import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents)
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
   , processWindowEvents
   , reconcileWindowEvents
   , rejectCloseRequest
   )
+import Hetoimasia.GLFW.Monitor (MonitorInventory, monitorInventory)
 import Hetoimasia.GLFW.Session (Session, SessionConfig, allocSession, defaultSessionConfig)
 import Hetoimasia.GLFW.Window
   ( CloseRequest
@@ -363,6 +369,12 @@ allocWindowHostIn sessionScope config = do
 hostWindows ∷ WindowHost → [Window]
 hostWindows = hostWindowList
 
+-- | The read endpoint of the host session's monitor inventory, which any thread
+-- may read. It carries no native pointer and no authority to resolve an
+-- identity; resolution is an owner-thread operation of "Hetoimasia.GLFW.Monitor".
+hostMonitors ∷ WindowHost → SnapshotReader MonitorInventory
+hostMonitors = monitorInventory . hostSession
+
 -- | The client port workers submit commands through.
 hostCommandPort ∷ WindowHost → WindowCommandPort
 hostCommandPort = windowCommandPort . hostCommands
@@ -436,6 +448,7 @@ runOwnerLoop host control hooks =
       queued ← commandsQueued <$> atomically (hostCommandStatistics host)
       let waited = idle && queued == 0
       processEvents host number waited
+      reconcileMonitorEvents (hostSession host)
       closes ← surfaceCloseRequests host
       checkRuntime control
       commands ← dispatchCommands host (hostCommandBudget settings)

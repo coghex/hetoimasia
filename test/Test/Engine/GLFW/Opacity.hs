@@ -12,12 +12,16 @@
 -- sublibraries; one names the window's and the observation's constructors; one
 -- reaches for a window's native handle and owner-boundary driver in the private
 -- window module; and one tries to close a window's observations through the
--- read endpoint it is given. Two more are rejected for the window commands: one
+-- read endpoint it is given. Two are rejected for the monitor inventory: one
+-- names the monitor identity's, description's, and inventory's constructors, and
+-- one reaches for a native monitor pointer and pointer-lending resolution in the
+-- private modules. Two more are rejected for the window commands: one
 -- names the command host's, port's, and completion ticket's constructors, and
 -- one reaches for command execution and admission hooks in the private command
 -- module. One client must be accepted, linked, and run: it uses only the public
--- session, window, and window command interfaces, including the read-only
--- observation endpoint, a command port, and a completion ticket, and every path
+-- session, monitor, window, and window command interfaces, including the
+-- read-only observation and inventory endpoints, identity resolution, a command
+-- port, and a completion ticket, and every path
 -- it takes is refused before GLFW is initialized, so the example opens no
 -- display.
 --
@@ -36,7 +40,8 @@
 -- clients are compiled against it and must be rejected: two name the window
 -- drivers and the private command executor through the public seam, which
 -- exports neither, and two reach for them in the seam's implementation, which
--- belongs to the private @seam-core@ sublibrary. Only the package's own
+-- belongs to the private @seam-core@ sublibrary, and a fifth names the monitor
+-- drivers through the public seam. Only the package's own
 -- @glfw-window-examples@ executable can use them.
 module Test.Engine.GLFW.Opacity (spec) where
 
@@ -96,6 +101,35 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       outcome ← compile Typecheck
       rejectedBecause outcome "SnapshotPublisher"
       clientOutput outcome `shouldContain` "SnapshotReader"
+
+  it "rejects a client that constructs a monitor identity, description, or inventory" $
+    withClient "Client.hs" monitorConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "MonitorId"
+      clientOutput outcome `shouldContain` "MonitorDescription"
+      clientOutput outcome `shouldContain` "MonitorInventory"
+
+  it "rejects a client that reaches for a native monitor pointer or pointer-lending resolution" $
+    withClient "Client.hs" monitorInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a native monitor pointer is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Monitor"
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Session"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that names a monitor driver through the public seam" $
+    withSeamClient "Client.hs" publicSeamMonitorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "seamDeliverMonitorEvents"
+      clientOutput outcome `shouldContain` "seamSetMonitorTopology"
 
   it "rejects a client that names a command host, port, or completion ticket constructor" $
     withClient "Client.hs" commandConstructorClient $ \compile → do
@@ -302,6 +336,7 @@ hostClient =
     , "import Control.Concurrent.STM (atomically)"
     , "import Control.Exception (SomeException, fromException, try)"
     , "import qualified Data.Text as Text"
+    , "import Hetoimasia.Foundation.Messaging.Snapshot (readSnapshot)"
     , "import Hetoimasia.Foundation.Resource (withScoped)"
     , "import Hetoimasia.GLFW.Command"
     , "import Hetoimasia.GLFW.Session (SessionMisuse)"
@@ -337,6 +372,7 @@ hostClient =
     , "    { loopEvent = noApplicationEvents"
     , "    , loopUpdate = \\turn → do"
     , "        activity ← atomically (hostActivity host)"
+    , "        _ ← atomically (readSnapshot (hostMonitors host))"
     , "        mapM_ (rejectHostCloseRequest host) (turnCloseRequests turn)"
     , "        mapM_ (\\window → submitWindowCommand (hostCommandPort host) [] (observeWindowCommand (windowIdentity window))) (hostWindows host)"
     , "        atomically (quiesceWindowHost host)"
@@ -383,6 +419,43 @@ privateSeamExecutorClient =
     [ "module Client () where"
     , ""
     , "import Hetoimasia.GLFW.Internal.Seam (seamExecuteNext, seamExecuteNextScripted)"
+    ]
+
+-- | A client naming the monitor identity's, description's, and inventory's data
+-- constructors.
+monitorConstructorClient ∷ String
+monitorConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.GLFW.Monitor (MonitorDescription (MonitorDescription), MonitorId (MonitorId), MonitorInventory (MonitorInventory))"
+    , ""
+    , "forged ∷ Maybe (MonitorId, MonitorDescription, MonitorInventory)"
+    , "forged = Nothing"
+    ]
+
+-- | A client reaching for the native monitor pointer type and the resolution
+-- that lends one, in the private monitor and session modules.
+monitorInternalsClient ∷ String
+monitorInternalsClient =
+  unlines
+    [ "module Client (pointer) where"
+    , ""
+    , "import Foreign.Ptr (Ptr, nullPtr)"
+    , "import Hetoimasia.GLFW.Internal.Monitor (NativeMonitor)"
+    , "import Hetoimasia.GLFW.Internal.Session (withResolvedMonitor)"
+    , ""
+    , "pointer ∷ Ptr NativeMonitor"
+    , "pointer = nullPtr"
+    ]
+
+-- | A client naming the monitor drivers through the public seam.
+publicSeamMonitorClient ∷ String
+publicSeamMonitorClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Seam (seamDeliverMonitorEvents, seamSetMonitorTopology)"
     ]
 
 -- | A client naming the command host's, port's, and ticket's data constructors.
@@ -524,6 +597,7 @@ publicClient =
     , "import Hetoimasia.Foundation.Messaging.Payload (preparedValue)"
     , "import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)"
     , "import Hetoimasia.GLFW.Command"
+    , "import Hetoimasia.GLFW.Monitor"
     , "import Hetoimasia.GLFW.Session"
     , "import Hetoimasia.GLFW.Window"
     , ""
@@ -531,13 +605,26 @@ publicClient =
     , "main = do"
     , "  wayland ← try (withSession defaultSessionConfig {requestedBackend = Just Wayland} (\\_ → pure ()))"
     , "  report \"wayland\" wayland"
-    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → withWindow session (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) (request session) >> pure ()))"
+    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → monitors session >> withWindow session (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) (request session) >> pure ()))"
     , "  report \"without the threaded runtime\" unthreaded"
     , "  putStrLn (\"capacity = \" <> show errorEvidenceCapacity <> \", description limit = \" <> show errorDescriptionLimit)"
     , "  putStrLn (\"zero width = \" <> either show (const \"accepted\") (validateWindowConfig (hiddenTestWindowConfig (Text.pack \"tool\") 0 48)))"
     , ""
     , "latest ∷ Window → IO (Attribute Extent)"
     , "latest window = observedFramebufferExtent . preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))"
+    , ""
+    , "monitors ∷ Session → IO [Attribute MonitorPosition]"
+    , "monitors session = do"
+    , "  inventory ← synchronizeMonitors session"
+    , "  latest ← preparedValue . observedValue <$> atomically (readSnapshot (monitorInventory session))"
+    , "  case (inventoryMonitors inventory, inventoryPhase latest) of"
+    , "    (Observed described, InventoryOpen) → mapM (\\description → positionOf <$> resolveMonitor session (monitorIdentity description)) described"
+    , "    _ → pure []"
+    , ""
+    , "positionOf ∷ MonitorResult MonitorDescription → Attribute MonitorPosition"
+    , "positionOf resolved = case resolved of"
+    , "  MonitorAvailable fresh → monitorPosition fresh"
+    , "  MonitorDisconnected _ → Unavailable"
     , ""
     , "request ∷ Session → Window → IO (Maybe Disposition)"
     , "request session window = do"

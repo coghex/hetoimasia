@@ -35,8 +35,8 @@
 --
 -- = Owner-only operations
 --
--- 'takeAsynchronousReports' and the window operations of
--- "Hetoimasia.GLFW.Internal.Window" check, before any native call, that they
+-- 'takeAsynchronousReports', the monitor operations below, and the window
+-- operations of "Hetoimasia.GLFW.Internal.Window" check, before any native call, that they
 -- run on the thread that entered the session ('NotSessionOwner') and that the session has not ended ('SessionEnded').
 --
 -- = Native errors
@@ -54,18 +54,21 @@
 --
 -- = Teardown and poisoning
 --
--- Release order is declared, not reversed: terminate, then detach the error
--- callback and free its storage, then settle the guard. A release reads native
+-- Release order is declared, not reversed: close the monitor inventory, detach
+-- the monitor callback, terminate, detach the error callback and free its
+-- storage, free the monitor callback's storage, then settle the guard. A release reads native
 -- errors after its call returns, logs nothing, pumps no events, and waits for no
 -- other thread, so each has the controlled blocking duration an uninterruptible
 -- release requires: its native calls are bounded GLFW calls on the owner thread,
 -- and its bookkeeping is a non-blocking 'IORef' update.
 --
--- Callback storage is freed only after the callback has been detached on the
--- owner thread and every earlier teardown step ended safely, because only then
+-- The monitor callback is detached before termination, and its storage stays
+-- allocated through the error callback's detach, the session's last native
+-- call. Callback storage is freed only after the callback has been detached on
+-- the owner thread and every earlier teardown step ended safely, because only then
 -- can GLFW no longer invoke it: this package makes every native call on the
 -- owner thread, and GLFW reports errors from inside the failing call. If a
--- teardown step raises instead of returning — termination, detaching the
+-- teardown step raises instead of returning — termination, detaching either
 -- callback, or a release attempted from another thread — the storage is
 -- deliberately leaked and the guard is poisoned, so every later entry fails
 -- with 'SessionPoisoned' before any native call. A window release that leaves
@@ -98,6 +101,15 @@
 -- | Liveness           | The session       | Termination clears   | Owner       | The session        | Never set again       |
 -- |                    |                   | it; operations read  |             |                    |                       |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Monitor inventory, | The session       | See                  | Owner;      | Construction until | Closed first; every   |
+-- | identities, and    |                   | "Hetoimasia.GLFW.    | callback    | the inventory      | identity ends         |
+-- | callback latch     |                   | Internal.Monitor"    | inside      | closes             |                       |
+-- |                    |                   |                      | owner calls |                    |                       |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Monitor callback   | The session       | Installed at entry;  | Owner       | Through the last   | Freed after a safe    |
+-- | storage            |                   | detached before      |             | native call        | teardown; leaked when |
+-- |                    |                   | termination          |             |                    | poisoned              |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 --
 -- Nothing here is application state, and nothing is shared between sessions
 -- except the guard.
@@ -123,6 +135,13 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionAssembly
   , sessionBackend
   , takeAsynchronousReports
+
+    -- * The monitor inventory
+  , monitorInventory
+  , synchronizeMonitors
+  , resolveMonitor
+  , reconcileMonitorEvents
+  , withResolvedMonitor
 
     -- * What window operations share with the session
   , WindowAttribute (..)
@@ -158,31 +177,61 @@ module Hetoimasia.GLFW.Internal.Session
   ) where
 
 import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId)
-import Control.Exception (Exception, onException)
+import Control.Exception (Exception, ExceptionWithContext, SomeException, onException, rethrowIO, tryWithContext)
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Int (Int32)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
 import Foreign.C.Types (CFloat, CInt)
 import Foreign.Ptr (FunPtr, Ptr)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
-import Hetoimasia.Foundation.Log (Component, unsafeComponent)
-import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep)
+import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
+import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withResourceLabelled)
 import Hetoimasia.GLFW.Internal.Capture
   ( Capture
   , ErrorCallback
   , NativeError (..)
+  , NativeFailure (..)
+  , NativeOutcome (..)
   , ReportingThread (..)
   , Reports (..)
   , captureCallback
   , errorDescriptionLimit
   , errorEvidenceCapacity
+  , glfwComponent
   , hasReports
   , newCapture
+  , raiseReported
   , settleStrayOwnerReports
   , takeOtherReports
   , takeOwnerReports
+  )
+import Hetoimasia.GLFW.Internal.Monitor
+  ( MonitorDescription
+  , MonitorId
+  , MonitorInventory
+  , MonitorNative (..)
+  , MonitorCallbackStorage
+  , MonitorResult (..)
+  , MonitorSource
+  , Monitors
+  , NativeMonitor
+  , assembleMonitors
+  , closeInventory
+  , monitorCallback
+  , monitorLocalIdentity
+  , monitorsReader
+  , newMonitorCell
+  , newMonitorSource
+  , publishInitialInventory
+  , reconcileInventory
+  , resolveInventory
+  , rethrowMonitorFault
+  , sampleInitialInventory
+  , synchronizeInventory
+  , takeMonitorFault
   )
 import Numeric.Natural (Natural)
 
@@ -305,6 +354,8 @@ data Native = Native
   , nativeFeatureUnavailable ∷ !Int
     -- ^ The error code a query reports for a property this platform cannot
     -- provide: @GLFW_FEATURE_UNAVAILABLE@.
+  , nativeMonitor ∷ !MonitorNative
+    -- ^ The monitor operations the session's inventory performs.
   }
 
 -- | Which session, if any, holds a native library's process-wide state.
@@ -333,15 +384,13 @@ data Session = Session
   , sessionTeardown ∷ !(IORef Bool)
     -- ^ Cleared once any teardown, a window's included, could not establish
     -- that native ownership and callback registration ended safely.
+  , sessionMonitors ∷ !Monitors
+    -- ^ The monitor inventory, its identities, and its callback's latch.
   }
 
 -- | The backend the session initialized.
 sessionBackend ∷ Session → Backend
 sessionBackend = sessionSelected
-
--- | The component every failure raised by this package is attributed to.
-glfwComponent ∷ Component
-glfwComponent = unsafeComponent "glfw"
 
 -- | Misuse rejected before any native state changes.
 data SessionMisuse
@@ -379,23 +428,6 @@ data BackendNotSelected = BackendNotSelected
 
 instance Exception BackendNotSelected
 
--- | Whether the native call itself signalled failure.
-data NativeOutcome
-  = NativeCallReturned
-    -- ^ The call returned normally, but errors were reported during it.
-  | NativeCallFailed
-    -- ^ The call returned its failure value.
-  deriving (Eq, Show)
-
--- | A native call failed or reported errors on the owner thread while it ran.
-data NativeFailure = NativeFailure
-  { nativeOutcome ∷ !NativeOutcome
-  , nativeReports ∷ !Reports
-  }
-  deriving (Eq, Show)
-
-instance Exception NativeFailure
-
 -- | Asynchronous reports nobody read before the session ended.
 newtype AsynchronousErrorsUnobserved = AsynchronousErrorsUnobserved Reports
   deriving (Eq, Show)
@@ -408,6 +440,15 @@ initializeOperation = operation "initialize"
 verifyOperation = operation "verify backend"
 terminateOperation = operation "terminate"
 detachOperation = operation "detach error callback"
+
+attachMonitorOperation, detachMonitorOperation ∷ Operation
+attachMonitorOperation = operation "attach monitor callback"
+detachMonitorOperation = operation "detach monitor callback"
+
+synchronizeMonitorsOperation, reconcileMonitorsOperation, resolveMonitorOperation ∷ Operation
+synchronizeMonitorsOperation = operation "synchronize monitors"
+reconcileMonitorsOperation = operation "reconcile monitor events"
+resolveMonitorOperation = operation "resolve monitor"
 
 takeReportsOperation, createWindowOperation, destroyWindowOperation ∷ Operation
 takeReportsOperation = operation "take asynchronous reports"
@@ -427,16 +468,28 @@ backendIdentifiers backend = [("backend", backendText backend)]
 -- | Resolve backend, check      | none                         |               |
 -- | thread                      |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Claim the guard             | Vacate, or poison            | third         |
+-- | Claim the guard             | Vacate, or poison            | sixth         |
 -- +-----------------------------+------------------------------+---------------+
 -- | Query platform support      | none                         |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Install the error callback  | Detach, then free if safe    | second        |
+-- | Install the error callback  | Detach, then free if safe    | fourth        |
 -- +-----------------------------+------------------------------+---------------+
--- | Set hints and initialize    | Terminate                    | first         |
+-- | Set hints and initialize    | Terminate                    | third         |
 -- +-----------------------------+------------------------------+---------------+
 -- | Raise initialization        | none                         |               |
 -- | reports; verify the backend |                              |               |
+-- +-----------------------------+------------------------------+---------------+
+-- | Allocate the monitor        | Free if safe                 | fifth         |
+-- | callback's storage          |                              |               |
+-- +-----------------------------+------------------------------+---------------+
+-- | Attach the monitor callback | Take a latched fault; detach | second        |
+-- +-----------------------------+------------------------------+---------------+
+-- | Sample the initial monitor  | none                         |               |
+-- | inventory                   |                              |               |
+-- +-----------------------------+------------------------------+---------------+
+-- | Publish the inventory       | End every identity; close    | first         |
+-- |                             | the snapshot holding the     |               |
+-- |                             | last descriptions            |               |
 -- +-----------------------------+------------------------------+---------------+
 sessionAssembly ∷ Native → SessionConfig → Assembly Session
 sessionAssembly native config = do
@@ -449,25 +502,50 @@ sessionAssembly native config = do
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native))
   acquirePart
     "glfw session occupancy"
-    (releaseRank 2)
+    (releaseRank 5)
     (claimGuard (nativeGuard native) backend)
     (\() → settleGuard (nativeGuard native) teardown)
   restoredStep (requireSupported native backend)
   _ ←
     acquirePart
       "glfw error callback"
-      (releaseRank 1)
+      (releaseRank 3)
       (attachCallback native capture teardown)
       (detachCallback native capture owner teardown)
   initialized ←
     acquirePart
       "glfw terminate"
-      (releaseRank 0)
+      (releaseRank 2)
       (initialize native capture teardown backend)
       (\_ → terminate native capture owner teardown live backend)
   restoredStep $ do
     raiseReported initializeOperation (backendIdentifiers backend) NativeCallReturned initialized
     verifySelected native capture backend
+  source ←
+    restoredStep (newMonitorSource (nativeMonitor native) capture (nativeFeatureUnavailable native) identity)
+  storage ←
+    acquirePart
+      "glfw monitor callback storage"
+      (releaseRank 4)
+      (nativeNewMonitorCallback (nativeMonitor native) (monitorCallback source))
+      (freeMonitorCallback native teardown)
+  -- The detach is registered before the callback is attached, so an attachment
+  -- that reported an error, raised, or was interrupted is detached before
+  -- termination.
+  acquirePart
+    "glfw monitor callback"
+    (releaseRank 1)
+    (pure ())
+    (\() → detachMonitorCallback native capture owner teardown source)
+  restoredStep (attachMonitorCallback native capture teardown storage)
+  initial ← restoredStep (sampleInitialInventory source)
+  cell ← restoredStep (newMonitorCell initial)
+  publisher ←
+    acquirePart
+      "glfw monitor inventory"
+      (releaseRank 0)
+      (publishInitialInventory initial)
+      (closeInventory cell)
   pure
     Session
       { sessionNative = native
@@ -478,6 +556,7 @@ sessionAssembly native config = do
       , sessionIdentity = identity
       , sessionWindows = windows
       , sessionTeardown = teardown
+      , sessionMonitors = assembleMonitors source cell publisher
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -582,6 +661,48 @@ detachCallback native capture owner teardown storage =
     when (hasReports unobserved) $
       throwFailure glfwComponent detachOperation [] (AsynchronousErrorsUnobserved unobserved)
 
+attachMonitorCallback ∷ Native → Capture → IORef Bool → MonitorCallbackStorage → IO ()
+attachMonitorCallback native capture teardown storage = do
+  settleStrayOwnerReports capture
+  -- An attachment that raises may have registered the callback, so its storage
+  -- is never freed and the guard is poisoned.
+  nativeAttachMonitorCallback (nativeMonitor native) storage `onException` atomicWriteIORef teardown False
+  reports ← takeOwnerReports capture
+  raiseReported attachMonitorOperation [] NativeCallReturned reports
+
+-- | Detach the monitor callback before termination. A fault latched since the
+-- last boundary is taken first, so no detach outcome can abandon it: after a
+-- detach that succeeded it is raised on its own, and beside a detach that failed
+-- it is retained as a labelled cleanup failure while the detach's failure stays
+-- primary.
+detachMonitorCallback ∷ Native → Capture → ThreadId → IORef Bool → MonitorSource → IO ()
+detachMonitorCallback native capture owner teardown source = do
+  pending ← takeMonitorFault source
+  detached ∷ Either (ExceptionWithContext SomeException) () ←
+    tryWithContext $
+      ownerRelease owner teardown detachMonitorOperation $ do
+        settleStrayOwnerReports capture
+        nativeDetachMonitorCallback (nativeMonitor native) `onException` atomicWriteIORef teardown False
+        reports ← takeOwnerReports capture
+        raiseReported detachMonitorOperation [] NativeCallReturned reports
+  case (detached, pending) of
+    (Right (), Nothing) → pure ()
+    (Right (), Just fault) → rethrowMonitorFault fault
+    (Left failure, Nothing) → rethrowIO failure
+    (Left failure, Just fault) →
+      withResourceLabelled
+        "glfw monitor callback fault"
+        (pure ())
+        (\() → rethrowMonitorFault fault)
+        (\() → rethrowIO failure)
+
+-- | Free the monitor callback's storage after the session's final native use,
+-- only if every teardown step so far ended safely; otherwise keep it.
+freeMonitorCallback ∷ Native → IORef Bool → MonitorCallbackStorage → IO ()
+freeMonitorCallback native teardown storage = do
+  safe ← readIORef teardown
+  when safe (nativeFreeMonitorCallback (nativeMonitor native) storage)
+
 -- | Run a release only on the owner thread. From any other thread it makes no
 -- native call, marks the teardown unsafe, and fails.
 ownerRelease ∷ ThreadId → IORef Bool → Operation → IO () → IO ()
@@ -592,11 +713,6 @@ ownerRelease owner teardown operationName release = do
     else do
       atomicWriteIORef teardown False
       throwFailure glfwComponent operationName [] NotSessionOwner
-
-raiseReported ∷ Operation → [(Text, Text)] → NativeOutcome → Reports → IO ()
-raiseReported operationName identifiers outcome reports =
-  when (hasReports reports) $
-    throwFailure glfwComponent operationName identifiers (NativeFailure outcome reports)
 
 -- | Check the owner thread and liveness, then run an operation.
 ownerOperation ∷ Session → Operation → [(Text, Text)] → IO a → IO a
@@ -636,3 +752,55 @@ requireUnpoisoned session operationName identifiers = do
 -- guard when it ends.
 poisonSession ∷ Session → IO ()
 poisonSession session = atomicWriteIORef (sessionTeardown session) False
+
+-- | The read endpoint of the session's monitor inventory. Any thread may read
+-- it, and it stays readable after the session ends, holding the closed
+-- inventory.
+monitorInventory ∷ Session → SnapshotReader MonitorInventory
+monitorInventory = monitorsReader . sessionMonitors
+
+-- | Refresh the monitor inventory at an owner boundary, publishing a new
+-- revision if a description or an identity changed, and answer the current
+-- inventory.
+synchronizeMonitors ∷ Session → IO MonitorInventory
+synchronizeMonitors session =
+  ownerOperation session synchronizeMonitorsOperation [] (synchronizeInventory (sessionMonitors session))
+
+-- | Refresh the monitor inventory only if the monitor callback captured a change
+-- since the last refresh: the owner loop's step after native events.
+reconcileMonitorEvents ∷ Session → IO ()
+reconcileMonitorEvents session =
+  ownerOperation session reconcileMonitorsOperation [] (reconcileInventory (sessionMonitors session))
+
+-- | Re-resolve a monitor identity against the monitors GLFW reports now, and
+-- answer its fresh description, or 'MonitorDisconnected' for an identity whose
+-- connection has ended or that belongs to another session.
+resolveMonitor ∷ Session → MonitorId → IO (MonitorResult MonitorDescription)
+resolveMonitor session identity =
+  ownerOperation session resolveMonitorOperation (monitorIdentifiers identity) $
+    resolveInventory (sessionMonitors session) identity >>= \case
+      MonitorAvailable (description, _) → pure (MonitorAvailable description)
+      MonitorDisconnected ended → pure (MonitorDisconnected ended)
+
+-- | Run one monitor-targeted native operation at an owner boundary: the identity
+-- is re-resolved immediately before it, the operation receives the live pointer
+-- that resolution's enumeration returned, and errors reported during it fail
+-- it. An ended identity answers 'MonitorDisconnected' without running it. The
+-- pointer must not escape the operation.
+withResolvedMonitor ∷ Session → Operation → MonitorId → (Ptr NativeMonitor → IO a) → IO (MonitorResult a)
+withResolvedMonitor session operationName identity action =
+  ownerOperation session operationName identifiers $
+    resolveInventory (sessionMonitors session) identity >>= \case
+      MonitorDisconnected ended → pure (MonitorDisconnected ended)
+      MonitorAvailable (_, pointer) → do
+        settleStrayOwnerReports capture
+        value ← action pointer
+        reports ← takeOwnerReports capture
+        raiseReported operationName identifiers NativeCallReturned reports
+        pure (MonitorAvailable value)
+  where
+    capture = sessionCapture session
+    identifiers = monitorIdentifiers identity
+
+monitorIdentifiers ∷ MonitorId → [(Text, Text)]
+monitorIdentifiers identity = [("monitor", Text.pack (show (monitorLocalIdentity identity)))]

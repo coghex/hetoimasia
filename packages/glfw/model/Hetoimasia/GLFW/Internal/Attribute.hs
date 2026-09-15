@@ -1,0 +1,36 @@
+{-# LANGUAGE DeriveGeneric #-}
+
+-- | The observation vocabulary windows and monitors share: an attribute the
+-- platform observed or cannot provide, and a content scale.
+--
+-- It holds no state. "Hetoimasia.GLFW.Internal.Window" and
+-- "Hetoimasia.GLFW.Internal.Monitor" both publish observations built from these
+-- values, and the public modules re-export them, so a client sees one
+-- 'Attribute' whichever observation it reads.
+module Hetoimasia.GLFW.Internal.Attribute
+  ( Attribute (..)
+  , ContentScale (..)
+  ) where
+
+import Control.DeepSeq (NFData)
+import GHC.Generics (Generic)
+
+-- | One observed attribute.
+data Attribute a
+  = Observed !a
+    -- ^ The value the platform reported when sampled or called back.
+  | Unavailable
+    -- ^ The platform cannot provide this attribute, or reported a value that is
+    -- not a consistent one.
+  deriving (Eq, Show, Generic)
+
+instance NFData a ⇒ NFData (Attribute a)
+
+-- | The ratio between the platform's DPI and its default DPI, per axis.
+data ContentScale = ContentScale
+  { scaleX ∷ !Float
+  , scaleY ∷ !Float
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData ContentScale

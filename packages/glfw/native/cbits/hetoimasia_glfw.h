@@ -15,6 +15,20 @@
  * main function. It reads the thread's identity and nothing else. */
 int hetoimasia_glfw_is_process_main_thread(void);
 
+/* glfwGetMonitors, glfwGetMonitorName, glfwGetVideoMode, and glfwGetVideoModes,
+ * returning the pointer types the Haskell imports' generated wrappers declare.
+ * GLFW owns what they point to, and the binding only reads and copies it
+ * before the calling operation returns. */
+void** hetoimasia_glfw_monitors(int* count);
+char* hetoimasia_glfw_monitor_name(GLFWmonitor* monitor);
+void* hetoimasia_glfw_video_mode(GLFWmonitor* monitor);
+void* hetoimasia_glfw_video_modes(GLFWmonitor* monitor, int* count);
+
+/* Copy the six fields of modes[index] — width, height, red, green, and blue
+ * bits, and refresh rate, in that order — into fields. It calls no GLFW
+ * function; the caller supplies an index below the count GLFW reported. */
+void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fields);
+
 /* Ask the platform to close a window, as its close button would, for the
  * native examples only. GLFW reports the request through the window's close
  * callback and destroys nothing. Call it on the session's owner thread. */

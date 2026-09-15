@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated: 2026-09-14. Durable project context for future interactive sessions.
+Updated: 2026-09-15. Durable project context for future interactive sessions.
 Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 [the foundation design](docs/engine_foundation_design.md).
 
@@ -314,6 +314,28 @@ not a verdict that Synarchy's design should be discarded.
   `requestCloseForCheck` (Cocoa `performClose:`; X11 `WM_DELETE_WINDOW` through
   a `dlopen`ed libX11, so no link requirement changes). Contract:
   `docs/glfw.md`, "The window host and owner loop".
+- GLFW-11 (#97) added `Hetoimasia.GLFW.Monitor`: the session owns a monitor
+  inventory (model `Hetoimasia.GLFW.Internal.Monitor`, stages in
+  `sessionAssembly`) published as a prepared `MonitorInventory` snapshot; the
+  host lends it as `hostMonitors`. `Attribute`/`ContentScale` moved to
+  `Internal.Attribute`, and `glfwComponent`, `NativeFailure`, `NativeOutcome`,
+  and `raiseReported` to `Internal.Capture` (both re-exported as before), so the
+  monitor model needs no import of the session. `MonitorId` is the session
+  `Unique` plus a never-reissued number per connection; native addresses are
+  kept only as correlation tokens. A connect or disconnect event for an address
+  ends its identity; overflow past 64 changes, an undefined event code, or a
+  callback fault ends every identity; an inconsistent enumeration makes the
+  monitor list `Unavailable`. `resolveMonitor` refreshes, then answers
+  `MonitorDisconnected` before any monitor-targeted call; the private
+  `withResolvedMonitor` lends the fresh pointer to one step (GLFW-6's hook). The
+  owner loop calls `reconcileMonitorEvents` after native events. Release order:
+  inventory close, monitor callback detach, terminate, error callback, monitor
+  storage free, guard; seam entry now ends with `CreateMonitorCallback`,
+  `AttachMonitorCallback`, `QueryMonitors`, `QueryPrimaryMonitor`. The CAPI
+  wrappers warn on GLFW's `const` returns, so four shim accessors restate them.
+  Xvfb exposes one 1280x1024 monitor; hotplug is model-tested, and the native
+  hotplug example is pending unless `HETOIMASIA_MONITOR_HOTPLUG_SECONDS` is set.
+  Contract: `docs/glfw.md`, "Monitors".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

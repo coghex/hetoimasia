@@ -5,31 +5,33 @@ to upstream GLFW 3.4, the one process-main-thread session over it, the
 lexically scoped windows created in that session, and the window host and owner
 loop that compose them with the runtime's application lifecycle. The accepted
 direction and the later slices live in
-[the GLFW integration design](glfw_integration_design.md) (P-1 to P-9, P-11,
-D-4, D-5, D-6, D-8, D-9, D-11, D-13, D-17); this document describes what the
-code does today.
+[the GLFW integration design](glfw_integration_design.md) (P-1 to P-9, P-10's
+monitor identity rules, P-11, D-4 to D-9, D-11, D-13, D-17); this document
+describes what the code does today.
 
-A session is entered, its asynchronous native error reports are read, windows
-are created in it, observed through read-only snapshots, asked for fresh
+A session is entered, its asynchronous native error reports are read, its
+monitor inventory is published with disconnect-safe identities, windows are
+created in it, observed through read-only snapshots, asked for fresh
 observations through bounded window command ports, and released when their
 scopes end, and the session ends. A window host owns those together as an
 application dependency, and its supervised owner loop processes native events,
-drains the ports, and surfaces close requests to application policy. There is
-no input feed, monitor inventory, manipulation or mode command, default close
-policy, dynamic window collection, or rendering operation.
+drains the ports, refreshes the monitor inventory when monitors change, and
+surfaces close requests to application policy. There is no input feed,
+manipulation or mode command, monitor selection, default close policy, dynamic
+window collection, or rendering operation.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
-| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
+| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, and `Hetoimasia.GLFW.Command`, the supported interface |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, and the window command protocol, including execution and settlement. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host, its supervised owner loop, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
-| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model, window command, and window host examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, window, and window host examples on the platform it runs on |
+| `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
+| `glfw-window-examples` | executable, test-only | The window model, window command, window host, and monitor inventory examples that use those drivers and that executor. `hetoimasia-tests` runs it. |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, and window host examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
@@ -71,6 +73,40 @@ data NativeOutcome       = NativeCallReturned | NativeCallFailed
 data NativeFailure       = NativeFailure { nativeOutcome ∷ NativeOutcome, nativeReports ∷ Reports }
 newtype AsynchronousErrorsUnobserved = AsynchronousErrorsUnobserved Reports
 glfwComponent ∷ Component                   -- "glfw"
+```
+
+```haskell
+-- Hetoimasia.GLFW.Monitor
+monitorInventory    ∷ Session → SnapshotReader MonitorInventory
+synchronizeMonitors ∷ Session → IO MonitorInventory
+resolveMonitor      ∷ Session → MonitorId → IO (MonitorResult MonitorDescription)
+data MonitorResult a = MonitorAvailable a | MonitorDisconnected MonitorId
+
+data MonitorInventory                        -- Eq, Show, NFData; read with:
+inventoryRevision ∷ MonitorInventory → Natural
+inventoryPhase    ∷ MonitorInventory → InventoryPhase
+inventoryMonitors ∷ MonitorInventory → Attribute [MonitorDescription]
+data InventoryPhase = InventoryOpen | InventoryClosed
+
+data MonitorId                               -- Eq, Ord, Show
+monitorLocalIdentity ∷ MonitorId → Natural
+
+data MonitorDescription                      -- Eq, Show, NFData; read with:
+monitorIdentity     ∷ MonitorDescription → MonitorId
+monitorName         ∷ MonitorDescription → Attribute Text
+monitorPrimary      ∷ MonitorDescription → Attribute Bool
+monitorPosition     ∷ MonitorDescription → Attribute MonitorPosition
+monitorWorkArea     ∷ MonitorDescription → Attribute WorkArea
+monitorPhysicalSize ∷ MonitorDescription → Attribute PhysicalSize
+monitorContentScale ∷ MonitorDescription → Attribute ContentScale
+monitorCurrentMode  ∷ MonitorDescription → Attribute VideoMode
+monitorVideoModes   ∷ MonitorDescription → Attribute [VideoMode]
+data MonitorPosition = MonitorPosition { monitorX, monitorY ∷ Int }
+data WorkArea        = WorkArea { workAreaX, workAreaY, workAreaWidth, workAreaHeight ∷ Int }
+data PhysicalSize    = PhysicalSize { physicalWidth, physicalHeight ∷ Int }   -- millimetres
+data VideoMode       = VideoMode { modeWidth, modeHeight ∷ Int
+                                 , modeRedBits, modeGreenBits, modeBlueBits, modeRefreshRate ∷ Attribute Int }
+-- Attribute and ContentScale are the ones Hetoimasia.GLFW.Window exports.
 ```
 
 ```haskell
@@ -161,6 +197,7 @@ data WindowHost
 allocWindowHost       ∷ HasCallStack ⇒ HostConfig → Scoped WindowHost
 allocWindowHostIn     ∷ HasCallStack ⇒ Scoped Session → HostConfig → Scoped WindowHost
 hostWindows           ∷ WindowHost → [Window]
+hostMonitors          ∷ WindowHost → SnapshotReader MonitorInventory
 hostCommandPort       ∷ WindowHost → WindowCommandPort
 hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostActivity          ∷ WindowHost → STM HostActivity
@@ -192,24 +229,26 @@ runWindowApplication
   → IO a
 ```
 
-`Session`, `Window`, `WindowObservation`, `WindowId`, `CloseRequest`,
-`WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
+`Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
+`WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
 `CommandOrigin`, `RequestId`, and `WindowCommand` are exported without their
 constructors, and their readers are functions rather than record fields, so no
 client can build or rewrite one. No public
-type holds a native pointer, and the snapshot publisher is never handed out:
-clients receive only the read endpoint. Nothing assumes a single or primary
-window.
+type holds a native window or monitor pointer, and no snapshot publisher is
+handed out: clients receive only read endpoints. Nothing assumes a single or
+primary window or monitor.
 
 Every failure is raised through `throwFailure` with the `glfw` component, the
 operation (`enter session`, `initialize`, `verify backend`, `terminate`,
-`detach error callback`, `take asynchronous reports`, `create window`,
+`detach error callback`, `take asynchronous reports`, `attach monitor callback`,
+`detach monitor callback`, `sample monitors`, `synchronize monitors`,
+`resolve monitor`, `reconcile monitor events`, `monitor callback`, `create window`,
 `sample window`, `attach window callbacks`, `synchronize window`,
 `detach window callbacks`, `destroy window`, `new window command host`,
 `submit window command`, `await window command`, `execute window command`,
 `perform window command`, `process window events`, `reconcile window events`,
 `run owner loop`, `reject close request`), and identifiers such as `backend`,
-`title`, `window`, or `request`, so `failureEvidence` reads the origin back
+`title`, `monitor`, `window`, or `request`, so `failureEvidence` reads the origin back
 without a logger. A host configuration rejection is raised under the `glfw.runtime`
 component and the `construct window host` operation.
 
@@ -242,6 +281,12 @@ component and the `construct window host` operation.
 7. **Verification.** Reports from a successful initialization are raised only
    now, after termination has been registered, and `glfwGetPlatform` must name
    the selected backend, or entry is `BackendNotSelected`.
+8. **Monitor callback.** The monitor callback's storage is allocated, its detach
+   is registered, and it is attached with `glfwSetMonitorCallback`. An
+   attachment that raises poisons the guard.
+9. **Monitor inventory.** The monitors are enumerated and described, anything
+   the callback captured since attachment is folded in, and the prepared
+   inventory becomes revision zero of a fresh snapshot. See [Monitors](#monitors).
 
 Steps 1 to 3 change no native state, so every misuse and unsupported request is
 rejected before native mutation. A failure at any later step releases exactly
@@ -284,13 +329,15 @@ full storage can never turn a native failure into success.
 
 ## Teardown, poisoning, and controlled blocking
 
-The composite declares its release order: terminate, then detach the error
-callback and free its storage, then settle the guard.
+The composite declares its release order:
 
 | Release | What it does |
 |---|---|
+| `glfw monitor inventory` | Ends every monitor identity, publishes the last descriptions as the `InventoryClosed` inventory, and closes the snapshot, in one transaction. No native call. |
+| `glfw monitor callback` | Takes any monitor callback fault latched since the last boundary, detaches the callback, then raises any report made during that call, and then the fault |
 | `glfw terminate` | Marks the session ended, calls `glfwTerminate`, then raises any report made during that call |
 | `glfw error callback` | Detaches the callback, frees its storage only if teardown has been safe so far, then raises any asynchronous report nobody read as `AsynchronousErrorsUnobserved` |
+| `glfw monitor callback storage` | Frees the monitor callback's storage, after the session's last native call, only if teardown has been safe so far |
 | `glfw session occupancy` | Vacates the guard after a safe teardown, or poisons it |
 
 A release-time native error is checked after the native call returns, without
@@ -301,10 +348,10 @@ It does not poison.
 
 Poisoning is the answer when teardown cannot establish that native ownership
 and callback registration ended safely. That is the case when termination or
-detaching raises instead of returning, when initialization or attachment raises
+detaching either callback raises instead of returning, when initialization or attachment raises
 with the native state unknown, or when a release runs on a thread other than
-the owner. The callback storage is then deliberately leaked rather than freed
-while it might still be called. The guard stays occupied-and-poisoned, so every
+the owner. The callback storages are then deliberately leaked rather than freed
+while they might still be called. The guard stays occupied-and-poisoned, so every
 later entry fails with `SessionPoisoned` before any native call.
 
 The storage is safe to free after a normal detach because of the owner-thread
@@ -321,7 +368,11 @@ update. No release contains a queue, fence, device wait, or logger.
 
 Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwSetErrorCallback`, `glfwInitHint`, `glfwInit`, `glfwGetPlatform`,
-`glfwTerminate`, `glfwDefaultWindowHints`, `glfwWindowHint`, `glfwCreateWindow`,
+`glfwTerminate`, `glfwSetMonitorCallback`, `glfwGetMonitors`,
+`glfwGetPrimaryMonitor`, `glfwGetMonitorName`, `glfwGetMonitorPos`,
+`glfwGetMonitorWorkarea`, `glfwGetMonitorPhysicalSize`,
+`glfwGetMonitorContentScale`, `glfwGetVideoMode`, `glfwGetVideoModes`,
+`glfwDefaultWindowHints`, `glfwWindowHint`, `glfwCreateWindow`,
 `glfwDestroyWindow`, `glfwGetWindowSize`, `glfwGetFramebufferSize`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
@@ -332,8 +383,17 @@ for the native examples only; no production path calls them.
 - Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
   installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
   checks each CAPI declaration, and every constant comes from the header. The
-  exception is `glfwSetErrorCallback`, a `ccall` import, because CAPI cannot
-  spell its function-pointer type.
+  exceptions are `glfwSetErrorCallback` and `glfwSetMonitorCallback`, `ccall`
+  imports, because CAPI cannot spell their function-pointer types.
+- `glfwGetMonitors`, `glfwGetMonitorName`, `glfwGetVideoMode`, and
+  `glfwGetVideoModes` are reached through shim accessors
+  (`hetoimasia_glfw_monitors` and its siblings) that only restate GLFW's `const`
+  return types as the generated wrappers declare them, keeping the C build
+  warning-clean. Each video mode is copied field by field through
+  `hetoimasia_glfw_video_mode_at`, which reads the header's own `GLFWvidmode`, so
+  no structure layout is assumed. Every array and string GLFW returns is copied
+  before the operation returns, and a negative count, or a positive count
+  beside a null array, is reported as inconsistent rather than read.
 - Every GLFW import is `safe`. Any of them may re-enter Haskell through the
   error callback, and a safe call lets other Haskell threads run while it is in
   C. The thread-identity shim calls nothing and is `unsafe`.
@@ -350,6 +410,149 @@ for the native examples only; no production path calls them.
 The window callback setters are `ccall` imports for the same reason. Each
 callback wrapper only drops the window pointer and calls the model's callback,
 which is already contained.
+
+## Monitors
+
+`Hetoimasia.GLFW.Monitor` publishes the monitor inventory the session owns. Its
+model is `Hetoimasia.GLFW.Internal.Monitor`; the session performs its stages and
+wraps every operation in the owner-thread and liveness checks.
+
+### Inventory ownership
+
+The session constructs the inventory at entry and ends it at teardown. A
+`MonitorInventory` is immutable and prepared to normal form before it is
+published through a [latest-value snapshot](messaging.md#latest-value-snapshots).
+It carries a revision equal to the snapshot's, a phase, and every connected
+monitor as a copied `MonitorDescription`, in the order GLFW enumerated them:
+
+| Attribute | Source |
+|---|---|
+| Identity | Issued by the session, per connection |
+| Name | `glfwGetMonitorName` |
+| Primary | Whether `glfwGetPrimaryMonitor` names this monitor |
+| Position | `glfwGetMonitorPos`; desktop screen coordinates, negative or nonzero as reported |
+| Work area | `glfwGetMonitorWorkarea` |
+| Physical size | `glfwGetMonitorPhysicalSize`; millimetres |
+| Content scale | `glfwGetMonitorContentScale` |
+| Current mode, video modes | `glfwGetVideoMode`, `glfwGetVideoModes` |
+
+An empty list is an ordinary observation of a desktop with no monitor. Any
+thread may read `monitorInventory`, and the window host lends the same endpoint
+as `hostMonitors`. Only the owner thread refreshes: `synchronizeMonitors` always
+does, `resolveMonitor` does before it answers, and the host's
+[owner loop](#the-owner-turn) does after native events whenever the monitor
+callback captured a change. A refresh enumerates the monitors, queries each, and
+publishes a new revision only when a description or an identity changed. GLFW's
+monitor callback reports connection changes only, so a change of work area,
+content scale, or mode on a monitor that stays connected appears at the next
+`synchronizeMonitors`. Nothing selects or assumes a primary monitor: the
+platform's designation is an attribute, and nothing assumes it starts at the
+desktop origin.
+
+### Identity lifetime
+
+A `MonitorId` is the session's identity and a local number starting at one that
+the session never reissues, issued once per connection. Between boundaries the
+session keeps each connection's native monitor address beside its identity as a
+private correlation token. A token is only compared; it is never turned back into
+a pointer, and no pointer is retained between owner boundaries. At a refresh:
+
+- a captured connection or disconnection for an address ends the identity that
+  address held, so a monitor disconnected and reconnected at the same address
+  before one boundary still receives a fresh identity, even though the final
+  enumeration is unchanged;
+- a lost change ends every identity, because which connection it concerned is
+  unknown (see [Callback containment](#callback-containment));
+- every enumerated monitor whose address still holds an identity keeps it,
+  wherever the enumeration now lists it, and every other one receives a fresh
+  identity;
+- an identity whose address is no longer enumerated ends.
+
+An ended identity never resolves again. An identity from another session —
+including a completed earlier session whose local numbers and native addresses
+repeat — never resolves either, because the session identity differs. A copied
+description stays readable, with its identity, after that identity ends.
+
+`resolveMonitor` re-resolves an identity at an owner boundary: it refreshes,
+which enumerates the monitors GLFW reports at that moment, and answers
+`MonitorAvailable` with the fresh description, or `MonitorDisconnected` before any
+native operation targets that monitor. Operations that need a live monitor, such
+as the mode transitions still to come, use the model's private
+`withResolvedMonitor`, which lends the pointer that same enumeration returned to
+one native step and keeps nothing.
+
+### Validation
+
+Every native number is checked before it becomes an observed value, and an
+inconsistent report becomes `Unavailable` rather than a fabricated value:
+
+| Report | Observation |
+|---|---|
+| An enumeration with an inconsistent count, a null monitor, or a repeated monitor | The inventory's monitors are `Unavailable`, and every identity ends |
+| A primary monitor that is not among those enumerated | Every monitor's primary attribute is `Unavailable`; no designated primary is `False` |
+| A null name | `Unavailable` |
+| A negative work area width or height | `Unavailable` |
+| A zero or negative physical width or height, as GLFW reports an unknown size | `Unavailable` |
+| A non-finite or non-positive content scale on either axis | `Unavailable`, checked before conversion |
+| A null current mode, or a mode with a non-positive width or height | `Unavailable` |
+| A video mode list with an inconsistent count, or holding an invalid mode | `Unavailable` |
+| A negative bit depth, or a zero or negative refresh rate | `Unavailable` within that mode |
+
+As for windows, a query that reports only `GLFW_FEATURE_UNAVAILABLE` is
+`Unavailable`, and any other report fails the boundary with `NativeFailure`
+under `sample monitors`.
+
+### Callback containment
+
+The monitor callback is a protected resource of the session. It runs
+uninterruptibly, copies the monitor's address and the event code, records them
+into the session's capture latch with one non-blocking `IORef` update, and
+returns. It calls no application code and no native function, waits for
+nothing, and lets no Haskell exception unwind into C. The latch keeps at most 64
+changes between boundaries. A change beyond that, an event code GLFW does not
+define, or a fault in the callback is a lost change: it is never dropped
+silently, and the next refresh ends every identity before any further monitor
+use. A fault is also latched with its context and rethrown, once that refresh
+has committed, with the `monitor callback` operation and the `callback` and
+`later-faults` identifiers.
+
+A refresh reads the latch without clearing it and clears what it folded only in
+the masked commit that publishes, and only if the callback recorded nothing
+since the read; otherwise it starts again. A cancellation or failure before the
+commit leaves every capture latched and the inventory unchanged.
+
+The callback's storage stays valid through the session's last native call. At
+teardown the inventory closes first; the callback is then detached before
+termination, taking any fault latched since the last boundary so no detach
+outcome can abandon it — raised on its own after a detach that succeeded, and
+retained as a `glfw monitor callback fault` cleanup failure beside one that
+failed — and its storage is freed after the error callback's detach, only if
+teardown stayed safe. A detach that raises, or runs off the owner thread, keeps
+the storage and poisons the guard, as for the error callback.
+
+### Session completion
+
+When the session ends, every identity ends, the last descriptions are published
+as the `InventoryClosed` inventory with the next revision, and the snapshot is
+closed in the same transaction, so waiting readers wake, receive that
+observation, and then `EndOfStream`. The closed inventory stays readable for as
+long as a reader holds the endpoint.
+
+### Platform restrictions
+
+- Monitors are observed on X11 and Cocoa, the backends a session selects.
+- GLFW 3.4 on X11 enumerates connected RandR outputs with active CRTCs, falling
+  back to one monitor for the screen when RandR is unusable. RandR 1.5 virtual
+  monitor objects are not GLFW monitors, so `xrandr --setmonitor` does not add
+  one. The isolated Xvfb display in CI exposes exactly one 1280 by 1024 monitor
+  at the origin and cannot simulate hotplug or a multi-monitor topology.
+- Empty inventories, several monitors at negative and nonzero origins,
+  disconnects, reconnects at a reused address, stale resolution, inconsistent
+  numbers, and lost changes are therefore proven by the CPU examples; real
+  attach and detach is local interactive evidence (see
+  [The native suite](#the-native-suite)).
+- A monitor's physical size may be unknown, which GLFW reports as zero, and a
+  refresh rate may be unknown; both are `Unavailable`.
 
 ## Windows
 
@@ -700,7 +903,8 @@ calls it on the process main thread — and refuses any other thread with
 1. `checkRuntime`;
 2. native event processing: `glfwPollEvents`, or on an idle turn
    `glfwWaitEventsTimeout` with the configured bound;
-3. reconciliation of every window's captured callbacks at an owner boundary,
+3. reconciliation at owner boundaries: the monitor inventory, refreshed only
+   when its callback captured a change, then every window's captured callbacks,
    collecting the close requests not yet surfaced;
 4. `checkRuntime`;
 5. command work: at most `hostCommandBudget` queued commands claimed, executed,
@@ -807,9 +1011,10 @@ callback events, such as a close request, for the next poll or wait to deliver
 from inside that call. They prove the turn order and the poll or wait choice,
 the checks after saturated command and event batches, worker progress during a
 wait, settlement through the loop, the owner-thread refusals, close-request
-surfacing, quiescence, and the shutdown order on startup failure, action return,
-failure, and cancellation, a supervisor-detected failure, and an abandoned
-managed startup.
+surfacing, a monitor change queued for the next poll refreshing the inventory
+only on the turn that delivered it, quiescence, and the shutdown order on
+startup failure, action return, failure, and cancellation, a
+supervisor-detected failure, and an abandoned managed startup.
 
 ## State
 
@@ -820,6 +1025,11 @@ managed startup.
 | Callback storage | The session | Installed at entry; freed at teardown | Owner | Until detached | Freed after a safe detach; leaked when poisoned |
 | Teardown safety flag | The session | Releases clear it; the guard release reads it | Owner | The session | Read once |
 | Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
+| Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
+| Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
+| Monitor connections and current inventory | The session | Committed refreshes write them; resolution reads them | Owner | The session | Emptied when the inventory closes |
+| Monitor inventory snapshot | The session | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed first at teardown, holding the last descriptions; never reopened |
+| Monitor callback storage | The session | Installed at entry; detached before termination; freed at teardown | Owner | Through the session's last native call | Freed after a safe teardown; leaked when poisoned |
 | Window identity counter | The session | Window creation issues from it | Owner | The session | Never reissued |
 | Native window | The window | Its parts create and destroy it; owner boundaries query it | Owner | The window's scope | Destroyed at release |
 | Window callback storage | The window | Its parts allocate, attach, detach, and free it; GLFW invokes it | Owner | Through the window's final native use | Freed after a certain release; kept when uncertain |
@@ -892,7 +1102,10 @@ running it.
   It proves the session model through the seam, checks the link declarations,
   and compiles external clients against the package, including clients refused
   for naming a command host's, port's, or ticket's constructor or reaching for
-  command execution, and a supported client that submits and awaits a command.
+  command execution, for constructing a monitor identity, description, or
+  inventory or reaching for a native monitor pointer, and for naming the monitor
+  drivers through the public seam, and a supported client that submits and
+  awaits a command and resolves monitors.
   It also runs the `glfw-window-examples` executable, reached through the suite's
   `build-tool-depends`, and fails with that executable's report if any window
   model example fails. It runs in the `test.engine` validation group.
@@ -921,6 +1134,23 @@ running it.
   Haskell exception with its context; owner-thread waits refused rather than
   blocking; and the observation request settling with a revision published
   first, while unserved and ended windows are rejected.
+- **The monitor inventory examples** in the same executable use the seam's
+  private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
+  and `seamQueueMonitorEvents` — over scripted monitors whose native pointers
+  stand for scripted addresses, and the seam raises if the model queries an
+  address its topology no longer lists. Without sleeps, they prove an empty
+  inventory published as an observation; several monitors at negative and
+  nonzero origins with the primary only an attribute; inconsistent numbers and
+  enumerations becoming `Unavailable`; `GLFW_FEATURE_UNAVAILABLE` and other
+  query reports; a disconnect ending an identity while its copied description
+  stays readable; a reconnect at a reused address receiving a fresh identity
+  within one boundary and across two, and reordering keeping identities; a stale
+  identity answered disconnected before any native operation targets it; an
+  identity from a completed session never resolving in a later one; a callback
+  fault rethrown with its context and lost changes ending every identity; a fault
+  latched after the last boundary raised from teardown; owner-thread refusals;
+  and the inventory closing, waking its waiters, before the callback is detached
+  ahead of termination and freed last.
 - **`glfw-native-tests`** needs a windowing session: Cocoa locally, or an
   isolated X11 display. It is not part of `hetoimasia-tests` or the console
   smoke; it is the `test.glfw-native` validation group, which only the display
@@ -965,6 +1195,17 @@ The native examples cover:
 - nested entry on the owner thread, entry from a bound worker and from an
   unbound thread, and owner-only use from the Hspec worker, each rejected while
   the shared session keeps serving;
+- the monitor inventory the display server exposes, read from the owner and
+  from the Hspec worker, with exactly one primary monitor, and on the isolated
+  X11 display exactly one monitor at the origin in a 1280 by 1024 mode; the run
+  prints the exercised topology, which on Cocoa is its record of the local
+  displays;
+- every identity re-resolving to a live monitor on the owner thread, lending its
+  pointer to a native step there, and keeping its identity across refreshes;
+- a physical attach or detach observed as ended identities and a refreshed
+  inventory, which is pending as unexercised unless
+  `HETOIMASIA_MONITOR_HOTPLUG_SECONDS` asks a person to perform one during the
+  run: no automated run can, and Xvfb cannot simulate it;
 - a hidden non-focusing window's creation, nondegenerate initial framebuffer
   observation, release, terminal observation, and terminal handle;
 - two live windows with a stray hint reset before the second's creation;
@@ -991,7 +1232,12 @@ The native examples cover:
   X11 delivers it after a round trip to the server, so later boundaries wait
   for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
   within a bound of 100 boundaries of at most 50 ms — until the fault is
-  rethrown.
+  rethrown;
+- in a private process, the real monitor callback detached while it is still the
+  callback GLFW holds, with none held afterwards, before `glfwTerminate`, and its
+  storage freed after the error callback's detach, with the closed inventory
+  readable after the session; and every identity from a completed real session
+  answered `MonitorDisconnected` in the next.
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct
