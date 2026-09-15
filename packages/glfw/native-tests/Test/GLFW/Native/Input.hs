@@ -21,6 +21,7 @@ import Hetoimasia.GLFW.Internal.Input
   , attemptOverflowWarning
   , feedControl
   , feedReader
+  , feedStatistics
   , newInputFeed
   , resumeInput
   )
@@ -92,6 +93,17 @@ spec shared = describe "native input callbacks" $ do
     inside `shouldBe` Just True
     allEqual windows `shouldBe` True
 
+  it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns" $ do
+    payloads ←
+      owned shared $ \session →
+        withWindow session (hiddenTestWindowConfig "native button turns" 320 240) $ \window → do
+          feed ← liveFeed window 8
+          inject window $ \handle → injectCursorPosForCheck handle 9 10
+          inject window $ \handle → injectMouseButtonForCheck handle 0 glfwPress 0
+          (events, _) ← drain feed
+          pure (map inputPayload events)
+    payloads `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers)]
+
   it "keeps a button event's captured coordinates after later cursor motion" $ do
     payloads ←
       owned shared $ \session →
@@ -144,6 +156,8 @@ spec shared = describe "native input callbacks" $ do
           atomically (readInput (feedReader feed)) >>= \case
             InputResetRequired token → do
               resetReason token `shouldBe` InputOverflowed
+              fmap summaryUnadmitted . statisticsLastReset <$> atomically (feedStatistics feed)
+                >>= (`shouldBe` Just (fromIntegral (inputStagingCapacity + 1)))
               (events, _) ← drain feed
               pure events
             other → failed ("staging overflow did not reset: " <> show other)

@@ -109,6 +109,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , WindowEvent (..)
   , DriveOrigin (..)
   , seamDrive
+  , seamDriveWith
   , seamDriveCancelledBeforeCommit
   , seamQueueEvents
   , seamRejectCloseRequest
@@ -590,7 +591,12 @@ requireSeamWindow seam window =
 -- without a native step; events for a window with no callbacks attached are
 -- dropped, as GLFW drops them.
 seamDrive ∷ Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
-seamDrive seam window origin = driveWith (pure ()) seam window (originName origin)
+seamDrive = seamDriveWith (pure ())
+
+-- | 'seamDrive' with an interruption at the reconciliation boundary: once
+-- before the commit, and again inside the masked publication step.
+seamDriveWith ∷ IO () → Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
+seamDriveWith interruption seam window origin = driveWith interruption seam window (originName origin)
   where
     originName DuringSetter = "seam setter"
     originName DuringPoll = "seam poll"

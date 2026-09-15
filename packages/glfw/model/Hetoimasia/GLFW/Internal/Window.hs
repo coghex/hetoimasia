@@ -429,7 +429,7 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find)
@@ -1498,15 +1498,20 @@ reconcileAdjusted forced adjust interruption window sample = do
           ( noCaptures
               { capturedGeneration = capturedGeneration latched
               , capturedFault = capturedFault latched
+              , capturedCursor = capturedCursor latched
+              , capturedCursorInside = capturedCursorInside latched
               }
           , True
           )
         else (latched, False)
-    when cleared $ forM_ prepared (commitObservation window next issued')
+    when cleared $ do
+      forM_ prepared (commitObservation window next issued')
+      -- Publication is bounded STM and evaluation. It stays uninterruptible
+      -- so a cancellation cannot admit a prefix and drop the rest.
+      uninterruptibleMask_ (publishCapturedInput window pending)
+    interruption
     pure cleared
-  if committed
-    then publishCapturedInput window pending
-    else reconcileAdjusted forced adjust interruption window sample
+  unless committed (reconcileAdjusted forced adjust interruption window sample)
 
 -- | Settle a window's monitor claims with a full sample, and answer how its
 -- applied mode changes: derived from the sample against the current monitors.
@@ -1553,7 +1558,14 @@ publishCapturedInput window pending = do
   forM_ feed $ \attached → do
     forM_ (capturedCursor pending) (recordCursor attached)
     if capturedInputLoss pending
-      then void (resetFromStagingOverflow attached)
+      then do
+        let lost = capturedInputLost pending + fromIntegral (capturedInputCount pending)
+        void (resetFromStagingOverflow attached lost)
+        -- The discarded batch is not replayed, but coalesced focus still
+        -- updates the feed's gate so resumption cannot reopen an unfocused
+        -- window.
+        forM_ (capturedFocused pending) $ \focused →
+          void (produceInput attached (FocusInput focused))
       else mapM_ (admitStaged attached) (reverse (capturedInput pending))
   where
     admitStaged feed = \case

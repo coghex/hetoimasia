@@ -876,15 +876,20 @@ context and latched rather than unwinding into C; the first is kept and later
 ones are counted. The focus callback is the one owner of focus: it coalesces
 the latest flag into the observation and stages an ordered focus event for the
 input feed. Cursor motion coalesces into the observation and the feed's cursor
-sample; it is not an input event. Key, character, button, scroll, and focus
+sample; it is not an input event. The latest cursor sample stays in the
+capture latch across boundaries, so a later turn's button still copies it. Key, character, button, scroll, and focus
 transitions are staged in a bounded buffer of `inputStagingCapacity` (256)
 events and are never coalesced. A button callback copies the latest cursor
 sample at that moment, so later motion does not move a click already staged.
 Overflow of that buffer sets a loss latch that remains set while the buffer is
 full. At the next owner boundary the latch is checked before any staged prefix
 is published: the ambiguous batch is discarded and the attached feed begins
-the same overflow reset a full channel would. A window with no feed attached
-discards staged input at that boundary without a reset.
+the same overflow reset a full channel would, with `unadmitted` equal to the
+discarded prefix plus every callback that arrived after the latch. Coalesced
+focus still updates the feed's gate, so resumption cannot reopen an unfocused
+window. A window with no feed attached discards staged input at that boundary
+without a reset. Publication of a captured batch is uninterruptible, so a
+cancellation cannot admit a prefix and drop the rest.
 
 Captures are reconciled on the owner thread at an owner boundary: at creation
 after the initial sampling, at `synchronizeWindow` after it samples, and after

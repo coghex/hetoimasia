@@ -15,7 +15,7 @@ import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM, replicateM_)
+import Control.Monad (forM, forM_, replicateM, replicateM_, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Log
@@ -37,6 +37,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , defaultScript
   , newSeam
   , seamDrive
+  , seamDriveWith
   )
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
 import Hetoimasia.GLFW.Window
@@ -101,8 +102,14 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testCallbackEvents)
     it "keeps a button event's captured coordinates after later cursor motion through callbacks"
       (boundedExample testCallbackButtonPosition)
+    it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns"
+      (boundedExample testCallbackButtonAcrossTurns)
     it "sets the staging loss latch while the buffer is full and begins the same reset, replaying no captured prefix"
       (boundedExample testStagingOverflow)
+    it "keeps the focus gate current when focus loss is discarded with a staging overflow"
+      (boundedExample testStagingOverflowFocus)
+    it "publishes a captured batch to completion before a cancellation at the publication boundary"
+      (boundedExample testPublishCancellationSafe)
     it "does not synthesize a press from a release delivered through a callback"
       (boundedExample testCallbackUnpairedRelease)
     it "gates callback input until admission is opened explicitly"
@@ -764,6 +771,15 @@ testCallbackButtonPosition =
                  ]
     observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 70 80)
 
+testCallbackButtonAcrossTurns ∷ Expectation
+testCallbackButtonAcrossTurns =
+  withLiveFeed 8 $ \seam window feed → do
+    drive seam window [CursorMovedTo 9 10]
+    drive seam window [ButtonEventAt 0 1 0]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers)]
+
 testStagingOverflow ∷ Expectation
 testStagingOverflow =
   withLiveFeed 16 $ \seam window feed → do
@@ -772,6 +788,8 @@ testStagingOverflow =
     readNow feed >>= \case
       InputResetRequired token → do
         resetReason token `shouldBe` InputOverflowed
+        summary ← statisticsLastReset <$> statisticsOf feed
+        fmap summaryUnadmitted summary `shouldBe` Just (fromIntegral (inputStagingCapacity + 1))
         drain (feedReader feed) >>= \(events, _) → events `shouldBe` []
         atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
         _ ← attemptOverflowWarning quietLogger feed
@@ -781,6 +799,33 @@ testStagingOverflow =
         map inputPayload events `shouldBe` [TextInput 'b']
         map (epochNumber . inputEpoch) events `shouldBe` [2]
       other → unexpected ("staging overflow did not reset: " <> show other)
+
+testStagingOverflowFocus ∷ Expectation
+testStagingOverflowFocus =
+  withLiveFeed 16 $ \seam window feed → do
+    let overflowed = replicate inputStagingCapacity (CharEventAt (fromEnum 'a')) <> [FocusChanged False]
+    drive seam window overflowed
+    token ←
+      readNow feed >>= \case
+        InputResetRequired reset → pure reset
+        other → unexpected ("staging overflow did not reset: " <> show other)
+    atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+    _ ← attemptOverflowWarning quietLogger feed
+    resumeInput feed `shouldReturn` ResumeUnfocused
+    drive seam window [FocusChanged True]
+    resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+
+testPublishCancellationSafe ∷ Expectation
+testPublishCancellationSafe =
+  withLiveFeed 8 $ \seam window feed → do
+    calls ← newIORef (0 ∷ Int)
+    let hook = do
+          n ← atomicModifyIORef' calls (\count → (count + 1, count))
+          when (n >= 1) (throwIO ThreadKilled)
+    (killed, _) ← caughtAs (seamDriveWith hook seam window DuringPoll [CharEventAt (fromEnum 'a'), CharEventAt (fromEnum 'b')])
+    killed `shouldBe` ThreadKilled
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events `shouldBe` [TextInput 'a', TextInput 'b']
 
 testCallbackUnpairedRelease ∷ Expectation
 testCallbackUnpairedRelease =

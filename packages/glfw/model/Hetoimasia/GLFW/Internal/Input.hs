@@ -859,20 +859,21 @@ produceButton feed button action modifiers = do
   produceInput feed (ButtonInput (ButtonEvent button action position modifiers))
 
 -- | Begin the overflow reset because native staging overflowed, without
--- presenting an event to the channel. The protocol is the same as a full send:
--- the running backlog is discarded, held state is cleared, and the consumer
--- sees one 'InputOverflowed' token. Already resetting or closed feeds do not
--- begin another episode.
-resetFromStagingOverflow ∷ InputFeed → IO Production
-resetFromStagingOverflow feed = atomically $ do
+-- presenting an event to the channel. @lost@ is the exact number of staged
+-- and unstaged callbacks that were never admitted: the discarded prefix plus
+-- every callback that arrived after the loss latch. The protocol is the same
+-- as a full send. Already resetting or closed feeds do not begin another
+-- episode; while resetting, @lost@ is counted as suppressed.
+resetFromStagingOverflow ∷ InputFeed → Natural → IO Production
+resetFromStagingOverflow feed lost = atomically $ do
   state ← readTVar (feedState feed)
   case statePhase state of
     InputFeedClosed → pure ProductionClosed
-    InputRunning → ProductionOverflowed . tokenOf feed <$> beginReset feed InputOverflowed 1 state
+    InputRunning → ProductionOverflowed . tokenOf feed <$> beginReset feed InputOverflowed lost state
     _ → do
       writeTVar (feedState feed) $
-        modifyCounters (\counts → counts {countSuppressed = countSuppressed counts + 1}) $
-          state {stateEpisode = (\summary → summary {summarySuppressed = summarySuppressed summary + 1}) <$> stateEpisode state}
+        modifyCounters (\counts → counts {countSuppressed = countSuppressed counts + lost}) $
+          state {stateEpisode = (\summary → summary {summarySuppressed = summarySuppressed summary + lost}) <$> stateEpisode state}
       pure ProductionSuppressed
 
 -- | The admission transaction. 'Nothing' when the running epoch is no longer the
