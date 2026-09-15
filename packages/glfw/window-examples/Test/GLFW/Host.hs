@@ -739,6 +739,7 @@ kind = \case
   Just (Interrupted _) → "interrupted"
   Just (Unsupported _) → "unsupported"
   Just (Attempted _) → "attempted"
+  Just (Transitioned _) → "transitioned"
 
 isLive ∷ WorkerStatus → Bool
 isLive WorkerLive = True

@@ -407,6 +407,26 @@ not a verdict that Synarchy's design should be discarded.
   quiescence close feeds; the host does not yet produce, warn, or resume — that
   owner-loop and native callback wiring is GLFW-12 (#100). Contract:
   `docs/glfw.md`, "Input feeds".
+- GLFW-6 (#98) added window modes: the pure private model
+  `Hetoimasia.GLFW.Internal.Mode` (requests, saved placement, `ModeRecord`,
+  `AppliedMode` derived from sampled decoration, fullscreen monitor, and work-area
+  containment, plans, the windowed placement policy, claims, outcomes), public
+  `Hetoimasia.GLFW.Mode`, `setWindowModeCommand` settling as `Transitioned`, and
+  `transitionWindow`/`reconcileWindowMode` in the window model. Each attempt is
+  a `recover` attempt inside `withResourceLabelled` whose release restores
+  windowed constraints; cleanup failure yields `ModeRecoveryStopped`. Samples now
+  query `DecoratedAttribute` and `glfwGetWindowMonitor` (the pointer is compared
+  with the inventory's connections without a refresh, `Unavailable` while changes
+  are unfolded). `ControlState` splits preserved windowed constraints from
+  `NativeConstraints`; controls check `controlEligibility` by applied
+  presentation. The session holds `sessionClaims` (`MonitorClaims`), pruned to
+  live identities when consulted; window release disposes them only on
+  `WindowReleased`. The owner loop calls `reconcileWindowModes` after its monitor
+  refresh. `WindowConfig` gained `windowStartupMode`. The seam tracks decoration
+  and monitor per window, geometry with `scriptTrackWindows`, applies a step's
+  effect only when it reported nothing, and takes windows off a detached monitor.
+  `WindowOperation` gained `BorderlessOperation`/`FullscreenOperation`; Wayland
+  names borderless unperformable. Contract: `docs/glfw.md`, "Window modes".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

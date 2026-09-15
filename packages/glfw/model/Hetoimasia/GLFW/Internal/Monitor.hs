@@ -170,6 +170,9 @@ module Hetoimasia.GLFW.Internal.Monitor
   , reconcileInventory
   , resolveInventory
   , closeInventory
+  , liveIdentities
+  , currentMonitors
+  , identifyPointer
 
     -- * Operation names
   , sampleMonitorsOperation
@@ -193,7 +196,7 @@ import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIO
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (Unique)
@@ -831,6 +834,38 @@ resolveInventory monitors identity = do
       pure $ case (described, lookup identity (refreshPointers plan)) of
         (Just description, Just pointer) → MonitorAvailable (description, pointer)
         _ → MonitorDisconnected identity
+
+-- | The identities of the connections the last committed refresh observed:
+-- none once the inventory has closed. It makes no native call.
+liveIdentities ∷ Monitors → IO [MonitorId]
+liveIdentities monitors = do
+  live ← inventoryLive monitors
+  let MonitorCell state _ = monitorsCell monitors
+  MonitorState connections _ ← readIORef state
+  pure (if live then Map.elems connections else [])
+
+-- | The monitors of the current inventory, without a refresh.
+currentMonitors ∷ Monitors → IO (Attribute [MonitorDescription])
+currentMonitors = fmap invMonitors . currentInventory
+
+-- | The identity a monitor pointer a window query just returned stands for:
+-- 'Observed' 'Nothing' for a null pointer, the identity whose connection holds
+-- that address, or 'Unavailable' when no current connection holds it, when the
+-- callback has captured a change no refresh has folded yet, or once the
+-- inventory has closed. The pointer is only compared; it makes no native call.
+identifyPointer ∷ Monitors → Ptr NativeMonitor → IO (Attribute (Maybe MonitorId))
+identifyPointer monitors pointer
+  | pointer == nullPtr = pure (Observed Nothing)
+  | otherwise = do
+      live ← inventoryLive monitors
+      pending ← readIORef (sourceCaptures (monitorsSource monitors))
+      let MonitorCell state _ = monitorsCell monitors
+      MonitorState connections _ ← readIORef state
+      let settled = capturedKept pending == 0 && not (capturedLost pending) && isNothing (capturedFault pending)
+      pure $
+        if live && settled
+          then maybe Unavailable (Observed . Just) (Map.lookup (ptrToIntPtr pointer) connections)
+          else Unavailable
 
 -- | End the inventory: every identity ends, and the last descriptions are
 -- published as the closed inventory before the snapshot is closed, in one

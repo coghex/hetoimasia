@@ -122,7 +122,10 @@
 --
 -- A control command executes "Hetoimasia.GLFW.Internal.Window"'s
 -- 'controlWindow' on the addressed window and settles as rejected, unsupported,
--- or attempted.
+-- or attempted. A mode command executes 'transitionWindow' and settles as
+-- rejected or unsupported when it was refused before any native call with no
+-- fallback to take, and otherwise as 'Transitioned' with its outcome and the
+-- revision its final sample published.
 --
 -- 'closeWindowCommand' and 'createWindowCommand' change which windows exist, so
 -- only an executor that owns window lifetimes performs them: the window host's
@@ -214,6 +217,10 @@ module Hetoimasia.GLFW.Internal.Command
   , maximizeWindowCommand
   , restoreWindowCommand
 
+    -- * Mode commands
+  , setWindowModeCommand
+  , ModeTransition (..)
+
     -- * Origins
   , RequestId
   , requestLocalIdentity
@@ -257,6 +264,7 @@ module Hetoimasia.GLFW.Internal.Command
   , executeCommand
   , observeWindow
   , controlDisposition
+  , modeDisposition
   , nativeRejectionOf
 
     -- * Private window ports
@@ -324,10 +332,12 @@ import Hetoimasia.GLFW.Internal.Control
   , ControlRejection
   , ControlResult (..)
   , PostCallObservation
+  , PresentationKind (..)
   , SizeConstraints
   , WindowControl (..)
-  , WindowOperation
+  , WindowOperation (..)
   )
+import Hetoimasia.GLFW.Internal.Mode (ModeOutcome, ModeRejection, ModeRequest, ModeResult (..), modePresentation, requestedMode)
 import Hetoimasia.GLFW.Internal.Session
   ( NativeFailure (..)
   , NativeOutcome
@@ -345,6 +355,7 @@ import Hetoimasia.GLFW.Internal.Window
   , WindowResult (..)
   , controlWindow
   , observedRevision
+  , transitionWindow
   , synchronizeWindow
   , windowCallbackOperation
   , windowIdentity
@@ -362,6 +373,7 @@ data WindowCommand
   | CloseWindow !WindowId
   | CreateWindow !WindowConfig
   | ControlWindow !WindowId !WindowControl
+  | ModeWindow !WindowId !ModeRequest
   deriving (Eq, Show)
 
 instance NFData WindowCommand where
@@ -369,6 +381,7 @@ instance NFData WindowCommand where
   rnf (CloseWindow window) = rnf window
   rnf (CreateWindow config) = rnf config
   rnf (ControlWindow window control) = rnf window `seq` rnf control
+  rnf (ModeWindow window request) = rnf window `seq` rnf request
 
 -- | Ask the owner to sample the window and publish a fresh observation of it at
 -- its next safe boundary.
@@ -392,6 +405,7 @@ commandWindow (ObserveWindow window) = Just window
 commandWindow (CloseWindow window) = Just window
 commandWindow (CreateWindow _) = Nothing
 commandWindow (ControlWindow window _) = Just window
+commandWindow (ModeWindow window _) = Just window
 
 -- | Ask the owner to set the window's title. A title containing a NUL is
 -- rejected when the command executes.
@@ -432,6 +446,12 @@ minimizeWindowCommand window = ControlWindow window MinimizeControl
 maximizeWindowCommand window = ControlWindow window MaximizeControl
 -- | Ask the owner to restore a minimized or maximized window.
 restoreWindowCommand window = ControlWindow window RestoreControl
+
+-- | Ask the owner to transition the window to a mode, with a fallback. The
+-- request, its monitor, and its video mode are validated against the window and
+-- the monitors reported when the command executes.
+setWindowModeCommand ∷ WindowId → ModeRequest → WindowCommand
+setWindowModeCommand = ModeWindow
 
 -- | A request's identity: its host's identity and a local number that host never
 -- reissues. Only the local number is displayed.
@@ -535,6 +555,9 @@ data Disposition
   | Attempted !ControlAttempt
     -- ^ The control's native calls were made. Whether the window reached the
     -- requested state is what its observations report.
+  | Transitioned !ModeTransition
+    -- ^ A mode request executed, whether inert, applied, failed, or stopped.
+    -- Whether the window reached the mode is what its observations report.
   | NotExecuted
     -- ^ Closure settled it while it was still queued.
   | Interrupted !RequestId
@@ -547,6 +570,7 @@ instance NFData Disposition where
   rnf (Rejected rejection) = rnf rejection
   rnf (Unsupported unsupported) = rnf unsupported
   rnf (Attempted attempt) = rnf attempt
+  rnf (Transitioned transition) = rnf transition
   rnf NotExecuted = ()
   rnf (Interrupted request) = rnf request
 
@@ -573,6 +597,19 @@ data ControlAttempt = ControlAttempt
 
 instance NFData ControlAttempt where
   rnf (ControlAttempt window outcome observation) = rnf window `seq` rnf outcome `seq` rnf observation
+
+-- | A mode request that executed.
+data ModeTransition = ModeTransition
+  { transitionedWindow ∷ !WindowId
+  , transitionOutcome ∷ !ModeOutcome
+  , transitionObservation ∷ !PostCallObservation
+    -- ^ The revision the sample taken after the transition published, or why
+    -- none was.
+  }
+  deriving (Eq, Show)
+
+instance NFData ModeTransition where
+  rnf (ModeTransition window outcome observation) = rnf window `seq` rnf outcome `seq` rnf observation
 
 -- | What a performed command produced.
 data CommandResult
@@ -641,6 +678,9 @@ data CommandRejection
     -- the owner as evidence.
   | ControlRejected !WindowId !ControlRejection
     -- ^ A control was refused before any native call.
+  | ModeRejected !WindowId !ModeRejection
+    -- ^ A mode request was refused before any native call, with no fallback to
+    -- take.
   deriving (Eq, Show)
 
 instance NFData CommandRejection where
@@ -657,6 +697,7 @@ instance NFData CommandRejection where
   rnf (WindowCreationFailed failed outcome reports) =
     rnf failed `seq` outcome `seq` rnfReports reports
   rnf (ControlRejected window rejection) = rnf window `seq` rnf rejection
+  rnf (ModeRejected window rejection) = rnf window `seq` rnf rejection
 
 -- | A command operation that would wait for work only the waiting thread can
 -- do.
@@ -1116,6 +1157,7 @@ runCommand windows = \case
   CloseWindow target → pure (Rejected (maybe (WindowNotServed target) (const (CloseNotPermitted target)) (served target)))
   CreateWindow _ → pure (Rejected CreationNotPermitted)
   ControlWindow target control → maybe (notServed target) (controlDisposition target control) (served target)
+  ModeWindow target request → maybe (notServed target) (modeDisposition target request) (served target)
   where
     served target = find ((== target) . windowIdentity) windows
     notServed = pure . Rejected . WindowNotServed
@@ -1132,6 +1174,24 @@ controlDisposition target control window =
     WindowAvailable (ControlRefused rejection) → pure (Rejected (ControlRejected target rejection))
     WindowAvailable (ControlUnsupported wanted reason) → pure (Unsupported (UnsupportedControl target wanted reason))
     WindowAvailable (ControlAttempted outcome observation) → pure (Attempted (ControlAttempt target outcome observation))
+
+-- | Execute a mode request on one window at an owner boundary and settle it: an
+-- ended window as 'WindowAlreadyEnded', a closing one as 'WindowIsClosing', a
+-- request refused before any native call with no fallback as 'ModeRejected', a
+-- target the platform cannot perform with no fallback as 'Unsupported', and
+-- otherwise as 'Transitioned'. Anything raised propagates.
+modeDisposition ∷ WindowId → ModeRequest → Window → IO Disposition
+modeDisposition target request window =
+  transitionWindow window request >>= \case
+    WindowEnded _ → pure (Rejected (WindowAlreadyEnded target))
+    WindowAvailable ModeWindowClosing → pure (Rejected (WindowIsClosing target))
+    WindowAvailable (ModeRefused rejection) → pure (Rejected (ModeRejected target rejection))
+    WindowAvailable (ModeUnsupported reason) → pure (Unsupported (UnsupportedControl target wanted reason))
+    WindowAvailable (ModeSettled outcome observation) → pure (Transitioned (ModeTransition target outcome observation))
+  where
+    wanted = case modePresentation (requestedMode request) of
+      FullscreenPresentation → FullscreenOperation
+      _ → BorderlessOperation
 
 -- | Synchronize one window at an owner boundary and answer the revision that
 -- followed. A native failure raised by the sampling is a typed rejection; a
