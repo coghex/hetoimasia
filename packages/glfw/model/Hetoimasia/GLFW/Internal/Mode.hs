@@ -50,9 +50,11 @@
 -- A repeated request is inert ('inertRequest') only when it equals the recorded
 -- request completely — the monitor identity and the video mode preference
 -- included — the last outcome settled cleanly at the target, and the applied
--- mode, reconciled immediately before, still matches it: windowed with its
--- constraints applied, borderless exactly over that monitor's work area, or
--- fullscreen on that monitor. An inert request makes no native call, so it
+-- mode, reconciled immediately before against a refreshed inventory, still
+-- matches it: windowed with its constraints applied, borderless exactly over that
+-- monitor's work area, or fullscreen on that monitor at the observed size the
+-- preference selects there, with the monitor's current video mode that size and,
+-- when the preference names one, that refresh rate. An inert request makes no native call, so it
 -- never restores saved geometry over a window the user has moved since.
 --
 -- = Windowed placement and fallback
@@ -499,7 +501,19 @@ inertRequest record native monitors placement extent mode =
         where
           monitorsOf (Observed described) = find ((== monitor) . monitorIdentity) described
           monitorsOf Unavailable = Nothing
-      FullscreenMode monitor _ → recApplied record == AppliedFullscreen monitor
+      FullscreenMode monitor preference →
+        recApplied record == AppliedFullscreen monitor
+          && case (monitorsOf monitors >>= either (const Nothing) Just . selectVideoMode preference, monitorsOf monitors, extent) of
+            (Just (selected, refresh), Just description, Observed observed) →
+              observed == selected && case monitorCurrentMode description of
+                Observed current →
+                  Extent (modeWidth current) (modeHeight current) == selected
+                    && all (\rate → modeRefreshRate current == Observed rate) refresh
+                Unavailable → False
+            _ → False
+        where
+          monitorsOf (Observed described) = find ((== monitor) . monitorIdentity) described
+          monitorsOf Unavailable = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Validation

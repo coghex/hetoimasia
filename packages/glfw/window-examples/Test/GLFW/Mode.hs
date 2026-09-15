@@ -59,6 +59,10 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testUserMoveSurvives)
     it "treats a request as inert only on complete equality with a cleanly applied target"
       (boundedExample testCompleteEquality)
+    it "never treats a borderless request as inert after its monitor detached, even before anything refreshed the inventory"
+      (boundedExample testBorderlessAfterDetach)
+    it "applies a repeated fullscreen request again when the observed size or the monitor's current video mode diverged"
+      (boundedExample testFullscreenDivergence)
 
   describe "validation" $
     it "refuses unrepresentable preferences, budgets, and placements, and unreported video modes, before any native setter"
@@ -251,6 +255,47 @@ testCompleteEquality = do
                  , SetWindowMonitor 1 2 0 0 2560 1440 (Just 60)
                  , SetWindowMonitor 1 2 0 0 2560 1440 (Just 60)
                  ]
+
+testBorderlessAfterDetach ∷ Expectation
+testBorderlessAfterDetach = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let run = execute desk [window]
+      left = deskLeft desk
+  placed ← run (mode window (borderlessOn left))
+  seamSetMonitorTopology (deskSeam desk) (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents (deskSeam desk) [MonitorDetached 1]
+  repeated ← run (mode window (borderlessOn left))
+  withFallback ← run (mode window (modeRequest (borderlessMode left) (windowedFallback 1)))
+  placed `shouldSatisfy` appliedCleanly
+  repeated `shouldBe` Rejected (ModeRejected (windowIdentity window) (ModeMonitorDisconnected left))
+  outcomeOf withFallback
+    `shouldBe` Just
+      ( ModeApplied
+          WindowedFallbackAttempt
+          [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)]
+          [ModeAttemptFailure TargetAttempt (RefusedBeforeMutation (ModeMonitorDisconnected left))]
+      )
+
+testFullscreenDivergence ∷ Expectation
+testFullscreenDivergence = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let run = execute desk [window]
+      seam = deskSeam desk
+      exact = fullscreenExact (deskRight desk) 1920 1080 (Just 144)
+  entering ← run (mode window exact)
+  unchanged ← run (mode window exact)
+  -- The window's size diverges on the same monitor.
+  _ ← seamDrive seam window DuringPoll [ResizedTo 2560 1440]
+  resized ← run (mode window exact)
+  unchangedAgain ← run (mode window exact)
+  -- The monitor's current video mode diverges while the window keeps its size.
+  seamSetMonitorTopology seam (MonitorTopology (Just [(1, leftMonitor), (2, rightMonitor)]) 2)
+  remoded ← run (mode window exact)
+  calls ← filter (\case SetWindowMonitor {} → True; _ → False) <$> modeCalls desk
+  entering `shouldSatisfy` appliedCleanly
+  unchanged `shouldSatisfy` inertly
+  resized `shouldSatisfy` appliedCleanly
+  unchangedAgain `shouldSatisfy` inertly
+  remoded `shouldSatisfy` appliedCleanly
+  calls `shouldBe` replicate 3 (SetWindowMonitor 1 2 0 0 1920 1080 (Just 144))
 
 -- ---------------------------------------------------------------------------
 -- Validation

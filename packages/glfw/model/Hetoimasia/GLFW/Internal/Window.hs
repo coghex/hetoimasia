@@ -127,8 +127,9 @@
 -- reconciled; a closing window attempts nothing; a window whose mode transition
 -- marker is set refuses with 'TransitionAlreadyInProgress'; the request is
 -- validated; the marker is set, and stays set until the transition settles; the
--- window is sampled, and its applied mode and monitor claims are reconciled with
--- that sample; an inert request settles at once; otherwise the target is
+-- monitor inventory is refreshed, so no decision uses monitors a disconnection
+-- has since ended; the window is sampled, and its applied mode and monitor
+-- claims are reconciled with that sample; an inert request settles at once; otherwise the target is
 -- attempted under "Hetoimasia.Foundation.Recovery"'s 'recover', whose budget is
 -- one attempt plus the request's fallback attempts, or those fallback attempts
 -- alone when reconciliation starts from the fallback. Each attempt is one complete
@@ -1614,6 +1615,7 @@ transitionAt window requirement request =
 runTransition ∷ Window → ModeRequirement → ModeRequest → ModeAttemptKind → IO ModeResult
 runTransition window requirement request first =
   bracket_ (setModeTransition window True) (setModeTransition window False) $ do
+    _ ← refreshMonitors (windowSession window)
     _ ← samplePresentation False window id
     OwnerState current _ ← readIORef (windowOwnerState window)
     ControlState _ native _ ← readIORef (windowControl window)

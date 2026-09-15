@@ -72,6 +72,10 @@
 -- answering queries from them instead of the script: creation starts a window at
 -- its requested size at (40, 30), a setter or a delivered move or resize changes
 -- them, and a fullscreen window takes its monitor's position and mode size.
+-- Whatever the tracking, a window put on a monitor sets that monitor's current
+-- video mode to its size and, when one is given, refresh rate, and the monitor's
+-- previous mode is restored once the window leaves it or is destroyed, as GLFW
+-- does.
 --
 -- The seam exposes no native handle and no session or window constructor.
 module Hetoimasia.GLFW.Internal.Seam
@@ -453,6 +457,9 @@ data Seam = Seam
     -- ^ What the seam keeps of each live window, by window key.
   , seamReported ∷ IORef Int
     -- ^ How many errors scripted steps have reported.
+  , seamReplacedModes ∷ IORef [(Int, Maybe NativeVideoMode)]
+    -- ^ The current mode each monitor had before a fullscreen window changed it,
+    -- by scripted address.
   }
 
 -- | A window's tracked decoration, monitor address, size, and position.
@@ -488,6 +495,7 @@ newSeam script =
     <*> newIORef []
     <*> newIORef []
     <*> newIORef 0
+    <*> newIORef []
 
 -- | Enter a session over this seam's native table.
 seamSession ∷ Seam → SessionConfig → Scoped Session
@@ -528,6 +536,7 @@ seamDeliverMonitorEvents seam events = do
     deliver callback = \case
       MonitorAttached key → mapM_ (\invoke → invoke (monitorPointer key) glfwConnectedCode) callback
       MonitorDetached key → do
+        atomicModifyIORef' (seamReplacedModes seam) (\replaced → (filter ((/= key) . fst) replaced, ()))
         atomicModifyIORef' (seamTracked seam) $ \tracked →
           ([(window, if trackedMonitor state == key then state {trackedMonitor = 0, trackedPosition = (0, 0)} else state) | (window, state) ← tracked], ())
         mapM_ (\invoke → invoke (monitorPointer key) glfwDisconnectedCode) callback
@@ -769,6 +778,8 @@ seamNative seam =
     , nativeDestroyWindow = \handle → do
         record (DestroyWindow (windowKey handle))
         scriptDestroyWindow script reporter
+        leaving ← maybe 0 trackedMonitor . lookup (windowKey handle) <$> readIORef (seamTracked seam)
+        restoreMode leaving
         atomicModifyIORef' (seamTracked seam) (\tracked → (filter ((/= windowKey handle) . fst) tracked, ()))
     , nativeNewWindowCallbacks = \callbacks → do
         record CreateWindowCallbacks
@@ -884,7 +895,10 @@ seamNative seam =
         | scriptTrackWindows script → trackWindow seam key (\state → state {trackedSize = (fromIntegral width, fromIntegral height)})
       SetWindowPosition key x y
         | scriptTrackWindows script → trackWindow seam key (\state → state {trackedPosition = (fromIntegral x, fromIntegral y)})
-      SetWindowMonitor key monitor x y width height _ → do
+      SetWindowMonitor key monitor x y width height refresh → do
+        previous ← maybe 0 trackedMonitor . lookup key <$> readIORef (seamTracked seam)
+        when (previous /= 0 && previous /= monitor) (restoreMode previous)
+        when (monitor /= 0) (replaceMode monitor (fromIntegral width) (fromIntegral height) (fromIntegral <$> refresh))
         topology ← readIORef (seamTopology seam)
         let position
               | monitor == 0 = (fromIntegral x, fromIntegral y)
@@ -892,6 +906,32 @@ seamNative seam =
         trackWindow seam key (\state → state {trackedMonitor = monitor, trackedPosition = position, trackedSize = (fromIntegral width, fromIntegral height)})
       SetWindowDecorated key decorated → trackWindow seam key (\state → state {trackedDecorated = decorated})
       _ → pure ()
+    -- A fullscreen window's video mode becomes its monitor's current one; the
+    -- mode it replaced is kept, once, to restore.
+    replaceMode ∷ Int → CInt → CInt → Maybe CInt → IO ()
+    replaceMode monitor width height refresh = do
+      topology ← readIORef (seamTopology seam)
+      case lookup monitor =<< topologyMonitors topology of
+        Nothing → pure ()
+        Just scripted → do
+          atomicModifyIORef' (seamReplacedModes seam) $ \replaced →
+            (if any ((== monitor) . fst) replaced then replaced else (monitor, scriptedCurrentMode scripted) : replaced, ())
+          let rate = maybe (maybe 60 nativeModeRefreshRate (scriptedCurrentMode scripted)) id refresh
+          setCurrentMode monitor (Just (NativeVideoMode width height 8 8 8 rate))
+    restoreMode ∷ Int → IO ()
+    restoreMode monitor = do
+      saved ← atomicModifyIORef' (seamReplacedModes seam) $ \replaced →
+        (filter ((/= monitor) . fst) replaced, lookup monitor replaced)
+      mapM_ (setCurrentMode monitor) saved
+    setCurrentMode monitor mode =
+      atomicModifyIORef' (seamTopology seam) $ \topology →
+        ( topology
+            { topologyMonitors =
+                map (\(address, entry) → if address == monitor then (address, entry {scriptedCurrentMode = mode}) else (address, entry))
+                  <$> topologyMonitors topology
+            }
+        , ()
+        )
     tracking ∷ Ptr NativeWindow → (Tracked → (Int, Int)) → (Int, Int) → IO (Int, Int)
     tracking handle field scripted
       | scriptTrackWindows script = maybe scripted field . lookup (windowKey handle) <$> readIORef (seamTracked seam)

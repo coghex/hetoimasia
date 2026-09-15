@@ -1348,8 +1348,9 @@ In order:
    `ModeRejected TransitionAlreadyInProgress`.
 3. The request's fallback budget and video mode preference are checked.
 4. The marker is set, and stays set until the transition settles.
-5. The window is sampled, and its applied mode and monitor claims are
-   reconciled with the sample.
+5. The monitor inventory is refreshed, so no decision uses a monitor a
+   disconnection has since ended, and the window is sampled, and its applied
+   mode and monitor claims are reconciled with the sample.
 6. An inert request settles at once as `ModeInert`.
 7. Otherwise the target is attempted under `Hetoimasia.Foundation.Recovery`'s
    `recover`, with a budget of one attempt plus the fallback's attempts; see
@@ -1431,9 +1432,11 @@ A window's saved placement is its windowed content position and logical size:
 
 A request is inert only when it equals the recorded request completely — the
 monitor identity and the video mode preference included — its last outcome
-settled cleanly at the target, and the applied mode reconciled in step 5 still
-matches it: windowed with its constraints applied, borderless exactly over that
-monitor's work area, or fullscreen on that monitor. An inert request makes no
+settled cleanly at the target, and the applied mode reconciled in step 5 against
+the refreshed inventory still matches it: windowed with its constraints applied,
+borderless exactly over that monitor's work area, or fullscreen on that monitor
+at the observed size the preference selects there, with the monitor's current
+video mode that size and, when the preference names one, that refresh rate. An inert request makes no
 native call, so it never restores stale geometry over a window the user moved.
 A request after a disconnect, a failure, or a fallback is never inert.
 
