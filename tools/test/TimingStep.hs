@@ -212,6 +212,7 @@ verdictStep fixture plan =
     , "--plan", plan
     , "--receipts", receiptsDirectory fixture
     , "--summary", summaryPath fixture
+    , "--worker", "floor=success"
     ]
 
 -- | The environment the runner gives a step, with the stub `gh` in front of
@@ -280,6 +281,7 @@ planAgainst fixture = do
       , "--head", "HEAD"
       , "--candidate", "HEAD"
       , "--json"
+      , "--worker", "floor=cpu:build.pass,test.fail"
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   let target = root fixture </> "plan.json"
@@ -298,6 +300,8 @@ runGroup fixture plan group =
     , group
     , "--plan", plan
     , "--receipts", receiptsDirectory fixture
+    , "--worker", "floor"
+    , "--runner-class", "cpu"
     ]
 
 -- ---------------------------------------------------------------------------

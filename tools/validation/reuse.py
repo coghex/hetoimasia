@@ -238,7 +238,9 @@ def fetch_receipt(api: Api, repository: str, artifact: dict, group: str, url: st
             raise Rejection(f"its receipt is malformed: {failure}", url) from failure
 
 
-def check_receipt(receipt: dict, group: str, entry: dict, candidate: dict, run: dict, url: str) -> None:
+def check_receipt(
+    receipt: dict, group: str, entry: dict, plan: dict, candidate: dict, run: dict, url: str
+) -> None:
     if receipt["group"] != group:
         raise Rejection(f"its receipt records group {receipt['group']!r}", url)
     if receipt["command"] != list(entry["command"]):
@@ -258,6 +260,7 @@ def check_receipt(receipt: dict, group: str, entry: dict, candidate: dict, run: 
             url,
         )
     problems = receipts.compatibility_problems(candidate, receipt, "its receipt")
+    problems += receipts.routing_problems(plan, entry, receipt, "its receipt")
     if problems:
         raise Rejection("; ".join(problems), url)
     # Outcome is checked last so an incompatible failure is reported as
@@ -292,7 +295,7 @@ def consider(
     run = source_run(api, repository, artifact, workflow)
     url = run_url(run, artifact)
     receipt = fetch_receipt(api, repository, artifact, group, url)
-    check_receipt(receipt, group, entry, candidate, run, url)
+    check_receipt(receipt, group, entry, plan, candidate, run, url)
     return {
         "group": group,
         "receipt": receipt,
@@ -376,11 +379,20 @@ def render_summary(document: dict, plan: dict) -> str:
     return "\n".join(lines)
 
 
-def parse_worker(entry: str) -> tuple[str, list[str]]:
+def parse_worker(entry: str) -> tuple[str, list[str] | None]:
+    """A worker named for the outputs, optionally restating the groups it owns.
+
+    The plan's validated assignment is what decides which groups a worker owns;
+    a restatement is accepted only when it agrees with that assignment exactly.
+    """
     name, separator, group_list = entry.partition("=")
-    groups = [identifier for identifier in group_list.split(",") if identifier]
-    if not separator or not name or not groups:
-        raise EvidenceError(f"--worker expects NAME=GROUP[,GROUP...], not {entry!r}")
+    if not name or (separator and not group_list):
+        raise EvidenceError(f"--worker expects NAME or NAME=GROUP[,GROUP...], not {entry!r}")
+    if not separator:
+        return name, None
+    groups = group_list.split(",")
+    if not all(groups):
+        raise EvidenceError(f"--worker expects NAME or NAME=GROUP[,GROUP...], not {entry!r}")
     return name, groups
 
 
@@ -401,8 +413,9 @@ def main(argv: list[str]) -> int:
         "--worker",
         action="append",
         default=[],
-        metavar="NAME=GROUP[,GROUP...]",
-        help="a worker job and the groups it owns, to decide whether it runs; repeatable",
+        metavar="NAME[=GROUP,...]",
+        help="restate one of the plan's workers, and optionally its groups, which must agree "
+        "with the plan's assignment; repeatable. Every plan worker is reported either way",
     )
     parser.add_argument(
         "--budget-seconds",
@@ -420,7 +433,11 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
 
     plan = receipts.load_plan(arguments.plan)
-    workers = [parse_worker(entry) for entry in arguments.worker]
+    conflicts: list[str] = []
+    for name, groups in (parse_worker(entry) for entry in arguments.worker):
+        conflicts += receipts.declared_routing_problems(plan, name, groups)
+    if conflicts:
+        raise EvidenceError("the worker arguments conflict with the plan: " + "; ".join(conflicts))
     if arguments.budget_seconds <= 0:
         raise EvidenceError("--budget-seconds must be positive")
 
@@ -450,9 +467,14 @@ def main(argv: list[str]) -> int:
     print("execute=" + " ".join(execute))
     print("reused=" + " ".join(sorted(covered)))
     print("input_identity=" + plan["input_identity"])
-    for name, groups in workers:
-        owned = [identifier for identifier in groups if identifier in execute]
-        print(f"run-{name}=" + ("true" if owned else "false"))
+    # Outputs for every worker the plan routes, straight from its validated
+    # assignment: whether the job has anything left to run, which groups those
+    # are, and every group it owns, so a job can still say why it skipped one.
+    for worker in plan["workers"]:
+        owned = [identifier for identifier in worker["groups"] if identifier in execute]
+        print(f"run-{worker['name']}=" + ("true" if owned else "false"))
+        print(f"groups-{worker['name']}=" + " ".join(owned))
+        print(f"assigned-{worker['name']}=" + " ".join(worker["groups"]))
 
     if arguments.summary:
         try:

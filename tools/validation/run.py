@@ -744,6 +744,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--receipts", required=True, help="directory the receipt is written to")
     parser.add_argument("--repo-root", help="the checkout to execute in (default: the working directory)")
     parser.add_argument(
+        "--worker",
+        required=True,
+        help="the worker executing this group, as the plan declares it",
+    )
+    parser.add_argument(
+        "--runner-class",
+        action="append",
+        required=True,
+        dest="runner_classes",
+        metavar="CLASS",
+        help="a runner class this executing worker provides; repeatable",
+    )
+    parser.add_argument(
         "--toolchain",
         action="append",
         default=[],
@@ -785,6 +798,16 @@ def main(argv: list[str]) -> int:
         raise ProvenanceError(
             f"the plan did not select {arguments.group!r} ({group['reason']}); "
             "an omitted group has no execution to record"
+        )
+    # The executing worker's own declaration against the plan's routing: a
+    # group runs only on the worker the plan assigned it to, and only where
+    # this execution provides the runner class the group requires.
+    refused = receipts.execution_problems(
+        plan, arguments.group, arguments.worker, arguments.runner_classes
+    )
+    if refused:
+        raise ProvenanceError(
+            f"this worker may not execute {arguments.group!r}: " + "; ".join(refused)
         )
     relevant = relevant_uncommitted(root, plan, changed, added)
     if relevant:
@@ -830,6 +853,8 @@ def main(argv: list[str]) -> int:
         "runner_os": os.environ.get("RUNNER_OS") or platform.system(),
         "runner_arch": os.environ.get("RUNNER_ARCH") or platform.machine(),
         "runner_python": platform.python_version(),
+        "worker": arguments.worker,
+        "runner_class": group["runner"],
         "toolchain": toolchain,
         # Copied from the plan rather than recomputed: the receipt has to name
         # the identity the candidate was planned under, and a runner that

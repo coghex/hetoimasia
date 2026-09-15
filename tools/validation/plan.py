@@ -40,7 +40,7 @@ import receipts
 # The catalog's schema and the plan's are separate contracts: the plan gained
 # the identity fields this slice added, while the catalog's keys did not move.
 CATALOG_SCHEMA_VERSION = 1
-PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = receipts.PLAN_SCHEMA_VERSION
 IDENTITY_SCHEMA_VERSION = 1
 DEFAULT_CATALOG = "tools/validation/catalog.json"
 PROJECT_FILE = "cabal.project"
@@ -62,7 +62,7 @@ REQUIRED_POLICY_ROOTS = ("tools/validation/", ".github/workflows/")
 
 COMPONENT_KINDS = ("lib", "exe", "test")
 FRAMEWORKS = ("hspec", "none")
-RUNNERS = ("cpu",)
+RUNNERS = receipts.RUNNER_CLASSES
 CATEGORIES = ("build", "test", "smoke", "probe")
 
 ID_PATTERN = re.compile(r"^[a-z0-9]+(\.[a-z0-9-]+)+$")
@@ -937,6 +937,7 @@ def build_plan(
     base_catalog_state: str,
     catalog_override: str | None,
     candidate_catalog: dict,
+    workers: list[dict] | None,
 ) -> dict:
     groups = catalog["groups"]
     groups_by_id = {group["id"]: group for group in groups}
@@ -1042,6 +1043,18 @@ def build_plan(
             }
         )
 
+    # Routing is decided here, once, against the groups this plan selected. A
+    # plan that nobody could execute is refused before it exists rather than
+    # discovered by a worker that cannot run it or an aggregate missing a
+    # receipt. Without declarations the plan is an inspection of selection
+    # alone, and every tool that would act on it refuses it.
+    routed = None
+    if workers is not None:
+        routed = receipts.normalized_workers(workers, entries)
+        problems = receipts.worker_assignment_problems(routed, entries)
+        if problems:
+            raise PlannerError("the worker declarations cannot route this plan: " + "; ".join(problems))
+
     return {
         "schema_version": PLAN_SCHEMA_VERSION,
         # The catalog's declared revision stays an integer a person can read,
@@ -1095,6 +1108,7 @@ def build_plan(
         "unknown_inputs": sorted(unknown_inputs),
         "groups": entries,
         "selected": [entry["id"] for entry in entries if entry["selected"]],
+        "workers": routed,
     }
 
 
@@ -1142,13 +1156,30 @@ def render_prose(plan: dict) -> str:
     lines.append("")
     lines.append("Groups")
     width = max(len(entry["id"]) for entry in plan["groups"])
+    owners = {
+        identifier: worker["name"]
+        for worker in plan["workers"] or []
+        for identifier in worker["groups"]
+    }
+    owner_width = max((len(name) for name in owners.values()), default=1)
     for entry in plan["groups"]:
         mark = "run " if entry["selected"] else "skip"
         lines.append(
             f"  [{mark}] {entry['id']:<{width}}  {entry['reason']:<19} "
             f"inputs changed: {'yes' if entry['inputs_changed'] else 'no':<3}  "
+            f"runner: {entry['runner']:<7}  worker: {owners.get(entry['id'], '-'):<{owner_width}}  "
             f"{' '.join(entry['command'])}"
         )
+
+    lines.append("")
+    if plan["workers"] is None:
+        lines.append("Workers: none declared; this plan is for inspection only and cannot be executed.")
+    else:
+        lines.append("Workers")
+        for worker in plan["workers"]:
+            lines.append(
+                f"  {worker['name']} ({'+'.join(worker['runner_classes'])}): {', '.join(worker['groups'])}"
+            )
 
     omitted = [entry for entry in plan["groups"] if not entry["selected"]]
     lines.append("")
@@ -1240,6 +1271,14 @@ def main(argv: list[str]) -> int:
         "--runner-os",
         help="the operating system the workers execute on (default: this runner's)",
     )
+    parser.add_argument(
+        "--worker",
+        action="append",
+        default=[],
+        metavar="NAME=CLASS[+CLASS]:GROUP[,GROUP]",
+        help="a worker, the runner classes it declares, and the groups it owns; repeatable. "
+        "Without any, the plan describes selection only and cannot be executed",
+    )
     parser.add_argument("--request-file", help="file holding a PR body with a validation-request block")
     parser.add_argument("--catalog", help="fixture catalog path, read from the filesystem")
     parser.add_argument("--repo-root", help="repository to plan for (default: the enclosing checkout)")
@@ -1250,7 +1289,7 @@ def main(argv: list[str]) -> int:
     root = repository_root(arguments.repo_root)
 
     if arguments.catalog_check:
-        for name in ("base", "head", "candidate", "request_file"):
+        for name in ("base", "head", "candidate", "request_file", "worker"):
             if getattr(arguments, name):
                 raise PlannerError(f"--catalog-check takes no --{name.replace('_', '-')}")
         tree = WorkTree(root)
@@ -1301,6 +1340,11 @@ def main(argv: list[str]) -> int:
 
     try:
         toolchain = receipts.parse_toolchain(arguments.toolchain)
+        workers = (
+            [receipts.parse_worker_declaration(entry) for entry in arguments.worker]
+            if arguments.worker
+            else None
+        )
     except receipts.EvidenceError as failure:
         raise PlannerError(str(failure)) from failure
     runner_os = arguments.runner_os or os.environ.get("RUNNER_OS") or platform.system()
@@ -1356,6 +1400,7 @@ def main(argv: list[str]) -> int:
         base_catalog_state,
         arguments.catalog,
         candidate_catalog,
+        workers,
     )
     if arguments.as_json:
         print(json.dumps(plan, indent=2, sort_keys=False))
