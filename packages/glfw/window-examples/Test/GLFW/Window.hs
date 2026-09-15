@@ -84,6 +84,8 @@ spec = do
       (boundedExample testHintsResetPerWindow)
     it "publishes sampled geometry, never the request, and releases in the declared order"
       (boundedExample testCreateObserveRelease)
+    it "destroys a live window before raising an error its creation reported, and never a null one"
+      (boundedExample testCreationFailures)
 
   describe "GLFW window observations" $ do
     it "coalesces callback captures into one new revision at the owner boundary"
@@ -122,8 +124,8 @@ spec = do
       (boundedExample (testUncertainRelease detachRaises "glfw window callbacks"))
     it "keeps callback storage and poisons the session when destroying the window raises"
       (boundedExample (testUncertainRelease destroyRaises "glfw window"))
-    it "retains a native error reported by a destroy that returned, without poisoning"
-      (boundedExample testDestroyReportRetained)
+    it "treats a destroy that reported an error as uncertain: storage kept, session poisoned"
+      (boundedExample testDestroyReportUncertain)
 
 -- ---------------------------------------------------------------------------
 -- Creation
@@ -691,31 +693,103 @@ testUncertainRelease script label = do
       , [Terminate, DetachErrorCallback]
       ]
 
-testDestroyReportRetained ∷ Expectation
-testDestroyReportRetained = do
-  firstAttempt ← firstTimeOnly
+testDestroyReportUncertain ∷ Expectation
+testDestroyReportUncertain = do
   seam ←
     newSeam
-      defaultScript
-        { scriptDestroyWindow = \reporter → do
-            reporting ← firstAttempt
-            if reporting then reportError reporter 0x00010008 "destroy reported" else pure ()
-        }
+      defaultScript {scriptDestroyWindow = \reporter → reportError reporter 0x00010008 "destroy reported"}
   stash ← newIORef Nothing
-  ((failure, caught), final, secondId) ← asProcessMainThread seam $ entered seam $ \session → do
+  ((failure, caught), final, (refused, _)) ← asProcessMainThread seam $ entered seam $ \session → do
     released ← caughtAs (withWindow session (hiddenTestWindowConfig "reported" 64 48) (writeIORef stash . Just))
     window ← stashed stash
     final ← current window
-    secondId ← withWindow session (hiddenTestWindowConfig "after" 64 48) (pure . windowIdentity)
-    pure (released, final, secondId)
+    refusal ← caughtAs (withWindow session (hiddenTestWindowConfig "refused" 64 48) (\_ → pure ()))
+    pure (released, final, refusal)
   failure
     `shouldBe` NativeFailure NativeCallReturned (Reports [NativeError 0x00010008 "destroy reported" False ProcessMainThread] 0 0)
   originOf caught `shouldBe` Just ("glfw", "destroy window", [("window", "1")])
   map cleanupFailureLabel (cleanupFailures caught) `shouldBe` ["glfw window"]
-  observedPhase final `shouldBe` WindowReleased
-  windowLocalIdentity secondId `shouldBe` 2
-  seamLiveWindowCallbacks seam `shouldReturn` 0
-  asProcessMainThread seam (entered seam (pure . sessionBackend)) `shouldReturn` X11
+  observedPhase final `shouldBe` WindowReleaseUncertain
+  refused `shouldBe` SessionPoisoned
+  -- The destruction was not established, so the wrappers are kept.
+  seamLiveWindowCallbacks seam `shouldReturn` 1
+  (poisoned, _) ← asProcessMainThread seam (caughtAs (entered seam (\_ → pure ())))
+  poisoned `shouldBe` SessionPoisoned
+  seamCalls seam
+    `shouldReturn` concat
+      [ entryCalls
+      , creationCalls "reported" 64 48 1
+      , [DetachWindowCallbacks 1, DestroyWindow 1]
+      , [Terminate, DetachErrorCallback]
+      ]
+
+testCreationFailures ∷ Expectation
+testCreationFailures = do
+  -- A live handle whose creation reported an error: its destruction was
+  -- registered first, so it is destroyed, and its storage freed, while the
+  -- reported error propagates.
+  liveAttempt ← firstTimeOnly
+  live ←
+    newSeam
+      defaultScript
+        { scriptCreateWindow = \reporter → do
+            reporting ← liveAttempt
+            if reporting then reportError reporter 0x00010008 "created with an error" else pure ()
+            pure True
+        }
+  ((liveFailure, liveCaught), liveLater) ← asProcessMainThread live $ entered live $ \session → do
+    rejected ← caughtAs (withWindow session (hiddenTestWindowConfig "reported" 64 48) (\_ → pure ()))
+    later ← withWindow session (hiddenTestWindowConfig "later" 64 48) (pure . windowIdentity)
+    pure (rejected, later)
+  liveFailure
+    `shouldBe` NativeFailure NativeCallReturned (Reports [NativeError 0x00010008 "created with an error" False ProcessMainThread] 0 0)
+  originOf liveCaught `shouldBe` Just ("glfw", "create window", [("window", "1")])
+  map cleanupFailureLabel (cleanupFailures liveCaught) `shouldBe` []
+  windowLocalIdentity liveLater `shouldBe` 2
+  seamLiveWindowCallbacks live `shouldReturn` 0
+  seamCalls live
+    `shouldReturn` concat
+      [ entryCalls
+      , take 7 (creationCalls "reported" 64 48 1)
+      , [DestroyWindow 1, FreeWindowCallbacks]
+      , creationCalls "later" 64 48 2
+      , releaseCalls 2
+      , exitCalls
+      ]
+
+  -- A null return: nothing was created, so nothing is destroyed; the storage
+  -- allocated before it is freed.
+  nullAttempt ← firstTimeOnly
+  refused ←
+    newSeam
+      defaultScript
+        { scriptCreateWindow = \reporter → do
+            refusing ← nullAttempt
+            if refusing
+              then reportError reporter 0x00010004 "invalid" >> pure False
+              else pure True
+        }
+  ((nullFailure, nullCaught), nullLater) ← asProcessMainThread refused $ entered refused $ \session → do
+    rejected ← caughtAs (withWindow session (hiddenTestWindowConfig "refused" 64 48) (\_ → pure ()))
+    later ← withWindow session (hiddenTestWindowConfig "later" 64 48) (pure . windowIdentity)
+    pure (rejected, later)
+  nullFailure
+    `shouldBe` NativeFailure NativeCallFailed (Reports [NativeError 0x00010004 "invalid" False ProcessMainThread] 0 0)
+  originOf nullCaught `shouldBe` Just ("glfw", "create window", [("window", "1")])
+  map cleanupFailureLabel (cleanupFailures nullCaught) `shouldBe` []
+  windowLocalIdentity nullLater `shouldBe` 2
+  seamLiveWindowCallbacks refused `shouldReturn` 0
+  seamCalls refused
+    `shouldReturn` concat
+      [ entryCalls
+      , take 7 (creationCalls "refused" 64 48 1)
+      , [FreeWindowCallbacks]
+      -- A null return consumed no native handle, so the later window's handle
+      -- is the first; its window identity is still the second.
+      , creationCalls "later" 64 48 1
+      , releaseCalls 1
+      , exitCalls
+      ]
 
 -- ---------------------------------------------------------------------------
 -- Support

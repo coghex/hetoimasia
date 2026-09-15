@@ -394,12 +394,14 @@ documented order. A callback fault nobody observed is taken before the detach,
 so no detach outcome can abandon it: after a detach that succeeded it is the
 release's own failure, and beside a detach that raised or reported an error it
 is retained as a `glfw window callback fault` cleanup failure while the detach's
-failure stays primary. A release-time native error whose call returned is checked
-after the call, without logging or pumping events, and retained through
-[the failure table](resources.md#the-failure-table); release stays certain.
+failure stays primary. A release-time native error whose call returned is checked after the call,
+without logging or pumping events, and retained through
+[the failure table](resources.md#the-failure-table). After a detach, release
+stays certain. After a destroy, the window's destruction was not established,
+so release becomes uncertain, as below.
 
 Release becomes uncertain when detaching or destroying raises instead of
-returning, when a release runs off the owner thread or after the session ended,
+returning, when destroying reports an error, when a release runs off the owner thread or after the session ended,
 or when attaching the callbacks raised during creation. Callback reachability is
 then unknown, so the wrappers are kept rather than freed beneath native code,
 the session refuses further windows with `SessionPoisoned`, keeps its own error

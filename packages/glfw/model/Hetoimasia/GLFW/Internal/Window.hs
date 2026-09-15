@@ -114,8 +114,9 @@
 --
 -- Each native release reads errors after its call returns, logs nothing, pumps
 -- no events, and waits for no other thread. A reported error whose call
--- returned is retained as that part's cleanup failure and leaves release
--- certain, as does a callback fault nobody observed. That fault is taken before
+-- returned is retained as that part's cleanup failure. After a detach it leaves
+-- release certain, as does a callback fault nobody observed; after a destroy it
+-- leaves the window's destruction unestablished, so release becomes uncertain. That fault is taken before
 -- the detach: it is raised on its own after a detach that succeeded, and
 -- retained as a @glfw window callback fault@ cleanup failure beside a detach
 -- that raised or reported an error, whose failure stays primary. A detach or
@@ -714,13 +715,16 @@ attachCallbacks session certain identifiers handle storage = do
 
 -- | A release that makes a native call: only on the owner thread of a live
 -- session. Anything else, or a native call that raises, leaves release
--- uncertain.
-nativeRelease ∷ Session → IORef Bool → Operation → [(Text, Text)] → IO () → IO ()
-nativeRelease session certain operationName identifiers release = do
+-- uncertain. When @uncertainOnReport@ holds, a call that returned but reported
+-- an error leaves release uncertain too, because what it releases was not
+-- established to have ended.
+nativeRelease ∷ Session → IORef Bool → Bool → Operation → [(Text, Text)] → IO () → IO ()
+nativeRelease session certain uncertainOnReport operationName identifiers release = do
   ownerOperation session operationName identifiers (pure ()) `onException` atomicWriteIORef certain False
   settleStrayOwnerReports capture
   release `onException` atomicWriteIORef certain False
   reports ← takeOwnerReports capture
+  when (uncertainOnReport && hasReports reports) $ atomicWriteIORef certain False
   raiseReported operationName identifiers NativeCallReturned reports
   where
     capture = sessionCapture session
@@ -734,7 +738,7 @@ detachCallbacks session live certain captures identifiers handle = do
   pending ← takeCaptures captures
   detached ∷ Either (ExceptionWithContext SomeException) () ←
     tryWithContext $
-      nativeRelease session certain detachOperation identifiers $
+      nativeRelease session certain False detachOperation identifiers $
         nativeDetachWindowCallbacks (sessionNative session) handle
   case (detached, capturedFault pending) of
     (Right (), Nothing) → pure ()
@@ -751,7 +755,7 @@ detachCallbacks session live certain captures identifiers handle = do
 
 destroyNative ∷ Session → IORef Bool → [(Text, Text)] → Ptr NativeWindow → IO ()
 destroyNative session certain identifiers handle =
-  nativeRelease session certain destroyWindowOperation identifiers $
+  nativeRelease session certain True destroyWindowOperation identifiers $
     nativeDestroyWindow (sessionNative session) handle
 
 freeStorage ∷ Session → IORef Bool → WindowCallbackStorage → IO ()
