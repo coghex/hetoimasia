@@ -33,6 +33,12 @@ cabal test hetoimasia-tests --test-show-details=direct --test-options='--match G
 cabal test glfw-native-tests --test-show-details=direct
 ```
 
+List the native examples without entering a session:
+
+```bash
+cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
+```
+
 `glfw-native-tests` runs the real session through the shared native fixture and
 needs a windowing session: Cocoa locally, or on Linux an isolated X11 display
 from `tools/display/x11.sh`. See [docs/glfw.md](../../docs/glfw.md#the-native-suite).
