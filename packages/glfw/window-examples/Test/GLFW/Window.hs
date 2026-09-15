@@ -646,7 +646,8 @@ testFaultBesideFailingDetach = do
       fmap nativeOutcome (fromException primary) `shouldBe` Just NativeCallReturned
       labels `shouldBe` sort ["glfw window callback fault", "glfw window callbacks"]
       fault `shouldBe` Just (ErrorCall "kept fault")
-      phase `shouldBe` WindowReleased
+      -- The detach failed while release stayed certain.
+      phase `shouldBe` WindowDisposalFailed
   where
     scenario script = do
       seam ← newSeam script

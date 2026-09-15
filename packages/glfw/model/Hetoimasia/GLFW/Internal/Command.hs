@@ -10,7 +10,8 @@
 --
 -- = Admission
 --
--- A 'WindowCommand' is an immutable value addressed to one window. Submitting
+-- A 'WindowCommand' is an immutable value: a request to observe or close one
+-- window, or to create a window from a 'WindowConfig'. Submitting
 -- one issues a request identity, records the submission site and the caller's
 -- diagnostic context beside it as a 'CommandOrigin', and prepares the message
 -- to normal form on the submitting thread before anything is admitted.
@@ -36,8 +37,9 @@
 --
 -- * 'Performed', with prepared 'CommandResult' data;
 -- * 'Rejected', with a typed 'CommandRejection', when nothing was applied — a
---   window the executor does not serve, a window that has ended, or a native
---   failure, carried as copied code and description data;
+--   window the executor does not serve, a window that has ended or is closing,
+--   a command outside the port's scope, a creation refused before any native
+--   effect, or a native failure, carried as copied code and description data;
 -- * 'NotExecuted', when closure settled it while it was still queued;
 -- * 'Interrupted', with its request identity, when its execution or the
 --   preparation of its completion data raised. Effects may have been applied;
@@ -48,6 +50,30 @@
 -- exception is never serialized into a ticket: the ticket names only the
 -- interrupted request, and the exception propagates from the executor with its
 -- own type and context.
+--
+-- = The creation handoff
+--
+-- A creation that succeeds settles as 'Performed' 'WindowCreated', naming the new
+-- window: ordinary data, prepared like every other disposition. The new window's
+-- client capabilities — its own command port and its read-only observations —
+-- are not data and are never prepared or put inside a message. They travel as a
+-- 'WindowClient' written beside the prepared disposition in the settling
+-- transaction, and 'pollWindowClient' reads them from the ticket. The executor
+-- hands them over only after the window was constructed, registered with its
+-- owner, and published its initial observation. A 'WindowClient' carries no
+-- native handle and no release, retirement, or creation authority. A creation
+-- interrupted before its settlement, including after registration, settles as
+-- 'Interrupted' with no capabilities; the window's owner still owns it.
+--
+-- = Port scope
+--
+-- A host created by 'newWindowCommandHost' serves every command. A window's own
+-- host, created privately for one window, serves only that window: its port can
+-- submit anything, but the executor settles a creation as 'Rejected'
+-- 'CreationNotPermitted' and a command addressed to another window as 'Rejected'
+-- 'WindowNotServed', each without executing it and each costing its dispatch
+-- attempt. A window's port therefore grants no authority over another window and
+-- no authority to create one.
 --
 -- = Tickets
 --
@@ -80,12 +106,18 @@
 -- production caller is the window host's owner loop in "Hetoimasia.Runtime.GLFW";
 -- the test seam's private executor also drives it in CPU examples.
 --
--- The one command is 'observeWindowCommand'. Executing it synchronizes the
--- addressed window at an owner boundary, which samples and publishes through
+-- 'observeWindowCommand' synchronizes the addressed window at an owner
+-- boundary, which samples and publishes through
 -- "Hetoimasia.GLFW.Internal.Window"'s observation contract, and answers with
 -- the revision of the committed observation that followed: a new revision when
 -- sampling changed anything, and otherwise the published one the sample
 -- matched. It never samples another window.
+--
+-- 'closeWindowCommand' and 'createWindowCommand' change which windows exist, so
+-- only an executor that owns window lifetimes performs them: the window host's
+-- owner loop in "Hetoimasia.Runtime.GLFW". The executor over lexically scoped
+-- windows, used by 'performWindowCommand' and the test seam, settles them as
+-- 'Rejected' 'CloseNotPermitted' and 'CreationNotPermitted'.
 --
 -- = Bookkeeping
 --
@@ -119,13 +151,18 @@
 -- | Active count         | The host    | Claims raise it;            | Owner                  | The host              | Zero whenever nothing is   |
 -- |                      |             | settlements lower it        |                        |                       | executing                  |
 -- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
--- | Completion cell      | Its ticket  | Settled once; tickets read  | Settle: owner; read:   | While a ticket        | Never reset                |
--- |                      |             |                             | any                    | references it         |                            |
+-- | Completion cell      | Its ticket  | Settled once, with any      | Settle: owner; read:   | While a ticket        | Never reset                |
+-- |                      |             | created window's client     | any                    | references it         |                            |
+-- |                      |             | beside the prepared         |                        |                       |                            |
+-- |                      |             | disposition; tickets read   |                        |                       |                            |
 -- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
 -- | Admission flag       | The host    | Closure sets it; direct     | Owner                  | The host              | Never cleared              |
 -- |                      |             | performance reads it        |                        |                       |                            |
 -- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
 -- | Request counter      | The port    | Submissions issue from it   | Any; atomic            | The host              | Never reissued             |
+-- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
+-- | Port scope           | The host    | Fixed at creation; the      | Any                    | The host              | Immutable                  |
+-- |                      |             | executor reads it           |                        |                       |                            |
 -- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
 --
 -- None of this is application state, and none of it holds a native handle.
@@ -147,8 +184,10 @@ module Hetoimasia.GLFW.Internal.Command
   , awaitSubmitWindowCommand
 
     -- * Commands
-  , WindowCommand
+  , WindowCommand (..)
   , observeWindowCommand
+  , closeWindowCommand
+  , createWindowCommand
   , commandWindow
 
     -- * Origins
@@ -169,6 +208,13 @@ module Hetoimasia.GLFW.Internal.Command
   , CommandResult (..)
   , CommandRejection (..)
 
+    -- * Window clients
+  , WindowClient
+  , clientWindow
+  , clientCommandPort
+  , clientObservations
+  , pollWindowClient
+
     -- * Misuse
   , WindowCommandMisuse (..)
 
@@ -178,8 +224,16 @@ module Hetoimasia.GLFW.Internal.Command
   , noAdmissionHooks
   , submitWith
   , ExecutionStep (..)
+  , Execution (..)
   , executeNextWith
   , executeCommand
+  , observeWindow
+  , nativeRejectionOf
+
+    -- * Private window ports
+  , PortScope (..)
+  , newWindowPortHost
+  , newWindowClient
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -232,6 +286,7 @@ import Hetoimasia.Foundation.Messaging.Channel
   , send
   )
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
 import Hetoimasia.GLFW.Internal.Capture (NativeError (..), Reports (..))
 import Hetoimasia.GLFW.Internal.Session
   ( NativeFailure (..)
@@ -243,7 +298,10 @@ import Hetoimasia.GLFW.Internal.Session
   )
 import Hetoimasia.GLFW.Internal.Window
   ( Window
+  , WindowConfig
+  , WindowConfigRejected
   , WindowId
+  , WindowObservation
   , WindowResult (..)
   , observedRevision
   , synchronizeWindow
@@ -258,20 +316,38 @@ import Numeric.Natural (Natural)
 
 -- | One immutable window command. Its representation is private, so a command
 -- is only ever one of the commands this module defines.
-newtype WindowCommand = ObserveWindow WindowId
+data WindowCommand
+  = ObserveWindow !WindowId
+  | CloseWindow !WindowId
+  | CreateWindow !WindowConfig
   deriving (Eq, Show)
 
 instance NFData WindowCommand where
   rnf (ObserveWindow window) = rnf window
+  rnf (CloseWindow window) = rnf window
+  rnf (CreateWindow config) = rnf config
 
 -- | Ask the owner to sample the window and publish a fresh observation of it at
 -- its next safe boundary.
 observeWindowCommand ∷ WindowId → WindowCommand
 observeWindowCommand = ObserveWindow
 
--- | The window a command is addressed to.
-commandWindow ∷ WindowCommand → WindowId
-commandWindow (ObserveWindow window) = window
+-- | Ask the owner to begin the window's close protocol. Only an executor that
+-- owns window lifetimes performs it.
+closeWindowCommand ∷ WindowId → WindowCommand
+closeWindowCommand = CloseWindow
+
+-- | Ask the owner to create a window from the configuration. Only an executor
+-- that owns window lifetimes performs it, and only through a port with creation
+-- authority.
+createWindowCommand ∷ WindowConfig → WindowCommand
+createWindowCommand = CreateWindow
+
+-- | The window a command is addressed to; 'Nothing' for a creation.
+commandWindow ∷ WindowCommand → Maybe WindowId
+commandWindow (ObserveWindow window) = Just window
+commandWindow (CloseWindow window) = Just window
+commandWindow (CreateWindow _) = Nothing
 
 -- | A request's identity: its host's identity and a local number that host never
 -- reissues. Only the local number is displayed.
@@ -292,7 +368,7 @@ requestLocalIdentity (RequestId _ local) = local
 -- | Where a request came from, prepared with it.
 data CommandOrigin = CommandOrigin
   { originRequestId ∷ !RequestId
-  , originTarget ∷ !WindowId
+  , originTarget ∷ !(Maybe WindowId)
   , originSubmissionSite ∷ !(Maybe FailureSite)
   , originCallerContext ∷ ![(Text, Text)]
   }
@@ -309,8 +385,8 @@ instance NFData CommandOrigin where
 submittedRequest ∷ CommandOrigin → RequestId
 submittedRequest = originRequestId
 
--- | The window the request was addressed to.
-submittedWindow ∷ CommandOrigin → WindowId
+-- | The window the request was addressed to; 'Nothing' for a creation.
+submittedWindow ∷ CommandOrigin → Maybe WindowId
 submittedWindow = originTarget
 
 -- | Where the request was submitted: the outermost call-stack frame and the
@@ -353,9 +429,8 @@ rnfSite (Just (FailureSite location frames)) = rnfLocation location `seq` foldr 
 -- context.
 originIdentifiers ∷ CommandOrigin → [(Text, Text)]
 originIdentifiers origin =
-  [ ("request", Text.pack (show (requestLocalIdentity (originRequestId origin))))
-  , ("window", Text.pack (show (windowLocalIdentity (originTarget origin))))
-  ]
+  [("request", Text.pack (show (requestLocalIdentity (originRequestId origin))))]
+    <> maybe [] (\window → [("window", Text.pack (show (windowLocalIdentity window)))]) (originTarget origin)
     <> maybe [] (\site → [("submitted-at", siteText site)]) (originSubmissionSite origin)
     <> originCallerContext origin
   where
@@ -385,15 +460,28 @@ instance NFData Disposition where
   rnf (Interrupted request) = rnf request
 
 -- | What a performed command produced.
-data CommandResult = ObservationPublished
-  { publishedWindow ∷ !WindowId
-  , publishedRevision ∷ !Natural
-    -- ^ The revision of the committed observation that followed the sample.
-  }
+data CommandResult
+  = ObservationPublished
+      { publishedWindow ∷ !WindowId
+      , publishedRevision ∷ !Natural
+        -- ^ The revision of the committed observation that followed the sample.
+      }
+  | WindowCreated
+      { createdWindow ∷ !WindowId
+        -- ^ The new window. Its client capabilities are read from the ticket
+        -- with 'pollWindowClient'.
+      }
+  | WindowCloseBegun
+      { closingWindow ∷ !WindowId
+        -- ^ The window whose close protocol began: its admission closed and its
+        -- queued commands settled. Its disposal is reported by its observations.
+      }
   deriving (Eq, Show)
 
 instance NFData CommandResult where
   rnf (ObservationPublished window revision) = rnf window `seq` rnf revision
+  rnf (WindowCreated window) = rnf window
+  rnf (WindowCloseBegun window) = rnf window
 
 -- | Why a command was not performed.
 data CommandRejection
@@ -410,6 +498,32 @@ data CommandRejection
         -- ^ The codes and descriptions GLFW reported, copied.
       }
     -- ^ A native call failed before anything was published.
+  | WindowIsClosing !WindowId
+    -- ^ The window's close protocol has begun; nothing was performed.
+  | CloseNotPermitted !WindowId
+    -- ^ The executor does not own this window's lifetime, which ends with its
+    -- scope.
+  | CreationNotPermitted
+    -- ^ The port has no creation authority, or the executor cannot create.
+  | WindowConfigInvalid !WindowConfigRejected
+    -- ^ The configuration was refused before any native call.
+  | WindowCapacityReached !Int
+    -- ^ The owner already holds this many live windows, its fixed limit. No
+    -- native call was made and nothing waited.
+  | WindowCreationPoisoned
+    -- ^ An earlier release failure poisoned further creation. No native call was
+    -- made.
+  | WindowCreationFailed
+      { creationOperation ∷ !(Maybe Text)
+        -- ^ The operation the native failure was raised by.
+      , creationOutcome ∷ !NativeOutcome
+      , creationReports ∷ !Reports
+        -- ^ The codes and descriptions GLFW reported, copied.
+      }
+    -- ^ A native call failed during construction. What construction had
+    -- acquired was rolled back, no window was registered, and no capacity was
+    -- consumed; a rollback's own cleanup failures poison creation and stay with
+    -- the owner as evidence.
   deriving (Eq, Show)
 
 instance NFData CommandRejection where
@@ -417,6 +531,14 @@ instance NFData CommandRejection where
   rnf (WindowAlreadyEnded window) = rnf window
   rnf (WindowNativeFailure window failed outcome reports) =
     rnf window `seq` rnf failed `seq` outcome `seq` rnfReports reports
+  rnf (WindowIsClosing window) = rnf window
+  rnf (CloseNotPermitted window) = rnf window
+  rnf CreationNotPermitted = ()
+  rnf (WindowConfigInvalid rejected) = rnf rejected
+  rnf (WindowCapacityReached limit) = rnf limit
+  rnf WindowCreationPoisoned = ()
+  rnf (WindowCreationFailed failed outcome reports) =
+    rnf failed `seq` outcome `seq` rnfReports reports
 
 rnfReports ∷ Reports → ()
 rnfReports reports =
@@ -452,7 +574,52 @@ performOperation = operation "perform window command"
 -- Hosts, ports, and tickets
 
 -- | A completion cell: empty until settled, then settled for good.
-type Cell = TVar (Maybe (Prepared Disposition))
+type Cell = TVar (Maybe Settlement)
+
+-- | What a cell is settled with: the prepared disposition, and, beside it and
+-- never inside it, the capabilities a successful creation hands over.
+data Settlement = Settlement !(Prepared Disposition) !(Maybe WindowClient)
+
+-- | The capabilities a client holds for one window: its identity, its own
+-- command port, and its read-only observations. Its representation is
+-- private: it carries no native handle and no release, retirement, or creation
+-- authority, and nothing in it reaches another window.
+data WindowClient = WindowClient
+  { clientIdentity ∷ !WindowId
+  , clientPort ∷ !WindowCommandPort
+  , clientReader ∷ !(SnapshotReader WindowObservation)
+  }
+
+instance Show WindowClient where
+  showsPrec precedence client =
+    showParen (precedence > 10) $
+      showString "WindowClient " . showsPrec 11 (clientIdentity client)
+
+-- | The window the capabilities are for.
+clientWindow ∷ WindowClient → WindowId
+clientWindow = clientIdentity
+
+-- | The window's own command port. The executor serves only commands addressed
+-- to this window through it, and no creation.
+clientCommandPort ∷ WindowClient → WindowCommandPort
+clientCommandPort = clientPort
+
+-- | The window's read-only observations. They stay readable after the window
+-- ends, holding its terminal observation.
+clientObservations ∷ WindowClient → SnapshotReader WindowObservation
+clientObservations = clientReader
+
+-- | Build the capabilities for a window from its own command host.
+newWindowClient ∷ WindowId → WindowCommandHost → SnapshotReader WindowObservation → WindowClient
+newWindowClient identity host = WindowClient identity (hostPort host)
+
+-- | Which commands a host's executor serves.
+data PortScope
+  = HostScope
+    -- ^ Every command.
+  | WindowScope !WindowId
+    -- ^ Only commands addressed to this window, and no creation.
+  deriving (Eq, Show)
 
 -- | The owner's side of a window command service. Its representation is
 -- private.
@@ -462,6 +629,7 @@ data WindowCommandHost = WindowCommandHost
   , hostPort ∷ !WindowCommandPort
   , hostActive ∷ !(TVar Natural)
   , hostNotExecuted ∷ !(Prepared Disposition)
+  , hostScope ∷ !PortScope
   }
 
 -- | The client's side of a window command service: it can only submit. Its
@@ -498,7 +666,15 @@ instance Show CompletionTicket where
 -- channel maximum is refused as 'Hetoimasia.Foundation.Messaging.Channel.newChannel'
 -- refuses it, attributed to the caller.
 newWindowCommandHost ∷ HasCallStack ⇒ Session → Integer → IO WindowCommandHost
-newWindowCommandHost session capacity =
+newWindowCommandHost session capacity = newScopedHost session capacity HostScope
+
+-- | Create an open, empty command host serving only one window, on the
+-- session's owner thread, with the checks of 'newWindowCommandHost'.
+newWindowPortHost ∷ HasCallStack ⇒ Session → Integer → WindowId → IO WindowCommandHost
+newWindowPortHost session capacity = newScopedHost session capacity . WindowScope
+
+newScopedHost ∷ HasCallStack ⇒ Session → Integer → PortScope → IO WindowCommandHost
+newScopedHost session capacity scope =
   ownerOperation session newHostOperation [("capacity", Text.pack (show capacity))] $ do
     control ← newChannel capacity
     identity ← newUnique
@@ -508,7 +684,16 @@ newWindowCommandHost session capacity =
     active ← newTVarIO 0
     notExecuted ← prepare NotExecuted
     let port = WindowCommandPort identity (sessionOwner session) (channelSender control) pending closed next
-    pure (WindowCommandHost session control port active notExecuted)
+    pure (WindowCommandHost session control port active notExecuted scope)
+
+-- | The rejection a command outside the host's scope settles with, if it is.
+outOfScope ∷ WindowCommandHost → WindowCommand → Maybe CommandRejection
+outOfScope host command = case (hostScope host, command) of
+  (HostScope, _) → Nothing
+  (WindowScope _, CreateWindow _) → Just CreationNotPermitted
+  (WindowScope served, _) → case commandWindow command of
+    Just target | target /= served → Just (WindowNotServed target)
+    _ → Nothing
 
 -- | The host's client port.
 windowCommandPort ∷ WindowCommandHost → WindowCommandPort
@@ -559,7 +744,7 @@ closeWindowCommands host = do
         Received entry → do
           let Submission origin _ = preparedValue entry
           cell ← pendingCell port origin
-          _ ← settleCell port origin cell (hostNotExecuted host)
+          _ ← settleCell port origin cell (Settlement (hostNotExecuted host) Nothing)
           drain (settled + 1)
         -- A closed channel never answers 'Empty'; either way nothing is queued.
         Empty → pure settled
@@ -683,12 +868,12 @@ pendingCell port origin =
 
 -- | Settle a cell unless it is already settled, and remove it from the
 -- bookkeeping. Answers the disposition the cell holds.
-settleCell ∷ WindowCommandPort → CommandOrigin → Cell → Prepared Disposition → STM Disposition
-settleCell port origin cell disposition = do
-  settled ←
+settleCell ∷ WindowCommandPort → CommandOrigin → Cell → Settlement → STM Disposition
+settleCell port origin cell settlement = do
+  Settlement settled _ ←
     readTVar cell >>= \case
       Just existing → pure existing
-      Nothing → disposition <$ writeTVar cell (Just disposition)
+      Nothing → settlement <$ writeTVar cell (Just settlement)
   modifyTVar' (portPending port) (Map.delete (originKey origin))
   pure (preparedValue settled)
 
@@ -701,7 +886,13 @@ ticketOrigin = ticketRequestOrigin
 
 -- | The disposition, if the command has settled. Never waits.
 pollCompletion ∷ CompletionTicket → STM (Maybe Disposition)
-pollCompletion ticket = fmap preparedValue <$> readTVar (ticketCell ticket)
+pollCompletion ticket = fmap (\(Settlement disposition _) → preparedValue disposition) <$> readTVar (ticketCell ticket)
+
+-- | The capabilities a settled creation handed over: 'Just' only once the
+-- command has settled as 'Performed' 'WindowCreated'. Never waits, and may be
+-- read as often as desired.
+pollWindowClient ∷ CompletionTicket → STM (Maybe WindowClient)
+pollWindowClient ticket = (>>= \(Settlement _ client) → client) <$> readTVar (ticketCell ticket)
 
 -- | Wait for the command to settle and return its disposition. It may be
 -- repeated, and cancelling it affects nothing but the wait.
@@ -736,18 +927,27 @@ data ExecutionStep
     -- ^ Admission has ended and nothing is queued.
   deriving (Eq, Show)
 
+-- | What an execution produced: completion data, or a created window's
+-- capabilities, from which the executor prepares 'WindowCreated' itself.
+data Execution
+  = Completed !(Either CommandRejection CommandResult)
+  | Created !WindowClient
+
 -- | Claim the oldest queued command, execute it with @work@, prepare its
 -- completion data, and settle it, on the owner thread.
 --
 -- The claim and the protection of its whole lifetime begin together, so no
 -- interruption can separate them. @afterClaim@ runs first inside that
--- protection; production passes @pure ()@. Anything raised afterwards settles
--- the command as 'Interrupted' and is rethrown with its context, gaining the
--- execute operation's context if it is synchronous.
+-- protection; production passes @pure ()@. A command outside the host's
+-- 'PortScope' is settled as rejected without calling @work@. Anything raised
+-- afterwards settles the command as 'Interrupted', with no capabilities, and is
+-- rethrown with its context, gaining the execute operation's context if it is
+-- synchronous. A created window's capabilities are written beside its prepared
+-- disposition in the settling transaction.
 executeNextWith
   ∷ IO ()
   → WindowCommandHost
-  → (CommandOrigin → WindowCommand → IO (Either CommandRejection CommandResult))
+  → (CommandOrigin → WindowCommand → IO Execution)
   → IO ExecutionStep
 executeNextWith afterClaim host work =
   ownerOperation (hostSession host) executeOperation [] $ mask $ \restore →
@@ -755,17 +955,19 @@ executeNextWith afterClaim host work =
       Nothing → atomically (readTVar (portClosed port)) >>= \closed →
         pure (if closed then CommandsEnded else NothingQueued)
       Just (origin, command, cell) → do
-        outcome ∷ Either (ExceptionWithContext SomeException) (Prepared Disposition) ←
+        outcome ∷ Either (ExceptionWithContext SomeException) Settlement ←
           tryWithContext . restore $
             withOperationContext glfwComponent executeOperation (originIdentifiers origin) $ do
               afterClaim
-              result ← work origin command
-              prepare (either Rejected Performed result)
+              execution ← maybe (work origin command) (pure . Completed . Left) (outOfScope host command)
+              case execution of
+                Completed result → (`Settlement` Nothing) <$> prepare (either Rejected Performed result)
+                Created client → (`Settlement` Just client) <$> prepare (Performed (WindowCreated (clientIdentity client)))
         case outcome of
-          Right prepared → Executed origin <$> atomically (finish origin cell prepared)
+          Right settlement → Executed origin <$> atomically (finish origin cell settlement)
           Left caught → do
             interrupted ← prepare (Interrupted (originRequestId origin))
-            _ ← atomically (finish origin cell interrupted)
+            _ ← atomically (finish origin cell (Settlement interrupted Nothing))
             rethrowIO caught
   where
     port = hostPort host
@@ -782,38 +984,50 @@ executeNextWith afterClaim host work =
       modifyTVar' (hostActive host) (subtract 1)
       settleCell port origin cell prepared
 
--- | Execute a command against the windows an executor serves.
-executeCommand ∷ [Window] → CommandOrigin → WindowCommand → IO (Either CommandRejection CommandResult)
-executeCommand windows _ = runCommand windows
+-- | Execute a command against the lexically scoped windows an executor serves.
+-- They cannot be closed early or added to.
+executeCommand ∷ [Window] → CommandOrigin → WindowCommand → IO Execution
+executeCommand windows _ = fmap Completed . runCommand windows
 
 runCommand ∷ [Window] → WindowCommand → IO (Either CommandRejection CommandResult)
-runCommand windows (ObserveWindow target) =
-  case find ((== target) . windowIdentity) windows of
-    Nothing → pure (Left (WindowNotServed target))
-    Just window →
-      tryWithContext (synchronizeWindow window) >>= \case
-        Right (WindowAvailable observation) →
-          pure (Right (ObservationPublished target (observedRevision observation)))
-        Right (WindowEnded _) → pure (Left (WindowAlreadyEnded target))
-        Left caught@(ExceptionWithContext context failure)
-          -- A callback fault rethrown at the boundary is not the sampling's
-          -- native failure, whatever its type.
-          | raisedByCallback evidence → rethrowIO caught
-          | otherwise →
-              pure
-                ( Left
-                    WindowNativeFailure
-                      { failedWindow = target
-                      , failedOperation = failedName (failureCause evidence)
-                      , failedOutcome = nativeOutcome failure
-                      , failedReports = nativeReports failure
-                      }
-                )
-          where
-            evidence = failureEvidenceInContext context
+runCommand windows = \case
+  ObserveWindow target → maybe (pure (Left (WindowNotServed target))) (observeWindow target) (served target)
+  CloseWindow target → pure (Left (maybe (WindowNotServed target) (const (CloseNotPermitted target)) (served target)))
+  CreateWindow _ → pure (Left CreationNotPermitted)
   where
-    raisedByCallback evidence =
-      any ((== windowCallbackOperation) . contextOperation) (failureContexts evidence)
+    served target = find ((== target) . windowIdentity) windows
+
+-- | Synchronize one window at an owner boundary and answer the revision that
+-- followed. A native failure raised by the sampling is a typed rejection; a
+-- callback fault rethrown at the boundary, and anything else, propagates.
+observeWindow ∷ WindowId → Window → IO (Either CommandRejection CommandResult)
+observeWindow target window =
+  tryWithContext (synchronizeWindow window) >>= \case
+    Right (WindowAvailable observation) →
+      pure (Right (ObservationPublished target (observedRevision observation)))
+    Right (WindowEnded _) → pure (Left (WindowAlreadyEnded target))
+    Left caught → case nativeRejectionOf caught of
+      Just (failed, outcome, reports) →
+        pure
+          ( Left
+              WindowNativeFailure
+                { failedWindow = target
+                , failedOperation = failed
+                , failedOutcome = outcome
+                , failedReports = reports
+                }
+          )
+      Nothing → rethrowIO caught
+
+-- | The copied data of a native failure raised by a native call, or 'Nothing'
+-- for a callback fault rethrown at an owner boundary, which is not that call's
+-- native failure whatever its type.
+nativeRejectionOf ∷ ExceptionWithContext NativeFailure → Maybe (Maybe Text, NativeOutcome, Reports)
+nativeRejectionOf (ExceptionWithContext context failure)
+  | any ((== windowCallbackOperation) . contextOperation) (failureContexts evidence) = Nothing
+  | otherwise = Just (failedName (failureCause evidence), nativeOutcome failure, nativeReports failure)
+  where
+    evidence = failureEvidenceInContext context
     failedName (EngineOrigin origin) = Just (operationText (originOperation origin))
     failedName NativeCause = Nothing
 
@@ -825,10 +1039,12 @@ runCommand windows (ObserveWindow target) =
 -- Haskell exception propagates unchanged.
 performWindowCommand ∷ WindowCommandHost → [Window] → WindowCommand → IO Disposition
 performWindowCommand host windows command =
-  ownerOperation (hostSession host) performOperation [("window", Text.pack (show (windowLocalIdentity (commandWindow command))))] $ do
+  ownerOperation (hostSession host) performOperation identifiers $ do
     closed ← readTVarIO (portClosed (hostPort host))
     if closed
       then pure NotExecuted
       else do
-        result ← runCommand windows command
+        result ← maybe (runCommand windows command) (pure . Left) (outOfScope host command)
         preparedValue <$> prepare (either Rejected Performed result)
+  where
+    identifiers = maybe [] (\window → [("window", Text.pack (show (windowLocalIdentity window)))]) (commandWindow command)

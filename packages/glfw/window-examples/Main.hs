@@ -6,10 +6,11 @@
 module Main (main) where
 
 import qualified Test.GLFW.Command as Command
+import qualified Test.GLFW.Dynamic as Dynamic
 import qualified Test.GLFW.Host as Host
 import qualified Test.GLFW.Monitor as Monitor
 import qualified Test.GLFW.Window as Window
 import Test.Hspec (describe, hspec)
 
 main ∷ IO ()
-main = hspec (describe "GLFW" (Window.spec >> Command.spec >> Host.spec >> Monitor.spec))
+main = hspec (describe "GLFW" (Window.spec >> Command.spec >> Host.spec >> Dynamic.spec >> Monitor.spec))

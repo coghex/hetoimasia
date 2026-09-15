@@ -652,10 +652,16 @@ settings windows =
 windowNamed ∷ Text → WindowConfig
 windowNamed name = hiddenTestWindowConfig name 64 48
 
+-- | The host's only window, on the owner thread. It is taken out of its borrow
+-- so an example can inspect its terminal state after the run; the examples only
+-- read it, and never keep it across its release on the owner thread.
 onlyWindow ∷ WindowHost → IO Window
-onlyWindow host = case hostWindows host of
-  [window] → pure window
-  windows → unexpected ("expected one window, found " <> show (length windows))
+onlyWindow host =
+  atomically (hostWindowIdentities host) >>= \case
+    [identity] → withHostWindow host identity pure >>= \case
+      WindowAvailable window → pure window
+      WindowEnded _ → unexpected "the host's only window has ended"
+    windows → unexpected ("expected one window, found " <> show (length windows))
 
 heldWindow ∷ IORef (Maybe Window) → IO Window
 heldWindow held = readIORef held >>= maybe (unexpected "no window was built") pure
