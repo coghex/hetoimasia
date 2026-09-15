@@ -17,7 +17,21 @@
 -- The scripted library answers every query with values deliberately different
 -- from every request, so an observation that copied its request would be seen.
 -- Threads are coordinated with 'MVar's, never with a sleep.
-module Test.GLFW.Window (spec) where
+module Test.GLFW.Window
+  ( spec
+
+    -- * Support shared with the command examples
+  , entered
+  , current
+  , stashed
+  , onThread
+  , caughtAs
+  , unexpected
+  , originOf
+  , operationOf
+  , contextsOf
+  , boundedExample
+  ) where
 
 import Control.Concurrent (ThreadId, forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)

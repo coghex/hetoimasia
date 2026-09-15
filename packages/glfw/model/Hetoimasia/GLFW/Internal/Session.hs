@@ -131,6 +131,7 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionNative
   , sessionCapture
   , sessionIdentity
+  , sessionOwner
   , nextWindowIdentity
   , requireUnpoisoned
   , poisonSession

@@ -8,8 +8,9 @@
 -- native error attribution, teardown, and poisoning.
 --
 -- A session is entered, its asynchronous error reports read, windows created
--- in it through "Hetoimasia.GLFW.Window", and it ends. There is no public event
--- loop, input, or window command operation yet.
+-- in it through "Hetoimasia.GLFW.Window" and commanded through
+-- "Hetoimasia.GLFW.Command", and it ends. There is no public event loop or input
+-- operation yet.
 --
 -- @
 -- main ∷ IO ()

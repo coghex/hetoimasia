@@ -258,6 +258,26 @@ not a verdict that Synarchy's design should be discarded.
   opacity harness exposes `-inplace` unit ids with `-package-id`, because
   sublibraries share their package's name.
   Contract: `docs/glfw.md`, "Windows".
+- GLFW-13 (#91) added `Hetoimasia.GLFW.Command`: an owner-created
+  `WindowCommandHost` (capacity-bounded, over `Messaging.Channel`) hands clients
+  a submit-only `WindowCommandPort`. Submission prepares the command with a
+  `CommandOrigin` (request id, window, call site, caller context);
+  `SubmitFull`/`SubmitClosed` are immediate and `awaitSubmitWindowCommand` is the
+  cancellable wait. Admission adds the message and a completion cell (keyed by
+  request in a pending map, never inside the message) in one transaction; a
+  `CompletionTicket` is persistent and non-consuming. Dispositions: `Performed`,
+  `Rejected` (not served, ended, copied native failure), `NotExecuted`
+  (closure), `Interrupted` (request id; the exception propagates with an
+  `execute window command` context, never serialized). On the owner thread,
+  waiting for a ticket or capacity fails with `OwnerThreadWouldWait`;
+  `performWindowCommand` is the direct path. `closeWindowCommands` is one finite
+  STM transaction that closes admission and settles the queued backlog, leaving
+  claimed work to its execution. The one command, `observeWindowCommand`, runs
+  `synchronizeWindow` and names the committed revision. Execution
+  (`executeNextWith`) is private; only the seam-core executor
+  (`seamExecuteNext*`) drives it until GLFW-3's owner loop drains ports. Its
+  examples live in `glfw-window-examples`. Contract: `docs/glfw.md`,
+  "Window commands".
 - Console `--smoke` needs no GPU, Lua, window, network, or Synarchy process.
 - Planned component directories contain ownership notes, not implementations.
 - Local Git initialized on `master`, with `origin` pointing to

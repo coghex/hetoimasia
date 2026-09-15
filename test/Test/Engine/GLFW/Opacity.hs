@@ -1,6 +1,7 @@
 -- | Examples proving that the GLFW package keeps its native handles, its
--- session and window representations, and its observation publisher out of
--- reach of a client outside the package.
+-- session, window, and window command representations, its observation
+-- publisher, and command execution and settlement out of reach of a client
+-- outside the package.
 --
 -- These examples compile separate single-module clients with the harness from
 -- "Test.Engine.Resources.Opacity", exposing @base@, @text@, @stm@,
@@ -11,17 +12,21 @@
 -- sublibraries; one names the window's and the observation's constructors; one
 -- reaches for a window's native handle and owner-boundary driver in the private
 -- window module; and one tries to close a window's observations through the
--- read endpoint it is given. One client must be accepted, linked, and run: it
--- uses only the public session and window interfaces, including the read-only
--- observation endpoint, and every path it takes is refused before GLFW is
--- initialized, so the example opens no display.
+-- read endpoint it is given. Two more are rejected for the window commands: one
+-- names the command host's, port's, and completion ticket's constructors, and
+-- one reaches for command execution and admission hooks in the private command
+-- module. One client must be accepted, linked, and run: it uses only the public
+-- session, window, and window command interfaces, including the read-only
+-- observation endpoint, a command port, and a completion ticket, and every path
+-- it takes is refused before GLFW is initialized, so the example opens no
+-- display.
 --
--- The test seam is a public component so this suite can depend on it. Two more
--- clients are compiled against it and must be rejected: one names the window
--- drivers through the public seam, which does not export them, and one reaches
--- for them in the seam's implementation, which belongs to the private
--- @seam-core@ sublibrary. Only the package's own @glfw-window-examples@
--- executable can use them.
+-- The test seam is a public component so this suite can depend on it. Four more
+-- clients are compiled against it and must be rejected: two name the window
+-- drivers and the private command executor through the public seam, which
+-- exports neither, and two reach for them in the seam's implementation, which
+-- belongs to the private @seam-core@ sublibrary. Only the package's own
+-- @glfw-window-examples@ executable can use them.
 module Test.Engine.GLFW.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
@@ -81,6 +86,49 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       rejectedBecause outcome "SnapshotPublisher"
       clientOutput outcome `shouldContain` "SnapshotReader"
 
+  it "rejects a client that names a command host, port, or completion ticket constructor" $
+    withClient "Client.hs" commandConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "WindowCommandHost"
+      clientOutput outcome `shouldContain` "WindowCommandPort"
+      clientOutput outcome `shouldContain` "CompletionTicket"
+
+  it "rejects a client that reaches for command execution or admission hooks in the private command module" $
+    withClient "Client.hs" commandInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so command execution is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Command"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that names the command executor through the public seam" $
+    withSeamClient "Client.hs" publicSeamExecutorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "seamExecuteNext"
+      clientOutput outcome `shouldContain` "submitWith"
+
+  it "rejects a client that reaches for the command executor in the private seam implementation" $
+    withSeamClient "Client.hs" privateSeamExecutorClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the command executor is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Seam"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "seam-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that names a window driver through the public seam" $
     withSeamClient "Client.hs" publicSeamDriverClient $ \compile → do
       outcome ← compile Typecheck
@@ -102,7 +150,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "seam-core"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
-  it "accepts and runs a client using only the public session and window interfaces, without initializing GLFW" $
+  it "accepts and runs a client using only the public session, window, and command interfaces, without initializing GLFW" $
     withClient "Main.hs" publicClient $ \compile → do
       outcome ← compile Link
       case clientStatus outcome of
@@ -146,6 +194,57 @@ publicSeamDriverClient =
     [ "module Client () where"
     , ""
     , "import Hetoimasia.GLFW.Seam (seamDrive, seamRejectCloseRequest)"
+    ]
+
+-- | A client naming the command executor and the admission hooks through the
+-- public seam.
+publicSeamExecutorClient ∷ String
+publicSeamExecutorClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Seam (seamExecuteNext, submitWith)"
+    ]
+
+-- | A client importing the command executor from the seam's private
+-- implementation.
+privateSeamExecutorClient ∷ String
+privateSeamExecutorClient =
+  unlines
+    [ "module Client () where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Seam (seamExecuteNext, seamExecuteNextScripted)"
+    ]
+
+-- | A client naming the command host's, port's, and ticket's data constructors.
+commandConstructorClient ∷ String
+commandConstructorClient =
+  unlines
+    [ "module Client (host, port, ticket) where"
+    , ""
+    , "import Hetoimasia.GLFW.Command (CompletionTicket (CompletionTicket), WindowCommandHost (WindowCommandHost), WindowCommandPort (WindowCommandPort))"
+    , ""
+    , "host ∷ Maybe WindowCommandHost"
+    , "host = Nothing"
+    , ""
+    , "port ∷ Maybe WindowCommandPort"
+    , "port = Nothing"
+    , ""
+    , "ticket ∷ Maybe CompletionTicket"
+    , "ticket = Nothing"
+    ]
+
+-- | A client reaching for command execution, which settles tickets, and for the
+-- admission hooks, in the private command module.
+commandInternalsClient ∷ String
+commandInternalsClient =
+  unlines
+    [ "module Client (settle) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Command (ExecutionStep, WindowCommandHost, executeNextWith, noAdmissionHooks)"
+    , ""
+    , "settle ∷ WindowCommandHost → IO ExecutionStep"
+    , "settle host = noAdmissionHooks `seq` executeNextWith (pure ()) host (\\_ _ → pure (Left undefined))"
     ]
 
 -- | A client importing the window drivers from the seam's private
@@ -241,7 +340,8 @@ publisherClient =
 -- | A client using only the public interface. A Wayland request is refused as
 -- unsupported before anything else, and a default request is refused because
 -- this client is built without the threaded runtime, so no thread is the bound
--- process main thread: neither reaches GLFW.
+-- process main thread: neither reaches GLFW, so the window command path inside
+-- the second compiles and links but never runs.
 publicClient ∷ String
 publicClient =
   unlines
@@ -254,6 +354,7 @@ publicClient =
     , "import Hetoimasia.Foundation.Log (componentText)"
     , "import Hetoimasia.Foundation.Messaging.Payload (preparedValue)"
     , "import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)"
+    , "import Hetoimasia.GLFW.Command"
     , "import Hetoimasia.GLFW.Session"
     , "import Hetoimasia.GLFW.Window"
     , ""
@@ -261,13 +362,24 @@ publicClient =
     , "main = do"
     , "  wayland ← try (withSession defaultSessionConfig {requestedBackend = Just Wayland} (\\_ → pure ()))"
     , "  report \"wayland\" wayland"
-    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → withWindow session (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) latest >> pure ()))"
+    , "  unthreaded ← try (withSession defaultSessionConfig (\\session → withWindow session (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) (request session) >> pure ()))"
     , "  report \"without the threaded runtime\" unthreaded"
     , "  putStrLn (\"capacity = \" <> show errorEvidenceCapacity <> \", description limit = \" <> show errorDescriptionLimit)"
     , "  putStrLn (\"zero width = \" <> either show (const \"accepted\") (validateWindowConfig (hiddenTestWindowConfig (Text.pack \"tool\") 0 48)))"
     , ""
     , "latest ∷ Window → IO (Attribute Extent)"
     , "latest window = observedFramebufferExtent . preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))"
+    , ""
+    , "request ∷ Session → Window → IO (Maybe Disposition)"
+    , "request session window = do"
+    , "  _ ← latest window"
+    , "  host ← newWindowCommandHost session 4"
+    , "  submitted ← submitWindowCommand (windowCommandPort host) [(Text.pack \"client\", Text.pack \"tool\")] (observeWindowCommand (windowIdentity window))"
+    , "  case submitted of"
+    , "    SubmitAccepted ticket → do"
+    , "      _ ← atomically (closeWindowCommands host)"
+    , "      Just <$> awaitCompletion ticket"
+    , "    _ → pure Nothing"
     , ""
     , "report ∷ String → Either SomeException () → IO ()"
     , "report label outcome = case outcome of"
