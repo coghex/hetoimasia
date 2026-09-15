@@ -69,13 +69,15 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testDisconnectedSelection)
     it "falls back through the owner loop when the applied monitor disconnects, deriving a reachable placement and keeping the saved one"
       (boundedExample testDisconnectAfterApplied)
+    it "follows a borderless window a later move callback carries onto another monitor's work area through the owner loop, with no synchronization"
+      (boundedExample testDelayedBorderlessConvergence)
     it "reports finite exhaustion when no monitor remains to place the window in"
       (boundedExample testEmptyInventory)
     it "settles borderless placement the platform cannot perform as unsupported, never as fullscreen"
       (boundedExample testUnsupportedBorderless)
     it "reports a partial native failure with its completed steps and leaves the saved placement unchanged"
       (boundedExample testPartialFailure)
-    it "stops recovery when restoring the windowed constraints fails during an attempt's cleanup"
+    it "stops recovery when restoring the windowed constraints fails during an attempt's cleanup, and a later refusal makes no setter"
       (boundedExample testCleanupStopsRecovery)
     it "propagates a cleanup that raises instead of reporting, settling its command as interrupted rather than as data"
       (boundedExample testRaisingCleanup)
@@ -382,6 +384,49 @@ testDisconnectAfterApplied = do
   where
     configuration = (defaultHostConfig [hiddenTestWindowConfig "first" 800 600]) {hostIdleWait = 0.01}
 
+-- | The window host's owner loop over a seam session: a borderless request over
+-- the left monitor, then a move callback, delivered by a poll as a window
+-- manager's late placement would be, onto the right monitor's work area.
+testDelayedBorderlessConvergence ∷ Expectation
+testDelayedBorderlessConvergence = do
+  seam ← newSeam tracked
+  stage ← newIORef (0 ∷ Int)
+  ticket ← newIORef Nothing
+  (applied, placed, right) ←
+    hosted seam configuration $ \host control →
+      looping host control $ \_ → do
+        client ← onlyClient host
+        let target = clientWindow client
+        inventory ← preparedValue . observedValue <$> atomically (readSnapshot (hostMonitors host))
+        readIORef stage >>= \case
+          0 → do
+            left ← named "left" inventory
+            submitted ← submitWindowCommand (clientCommandPort client) [] (setWindowModeCommand target (modeRequest (borderlessMode left) noModeFallback))
+            case submitted of
+              SubmitAccepted accepted → writeIORef ticket (Just accepted) >> writeIORef stage 1
+              other → unexpected ("the borderless request was not admitted: " <> show other)
+            pure Continue
+          1 → do
+            accepted ← readIORef ticket >>= maybe (unexpected "no ticket was stored") pure
+            atomically (pollCompletion accepted) >>= \case
+              Nothing → pure Continue
+              Just disposition → do
+                when (not (appliedCleanly disposition)) (unexpected ("the borderless request settled as " <> show disposition))
+                _ ← withHostWindow host target (\window → seamQueueEvents seam window [MovedTo 100 200])
+                writeIORef stage 2
+                pure Continue
+          _ → do
+            right ← named "right" inventory
+            latest ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+            pure $
+              if modeApplied (observedMode latest) == AppliedBorderless right
+                then Finish (modeApplied (observedMode latest), observedPlacement latest, right)
+                else Continue
+  applied `shouldBe` AppliedBorderless right
+  placed `shouldBe` Observed (Placement 100 200)
+  where
+    configuration = (defaultHostConfig [hiddenTestWindowConfig "first" 800 600]) {hostIdleWait = 0.01}
+
 testEmptyInventory ∷ Expectation
 testEmptyInventory = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
   let seam = deskSeam desk
@@ -491,6 +536,15 @@ testCleanupStopsRecovery = do
                  , SetWindowSizeLimits 1 100 100 3000 3000
                  ]
     refusedSize `shouldBe` Rejected (ControlRejected target ActiveConstraintsIndeterminate)
+    -- A request refused before any native call runs no cleanup of its own, even
+    -- though the constraints are still indeterminate.
+    seamSetMonitorTopology (deskSeam desk) (MonitorTopology (Just [(2, rightMonitor)]) 2)
+    seamDeliverMonitorEvents (deskSeam desk) [MonitorDetached 1]
+    beforeRefusal ← length <$> seamCalls (deskSeam desk)
+    refusedAfterStop ← run (mode window (borderlessOn (deskLeft desk)))
+    settersAfterRefusal ← filter isSetter . drop beforeRefusal <$> seamCalls (deskSeam desk)
+    refusedAfterStop `shouldBe` Rejected (ModeRejected target (ModeMonitorDisconnected (deskLeft desk)))
+    settersAfterRefusal `shouldBe` []
 
 testRaisingCleanup ∷ Expectation
 testRaisingCleanup = do

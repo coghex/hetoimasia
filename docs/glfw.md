@@ -1447,8 +1447,11 @@ no current identity names, or one whose change the callback captured but no
 refresh folded, is `Unavailable`.
 
 The applied mode is re-derived at every full sample: a synchronization, a
-control's post-call sample, and a transition's samples, so a window manager that
-converges later is reflected, and eligibility follows it.
+control's post-call sample, and a transition's samples. Between samples, a
+position callback that moves a window applied borderless re-derives which
+monitor's work area it is over, from its latest sampled decoration and
+fullscreen monitor. A window manager that converges later is therefore
+reflected, and eligibility follows it.
 
 `observedMode` is the window's `ModeRecord`: `modeRequested` and `modeFallback`,
 the last request that executed; `modeApplied`, an `AppliedMode`; the
@@ -1496,7 +1499,9 @@ placement is reachable. The derived placement is never saved.
 
 An attempt's cleanup restores the preserved windowed constraints of a window the
 attempt left windowed while its native constraints were suspended or
-indeterminate. A restoration call that reports an error fails the cleanup, and,
+indeterminate, and only when that attempt made a constraint step itself: an
+attempt refused before any native call runs no cleanup call, whatever state an
+earlier transition left. A restoration call that reports an error fails the cleanup, and,
 as the recovery contract requires, a failure carrying cleanup evidence is never
 retried: the transition settles as `ModeRecoveryStopped`, with every attempt and
 the cleanup's reports, and no further native call is made. A cleanup that raises

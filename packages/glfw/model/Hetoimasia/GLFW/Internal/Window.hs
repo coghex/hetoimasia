@@ -146,7 +146,13 @@
 --
 -- Every full sample — a synchronization, a control's post-call sample, and a
 -- transition's samples — derives the applied mode and settles the window's
--- monitor claims before it publishes.
+-- monitor claims before it publishes. A callback-only fold that changes the
+-- placement of a window applied borderless re-derives which monitor's work area
+-- it is over, from its latest sampled decoration and fullscreen monitor, so a
+-- window manager that places it later is reflected without another sample.
+--
+-- An attempt's constraint cleanup runs only when that attempt made a constraint
+-- step itself, so an attempt refused before any native call makes none.
 --
 -- The transition interval is that execution, from setting the marker to the
 -- settlement, on the owner thread. Nothing else executes a command inside it: the
@@ -1268,8 +1274,12 @@ reconcileWith forced = reconcileAdjusted forced id
 -- sample it was reconciled with.
 reconcileAdjusted ∷ Bool → (WindowObservation → WindowObservation) → IO () → Window → Maybe Sample → IO ()
 reconcileAdjusted forced adjust interruption window sample = do
-  derived ← maybe (pure id) (presentationFrom window) sample
   pending ← readIORef (windowCaptures window)
+  derived ← case sample of
+    Just taken → presentationFrom window taken
+    Nothing
+      | isJust (capturedPlacement pending) → borderlessFrom window
+      | otherwise → pure id
   OwnerState current issued ← readIORef (windowOwnerState window)
   let (reconciledObservation, issued') = reconciled (windowId window) sample pending current issued
       folded = adjust (derived reconciledObservation)
@@ -1304,6 +1314,19 @@ presentationFrom window taken = do
   pure (\observation → observation {obsMode = recordApplied applied (obsMode observation)})
   where
     session = windowSession window
+
+-- | How a callback-only fold changes a borderless window's applied mode: its
+-- monitor is re-derived from the folded placement, with the decoration and
+-- fullscreen monitor of its latest sample. Any other applied mode depends on no
+-- placement, and is left alone.
+borderlessFrom ∷ Window → IO (WindowObservation → WindowObservation)
+borderlessFrom window = do
+  monitors ← currentSessionMonitors (windowSession window)
+  pure $ \observation → case modeApplied (obsMode observation) of
+    AppliedBorderless _ →
+      let applied = deriveApplied monitors (obsMonitor observation) (obsDecorated observation) (obsPlacement observation)
+       in observation {obsMode = recordApplied applied (obsMode observation)}
+    _ → observation
 
 -- | Publish a prepared observation and record it as the owner's current one.
 -- The caller must be masked: neither write is interruptible, so the two cannot
@@ -1686,7 +1709,7 @@ cleanupReports cleanups = combined <$> traverse native cleanups
 -- with them suspended.
 modeAttempt ∷ Window → ModeRequest → ModeAttemptKind → IO (ModeAttemptKind, [ModeStep])
 modeAttempt window request kind =
-  withResourceLabelled "glfw window constraint restoration" (pure ()) (\() → restoreLeftWindowed window) $ \() → do
+  withResourceLabelled "glfw window constraint restoration" (newIORef False) (restoreLeftWindowed window) $ \disturbed → do
     OwnerState current _ ← readIORef (windowOwnerState window)
     ControlState windowed native _ ← readIORef (windowControl window)
     let record = obsMode current
@@ -1720,7 +1743,7 @@ modeAttempt window request kind =
         placement ← refused (windowedPlacement windowed (modeSavedPlacement record) (inventoryMonitors inventory))
         plan ← refused (windowedPlan native windowed placement)
         pure (plan, Nothing)
-    runModeSteps window pointer plan >>= \case
+    runModeSteps window disturbed pointer plan >>= \case
       Right steps → (kind, steps) <$ samplePresentation True window (maybe id recordSaved leaving)
       Left failure → samplePresentation True window id >> failWith failure
   where
@@ -1745,13 +1768,14 @@ modeAttempt window request kind =
 -- | Make a plan's steps in order, stopping at the first that reports an error.
 -- The native constraint state is indeterminate from a constraint step's start
 -- until every step has returned.
-runModeSteps ∷ Window → Maybe (Ptr NativeMonitor) → ModePlan → IO (Either ModeFailure [ModeStep])
-runModeSteps window pointer (ModePlan steps after) = go [] steps
+runModeSteps ∷ Window → IORef Bool → Maybe (Ptr NativeMonitor) → ModePlan → IO (Either ModeFailure [ModeStep])
+runModeSteps window disturbed pointer (ModePlan steps after) = go [] steps
   where
     native = sessionNative (windowSession window)
     handle = windowHandle window
     go returned [] = Right (reverse returned) <$ mapM_ (setNativeConstraints window) after
     go returned (step : rest) = do
+      when (constraintStep step) (writeIORef disturbed True)
       when (isJust after && constraintStep step) (setNativeConstraints window NativeIndeterminate)
       reports ← reportsDuring (windowSession window) (call step)
       if hasReports reports
@@ -1811,16 +1835,18 @@ samplePresentation forced window adjust =
         (settleClaims (windowLocalIdentity (windowId window)) observed (pruneClaims live claims), ())
     withRecord change observation = observation {obsMode = change (obsMode observation)}
 
--- | An attempt's cleanup: restore the preserved windowed constraints of a window
--- left windowed with its native constraints suspended or indeterminate. A call
--- that reports an error fails the cleanup.
-restoreLeftWindowed ∷ Window → IO ()
-restoreLeftWindowed window = do
+-- | An attempt's cleanup: when the attempt made a constraint step, restore the
+-- preserved windowed constraints of a window it left windowed with its native
+-- constraints suspended or indeterminate. A call that reports an error fails
+-- the cleanup.
+restoreLeftWindowed ∷ Window → IORef Bool → IO ()
+restoreLeftWindowed window disturbed = do
+  stepped ← readIORef disturbed
   OwnerState current _ ← readIORef (windowOwnerState window)
   ControlState windowed native _ ← readIORef (windowControl window)
-  case (modeApplied (obsMode current), native, windowed) of
-    (AppliedWindowed, NativeSuspended, ConstraintsKnown preserved) → restore preserved
-    (AppliedWindowed, NativeIndeterminate, ConstraintsKnown preserved) → restore preserved
+  case (stepped, modeApplied (obsMode current), native, windowed) of
+    (True, AppliedWindowed, NativeSuspended, ConstraintsKnown preserved) → restore preserved
+    (True, AppliedWindowed, NativeIndeterminate, ConstraintsKnown preserved) → restore preserved
     _ → pure ()
   where
     session = windowSession window
