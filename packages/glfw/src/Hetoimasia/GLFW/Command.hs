@@ -15,8 +15,8 @@
 -- have to provide either: there it uses 'performWindowCommand'.
 --
 -- Ports, tickets, and hosts are opaque and carry no native handle. Executing
--- queued commands is private to this package; the owner's event loop drains
--- them in a later slice.
+-- queued commands is private to this package: the window host's owner loop in
+-- "Hetoimasia.Runtime.GLFW", from the @runtime-glfw@ sublibrary, drains them.
 --
 -- See "Hetoimasia.GLFW.Internal.Command"'s contract, repeated in prose in
 -- @docs/glfw.md@, for the admission, disposition, ticket, bookkeeping, and

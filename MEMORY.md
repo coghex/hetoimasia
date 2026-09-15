@@ -274,8 +274,8 @@ not a verdict that Synarchy's design should be discarded.
   STM transaction that closes admission and settles the queued backlog, leaving
   claimed work to its execution. The one command, `observeWindowCommand`, runs
   `synchronizeWindow` and names the committed revision. Execution
-  (`executeNextWith`) is private; only the seam-core executor
-  (`seamExecuteNext*`) drives it until GLFW-3's owner loop drains ports. Its
+  (`executeNextWith`) is private; GLFW-3's owner loop is its production caller
+  and the seam-core executor (`seamExecuteNext*`) drives it in tests. Its
   examples live in `glfw-window-examples`. Contract: `docs/glfw.md`,
   "Window commands".
 - GLFW-7 (#93) delivered TEST-2's first shared native fixture and the

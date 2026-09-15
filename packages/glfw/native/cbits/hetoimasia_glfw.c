@@ -15,6 +15,30 @@
 
 #include "hetoimasia_glfw.h"
 
+#include <stdatomic.h>
+
+/* The probed wait's state: 0 outside it, 1 inside it, 2 inside it after a
+ * progress note. Only the wait enters and leaves it, and a note moves 1 to 2
+ * in one compare-and-swap, so a note counts only if it landed strictly between
+ * the wait's entry and its return. */
+static atomic_int probed_wait_state = 0;
+
+int hetoimasia_glfw_wait_events_probed_for_check(double timeout)
+{
+    atomic_store(&probed_wait_state, 1);
+    glfwWaitEventsTimeout(timeout);
+    return atomic_exchange(&probed_wait_state, 0) == 2;
+}
+
+int hetoimasia_glfw_note_progress_for_check(void)
+{
+    int inside = 1;
+    if (!atomic_compare_exchange_strong(&probed_wait_state, &inside, 2))
+        return 0;
+    glfwPostEmptyEvent();
+    return 1;
+}
+
 #if defined(__APPLE__)
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>

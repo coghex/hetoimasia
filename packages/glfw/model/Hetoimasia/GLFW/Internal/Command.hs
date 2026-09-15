@@ -76,9 +76,9 @@
 -- context, so crossing the queue keeps where a request came from; the failure's
 -- origin stays at the operation that raised it.
 --
--- The executor protocol, 'executeNextWith', is private to this package. This
--- slice drives it only through the test seam's private executor; the owner's
--- event loop drains it in a later slice.
+-- The executor protocol, 'executeNextWith', is private to this package. Its one
+-- production caller is the window host's owner loop in "Hetoimasia.Runtime.GLFW";
+-- the test seam's private executor also drives it in CPU examples.
 --
 -- The one command is 'observeWindowCommand'. Executing it synchronizes the
 -- addressed window at an owner boundary, which samples and publishes through

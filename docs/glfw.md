@@ -238,7 +238,7 @@ component and the `construct window host` operation.
    are set, so session configuration never changes the process working
    directory, and `glfwInit` runs. A false return is a `NativeFailure` carrying
    the reports GLFW made during the call. That is how an initialization error is
-   observed before any event polling exists.
+   observed before any event is polled.
 7. **Verification.** Reports from a successful initialization are raised only
    now, after termination has been registered, and `glfwGetPlatform` must name
    the selected backend, or entry is `BackendNotSelected`.
@@ -438,8 +438,9 @@ ones are counted.
 Captures are reconciled on the owner thread at an owner boundary: at creation
 after the initial sampling, at `synchronizeWindow` after it samples, and after
 any private owner step's native calls return, whether that call was a setter or
-a poll. An observation request executes through the same boundary, and the
-event loop that arrives later will too. In order, a boundary:
+a poll. An observation request executes through the same boundary, and so
+does the window host's [owner loop](#the-window-host-and-owner-loop), which
+reconciles every window after each poll or wait. In order, a boundary:
 
 1. runs its native work, taking the reports made during it;
 2. reads the capture latch without clearing it and folds it, then any fresh
@@ -929,7 +930,7 @@ test environment.
 | Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
 | Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and a window host over a native table whose wait is probed cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. |
 | Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
@@ -958,8 +959,7 @@ The native examples cover:
 - a second window after a window's release in the same session;
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
-  the real owner loop and settled with a published revision, and that worker
-  progressing while the owner sits inside `glfwWaitEventsTimeout`;
+  the real owner loop and settled with a published revision;
 - a real close request — `performClose:` on Cocoa, a `WM_DELETE_WINDOW` client
   message on X11, sent by a test-only shim driver — reaching application policy
   without destroying the only window, the loop and a worker still running two
@@ -973,7 +973,14 @@ The native examples cover:
   X11 delivers it after a round trip to the server, so later boundaries wait
   for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
   within a bound of 100 boundaries of at most 50 ms — until the fault is
-  rethrown.
+  rethrown;
+- in a private process, a supervised worker progressing strictly inside the
+  window host's real native wait. The session's native table brackets
+  `glfwWaitEventsTimeout` in a test-only shim function, and the worker's
+  progress note is a compare-and-swap that succeeds only between that call's
+  entry into C and its return, then wakes the wait with `glfwPostEmptyEvent`.
+  On the suite's single capability, a wait that kept its capability would let
+  no note land inside it.
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct

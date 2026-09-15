@@ -28,6 +28,8 @@ module Hetoimasia.GLFW.Internal.Native
   , pollEventsForCheck
   , waitEventsForCheck
   , requestCloseForCheck
+  , waitEventsProbedForCheck
+  , noteProgressForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
   ) where
@@ -220,6 +222,18 @@ waitEventsForCheck seconds = c_glfwWaitEventsTimeout (CDouble seconds)
 requestCloseForCheck ∷ Ptr NativeWindow → IO ()
 requestCloseForCheck = c_requestCloseForCheck
 
+-- | 'waitEventsForCheck', bracketed in C for the native examples only: 'True'
+-- when 'noteProgressForCheck' succeeded strictly between the wait's entry into
+-- C and its return.
+waitEventsProbedForCheck ∷ Double → IO Bool
+waitEventsProbedForCheck seconds = (/= 0) <$> c_waitEventsProbedForCheck (CDouble seconds)
+
+-- | Record progress only while the owner is inside 'waitEventsProbedForCheck',
+-- and wake that wait with an empty event, for the native examples only. 'False'
+-- when no probed wait was in progress.
+noteProgressForCheck ∷ IO Bool
+noteProgressForCheck = (/= 0) <$> c_noteProgressForCheck
+
 -- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
 leakResizableHintForCheck ∷ IO ()
@@ -239,6 +253,12 @@ foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_is_process_main_th
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_request_close_for_check"
   c_requestCloseForCheck ∷ Ptr NativeWindow → IO ()
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wait_events_probed_for_check"
+  c_waitEventsProbedForCheck ∷ CDouble → IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_progress_for_check"
+  c_noteProgressForCheck ∷ IO CInt
 
 foreign import capi safe "hetoimasia_glfw.h glfwPlatformSupported"
   c_glfwPlatformSupported ∷ CInt → IO CInt
