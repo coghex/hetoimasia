@@ -40,6 +40,7 @@ import Test.Hspec
   , shouldNotBe
   , shouldNotContain
   , shouldReturn
+  , shouldSatisfy
   )
 
 data Fixture = Fixture
@@ -404,6 +405,90 @@ spec = describe "Validation evidence reuse" $ do
         output `shouldContain` "build.pass"
         output `shouldContain` "exited 1"
 
+  describe "display evidence" $ do
+    it "reuses an unchanged display group's receipt and skips the native worker, then executes it again for a changed native input" $
+      withNativeReceipt $ \fixture earlier → do
+        plan ← proseCandidate fixture
+        install fixture plan "test.native" [passing earlier]
+        (result, output, _) ← reuse fixture plan
+        result `shouldBe` ExitSuccess
+        output `shouldContain` "reused=test.native"
+        output `shouldContain` "run-native=false"
+        output `shouldContain` "groups-native=\n"
+        reusedIdentity ← identityOf plan
+        change fixture "native/note.txt" "a native input no run has validated\n"
+        changed ← planFrom fixture (seeded fixture) "HEAD" "native-changed-plan.json"
+        entryText changed "test.native" "reason" `shouldReturn` Just "affected"
+        identityOf changed >>= (`shouldNotBe` reusedIdentity)
+        install fixture changed "test.native" []
+        (again, againOutput, _) ← reuse fixture changed
+        again `shouldBe` ExitSuccess
+        againOutput `shouldContain` "run-native=true"
+        againOutput `shouldContain` "groups-native=test.native\n"
+
+    it "refuses a display receipt produced on another operating system" $
+      withNativeReceipt $ \fixture earlier → do
+        elsewhere ← patched fixture earlier "native-darwin.json" "runner_os" "\"Darwin\""
+        plan ← proseCandidate fixture
+        install fixture plan "test.native" [passing elsewhere]
+        refusal fixture plan "test.native" "a different runner_os"
+
+    it "refuses a display receipt that another route produced" $
+      withNativeReceipt $ \fixture earlier → do
+        reclassed ← patched fixture earlier "native-cpu.json" "runner_class" "\"cpu\""
+        plan ← proseCandidate fixture
+        install fixture plan "test.native" [passing reclassed]
+        refusal fixture plan "test.native" "records runner class 'cpu'"
+        misrouted ← patched fixture earlier "native-engine.json" "worker" "\"engine\""
+        install fixture plan "test.native" [passing misrouted]
+        refusal fixture plan "test.native" "records worker 'engine', not 'native'"
+
+    it "invalidates display evidence when the native dependency identity changes" $
+      withNativeReceipt $ \fixture earlier → do
+        change fixture "README.md" "a prose-only update\n"
+        pinned ← planCandidateWith fixture ["--toolchain", "native-manifest=" ++ replicate 64 'a'] (seeded fixture) "HEAD" "HEAD" "pinned.json"
+        rebuilt ← planCandidateWith fixture ["--toolchain", "native-manifest=" ++ replicate 64 'b'] (seeded fixture) "HEAD" "HEAD" "rebuilt.json"
+        pinnedIdentity ← identityOf pinned
+        identityOf rebuilt >>= (`shouldNotBe` pinnedIdentity)
+        recorded ←
+          patched fixture earlier "native-pinned.json" "toolchain"
+            ("{\"ghc\": \"9.12.2\", \"native-manifest\": \"" ++ replicate 64 'a' ++ "\"}")
+        install fixture rebuilt "test.native" [passing recorded]
+        refusal fixture rebuilt "test.native" "a different toolchain"
+
+    it "invalidates display evidence when the display setup changes" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "a native input\n"
+        before ← identityNow fixture
+        change fixture "display/setup.sh" "#!/bin/sh\necho a revised display\n"
+        identityNow fixture >>= (`shouldNotBe` before)
+        plan ← planFrom fixture "HEAD~1" "HEAD" "display-plan.json"
+        entryText plan "test.native" "reason" `shouldReturn` Just "affected"
+        entryText plan "test.fail" "reason" `shouldReturn` Just "unaffected"
+
+    it "refuses a restated worker assignment that conflicts with the plan's" $
+      withFixture $ \fixture → do
+        plan ← proseCandidate fixture
+        (result, _, errors) ← reuseWith fixture plan ["--worker", "native=test.fail"]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "conflicts with the plan's validated assignment"
+
+    it "refuses a plan resolved without worker declarations" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "a prose-only update\n"
+        (planned, output, planErrors) ←
+          run
+            (environment fixture)
+            (root fixture)
+            "python3"
+            [tools fixture </> "plan.py", "--base", seeded fixture, "--head", "HEAD", "--json"]
+        (planned, planErrors) `shouldBe` (ExitSuccess, "")
+        let inspection = root fixture </> "inspection.json"
+        writeFile inspection output
+        (result, _, errors) ← reuseWith fixture inspection []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "resolved without worker declarations"
+
 -- ---------------------------------------------------------------------------
 -- Driving the tools
 
@@ -413,20 +498,27 @@ planFrom fixture base head' = planCandidate fixture base head' head'
 -- | Resolve a plan with the real planner, under the pinned platform every
 -- receipt in these examples is compared against.
 planCandidate ∷ Fixture → String → String → String → FilePath → IO FilePath
-planCandidate fixture base head' candidate name = do
+planCandidate fixture = planCandidateWith fixture []
+
+-- | The same, with extra planner arguments such as another toolchain entry.
+planCandidateWith ∷ Fixture → [String] → String → String → String → FilePath → IO FilePath
+planCandidateWith fixture extra base head' candidate name = do
   (result, output, errors) ←
     run
       (environment fixture)
       (root fixture)
       "python3"
-      [ tools fixture </> "plan.py"
-      , "--base", base
-      , "--head", head'
-      , "--candidate", candidate
-      , "--toolchain", "ghc=9.12.2"
-      , "--runner-os", "Linux"
-      , "--json"
-      ]
+      ( [ tools fixture </> "plan.py"
+        , "--base", base
+        , "--head", head'
+        , "--candidate", candidate
+        , "--toolchain", "ghc=9.12.2"
+        , "--runner-os", "Linux"
+        , "--json"
+        ]
+          ++ fixtureWorkers
+          ++ extra
+      )
   (result, errors) `shouldBe` (ExitSuccess, "")
   let target = root fixture </> name
   writeFile target output
@@ -437,6 +529,19 @@ proseCandidate ∷ Fixture → IO FilePath
 proseCandidate fixture = do
   change fixture "README.md" "a prose-only update\n"
   planFrom fixture (seeded fixture) "HEAD" "plan.json"
+
+-- | The fixture's workers: one per group, the display group on the only worker
+-- declaring the display runner class.
+fixtureWorkers ∷ [String]
+fixtureWorkers =
+  ["--worker", "engine=cpu:build.pass", "--worker", "extra=cpu:test.fail", "--worker", "native=display:test.native"]
+
+-- | The worker and runner class 'fixtureWorkers' assigns a group to.
+routeOf ∷ String → [String]
+routeOf group = case group of
+  "build.pass" → ["--worker", "engine", "--runner-class", "cpu"]
+  "test.native" → ["--worker", "native", "--runner-class", "display"]
+  _ → ["--worker", "extra", "--runner-class", "cpu"]
 
 runGroup ∷ Fixture → FilePath → String → [String] → IO (ExitCode, String, String)
 runGroup fixture plan group extra =
@@ -452,23 +557,27 @@ runGroup fixture plan group extra =
       , "--toolchain", "ghc=9.12.2"
       , "--source-run-url", runUrl 41 1
       ]
-        ++ extra
+        ++ (if "--worker" `elem` extra then extra else routeOf group ++ extra)
     )
 
 reuse ∷ Fixture → FilePath → IO (ExitCode, String, String)
-reuse fixture plan =
+reuse fixture plan = reuseWith fixture plan ["--worker", "engine=build.pass", "--worker", "extra=test.fail"]
+
+-- | The lookup with whichever restated workers an example passes.
+reuseWith ∷ Fixture → FilePath → [String] → IO (ExitCode, String, String)
+reuseWith fixture plan workers =
   run
     (environment fixture)
     (root fixture)
     "python3"
-    [ tools fixture </> "reuse.py"
-    , "--plan", plan
-    , "--repo", "owner/project"
-    , "--output", root fixture </> "applicability.json"
-    , "--gh", stubDirectory fixture </> "gh"
-    , "--worker", "engine=build.pass"
-    , "--worker", "extra=test.fail"
-    ]
+    ( [ tools fixture </> "reuse.py"
+      , "--plan", plan
+      , "--repo", "owner/project"
+      , "--output", root fixture </> "applicability.json"
+      , "--gh", stubDirectory fixture </> "gh"
+      ]
+        ++ workers
+    )
 
 aggregate ∷ Fixture → FilePath → [String] → IO (ExitCode, String, String)
 aggregate fixture plan extra =
@@ -482,15 +591,18 @@ aggregate fixture plan extra =
       , "--applicability", root fixture </> "applicability.json"
       , "--summary", root fixture </> "summary.md"
       ]
-        ++ extra
+        ++ (if "--worker" `elem` extra then extra else extra ++ reported)
     )
+  where
+    reported = ["--worker", "engine=success", "--worker", "extra=success", "--worker", "native=success"]
 
 -- | Look one group up, expecting a refusal that names a reason.
 refusal ∷ Fixture → FilePath → String → String → IO ()
 refusal fixture plan group reason = do
   (result, output, _) ← reuse fixture plan
   result `shouldBe` ExitSuccess
-  output `shouldContain` ("execute=" ++ group)
+  [words (drop 8 line) | line ← lines output, take 8 line == ("execute=" ∷ String)]
+    `shouldSatisfy` any (group `elem`)
   document ← applicability fixture
   rejectionReason document group `shouldContain` reason
 
@@ -757,6 +869,19 @@ withReceipt action = withFixture $ \fixture → do
   removeFile (receiptPath fixture "build.pass")
   action fixture earlier
 
+-- | The same for the display group: a native input change an earlier run of the
+-- display worker validated.
+withNativeReceipt ∷ (Fixture → FilePath → IO a) → IO a
+withNativeReceipt action = withFixture $ \fixture → do
+  change fixture "native/note.txt" "the native input that earlier run validated\n"
+  plan ← planFrom fixture (seeded fixture) "HEAD" "native-seed-plan.json"
+  (result, _, errors) ← runGroup fixture plan "test.native" []
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  let earlier = root fixture </> "native-earlier.json"
+  copyFile (receiptPath fixture "test.native") earlier
+  removeFile (receiptPath fixture "test.native")
+  action fixture earlier
+
 withFixture ∷ (Fixture → IO a) → IO a
 withFixture action = do
   checkout ← getCurrentDirectory
@@ -802,6 +927,8 @@ fixtureFiles =
   , ("app/Main.hs", "module Main (main) where\nmain :: IO ()\nmain = pure ()\n")
   , ("src/note.txt", "a fixture the failing group consumes\n")
   , ("docs/consumed.md", "a document the failing group consumes\n")
+  , ("native/note.txt", "an input the display group consumes\n")
+  , ("display/setup.sh", "#!/bin/sh\necho a display\n")
   , ("README.md", "ordinary prose\n")
   , (".github/workflows/validation.yml", "name: validation\n")
   , ("tools/validation/helper.py", "# a validation tool beside the catalog\n")
@@ -861,6 +988,18 @@ fixtureCatalogWith policy inputs =
     , "      \"inputs\": [\"src/\", \"docs/consumed.md\"],"
     , "      \"framework\": \"hspec\","
     , "      \"runner\": \"cpu\","
+    , "      \"timeout_seconds\": 60,"
+    , "      \"category\": \"test\","
+    , "      \"optional\": false"
+    , "    },"
+    , "    {"
+    , "      \"id\": \"test.native\","
+    , "      \"description\": \"A group that needs a display.\","
+    , "      \"command\": [\"true\"],"
+    , "      \"component\": null,"
+    , "      \"inputs\": [\"native/\", \"display/\"],"
+    , "      \"framework\": \"hspec\","
+    , "      \"runner\": \"display\","
     , "      \"timeout_seconds\": 60,"
     , "      \"category\": \"test\","
     , "      \"optional\": false"

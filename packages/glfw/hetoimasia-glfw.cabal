@@ -143,17 +143,32 @@ executable glfw-window-examples
         hetoimasia-glfw,
         hetoimasia-glfw:seam-core
 
--- The native session check. It runs a real session on the process main
--- thread, so it is a plain executable rather than an Hspec suite, and it is
--- neither part of hetoimasia-tests nor of any validation group.
-test-suite glfw-native-check
+-- The native Hspec suite. The executable's process main thread owns one shared
+-- production session and serves the operations examples dispatch to it from
+-- Hspec's worker thread; examples needing a session of their own run in a
+-- private child process of this same executable. It needs a windowing session —
+-- Cocoa locally, an isolated X11 display in the test.glfw-native validation
+-- group — so it is neither part of hetoimasia-tests nor of the CPU groups, and
+-- `cabal build all` compiles it without running it.
+test-suite glfw-native-tests
     import: language
     type: exitcode-stdio-1.0
     main-is: Main.hs
-    hs-source-dirs: native-check
+    hs-source-dirs: native-tests
+    other-modules:
+        Test.GLFW.Native.Fixture
+        Test.GLFW.Native.Harness
+        Test.GLFW.Native.Private
+        Test.GLFW.Native.Session
+        Test.GLFW.Native.Spec
+        Test.GLFW.Native.Support
+        Test.GLFW.Native.Window
     ghc-options: -threaded
     build-depends:
         base >=4.21 && <4.22,
+        hspec >=2.11 && <3,
+        hspec-core >=2.11 && <2.12,
+        process >=1.6 && <1.7,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,

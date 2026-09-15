@@ -568,6 +568,7 @@ planRaw fixture head' candidate extra =
       , "--base", seeded fixture
       , "--head", head'
       , "--json"
+      , "--worker", "ci=cpu:build.pass,test.src"
       ]
         ++ maybe [] (\commit → ["--candidate", commit]) candidate
         ++ extra

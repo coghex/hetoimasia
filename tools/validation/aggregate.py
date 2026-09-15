@@ -57,22 +57,31 @@ SATISFYING_RESULT = "success"
 
 
 class Worker:
-    def __init__(self, name: str, result: str, groups: list[str]) -> None:
+    def __init__(self, name: str, result: str, groups: list[str] | None) -> None:
         self.name = name
         self.result = result
         self.groups = groups
 
 
 def parse_worker(entry: str) -> Worker:
+    """A worker's job result, optionally restating the groups it owns.
+
+    Which groups a worker owns is the plan's validated assignment. A restated
+    group list is accepted only when it is exactly that assignment, so no
+    second, unchecked copy of the routing can account for another worker's work.
+    """
+    usage = f"--worker expects NAME=RESULT or NAME=RESULT:GROUP[,GROUP...], not {entry!r}"
     name, separator, remainder = entry.partition("=")
     if not separator or not name:
-        raise EvidenceError(f"--worker expects NAME=RESULT:GROUP[,GROUP...], not {entry!r}")
-    result, separator, group_list = remainder.partition(":")
-    if not separator or not result:
-        raise EvidenceError(f"--worker expects NAME=RESULT:GROUP[,GROUP...], not {entry!r}")
-    groups = [identifier for identifier in group_list.split(",") if identifier]
-    if not groups:
-        raise EvidenceError(f"--worker {name!r} declares no groups")
+        raise EvidenceError(usage)
+    result, colon, group_list = remainder.partition(":")
+    if not result or (colon and not group_list):
+        raise EvidenceError(usage)
+    if not colon:
+        return Worker(name, result, None)
+    groups = group_list.split(",")
+    if not all(groups):
+        raise EvidenceError(usage)
     return Worker(name, result, groups)
 
 
@@ -146,17 +155,27 @@ def describe_request(identifiers: list[str], all_hspec: bool) -> str:
 def worker_problems(plan: dict, workers: list[Worker], covered: set[str]) -> list[str]:
     """A worker only has to account for the groups it was actually asked to run.
 
-    A job skipped because every group it owns was satisfied by earlier evidence
-    left nothing unvouched for, so it is not an obstacle. A job that was asked
-    to execute something and did not conclude ``success`` still is.
+    The groups each worker owns come from the plan's validated assignment. A job
+    skipped because every group it owns was satisfied by earlier evidence left
+    nothing unvouched for, so it is not an obstacle. A job that was asked to
+    execute something and did not conclude ``success`` still is, and so is one
+    whose result nobody reported: another worker's success cannot stand in for
+    it.
     """
     selected = set(plan["selected"]) - covered
+    reported = {worker.name: worker for worker in workers}
     problems: list[str] = []
-    for worker in workers:
-        owned = [identifier for identifier in worker.groups if identifier in selected]
+    for declared in plan["workers"]:
+        owned = [identifier for identifier in declared["groups"] if identifier in selected]
         if not owned:
             continue
-        if worker.result != SATISFYING_RESULT:
+        worker = reported.get(declared["name"])
+        if worker is None:
+            problems.append(
+                f"worker {declared['name']} reported no result while the plan selected "
+                + ", ".join(owned)
+            )
+        elif worker.result != SATISFYING_RESULT:
             problems.append(
                 f"worker {worker.name} was {worker.result} while the plan selected "
                 + ", ".join(owned)
@@ -183,6 +202,7 @@ def reuse_finding(record: dict, entry: dict, plan: dict) -> Finding:
         problems.append(f"the reused receipt records group {receipt.get('group')!r}")
     if receipt.get("command") != list(entry["command"]):
         problems.append("the reused receipt records a different command from the one the plan selected")
+    problems += receipts.routing_problems(plan, entry, receipt, "the reused receipt")
     if receipt.get("outcome") != "passed" or receipt.get("exit_status") != 0:
         problems.append(f"the reused receipt records outcome {receipt.get('outcome')!r}")
     if problems:
@@ -275,6 +295,9 @@ def inspect_group(
     problems += receipts.compatibility_problems(
         receipts.candidate_identity(plan), receipt, "the receipt"
     )
+    # A receipt from another route is not the evidence the plan asked for: a
+    # display group's result has to come from the display worker assigned it.
+    problems += receipts.routing_problems(plan, entry, receipt, "the receipt")
     if problems:
         return Finding(identifier, reason, "mismatched", "; ".join(problems), False)
     if receipt["outcome"] == "timeout":
@@ -381,8 +404,9 @@ def main(argv: list[str]) -> int:
         "--worker",
         action="append",
         default=[],
-        metavar="NAME=RESULT:GROUP[,GROUP...]",
-        help="a worker job, its result, and the groups it owns; repeatable",
+        metavar="NAME=RESULT[:GROUP,...]",
+        help="one of the plan's workers and its job result, optionally restating the groups the "
+        "plan assigns it, which must agree exactly; repeatable",
     )
     parser.add_argument("--expect-head", help="the pull request's current head commit")
     parser.add_argument("--expect-base", help="the pull request's current merge base")
@@ -393,6 +417,15 @@ def main(argv: list[str]) -> int:
     plan = receipts.load_plan(arguments.plan)
     identity = receipts.plan_identity(plan)
     workers = [parse_worker(entry) for entry in arguments.worker]
+    conflicts: list[str] = []
+    names: set[str] = set()
+    for worker in workers:
+        if worker.name in names:
+            conflicts.append(f"worker {worker.name!r} is reported more than once")
+        names.add(worker.name)
+        conflicts += receipts.declared_routing_problems(plan, worker.name, worker.groups)
+    if conflicts:
+        raise EvidenceError("the worker arguments conflict with the plan: " + "; ".join(conflicts))
 
     applicable, rejected, problems = read_applicability(arguments.applicability, plan, identity)
     problems += freshness_problems(plan, arguments)

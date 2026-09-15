@@ -23,9 +23,10 @@ module Hetoimasia.GLFW.Internal.Native
     -- * Error codes
   , glfwPlatformUnavailable
 
-    -- * Native check drivers
+    -- * Native example drivers
   , setWindowSizeForCheck
   , pollEventsForCheck
+  , waitEventsForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
   ) where
@@ -37,7 +38,7 @@ import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8)
 import Foreign.C.String (CString)
-import Foreign.C.Types (CFloat (CFloat), CInt (CInt))
+import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (Storable, peek)
@@ -193,20 +194,27 @@ detachWindowCallbacks window = do
   void (c_glfwSetWindowRefreshCallback window nullFunPtr)
   void (c_glfwSetWindowCloseCallback window nullFunPtr)
 
--- | Resize a window: a callback-producing setter for the native check only.
+-- | Resize a window: a callback-producing setter for the native examples only.
 setWindowSizeForCheck ∷ Ptr NativeWindow → Int → Int → IO ()
 setWindowSizeForCheck window width height = c_glfwSetWindowSize window (fromIntegral width) (fromIntegral height)
 
--- | Process pending events once, for the native check only.
+-- | Process pending events once, for the native examples only.
 pollEventsForCheck ∷ IO ()
 pollEventsForCheck = c_glfwPollEvents
 
--- | Set a creation hint no window configuration sets, so the native check can
+-- | Wait until an event arrives, or at most this many seconds, and process it,
+-- for the native examples only. X11 delivers a window's configure event after a
+-- round trip to the server rather than inside the setter, so an example waiting
+-- for a callback the platform has yet to deliver waits here instead of spinning.
+waitEventsForCheck ∷ Double → IO ()
+waitEventsForCheck seconds = c_glfwWaitEventsTimeout (CDouble seconds)
+
+-- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
 leakResizableHintForCheck ∷ IO ()
 leakResizableHintForCheck = c_glfwWindowHint glfwResizable glfwFalse
 
--- | Whether a window is resizable, for the native check only.
+-- | Whether a window is resizable, for the native examples only.
 windowResizableForCheck ∷ Ptr NativeWindow → IO Bool
 windowResizableForCheck window = (/= glfwFalse) <$> c_glfwGetWindowAttrib window glfwResizable
 
@@ -271,6 +279,9 @@ foreign import capi safe "hetoimasia_glfw.h glfwSetWindowSize"
 
 foreign import capi safe "hetoimasia_glfw.h glfwPollEvents"
   c_glfwPollEvents ∷ IO ()
+
+foreign import capi safe "hetoimasia_glfw.h glfwWaitEventsTimeout"
+  c_glfwWaitEventsTimeout ∷ CDouble → IO ()
 
 foreign import ccall "wrapper"
   c_wrapPairCallback ∷ PairCallback → IO (FunPtr PairCallback)

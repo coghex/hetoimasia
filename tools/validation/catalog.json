@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 6,
+  "policy_version": 7,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -85,7 +85,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, and the native recipe helper against temporary Git repositories.",
+      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the isolated X11 display helper against temporary Git repositories.",
       "command": [
         "cabal",
         "test",
@@ -95,6 +95,7 @@
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
         "tools/ci-image/",
+        "tools/display/",
         "tools/docs_land.sh",
         "tools/docs_land_paths.py",
         "tools/native/",
@@ -102,6 +103,27 @@
       ],
       "framework": "hspec",
       "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.glfw-native",
+      "description": "Real GLFW session, thread, and window examples through the shared native Hspec fixture, on an isolated X11 display.",
+      "command": [
+        "cabal",
+        "test",
+        "glfw-native-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-glfw:test:glfw-native-tests",
+      "inputs": [
+        "tools/ci-image/",
+        "tools/display/",
+        "tools/native/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
       "timeout_seconds": 1800,
       "category": "test",
       "optional": false

@@ -367,6 +367,8 @@ spec = describe "Validation execution" $ do
             [ "-I", tools fixture </> "run.py", "build.pass"
             , "--plan", plan
             , "--receipts", receiptsDirectory fixture
+            , "--worker", "floor"
+            , "--runner-class", "cpu"
             ]
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "sitecustomize.py"
@@ -383,6 +385,8 @@ spec = describe "Validation execution" $ do
             [ tools fixture </> "run.py", "build.pass"
             , "--plan", plan
             , "--receipts", receiptsDirectory fixture
+            , "--worker", "floor"
+            , "--runner-class", "cpu"
             ]
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "isolated interpreter"
@@ -404,6 +408,8 @@ spec = describe "Validation execution" $ do
             [ "-I", tools fixture </> "run.py", "build.pass"
             , "--plan", plan
             , "--receipts", receiptsDirectory fixture
+            , "--worker", "floor"
+            , "--runner-class", "cpu"
             ]
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "platform.py"
@@ -597,6 +603,7 @@ spec = describe "Validation execution" $ do
             [ "--base", seeded fixture
             , "--head", "HEAD"
             , "--catalog", root fixture </> "fixtures/alternate.json"
+            , "--worker", "floor=cpu:build.pass"
             ]
             "alternate-plan.json"
         -- The same plan runs from the clean checkout it was resolved for.
@@ -616,6 +623,7 @@ spec = describe "Validation execution" $ do
             [ "--base", seeded fixture
             , "--head", "HEAD"
             , "--catalog", root fixture </> "fixtures/alternate.json"
+            , "--worker", "floor=cpu:build.pass"
             ]
             "alternate-plan.json"
         -- Naming the path binds nothing on its own. Rewriting the fixture to
@@ -636,6 +644,7 @@ spec = describe "Validation execution" $ do
               [ "--base", seeded fixture
               , "--head", "HEAD"
               , "--catalog", root fixture </> "fixtures/alternate.json"
+              , "--worker", "floor=cpu:build.pass"
               ]
         plan ← planWith fixture arguments "alternate-plan.json"
         -- A worker that rewrites the catalog to stop consuming the document and
@@ -650,7 +659,7 @@ spec = describe "Validation execution" $ do
         (executed, errors) `shouldBe` (ExitSuccess, "")
         -- The verdict is decided against the plan that was actually resolved,
         -- and the classification is part of what that plan's identity names.
-        (result, output, _) ← aggregate fixture plan []
+        (result, output, _) ← aggregate fixture plan ["--worker", "floor=success"]
         result `shouldBe` ExitFailure 1
         output `shouldContain` "names plan"
 
@@ -845,9 +854,169 @@ spec = describe "Validation execution" $ do
             [ "--worker"
             , "floor=success:build.pass"
             , "--worker"
-            , "extra=skipped:test.fail,smoke.slow"
+            , "extra=skipped"
             ]
         result `shouldBe` ExitSuccess
+
+  describe "runner classes and worker routing" $ do
+    it "refuses at planning a display group routed to a CPU-only worker" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        (result, _, errors) ←
+          planAttempt
+            fixture
+            [ "--worker", "floor=cpu:build.pass"
+            , "--worker", "extra=cpu:test.fail,test.flag,smoke.slow,smoke.stubborn,probe.optional,test.native,probe.desktop"
+            ]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "group 'test.native' requires the display runner class, but worker 'extra' declares only cpu"
+
+    it "refuses at planning an unknown group, an unknown runner class, a group owned twice, and selected work nobody owns" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        (unknownGroup, _, groupErrors) ←
+          planAttempt fixture ["--worker", "floor=cpu:build.pass,group.absent", "--worker", "extra=cpu:test.fail"]
+        unknownGroup `shouldBe` ExitFailure 2
+        groupErrors `shouldContain` "worker 'floor' is assigned unknown group 'group.absent'"
+        (unknownClass, _, classErrors) ←
+          planAttempt fixture ["--worker", "floor=gpu:build.pass", "--worker", "extra=cpu:test.fail"]
+        unknownClass `shouldBe` ExitFailure 2
+        classErrors `shouldContain` "unknown runner class 'gpu'"
+        (twice, _, twiceErrors) ←
+          planAttempt fixture ["--worker", "floor=cpu:build.pass,test.fail", "--worker", "extra=cpu:test.fail"]
+        twice `shouldBe` ExitFailure 2
+        twiceErrors `shouldContain` "group 'test.fail' is assigned to both 'extra' and 'floor'"
+        (unowned, _, unownedErrors) ← planAttempt fixture ["--worker", "floor=cpu:build.pass"]
+        unowned `shouldBe` ExitFailure 2
+        unownedErrors `shouldContain` "selected group 'test.fail' is assigned to no worker"
+
+    it "accepts the display runner class in a catalog and names an unknown one" $
+      withFixture $ \fixture → do
+        (valid, validOutput, _) ← catalogCheck fixture "tools/validation/catalog.json"
+        valid `shouldBe` ExitSuccess
+        validOutput `shouldContain` "is valid"
+        writeFixtureFile (root fixture) "fixtures/gpu.json" (replaceAll "\"display\"" "\"gpu\"" fixtureCatalog)
+        (invalid, _, errors) ← catalogCheck fixture (root fixture </> "fixtures/gpu.json")
+        invalid `shouldBe` ExitFailure 2
+        errors `shouldContain` "runner 'gpu' is not one of ['cpu', 'display']"
+
+    it "selects the display group for a changed native input while an affected optional display probe stays unselected" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        selectionOf plan "test.native" `shouldReturn` Just (Selection "affected" True True)
+        selectionOf plan "probe.desktop" `shouldReturn` Just (Selection "optional-unrequested" False True)
+
+    it "selects no display work for a documentation-only candidate, which passes with the display worker skipped" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        selectionOf plan "test.native" `shouldReturn` Just (Selection "unaffected" False False)
+        selectionOf plan "probe.desktop" `shouldReturn` Just (Selection "optional-unrequested" False False)
+        (executed, _, errors) ← runGroup fixture "build.pass" plan []
+        (executed, errors) `shouldBe` (ExitSuccess, "")
+        (result, output, _) ←
+          aggregate fixture plan ["--worker", "floor=success", "--worker", "extra=skipped", "--worker", "native=skipped"]
+        result `shouldBe` ExitSuccess
+        output `shouldContain` "verdict: passed"
+
+    it "fails the verdict when a selected display group left no receipt, however the CPU workers ended" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, errors) ← runGroup fixture "build.pass" plan []
+        (executed, errors) `shouldBe` (ExitSuccess, "")
+        (failedSetup, output, _) ←
+          aggregate fixture plan ["--worker", "floor=success", "--worker", "extra=success", "--worker", "native=failure"]
+        failedSetup `shouldBe` ExitFailure 1
+        output `shouldContain` "test.native"
+        output `shouldContain` "neither an execution nor an applicable earlier receipt"
+        output `shouldContain` "worker native was failure while the plan selected test.native"
+        (unreported, silent, _) ← aggregate fixture plan ["--worker", "floor=success", "--worker", "extra=success"]
+        unreported `shouldBe` ExitFailure 1
+        silent `shouldContain` "worker native reported no result while the plan selected test.native"
+
+    it "refuses to execute a group on a worker that does not declare its runner class or does not own it" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (onCpu, _, cpuErrors) ← runGroup fixture "test.native" plan ["--worker", "extra", "--runner-class", "cpu"]
+        onCpu `shouldBe` ExitFailure 2
+        cpuErrors `shouldContain` "'test.native' requires the display runner class, which this execution does not declare"
+        cpuErrors `shouldContain` "the plan assigns 'test.native' to 'native', not 'extra'"
+        (claimed, _, claimedErrors) ← runGroup fixture "test.native" plan ["--worker", "extra", "--runner-class", "display"]
+        claimed `shouldBe` ExitFailure 2
+        claimedErrors `shouldContain` "the plan declares worker 'extra' as cpu"
+        (underclassed, _, underclassedErrors) ←
+          runGroup fixture "test.native" plan ["--worker", "native", "--runner-class", "cpu"]
+        underclassed `shouldBe` ExitFailure 2
+        underclassedErrors `shouldContain` "which this execution does not declare"
+        doesFileExist (receiptPath fixture "test.native") `shouldReturn` False
+        (routed, _, routedErrors) ← runGroup fixture "test.native" plan []
+        (routed, routedErrors) `shouldBe` (ExitSuccess, "")
+        receipt ← readReceipt fixture "test.native"
+        stringField receipt "worker" `shouldBe` Just "native"
+        stringField receipt "runner_class" `shouldBe` Just "display"
+
+    it "refuses a plan resolved without worker declarations at execution and at the verdict" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        (planned, output, planErrors) ←
+          run
+            (environment fixture)
+            (root fixture)
+            "python3"
+            [tools fixture </> "plan.py", "--base", seeded fixture, "--head", "HEAD", "--json"]
+        (planned, planErrors) `shouldBe` (ExitSuccess, "")
+        let inspection = root fixture </> "inspection.json"
+        writeFile inspection output
+        (executed, _, executeErrors) ← runGroup fixture "build.pass" inspection []
+        executed `shouldBe` ExitFailure 2
+        executeErrors `shouldContain` "resolved without worker declarations"
+        (verdict, _, verdictErrors) ← aggregate fixture inspection []
+        verdict `shouldBe` ExitFailure 2
+        verdictErrors `shouldContain` "resolved without worker declarations"
+
+    it "refuses a fresh display receipt produced on another operating system" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        plan ←
+          planWith
+            fixture
+            ["--base", seeded fixture, "--head", "HEAD", "--candidate", "HEAD", "--runner-os", "Linux"]
+            "linux-plan.json"
+        (elsewhere, _, errors) ← runGroupWith fixture [("RUNNER_OS", "macOS")] "test.native" plan []
+        (elsewhere, errors) `shouldBe` (ExitSuccess, "")
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "different runner_os"
+
+    it "refuses a fresh receipt that another route produced" $
+      withFixture $ \fixture → do
+        change fixture "native/note.txt" "revised native input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, errors) ← runGroup fixture "test.native" plan []
+        (executed, errors) `shouldBe` (ExitSuccess, "")
+        patchReceipt fixture "test.native" "worker" "extra"
+        (misrouted, output, _) ← aggregate fixture plan []
+        misrouted `shouldBe` ExitFailure 1
+        output `shouldContain` "records worker 'extra', not 'native'"
+        patchReceipt fixture "test.native" "worker" "native"
+        patchReceipt fixture "test.native" "runner_class" "cpu"
+        (reclassed, reclassedOutput, _) ← aggregate fixture plan []
+        reclassed `shouldBe` ExitFailure 1
+        reclassedOutput `shouldContain` "records runner class 'cpu'"
+
+    it "refuses a restated worker assignment that conflicts with the plan's" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (conflicting, _, errors) ← aggregate fixture plan ["--worker", "floor=success:build.pass,test.native"]
+        conflicting `shouldBe` ExitFailure 2
+        errors `shouldContain` "conflicts with the plan's validated assignment"
+        (stranger, _, strangerErrors) ← aggregate fixture plan ["--worker", "stranger=success"]
+        stranger `shouldBe` ExitFailure 2
+        strangerErrors `shouldContain` "worker 'stranger' is not one this plan declares"
 
   describe "publication freshness" $ do
     it "refuses to answer for a head the pull request has moved past" $
@@ -1046,6 +1215,8 @@ requiredReceiptFields =
   , "input_identity"
   , "policy_version"
   , "source_run_url"
+  , "worker"
+  , "runner_class"
   ]
 
 -- | Stand-ins for a revision this checkout never was, so an example can offer
@@ -1078,11 +1249,55 @@ planWith fixture arguments name = do
       (environment fixture)
       (root fixture)
       "python3"
-      ((tools fixture </> "plan.py") : arguments ++ ["--json"])
+      ((tools fixture </> "plan.py") : routed ++ ["--json"])
   (result, errors) `shouldBe` (ExitSuccess, "")
   let target = root fixture </> name
   writeFile target output
   pure target
+  where
+    routed = if "--worker" `elem` arguments then arguments else arguments ++ fixtureWorkers
+
+-- | The workers every fixture plan is routed to unless an example routes its
+-- own: the floor, the fixture's other CPU groups, and its display groups.
+fixtureWorkers ∷ [String]
+fixtureWorkers =
+  [ "--worker", "floor=cpu:build.pass"
+  , "--worker", "extra=cpu:test.fail,test.flag,smoke.slow,smoke.stubborn,probe.optional"
+  , "--worker", "native=display:test.native,probe.desktop"
+  ]
+
+-- | The worker, and the runner class it declares, that 'fixtureWorkers'
+-- assigns a group to.
+routeOf ∷ String → [String]
+routeOf group
+  | group == "build.pass" = ["--worker", "floor", "--runner-class", "cpu"]
+  | group `elem` ["test.native", "probe.desktop"] = ["--worker", "native", "--runner-class", "display"]
+  | otherwise = ["--worker", "extra", "--runner-class", "cpu"]
+
+-- | Resolve a plan with explicit worker declarations and return the planner's
+-- result, so an example can assert on a refusal.
+planAttempt ∷ Fixture → [String] → IO (ExitCode, String, String)
+planAttempt fixture workers =
+  run
+    (environment fixture)
+    (root fixture)
+    "python3"
+    ((tools fixture </> "plan.py") : ["--base", seeded fixture, "--head", "HEAD", "--json"] ++ workers)
+
+-- | Validate a catalog document with the real planner.
+catalogCheck ∷ Fixture → FilePath → IO (ExitCode, String, String)
+catalogCheck fixture catalog =
+  run
+    (environment fixture)
+    (root fixture)
+    "python3"
+    [tools fixture </> "plan.py", "--repo-root", root fixture, "--catalog-check", "--catalog", catalog]
+
+replaceAll ∷ String → String → String → String
+replaceAll _ _ [] = []
+replaceAll needle replacement haystack@(first : rest)
+  | take (length needle) haystack == needle = replacement ++ replaceAll needle replacement (drop (length needle) haystack)
+  | otherwise = first : replaceAll needle replacement rest
 
 -- | Copy one of the real tools into the fixture's own tree, so an example can
 -- drive the checkout's copy the way a hosted worker does.
@@ -1099,12 +1314,17 @@ runFrom fixture runner group plan =
     (root fixture)
     "python3"
     -- `-I` as every caller passes it: the runner refuses to start otherwise.
-    ["-I", runner, group, "--plan", plan, "--receipts", receiptsDirectory fixture]
+    (["-I", runner, group, "--plan", plan, "--receipts", receiptsDirectory fixture] ++ routeOf group)
 
 runGroup ∷ Fixture → String → FilePath → [String] → IO (ExitCode, String, String)
-runGroup fixture group plan extra =
+runGroup fixture = runGroupWith fixture []
+
+-- | Execute a group under the fixture's routing unless the example names its own
+-- worker, with some environment variables replaced.
+runGroupWith ∷ Fixture → [(String, String)] → String → FilePath → [String] → IO (ExitCode, String, String)
+runGroupWith fixture overrides group plan extra =
   run
-    (environment fixture)
+    (overrides ++ filter ((`notElem` map fst overrides) . fst) (environment fixture))
     (root fixture)
     "python3"
     ( [ "-I"
@@ -1115,7 +1335,7 @@ runGroup fixture group plan extra =
       , "--receipts"
       , receiptsDirectory fixture
       ]
-        ++ extra
+        ++ (if "--worker" `elem` extra then extra else routeOf group ++ extra)
     )
 
 resolveRange ∷ Fixture → [String] → IO (ExitCode, String, String)
@@ -1138,8 +1358,15 @@ aggregate fixture plan extra =
       , "--receipts"
       , receiptsDirectory fixture
       ]
-        ++ extra
+        ++ reported
     )
+  where
+    -- Every fixture worker reports success unless an example reports its own,
+    -- so a verdict is decided by the receipts an example arranged.
+    reported =
+      if "--worker" `elem` extra
+        then extra
+        else extra ++ ["--worker", "floor=success", "--worker", "extra=success", "--worker", "native=success"]
 
 -- ---------------------------------------------------------------------------
 -- Reading and tampering with receipts
@@ -1230,7 +1457,7 @@ emptyPlan ∷ String
 emptyPlan =
   unlines
     [ "{"
-    , "  \"schema_version\": 2,"
+    , "  \"schema_version\": 3,"
     , "  \"policy_version\": \"eeee\","
     , "  \"catalog_policy_version\": 1,"
     , "  \"input_identity\": \"ffff\","
@@ -1317,6 +1544,7 @@ fixtureFiles =
   , ("slow/note.txt", "an input the slow group consumes\n")
   , ("stubborn/note.txt", "an input the stubborn group consumes\n")
   , ("probe/note.txt", "an input the optional group consumes\n")
+  , ("native/note.txt", "an input the display groups consume\n")
   , ("flag/value", "good\n")
   , ("docs/consumed.md", "a document the flag group consumes\n")
   , ("docs/alternate.md", "a document only the alternate catalog consumes\n")
@@ -1367,7 +1595,9 @@ fixtureCatalogWith nonAffecting =
     , groupDocumentFor "test.flag" "\"demo:exe:demo\"" flagCommand flagInputs "hspec" "test" "60" "false" ++ ","
     , groupDocument "smoke.slow" slowCommand "[\"slow/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
-    , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true"
+    , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true" ++ ","
+    , displayGroupDocument "test.native" "test" "false" ++ ","
+    , displayGroupDocument "probe.desktop" "probe" "true"
     , "  ]"
     , "}"
     ]
@@ -1420,7 +1650,16 @@ groupDocument identifier = groupDocumentFor identifier "null"
 -- | The same, for a group whose inputs are derived from a real component, so an
 -- example can exercise the package graph the classifier reads.
 groupDocumentFor ∷ String → String → String → String → String → String → String → String → String
-groupDocumentFor identifier component command inputs framework category timeout optional =
+groupDocumentFor = groupDocumentWith "cpu"
+
+-- | A group requiring the display runner class, consuming @native/@, whose
+-- outcome the catalog decides like the CPU groups beside it.
+displayGroupDocument ∷ String → String → String → String
+displayGroupDocument identifier category optional =
+  groupDocumentWith "display" identifier "null" "[\"true\"]" "[\"native/\"]" "hspec" category "60" optional
+
+groupDocumentWith ∷ String → String → String → String → String → String → String → String → String → String
+groupDocumentWith runner identifier component command inputs framework category timeout optional =
   init $
     unlines
       [ "    {"
@@ -1430,7 +1669,7 @@ groupDocumentFor identifier component command inputs framework category timeout 
       , "      \"component\": " ++ component ++ ","
       , "      \"inputs\": " ++ inputs ++ ","
       , "      \"framework\": \"" ++ framework ++ "\","
-      , "      \"runner\": \"cpu\","
+      , "      \"runner\": \"" ++ runner ++ "\","
       , "      \"timeout_seconds\": " ++ timeout ++ ","
       , "      \"category\": \"" ++ category ++ "\","
       , "      \"optional\": " ++ optional
