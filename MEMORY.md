@@ -14,12 +14,14 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   [review report](docs/project_review_114-101.md) records four remaining repairs:
   #115 creation primary/cleanup evidence; #116 disconnect recovery across
   observations; #117 restoration after partial departure; #118 fixture drain
-  under repeated cancellation. #115 is repaired (PR #119) and #116 is repaired:
+  under repeated cancellation. #115 is repaired (PR #119); #116 is repaired:
   the mode record keeps the monitor identity a settled request's recovery is
   owed to, so observations between the disconnect and the reconciliation no
-  longer erase it. #117 and #118 remain open.
-- #117 is next, coordinating after #116's controller edits; #118 is
-  independent. Verify the repairs before concluding the arc.
+  longer erase it; and #117 is repaired: a departure from an applied windowed
+  presentation retains the geometry it departs from as the saved placement,
+  whether the attempt's steps all return, one reports partway, or the attempt
+  is interrupted after a native step. #118 remains open.
+- #118 is next and independent. Verify the repairs before concluding the arc.
   Epics #86 and #49 remain open; their original implementation checklists lag
   the merges and need tracker housekeeping separately from these docs.
 - Verification at that baseline: build, console smoke, static linking, 517
