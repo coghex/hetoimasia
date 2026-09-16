@@ -17,13 +17,18 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   under repeated cancellation. #115 is repaired (PR #119); #116 is repaired:
   the mode record keeps the monitor identity a settled request's recovery is
   owed to, so observations between the disconnect and the reconciliation no
-  longer erase it; and #117 is repaired: a departure from an applied windowed
+  longer erase it; #117 is repaired: a departure from an applied windowed
   presentation retains the geometry it departs from as the saved placement,
   whether the attempt's steps all return, one reports partway, or the attempt
-  is interrupted after a native step. #118 remains open.
-- #118 is next and independent. Verify the repairs before concluding the arc.
-  Epics #86 and #49 remain open; their original implementation checklists lag
-  the merges and need tracker housekeeping separately from these docs.
+  is interrupted after a native step; and #118 is repaired: the fixture's
+  settlement wait absorbs repeated owner cancellation, the shared resource is
+  released only after the borrower finishes, and the initiating failure stays
+  primary with its retained cleanup evidence, including a cancellation
+  deferred through the uninterruptible release.
+- All four review repairs are now implemented. Verify the repairs before
+  concluding the arc. Epics #86 and #49 remain open; their original
+  implementation checklists lag the merges and need tracker housekeeping
+  separately from these docs.
 - Verification at that baseline: build, console smoke, static linking, 517
   engine examples, 331 workflow examples, and 8 scripted fixture examples passed
   locally. Linux native CI ran 55 examples with no failures and one physical

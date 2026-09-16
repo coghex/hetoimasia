@@ -16,13 +16,16 @@ observation and reconciliation are ordered.
 windowed presentation retains the geometry it departs from as the saved
 placement, whether the attempt's steps all return, one reports partway, or the
 attempt is interrupted after a native step, so the configured fallback or a
-later windowed return restores where the user left the window. One defect
-remains open:
+later windowed return restores where the user left the window.
 [#118](https://github.com/coghex/hetoimasia/issues/118)
-(fixture settlement under repeated cancellation). See the
-[completion review](project_review_114-101.md) for reproductions. #118's
-corrected contract and regressions must accompany its repair PR; this status
-update does not claim that fix has landed.
+(fixture settlement under repeated cancellation) is repaired: once an owner
+failure or cancellation begins fixture settlement, further cancellation of the
+owner is absorbed by the wait for the borrower rather than ending it, the
+resource is still released only after the borrower finishes, and the run
+reports the failure that began the settlement with its retained cleanup
+evidence, including against a cancellation deferred through the
+uninterruptible release. All four recorded defects are now repaired; see the
+[completion review](project_review_114-101.md) for reproductions.
 
 Current behavior of `hetoimasia-glfw`, the package that owns the native binding
 to upstream GLFW 3.4, the one process-main-thread session over it, the
@@ -2423,17 +2426,22 @@ test environment.
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
 | Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
-| Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. |
+| Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
 | Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
 
 The fixture's settlement rules are proven against a scripted owner that records
 its acquisition and release — lazy single acquisition, nothing acquired by a dry
 run or an empty selection, a deliberately failing nested example, a cancelled
 borrower with one operation in flight and one queued, an owner that fails while
-a borrower waits, and an acquisition failure — and the failing and cancelled
-cases again against the real shared session. Every deliberate failure is inside
-a nested run or a forked borrower and is asserted as expected, so the suite
-itself passes.
+a borrower waits, an owner cancelled again while it settles the first
+cancellation, with the release succeeding and with it failing, an owner
+cancelled once more while its release still runs, an owner with a cancellation
+already pending at its acquisition's handoff to the borrower, cancelled again
+during the release, an owner cancelled while its acquisition is blocked, and
+an acquisition failure —
+and the failing and cancelled cases again against the real shared session.
+Every deliberate failure is inside a nested run or a forked borrower and is
+asserted as expected, so the suite itself passes.
 
 The native examples cover:
 
