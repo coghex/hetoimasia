@@ -14,7 +14,7 @@ module Test.GLFW.Dynamic (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (AsyncException (ThreadKilled), Exception, IOException, SomeException, displayException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (elemIndex)
@@ -61,7 +61,7 @@ spec = describe "GLFW dynamic windows" $ do
       (boundedExample testCapacityRejection)
     it "rolls a failed construction back with its native evidence, registering nothing and consuming no capacity"
       (boundedExample testFailedCreationRollback)
-    it "poisons creation after a rollback's own cleanup failure, retaining it through the host's final exit"
+    it "propagates a construction failure whose rollback failed as the host's primary failure, interrupting its ticket, settling the queued command behind it, and stopping the loop"
       (boundedExample testRollbackCleanupPoisons)
     it "keeps a window whose creation ticket nobody awaits enumerable, live through the drain, and disposed at shutdown"
       (boundedExample testDroppedCreationTicket)
@@ -214,6 +214,15 @@ testFailedCreationRollback = do
     Just (Performed (WindowCreated window)) → windowLocalIdentity window == 2
     _ → False
 
+-- A construction whose rollback's own release fails is never downgraded to a
+-- rejection: the original native failure propagates as the host's primary
+-- failure, with the rollback failure retained exactly once as cleanup evidence.
+-- The failing command's ticket settles as 'Interrupted', the command queued
+-- behind it settles as 'NotExecuted' through quiescence, and the loop stops
+-- before the update of the turn that dispatched the failure, so every command
+-- whose settlement is asserted here is submitted in the one update that runs.
+-- Collection poisoning is visible through that retained evidence: no later
+-- creation executes once the loop has stopped.
 testRollbackCleanupPoisons ∷ Expectation
 testRollbackCleanupPoisons = do
   (reporting, armReport) ← armedOnce
@@ -224,33 +233,34 @@ testRollbackCleanupPoisons = do
         { scriptAttachWindowCallbacks = \reporter → reporting >>= \now → when now (reportError reporter 0x00010008 "attach reported")
         , scriptDestroyWindow = \_ → raising >>= \now → when now (throwIO (userError "release raised"))
         }
-  observed ← newIORef Nothing
+  updates ← newIORef (0 ∷ Int)
   requested ← newIORef Nothing
   (failure, caught) ←
     caughtHosted seam (settings []) (\host _ → pure host) $ \host control →
-        looping host control $ \turn → case turnNumber turn of
+      looping host control $ \turn → do
+        modifyIORef' updates (+ 1)
+        case turnNumber turn of
           1 → do
             armReport >> armRaise
-            submit (hostCommandPort host) (createWindowCommand (windowNamed "failing")) >>= writeIORef requested . Just
+            tickets ←
+              (,)
+                <$> submit (hostCommandPort host) (createWindowCommand (windowNamed "failing"))
+                <*> submit (hostCommandPort host) (createWindowCommand (windowNamed "behind"))
+            writeIORef requested (Just tickets)
             pure Continue
-          2 → do
-            first ← slot requested >>= disposition
-            ticket ← submit (hostCommandPort host) (createWindowCommand (windowNamed "refused"))
-            writeIORef requested (Just ticket)
-            writeIORef observed (Just (first, Nothing))
-            pure Continue
-          _ → do
-            (first, _) ← slot observed
-            second ← slot requested >>= disposition
-            writeIORef observed (Just (first, second))
-            pure (Finish ())
-  displayException (failure ∷ IOException) `shouldBe` "user error (release raised)"
+          -- The failing creation is dispatched on turn 2's command step, which
+          -- precedes that turn's update; reaching this update means the loop
+          -- kept turning, and the run returning lets 'caughtHosted' fail the
+          -- example.
+          _ → pure (Finish ())
+  nativeOutcome failure `shouldBe` NativeCallReturned
+  nativeReports failure `shouldBe` Reports [NativeError 0x00010008 "attach reported" False ProcessMainThread] 0 0
   map cleanupFailureLabel (cleanupFailures caught) `shouldBe` ["glfw window"]
-  (first, second) ← slot observed
-  first `shouldSatisfy` \case
-    Just (Rejected (WindowCreationFailed {})) → True
-    _ → False
-  second `shouldBe` Just (Rejected WindowCreationPoisoned)
+  destroyed seam `shouldReturn` [1]
+  (failing, behind) ← slot requested
+  disposition failing `shouldReturn` Just (Interrupted (submittedRequest (ticketOrigin failing)))
+  disposition behind `shouldReturn` Just NotExecuted
+  readIORef updates `shouldReturn` 1
 
 testDroppedCreationTicket ∷ Expectation
 testDroppedCreationTicket = do

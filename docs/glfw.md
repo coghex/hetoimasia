@@ -1,14 +1,18 @@
 # GLFW session and windows
 
-**Review status at `727f59a`:** the original GLFW implementation is merged, with
-four known defects awaiting repair: [#115](https://github.com/coghex/hetoimasia/issues/115)
-(construction/rollback failure evidence), [#116](https://github.com/coghex/hetoimasia/issues/116)
+**Review status at `727f59a`:** the original GLFW implementation is merged. Of
+the four known defects that review recorded,
+[#115](https://github.com/coghex/hetoimasia/issues/115)
+(construction/rollback failure evidence) is repaired: a construction failure
+whose rollback's own release failed now propagates as the host's primary
+failure, interrupting the command and stopping the loop. Three defects remain
+open: [#116](https://github.com/coghex/hetoimasia/issues/116)
 (disconnect recovery across observations), [#117](https://github.com/coghex/hetoimasia/issues/117)
 (restoration after partial departure), and [#118](https://github.com/coghex/hetoimasia/issues/118)
 (fixture settlement under repeated cancellation). See the
 [completion review](project_review_114-101.md) for reproductions. The corrected
 contracts and regressions must accompany those repair PRs; this status update
-does not claim the fixes have landed.
+does not claim those fixes have landed.
 
 Current behavior of `hetoimasia-glfw`, the package that owns the native binding
 to upstream GLFW 3.4, the one process-main-thread session over it, the
@@ -1057,7 +1061,7 @@ requests and do not order them; order is the order admissions committed.
 | Disposition | When | Effects |
 |---|---|---|
 | `Performed result` | The command was performed or requested from the window system | Applied; `result` was prepared before settlement |
-| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`) or is closing (`WindowIsClosing`), a native call failed first (`WindowNativeFailure`), the executor or port cannot close or create (`CloseNotPermitted`, `CreationNotPermitted`), or a creation was refused (`WindowConfigInvalid`, `WindowCapacityReached`, `WindowCreationPoisoned`) or failed during construction (`WindowCreationFailed`) | None applied; a failed construction was rolled back |
+| `Rejected reason` | The executor serves no such window (`WindowNotServed`), the window has ended (`WindowAlreadyEnded`) or is closing (`WindowIsClosing`), a native call failed first (`WindowNativeFailure`), the executor or port cannot close or create (`CloseNotPermitted`, `CreationNotPermitted`), or a creation was refused (`WindowConfigInvalid`, `WindowCapacityReached`, `WindowCreationPoisoned`) or failed during construction with a clean rollback (`WindowCreationFailed`) | None applied; a failed construction was rolled back |
 | `Rejected (ControlRejected window reason)` | A [window control](#window-controls) was refused by its mode transition or its validation | None applied |
 | `Unsupported control` | The platform cannot perform a window control | None applied |
 | `Attempted attempt` | A window control's native calls were made | Requested from the window system; its observations report what happened |
@@ -1069,7 +1073,10 @@ native failure is carried as copied data: the operation that raised it, whether
 the call itself failed, and the reported codes and descriptions. An arbitrary
 Haskell exception is never serialized into a ticket. The ticket names only the
 interrupted request, and the exception propagates from the executor with its
-own type and context.
+own type and context. A construction whose rollback's own release failed is
+never a `WindowCreationFailed` rejection — only a clean rollback is one: the
+construction failure carries the rollback failure as retained cleanup evidence
+and propagates, settling the command as `Interrupted` and ending the loop.
 
 ### The creation handoff
 
@@ -1839,11 +1846,16 @@ then acquired through the window's own `Assembly` as a collection member, and,
 with nothing interruptible in between, registered with the host beside a port of
 its own. A native failure during construction is `WindowCreationFailed` once the
 construction has rolled back exactly what it acquired: nothing is registered and
-no capacity is consumed. Anything else raised during construction — a
+no capacity is consumed. A construction failure carrying retained cleanup
+evidence — a rollback whose own release failed — is never downgraded to that
+rejection: the original construction failure propagates unchanged as the host's
+primary failure, the command's ticket settles as `Interrupted`, the owner loop
+stops at that failure, and commands still queued settle through the quiescence
+contract. The collection keeps the rollback failure as evidence through its
+final exit, where the propagated primary retains it exactly once, and the latch
+poisons any later creation. Anything else raised during construction — a
 cancellation, a callback fault, any other exception — interrupts the command and
-propagates with its cleanup evidence on the host's failure path. A rollback
-whose own release failed poisons further creation, and the collection keeps that
-failure as evidence through its final exit. On success the ticket settles as
+propagates with its cleanup evidence on the host's failure path. On success the ticket settles as
 `WindowCreated` and hands over the window's `WindowClient`, as
 [the creation handoff](#the-creation-handoff) describes.
 
@@ -1888,7 +1900,11 @@ borrow and does not delay retirement. A retirement whose release fails is not
 retried, at shutdown or ever: the window is forgotten with its
 `WindowDisposalFailed` or `WindowReleaseUncertain` phase, and the collection
 latches the failure, poisoning creation and keeping the failure as evidence for
-its final exit.
+its final exit. Unlike a construction rollback's failure — which propagates as
+the host's primary failure and stops the loop — a retirement failure stays
+non-fatal: the window was already built and serving when its release failed, so
+the failure is latched and reported rather than thrown into the turn that
+observed it.
 
 **Retained handles.** Once a window has been retired, its port answers
 `SubmitClosed`, and `WaitClosed` to a waiting submission; `withHostWindow`
@@ -2079,7 +2095,11 @@ prepared `WindowCreated` data, capabilities readable only after settlement and
 after the initial observation, and a window port refused creation and other
 windows; capacity and configuration rejections before any native call; a failed
 construction rolled back with its native evidence and no consumed capacity; a
-rollback cleanup failure poisoning creation and surviving to final exit; an
+construction whose rollback's own release failed propagating its original
+native failure as the host's primary failure — the rollback failure retained
+exactly once as cleanup evidence, the failing command's ticket interrupted, the
+command queued behind it settled as not executed, and the loop stopped before
+that turn's update — with poisoning visible through that retained evidence; an
 unawaited creation's window enumerable, live through the drain, and disposed at
 shutdown; a cancellation delivered from another thread during construction
 rolling it back with no registry entry and its capacity reclaimed, and one

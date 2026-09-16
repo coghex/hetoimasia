@@ -672,10 +672,12 @@ data CommandRejection
       , creationReports ∷ !Reports
         -- ^ The codes and descriptions GLFW reported, copied.
       }
-    -- ^ A native call failed during construction. What construction had
-    -- acquired was rolled back, no window was registered, and no capacity was
-    -- consumed; a rollback's own cleanup failures poison creation and stay with
-    -- the owner as evidence.
+    -- ^ A native call failed during construction, and the rollback released
+    -- everything construction had acquired: no window was registered and no
+    -- capacity was consumed. A construction whose rollback's own release
+    -- failed is never this rejection: the construction failure propagates with
+    -- the rollback failure retained as cleanup evidence, interrupting the
+    -- command.
   | ControlRejected !WindowId !ControlRejection
     -- ^ A control was refused before any native call.
   | ModeRejected !WindowId !ModeRejection

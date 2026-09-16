@@ -95,9 +95,12 @@
 --
 -- A creation command, admitted only through 'hostCommandPort', checks the
 -- configuration, the limit, and poisoning before any native effect, each a typed
--- rejection. A native failure during construction is a typed rejection after
--- its rollback, registering nothing and consuming no capacity; anything else
--- raised propagates with its cleanup evidence, and the command is interrupted.
+-- rejection. A native failure during construction whose rollback released
+-- everything construction acquired is a typed rejection, registering nothing and
+-- consuming no capacity. A construction failure whose rollback's own release
+-- failed is never downgraded to one: it propagates unchanged with that cleanup
+-- evidence, interrupting the command and ending the loop, as does anything else
+-- raised — a cancellation, a callback fault, any other exception.
 -- Success settles as 'Hetoimasia.GLFW.Command.WindowCreated' and hands over the
 -- window's client capabilities beside that prepared data. An unawaited ticket
 -- relinquishes nothing: 'hostWindowIdentities' still enumerates the window, and

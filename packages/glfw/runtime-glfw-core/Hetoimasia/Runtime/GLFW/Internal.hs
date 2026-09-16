@@ -67,7 +67,7 @@ import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (Scoped, allocResource)
+import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext)
 import Hetoimasia.Foundation.Resource.Collection
   ( Collection
   , CollectionError (..)
@@ -552,8 +552,12 @@ registerWindow host config =
 
 -- | Create a window for a creation command. The configuration and the live
 -- limit are checked before any native effect, and poisoning is refused before
--- one too; each is a typed rejection. A native failure during construction,
--- after its rollback, is a typed rejection as well. Anything else — a
+-- one too; each is a typed rejection. A native failure during construction
+-- whose rollback released everything construction acquired is a typed
+-- rejection as well. A construction failure carrying retained cleanup
+-- evidence — a rollback whose own release failed — is never downgraded to one:
+-- it propagates unchanged, interrupting the command and ending the loop, with
+-- the evidence still attached for the collection's exit. Anything else — a
 -- cancellation, a callback fault, any other exception — propagates with its
 -- cleanup evidence.
 createWindow ∷ WindowHost → WindowConfig → IO Execution
@@ -567,6 +571,7 @@ createWindow host config = case validateWindowConfig config of
         tryWithContext (registerWindow host config) >>= \case
           Right client → pure (Created client)
           Left caught@(ExceptionWithContext context failure)
+            | _ : _ ← cleanupFailuresInContext context → rethrowIO caught
             | Just CollectionPoisoned ← fromException failure → rejected WindowCreationPoisoned
             | Just SessionPoisoned ← fromException failure → rejected WindowCreationPoisoned
             | Just (MemberLimitReached reached) ← fromException failure → rejected (WindowCapacityReached reached)
