@@ -46,10 +46,11 @@
 -- * it is seeded from the window's initial observation, before any startup
 --   transition;
 -- * it is cached from the observed placement when a transition leaves an applied
---   windowed presentation, and only once that transition's native steps have
---   all returned without a report;
+--   windowed presentation — the geometry the attempt departs from, retained
+--   whether the attempt's native steps all return, one reports partway, or the
+--   attempt is interrupted after a native step;
 -- * it is never overwritten on a return to windowed, on a change between
---   borderless and fullscreen, by a failed or partial transition, or by a
+--   borderless and fullscreen, by a failed attempt's target placement, or by a
 --   fallback's derived placement.
 --
 -- A repeated request is inert ('inertRequest') only when it equals the recorded

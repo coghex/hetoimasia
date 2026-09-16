@@ -94,8 +94,14 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testSupersededRecovery)
     it "settles borderless placement the platform cannot perform as unsupported, never as fullscreen"
       (boundedExample testUnsupportedBorderless)
-    it "reports a partial native failure with its completed steps and leaves the saved placement unchanged"
+    it "reports a partial native failure with its completed steps and retains the pre-departure geometry for a later return"
       (boundedExample testPartialFailure)
+    it "restores the pre-departure geometry through the configured fallback when a departure fails partway"
+      (boundedExample testPartialFailureFallback)
+    it "restores the pre-departure geometry under constraints that admit it and exclude the stale size"
+      (boundedExample testPartialFailureConstraints)
+    it "retains the pre-departure geometry when a departure is interrupted after a native step"
+      (boundedExample testInterruptedDeparture)
     it "stops recovery when restoring the windowed constraints fails during an attempt's cleanup, and a later refusal makes no setter"
       (boundedExample testCleanupStopsRecovery)
     it "propagates a cleanup that raises instead of reporting, settling its command as interrupted rather than as data"
@@ -753,26 +759,155 @@ testUnsupportedBorderless =
             ) → True
         _ → False
 
+-- | A departure whose target placement reports a failure has still partially
+-- left windowed presentation: the attempt retains the geometry it departed
+-- from — the user's latest move and resize — while the failed borderless
+-- target never enters the restoration cache, so a later explicit windowed
+-- return restores where the user left the window.
 testPartialFailure ∷ Expectation
 testPartialFailure = do
   let script =
         tracked
           { scriptWindowControl = \call reporter → case call of
-              SetWindowMonitor _ 0 _ _ _ _ _ → reportError reporter platformErrorCode "The window could not be placed"
+              SetWindowMonitor _ 0 (-1900) 40 1880 1000 _ → reportError reporter platformErrorCode "The window could not be placed"
               _ → pure ()
           }
   withDesk script $ \desk → withWindowIn desk "first" $ \window → do
-    _ ← seamDrive (deskSeam desk) window DuringPoll [MovedTo 111 222]
+    _ ← seamDrive (deskSeam desk) window DuringPoll [MovedTo 111 222, ResizedTo 640 480]
     partial ← execute desk [window] (mode window (borderlessOn (deskLeft desk)))
+    recordAfter ← recordOf window
+    callsAfterPartial ← modeCalls desk
+    returned ← execute desk [window] (mode window windowed)
+    restored ← geometry window
     record ← recordOf window
-    calls ← modeCalls desk
     partial `shouldSatisfy` stoppedPartwayAfter [DecorationStep False] (PlacementStep (Placement (-1900) 40) (Extent 1880 1000)) ["The window could not be placed"]
-    calls `shouldBe` [SetWindowDecorated 1 False, SetWindowMonitor 1 0 (-1900) 40 1880 1000 Nothing]
-    placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
-    modeRequested record `shouldBe` borderlessMode (deskLeft desk)
+    callsAfterPartial `shouldBe` [SetWindowDecorated 1 False, SetWindowMonitor 1 0 (-1900) 40 1880 1000 Nothing]
+    -- The retained placement is the pre-departure (111,222), 640x480, never
+    -- the failed target's (-1900,40), 1880x1000.
+    placementOf <$> modeSavedPlacement recordAfter `shouldBe` Just (Placement 111 222, Extent 640 480)
+    modeRequested recordAfter `shouldBe` borderlessMode (deskLeft desk)
     -- What was observed: an undecorated window over the right monitor's work
     -- area, where the user left it.
-    modeApplied record `shouldBe` AppliedBorderless (deskRight desk)
+    modeApplied recordAfter `shouldBe` AppliedBorderless (deskRight desk)
+    returned `shouldSatisfy` appliedCleanly
+    restored `shouldBe` (Observed (Placement 111 222), Observed (Extent 640 480))
+    placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 111 222, Extent 640 480)
+
+-- | The configured fallback of a departure that failed partway is itself a
+-- windowed return: it places the window at the retained pre-departure
+-- geometry, which the scripted failure — matching only the borderless target
+-- placement — leaves reachable.
+testPartialFailureFallback ∷ Expectation
+testPartialFailureFallback = do
+  let script =
+        tracked
+          { scriptWindowControl = \call reporter → case call of
+              SetWindowMonitor _ 0 (-1900) 40 1880 1000 _ → reportError reporter platformErrorCode "The window could not be placed"
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    _ ← seamDrive (deskSeam desk) window DuringPoll [MovedTo 111 222, ResizedTo 640 480]
+    settled ← execute desk [window] (mode window (modeRequest (borderlessMode (deskLeft desk)) (windowedFallback 1)))
+    record ← recordOf window
+    restored ← geometry window
+    calls ← modeCalls desk
+    outcomeOf settled `shouldSatisfy` \case
+      Just (ModeApplied WindowedFallbackAttempt steps [ModeAttemptFailure TargetAttempt (StoppedPartway returned at unattempted reports)]) →
+        steps == [DecorationStep True, PlacementStep (Placement 111 222) (Extent 640 480)]
+          && returned == [DecorationStep False]
+          && at == PlacementStep (Placement (-1900) 40) (Extent 1880 1000)
+          && null unattempted
+          && reportedTexts reports == ["The window could not be placed"]
+      _ → False
+    placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 111 222, Extent 640 480)
+    restored `shouldBe` (Observed (Placement 111 222), Observed (Extent 640 480))
+    modeApplied record `shouldBe` AppliedWindowed
+    calls
+      `shouldBe` [ SetWindowDecorated 1 False
+                 , SetWindowMonitor 1 0 (-1900) 40 1880 1000 Nothing
+                 , SetWindowDecorated 1 True
+                 , SetWindowMonitor 1 0 111 222 640 480 Nothing
+                 ]
+
+-- | Preserved constraints admit sizes only, so they are what proves the
+-- retained geometry restores under constraint: resized to an admitted size the
+-- stale seeded size violates, a partial departure followed by a windowed
+-- return succeeds at the latest geometry, where a stale cache would refuse
+-- 'PlacementExcluded'.
+testPartialFailureConstraints ∷ Expectation
+testPartialFailureConstraints = do
+  let script =
+        tracked
+          { scriptWindowControl = \call reporter → case call of
+              SetWindowMonitor _ 0 (-1900) 40 1880 1000 _ → reportError reporter platformErrorCode "The window could not be placed"
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    let run = execute desk [window]
+        target = windowIdentity window
+        constraints = sizeConstraints (Extent 400 300) (Extent 700 500) Nothing
+    _ ← seamDrive (deskSeam desk) window DuringPoll [ResizedTo 640 480]
+    installed ← run (setSizeConstraintsCommand target constraints)
+    partial ← run (mode window (borderlessOn (deskLeft desk)))
+    recordAfter ← recordOf window
+    beforeReturn ← length <$> seamCalls (deskSeam desk)
+    returned ← run (mode window windowed)
+    returnCalls ← filter isModeCall . drop beforeReturn <$> seamCalls (deskSeam desk)
+    restored ← geometry window
+    installed `shouldSatisfy` attempted
+    partial `shouldSatisfy` stoppedPartwayAfter [ClearSizeLimitsStep, ClearAspectRatioStep, DecorationStep False] (PlacementStep (Placement (-1900) 40) (Extent 1880 1000)) ["The window could not be placed"]
+    -- The retained placement is the admitted (40,30), 640x480, not the stale
+    -- seeded 800x600 the constraints exclude.
+    placementOf <$> modeSavedPlacement recordAfter `shouldBe` Just (Placement 40 30, Extent 640 480)
+    returned `shouldSatisfy` appliedCleanly
+    returnCalls
+      `shouldBe` [ SetWindowDecorated 1 True
+                 , SetWindowMonitor 1 0 40 30 640 480 Nothing
+                 , SetWindowSizeLimits 1 400 300 700 500
+                 , SetWindowAspectRatio 1 Nothing
+                 ]
+    restored `shouldBe` (Observed (Placement 40 30), Observed (Extent 640 480))
+
+-- | A departure interrupted by an exception that is not its own attempt
+-- failure, after a native step ran, settles its command as interrupted and its
+-- applied mode indeterminate — and still retains the pre-departure geometry,
+-- so after the reconciliation's resample an explicit windowed return restores
+-- where the user left the window.
+testInterruptedDeparture ∷ Expectation
+testInterruptedDeparture = do
+  let script =
+        tracked
+          { scriptWindowControl = \call _reporter → case call of
+              SetWindowMonitor _ 0 (-1900) 40 1880 1000 _ → throwIO (userError "the placement raised")
+              _ → pure ()
+          }
+  withDesk script $ \desk → withWindowIn desk "first" $ \window → do
+    _ ← seamDrive (deskSeam desk) window DuringPoll [MovedTo 111 222, ResizedTo 640 480]
+    ticket ← submit (windowCommandPort (deskHost desk)) (mode window (borderlessOn (deskLeft desk)))
+    raised ← try @SomeException (seamExecuteNext (deskSeam desk) (deskHost desk) [window])
+    settled ← atomically (pollCompletion ticket)
+    reconciled ← reconcileWindowMode window
+    afterReconcile ← recordOf window
+    returned ← execute desk [window] (mode window windowed)
+    restored ← geometry window
+    record ← recordOf window
+    case raised of
+      Left caught → do
+        (fromException caught ∷ Maybe ModeAttemptFailure) `shouldSatisfy` \case
+          Nothing → True
+          Just _ → False
+        length (cleanupFailures caught) `shouldBe` 0
+      Right step → unexpected ("the raising step settled as data: " <> show step)
+    settled `shouldBe` Just (Interrupted (submittedRequest (ticketOrigin ticket)))
+    -- The interrupted attempt settled the applied mode indeterminate; the
+    -- reconciliation resamples and publishes the platform's truth.
+    reconciled `shouldBe` WindowAvailable Nothing
+    modeApplied afterReconcile `shouldBe` AppliedBorderless (deskRight desk)
+    placementOf <$> modeSavedPlacement afterReconcile `shouldBe` Just (Placement 111 222, Extent 640 480)
+    returned `shouldSatisfy` appliedCleanly
+    restored `shouldBe` (Observed (Placement 111 222), Observed (Extent 640 480))
+    modeApplied record `shouldBe` AppliedWindowed
+    placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 111 222, Extent 640 480)
 
 testCleanupStopsRecovery ∷ Expectation
 testCleanupStopsRecovery = do

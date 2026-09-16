@@ -548,6 +548,7 @@ import Hetoimasia.GLFW.Internal.Mode
   , requestedFallback
   , requestedMode
   , reserveClaim
+  , SavedPlacement
   , savedPlacement
   , selectVideoMode
   , settleClaims
@@ -1951,25 +1952,33 @@ cleanupReports cleanups = combined <$> traverse native cleanups
      Reports (concatMap reportedErrors reports) (sum (map reportsLost reports)) (sum (map callbackFaults reports))
 
 -- | One complete owned attempt: validate and plan, make the steps, and sample,
--- answering the steps or failing with a 'ModeAttemptFailure'. Its cleanup
--- restores the preserved windowed constraints of a window it left windowed
--- with them suspended.
+-- answering the steps or failing with a 'ModeAttemptFailure'. A departure from
+-- an applied windowed presentation retains the geometry it departed from as
+-- the saved placement whether every step returns or one reports partway, so a
+-- later windowed return restores it; the failed attempt's target placement is
+-- never recorded. Its cleanup restores the preserved windowed constraints of a
+-- window it left windowed with them suspended.
 modeAttempt ∷ IO () → Window → ModeRequest → ModeAttemptKind → IO (ModeAttemptKind, [ModeStep])
 modeAttempt afterReservation window request kind =
   withResourceLabelled "glfw window constraint restoration" (newIORef False) (restoreLeftWindowed window) $ \disturbed → do
    reservation ← newIORef Nothing
+   departing ← newIORef Nothing
    -- The protection that settles an interrupted attempt is in place before the
    -- attempt plans, and its handler runs masked.
    mask $ \restore → do
      attempted ∷ Either (ExceptionWithContext SomeException) (ModeAttemptKind, [ModeStep]) ←
-       tryWithContext (restore (attemptBody disturbed reservation))
+       tryWithContext (restore (attemptBody disturbed reservation departing))
      case attempted of
        Right value → pure value
        Left caught@(ExceptionWithContext _ raised)
          | Just (_ ∷ ModeAttemptFailure) ← fromException raised → rethrowIO caught
-         | otherwise → readIORef reservation >>= abandonAttempt window disturbed >> rethrowIO caught
+         | otherwise → do
+             reserved ← readIORef reservation
+             leaving ← readIORef departing
+             abandonAttempt window disturbed reserved leaving
+             rethrowIO caught
   where
-    attemptBody disturbed reservation = do
+    attemptBody disturbed reservation departing = do
       OwnerState current _ ← readIORef (windowOwnerState window)
       ControlState windowed native _ ← readIORef (windowControl window)
       let record = obsMode current
@@ -1977,6 +1986,7 @@ modeAttempt afterReservation window request kind =
             (AppliedWindowed, Observed position, Observed extent)
               | target /= WindowedPresentation → Just (savedPlacement position extent)
             _ → Nothing
+      writeIORef departing leaving
       (plan, pointer) ← case (target, modeMonitor mode, modeVideoPreference mode) of
         (BorderlessPresentation, Just monitor, _) → do
           unsupported BorderlessOperation
@@ -2013,7 +2023,7 @@ modeAttempt afterReservation window request kind =
           pure (plan, Nothing)
       runModeSteps window disturbed pointer plan >>= \case
         Right steps → (kind, steps) <$ samplePresentation True window (maybe id recordSaved leaving)
-        Left failure → samplePresentation True window id >> failWith failure
+        Left failure → samplePresentation True window (maybe id recordSaved leaving) >> failWith failure
     session = windowSession window
     local = windowLocalIdentity (windowId window)
     mode = requestedMode request
@@ -2033,17 +2043,18 @@ modeAttempt afterReservation window request kind =
       Unavailable → Nothing
 
 -- | Settle an attempt interrupted by something other than its own failure: its
--- claims under 'abandonClaims', and, after a native step, an indeterminate
--- applied mode in the owner's state, which the next mode reconciliation resamples
--- and publishes.
-abandonAttempt ∷ Window → IORef Bool → Maybe MonitorId → IO ()
-abandonAttempt window disturbed reserved = do
+-- claims under 'abandonClaims', and, after a native step, the windowed geometry
+-- it departed from retained as the saved placement and an indeterminate applied
+-- mode in the owner's state, which the next mode reconciliation resamples and
+-- publishes.
+abandonAttempt ∷ Window → IORef Bool → Maybe MonitorId → Maybe SavedPlacement → IO ()
+abandonAttempt window disturbed reserved leaving = do
   stepped ← readIORef disturbed
   atomicModifyIORef' (sessionClaims (windowSession window)) $ \claims →
     (abandonClaims (windowLocalIdentity (windowId window)) reserved stepped claims, ())
   when stepped $
     atomicModifyIORef' (windowOwnerState window) $ \(OwnerState current issued) →
-      (OwnerState current {obsMode = recordApplied AppliedIndeterminate (obsMode current)} issued, ())
+      (OwnerState current {obsMode = recordApplied AppliedIndeterminate (maybe id recordSaved leaving (obsMode current))} issued, ())
 
 -- | Make a plan's steps in order, stopping at the first that reports an error.
 -- The native constraint state is indeterminate from a constraint step's start

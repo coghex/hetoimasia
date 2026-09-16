@@ -10,13 +10,19 @@ failure, interrupting the command and stopping the loop.
 (disconnect recovery across observations) is repaired: the recovery a settled
 mode owes to its monitor's identity survives ordinary observations of the
 platform's post-disconnect state, so the configured fallback runs however
-observation and reconciliation are ordered. Two defects remain open:
+observation and reconciliation are ordered.
 [#117](https://github.com/coghex/hetoimasia/issues/117)
-(restoration after partial departure) and [#118](https://github.com/coghex/hetoimasia/issues/118)
+(restoration after partial departure) is repaired: a departure from an applied
+windowed presentation retains the geometry it departs from as the saved
+placement, whether the attempt's steps all return, one reports partway, or the
+attempt is interrupted after a native step, so the configured fallback or a
+later windowed return restores where the user left the window. One defect
+remains open:
+[#118](https://github.com/coghex/hetoimasia/issues/118)
 (fixture settlement under repeated cancellation). See the
-[completion review](project_review_114-101.md) for reproductions. The corrected
-contracts and regressions must accompany those repair PRs; this status update
-does not claim those fixes have landed.
+[completion review](project_review_114-101.md) for reproductions. #118's
+corrected contract and regressions must accompany its repair PR; this status
+update does not claim that fix has landed.
 
 Current behavior of `hetoimasia-glfw`, the package that owns the native binding
 to upstream GLFW 3.4, the one process-main-thread session over it, the
@@ -1472,10 +1478,12 @@ A window's saved placement is its windowed content position and logical size:
 
 - seeded from the window's initial observation, before any startup transition;
 - cached from the observed placement when a transition leaves an applied
-  windowed presentation, and only once every step of that attempt returned
-  without a report;
+  windowed presentation — the geometry the attempt departs from, retained
+  whether the attempt's native steps all return, one reports partway, or the
+  attempt is interrupted after a native step;
 - never overwritten by a return to windowed, a change between borderless and
-  fullscreen, a failed or partial attempt, or a fallback's derived placement.
+  fullscreen, a failed attempt's target placement, or a fallback's derived
+  placement.
 
 A request is inert only when it equals the recorded request completely — the
 monitor identity and the video mode preference included — its last outcome
@@ -2357,9 +2365,12 @@ running it.
   disconnect after fullscreen was applied falling back through the owner loop
   with no further command to a derived reachable placement while the off-screen
   saved placement is kept; exhaustion with no monitor left; borderless placement
-  settling as unsupported on the modeled Wayland backend; a partial failure
-  naming its steps with the saved placement unchanged; a failed constraint
-  restoration stopping recovery; a required startup mode failing and rolling the
+  settling as unsupported on the modeled Wayland backend; a partial departure
+  naming its steps and retaining the pre-departure geometry — restored through
+  the configured fallback, a later explicit return, constraints admitting it
+  while excluding the stale size, and an interruption after a native step; a
+  failed constraint restoration stopping recovery; a required startup mode
+  failing and rolling the
   window back while an optional one records its fallback; `MonitorBusy` for a
   second window without native effect, including while the first is iconified;
   independent claims released in both close orders; a claim invalidated by
