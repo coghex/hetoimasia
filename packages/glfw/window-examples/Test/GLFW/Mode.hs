@@ -671,7 +671,9 @@ testExhaustionAfterObservation = withDesk tracked $ \desk → withWindowIn desk 
 
 -- | With no fallback configured, an observed disconnect is only resampled: the
 -- observation keeps reporting the platform's post-disconnect state, no
--- recovery invents a placement, and the saved placement is preserved.
+-- recovery invents a placement, and the saved placement is preserved. That
+-- resample answers the obligation, so a later reconciliation samples nothing
+-- again — the owner loop reconciles every turn.
 testObservationWithoutFallback ∷ Expectation
 testObservationWithoutFallback = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
   let seam = deskSeam desk
@@ -685,12 +687,17 @@ testObservationWithoutFallback = withDesk tracked $ \desk → withWindowIn desk 
   record ← recordOf window
   postDisconnect ← geometry window
   afterReconciliation ← setterCalls desk
+  callsAfterAnswer ← seamCalls seam
+  repeated ← reconcileWindowMode window
+  callsAfterRepeat ← seamCalls seam
   entering `shouldSatisfy` appliedCleanly
   appliedOf observed `shouldBe` Just AppliedWindowed
   reconciled `shouldBe` WindowAvailable Nothing
   placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
   postDisconnect `shouldBe` (Observed (Placement 0 0), Observed (Extent 1920 1080))
   afterReconciliation `shouldBe` beforeReconciliation
+  repeated `shouldBe` WindowAvailable Nothing
+  callsAfterRepeat `shouldBe` callsAfterAnswer
 
 -- | A mode request that executes after the disconnect and settles takes over
 -- the record, whatever the pending recovery was: no stale recovery undoes it.

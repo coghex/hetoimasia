@@ -172,6 +172,7 @@ module Hetoimasia.GLFW.Internal.Mode
   , modeRecoveryObligation
   , recordApplied
   , recordSaved
+  , recordRecoveryCleared
   , recordSettled
   , deriveApplied
   , inertRequest
@@ -487,6 +488,13 @@ recordApplied applied record = record {recApplied = applied}
 
 recordSaved ∷ SavedPlacement → ModeRecord → ModeRecord
 recordSaved saved record = record {recSaved = Just saved}
+
+-- | Answer a recovery obligation without a transition: the resample that
+-- publishes the platform's post-disconnect truth when no fallback is
+-- configured consumes it, so the owner loop's reconciliation does not resample
+-- the window on every later turn.
+recordRecoveryCleared ∷ ModeRecord → ModeRecord
+recordRecoveryCleared record = record {recRecovery = Nothing}
 
 -- | Record a request that executed and how it settled. The settlement's sample
 -- has already been folded into the record, so the recovery now owed is the one

@@ -1579,7 +1579,8 @@ After the owner loop refreshes the monitor inventory, it reconciles every window
 that is not closing. A window whose recovery obligation names an ended monitor
 identity takes its recorded windowed fallback at once, with no further command,
 attempting it at most its configured number of times, and its outcome is
-recorded; with no fallback it is only resampled. The obligation is the monitor
+recorded; with no fallback it is only resampled, once — that resample answers
+the obligation, so later turns do not sample the window again. The obligation is the monitor
 identity the last settled request's own sample established the applied mode on —
 fullscreen or borderless — and it survives every ordinary observation: GLFW
 itself takes a fullscreen window off a disconnected monitor before the monitor
