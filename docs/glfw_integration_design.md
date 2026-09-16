@@ -83,7 +83,10 @@ root inside `hetoimasia-glfw`; the foundation/runtime boundaries remain intact.
 The [completion review](project_review_114-101.md) found four open repairs:
 #115 construction/rollback failure preservation, #116 disconnect recovery across
 observations, #117 geometry restoration after partial departure, and #118 fixture
-drain under repeated cancellation. Their issues are filed, not implemented.
+drain under repeated cancellation. All four are repaired: #118's fixture now
+absorbs repeated owner cancellation during settlement, releases only after the
+borrower finishes, and keeps the initiating failure primary with its retained
+cleanup evidence.
 Epic #86 remains open; its original child checkboxes still need tracker
 reconciliation. TEST-2's single implementation is #93; do not create another.
 
@@ -125,7 +128,8 @@ children (#87–#100) now exist, as the ledger records. The 2026-09-14 backlog
 review verified the completed CI, resource and messaging children and closed
 their epics (#8, #22, #73) with owner approval. TEST-1's completed checkbox
 under #49 was also synchronized. TEST-2/#93 subsequently merged through PR #107;
-the current fixture repair is #118. Do not file a duplicate fixture implementation.
+the current fixture repair was #118, now implemented. Do not file a duplicate
+fixture implementation.
 
 ### Synarchy: preserve these decisions deliberately
 

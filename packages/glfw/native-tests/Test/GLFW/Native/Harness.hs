@@ -5,16 +5,29 @@
 -- failures are observable without GLFW: lazy single acquisition, nothing
 -- acquired by a dry run or an empty selection, a deliberately failing nested
 -- example, a cancelled borrower with work in flight and queued, an owner that
--- fails while a borrower waits, and an acquisition failure. The shared-session
--- examples repeat the failing and cancelled cases against the real session on
--- the process main thread. Every deliberate failure is inside a nested run or a
--- forked borrower and is asserted as expected, so this suite still passes.
+-- fails while a borrower waits, an owner cancelled again while it settles the
+-- first cancellation — with a clean release and with a failing one — an owner
+-- cancelled once more while its release still runs, and an acquisition
+-- failure. The shared-session examples repeat the failing and cancelled cases
+-- against the real session on the process main thread. Every deliberate
+-- failure is inside a nested run or a forked borrower and is asserted as
+-- expected, so this suite still passes.
 --
 -- Coordination is explicit throughout: gates, the fixture's queue count, and
 -- thread outcomes. Nothing waits on time.
 module Test.GLFW.Native.Harness (spec) where
 
-import Control.Concurrent (ThreadId, forkFinally, killThread, newEmptyMVar, putMVar, readMVar, takeMVar, throwTo)
+import Control.Concurrent
+  ( ThreadId
+  , forkFinally
+  , killThread
+  , newEmptyMVar
+  , putMVar
+  , readMVar
+  , takeMVar
+  , throwTo
+  , yield
+  )
 import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception
@@ -28,7 +41,9 @@ import Control.Exception
   , throwIO
   , try
   )
-import Control.Monad (replicateM, void, when)
+import Control.Monad (replicateM, unless, void, when)
+import Data.Foldable (for_)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Failure
   ( FailureCause (EngineOrigin)
@@ -198,6 +213,87 @@ spec shared = describe "the shared fixture" $ do
       let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
       map fromException retained `shouldBe` [Just ReleaseFailed]
 
+    it "keeps the resource alive through repeated owner cancellation during settlement, the first cancellation primary" $ do
+      script ← newScript False False
+      started ← newEmptyMVar
+      never ← newEmptyMVar ∷ IO (MVar ())
+      (outcome, report) ←
+        runOwned (scripted script) $ \fixture → do
+          (_, waited) ← forked . dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value
+          takeMVar started
+          throwTo (ownerThread fixture) OwnerKilled
+          woken ← waited
+          -- The owner is settling the first cancellation, waiting for this
+          -- borrower. A second cancellation is delivered to that wait — the
+          -- throwTo returns — while the borrower has not finished.
+          (_, cancelledAgain) ← forked (throwTo (ownerThread fixture) OwnerKilledAgain)
+          delivered ← cancelledAgain
+          note script "borrower finished"
+          pure (woken, delivered)
+      (woken, delivered) ← either throwIO pure outcome
+      failedWith OwnerKilled woken `shouldBe` True
+      either throwIO pure delivered
+      events script `shouldReturn` ["acquired", "borrower finished", "released"]
+      reportAcquisitions report `shouldBe` 1
+      reportServed report `shouldBe` 0
+      reportDeclined report `shouldBe` 0
+      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+      fromException failure `shouldBe` Just OwnerKilled
+
+    it "keeps the release's cleanup evidence beside the first cancellation through repeated cancellation during settlement" $ do
+      script ← newScript False True
+      started ← newEmptyMVar
+      never ← newEmptyMVar ∷ IO (MVar ())
+      (outcome, report) ←
+        runOwned (scripted script) $ \fixture → do
+          (_, waited) ← forked . dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value
+          takeMVar started
+          throwTo (ownerThread fixture) OwnerKilled
+          woken ← waited
+          (_, cancelledAgain) ← forked (throwTo (ownerThread fixture) OwnerKilledAgain)
+          delivered ← cancelledAgain
+          note script "borrower finished"
+          pure (woken, delivered)
+      (woken, delivered) ← either throwIO pure outcome
+      failedWith OwnerKilled woken `shouldBe` True
+      either throwIO pure delivered
+      events script `shouldReturn` ["acquired", "borrower finished", "released"]
+      reportAcquisitions report `shouldBe` 1
+      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+      fromException failure `shouldBe` Just OwnerKilled
+      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+      map fromException retained `shouldBe` [Just ReleaseFailed]
+
+    it "keeps the initiating failure primary when a later cancellation is deferred through the release" $ do
+      (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
+      (outcome, report) ←
+        runOwned (scripted script) $ \fixture → do
+          served ← dispatch fixture pure
+          throwTo (ownerThread fixture) OwnerKilled
+          -- Once the release begins, a further cancellation is aimed at the
+          -- owner; the release is uninterruptible, so it is delivered only
+          -- after the release finishes. The gate is opened only once the
+          -- cancellation is observed pending, so the deferral is certain.
+          (canceller, cancelled) ← forked $ do
+            readMVar enteredRelease
+            throwTo (ownerThread fixture) OwnerKilledAgain
+          (_, opened) ← forked $ do
+            readMVar enteredRelease
+            awaitThrowing canceller
+            putMVar releaseGate ()
+          note script "borrower finished"
+          pure (served, cancelled, opened)
+      (served, cancelled, opened) ← either throwIO pure outcome
+      served `shouldBe` 7
+      cancelled >>= either throwIO pure
+      opened >>= either throwIO pure
+      events script `shouldReturn` ["acquired", "borrower finished", "released"]
+      reportAcquisitions report `shouldBe` 1
+      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+      fromException failure `shouldBe` Just OwnerKilled
+      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+      map fromException retained `shouldBe` [Just ReleaseFailed]
+
     it "answers every borrower with an acquisition failure, never retries it, and releases nothing" $ do
       script ← newScript True False
       (outcome, report) ←
@@ -256,6 +352,10 @@ data Script = Script
   { scriptLog ∷ TVar [String]
   , scriptAcquireFails ∷ Bool
   , scriptReleaseFails ∷ Bool
+  , scriptReleaseWait ∷ Maybe (MVar (), MVar ())
+    -- ^ When set, the release announces it has begun on the first 'MVar' and
+    -- then blocks on the second, so an example can aim a cancellation at the
+    -- owner while the uninterruptible release runs.
   }
 
 data ScriptedFailure = AcquisitionFailed | ReleaseFailed
@@ -271,10 +371,28 @@ instance Exception OwnerKilled where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
 
+-- | A second cancellation aimed at an owner already settling 'OwnerKilled',
+-- distinguishable from it in the report.
+data OwnerKilledAgain = OwnerKilledAgain
+  deriving (Eq, Show)
+
+instance Exception OwnerKilledAgain where
+  toException = asyncExceptionToException
+  fromException = asyncExceptionFromException
+
 newScript ∷ Bool → Bool → IO Script
 newScript acquireFails releaseFails = do
   entries ← newTVarIO []
-  pure (Script entries acquireFails releaseFails)
+  pure (Script entries acquireFails releaseFails Nothing)
+
+-- | A script whose release announces it has begun and then blocks on a gate,
+-- so an example can aim a cancellation at the owner while the release runs.
+newScriptBlockingRelease ∷ Bool → IO (Script, MVar (), MVar ())
+newScriptBlockingRelease releaseFails = do
+  entries ← newTVarIO []
+  entered ← newEmptyMVar
+  gate ← newEmptyMVar
+  pure (Script entries False releaseFails (Just (entered, gate)), entered, gate)
 
 note ∷ Script → String → IO ()
 note script entry = atomically (modifyTVar' (scriptLog script) (<> [entry]))
@@ -294,6 +412,7 @@ scripted script =
       when (scriptAcquireFails script) (throwIO AcquisitionFailed)
       pure 7
     release _ = do
+      for_ (scriptReleaseWait script) $ \(entered, gate) → putMVar entered () >> takeMVar gate
       note script "released"
       when (scriptReleaseFails script) (throwIO ReleaseFailed)
 
@@ -307,6 +426,14 @@ forked action = do
   finished ← newEmptyMVar
   thread ← forkFinally action (putMVar finished)
   pure (thread, readMVar finished)
+
+-- | Wait until the thread is blocked delivering an exception, so a
+-- cancellation aimed at an uninterruptible owner is known to be pending before
+-- the blocker it waits on is released.
+awaitThrowing ∷ ThreadId → IO ()
+awaitThrowing thread = do
+  status ← threadStatus thread
+  unless (status == ThreadBlocked BlockedOnException) (yield >> awaitThrowing thread)
 
 -- | Run a nested spec silently, independent of this run's own options.
 runNested ∷ (Config → Config) → Spec → IO SpecResult

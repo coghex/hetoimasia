@@ -28,6 +28,12 @@
 --   settles whatever is still queued unexecuted first. Release goes through
 --   "Hetoimasia.Foundation.Resource", so a release failure beside a primary one
 --   is retained as cleanup evidence rather than replacing it.
+-- * Once an owner failure or cancellation begins that settlement, further
+--   cancellation of the owner is absorbed by the wait for the borrower — which
+--   stays interruptible — rather than ending it, and the failure the run
+--   reports stays the one that began the settlement, with its context and
+--   retained cleanup evidence. This is the protected-drain policy of
+--   "Hetoimasia.Foundation.Worker" applied to the fixture's one borrower.
 --
 -- = State
 --
@@ -91,8 +97,9 @@ import Control.Exception
   , toException
   , try
   , tryJust
+  , uninterruptibleMask
   )
-import Control.Monad (unless, void)
+import Control.Monad (unless, void, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (Scoped, withScoped)
 
@@ -200,6 +207,7 @@ runOwned owner borrower = do
   finished ← newEmptyTMVarIO
   served ← newIORef (0 ∷ Int)
   declined ← newIORef (0 ∷ Int)
+  reported ← newIORef Nothing
   _ ← forkFinally (borrower fixture) (atomically . void . tryPutTMVar finished)
   let next =
         atomically
@@ -216,12 +224,22 @@ runOwned owner borrower = do
           then decline (toException NotExecuted) request
           else requestPerform request resource >> modifyIORef' served (+ 1)
       -- Stop serving: wake every waiter with the reason, let the borrower
-      -- finish, and settle what it left queued. Idempotent.
+      -- finish, and settle what it left queued. Idempotent, so a caller that
+      -- absorbs an interruption delivered during its wait can retry it.
       stopServing reason = do
         atomically (void (tryPutTMVar (fixtureEnded fixture) reason))
         void (atomically (readTMVar finished))
         drain
-      held resource first = serving `catch` \failure → stopServing failure >> rethrow failure
+      -- Run a settlement step to the end of the wait. The wait stays
+      -- interruptible, but an interruption delivered during it — a further
+      -- cancellation aimed at the owner — is absorbed and the step retried,
+      -- so it neither ends the settlement nor escapes its caller.
+      absorbing step = do
+        outcome ← try step
+        case outcome of
+          Right () → pure ()
+          Left (_ ∷ SomeException) → absorbing step
+      held resource first = serving `catch` \failure → absorbing (stopServing failure) >> rethrow failure
         where
           serving = perform resource first >> loop
           loop =
@@ -238,10 +256,33 @@ runOwned owner borrower = do
       acquireFor request = do
         atomically (modifyTVar' (fixtureAcquisitions fixture) (+ 1))
         entered ← newIORef False
+        -- The scope's orchestration runs uninterruptibly, so a cancellation
+        -- deferred through the release cannot replace the scope's failure in
+        -- flight: the failure the scope produced, with the cleanup evidence
+        -- the release retained, reaches the 'try' below whole, and the
+        -- deferred cancellation is delivered only afterwards, where it is
+        -- absorbed beside the recorded primary. The scope's own masking keeps
+        -- its acquisition and the settlement wait interruptible, the served
+        -- operations run with the caller's masking state restored, and the
+        -- release stays the only uninterruptible blocking step.
         outcome ←
-          try . withScoped (ownerAcquire owner) $ \resource → do
-            writeIORef entered True
-            held resource request
+          uninterruptibleMask $ \restore → do
+            caught ←
+              try . withScoped (ownerAcquire owner) $ \resource →
+                restore $ do
+                  writeIORef entered True
+                  held resource request
+            -- Record the scope's failure — the initiating failure, with the
+            -- cleanup evidence its release retained — while still
+            -- uninterruptible: a cancellation deferred through the release
+            -- is delivered as soon as this region exits, and would take the
+            -- report over that primary failure if it were recorded later.
+            case caught of
+              Right () → pure ()
+              Left failure → do
+                inside ← readIORef entered
+                when inside (writeIORef reported (Just failure))
+            pure caught
         case outcome of
           Right () → pure Nothing
           Left failure → do
@@ -259,8 +300,14 @@ runOwned owner borrower = do
               then decline (toException NotExecuted) request >> idle
               else acquireFor request
   outcome ← try idle
-  let failure = either Just id outcome
-  stopServing (maybe (toException OwnerFinished) id failure)
+  -- A cancellation deferred through the release is delivered after it and is
+  -- what 'try' catches here; the failure the scope recorded, if there is one,
+  -- stays the report's primary.
+  recorded ← readIORef reported
+  let failure = case recorded of
+        Just primary → Just primary
+        Nothing → either Just id outcome
+  absorbing (stopServing (maybe (toException OwnerFinished) id failure))
   borrowed ← atomically (readTMVar finished)
   report ←
     OwnerReport
