@@ -97,7 +97,6 @@ import Control.Exception
   , toException
   , try
   , tryJust
-  , uninterruptibleMask
   )
 import Control.Monad (unless, void, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -256,27 +255,28 @@ runOwned owner borrower = do
       acquireFor request = do
         atomically (modifyTVar' (fixtureAcquisitions fixture) (+ 1))
         entered ← newIORef False
-        -- The scope's orchestration runs uninterruptibly, so a cancellation
-        -- deferred through the release cannot replace the scope's failure in
-        -- flight: the failure the scope produced, with the cleanup evidence
-        -- the release retained, reaches the 'try' below whole, and the
-        -- deferred cancellation is delivered only afterwards, where it is
-        -- absorbed beside the recorded primary. The scope's own masking keeps
-        -- its acquisition and the settlement wait interruptible, the served
-        -- operations run with the caller's masking state restored, and the
-        -- release stays the only uninterruptible blocking step.
+        -- The scope's orchestration runs masked, so a cancellation deferred
+        -- through the uninterruptible release cannot replace the scope's
+        -- failure in flight: the failure the scope produced, with the cleanup
+        -- evidence the release retained, unwinds to the 'try' below under a
+        -- mask the deferred delivery cannot cross without a blocking point,
+        -- and is recorded before unmasked code gives that delivery one. The
+        -- scope's own masking keeps its acquisition and the settlement wait
+        -- interruptible, the served operations run with the caller's masking
+        -- state restored, and the release stays the only uninterruptible
+        -- blocking step.
         outcome ←
-          uninterruptibleMask $ \restore → do
+          mask $ \restore → do
             caught ←
               try . withScoped (ownerAcquire owner) $ \resource →
                 restore $ do
                   writeIORef entered True
                   held resource request
             -- Record the scope's failure — the initiating failure, with the
-            -- cleanup evidence its release retained — while still
-            -- uninterruptible: a cancellation deferred through the release
-            -- is delivered as soon as this region exits, and would take the
-            -- report over that primary failure if it were recorded later.
+            -- cleanup evidence its release retained — while still masked: a
+            -- cancellation deferred through the release is delivered as soon
+            -- as unmasked code resumes, and would take the report over that
+            -- primary failure if it were recorded any later.
             case caught of
               Right () → pure ()
               Left failure → do

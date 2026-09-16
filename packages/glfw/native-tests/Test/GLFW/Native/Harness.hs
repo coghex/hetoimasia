@@ -7,8 +7,9 @@
 -- example, a cancelled borrower with work in flight and queued, an owner that
 -- fails while a borrower waits, an owner cancelled again while it settles the
 -- first cancellation — with a clean release and with a failing one — an owner
--- cancelled once more while its release still runs, and an acquisition
--- failure. The shared-session examples repeat the failing and cancelled cases
+-- cancelled once more while its release still runs, an owner cancelled while
+-- its acquisition is blocked, and an acquisition failure. The shared-session
+-- examples repeat the failing and cancelled cases
 -- against the real session on the process main thread. Every deliberate
 -- failure is inside a nested run or a forked borrower and is asserted as
 -- expected, so this suite still passes.
@@ -294,6 +295,28 @@ spec shared = describe "the shared fixture" $ do
       let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
       map fromException retained `shouldBe` [Just ReleaseFailed]
 
+    it "interrupts a blocked acquisition with a cancellation, answering the waiter with it" $ do
+      (script, enteredAcquire, _acquireGate) ← newScriptBlockingAcquire
+      (outcome, report) ←
+        runOwned (scripted script) $ \fixture → do
+          (_, waited) ← forked (dispatch fixture pure)
+          readMVar enteredAcquire
+          -- Delivered while the owner blocks in the acquisition: the throwTo
+          -- returning proves the delivery, so the acquisition stayed
+          -- interruptible.
+          throwTo (ownerThread fixture) OwnerKilled
+          woken ← waited
+          note script "borrower finished"
+          pure woken
+      woken ← either throwIO pure outcome
+      failedWith OwnerKilled woken `shouldBe` True
+      events script `shouldReturn` ["borrower finished"]
+      reportAcquisitions report `shouldBe` 1
+      reportServed report `shouldBe` 0
+      reportDeclined report `shouldBe` 1
+      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+      fromException failure `shouldBe` Just OwnerKilled
+
     it "answers every borrower with an acquisition failure, never retries it, and releases nothing" $ do
       script ← newScript True False
       (outcome, report) ←
@@ -352,6 +375,10 @@ data Script = Script
   { scriptLog ∷ TVar [String]
   , scriptAcquireFails ∷ Bool
   , scriptReleaseFails ∷ Bool
+  , scriptAcquireWait ∷ Maybe (MVar (), MVar ())
+    -- ^ When set, the acquisition announces it has begun on the first 'MVar'
+    -- and then blocks on the second, so an example can cancel the owner while
+    -- the acquisition is blocked.
   , scriptReleaseWait ∷ Maybe (MVar (), MVar ())
     -- ^ When set, the release announces it has begun on the first 'MVar' and
     -- then blocks on the second, so an example can aim a cancellation at the
@@ -383,7 +410,16 @@ instance Exception OwnerKilledAgain where
 newScript ∷ Bool → Bool → IO Script
 newScript acquireFails releaseFails = do
   entries ← newTVarIO []
-  pure (Script entries acquireFails releaseFails Nothing)
+  pure (Script entries acquireFails releaseFails Nothing Nothing)
+
+-- | A script whose acquisition announces it has begun and then blocks on a
+-- gate, so an example can cancel the owner while the acquisition is blocked.
+newScriptBlockingAcquire ∷ IO (Script, MVar (), MVar ())
+newScriptBlockingAcquire = do
+  entries ← newTVarIO []
+  entered ← newEmptyMVar
+  gate ← newEmptyMVar
+  pure (Script entries False False (Just (entered, gate)) Nothing, entered, gate)
 
 -- | A script whose release announces it has begun and then blocks on a gate,
 -- so an example can aim a cancellation at the owner while the release runs.
@@ -392,7 +428,7 @@ newScriptBlockingRelease releaseFails = do
   entries ← newTVarIO []
   entered ← newEmptyMVar
   gate ← newEmptyMVar
-  pure (Script entries False releaseFails (Just (entered, gate)), entered, gate)
+  pure (Script entries False releaseFails Nothing (Just (entered, gate)), entered, gate)
 
 note ∷ Script → String → IO ()
 note script entry = atomically (modifyTVar' (scriptLog script) (<> [entry]))
@@ -408,6 +444,7 @@ scripted script =
     }
   where
     acquire = do
+      for_ (scriptAcquireWait script) $ \(entered, gate) → putMVar entered () >> takeMVar gate
       note script "acquired"
       when (scriptAcquireFails script) (throwIO AcquisitionFailed)
       pure 7

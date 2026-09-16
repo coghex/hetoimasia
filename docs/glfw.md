@@ -2435,7 +2435,8 @@ run or an empty selection, a deliberately failing nested example, a cancelled
 borrower with one operation in flight and one queued, an owner that fails while
 a borrower waits, an owner cancelled again while it settles the first
 cancellation, with the release succeeding and with it failing, an owner
-cancelled once more while its release still runs, and an acquisition failure —
+cancelled once more while its release still runs, an owner cancelled while its
+acquisition is blocked, and an acquisition failure —
 and the failing and cancelled cases again against the real shared session.
 Every deliberate failure is inside a nested run or a forked borrower and is
 asserted as expected, so the suite itself passes.
