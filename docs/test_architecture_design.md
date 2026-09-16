@@ -41,10 +41,12 @@ The ledger records issue processing, not implementation completion. TEST-1/#50
 merged through PR #51. TEST-2's single implementation, GLFW-7/#93, merged through
 PR #107 with its shared native fixture and platform gates. Repair #118 merged
 through PR #122; the subsequent review is recorded in
-[project_review_122-119.md](project_review_122-119.md). Epic #49 remains open;
-its TEST-2 checkbox and historical implementation prose need reconciliation.
-Extending that epic to TEST-3 through TEST-6 requires an approved epic amendment
-during processing. This document does not itself edit the tracker.
+[project_review_122-119.md](project_review_122-119.md). On 2026-09-16 the owner
+directly authorized the epic amendment: #49 now marks TEST-1/TEST-2 complete,
+records the merged fixture repair, and includes TEST-3 through TEST-6 with the
+reviewed ownership, dependency and validation contracts. The tracker edit was
+verified; its title, `epic`/`tests` labels and open state are unchanged.
+No new child issue was created. TEST-3 is the next processing entry.
 
 ## Epic contract
 
@@ -301,9 +303,9 @@ of effective mandatory coverage. These are the processing contracts. New suite
 groups enter the existing floor as their examples leave the monolithic suite;
 reducing that floor requires a separate policy decision.
 
-Q-2 is resolved. This signs off the design for processing, not implementation
-or a tracker edit. Processing must first propose the concrete amendment to
-existing epic #49, then obtain approval for each new child separately.
+Q-2 is resolved. This signs off the design for processing, not implementation.
+The owner subsequently directly authorized amending existing epic #49, and
+that amendment is complete. Each new child still receives separate approval.
 
 ## Design
 
@@ -695,14 +697,17 @@ both implementation children and fixture repair #118 have merged. Preserve
 those IDs and their completed contracts. Vulkan owns GPU fixtures and actual
 GPU-completion evidence separately.
 
-Readiness is signed off. Processing first proposes an amendment to existing
-epic #49: retain TEST-1/TEST-2, reconcile their completion with PRs #51/#107/#122,
-and add this package-ownership phase and its done conditions. Obtain approval
-for that concrete tracker edit before drafting new children. Do not create a
-duplicate epic or repurpose closed issues #50/#93. Then process TEST-3 through
-TEST-6 one child at a time, rechecking tracker overlap and the current source
-layout. Issue #124 remains the independent native opt-in guard; do not draft
-another issue for it here.
+Readiness is signed off, and the owner-directed amendment of epic #49 is
+complete and verified on 2026-09-16. Its checklist retains completed
+TEST-1/TEST-2, accounts for PRs #51/#107/#122, and adds the package-ownership
+phase and its done conditions. Do not repeat the epic amendment, create a
+duplicate epic, or repurpose closed issues #50/#93.
+
+The next invocation selects TEST-3. Process TEST-3 through TEST-6 one child at a
+time, with separate child approval, rechecking tracker overlap and the current
+source layout. Their four ledger entries remain unchecked until linked to
+actual issues. Issue #124 remains the independent native opt-in guard; do not
+draft another issue for it here.
 
 Recommended document processing order: this package-test extension, then
 `runtime_scheduling_design.md`, then `window_graphics_lifetime_design.md`.
