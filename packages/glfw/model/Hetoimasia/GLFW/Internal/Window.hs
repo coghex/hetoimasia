@@ -62,17 +62,26 @@
 -- = Callbacks and the reconciliation boundary
 --
 -- The size, framebuffer size, content scale, position, focus, iconify,
--- maximize, refresh, and close callbacks are contained at the trampoline. Each
--- runs uninterruptibly, copies its fixed payload, records it into the window's
--- capture latch with one non-blocking 'IORef' update, and returns. None calls
--- application code, waits, polls, logs, or destroys anything. Anything a
--- callback raises is caught there with its context and latched instead of
--- unwinding into C; only the first is kept, and later ones are counted.
+-- maximize, refresh, close, key, character, mouse button, cursor position,
+-- cursor enter and leave, and scroll callbacks are contained at the trampoline.
+-- Each runs uninterruptibly, copies its fixed payload, records it into the
+-- window's capture latch with one non-blocking 'IORef' update, and returns.
+-- None calls application code, waits, polls, logs, or destroys anything.
+-- Anything a callback raises is caught there with its context and latched
+-- instead of unwinding into C; only the first is kept, and later ones are
+-- counted. The focus callback is the one owner of focus: it coalesces the
+-- latest flag into the observation and stages an ordered focus event for the
+-- input feed. There is no second focus callback.
 --
 -- Captures are reconciled on the owner thread at an owner boundary: after the
 -- initial sampling, and after any owner operation's native calls return,
--- whether they were a setter or a poll. Geometry and attribute captures
--- coalesce to their latest values, so a snapshot preserves no event history. A
+-- whether they were a setter or a poll. Geometry, attribute, and cursor
+-- captures coalesce to their latest values, so a snapshot preserves no event
+-- history. Ordered input — key, character, button, scroll, and focus
+-- transitions — is staged in a bounded buffer of 'inputStagingCapacity' events
+-- and is never coalesced. Cursor position is not an input event: it coalesces
+-- into the observation and updates the feed's cursor sample, so a later button
+-- still carries the coordinates copied when that button callback ran. A
 -- refresh or a close request always publishes a new revision, even when every
 -- sampled attribute is unchanged. Preparation runs in 'IO', outside the
 -- trampoline and outside 'STM'. Nothing changes until the commit: after
@@ -86,6 +95,16 @@
 -- asynchronous exception is rethrown unannotated, so cancellation stays
 -- cancellation. If the operation's own native step fails first, its failure
 -- propagates and the captures and fault stay latched for the next boundary.
+--
+-- Staging overflow sets a loss latch that remains set while the buffer is
+-- full. At the next owner boundary the latch is checked before any staged
+-- event is published: the ambiguous batch is discarded, none of its prefix is
+-- replayed, and the window's input feed begins the same overflow reset a full
+-- channel would. Close intent and the observation keep updating. One window's
+-- loss leaves every other window's feed and commands usable. A feed is
+-- attached with 'attachWindowInputFeed' after construction; until then staged
+-- input is discarded at the boundary that would have published it, without a
+-- reset.
 --
 -- = Ordinary controls
 --
@@ -273,6 +292,14 @@
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 -- | Capture latch       | The window    | Callbacks write;           | Callbacks:  | The window          | Emptied at each boundary |
 -- |                     |               | boundaries and release     | owner calls |                     |                          |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Input staging       | The window    | Input callbacks write;     | Callbacks:  | The window          | Discarded on overflow or |
+-- |                     |               | the owner boundary         | owner       |                     | published, then emptied  |
+-- |                     |               | publishes or discards      | publishes   |                     |                          |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Attached input feed | The window    | The host attaches it;      | Owner       | From attachment     | Closed with the window   |
+-- |                     |               | the owner boundary         |             | until the window    |                          |
+-- |                     |               | publishes into it          |             | ends                |                          |
 -- |                     |               | take                       |             |                     |                          |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 -- | Current observation | The window    | Boundaries write and then  | Owner       | The window          | Final value retained in  |
@@ -345,11 +372,14 @@ module Hetoimasia.GLFW.Internal.Window
   , observedDecorated
   , observedFullscreenMonitor
   , observedMode
+  , observedCursorPosition
+  , observedCursorInside
   , WindowPhase (..)
   , Attribute (..)
   , Extent (..)
   , ContentScale (..)
   , Placement (..)
+  , CursorPosition (..)
   , CloseRequest
   , closeRequestWindow
   , closeRequestNumber
@@ -376,6 +406,9 @@ module Hetoimasia.GLFW.Internal.Window
   , beginWindowClosing
   , windowNativeHandle
   , windowCallbackOperation
+  , attachWindowInputFeed
+  , windowInputFeed
+  , inputStagingCapacity
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -400,6 +433,8 @@ import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (find)
+import Data.Bits (testBit)
+import Data.Char (chr)
 import Data.Either (isRight)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
@@ -429,7 +464,20 @@ import Hetoimasia.Foundation.Resource
   , restoredStep
   , withResourceLabelled
   )
-import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..), Extent (..), Placement (..))
+import Hetoimasia.GLFW.Internal.Attribute (Attribute (..), ContentScale (..), CursorPosition (..), Extent (..), Placement (..))
+import Hetoimasia.GLFW.Internal.Input
+  ( ButtonAction (..)
+  , ButtonEvent (..)
+  , InputFeed
+  , InputPayload (..)
+  , KeyAction (..)
+  , KeyEvent (..)
+  , Modifiers (..)
+  , ScrollEvent (..)
+  , produceInput
+  , recordCursor
+  , resetFromStagingOverflow
+  )
 import Hetoimasia.GLFW.Internal.Control
   ( AspectRatio (..)
   , ConstraintCall (..)
@@ -708,6 +756,10 @@ data WindowObservation = WindowObservation
   , obsDecorated ∷ !(Attribute Bool)
   , obsMonitor ∷ !(Attribute (Maybe MonitorId))
   , obsMode ∷ !ModeRecord
+  , obsCursor ∷ !(Maybe CursorPosition)
+    -- ^ Latest cursor callback; 'Nothing' until one has run.
+  , obsCursorInside ∷ !(Maybe Bool)
+    -- ^ Latest enter/leave callback; 'Nothing' until one has run.
   }
   deriving (Eq, Show)
 
@@ -728,6 +780,8 @@ instance NFData WindowObservation where
       `seq` rnf (obsDecorated observation)
       `seq` rnf (obsMonitor observation)
       `seq` rnf (obsMode observation)
+      `seq` rnf (obsCursor observation)
+      `seq` rnf (obsCursorInside observation)
 
 -- | The window observed.
 observedWindow ∷ WindowObservation → WindowId
@@ -789,6 +843,16 @@ observedFullscreenMonitor = obsMonitor
 observedMode ∷ WindowObservation → ModeRecord
 observedMode = obsMode
 
+-- | The latest cursor position a cursor callback recorded, if any. Cursor
+-- motion coalesces: an observation keeps only the last sample, never a trail.
+observedCursorPosition ∷ WindowObservation → Maybe CursorPosition
+observedCursorPosition = obsCursor
+
+-- | Whether the cursor is inside the content area, as the latest enter or leave
+-- callback reported it, if any has.
+observedCursorInside ∷ WindowObservation → Maybe Bool
+observedCursorInside = obsCursorInside
+
 -- ---------------------------------------------------------------------------
 -- Windows
 
@@ -802,6 +866,7 @@ data Window = Window
   , windowOwnerState ∷ !(IORef OwnerState)
   , windowControl ∷ !(IORef ControlState)
   , windowPublisher ∷ !(SnapshotPublisher WindowObservation)
+  , windowFeed ∷ !(IORef (Maybe InputFeed))
   }
 
 -- | What an operation through a handle produced.
@@ -823,6 +888,16 @@ windowObservations = snapshotReader . windowPublisher
 -- | Whether the window has ended. Any thread may ask.
 windowEnded ∷ Window → IO Bool
 windowEnded window = not <$> readIORef (windowLive window)
+
+-- | Attach the feed this window's owner boundary publishes staged input into.
+-- Replacing a feed leaves the previous one untouched; the caller owns closing
+-- it. A window with no feed discards staged input at the boundary.
+attachWindowInputFeed ∷ Window → InputFeed → IO ()
+attachWindowInputFeed window = atomicWriteIORef (windowFeed window) . Just
+
+-- | The feed last attached, if any.
+windowInputFeed ∷ Window → IO (Maybe InputFeed)
+windowInputFeed window = readIORef (windowFeed window)
 
 -- | The owner's current observation and the last close request number issued.
 data OwnerState = OwnerState !WindowObservation !Natural
@@ -851,14 +926,54 @@ data Captures = Captures
   , capturedGeneration ∷ !Natural
     -- ^ Advanced by every record, so a commit can tell whether a callback
     -- recorded anything since the captures it folded were read.
+  , capturedCursor ∷ !(Maybe CursorPosition)
+  , capturedCursorInside ∷ !(Maybe Bool)
+  , capturedInput ∷ ![StagedInput]
+    -- ^ Ordered input, newest first, at most 'inputStagingCapacity'.
+  , capturedInputCount ∷ !Int
+  , capturedInputLost ∷ !Natural
+    -- ^ Ordered events that could not be staged, counted exactly.
+  , capturedInputLoss ∷ !Bool
   }
+
+-- | One ordered input event copied at the trampoline. Cursor motion is not
+-- staged: it coalesces onto 'capturedCursor'.
+data StagedInput
+  = StagedKey !KeyEvent
+  | StagedChar !Char
+  | StagedButton !ButtonEvent
+  | StagedScroll !ScrollEvent
+  | StagedFocus !Bool
+
+-- | How many ordered input events one window stages between owner boundaries.
+inputStagingCapacity ∷ Int
+inputStagingCapacity = 256
 
 -- | The first fault a callback raised since the last boundary, the callback it
 -- was raised in, and how many later faults were not kept.
 data CallbackFault = CallbackFault !Text !(ExceptionWithContext SomeException) !Natural
 
 noCaptures ∷ Captures
-noCaptures = Captures Nothing Nothing Nothing Nothing Nothing Nothing Nothing False 0 Nothing 0
+noCaptures =
+  Captures
+    { capturedSize = Nothing
+    , capturedFramebuffer = Nothing
+    , capturedScale = Nothing
+    , capturedPlacement = Nothing
+    , capturedFocused = Nothing
+    , capturedIconified = Nothing
+    , capturedMaximized = Nothing
+    , capturedRefresh = False
+    , capturedCloses = 0
+    , capturedFault = Nothing
+    , capturedGeneration = 0
+    , capturedCursor = Nothing
+    , capturedCursorInside = Nothing
+    , capturedInput = []
+    , capturedInputCount = 0
+    , capturedInputLost = 0
+    , capturedInputLoss = False
+    }
 
 -- | Samples taken together at one boundary.
 data Sample = Sample
@@ -901,6 +1016,7 @@ windowAssembly session config = do
       identifiers = windowIdentifiers identity
   live ← restoredStep (newIORef True)
   captures ← restoredStep (newIORef noCaptures)
+  feed ← restoredStep (newIORef Nothing)
   control ← restoredStep (newIORef (ControlState (ConstraintsKnown Nothing) NativeFollowsWindowed False))
   certain ← restoredStep (newIORef True)
   failed ← restoredStep (newIORef False)
@@ -953,6 +1069,7 @@ windowAssembly session config = do
           , windowOwnerState = ownerState
           , windowControl = control
           , windowPublisher = publisher
+          , windowFeed = feed
           }
   forM_ (windowStartupMode config) (restoredStep . startWindowMode window)
   pure window
@@ -978,6 +1095,8 @@ blankObservation identity sample record =
     , obsDecorated = sampleDecorated sample
     , obsMonitor = sampleMonitor sample
     , obsMode = record
+    , obsCursor = Nothing
+    , obsCursorInside = Nothing
     }
 
 createNative ∷ Session → Request → [(Text, Text)] → IO (Ptr NativeWindow, Reports)
@@ -1114,7 +1233,7 @@ windowCallbacks capabilities captures =
     , onWindowFocus = \focused →
         reported FocusedReport . contained "window focus" $ do
           flag ← flagOf focused
-          pure (\latched → latched {capturedFocused = Just flag})
+          pure (\latched → stageInput (StagedFocus flag) (latched {capturedFocused = Just flag}))
     , onWindowIconify = \iconified →
         reported IconifiedReport . contained "window iconify" $ do
           flag ← flagOf iconified
@@ -1127,6 +1246,35 @@ windowCallbacks capabilities captures =
         contained "window refresh" (pure (\latched → latched {capturedRefresh = True}))
     , onWindowClose =
         contained "window close" (pure (\latched → latched {capturedCloses = capturedCloses latched + 1}))
+    , onKey = \key scancode action mods →
+        contained "window key" $ do
+          decoded ← KeyEvent <$> evaluate (fromIntegral key) <*> evaluate (fromIntegral scancode) <*> keyActionOf action <*> modifiersOf mods
+          pure (stageInput (StagedKey decoded))
+    , onChar = \codepoint →
+        contained "window character" $ do
+          decoded ← charOf codepoint
+          pure (stageInput (StagedChar decoded))
+    , onMouseButton = \button action mods →
+        contained "window mouse button" $ do
+          decodedAction ← buttonActionOf action
+          decodedMods ← modifiersOf mods
+          decodedButton ← evaluate (fromIntegral button)
+          pure $ \latched →
+            stageInput
+              (StagedButton (ButtonEvent decodedButton decodedAction (capturedCursor latched) decodedMods))
+              latched
+    , onCursorPos = \x y →
+        contained "window cursor position" $ do
+          position ← CursorPosition <$> evaluate (realToFrac x) <*> evaluate (realToFrac y)
+          pure (\latched → latched {capturedCursor = Just position})
+    , onCursorEnter = \entered →
+        contained "window cursor enter" $ do
+          flag ← flagOf entered
+          pure (\latched → latched {capturedCursorInside = Just flag})
+    , onScroll = \x y →
+        contained "window scroll" $ do
+          decoded ← ScrollEvent <$> evaluate (realToFrac x) <*> evaluate (realToFrac y)
+          pure (stageInput (StagedScroll decoded))
     }
   where
     reported report callback = when (reportable capabilities report) callback
@@ -1154,6 +1302,44 @@ windowCallbacks capabilities captures =
     scaleOf x y = ContentScale <$> evaluate (realToFrac x) <*> evaluate (realToFrac y)
     flagOf ∷ CInt → IO Bool
     flagOf value = evaluate (value /= 0)
+    -- GLFW_RELEASE, GLFW_PRESS, GLFW_REPEAT.
+    keyActionOf code = case fromIntegral code ∷ Int of
+      0 → pure KeyReleased
+      1 → pure KeyPressed
+      2 → pure KeyRepeated
+      _ → ioError (userError "unknown key action")
+    buttonActionOf code = case fromIntegral code ∷ Int of
+      0 → pure ButtonReleased
+      1 → pure ButtonPressed
+      _ → ioError (userError "unknown button action")
+    modifiersOf bits = do
+      let value = fromIntegral bits ∷ Int
+      evaluate
+        Modifiers
+          { modifierShift = testBit value 0
+          , modifierControl = testBit value 1
+          , modifierAlt = testBit value 2
+          , modifierSuper = testBit value 3
+          , modifierCapsLock = testBit value 4
+          , modifierNumLock = testBit value 5
+          }
+    charOf codepoint = do
+      let code = fromIntegral codepoint ∷ Int
+      evaluate (chr code)
+
+-- | Stage one ordered event, or set the loss latch when the buffer is full.
+-- Later events while the latch is set are counted and not stored.
+stageInput ∷ StagedInput → Captures → Captures
+stageInput event latched
+  | capturedInputLoss latched = countLost latched
+  | capturedInputCount latched >= inputStagingCapacity = countLost (latched {capturedInputLoss = True})
+  | otherwise =
+      latched
+        { capturedInput = event : capturedInput latched
+        , capturedInputCount = capturedInputCount latched + 1
+        }
+  where
+    countLost captures = captures {capturedInputLost = capturedInputLost captures + 1}
 
 latchFault ∷ Text → ExceptionWithContext SomeException → Captures → Captures
 latchFault name caught latched = case capturedFault latched of
@@ -1244,6 +1430,8 @@ reconciled identity sample pending current issued =
         , obsMaximized = maybe (obsMaximized observation) Observed (capturedMaximized pending)
         , obsCloseRequest =
             if closes > 0 then Just (CloseRequest identity issued') else obsCloseRequest observation
+        , obsCursor = maybe (obsCursor observation) Just (capturedCursor pending)
+        , obsCursorInside = maybe (obsCursorInside observation) Just (capturedCursorInside pending)
         }
     sampledOver observation = case sample of
       Nothing → observation
@@ -1310,11 +1498,18 @@ reconcileAdjusted forced adjust interruption window sample = do
           ( noCaptures
               { capturedGeneration = capturedGeneration latched
               , capturedFault = capturedFault latched
+              , capturedCursor = capturedCursor latched
+              , capturedCursorInside = capturedCursorInside latched
               }
           , True
           )
         else (latched, False)
-    when cleared $ forM_ prepared (commitObservation window next issued')
+    when cleared $ do
+      forM_ prepared (commitObservation window next issued')
+      -- Publication is bounded STM and evaluation. It stays uninterruptible
+      -- so a cancellation cannot admit a prefix and drop the rest.
+      uninterruptibleMask_ (publishCapturedInput window pending)
+    interruption
     pure cleared
   unless committed (reconcileAdjusted forced adjust interruption window sample)
 
@@ -1351,6 +1546,29 @@ commitObservation ∷ Window → WindowObservation → Natural → Prepared Wind
 commitObservation window next issued prepared = do
   _ ← atomically (publish (windowPublisher window) prepared)
   writeIORef (windowOwnerState window) (OwnerState next issued)
+
+-- | Publish staged input into the attached feed, if any. Loss is checked
+-- before any captured prefix is admitted: a latched overflow discards the
+-- batch and starts the same reset a full channel would. Cursor samples update
+-- the feed even when the batch is discarded, so a later button still has a
+-- position after resumption.
+publishCapturedInput ∷ Window → Captures → IO ()
+publishCapturedInput window pending = do
+  feed ← readIORef (windowFeed window)
+  forM_ feed $ \attached → do
+    forM_ (capturedCursor pending) (recordCursor attached)
+    if capturedInputLoss pending
+      then do
+        let lost = capturedInputLost pending + fromIntegral (capturedInputCount pending)
+        void (resetFromStagingOverflow attached lost (capturedFocused pending))
+      else mapM_ (admitStaged attached) (reverse (capturedInput pending))
+  where
+    admitStaged feed = \case
+      StagedKey event → void (produceInput feed (KeyInput event))
+      StagedChar character → void (produceInput feed (TextInput character))
+      StagedButton event → void (produceInput feed (ButtonInput event))
+      StagedScroll event → void (produceInput feed (ScrollInput event))
+      StagedFocus focused → void (produceInput feed (FocusInput focused))
 
 -- | Take a latched callback fault and rethrow it, in one masked step, so a
 -- cancellation cannot discard the fault between the take and the rethrow.

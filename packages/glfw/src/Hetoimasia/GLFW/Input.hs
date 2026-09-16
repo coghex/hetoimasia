@@ -12,6 +12,8 @@
 -- A delivered 'InputEvent' carries its window, its 'InputEpoch', and a payload:
 -- a key transition, a Unicode character, a button transition with the cursor
 -- position and modifiers captured for it, scroll offsets, or a focus transition.
+-- Native callbacks copy those payloads and return; the owner boundary publishes
+-- them into the feed. Cursor motion coalesces into the window observation.
 -- When ordered admission is full, or input is suspended, the feed discards its
 -- backlog and every read answers 'InputResetRequired' until the consumer —
 -- having finished or abandoned its current handler and cleared its own held keys,

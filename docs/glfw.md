@@ -20,22 +20,24 @@ surfaces close requests to application policy. Ordinary controls — title, size
 position, size constraints, visibility, focus and attention requests, and
 minimize, maximize, and restore — settle with honest outcomes. Each host window
 has a bounded, ordered input feed with an acknowledged reset after overflow or
-temporary suspension; no native input callback produces into it yet. There is no
-mode command, monitor selection, default close policy, or rendering operation.
+temporary suspension. Native key, character, button, cursor, enter, and scroll
+callbacks copy a fixed payload and return; the owner boundary publishes ordered
+events into that feed and coalesces cursor motion into the window observation.
+There is no default close policy or rendering operation.
 
 ## Package layout
 
 | Component | Visibility | Holds |
 |---|---|---|
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, and `Hetoimasia.GLFW.Input`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, and the input feed model with its private producer, warning, resumption, and closure. Binds nothing. |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the input feed model with its private producer, warning, resumption, and closure, and bounded input staging at the window callbacks. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, monitor inventory, and input feed examples that use those drivers, that executor, and the private input producer. `hetoimasia-tests` runs it. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, and window host examples on the platform it runs on |
+| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, monitor inventory, and input feed examples that use those drivers, that executor, the private input producer, and scripted input callbacks. `hetoimasia-tests` runs it. |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
@@ -148,6 +150,8 @@ observedCloseRequest ∷ WindowObservation → Maybe CloseRequest
 observedDecorated ∷ WindowObservation → Attribute Bool
 observedFullscreenMonitor ∷ WindowObservation → Attribute (Maybe MonitorId)
 observedMode ∷ WindowObservation → ModeRecord
+observedCursorPosition ∷ WindowObservation → Maybe CursorPosition
+observedCursorInside ∷ WindowObservation → Maybe Bool
 
 data WindowPhase  = WindowOpen | WindowClosing | WindowReleased | WindowDisposalFailed | WindowReleaseUncertain
 data Attribute a  = Observed a | Unavailable
@@ -424,7 +428,7 @@ data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | 
 hostComponent ∷ Component                   -- "glfw.runtime"
 
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
-data LoopHooks a = LoopHooks { loopEvent ∷ IO Bool, loopUpdate ∷ Turn → IO (TurnStep a) }
+data LoopHooks a = LoopHooks { loopLogger ∷ Logger, loopEvent ∷ IO Bool, loopUpdate ∷ Turn → IO (TurnStep a) }
 noApplicationEvents ∷ IO Bool
 data Turn = Turn { turnNumber ∷ Natural, turnWaited ∷ Bool, turnCommands, turnEvents ∷ Int
                  , turnCloseRequests ∷ [CloseRequest] }
@@ -593,9 +597,12 @@ Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwDestroyWindow`, `glfwGetWindowSize`, `glfwGetFramebufferSize`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, and close callback setters, and the owner loop's `glfwPollEvents` and
+refresh, close, key, character, mouse button, cursor position, cursor enter,
+and scroll callback setters, and the owner loop's `glfwPollEvents` and
 `glfwWaitEventsTimeout`. `glfwSetWindowSize` and `glfwPostEmptyEvent` are called
-for the native examples only; no production path calls them.
+for the native examples only; no production path calls them. The native
+examples also invoke the registered input trampolines through
+`hetoimasia_glfw_inject_*_for_check`.
 
 - Imports go through `native/cbits/hetoimasia_glfw.h`, which includes the
   installed `GLFW/glfw3.h` with `GLFW_INCLUDE_NONE`. The C compiler therefore
@@ -842,6 +849,8 @@ attributes:
 | Focused, iconified, maximized | `glfwGetWindowAttrib`, their callbacks |
 | Visible | `glfwGetWindowAttrib` |
 | Close request | close callback |
+| Cursor position | cursor position callback; coalesced, never sampled |
+| Cursor inside | cursor enter/leave callback; coalesced |
 
 Observed fields hold only sampled or called-back values, never the requested
 configuration; a sampled value may of course equal the request. Each query is
@@ -857,13 +866,30 @@ preserves no event history.
 ### Callbacks and the reconciliation boundary
 
 The size, framebuffer size, content scale, position, focus, iconify, maximize,
-refresh, and close callbacks are contained at the trampoline. Each runs
+refresh, close, key, character, mouse button, cursor position, cursor enter,
+and scroll callbacks are contained at the trampoline. Each runs
 uninterruptibly, copies and forces its fixed payload, records it into the
 window's capture latch with one non-blocking `IORef` update, and returns. None
 calls application code, waits for capacity, joins a worker, polls, logs, or
 destroys a native object. Anything a callback raises is caught there with its
 context and latched rather than unwinding into C; the first is kept and later
-ones are counted.
+ones are counted. The focus callback is the one owner of focus: it coalesces
+the latest flag into the observation and stages an ordered focus event for the
+input feed. Cursor motion coalesces into the observation and the feed's cursor
+sample; it is not an input event. The latest cursor sample stays in the
+capture latch across boundaries, so a later turn's button still copies it. Key, character, button, scroll, and focus
+transitions are staged in a bounded buffer of `inputStagingCapacity` (256)
+events and are never coalesced. A button callback copies the latest cursor
+sample at that moment, so later motion does not move a click already staged.
+Overflow of that buffer sets a loss latch that remains set while the buffer is
+full. At the next owner boundary the latch is checked before any staged prefix
+is published: the ambiguous batch is discarded and the attached feed begins
+the same overflow reset a full channel would, with `unadmitted` equal to the
+discarded prefix plus every callback that arrived after the latch. Coalesced
+focus is applied in that same reset transaction, so resumption cannot reopen
+an unfocused window and the focus callback is not counted twice. A window with no feed attached discards staged input at that boundary
+without a reset. Publication of a captured batch is uninterruptible, so a
+cancellation cannot admit a prefix and drop the rest.
 
 Captures are reconciled on the owner thread at an owner boundary: at creation
 after the initial sampling, at `synchronizeWindow` after it samples, and after
@@ -1682,12 +1708,16 @@ and at closure.
 ### The reset
 
 An overflow of a running generation — the channel full when an event, a focus
-transition included, is admitted — commits one transaction that aborts the
+transition included, is admitted, or native staging full when an ordered
+callback cannot be recorded — commits one transaction that aborts the
 channel, records the backlog it discarded from the channel's depth counter apart
 from the one overflowing event never admitted, reserves the next epoch, clears
 the held baseline, drops the aborted channel, and installs a reset with reason
-`InputOverflowed` and an opaque token bound to the feed and that epoch. The
-foundation channel's own statistics keep their meanings.
+`InputOverflowed` and an opaque token bound to the feed and that epoch. Staging
+loss is checked before any captured prefix is published, so that prefix is
+never replayed as if the gap happened after it. The foundation channel's own
+statistics keep their meanings; staging's lost count is exact and is not
+reported as channel telemetry.
 
 `suspendInput` after readiness, while running, makes the same transition with
 reason `AdmissionSuspended` and no unadmitted event. During a reset,
@@ -1748,10 +1778,12 @@ re-exports the private `runtime-glfw-core` implementation, composes a
 session, its windows, and their command bookkeeping with the runtime's
 [application lifecycle](resources.md#the-application-runner). It follows the
 [module authoring guide](logging.md#module-authoring-guide): it takes no logger
-and writes to no sink, and its failures are raised, never logged — a
-configuration rejection under `glfw.runtime` and `construct window host`, native
-failures under GLFW's own operations, and supervised failures as the runtime
-delivers them. The runner makes the one terminal report.
+of its own. The owner loop writes the input overflow warning through the
+`Logger` the application injects on `LoopHooks`, under `glfw.input`, at a safe
+boundary after callbacks have been reconciled. Configuration rejection is
+raised under `glfw.runtime` and `construct window host`; native failures under
+GLFW's own operations; supervised failures as the runtime delivers them. The
+runner makes the one terminal report.
 
 ### Construction and ownership
 
@@ -1771,8 +1803,8 @@ exists. The host is never a service the startup callback returns: startup
 receives it among the dependencies and hands workers only client capabilities —
 `hostCommandPort`, a window's `WindowClient` with its input reader and admission
 control, the monitor inventory's reader, and `hostActivity` — transferring no
-native ownership. The host owns no input producer and does not yet warn about
-or resume a feed: native input and that owner-loop integration are GLFW-12's. `allocWindowHostIn` builds
+native ownership. At registration the host attaches the window's input feed so
+owner-boundary callbacks publish into it. `allocWindowHostIn` builds
 the same host over a session scope the caller supplies, such as a test seam's or
 a borrowed session; the host then owns the session only if that scope does.
 
@@ -1873,10 +1905,12 @@ calls it on the process main thread — and refuses any other thread with
 3. reconciliation at owner boundaries: the monitor inventory, refreshed only
    when its callback captured a change, then the retirement of every closing
    window no borrow defers, then every window's captured callbacks, collecting
-   the close requests not yet surfaced for windows that are not closing;
+   the close requests not yet surfaced for windows that are not closing, then
+   each open feed's overflow warning claim and resumption;
 4. `checkRuntime`;
 5. command work: at most `hostCommandBudget` queued commands claimed, executed,
-   and settled, across every port;
+   and settled, across every port, then warning claim and resumption again,
+   because a setter can invoke callbacks;
 6. `checkRuntime`;
 7. application event work: at most `hostEventBudget` calls of `loopEvent` that
    dispatched something, ending at the first that found nothing ready;
@@ -2064,13 +2098,20 @@ acknowledgement.
 ### Input feed examples
 
 The input feed examples in `glfw-window-examples` drive the feed model through
-its private producer, with window identities from a seam session and no GLFW.
+its private producer and through scripted native callbacks, with window
+identities from a seam session and no GLFW.
 Threads are coordinated with `MVar`s and STM; a wait is observed through
 `orElse`. They prove: distinct, uncoalesced key, text, button, scroll, and focus
-events tagged with window and epoch; gating before readiness and while
-unfocused, no reset for pre-readiness disablement, and a delivered focus loss
-that closes the focus gate; a click keeping its captured position after later
-cursor motion; focus loss clearing held state; one stable token across twenty
+events tagged with window and epoch, from the private producer and from
+scripted callbacks with cursor coalesced into the observation; gating before
+readiness and while unfocused, no reset for pre-readiness disablement, and a
+delivered focus loss that closes the focus gate; a click keeping its captured
+position after later cursor motion; staging overflow setting the loss latch
+while the buffer is full, beginning the same reset, and replaying no prefix;
+a callback release synthesizing no press; one window's staging overflow leaving
+another's feed running; focus loss and gain in native order, and a focus
+transition that cannot be admitted starting the reset; focus loss clearing held
+state; one stable token across twenty
 thousand suppressed events with exact, non-wrapping counters and no channel,
 epoch, or warning added; exact discard accounting apart from the unadmitted
 event and delivered events; no old backlog after reset detection and no
@@ -2110,6 +2151,8 @@ candidate unpublished.
 | Native window | The window | Its parts create and destroy it; owner boundaries query it | Owner | The window's scope | Destroyed at release |
 | Window callback storage | The window | Its parts allocate, attach, detach, and free it; GLFW invokes it | Owner | Through the window's final native use | Freed after a certain release; kept when uncertain |
 | Capture latch | The window | Callbacks write; boundaries and release take | Callbacks: inside owner calls; takes: owner | The window | Emptied at each boundary |
+| Input staging | The window | Input callbacks write; the owner boundary publishes or discards | Callbacks: inside owner calls; publish: owner | The window | Discarded on overflow or published, then emptied |
+| Attached input feed | The window | The host attaches it; the owner boundary publishes into it | Owner | From attachment until the window ends | Closed with the window |
 | Current observation and close counter | The window | Boundaries fold, then publish | Owner | The window | Final value retained in the closed snapshot |
 | Observation snapshot | The window | The owner publishes and closes; clients read | Publish: owner; read: any | While referenced | Closed at release; never reopened |
 | Window liveness | The window | Release clears it; every operation reads it | Owner; `windowEnded` any | The window | Never set again |
@@ -2418,6 +2461,17 @@ The native examples cover:
   the close protocol, leaving the other window open; and every remaining window,
   a created one included, still open through the drain and disposed after it,
   with the run returning normally and so retaining no cleanup failure;
+- native input callbacks invoked through the registered C trampolines
+  (`hetoimasia_glfw_inject_*_for_check`), not the feed's private producer:
+  tagged key, character, button, and scroll events; cursor coalesced into the
+  observation; a button keeping captured coordinates after later motion; feed
+  and staging saturation starting the same reset, with a fresh press after
+  acknowledgement and no press for a key still held; one window's overflow
+  leaving a second window receiving input; a fault inside a real input
+  callback rethrown at the owner boundary; a close request visible while a
+  feed is full; and callbacks removed before destruction. Hidden windows do
+  not receive display-server events, so every scenario uses that fixture
+  owner-thread path, which the suite records;
 - in a private process, sessions entered and left in sequence, a real
   `GLFW_PLATFORM_UNAVAILABLE` initialization failure before any polling followed
   by a successful session, and a fault raised inside a real GLFW size callback,

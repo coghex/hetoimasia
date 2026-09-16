@@ -255,6 +255,7 @@ module Hetoimasia.GLFW.Internal.Input
   , produceInput
   , recordCursor
   , produceButton
+  , resetFromStagingOverflow
   , WarningAttempt (..)
   , attemptOverflowWarning
   , Resumption (..)
@@ -300,7 +301,8 @@ import Hetoimasia.Foundation.Messaging.Channel
   , statisticsDepth
   )
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
-import Hetoimasia.GLFW.Internal.Window (WindowId, windowLocalIdentity)
+import Hetoimasia.GLFW.Internal.Attribute (CursorPosition (..))
+import {-# SOURCE #-} Hetoimasia.GLFW.Internal.Window (WindowId, windowLocalIdentity)
 import Numeric.Natural (Natural)
 
 -- ---------------------------------------------------------------------------
@@ -355,15 +357,6 @@ data ButtonAction = ButtonPressed | ButtonReleased
   deriving (Eq, Show, Generic)
 
 instance NFData ButtonAction
-
--- | A cursor position in screen coordinates relative to the content area.
-data CursorPosition = CursorPosition
-  { cursorX ∷ !Double
-  , cursorY ∷ !Double
-  }
-  deriving (Eq, Show, Generic)
-
-instance NFData CursorPosition
 
 -- | A mouse button transition, with the cursor position and modifiers captured
 -- for this event. The position is 'Nothing' when the producer had no cursor
@@ -864,6 +857,32 @@ produceButton ∷ InputFeed → Int → ButtonAction → Modifiers → IO Produc
 produceButton feed button action modifiers = do
   position ← readIORef (feedCursor feed)
   produceInput feed (ButtonInput (ButtonEvent button action position modifiers))
+
+-- | Begin the overflow reset because native staging overflowed, without
+-- presenting an event to the channel. @lost@ is the exact number of staged
+-- and unstaged callbacks that were never admitted: the discarded prefix plus
+-- every callback that arrived after the loss latch. @focus@ is the coalesced
+-- focus flag from the same capture, applied in this transaction so the gate
+-- stays current without counting a second event. Already resetting or closed
+-- feeds do not begin another episode; while resetting, @lost@ is counted as
+-- suppressed.
+resetFromStagingOverflow ∷ InputFeed → Natural → Maybe Bool → IO Production
+resetFromStagingOverflow feed lost focus = atomically $ do
+  state ← readTVar (feedState feed)
+  let gated = withFocus focus state
+  case statePhase gated of
+    InputFeedClosed → pure ProductionClosed
+    InputRunning → ProductionOverflowed . tokenOf feed <$> beginReset feed InputOverflowed lost gated
+    _ → do
+      writeTVar (feedState feed) $
+        modifyCounters (\counts → counts {countSuppressed = countSuppressed counts + lost}) $
+          gated {stateEpisode = (\summary → summary {summarySuppressed = summarySuppressed summary + lost}) <$> stateEpisode gated}
+      pure ProductionSuppressed
+  where
+    withFocus update current = case update of
+      Nothing → current
+      Just True → current {stateFocused = True}
+      Just False → current {stateFocused = False, stateHeldKeys = IntSet.empty, stateHeldButtons = IntSet.empty}
 
 -- | The admission transaction. 'Nothing' when the running epoch is no longer the
 -- one the event was prepared for.

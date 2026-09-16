@@ -24,7 +24,18 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
-import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
+import Hetoimasia.Foundation.Log
+  ( Component
+  , LogEntry (..)
+  , LogLevel (Warning)
+  , Logger
+  , callbackSink
+  , componentText
+  , defaultLogFilter
+  , mkLoggerWith
+  , systemMetadata
+  , unsafeComponent
+  )
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
@@ -38,7 +49,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , Seam
   , SeamMonitorEvent (MonitorDetached)
   , SeamScript (..)
-  , WindowEvent (CloseRequested)
+  , WindowEvent (CharEventAt, CloseRequested, FocusChanged)
   , asProcessMainThread
   , defaultScript
   , designateProcessMainThread
@@ -47,6 +58,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , scriptedMonitor
   , seamCalls
   , seamLiveWindowCallbacks
+  , seamQueueControlEvents
   , seamQueueEvents
   , seamQueueMonitorEvents
   , seamSession
@@ -116,6 +128,10 @@ spec = describe "GLFW window host" $ do
       (boundedExample testQuiescence)
     it "closes a window's input feed with its close protocol, and every feed at quiescence, without awaiting a pending reset's acknowledgement"
       (boundedExample testInputFeedsClosed)
+    it "claims the overflow warning through the injected loop logger and resumes after acknowledgement at the owner-loop recovery boundary"
+      (boundedExample testOwnerLoopRecoversFeed)
+    it "recovers a feed overflowed by command-triggered callbacks at the post-command boundary"
+      (boundedExample testOwnerLoopRecoversFeedAfterCommand)
     it "settles queued callers before the boundary drain when startup fails after a worker started"
       (boundedExample (testSettledBeforeDrain StartupFails))
     it "settles queued callers before the boundary drain when the action returns"
@@ -142,7 +158,8 @@ testPollThenWait = do
       queued ← newIORef Nothing
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → do
               modifyIORef' summaries (<> [summary turn])
               case turnNumber turn of
@@ -169,7 +186,8 @@ testNoWindowsWait = do
     hosted seam (settings []) {hostIdleWait = 0.5} (\host _ → pure host) $ \host control →
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → pure (if turnNumber turn == 4 then Finish (turnNumber turn) else Continue)
           }
   turns `shouldBe` 4
@@ -258,7 +276,8 @@ testPreemption trigger = do
         ( \host control →
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = do
+                { loopLogger = quietLogger
+                , loopEvent = do
                     when (trigger == AtApplicationEvent) once
                     modifyIORef' events (+ 1)
                     pure True
@@ -289,7 +308,8 @@ testMonitorReconciliation = do
       observed ← newIORef []
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \turn → do
               inventory ← preparedValue . observedValue <$> atomically (readSnapshot (hostMonitors host))
               modifyIORef' observed (<> [(turnNumber turn, inventoryRevision inventory, inventoryMonitors inventory == Observed [])])
@@ -322,7 +342,8 @@ testProgressDuringWait = do
       ( \host control →
           runOwnerLoop host control $
             LoopHooks
-              { loopEvent = noApplicationEvents
+              { loopLogger = quietLogger
+              , loopEvent = noApplicationEvents
               , loopUpdate = \turn →
                   readTVarIO progress >>= \case
                     Just recorded | turnWaited turn → pure (Finish (recorded, turnNumber turn))
@@ -348,7 +369,8 @@ testObservationThroughLoop = do
       ( \host control →
           runOwnerLoop host control $
             LoopHooks
-              { loopEvent = noApplicationEvents
+              { loopLogger = quietLogger
+              , loopEvent = noApplicationEvents
               , loopUpdate = \_ →
                   readTVarIO result >>= \case
                     Nothing → pure Continue
@@ -367,7 +389,8 @@ testOwnerNeverWaits = do
     hosted seam (settings [windowNamed "owner"]) {hostCommandCapacity = 1} (\host _ → pure host) $ \host control →
       runOwnerLoop host control $
         LoopHooks
-          { loopEvent = noApplicationEvents
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
           , loopUpdate = \_ → do
               window ← onlyWindow host
               let port = hostCommandPort host
@@ -376,7 +399,7 @@ testOwnerNeverWaits = do
               (submitMisuse, _) ← caughtAs (awaitSubmitWindowCommand port [] (observeOf window))
               (offOwner, _) ←
                 onThread forkIO . caughtAs $
-                  runOwnerLoop host control (LoopHooks noApplicationEvents (\_ → pure (Finish ())))
+                  runOwnerLoop host control (LoopHooks quietLogger noApplicationEvents (\_ → pure (Finish ())))
               pure (Finish (awaitMisuse, submitMisuse, offOwner))
           }
   awaitMisuse `shouldBe` OwnerThreadWouldWait
@@ -405,7 +428,8 @@ testCloseRequest = do
           outcome ←
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = noApplicationEvents
+                { loopLogger = quietLogger
+                , loopEvent = noApplicationEvents
                 , loopUpdate = \turn → do
                     modifyIORef' surfaced (<> [turnCloseRequests turn])
                     if turnNumber turn < 3
@@ -484,6 +508,114 @@ testQuiescence = do
   dispositions `shouldBe` replicate 3 (Just NotExecuted)
   late `shouldBe` SubmitClosed
   sampled `shouldBe` 0
+
+-- | Overflow from queued callbacks is warned through loopLogger and resumed by
+-- recoverFeeds after acknowledgement, without the example calling
+-- attemptOverflowWarning or resumeInput itself.
+testOwnerLoopRecoversFeed ∷ Expectation
+testOwnerLoopRecoversFeed = do
+  seam ← newSeam defaultScript
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (entry :)))
+  (messages, phase, epoch) ←
+    hosted seam ((settings [windowNamed "input"]) {hostInputCapacity = 2}) (\host _ → pure host) $ \host control →
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn →
+              case turnNumber turn of
+                1 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.enableInput (clientInputControl client)) `shouldReturn` Input.AdmissionOpened
+                  seamQueueEvents
+                    seam
+                    window
+                    (FocusChanged True : replicate 3 (CharEventAt (fromEnum 'x')))
+                  pure Continue
+                2 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.readInput (clientInputReader client)) >>= \case
+                    Input.InputResetRequired token → do
+                      atomically (Input.acknowledgeReset (clientInputReader client) token) `shouldReturn` Right Input.Acknowledged
+                      pure Continue
+                    other → unexpected ("expected a reset after overflow: " <> show other)
+                3 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  statistics ← atomically (Input.inputStatistics (clientInputReader client))
+                  logged ← reverse <$> readIORef warnings
+                  map entryLevel logged `shouldBe` [Warning]
+                  map (componentText . entryComponent) logged `shouldBe` ["glfw.input"]
+                  pure
+                    ( Finish
+                        ( map entryMessage logged
+                        , Input.statisticsPhase statistics
+                        , Input.epochNumber (Input.statisticsEpoch statistics)
+                        )
+                    )
+                _ → unexpected "the recovery did not finish within three turns"
+          }
+  messages `shouldBe` ["Input overflowed; the feed was reset"]
+  phase `shouldBe` Input.InputRunning
+  epoch `shouldBe` 2
+
+testOwnerLoopRecoversFeedAfterCommand ∷ Expectation
+testOwnerLoopRecoversFeedAfterCommand = do
+  seam ← newSeam defaultScript
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (entry :)))
+  (messages, phase, epoch) ←
+    hosted seam ((settings [windowNamed "input"]) {hostInputCapacity = 2}) (\host _ → pure host) $ \host control →
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn →
+              case turnNumber turn of
+                1 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.enableInput (clientInputControl client)) `shouldReturn` Input.AdmissionOpened
+                  seamQueueControlEvents
+                    seam
+                    window
+                    (FocusChanged True : replicate 3 (CharEventAt (fromEnum 'x')))
+                  _ ← submitWindowCommand (clientCommandPort client) [] (setWindowTitleCommand (windowIdentity window) "renamed") >>= admitted
+                  pure Continue
+                2 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  atomically (Input.readInput (clientInputReader client)) >>= \case
+                    Input.InputResetRequired token → do
+                      atomically (Input.acknowledgeReset (clientInputReader client) token) `shouldReturn` Right Input.Acknowledged
+                      logged ← reverse <$> readIORef warnings
+                      map entryMessage logged `shouldBe` ["Input overflowed; the feed was reset"]
+                      pure Continue
+                    other → unexpected ("expected a reset after a command setter: " <> show other)
+                3 → do
+                  window ← onlyWindow host
+                  client ← windowClient host window
+                  statistics ← atomically (Input.inputStatistics (clientInputReader client))
+                  logged ← reverse <$> readIORef warnings
+                  pure
+                    ( Finish
+                        ( map entryMessage logged
+                        , Input.statisticsPhase statistics
+                        , Input.epochNumber (Input.statisticsEpoch statistics)
+                        )
+                    )
+                _ → unexpected "the command recovery did not finish within three turns"
+          }
+  messages `shouldBe` ["Input overflowed; the feed was reset"]
+  phase `shouldBe` Input.InputRunning
+  epoch `shouldBe` 2
+
+windowClient ∷ WindowHost → Window → IO WindowClient
+windowClient host window =
+  atomically (hostWindowClient host (windowIdentity window)) >>= maybe (unexpected "the host window has no client") pure
 
 -- | Each window's client carries its own input feed. A window's close protocol
 -- closes that feed, and quiescence closes the rest, even while a reset waits for
@@ -589,7 +721,8 @@ testSupervisorDetectedFailure = do
             first ← newIORef True
             runOwnerLoop host control $
               LoopHooks
-                { loopEvent = do
+                { loopLogger = quietLogger
+                , loopEvent = do
                     firstEvent ← atomicModifyIORef' first (\isFirst → (False, isFirst))
                     when firstEvent $ do
                       -- The requester's command is queued after this turn's
@@ -656,7 +789,10 @@ testAbandonedStartup = do
 
 -- | A logging lifetime whose records go nowhere.
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 hostOver ∷ Seam → HostConfig → Scoped WindowHost
 hostOver seam = allocWindowHostIn (seamSession seam defaultSessionConfig)

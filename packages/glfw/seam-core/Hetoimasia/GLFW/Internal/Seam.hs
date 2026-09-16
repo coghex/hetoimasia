@@ -109,8 +109,10 @@ module Hetoimasia.GLFW.Internal.Seam
   , WindowEvent (..)
   , DriveOrigin (..)
   , seamDrive
+  , seamDriveWith
   , seamDriveCancelledBeforeCommit
   , seamQueueEvents
+  , seamQueueControlEvents
   , seamRejectCloseRequest
   , seamSetModeTransition
   , ForeignSeamWindow (..)
@@ -143,7 +145,7 @@ module Hetoimasia.GLFW.Internal.Seam
 import Control.Concurrent (ThreadId, forkIO, myThreadId, runInBoundThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, throw, throwIO, try)
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
@@ -339,6 +341,15 @@ data WindowEvent
   | MaximizeChanged Bool
   | RefreshRequested
   | CloseRequested
+  | KeyEventAt Int Int Int Int
+    -- ^ Physical key, scancode, action, and modifiers, as GLFW passes them.
+  | CharEventAt Int
+    -- ^ Unicode code point.
+  | ButtonEventAt Int Int Int
+    -- ^ Button, action, and modifiers.
+  | CursorMovedTo Double Double
+  | CursorEnterChanged Bool
+  | ScrollEventAt Double Double
   | CallbackRaises SomeException
     -- ^ A size callback whose payload raises the exception when copied.
 
@@ -447,6 +458,9 @@ data Seam = Seam
     -- ^ Window key to the callback storage key attached to it.
   , seamQueuedEvents ∷ IORef [(Int, [WindowEvent])]
     -- ^ Events for the next poll or wait to deliver, by window key, oldest first.
+  , seamQueuedControlEvents ∷ IORef [(Int, [WindowEvent])]
+    -- ^ Events the next owner-thread control of that window delivers from
+    -- inside the setter, as GLFW can invoke callbacks during a setter.
   , seamTopology ∷ IORef MonitorTopology
   , seamMonitorCallbacks ∷ IORef [(Int, MonitorCallback)]
     -- ^ Allocated and not yet freed monitor callback storage, by key.
@@ -486,6 +500,7 @@ newSeam script =
     <*> newIORef 1
     <*> newIORef Nothing
     <*> newIORef 1
+    <*> newIORef []
     <*> newIORef []
     <*> newIORef []
     <*> newIORef []
@@ -581,7 +596,12 @@ requireSeamWindow seam window =
 -- without a native step; events for a window with no callbacks attached are
 -- dropped, as GLFW drops them.
 seamDrive ∷ Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
-seamDrive seam window origin = driveWith (pure ()) seam window (originName origin)
+seamDrive = seamDriveWith (pure ())
+
+-- | 'seamDrive' with an interruption at the reconciliation boundary: once
+-- before the commit, and again inside the masked publication step.
+seamDriveWith ∷ IO () → Seam → Window → DriveOrigin → [WindowEvent] → IO (WindowResult ())
+seamDriveWith interruption seam window origin = driveWith interruption seam window (originName origin)
   where
     originName DuringSetter = "seam setter"
     originName DuringPoll = "seam poll"
@@ -607,6 +627,42 @@ seamQueueEvents seam window events = do
   let key = windowKey (windowNativeHandle window)
   atomicModifyIORef' (seamQueuedEvents seam) (\queued → (queued <> [(key, events)], ()))
 
+-- | Queue events for a window's attached callbacks. The next ordinary control
+-- of that window over this seam's native table delivers them from inside the
+-- setter, as GLFW can invoke callbacks during a setter.
+seamQueueControlEvents ∷ Seam → Window → [WindowEvent] → IO ()
+seamQueueControlEvents seam window events = do
+  requireSeamWindow seam window
+  let key = windowKey (windowNativeHandle window)
+  atomicModifyIORef' (seamQueuedControlEvents seam) (\queued → (queued <> [(key, events)], ()))
+
+deliverQueuedControl ∷ Seam → Int → IO ()
+deliverQueuedControl seam key = do
+  events ← atomicModifyIORef' (seamQueuedControlEvents seam) $ \queued →
+    ( [(k, es) | (k, es) ← queued, k /= key]
+    , concat [es | (k, es) ← queued, k == key]
+    )
+  deliverTo seam key events
+
+controlWindowKey ∷ NativeCall → Maybe Int
+controlWindowKey = \case
+  SetWindowTitle key _ → Just key
+  SetWindowSize key _ _ → Just key
+  SetWindowPosition key _ _ → Just key
+  SetWindowSizeLimits key _ _ _ _ → Just key
+  SetWindowAspectRatio key _ → Just key
+  ShowWindow key → Just key
+  HideWindow key → Just key
+  FocusWindow key → Just key
+  RequestWindowAttention key → Just key
+  IconifyWindow key → Just key
+  MaximizeWindow key → Just key
+  RestoreWindow key → Just key
+  SetWindowMonitor key _ _ _ _ _ _ → Just key
+  SetWindowDecorated key _ → Just key
+  ClearWindowSizeLimits key → Just key
+  _ → Nothing
+
 -- | Deliver events to the callbacks attached to a window key. Events for a
 -- window with no callbacks attached are dropped, as GLFW drops them.
 deliverTo ∷ Seam → Int → [WindowEvent] → IO ()
@@ -631,6 +687,14 @@ deliverTo seam key events = do
       MaximizeChanged flag → onWindowMaximize callbacks (flagOf flag)
       RefreshRequested → onWindowRefresh callbacks
       CloseRequested → onWindowClose callbacks
+      KeyEventAt code scancode action mods →
+        onKey callbacks (fromIntegral code) (fromIntegral scancode) (fromIntegral action) (fromIntegral mods)
+      CharEventAt codepoint → onChar callbacks (fromIntegral codepoint)
+      ButtonEventAt button action mods →
+        onMouseButton callbacks (fromIntegral button) (fromIntegral action) (fromIntegral mods)
+      CursorMovedTo x y → onCursorPos callbacks (realToFrac x) (realToFrac y)
+      CursorEnterChanged entered → onCursorEnter callbacks (flagOf entered)
+      ScrollEventAt x y → onScroll callbacks (realToFrac x) (realToFrac y)
       CallbackRaises failure → onWindowSize callbacks (throw failure) 1
     flagOf flag = if flag then 1 else 0
 
@@ -887,6 +951,7 @@ seamNative seam =
       record call
       before ← readIORef (seamReported seam)
       scriptWindowControl script call reporter
+      forM_ (controlWindowKey call) (deliverQueuedControl seam)
       after ← readIORef (seamReported seam)
       when (before == after) (effect call)
     -- What a control or mode step that reported no error changes.

@@ -21,7 +21,7 @@ import Data.List (elemIndex)
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
-import Hetoimasia.Foundation.Log (Component, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotCursor, SnapshotReader, Update (..), awaitSnapshot, observedCursor, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocResource, cleanupFailureLabel, cleanupFailures)
@@ -853,7 +853,10 @@ refill tickets alternation busy quiet = do
 
 -- | A logging lifetime whose records go nowhere.
 lifetime ∷ (LoggingLifetime → IO r) → IO r
-lifetime = withLoggingLifetime (mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ())))
+lifetime = withLoggingLifetime quietLogger
+
+quietLogger ∷ Logger
+quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
 -- | Run an application over a host in the seam's session, on a bound thread
 -- designated as the process main thread.
@@ -880,7 +883,7 @@ caughtHosted seam config startup action =
 -- update, and fail an example that has not finished within 'turnBound' turns.
 looping ∷ WindowHost → RuntimeControl → (Turn → IO (TurnStep a)) → IO a
 looping host control update =
-  runOwnerLoop host control . LoopHooks noApplicationEvents $ \turn →
+  runOwnerLoop host control . LoopHooks quietLogger noApplicationEvents $ \turn →
     if turnNumber turn > turnBound
       then unexpected "the example did not finish within its turn bound"
       else update turn

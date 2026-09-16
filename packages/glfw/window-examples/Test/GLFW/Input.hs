@@ -1,11 +1,11 @@
 -- | Examples for window input feeds and their acknowledged reset, driven by the
--- private producer on the CPU.
+-- private producer and by scripted native callbacks on the CPU.
 --
 -- Every example drives the production feed model in
 -- "Hetoimasia.GLFW.Internal.Input": the owner's production, overflow, warning,
 -- resumption, and closure operations, and the consumer's reader and admission
--- control. Nothing initializes GLFW. A feed needs only its window's identity, so
--- the identities come from windows created and released in a seam session.
+-- control. Callback-staging examples attach a feed to a seam window and deliver
+-- scripted input callbacks through 'seamDrive'. Nothing initializes GLFW.
 --
 -- Threads are coordinated with 'MVar's and STM, never with a sleep, and a
 -- transaction that would wait is observed by composing it with 'orElse'.
@@ -15,7 +15,7 @@ import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM, replicateM_)
+import Control.Monad (forM, forM_, replicateM, replicateM_, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Log
@@ -29,8 +29,31 @@ import Hetoimasia.Foundation.Log
   , systemMetadata
   )
 import Hetoimasia.GLFW.Internal.Input
-import Hetoimasia.GLFW.Internal.Seam (asProcessMainThread, defaultScript, newSeam)
-import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig, windowIdentity, withWindow)
+import Hetoimasia.GLFW.Internal.Seam
+  ( DriveOrigin (..)
+  , Seam
+  , WindowEvent (..)
+  , asProcessMainThread
+  , defaultScript
+  , newSeam
+  , seamDrive
+  , seamDriveWith
+  )
+import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity)
+import Hetoimasia.GLFW.Window
+  ( Window
+  , WindowId
+  , WindowObservation
+  , WindowResult (..)
+  , hiddenTestWindowConfig
+  , observedCursorPosition
+  , observedCursorInside
+  , windowIdentity
+  , windowObservations
+  , withWindow
+  )
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
 
@@ -73,6 +96,28 @@ spec = describe "GLFW input feeds" $ do
       (boundedExample testWarningFailure)
     it "retains an episode whose warning attempt shutdown cancelled, or prevented, in final observations"
       (boundedExample testWarningCancelled)
+
+  describe "callback staging" $ do
+    it "delivers key, character, button, and scroll from callbacks as tagged, uncoalesced events, and coalesces cursor into the observation"
+      (boundedExample testCallbackEvents)
+    it "keeps a button event's captured coordinates after later cursor motion through callbacks"
+      (boundedExample testCallbackButtonPosition)
+    it "keeps a button event's captured coordinates when motion and the button occur in separate owner turns"
+      (boundedExample testCallbackButtonAcrossTurns)
+    it "sets the staging loss latch while the buffer is full and begins the same reset, replaying no captured prefix"
+      (boundedExample testStagingOverflow)
+    it "keeps the focus gate current when focus loss is discarded with a staging overflow"
+      (boundedExample testStagingOverflowFocus)
+    it "publishes a captured batch to completion before a cancellation at the publication boundary"
+      (boundedExample testPublishCancellationSafe)
+    it "does not synthesize a press from a release delivered through a callback"
+      (boundedExample testCallbackUnpairedRelease)
+    it "gates callback input until admission is opened explicitly"
+      (boundedExample testCallbackAdmission)
+    it "leaves a second window's feed running when the first window's staging overflows"
+      (boundedExample testCallbackIndependentWindows)
+    it "delivers focus loss and gain in native order, and a focus transition that cannot be admitted starts the reset"
+      (boundedExample testCallbackFocus)
 
   describe "application suspension" $ do
     it "leaves no backlog or held state after press, suspend, suppressed release, and enable, and needs acknowledgement, resumption, and a fresh press"
@@ -683,7 +728,193 @@ testClosureWinsSuspension = do
       _ → False
 
 -- ---------------------------------------------------------------------------
+-- Callback staging
+
+testCallbackEvents ∷ Expectation
+testCallbackEvents =
+  withLiveFeed 16 $ \seam window feed → do
+    drive seam window
+      [ CursorMovedTo 3 4
+      , CursorEnterChanged True
+      , KeyEventAt 65 38 1 1
+      , CharEventAt (fromEnum 'A')
+      , ButtonEventAt 1 1 0
+      , ScrollEventAt 0 1
+      , ScrollEventAt 0 1
+      , CharEventAt (fromEnum 'A')
+      , FocusChanged False
+      ]
+    observation ← currentObservation window
+    observedCursorPosition observation `shouldBe` Just (CursorPosition 3 4)
+    observedCursorInside observation `shouldBe` Just True
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ KeyInput (KeyEvent 65 38 KeyPressed (noModifiers {modifierShift = True}))
+                 , TextInput 'A'
+                 , ButtonInput (ButtonEvent 1 ButtonPressed (Just (CursorPosition 3 4)) noModifiers)
+                 , ScrollInput (ScrollEvent 0 1)
+                 , ScrollInput (ScrollEvent 0 1)
+                 , TextInput 'A'
+                 , FocusInput False
+                 ]
+    map inputWindow events `shouldBe` replicate 7 (windowIdentity window)
+    map (epochNumber . inputEpoch) events `shouldBe` replicate 7 1
+
+testCallbackButtonPosition ∷ Expectation
+testCallbackButtonPosition =
+  withLiveFeed 8 $ \seam window feed → do
+    drive seam window [CursorMovedTo 1 2, ButtonEventAt 0 1 1, CursorMovedTo 50 60, CursorMovedTo 70 80, ButtonEventAt 0 0 1]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 1 2)) (noModifiers {modifierShift = True}))
+                 , ButtonInput (ButtonEvent 0 ButtonReleased (Just (CursorPosition 70 80)) (noModifiers {modifierShift = True}))
+                 ]
+    observedCursorPosition <$> currentObservation window `shouldReturn` Just (CursorPosition 70 80)
+
+testCallbackButtonAcrossTurns ∷ Expectation
+testCallbackButtonAcrossTurns =
+  withLiveFeed 8 $ \seam window feed → do
+    drive seam window [CursorMovedTo 9 10]
+    drive seam window [ButtonEventAt 0 1 0]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events
+      `shouldBe` [ButtonInput (ButtonEvent 0 ButtonPressed (Just (CursorPosition 9 10)) noModifiers)]
+
+testStagingOverflow ∷ Expectation
+testStagingOverflow =
+  withLiveFeed 16 $ \seam window feed → do
+    let overflowed = CharEventAt (fromEnum 'x') : replicate inputStagingCapacity (CharEventAt (fromEnum 'a'))
+    drive seam window overflowed
+    readNow feed >>= \case
+      InputResetRequired token → do
+        resetReason token `shouldBe` InputOverflowed
+        summary ← statisticsLastReset <$> statisticsOf feed
+        fmap summaryUnadmitted summary `shouldBe` Just (fromIntegral (inputStagingCapacity + 1))
+        drain (feedReader feed) >>= \(events, _) → events `shouldBe` []
+        atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+        _ ← attemptOverflowWarning quietLogger feed
+        resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+        drive seam window [CharEventAt (fromEnum 'b')]
+        (events, _) ← drain (feedReader feed)
+        map inputPayload events `shouldBe` [TextInput 'b']
+        map (epochNumber . inputEpoch) events `shouldBe` [2]
+      other → unexpected ("staging overflow did not reset: " <> show other)
+
+testStagingOverflowFocus ∷ Expectation
+testStagingOverflowFocus =
+  withLiveFeed 16 $ \seam window feed → do
+    let overflowed = replicate inputStagingCapacity (CharEventAt (fromEnum 'a')) <> [FocusChanged False]
+    drive seam window overflowed
+    token ←
+      readNow feed >>= \case
+        InputResetRequired reset → pure reset
+        other → unexpected ("staging overflow did not reset: " <> show other)
+    summary ← statisticsLastReset <$> statisticsOf feed
+    fmap summaryUnadmitted summary `shouldBe` Just (fromIntegral (inputStagingCapacity + 1))
+    fmap summarySuppressed summary `shouldBe` Just 0
+    statisticsFocused <$> statisticsOf feed `shouldReturn` False
+    atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
+    _ ← attemptOverflowWarning quietLogger feed
+    resumeInput feed `shouldReturn` ResumeUnfocused
+    drive seam window [FocusChanged True]
+    resumeInput feed `shouldReturn` Resumed (resetEpoch token)
+
+testPublishCancellationSafe ∷ Expectation
+testPublishCancellationSafe =
+  withLiveFeed 8 $ \seam window feed → do
+    calls ← newIORef (0 ∷ Int)
+    let hook = do
+          n ← atomicModifyIORef' calls (\count → (count + 1, count))
+          when (n >= 1) (throwIO ThreadKilled)
+    (killed, _) ← caughtAs (seamDriveWith hook seam window DuringPoll [CharEventAt (fromEnum 'a'), CharEventAt (fromEnum 'b')])
+    killed `shouldBe` ThreadKilled
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events `shouldBe` [TextInput 'a', TextInput 'b']
+
+testCallbackUnpairedRelease ∷ Expectation
+testCallbackUnpairedRelease =
+  withLiveFeed 8 $ \seam window feed → do
+    drive seam window [KeyEventAt 65 0 0 0, KeyEventAt 65 0 2 0, ButtonEventAt 0 0 0]
+    (events, _) ← drain (feedReader feed)
+    events `shouldBe` []
+    statisticsUnpaired <$> statisticsOf feed `shouldReturn` 3
+    drive seam window [KeyEventAt 65 0 1 0, KeyEventAt 65 0 0 0]
+    (pressed, _) ← drain (feedReader feed)
+    map inputPayload pressed `shouldBe` [key 65 KeyPressed, key 65 KeyReleased]
+
+testCallbackAdmission ∷ Expectation
+testCallbackAdmission = do
+  seam ← newSeam defaultScript
+  asProcessMainThread seam . entered seam $ \session →
+    withWindow session (hiddenTestWindowConfig "input" 64 48) $ \window → do
+      feed ← newInputFeed (windowIdentity window) 8 True
+      attachWindowInputFeed window feed
+      drive seam window [CharEventAt (fromEnum 'a')]
+      (events, _) ← drain (feedReader feed)
+      events `shouldBe` []
+      statisticsGated <$> statisticsOf feed `shouldReturn` 1
+      statisticsResets <$> statisticsOf feed `shouldReturn` 0
+      atomically (enableInput (feedControl feed)) `shouldReturn` AdmissionOpened
+      drive seam window [CharEventAt (fromEnum 'b')]
+      (delivered, _) ← drain (feedReader feed)
+      map inputPayload delivered `shouldBe` [TextInput 'b']
+
+testCallbackIndependentWindows ∷ Expectation
+testCallbackIndependentWindows = do
+  seam ← newSeam defaultScript
+  asProcessMainThread seam . entered seam $ \session →
+    withWindow session (hiddenTestWindowConfig "one" 64 48) $ \first →
+      withWindow session (hiddenTestWindowConfig "two" 64 48) $ \second → do
+        feedOne ← attached first 16
+        feedTwo ← attached second 16
+        let overflowed = replicate (inputStagingCapacity + 1) (CharEventAt (fromEnum 'x'))
+        drive seam first overflowed
+        drive seam second [CharEventAt (fromEnum 'y')]
+        readNow feedOne >>= \case
+          InputResetRequired _ → pure ()
+          other → unexpected ("first window did not reset: " <> show other)
+        (events, _) ← drain (feedReader feedTwo)
+        map inputPayload events `shouldBe` [TextInput 'y']
+        statisticsPhase <$> statisticsOf feedTwo `shouldReturn` InputRunning
+
+testCallbackFocus ∷ Expectation
+testCallbackFocus =
+  withLiveFeed 2 $ \seam window feed → do
+    drive seam window [FocusChanged False, FocusChanged True]
+    (events, _) ← drain (feedReader feed)
+    map inputPayload events `shouldBe` [FocusInput False, FocusInput True]
+    fill feed 2
+    drive seam window [FocusChanged False]
+    readNow feed >>= \case
+      InputResetRequired token → resetReason token `shouldBe` InputOverflowed
+      other → unexpected ("a focus transition into a full feed did not reset: " <> show other)
+
+-- ---------------------------------------------------------------------------
 -- Support
+
+withLiveFeed ∷ Integer → (Seam → Window → InputFeed → IO a) → IO a
+withLiveFeed capacity action = do
+  seam ← newSeam defaultScript
+  asProcessMainThread seam . entered seam $ \session →
+    withWindow session (hiddenTestWindowConfig "input" 64 48) $ \window → do
+      feed ← attached window capacity
+      action seam window feed
+
+attached ∷ Window → Integer → IO InputFeed
+attached window capacity = do
+  feed ← newInputFeed (windowIdentity window) capacity True >>= enabled
+  attachWindowInputFeed window feed
+  pure feed
+
+drive ∷ Seam → Window → [WindowEvent] → IO ()
+drive seam window events =
+  seamDrive seam window DuringPoll events >>= \case
+    WindowAvailable () → pure ()
+    WindowEnded identity → unexpected ("window ended during drive: " <> show identity)
+
+currentObservation ∷ Window → IO WindowObservation
+currentObservation window = preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))
+
 
 -- | Distinct window identities from windows created, and released, in a seam
 -- session. A feed needs only the identity.

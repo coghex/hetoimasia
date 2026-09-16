@@ -53,7 +53,7 @@ module Hetoimasia.Runtime.GLFW.Internal
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, finally, fromException, rethrowIO, tryWithContext)
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM, forM_, unless, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -63,7 +63,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
-import Hetoimasia.Foundation.Log (Component, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
@@ -107,10 +107,19 @@ import Hetoimasia.GLFW.Internal.Command
   , observeWindow
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
-import Hetoimasia.GLFW.Internal.Input (InputFeed, closeInputFeed, feedControl, feedReader, newInputFeed)
+import Hetoimasia.GLFW.Internal.Input
+  ( InputFeed
+  , attemptOverflowWarning
+  , closeInputFeed
+  , feedControl
+  , feedReader
+  , newInputFeed
+  , resumeInput
+  )
 import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents, sessionWindowCapabilities)
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
+  , attachWindowInputFeed
   , beginWindowClosing
   , processWindowEvents
   , reconcileWindowEvents
@@ -527,11 +536,15 @@ retirePending host = do
 registerWindow ∷ WindowHost → WindowConfig → IO WindowClient
 registerWindow host config =
   acquireMemberThen (hostCollection host) (windowAssembly (hostSession host) config) $ \member → do
-    (identity, reader) ←
-      withMember (hostCollection host) member (\window → pure (windowIdentity window, windowObservations window))
-    focused ← (== Observed True) . observedFocused . preparedValue . observedValue <$> atomically (readSnapshot reader)
+    (identity, reader, feed) ←
+      withMember (hostCollection host) member $ \window → do
+        let identity = windowIdentity window
+            reader = windowObservations window
+        focused ← (== Observed True) . observedFocused . preparedValue . observedValue <$> atomically (readSnapshot reader)
+        feed ← newInputFeed identity (hostInputCapacity (hostSettings host)) focused
+        attachWindowInputFeed window feed
+        pure (identity, reader, feed)
     commands ← newWindowPortHost (hostSession host) (hostCommandCapacity (hostSettings host)) identity
-    feed ← newInputFeed identity (hostInputCapacity (hostSettings host)) focused
     let client = newWindowClient identity commands reader (feedReader feed) (feedControl feed)
     atomically (modifyTVar' (hostEntries host) (Map.insert identity (HostEntry member commands feed client False)))
     afterRegistration (hostHooks host)
@@ -652,7 +665,10 @@ latestCloseRequest window =
 
 -- | What the application supplies to the owner loop.
 data LoopHooks a = LoopHooks
-  { loopEvent ∷ IO Bool
+  { loopLogger ∷ Logger
+    -- ^ The injected logger the overflow warning is written through, at a
+    -- safe owner boundary outside callbacks.
+  , loopEvent ∷ IO Bool
     -- ^ One application event opportunity. 'True' when it dispatched
     -- something, which costs one unit of the event budget; 'False' when nothing
     -- was ready, which ends the turn's event work.
@@ -706,8 +722,10 @@ runOwnerLoop host control hooks =
       reconcileWindowModes host
       retirePending host
       closes ← surfaceCloseRequests host
+      recoverFeeds (loopLogger hooks) host
       checkRuntime control
       commands ← dispatchCommands host (hostCommandBudget settings)
+      recoverFeeds (loopLogger hooks) host
       checkRuntime control
       events ← dispatchEvents (loopEvent hooks) (hostEventBudget settings)
       checkRuntime control
@@ -745,6 +763,16 @@ reconcileWindowModes host = do
   entries ← readTVarIO (hostEntries host)
   forM_ (Map.toAscList entries) $ \(target, entry) →
     if entryClosing entry then pure () else void (borrowWindow host target entry reconcileWindowMode)
+
+-- | Claim each open feed's overflow warning and resume any acknowledged
+-- reset, at a safe owner boundary after callbacks have been reconciled.
+recoverFeeds ∷ Logger → WindowHost → IO ()
+recoverFeeds logger host = do
+  entries ← readTVarIO (hostEntries host)
+  forM_ (Map.elems entries) $ \entry →
+    unless (entryClosing entry) $ do
+      void (attemptOverflowWarning logger (entryInput entry))
+      void (resumeInput (entryInput entry))
 
 -- | Reconcile every window the host holds, and answer the close requests of
 -- windows not closing that were not surfaced before.

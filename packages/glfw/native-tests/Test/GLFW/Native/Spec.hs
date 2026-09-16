@@ -14,6 +14,7 @@ import qualified Test.GLFW.Native.Control as Control
 import qualified Test.GLFW.Native.Harness as Harness
 import qualified Test.GLFW.Native.Mode as Mode
 import qualified Test.GLFW.Native.Host as Host
+import qualified Test.GLFW.Native.Input as Input
 import qualified Test.GLFW.Native.Monitor as Monitor
 import qualified Test.GLFW.Native.Private as Private
 import qualified Test.GLFW.Native.Session as Session
@@ -30,4 +31,5 @@ spec shared = describe "GLFW native" $ do
   Mode.spec shared
   Monitor.spec shared
   Host.spec shared
+  Input.spec shared
   Private.spec

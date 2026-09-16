@@ -9,7 +9,8 @@ description:
     with disconnect-safe identities, scoped NoAPI windows that publish what the
     platform observed through snapshots, and
     bounded window command admission with persistent completion tickets, and
-    bounded per-window input feeds with an acknowledged reset. Its main library
+    bounded per-window input feeds whose native key, character, button, cursor,
+    and scroll callbacks publish through an acknowledged reset. Its main library
     depends on the foundation library and not on the runtime. The
     separate public runtime-glfw sublibrary composes a window host, its
     dynamically created and independently closed windows, and its supervised
@@ -40,7 +41,7 @@ common language
 -- construction and rollback, bounded error capture, window observations, the
 -- monitor inventory and its identities, contained callbacks, window command
 -- admission, execution, and completion, and bounded input feeds with their
--- acknowledged reset,
+-- acknowledged reset, and bounded input staging at the window callbacks,
 -- written over a table of native operations. It binds nothing, so the test seam
 -- can drive it without linking GLFW.
 library model
@@ -226,6 +227,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Fixture
         Test.GLFW.Native.Harness
         Test.GLFW.Native.Host
+        Test.GLFW.Native.Input
         Test.GLFW.Native.Mode
         Test.GLFW.Native.Monitor
         Test.GLFW.Native.Private
