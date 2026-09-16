@@ -78,6 +78,20 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testDelayedBorderlessConvergence)
     it "reports finite exhaustion when no monitor remains to place the window in"
       (boundedExample testEmptyInventory)
+    it "recovers through the configured fallback when an observation intervenes before reconciliation, and never repeats it"
+      (boundedExample testObservationBeforeReconcile)
+    it "recovers when the observation precedes the inventory refresh that ends the identity"
+      (boundedExample testObservationBeforeRefresh)
+    it "recovers when an observation command intervenes, and a refused request leaves the recovery pending"
+      (boundedExample testObservationCommandAndRefusal)
+    it "recovers a borderless window from the indeterminate observation its disconnect leaves"
+      (boundedExample testBorderlessObservationRecovery)
+    it "reports exhaustion once across an intervening observation and never revives it through refreshes, observations, or a reconnect"
+      (boundedExample testExhaustionAfterObservation)
+    it "only resamples an observed disconnect with no fallback configured, reporting the platform's truth"
+      (boundedExample testObservationWithoutFallback)
+    it "lets a request settled after the disconnect supersede the pending recovery"
+      (boundedExample testSupersededRecovery)
     it "settles borderless placement the platform cannot perform as unsupported, never as fullscreen"
       (boundedExample testUnsupportedBorderless)
     it "reports a partial native failure with its completed steps and leaves the saved placement unchanged"
@@ -503,6 +517,208 @@ testEmptyInventory = withDesk tracked $ \desk → withWindowIn desk "first" $ \w
   placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
   modeLastOutcome record `shouldBe` Just (ModeFailed [unreachable])
   claims `shouldBe` Map.empty
+
+-- | Fullscreen with a fallback, then the monitor's disconnect: an ordinary
+-- observation folded between the inventory refresh and the mode reconciliation
+-- reports the platform's truthful post-disconnect windowed state, and the
+-- recovery survives it, restoring the saved placement. Once settled, neither
+-- another reconciliation nor another observation restarts it.
+testObservationBeforeReconcile ∷ Expectation
+testObservationBeforeReconcile = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (fullscreenMode (deskLeft desk) currentVideoMode) (windowedFallback 1)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  observed ← synchronizeWindow window
+  postDisconnect ← geometry window
+  reconciled ← reconcileWindowMode window
+  settledCalls ← setterCalls desk
+  record ← recordOf window
+  restored ← geometry window
+  repeated ← reconcileWindowMode window
+  reobserved ← synchronizeWindow window
+  afterSettlement ← setterCalls desk
+  entering `shouldSatisfy` appliedCleanly
+  appliedOf observed `shouldBe` Just AppliedWindowed
+  postDisconnect `shouldBe` (Observed (Placement 0 0), Observed (Extent 1920 1080))
+  reconciled `shouldBe` WindowAvailable (Just recovered)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recovered
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  restored `shouldBe` original
+  repeated `shouldBe` WindowAvailable Nothing
+  appliedOf reobserved `shouldBe` Just AppliedWindowed
+  afterSettlement `shouldBe` settledCalls
+  where
+    recovered = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] []
+
+-- | The platform clears the window's fullscreen monitor before the monitor
+-- callback's refresh ends its identity, so an observation taken between the
+-- native disconnect and the refresh already reports the windowed truth. The
+-- refresh that ends the identity still triggers the configured recovery.
+testObservationBeforeRefresh ∷ Expectation
+testObservationBeforeRefresh = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (fullscreenMode (deskLeft desk) currentVideoMode) (windowedFallback 1)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  observed ← synchronizeWindow window
+  postDisconnect ← geometry window
+  reconcileMonitorEvents (deskSession desk)
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  restored ← geometry window
+  entering `shouldSatisfy` appliedCleanly
+  appliedOf observed `shouldBe` Just AppliedWindowed
+  postDisconnect `shouldBe` (Observed (Placement 0 0), Observed (Extent 1920 1080))
+  reconciled `shouldBe` WindowAvailable (Just recovered)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recovered
+  restored `shouldBe` original
+  where
+    recovered = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] []
+
+-- | An observation through the window command port intervenes the same way,
+-- and a later request refused before any native call is not retained by the
+-- record: the pending recovery is still owed afterwards.
+testObservationCommandAndRefusal ∷ Expectation
+testObservationCommandAndRefusal = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+      target = windowIdentity window
+  entering ← execute desk [window] (mode window (modeRequest (fullscreenMode (deskLeft desk) currentVideoMode) (windowedFallback 1)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  observed ← execute desk [window] (observeWindowCommand target)
+  recordAfterObservation ← recordOf window
+  beforeRefusal ← setterCalls desk
+  refused ← execute desk [window] (mode window (fullscreenOn (deskLeft desk)))
+  afterRefusal ← setterCalls desk
+  reconciled ← reconcileWindowMode window
+  restored ← geometry window
+  entering `shouldSatisfy` appliedCleanly
+  observed `shouldSatisfy` \case
+    Performed (ObservationPublished published _) → published == target
+    _ → False
+  modeApplied recordAfterObservation `shouldBe` AppliedWindowed
+  refused `shouldBe` Rejected (ModeRejected target (ModeMonitorDisconnected (deskLeft desk)))
+  afterRefusal `shouldBe` beforeRefusal
+  reconciled `shouldBe` WindowAvailable (Just recovered)
+  restored `shouldBe` original
+  where
+    recovered = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] []
+
+-- | The disconnect does not move a borderless window: after the refresh its
+-- origin lies over no live monitor's work area, so the observation is
+-- indeterminate — and the configured recovery still runs from it. That is not
+-- the resample-only indeterminate state an interrupted attempt leaves, which
+-- has no ended monitor.
+testBorderlessObservationRecovery ∷ Expectation
+testBorderlessObservationRecovery = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (borderlessMode (deskLeft desk)) (windowedFallback 1)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  observed ← synchronizeWindow window
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  restored ← geometry window
+  entering `shouldSatisfy` appliedCleanly
+  appliedOf observed `shouldBe` Just AppliedIndeterminate
+  reconciled `shouldBe` WindowAvailable (Just recovered)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recovered
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  restored `shouldBe` original
+  where
+    recovered = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] []
+
+-- | Exhaustion settles the recovery too: with no monitor left to place the
+-- window in, the fallback reports honestly across an intervening observation,
+-- and no later refresh, observation, or reconnection at a reused address under
+-- a new identity revives it.
+testExhaustionAfterObservation ∷ Expectation
+testExhaustionAfterObservation = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (fullscreenMode (deskLeft desk) currentVideoMode) (windowedFallback 1)))
+  seamSetMonitorTopology seam noMonitors
+  seamDeliverMonitorEvents seam [MonitorDetached 1, MonitorDetached 2]
+  observed ← synchronizeWindow window
+  reconcileMonitorEvents (deskSession desk)
+  reconciled ← reconcileWindowMode window
+  settledCalls ← setterCalls desk
+  record ← recordOf window
+  repeated ← reconcileWindowMode window
+  reobserved ← synchronizeWindow window
+  seamSetMonitorTopology seam (MonitorTopology (Just [(1, leftMonitor), (2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorAttached 1, MonitorAttached 2]
+  reconcileMonitorEvents (deskSession desk)
+  afterReconnect ← reconcileWindowMode window
+  finalCalls ← setterCalls desk
+  entering `shouldSatisfy` appliedCleanly
+  appliedOf observed `shouldBe` Just AppliedWindowed
+  reconciled `shouldBe` WindowAvailable (Just (ModeFailed [unreachable]))
+  modeLastOutcome record `shouldBe` Just (ModeFailed [unreachable])
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  repeated `shouldBe` WindowAvailable Nothing
+  appliedOf reobserved `shouldBe` Just AppliedWindowed
+  afterReconnect `shouldBe` WindowAvailable Nothing
+  finalCalls `shouldBe` settledCalls
+  where
+    unreachable = ModeAttemptFailure WindowedFallbackAttempt (RefusedBeforeMutation NoReachablePlacement)
+
+-- | With no fallback configured, an observed disconnect is only resampled: the
+-- observation keeps reporting the platform's post-disconnect state, no
+-- recovery invents a placement, and the saved placement is preserved. That
+-- resample answers the obligation, so a later reconciliation samples nothing
+-- again — the owner loop reconciles every turn.
+testObservationWithoutFallback ∷ Expectation
+testObservationWithoutFallback = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (fullscreenOn (deskLeft desk)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  observed ← synchronizeWindow window
+  beforeReconciliation ← setterCalls desk
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  postDisconnect ← geometry window
+  afterReconciliation ← setterCalls desk
+  callsAfterAnswer ← seamCalls seam
+  repeated ← reconcileWindowMode window
+  callsAfterRepeat ← seamCalls seam
+  entering `shouldSatisfy` appliedCleanly
+  appliedOf observed `shouldBe` Just AppliedWindowed
+  reconciled `shouldBe` WindowAvailable Nothing
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  postDisconnect `shouldBe` (Observed (Placement 0 0), Observed (Extent 1920 1080))
+  afterReconciliation `shouldBe` beforeReconciliation
+  repeated `shouldBe` WindowAvailable Nothing
+  callsAfterRepeat `shouldBe` callsAfterAnswer
+
+-- | A mode request that executes after the disconnect and settles takes over
+-- the record, whatever the pending recovery was: no stale recovery undoes it.
+testSupersededRecovery ∷ Expectation
+testSupersededRecovery = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (fullscreenMode (deskLeft desk) currentVideoMode) (windowedFallback 1)))
+  seamSetMonitorTopology seam (MonitorTopology (Just [(2, rightMonitor)]) 2)
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  _ ← synchronizeWindow window
+  settled ← execute desk [window] (mode window windowed)
+  afterSettled ← setterCalls desk
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  afterReconciliation ← setterCalls desk
+  entering `shouldSatisfy` appliedCleanly
+  outcomeOf settled `shouldBe` Just (ModeApplied TargetAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] [])
+  reconciled `shouldBe` WindowAvailable Nothing
+  modeApplied record `shouldBe` AppliedWindowed
+  afterReconciliation `shouldBe` afterSettled
 
 testUnsupportedBorderless ∷ Expectation
 testUnsupportedBorderless =

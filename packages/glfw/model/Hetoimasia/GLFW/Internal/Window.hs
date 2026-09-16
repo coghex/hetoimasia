@@ -196,10 +196,14 @@
 -- Every sample queries the window's decoration and fullscreen monitor beside its
 -- other attributes, and the monitor pointer is compared with the inventory's
 -- current connections without a refresh. 'reconcileWindowMode' is the owner
--- loop's step after its monitor refresh: a window whose applied mode names an
--- ended monitor identity takes its recorded windowed fallback without another
--- command, or is resampled when it has none; a window whose applied mode is
--- indeterminate is resampled.
+-- loop's step after its monitor refresh: a window whose recorded recovery
+-- obligation names an ended monitor identity takes its recorded windowed
+-- fallback without another command, or is resampled once when it has none, the
+-- resample answering the obligation; a window whose applied mode is
+-- indeterminate is resampled. The obligation is the monitor identity the last
+-- settlement's own sample established, so the observations that truthfully
+-- report the platform's post-disconnect state — before the refresh or after it
+-- — do not erase it.
 --
 -- A 'WindowConfig' may carry a startup mode, transitioned during creation after
 -- the initial observation seeded the saved placement. A required startup mode
@@ -532,11 +536,13 @@ import Hetoimasia.GLFW.Internal.Mode
   , modeMonitor
   , modePresentation
   , modeRequest
+  , modeRecoveryObligation
   , modeRequested
   , modeSavedPlacement
   , modeVideoPreference
   , pruneClaims
   , recordApplied
+  , recordRecoveryCleared
   , recordSaved
   , recordSettled
   , requestedFallback
@@ -2170,10 +2176,16 @@ restoreLeftWindowed window disturbed = do
         ]
 
 -- | Reconcile a window's mode after a monitor refresh, at an owner boundary: take
--- the recorded windowed fallback when the applied mode names an ended monitor
--- identity, answering its outcome, or resample when there is no fallback or the
--- applied mode is indeterminate. A closing window, and one inside a transition,
--- are left alone.
+-- the recorded windowed fallback when the monitor identity its recovery is owed
+-- to has ended, answering its outcome, or resample when there is no fallback or
+-- the applied mode is indeterminate. The obligation is the one the last
+-- settlement's own sample established, so an ordinary observation that already
+-- reports the platform's post-disconnect state — windowed at the desktop origin,
+-- or indeterminate for a borderless window left over no live work area — does
+-- not erase it, and the refresh that ends the identity triggers it however the
+-- two were ordered. With no fallback the resample answers the obligation, so a
+-- settled window is not resampled again on later turns. A closing window, and
+-- one inside a transition, are left alone.
 reconcileWindowMode ∷ Window → IO (WindowResult (Maybe ModeOutcome))
 reconcileWindowMode window =
   atBoundary (pure ()) window reconcileModeOperation $ do
@@ -2181,7 +2193,7 @@ reconcileWindowMode window =
     ControlState _ _ transition ← readIORef (windowControl window)
     live ← liveMonitors (windowSession window)
     let record = obsMode current
-        ended = any (`notElem` live) (appliedMonitor (modeApplied record))
+        ended = any (`notElem` live) (modeRecoveryObligation record)
     if obsPhase current /= WindowOpen || transition
       then pure Nothing
       else
@@ -2190,12 +2202,13 @@ reconcileWindowMode window =
             runTransition (pure ()) window ModeOptional (modeRequest (modeRequested record) (modeFallback record)) WindowedFallbackAttempt >>= \case
               ModeSettled outcome _ → pure (Just outcome)
               _ → pure Nothing
-          else Nothing <$ when (ended || modeApplied record == AppliedIndeterminate) (void (samplePresentation False window id))
-  where
-    appliedMonitor = \case
-      AppliedBorderless monitor → Just monitor
-      AppliedFullscreen monitor → Just monitor
-      _ → Nothing
+          else
+            Nothing
+              <$ when
+                (ended || modeApplied record == AppliedIndeterminate)
+                -- A resample reached through an ended obligation carries no
+                -- fallback: publishing the truth answers the obligation.
+                (void (samplePresentation False window (if ended then recordRecoveryCleared else id)))
 
 -- | How an owner turn processes native events.
 data EventProcessing
