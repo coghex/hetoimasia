@@ -36,16 +36,19 @@ import Hetoimasia.GLFW.Internal.Native
   , inputCallbacksClearedForCheck
   , requestCloseForCheck
   , takeInputCallbacksClearedForCheck
+  , waitEventsForCheck
   )
 import Hetoimasia.GLFW.Internal.Session (NativeWindow)
 import Hetoimasia.GLFW.Internal.Window (attachWindowInputFeed, inputStagingCapacity, windowNativeHandle, windowStep)
 import Hetoimasia.GLFW.Window
-  ( Window
+  ( CloseRequest
+  , Window
   , WindowResult (..)
   , hiddenTestWindowConfig
   , observedCloseRequest
   , observedCursorPosition
   , observedCursorInside
+  , synchronizeWindow
   , windowEnded
   , windowIdentity
   , withWindow
@@ -202,7 +205,10 @@ spec shared = describe "native input callbacks" $ do
           atomically (readInput (feedReader feed)) >>= \case
             InputResetRequired _ → pure ()
             other → failed ("expected a full-feed reset, found " <> show other)
-          observedCloseRequest <$> currentObservation window
+          request ← awaitCloseRequest window
+          atomically (readInput (feedReader feed)) >>= \case
+            InputResetRequired _ → pure request
+            other → failed ("the feed left overflow reset before the close request was observed: " <> show other)
     close `shouldSatisfy` isJust
 
   it "removes every input callback before the window is destroyed, with no retained cleanup failure" $ do
@@ -262,6 +268,28 @@ inject window action =
   windowStep window (operation "inject input") action >>= \case
     WindowAvailable () → pure ()
     WindowEnded identity → failed ("window ended during inject: " <> show identity)
+
+-- | Cocoa delivers 'requestCloseForCheck' during the call; X11 posts
+-- WM_DELETE_WINDOW, which GLFW reports on a later poll or wait.
+awaitCloseRequest ∷ Window → IO (Maybe CloseRequest)
+awaitCloseRequest window = attempt deliveryAttempts
+  where
+    attempt remaining = do
+      observation ←
+        synchronizeWindow window >>= \case
+          WindowAvailable observed → pure observed
+          WindowEnded identity → failed ("window ended while waiting for close: " <> show identity)
+      case observedCloseRequest observation of
+        Just request → pure (Just request)
+        Nothing
+          | remaining <= 0 → failed "the close request did not arrive within its bound"
+          | otherwise → waitEventsForCheck deliveryWaitSeconds >> attempt (remaining - 1)
+
+deliveryAttempts ∷ Int
+deliveryAttempts = 100
+
+deliveryWaitSeconds ∷ Double
+deliveryWaitSeconds = 0.05
 
 drain ∷ InputFeed → IO ([InputEvent], InputRead)
 drain feed = atomically (go [])
