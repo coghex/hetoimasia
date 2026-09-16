@@ -14,7 +14,7 @@ The owner corrected the repository-name typo during setup; the new target was em
 Local standalone design work uses a `docs-wip` worktree.
 GitHub Actions runs the validation pipeline described in
 [validation.md](validation.md): `plan` resolves the candidate's groups,
-`haskell-engine` and `haskell-workflow` execute the selected ones, and
+`haskell-engine`, `haskell-workflow`, and `glfw-native` execute the selected ones, and
 `build-test` publishes the aggregate verdict, alongside `review-approved` and
 its `dismiss-stale-approval` job from the review gate. A ruleset on `master`
 requires `build-test` and `review-approved` and requires branches to be up to
@@ -29,8 +29,10 @@ it always strips. CI is independent of
 that — the affected groups still run on the integrated head, and approval alone
 never makes them green. [validation.md](validation.md) documents the rule.
 The issue-approval service and PR drainer were installed for this repository
-on the owner's machine on 2026-09-10. Both jobs are loaded under launchd and
-have not been started.
+on the owner's machine on 2026-09-10. That installation record does not establish
+their current running state; inspect the board or installed controllers when
+operating the pipeline. GLFW PRs #101–#114 are merged; repair issues #115–#118
+remain open after the completion review.
 Installed plugins being available in a conversation does not establish readiness
 of a future CLI session or repository service.
 

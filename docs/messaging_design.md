@@ -10,8 +10,10 @@ Design state: `ready for issue processing`
 Owner: `coghex/hetoimasia`; publication target: `master`.
 Started 2026-09-13 against Hetoimasia `8979877` and Synarchy `fe225c5`.
 The owner granted readiness on 2026-09-13 after the review corrections in D-12.
-This local specification and its six-slice delivery plan are ready for processing.
-No messaging tracker artifact or implementation is created by this design pass.
+The six-slice design was subsequently processed and implemented as issues
+#74–#79 through PRs #80–#85. Epic #73 is closed. The retained ready state records
+the approved design; it does not mean another implementation should be filed.
+Current behavior is documented in [messaging.md](messaging.md).
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -29,8 +31,8 @@ concrete precondition
 
 The owner approved the behavioral choices in D-4 through D-11 and granted
 readiness to the corrected specification in D-12. All eight design questions are
-resolved. The six delivery slices below mirror this ledger; no item has been
-filed. The readiness tracker recheck found no overlapping messaging arc.
+resolved. The six delivery slices below mirror the completed processing ledger.
+All six children have merged; do not refile them.
 
 ## Epic contract
 
@@ -44,14 +46,14 @@ for the corrected specification and six-slice delivery plan below.
   and Hspec evidence of their composition with the actual worker and supervision
   APIs. No window, GPU, or Lua VM is needed to prove those contracts.
 - **Users:** component authors and the application assembling their services.
-- **Arc label:** `messaging` proposed; not created.
+- **Arc label:** `messaging` (created during processing).
 
 The complete arc includes producer preparation, origin-aware STM failures,
 FIFO channels, snapshots, and the optional supervised inbox-service adapter.
 Individual slices must document only the behavior they actually deliver; the
 adapter's graceful-finish guarantee is complete only when MSG-6 lands.
 
-## Verified current state
+## Verified design baseline
 
 Hetoimasia's runtime arc #52 is complete, including repairs #69 and #70. The
 reviewed baseline passes 298 engine and 262 workflow Hspec examples, both smoke

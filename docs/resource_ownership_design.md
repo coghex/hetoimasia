@@ -14,11 +14,17 @@ through D-9, then granted fresh readiness after approving each recommendation
 and the RES-4 catalog choice. The same day the owner relayed the document
 author's review and approved its four corrections: D-7's verified rethrow
 behavior, D-6's release boundary and GPU completion on exceptional exits, D-9's
-protected acquisition step, and the RES-2 to RES-3 dependency. None of its
-APIs exists yet.
+protected acquisition step, and the RES-2 to RES-3 dependency. Those reviews
+preceded implementation.
 The owner then requested the final logical corrections to D-6 and D-7 and
 continued readiness. Those corrections are incorporated below; the four-slice
-plan remains ready for issue processing. The revised document is unpublished.
+plan was subsequently published and processed.
+
+Implementation status: RES-1 through RES-4 and their review repairs are merged;
+epic #22 is closed. Current scopes, composites and continuation contracts are
+in [resources.md](resources.md). The later GLFW arc added the independent CPU
+resource collection through #87 / PR #101. GPU completion remains outside
+these CPU ownership guarantees. The retained design state is not an unfiled queue.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -39,7 +45,7 @@ concrete precondition
 - **Done when:** the four slices pass Hspec, a console consumer exercises normal
   and failing lifetimes, and the public contract documents ownership and errors.
 - **Users:** engine/game developers and future Vulkan/Lua component owners.
-- **Arc label:** `resources` (proposed).
+- **Arc label:** `resources` (created during processing).
 - **In scope:** CPU scope primitives, structured cleanup-failure evidence,
   exception-safe composite construction, a small CPS facade, integration/docs.
 - **Out of scope:** Vulkan/Lua calls, workers/job systems, GPU retirement queues,
@@ -50,7 +56,7 @@ concrete precondition
   `hetoimasia-tests` Hspec suite, which the validation catalog runs as the floor
   group `test.engine`; no GPU or Python probes are required.
 
-## Tracker relationship and sequencing
+## Historical tracker relationship and sequencing
 
 Tracker recheck on 2026-09-11 at `b4ef301`: the target has thirteen issues and
 no resource issue or epic. The [logging](logging_design.md) arc is complete:

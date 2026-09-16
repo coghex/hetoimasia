@@ -36,7 +36,28 @@ yet.
   consumers; agents implementing and testing its bounded parts.
 - **Arc label:** none proposed yet.
 
-## Current state and evidence
+## Current handoff at `727f59a`
+
+The CPU runtime, messaging, and independent GLFW implementation are now present.
+Logging, resources, runtime, and messaging arcs are complete. GLFW issues
+#87–#100 merged through PRs #101–#114, including the main-thread host, dynamic
+windows, native input, and shared native fixture. The
+[completion review](project_review_114-101.md) produced repairs #115–#118;
+verify those before Vulkan implementation. This design remains exploring.
+
+The active work is to settle window/surface borrowing and dynamic retirement,
+GPU and presentation completion on every exit path, frame scheduling alongside
+the existing owner loop, and the actual platform/toolchain verification baseline.
+The present loop decides idleness from command/event dispatch counts; it does
+not yet express continuous renderer demand. None of these GPU choices is
+settled by the CPU scope or by completing the GLFW arc.
+
+The GLFW arc supersedes the early windowing proposals below. Keep its accepted
+multiple-window ownership and capability boundaries; do not reimplement the
+runtime, messaging, window binding, or fixture from historical inventory text.
+Linux remote CI and local Cocoa verification remain fixed owner decisions.
+
+## Historical pre-GLFW baseline and evidence
 
 Hetoimasia inspected at `7e92e73d5eed7e564e9752ee49cce0eb5ba150c2`:
 
@@ -78,7 +99,9 @@ constructs queues, references, and subsystems into EngineEnv. Hetoimasia has
 implemented the resource-continuation responsibility. The separate
 [runtime foundation design](runtime_foundation_design.md) now specifies
 application context, component state, and initialization composition under
-epic #52; all eight children #53–#60 are filed and approved, awaiting implementation.
+epic #52. Its eight children and supervision repairs were subsequently merged
+and verified; current runtime contracts live in `supervision.md` and related
+implementation documents.
 
 This arc refines FND-2/FND-3 of the
 [broader foundation design](engine_foundation_design.md). The owner's chosen
@@ -366,25 +389,26 @@ graphics groups are optional/requested under the existing catalog and which
 evidence is required to complete this milestone. Do not silently enlarge the
 mandatory floor or turn an unavailable requested environment into a pass.
 
-Confirm the proposed resize/minimize/close scope with this verification choice.
+GLFW's window manipulation and dynamic-close scope is already implemented.
+Define the Vulkan resize/minimize/close behavior and dependent lifetime proof
+with this verification choice; do not reopen the GLFW scope decision.
 
 ### Q-4. Establish P-3's small queue foundation before GLFW/Vulkan integration?
 
-Resolved at the sequencing level by D-6: queues and their Hspec coverage precede
-graphics, and worker/runtime infrastructure also belongs before Vulkan. Queue
-capacity, draining, and diagnostic scope still need review before issues are
-drafted. This approval does not select one generic event bus or import all of
-Synarchy's game protocols.
+Resolved and implemented by messaging epic #73, issues #74–#79 and PRs #80–#85.
+Use the existing bounded channels, snapshots, and inbox contracts in
+[messaging.md](messaging.md). No further queue prerequisite or generic event bus
+is authorized by this historical proposal.
 
 ### Q-5. What is the runtime composition and initialization contract?
 
-Resolved by the [runtime foundation design](runtime_foundation_design.md),
-including D-13 through D-18 and P-10 through P-13. Epic #52 and approved children
-#53–#60 own errors, recovery, component construction, worker ownership, logging
-lifetime, supervision, and application integration. Read their canonical review
-amendments when implementing them; do not reopen those decisions here.
-The backend still waits for those CPU contracts to be implemented and verified,
-and for independent messaging and GLFW designs.
+Resolved and implemented by the [runtime foundation design](runtime_foundation_design.md),
+including D-13 through D-18 and P-10 through P-13. Epic #52 and children #53–#60,
+plus repairs #69/#70, delivered errors, recovery, construction, worker ownership,
+logging lifetime, supervision, and application integration. GLFW subsequently
+added the pre-drain quiescence hook. Use those contracts; do not reopen them.
+The remaining implementation gates are the four GLFW review repairs and the
+unsettled GPU lifecycle/platform questions above.
 
 ## Verification strategy
 

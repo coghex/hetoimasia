@@ -9,7 +9,7 @@ Design state: `ready for issue processing`
 Owner: `coghex/hetoimasia`. Source inspection: 2026-09-13 local session,
 Hetoimasia `16cab027436640ff7d0d7a8381a8690ff73ea875`, Synarchy
 `fe225c5621b2fc9e86d09d841af2b2efdf10cabf`. This document specifies intended
-implementation, not delivered behavior. No windows were launched during design
+implementation contracts; delivered behavior is documented in `glfw.md`. No windows were launched during design
 work.
 
 Owner decisions D-9 through D-16 were recorded on 2026-09-14. Final review on
@@ -71,13 +71,32 @@ resource prerequisite separately from native integration.
   validation declarations, and required native evidence before final review.
   This standalone design uses the docs lane; implementation documentation does not.
 
-## Current state and evidence
+## Implementation status at `727f59a`
+
+All fourteen original children #87–#100 are closed by PRs #101–#114. The
+checked ledger above records issue processing. The implementation includes
+the pinned native toolchain, shared native fixture, runtime quiescence hook,
+dynamic multi-window host, monitor-aware controls/modes, and bounded native input.
+The runtime adapter is a separate public Cabal sublibrary with its own source
+root inside `hetoimasia-glfw`; the foundation/runtime boundaries remain intact.
+
+The [completion review](project_review_114-101.md) found four open repairs:
+#115 construction/rollback failure preservation, #116 disconnect recovery across
+observations, #117 geometry restoration after partial departure, and #118 fixture
+drain under repeated cancellation. Their issues are filed, not implemented.
+Epic #86 remains open; its original child checkboxes still need tracker
+reconciliation. TEST-2's single implementation is #93; do not create another.
+
+Linux native CI uses the pinned image and isolated X11. Cocoa verification is
+local. Vulkan interop and GPU completion remain future work.
+
+## Historical design baseline and evidence
 
 ### Hetoimasia
 
-The messaging arc (#74–#79, PRs #80–#85) is merged. There is no implemented
-GLFW package. Read current production sources from master, not the older
-docs-worktree HEAD.
+At the initial `16cab02` inspection, messaging (#74–#79, PRs #80–#85) was
+merged and no GLFW package existed. The following table describes that design
+baseline, not the implementation inventory above.
 
 | Existing surface | Consequence for this design |
 |---|---|
@@ -89,7 +108,7 @@ docs-worktree HEAD.
 | `docs/test_architecture_design.md`, epic #49 | TEST-1 (#50) is complete. TEST-2 is linked to GLFW-7/#93 through the separately approved existing-issue disposition; implementation still waits for GLFW-1/GLFW-2 and native evidence. |
 | `tools/validation/catalog.json` | Existing mandatory floor, affected non-optional tests, and PR-requested groups remain authoritative. Optional groups stay optional when affected. |
 
-The current workflow has no display provisioning and routes four CPU groups
+The baseline workflow had no display provisioning and routed four CPU groups
 through two workers. `tools/validation/plan.py` accepts only `runner: cpu`.
 GLFW-14 supplies the native build dependency before GLFW-1;
 GLFW-7 owns the display runner
@@ -105,8 +124,8 @@ Initial tracker deduplication preceded processing. Epic #86 and all fourteen
 children (#87–#100) now exist, as the ledger records. The 2026-09-14 backlog
 review verified the completed CI, resource and messaging children and closed
 their epics (#8, #22, #73) with owner approval. TEST-1's completed checkbox
-under #49 is also synchronized. Keep TEST-2/#93 unchecked until its
-implementation and native evidence land; do not file a duplicate fixture.
+under #49 was also synchronized. TEST-2/#93 subsequently merged through PR #107;
+the current fixture repair is #118. Do not file a duplicate fixture implementation.
 
 ### Synarchy: preserve these decisions deliberately
 

@@ -4,6 +4,33 @@ Updated: 2026-09-15. Durable project context for future interactive sessions.
 Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 [the foundation design](docs/engine_foundation_design.md).
 
+## Current handoff — after the GLFW completion review
+
+- Code baseline: `master@727f59a`. Four active Cabal packages: root consumer/tests,
+  foundation, runtime, and GLFW. Logging, CPU scopes/collections, failure/recovery,
+  supervision, application composition, messaging, dynamic windows, controls,
+  modes, monitors, and native input are implemented.
+- GLFW issues #87–#100 merged through PRs #101–#114. The
+  [review report](docs/project_review_114-101.md) records four remaining repairs:
+  #115 creation primary/cleanup evidence; #116 disconnect recovery across
+  observations; #117 restoration after partial departure; #118 fixture drain
+  under repeated cancellation. The owner approved and filed all four; that is
+  not canonical readiness approval or completed implementation.
+- Prioritize #115. #118 is independent. Coordinate #116 before #117 to avoid
+  overlapping controller edits. Verify the repairs before concluding the arc.
+  Epics #86 and #49 remain open; their original implementation checklists lag
+  the merges and need tracker housekeeping separately from these docs.
+- Verification at that baseline: build, console smoke, static linking, 517
+  engine examples, 331 workflow examples, and 8 scripted fixture examples passed
+  locally. Linux native CI ran 55 examples with no failures and one physical
+  hotplug example pending. The audit did not rerun interactive Cocoa tests.
+- Next design: Vulkan ownership, window/surface retirement, completion, frame
+  scheduling, and platform verification. The design remains exploring; the
+  four GLFW repairs gate implementation. Completed runtime/messaging arcs need
+  no replacement. CI-5 (`test`/`autotest` integration) remains owner-deferred.
+- Lua, fonts, rendering, and game adapters remain planned. Remote CI stays
+  Linux-only; macOS native evidence is local. Dated entries below are history.
+
 ## User intent and accepted direction
 
 - Build a fresh modular Haskell/Vulkan game engine with Lua scripting.
@@ -56,9 +83,9 @@ require a universal EngineEnv. Shared mutable logging context and broad environm
 access should not be ported automatically. The scratch logger here is a bootstrap,
 not a verdict that Synarchy's design should be discarded.
 
-## Implemented bootstrap
+## Implemented components and delivery history
 
-- Three Cabal packages: root console/tests, `hetoimasia-foundation` logging,
+- Initial bootstrap: three Cabal packages, root console/tests, `hetoimasia-foundation` logging,
   and `hetoimasia-runtime` application entry point. Separate source roots.
 - Logger accepts an injected sink and injectable clock/thread metadata, applies
   a pure filter (master switch, global and per-component thresholds, independent
@@ -383,7 +410,7 @@ not a verdict that Synarchy's design should be discarded.
   and focus unperformable and placement and iconified unreportable, and
   unreportable attributes are neither queried nor captured. A private per-window
   mode transition marker (`setModeTransition`, seam `seamSetModeTransition`)
-  refuses controls; GLFW-6 is to be its only producer. Native checks use
+  refuses controls; GLFW-6 now owns its production use. Native checks use
   test-only queries (`windowSizeForCheck`, `windowPositionForCheck`,
   `windowTitleForCheck`, `windowStateForCheck`). Contract: `docs/glfw.md`,
   "Window controls".
@@ -474,8 +501,8 @@ not a verdict that Synarchy's design should be discarded.
   come from the installed bundle, not this repository's `tools/` directory.
 - The owner then supplied Kanban's missing-service screenshot. Installed the
   issue-approval and PR-drainer jobs for `coghex/hetoimasia` using Kanban's
-  installer/controller. Both are loaded in launchd and have not been started;
-  the approval controller has no run-status document yet. Board keys `a` and
+  installer/controller. At that setup check both were loaded but not started;
+  current service state must be checked live. Board keys `a` and
   `d` control them.
 - The owner explicitly approved publishing this tested tooling setup directly
   to `master` as a bootstrap exception. Subsequent implementation still follows
@@ -556,10 +583,11 @@ not a verdict that Synarchy's design should be discarded.
   alive until completion; supervision uses checkpoints and supervised waits;
   logging finalization has its own IO lifetime outside controlled releases.
   Application services remain application-owned and immutable. Messaging and
-  independent GLFW work still need their own designs before Vulkan.
+  independent GLFW were subsequently implemented; current repairs are in the
+  handoff above.
 - Messaging design started in [docs/messaging_design.md](docs/messaging_design.md)
-  against `8979877`, with Synarchy `fe225c5` inspected read-only. It is now
-  `ready for issue processing`, by owner signoff on 2026-09-13 (D-12):
+  against `8979877`, with Synarchy `fe225c5` inspected read-only. It was marked
+  `ready for issue processing` by owner signoff on 2026-09-13 (D-12):
   the owner approved typed bounded FIFO channels plus latest-value snapshots,
   deferring broadcast/request-reply; ordinary sends report Full immediately with
   waiting explicitly selected; close preserves backlog and explicit abort discards
@@ -588,9 +616,9 @@ not a verdict that Synarchy's design should be discarded.
   Cancellation/cleanup failure retains its original completion instead of
   fabricating an ordinary result. STM failure origin matches the engine annotation,
   without promising the IO throw primitive's additional backtrace.
-  The corrected specification and split are approved for processing; the tracker
-  readiness recheck found no overlapping arc. No messaging issues or implementation
-  have been created, and the design remains unpublished.
+  The corrected specification was processed as epic #73 and issues #74–#79,
+  implemented through PRs #80–#85. Epic #73 is closed; current contracts are in
+  `docs/messaging.md`. Do not refile the completed messaging arc.
 - The owner wants Synarchy's solid GLFW integration preserved deliberately.
   The backend design records its existing window/callback, resize, Vulkan
   synchronization, and shared-scope test decisions as reuse evidence.

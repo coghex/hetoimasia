@@ -3,25 +3,40 @@
 A modular Haskell/Vulkan game engine with a planned Lua scripting host and
 separate 2D and 3D rendering modules. Synarchy is a potential future client.
 
-**Current implementation:** an injectable logging library with
-environment-configured filtering, a small runtime entry point, a console smoke
-executable, and focused Hspec tests. Vulkan, Lua, input, fonts, and rendering
-are not implemented yet. Planned directories are explicitly marked and are not
-included in the Cabal package list.
+**Current implementation:** logging, scoped CPU resources, failures and bounded
+recovery, application composition, supervised workers, bounded messaging, and
+GLFW with dynamic windows, controls, monitor-aware modes, and input feeds.
+Vulkan, Lua, fonts, and rendering remain planned; their directories contain
+ownership notes and are not in the Cabal package list.
+
+All fourteen original GLFW PRs are merged. The
+[completion review](docs/project_review_114-101.md) identified four open repairs
+([#115](https://github.com/coghex/hetoimasia/issues/115),
+[#116](https://github.com/coghex/hetoimasia/issues/116),
+[#117](https://github.com/coghex/hetoimasia/issues/117),
+[#118](https://github.com/coghex/hetoimasia/issues/118)) to verify before Vulkan.
 
 ## Start here
 
 - [Working agreements](AGENTS.md)
 - [Project memory and decisions](MEMORY.md)
 - [Foundation design and dependency diagram](docs/engine_foundation_design.md)
-- [Logging design — ready for processing](docs/logging_design.md)
-- [Resource ownership design — ready for processing](docs/resource_ownership_design.md)
+- [Logging contract](docs/logging.md)
+- [Resource ownership contract](docs/resources.md)
+- [Runtime supervision](docs/supervision.md)
+- [Messaging contract](docs/messaging.md)
+- [GLFW contract and native tests](docs/glfw.md)
+- [Validation and evidence reuse](docs/validation.md)
+- [Vulkan backend design — exploring](docs/vulkan_backend_design.md)
 - [Kanban development workflow](docs/workflow.md)
 
 ## Build and run
 
-Toolchain: GHC **9.12.2**, Cabal **3.16.1.0**. This initial console program
-does not require Vulkan, Lua, a display, or a running Synarchy process.
+Toolchain: GHC **9.12.2**, Cabal **3.16.1.0**. Console execution needs no
+Vulkan, Lua, display, or Synarchy process. Building all components requires
+the pinned GLFW dependency: follow the
+[native prerequisites](docs/validation.md#developer-prerequisites-and-macos)
+to build/cache it and prepare the local environment. Linux CI uses the pinned image.
 
 ```sh
 cabal build all
@@ -32,7 +47,9 @@ cabal test hetoimasia-tests --test-show-details=direct
 
 Run `cabal update` if the local Hackage index does not cover the pinned
 `index-state` in `cabal.project`. Local packages build with warnings as errors.
-`cabal build all` does not run or build the test suite by default.
+`cabal build all` compiles the GLFW native test suite under this project's
+configuration but runs no tests or native session. Engine tests initialize no
+GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux.
 
 Expected smoke output on stderr — three `INFO` records in the
 [logging record layout](docs/logging.md#record-layout), with the timestamp,
@@ -91,18 +108,21 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | Directory | Purpose | Status |
 |---|---|---|
 | `app/` | Application composition and console consumer | Buildable |
-| `packages/foundation/` | Independent services; currently logging | Buildable |
-| `packages/runtime/` | Application lifecycle entry point | Buildable |
+| `packages/foundation/` | Logging, CPU scopes/collections, failures, recovery, workers and messaging | Buildable |
+| `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
+| `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; four repairs open |
 | `packages/render-api/` | Backend-independent rendering contracts | Planned |
 | `packages/gpu-vulkan/` | Vulkan resource and submission ownership | Planned |
 | `packages/render-2d/`, `packages/render-3d/` | Dedicated rendering paths | Planned |
 | `packages/scripting-lua/` | Lua host and registration mechanism | Planned |
 | `samples/` | Future independent rendering consumers | Planned |
 | `integrations/` | Game adapters | Planned |
-| `test/` | GPU-free Hspec Logging, Runtime, Resources, Failures, and Recovery examples | Buildable |
+| `test/` | Component-owned, display-free engine Hspec examples | Buildable |
+| `packages/glfw/native-tests/` | Shared native Hspec fixture and platform verification | Cocoa locally; Linux X11 in CI |
+| `tools/test/` | Workflow, validation and provisioning Hspec examples | Buildable |
 
-The two libraries have separate source roots and declared dependencies. Neither
-can import root application modules. Add future packages explicitly to
+The libraries and Cabal components have separate source roots and declared
+dependencies. Lower components cannot import root application modules. Add packages to
 `cabal.project` when they contain useful implementations.
 
 ## Project status
@@ -110,8 +130,10 @@ can import root application modules. Add future packages explicitly to
 The bootstrap uses `master` and the owner-selected GitHub repository
 [coghex/hetoimasia](https://github.com/coghex/hetoimasia). Repository, local
 directory, and Haskell package names all use `hetoimasia`.
-Kanban's issue-approval and PR-drainer jobs are installed on the owner's machine
-and await an explicit start from the board. CI remains to be configured.
+Kanban's issue-approval and PR-drainer jobs were installed during bootstrap;
+check their current running state through the board/controllers. Linux CI plans
+required and requested groups, reuses compatible evidence, and runs native GLFW
+checks when affected. macOS native verification remains local.
 
 ## License
 

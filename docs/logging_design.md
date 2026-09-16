@@ -7,8 +7,13 @@ Design state: `ready for issue processing`
 
 Owner: `coghex/hetoimasia`; publication target: `master`.
 Readiness approved by the owner on 2026-09-10, after discussion of the recommended
-contracts. Reviewed against `2062f8a`; implementation has not started.
+contracts. The original review against `2062f8a` preceded implementation.
 The owner requested publication to `master` on 2026-09-10.
+
+Implementation status: LOG-1 through LOG-3 and the logging follow-up #9 are
+merged; epic #1 is closed. This is the retained approved design, not pending
+implementation. Current behavior and authoring conventions are in
+[logging.md](logging.md).
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -28,13 +33,13 @@ concrete precondition
 - **Done when:** all slices pass Hspec, console/runtime use the final interface,
   and an authoring guide plus AGENTS.md pointer establish future conventions.
 - **Users:** engine/game developers and implementation agents.
-- **Arc label:** `logging` (proposed).
+- **Arc label:** `logging` (created during processing).
 - **Scope:** synchronous structured logging, filtering, context, metadata,
   handle/callback sinks, startup configuration, and conventions.
 - **Deferred:** queues, rotation, telemetry, JSON output, live reload, a logging
   monad, and resource management. No continuation-monad decision is required.
 
-## Verified evidence
+## Historical design evidence
 
 At Hetoimasia `4c4ed18`, the [logger](../packages/foundation/src/Hetoimasia/Foundation/Log.hs)
 is scratch code: synchronous level filtering, an opaque injected sink, strict
@@ -205,7 +210,7 @@ Choose and document the exact text layout in LOG-2, including fixed-metadata
 examples and Hspec expectations; it must implement P-3's record/escaping rules.
 This is a presentation detail, not permission to alter ownership or failures.
 
-## Verification and delivery plan
+## Delivery plan
 
 Use Hspec, injected providers, temporary handles, and explicitly coordinated
 concurrency tests without timing sleeps. No GPU, Lua, or Python probes are needed.
@@ -248,12 +253,7 @@ Each slice includes its contract updates and evidence in its code PR.
 
 ## Agent handoff
 
-Resolve this repository's `docs-wip` worktree by branch. `kanban:process-design-doc`
-processes the epic first, then exactly one child per invocation, with separate
-artifact approvals. Readiness is approved; do not reopen Q-1/Q-2 without new
-contradictory evidence. Recheck code/tracker state and update the ledger.
-
-Follow the appropriate publication and issue/solve/review workflows; this design
-grants no tracker or merge approvals. Resource
-design can proceed alongside logging, while resource implementation should use
-the settled logging facade.
+The epic and all three slices have been processed and implemented. Use the
+current logging contract and module authoring guide; do not recreate these
+issues or reopen Q-1/Q-2 without new contradictory evidence. Further behavior
+changes require their own bounded issue and normal review workflow.

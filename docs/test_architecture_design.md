@@ -27,10 +27,12 @@ concrete precondition
 - [x] TEST-1. Split the headless engine suite into component specs — [#50]
 - [x] TEST-2. Add a shared fixture for the first concrete graphics suite — [#93]
 
-The ledger records issue processing, not implementation completion. A linked
-issue does not satisfy a requirement that its implementation has merged.
-GLFW-7 is filed as #93 and linked here and under epic #49. TEST-2 stays
-unchecked in the epic until #93 merges with its evidence.
+The ledger records issue processing, not implementation completion. TEST-1/#50
+merged through PR #51. TEST-2's single implementation, GLFW-7/#93, merged through
+PR #107 with its shared native fixture and platform gates. Review at `727f59a`
+found a repeated-cancellation teardown defect now tracked as #118. Epic #49
+remains open; its TEST-2 checkbox still needs reconciliation with the merge,
+and completion must account for the outstanding repair.
 
 ## Epic contract
 
@@ -47,16 +49,23 @@ unchecked in the epic until #93 merges with its evidence.
   integrating `test`/`autotest`, introducing a generic fixture framework, or
   reopening the completed logging implementation.
 
-## Current state and evidence
+## Current implementation
+
+At `master@727f59a`, component-owned engine tests and the separate native GLFW
+suite are implemented. The fixture acquires one session lazily on the process
+main thread and dispatches operations from the Hspec borrower. Linux X11 runs
+remotely when affected; Cocoa runs locally. GPU fixtures remain future Vulkan
+work. See [glfw.md](glfw.md#the-native-suite) for current instructions and
+[the review](project_review_114-101.md) for #118's reproduced lifetime defect.
+
+## Historical design evidence
 
 Rechecked 2026-09-14 against `master@16cab02`: TEST-1 (#50) is closed, the
 resource, runtime and messaging APIs exist, and no GLFW package exists yet.
 The owner selected GLFW-7 in [the GLFW design](glfw_integration_design.md) as
-TEST-2's implementation. Epic #49 still has the old deferred fixture language;
-the TEST-2 adoption needs its approved tracker edit. Its unchecked TEST-1 item
-is separate housekeeping with its own approval. Keep TEST-2 unchecked in the
-epic until implementation and evidence exist. This document already records the
-thread model in D-7 and resolves Q-1; the deferred marker does not reopen it.
+TEST-2's implementation. Its adoption and existing-issue disposition subsequently
+linked #93; TEST-1 was checked in the epic. D-7's thread model and Q-1 are
+resolved. The historical no-GLFW observation is not the current state.
 
 Inspected Hetoimasia at `b4ef301566259d5c43b7cca46cc366db50f73f2a` on
 2026-09-11. These are source observations, not a new test execution:
@@ -337,19 +346,11 @@ proves neither native lifecycle execution nor GPU execution.
 
 ## Processing handoff
 
-EPIC #49 and TEST-1 #50 are already linked; TEST-1 is implemented. Checking its
-stale checkbox in #49 is separate housekeeping requiring its own approval, not
-a prerequisite for GLFW-7 and not part of the TEST-2 adoption edit.
+Processing is complete: #49, #50, and existing issue #93 are linked. Both
+implementation children have merged. Do not recreate TEST-2 or reopen its
+thread-model decision.
 
-Process GLFW-7 once through the ready GLFW design. Then run
-`process-design-doc` separately over this document and present an existing-issue
-disposition for TEST-2 with GLFW-7's actual issue number. Its approved epic edit
-replaces TEST-2's unresolved-design gate with GLFW-7 ownership and GLFW-1/GLFW-2
-implementation prerequisites, records D-7's thread model and the Vulkan arc's
-separate GPU obligations, and keeps TEST-2 unchecked. Only then update this
-ledger to link that existing issue. Do not file a second implementation.
-
-Code, tests, documentation, and required Linux/local-macOS evidence belong in
-GLFW-7's one PR. On verified completion, check TEST-2 under #49; the epic's
-remaining completion criteria still apply. No source-document link alone proves
-delivery.
+The remaining fixture work is repair #118, with code, regressions, contracts,
+and evidence in its own PR. Reconcile the epic's implementation checkbox with
+PR #107 and retain the repair as outstanding until verified. Vulkan owns future
+GPU fixtures and GPU-completion evidence separately.

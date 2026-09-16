@@ -9,7 +9,7 @@ putting every probe on every PR's critical path.
 Design state: `ready for issue processing`
 
 Owner: `coghex/hetoimasia`; publication target: `master`.
-Created 2026-09-10 in the owner's `docs-wip` worktree. Local and unpublished.
+Created 2026-09-10 in the owner's `docs-wip` worktree and subsequently published.
 The owner settled optional-test selection, review inheritance, and deferred
 skill integration on 2026-09-10. The final design pass checked the current
 repository and tracker. Policy decisions are settled; Q-4 explicitly delegates
@@ -29,9 +29,9 @@ concrete precondition
 - [x] CI-4. Carry review approval through clean base merges independently of CI — [#13]
 - [ ] CI-5. Integrate `test` and `autotest` with the shared testing contract — [deferred]: the owner explicitly requests `test`/`autotest` integration
 
-These delivery boundaries are ready for issue processing and mirrored below.
-Umbrella epic #8 tracks this arc; children are filed one per processing run.
-CI-1 and CI-2 have landed; the behaviour they established is described in
+CI-1 through CI-4 are implemented and epic #8 is closed. Their delivery
+boundaries remain below as design history, not an unfiled work queue. Current
+behavior, including GLFW's later native/display worker and image caching, is in
 [validation.md](validation.md) rather than here, because this document records
 the design rather than the shipped system.
 CI-5 resumes when the owner requests skill integration; inspect the skills'
@@ -537,23 +537,56 @@ selection. Proposed acceptance cases include:
 
 ## Delivery plan
 
-The owner has resolved Q-1 through Q-3 and approved this design for issue
-processing. These slices make that policy concrete; individual issues still
-need drafting, deduplication, and their normal approval gates. Q-4 records the
-bounded choices to resolve in the affected issue specifications.
+The approved slices below preserve their original IDs, scope and dependency
+order. CI-1 through CI-4 are delivered; only CI-5 remains deferred. Q-4's
+bounded choices were resolved by the affected implementation issues.
 
-| Slice | Deliverable and acceptance boundary | Dependencies |
-| --- | --- | --- |
-| CI-1 | Shared catalog, initial non-optional floor, explicit optional status, request grammar, and locally runnable planner. Hspec proves affected dependency selection, optional exclusion under fallback, request validation, and explained omissions. | Existing package/test commands; coordinate with concurrent logger changes |
-| CI-2 | Hosted workflow consumes the plan, runs independent workers in parallel, and publishes stable `build-test`. Establish the required review-check wiring, current-plan handling, bounded timeouts, compatible caches, and timing output. Prove docs candidates receive a verdict and missing/failed workers cannot pass. | CI-1; verify Kanban/GitHub check contract |
-| CI-3 | Content comparison and attributable receipts preserve valid code CI across prose-only head/base updates. Prove renames/deletions, test-consumed docs, failures, and concurrent updates behave correctly. Start with conservative code-input equivalence; do not require a general test-result cache. | CI-2 |
-| CI-4 | Clean-base replay carries existing review provenance through required checks and the Kanban drainer. Prove code merges retain review while required CI reruns, and additional edits/conflict resolutions invalidate approval. | CI-2; any verified shared Kanban gap becomes an explicit prerequisite |
-| CI-5 | **Deferred:** inspect and integrate `test` and `autotest` with the catalog, commands, and result contract. Choose adapter or scheduler changes from the actual interfaces; preserve oldest-first testing, optional rotation, claims, resource limits, and durable history. | Owner resumes integration; CI-1; align results with CI-3 before enabling local evidence reuse |
+### CI-1. Define the shared catalog and explainable test selection
 
-CI-3 and CI-4 can progress independently after CI-2, with the catalog and result
-contracts agreed first. CI-5 stays deferred and does not block initial CI.
-Keep each implementation's tests and required documentation in its PR.
-More sharding, custom build images,
-and shared in-flight execution need measured benefit before becoming additional
-slices. Q-4 assigns the remaining implementation choices to their affected
-issue specifications; no CI-5 choice blocks processing CI-1 through CI-4.
+- **Delivered by:** #10.
+- **Scope and acceptance:** shared catalog, initial non-optional floor, explicit
+  optional status, request grammar, and locally runnable planner. Hspec proves
+  affected dependency selection, optional exclusion under fallback, request
+  validation, and explained omissions.
+- **Dependencies:** existing package/test commands and logger integration.
+
+### CI-2. Run selected validation through stable, parallel GitHub checks
+
+- **Delivered by:** #11.
+- **Scope and acceptance:** hosted workflow consumes the plan, runs independent
+  workers in parallel, and publishes stable `build-test`. Required review-check
+  wiring, current-plan handling, bounded timeouts, compatible caches, and timing
+  output. Docs candidates receive a verdict; missing/failed workers cannot pass.
+- **Depends on:** CI-1 and the verified Kanban/GitHub check contract.
+
+### CI-3. Preserve valid CI evidence across documentation changes
+
+- **Delivered by:** #12.
+- **Scope and acceptance:** content comparison and attributable receipts preserve
+  valid code CI across prose-only head/base updates. Cover renames/deletions,
+  test-consumed docs, failures, and concurrent updates. Begin with conservative
+  code-input equivalence; no general test-result cache is required.
+- **Depends on:** CI-2.
+
+### CI-4. Carry review approval through clean base merges independently of CI
+
+- **Delivered by:** #13.
+- **Scope and acceptance:** clean-base replay carries review provenance through
+  required checks and the Kanban drainer. Code merges retain review while
+  required CI reruns; additional edits/conflict resolutions invalidate approval.
+- **Depends on:** CI-2; a verified shared Kanban gap is an explicit prerequisite.
+
+### CI-5. Integrate `test` and `autotest` with the shared testing contract
+
+> **Deferred:** resume only when the owner requests `test`/`autotest` integration.
+
+- **Scope and acceptance:** inspect the actual skill interfaces before choosing
+  adapters or scheduler changes. Integrate the catalog, commands and result
+  contract while preserving oldest-first testing, optional rotation, claims,
+  resource limits and durable history.
+- **Depends on:** CI-1; align results with CI-3 before enabling local evidence reuse.
+
+CI-3 and CI-4 were independent after CI-2. CI-5 does not block the completed CI
+arc. Required tests and documentation stay with each implementation PR. The
+later GLFW arc supplied its measured native-image/display needs separately;
+further sharding or shared in-flight execution still requires a concrete need.

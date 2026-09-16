@@ -13,6 +13,13 @@ work queue. The first eventual graphics result is a windowed triangle on macOS
 and Linux, with Linux-only remote CI and local macOS validation. See D-8 and
 [the backend design](vulkan_backend_design.md).
 
+At `master@727f59a`, logging, resources, runtime composition/supervision,
+messaging, and the original GLFW arc are implemented. The
+[GLFW completion review](project_review_114-101.md) tracks repairs #115–#118.
+Vulkan, rendering, Lua, and game integration remain planned. This broader design
+stays exploring; update its rendering slices after settling the backend's
+ownership, completion, frame scheduling, and platform contracts.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -20,7 +27,7 @@ concrete precondition
 ## Processing status
 
 - [ ] EPIC. Establish the engine's first reusable rendering foundation
-- [ ] FND-1. Establish scoped runtime resource ownership
+- [x] FND-1. Establish scoped runtime resource ownership — [#22]
 - [ ] FND-2. Initialize and dispose a Vulkan device in a console probe
 - [ ] FND-3. Render and capture a minimal 3D scene through a public contract
 - [ ] FND-4. Add an independent 2D consumer over the same GPU infrastructure
@@ -36,7 +43,7 @@ concrete precondition
   potential Synarchy game adapter.
 - **Arc label:** proposed `foundation`; no epic or child issues have been filed.
 
-## Current state and evidence
+## Historical bootstrap evidence
 
 The directory was empty at the start of the 2026-09-10 bootstrap. The authorized
 scaffold creates foundation logging, a runtime entry point, a console consumer,
@@ -63,15 +70,19 @@ presentation data and never queries the game's managers to discover it.
 
 ## Design
 
-The proposed dependencies below point from consumer to dependency. Only the
-application → runtime/foundation portion is implemented. Dashed arrows and
-all rendering/scripting boxes represent planned boundaries.
+The dependencies below point from consumer to dependency. Solid arrows show
+implemented runtime/foundation/windowing relationships. Dashed arrows and the
+rendering/scripting boxes represent planned boundaries.
 
 ```mermaid
 flowchart TD
     App[Application composition] --> Runtime[Runtime]
     App --> Foundation[Foundation services]
     Runtime --> Foundation
+    App --> WindowRuntime[GLFW runtime adapter]
+    WindowRuntime --> Runtime
+    WindowRuntime --> GLFW[GLFW window owner]
+    GLFW --> Foundation
     App -.-> Game[Game and presentation adapter]
     App -.-> Lua[Lua host]
     App -.-> Two[2D rendering]
@@ -95,7 +106,8 @@ by the directory names; define its smallest useful surface with FND-3.
 |---|---|---|
 | Application | process composition; game session selection | creates and connects services |
 | Logging sink | caller-owned handle or sink resource | borrowed synchronous Logger |
-| Runtime | future scoped lifecycle and scheduling | runs supplied application actions |
+| Runtime | scoped application lifecycle, reporting and supervision | runs supplied startup/actions and drains workers |
+| GLFW | session, dynamic windows, monitors, callbacks and input | narrow command ports and read-only observations |
 | Game session | world/rules; game-owned save and load | presentation and explicit commands |
 | Vulkan backend | device, GPU allocations, completion and disposal | opaque resources and submission |
 | Render target/frame | resize lifetime and per-frame reuse | confined to rendering owners |
@@ -106,15 +118,13 @@ when submissions are retired before memory is reclaimed. Cross-thread state
 must define atomic publication, ownership, and cancellation rather than expose
 arbitrary mutable references. Concurrency is introduced for measured needs.
 
-The initial Logger uses an injectable sink and no global state. The runtime
-runner logs start and successful completion, returns the action's result, and
-propagates exceptions. It owns no resource scope yet. Standard IO is sufficient
-for this baseline. The scoped continuation facade is now implemented under
-[the resource contract](resources.md). The accepted
-[runtime design](runtime_foundation_design.md) composes it through explicit IO
-and narrow handles; an application-wide monad is outside that arc. The resource
-design preserves subsystem boundaries, future GPU lifetimes, and the Synarchy
-decisions to retain.
+Logging uses an injectable sink and no global mutable context. The thin
+`runApplication` wrapper remains available, while `runScopedApplication` composes
+scoped dependencies, supervision, startup/action and pre-drain quiescence on its
+caller. The [resource contract](resources.md) supplies the continuation facade;
+the implemented [runtime design](runtime_foundation_design.md) uses explicit IO
+and narrow handles. An application-wide monad remains outside that arc. GPU
+completion is deliberately a separate backend obligation.
 
 ## Decisions
 
@@ -182,7 +192,7 @@ the infrastructure phase.
 
 The [runtime foundation design](runtime_foundation_design.md) now specifies
 errors, recovery, component contexts, and lifecycle. Epic #52 and all eight
-children #53–#60 are filed and approved; implementation is the next step.
+children #53–#60, plus repairs #69/#70, are implemented and verified.
 The resource continuation already propagates native exceptions safely and
 remains the ownership mechanism under these new contracts.
 
@@ -242,9 +252,9 @@ choices before processing; do not file the old offscreen-first sequence.
 
 - **Outcome:** a resource-owning service cleans up on success and failure.
 - **Scope:** supplied by RES-1 through RES-4 in
-  [resource_ownership_design.md](resource_ownership_design.md). Process that
-  document first; link/reuse its epic here rather than draft another resource
-  implementation. This entry remains unprocessed until its tracker link exists.
+  [resource_ownership_design.md](resource_ownership_design.md). That
+  document's completed epic #22 supplies this entry. Its existing tracker is
+  linked above; do not draft another resource implementation.
 - **Phase:** foundation/runtime; **Depends on:** none; **Ordering:** critical path.
 - **External implementation gate:** logging LOG-3 merged.
 - **Relevant decisions:** D-1, D-3, D-7.

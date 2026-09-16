@@ -1,5 +1,15 @@
 # GLFW session and windows
 
+**Review status at `727f59a`:** the original GLFW implementation is merged, with
+four known defects awaiting repair: [#115](https://github.com/coghex/hetoimasia/issues/115)
+(construction/rollback failure evidence), [#116](https://github.com/coghex/hetoimasia/issues/116)
+(disconnect recovery across observations), [#117](https://github.com/coghex/hetoimasia/issues/117)
+(restoration after partial departure), and [#118](https://github.com/coghex/hetoimasia/issues/118)
+(fixture settlement under repeated cancellation). See the
+[completion review](project_review_114-101.md) for reproductions. The corrected
+contracts and regressions must accompany those repair PRs; this status update
+does not claim the fixes have landed.
+
 Current behavior of `hetoimasia-glfw`, the package that owns the native binding
 to upstream GLFW 3.4, the one process-main-thread session over it, the
 lexically scoped windows created in that session, and the window host and owner
