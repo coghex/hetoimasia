@@ -760,9 +760,9 @@ processEvents host number waited = do
       | otherwise = ProcessPending
 
 -- | Reconcile the mode of every window the host holds that is not closing, in
--- registration order, after the turn's monitor refresh: a window whose applied
--- mode names an ended monitor takes its recorded fallback without another
--- command.
+-- registration order, after the turn's monitor refresh: a window whose settled
+-- mode's monitor identity has ended takes its recorded fallback without another
+-- command, whatever observations intervened since the disconnect.
 reconcileWindowModes ∷ WindowHost → IO ()
 reconcileWindowModes host = do
   entries ← readTVarIO (hostEntries host)

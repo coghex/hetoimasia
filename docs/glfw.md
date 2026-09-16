@@ -5,10 +5,14 @@ the four known defects that review recorded,
 [#115](https://github.com/coghex/hetoimasia/issues/115)
 (construction/rollback failure evidence) is repaired: a construction failure
 whose rollback's own release failed now propagates as the host's primary
-failure, interrupting the command and stopping the loop. Three defects remain
-open: [#116](https://github.com/coghex/hetoimasia/issues/116)
-(disconnect recovery across observations), [#117](https://github.com/coghex/hetoimasia/issues/117)
-(restoration after partial departure), and [#118](https://github.com/coghex/hetoimasia/issues/118)
+failure, interrupting the command and stopping the loop.
+[#116](https://github.com/coghex/hetoimasia/issues/116)
+(disconnect recovery across observations) is repaired: the recovery a settled
+mode owes to its monitor's identity survives ordinary observations of the
+platform's post-disconnect state, so the configured fallback runs however
+observation and reconciliation are ordered. Two defects remain open:
+[#117](https://github.com/coghex/hetoimasia/issues/117)
+(restoration after partial departure) and [#118](https://github.com/coghex/hetoimasia/issues/118)
 (fixture settlement under repeated cancellation). See the
 [completion review](project_review_114-101.md) for reproductions. The corrected
 contracts and regressions must accompany those repair PRs; this status update
@@ -1572,12 +1576,23 @@ cleanup failure propagates the failure with its context and recovery history,
 and the window's creation rolls back.
 
 After the owner loop refreshes the monitor inventory, it reconciles every window
-that is not closing. A window whose applied mode names an ended monitor identity
-takes its recorded windowed fallback at once, with no further command, attempting
-it at most its configured number of times, and its outcome is recorded; with no fallback it is only resampled. GLFW itself takes a
-fullscreen window off a disconnected monitor. A window whose applied mode is
-indeterminate is resampled. If no placement is reachable the fallback reports
-exhaustion and the saved placement is preserved.
+that is not closing. A window whose recovery obligation names an ended monitor
+identity takes its recorded windowed fallback at once, with no further command,
+attempting it at most its configured number of times, and its outcome is
+recorded; with no fallback it is only resampled. The obligation is the monitor
+identity the last settled request's own sample established the applied mode on —
+fullscreen or borderless — and it survives every ordinary observation: GLFW
+itself takes a fullscreen window off a disconnected monitor before the monitor
+callback's refresh ends the identity, so a synchronization, an observation
+command, or a control's post-call sample taken anywhere between the native
+disconnect and the reconciliation reports the platform's truth — windowed at the
+desktop origin, or indeterminate for a borderless window whose monitor's work
+area is gone — without erasing the unresolved recovery. A recovery that settles,
+applied or exhausted, is owed no longer; a later request that settles supersedes
+it, while a request refused before any native call leaves it pending. A window
+whose applied mode is indeterminate without an ended obligation is resampled. If
+no placement is reachable the fallback reports exhaustion and the saved
+placement is preserved.
 
 ### Fullscreen claims
 

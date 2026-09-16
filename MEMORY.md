@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated: 2026-09-15. Durable project context for future interactive sessions.
+Updated: 2026-09-16. Durable project context for future interactive sessions.
 Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
 [the foundation design](docs/engine_foundation_design.md).
 
@@ -14,10 +14,12 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   [review report](docs/project_review_114-101.md) records four remaining repairs:
   #115 creation primary/cleanup evidence; #116 disconnect recovery across
   observations; #117 restoration after partial departure; #118 fixture drain
-  under repeated cancellation. The owner approved and filed all four; that is
-  not canonical readiness approval or completed implementation.
-- Prioritize #115. #118 is independent. Coordinate #116 before #117 to avoid
-  overlapping controller edits. Verify the repairs before concluding the arc.
+  under repeated cancellation. #115 is repaired (PR #119) and #116 is repaired:
+  the mode record keeps the monitor identity a settled request's recovery is
+  owed to, so observations between the disconnect and the reconciliation no
+  longer erase it. #117 and #118 remain open.
+- #117 is next, coordinating after #116's controller edits; #118 is
+  independent. Verify the repairs before concluding the arc.
   Epics #86 and #49 remain open; their original implementation checklists lag
   the merges and need tracker housekeeping separately from these docs.
 - Verification at that baseline: build, console smoke, static linking, 517

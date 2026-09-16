@@ -532,6 +532,7 @@ import Hetoimasia.GLFW.Internal.Mode
   , modeMonitor
   , modePresentation
   , modeRequest
+  , modeRecoveryObligation
   , modeRequested
   , modeSavedPlacement
   , modeVideoPreference
@@ -2170,10 +2171,15 @@ restoreLeftWindowed window disturbed = do
         ]
 
 -- | Reconcile a window's mode after a monitor refresh, at an owner boundary: take
--- the recorded windowed fallback when the applied mode names an ended monitor
--- identity, answering its outcome, or resample when there is no fallback or the
--- applied mode is indeterminate. A closing window, and one inside a transition,
--- are left alone.
+-- the recorded windowed fallback when the monitor identity its recovery is owed
+-- to has ended, answering its outcome, or resample when there is no fallback or
+-- the applied mode is indeterminate. The obligation is the one the last
+-- settlement's own sample established, so an ordinary observation that already
+-- reports the platform's post-disconnect state — windowed at the desktop origin,
+-- or indeterminate for a borderless window left over no live work area — does
+-- not erase it, and the refresh that ends the identity triggers it however the
+-- two were ordered. A closing window, and one inside a transition, are left
+-- alone.
 reconcileWindowMode ∷ Window → IO (WindowResult (Maybe ModeOutcome))
 reconcileWindowMode window =
   atBoundary (pure ()) window reconcileModeOperation $ do
@@ -2181,7 +2187,7 @@ reconcileWindowMode window =
     ControlState _ _ transition ← readIORef (windowControl window)
     live ← liveMonitors (windowSession window)
     let record = obsMode current
-        ended = any (`notElem` live) (appliedMonitor (modeApplied record))
+        ended = any (`notElem` live) (modeRecoveryObligation record)
     if obsPhase current /= WindowOpen || transition
       then pure Nothing
       else
@@ -2191,11 +2197,6 @@ reconcileWindowMode window =
               ModeSettled outcome _ → pure (Just outcome)
               _ → pure Nothing
           else Nothing <$ when (ended || modeApplied record == AppliedIndeterminate) (void (samplePresentation False window id))
-  where
-    appliedMonitor = \case
-      AppliedBorderless monitor → Just monitor
-      AppliedFullscreen monitor → Just monitor
-      _ → Nothing
 
 -- | How an owner turn processes native events.
 data EventProcessing
