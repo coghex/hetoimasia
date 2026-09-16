@@ -238,13 +238,16 @@ runOwned owner borrower = do
         case outcome of
           Right () → pure ()
           Left (_ ∷ SomeException) → absorbing step
-      held resource first = serving `catch` \failure → absorbing (stopServing failure) >> rethrow failure
+      held resource first = perform resource first >> loop
         where
-          serving = perform resource first >> loop
           loop =
             next >>= \case
               BorrowerFinished → drain >> ownerSettled owner
               Serve request → perform resource request >> loop
+      -- Once serving fails or is cancelled, settlement still runs with the
+      -- resource held: the borrower finishes first, and the failure that
+      -- began the settlement is the one rethrown.
+      settle failure = absorbing (stopServing failure) >> rethrow failure
       refusing failure =
         next >>= \case
           BorrowerFinished → drain
@@ -268,10 +271,14 @@ runOwned owner borrower = do
         outcome ←
           mask $ \restore → do
             caught ←
-              try . withScoped (ownerAcquire owner) $ \resource →
-                restore $ do
-                  writeIORef entered True
-                  held resource request
+              try . withScoped (ownerAcquire owner) $ \resource → do
+                -- Entered is recorded and the settlement handler installed
+                -- while still masked, so a cancellation already pending when
+                -- the acquisition returns is delivered only inside the
+                -- handler — never in an unprotected gap where its unwind
+                -- would release the resource before the borrower finishes.
+                writeIORef entered True
+                restore (held resource request) `catch` settle
             -- Record the scope's failure — the initiating failure, with the
             -- cleanup evidence its release retained — while still masked: a
             -- cancellation deferred through the release is delivered as soon

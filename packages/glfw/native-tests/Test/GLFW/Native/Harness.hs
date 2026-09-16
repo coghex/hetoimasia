@@ -7,8 +7,10 @@
 -- example, a cancelled borrower with work in flight and queued, an owner that
 -- fails while a borrower waits, an owner cancelled again while it settles the
 -- first cancellation — with a clean release and with a failing one — an owner
--- cancelled once more while its release still runs, an owner cancelled while
--- its acquisition is blocked, and an acquisition failure. The shared-session
+-- cancelled once more while its release still runs, an owner with a
+-- cancellation already pending at its acquisition's handoff to the borrower,
+-- cancelled again during the release, an owner cancelled while its
+-- acquisition is blocked, and an acquisition failure. The shared-session
 -- examples repeat the failing and cancelled cases
 -- against the real session on the process main thread. Every deliberate
 -- failure is inside a nested run or a forked borrower and is asserted as
@@ -22,6 +24,7 @@ import Control.Concurrent
   ( ThreadId
   , forkFinally
   , killThread
+  , myThreadId
   , newEmptyMVar
   , putMVar
   , readMVar
@@ -41,6 +44,7 @@ import Control.Exception
   , displayException
   , throwIO
   , try
+  , uninterruptibleMask_
   )
 import Control.Monad (replicateM, unless, void, when)
 import Data.Foldable (for_)
@@ -288,6 +292,50 @@ spec shared = describe "the shared fixture" $ do
       served `shouldBe` 7
       cancelled >>= either throwIO pure
       opened >>= either throwIO pure
+      events script `shouldReturn` ["acquired", "borrower finished", "released"]
+      reportAcquisitions report `shouldBe` 1
+      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+      fromException failure `shouldBe` Just OwnerKilled
+      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+      map fromException retained `shouldBe` [Just ReleaseFailed]
+
+    it "settles a cancellation pending at the acquisition handoff, and a later one deferred through the release" $ do
+      (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
+      owner ← myThreadId
+      throwerWait ← newEmptyMVar ∷ IO (MVar (IO (Either SomeException ())))
+      let -- The acquisition pends a cancellation on the owner and returns with
+          -- it pending, so the delivery lands exactly at the handoff to the
+          -- borrower.
+          acquire = do
+            (thrower, thrown) ← forked (throwTo owner OwnerKilled)
+            uninterruptibleMask_ (awaitThrowing thrower)
+            putMVar throwerWait thrown
+            note script "acquired"
+            pure (7 ∷ Int)
+          release _ = do
+            putMVar enteredRelease ()
+            takeMVar releaseGate
+            note script "released"
+            throwIO ReleaseFailed
+          pendingOwner = Owner (allocResource acquire release) (note script "owner settled")
+      (outcome, report) ←
+        runOwned pendingOwner $ \fixture → do
+          woken ← try (dispatch fixture pure)
+          (canceller, cancelled) ← forked $ do
+            readMVar enteredRelease
+            throwTo (ownerThread fixture) OwnerKilledAgain
+          (_, opened) ← forked $ do
+            readMVar enteredRelease
+            awaitThrowing canceller
+            putMVar releaseGate ()
+          note script "borrower finished"
+          pure (woken, cancelled, opened)
+      (woken, cancelled, opened) ← either throwIO pure outcome
+      failedWith OwnerKilled woken `shouldBe` True
+      cancelled >>= either throwIO pure
+      opened >>= either throwIO pure
+      thrown ← takeMVar throwerWait
+      thrown >>= either throwIO pure
       events script `shouldReturn` ["acquired", "borrower finished", "released"]
       reportAcquisitions report `shouldBe` 1
       failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
