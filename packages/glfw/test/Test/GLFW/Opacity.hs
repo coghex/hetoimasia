@@ -42,8 +42,9 @@
 --
 -- The window host from the public @runtime-glfw@ sublibrary is compiled against
 -- as well, exposing @hetoimasia-runtime@ and that sublibrary beside the rest.
--- This suite does not import the sublibrary: it is built and registered because
--- @glfw-window-examples@, one of this suite's build tools, depends on it.
+-- This suite declares the sublibrary as a dependency so it is built and
+-- registered for these clients, rather than relying on another component
+-- registering it incidentally.
 -- Six clients must be rejected: one names the host's constructor, one asks
 -- the host for its session, windows' command host, and settings, one reaches
 -- for the owner loop's executor and event processing in the private modules
@@ -58,14 +59,20 @@
 -- admission control, and every path it runs is refused
 -- before GLFW is initialized.
 --
--- The test seam is a public component so this suite can depend on it. Four more
+-- The test seam is a public component, and this suite declares it for the same
+-- reason. Four more
 -- clients are compiled against it and must be rejected: two name the window
 -- drivers and the private command executor through the public seam, which
 -- exports neither, and two reach for them in the seam's implementation, which
 -- belongs to the private @seam-core@ sublibrary, and a fifth names the monitor
--- drivers through the public seam. Only the package's own
--- @glfw-window-examples@ executable can use them.
-module Test.Engine.GLFW.Opacity (spec) where
+-- drivers through the public seam. Only components inside @hetoimasia-glfw@,
+-- such as this suite's window examples, can use them.
+--
+-- This suite belongs to @hetoimasia-glfw@, so its own modules may import the
+-- private sublibraries; that access is not evidence about the boundary. Only a
+-- client compiled here, with every package it may see named explicitly and
+-- every other package hidden, answers what a package outside can reach.
+module Test.GLFW.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))

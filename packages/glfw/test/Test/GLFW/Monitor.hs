@@ -1,7 +1,7 @@
 -- | Examples for the monitor inventory a session owns, driven through the
 -- private test seam.
 --
--- They live in the package's @glfw-window-examples@ executable because they use
+-- They live in the package's own @glfw-tests@ suite because they use
 -- the seam's private monitor drivers: 'seamSetMonitorTopology' changes what the
 -- scripted platform enumerates, 'seamDeliverMonitorEvents' invokes the monitor
 -- callback the session attached, and neither is public. The inventory,

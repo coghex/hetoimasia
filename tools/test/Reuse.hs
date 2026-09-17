@@ -494,7 +494,7 @@ spec = describe "Validation evidence reuse" $ do
     -- Each package suite's group took over coverage the root suite's group
     -- used to carry, so each is proven routed, required, and reusable on its
     -- own rather than through the root group's pass.
-    forM_ ["test.foundation", "test.runtime"] $ \packageGroup →
+    forM_ ["test.foundation", "test.runtime", "test.glfw"] $ \packageGroup →
       it ("assigns " ++ packageGroup ++ " to the engine worker, requires it in the aggregate, and reuses its published receipt") $
         withCheckedInRouting $ \fixture workers → do
           -- The workflow publishes every engine group's receipt under the name

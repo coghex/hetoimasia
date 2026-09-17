@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 9,
+  "policy_version": 10,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -31,6 +31,7 @@
     "test.engine",
     "test.foundation",
     "test.runtime",
+    "test.glfw",
     "smoke.console"
   ],
   "groups": [
@@ -52,7 +53,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the root package's console startup and exit integration, and its GLFW component until that package has its own suite.",
+      "description": "Focused Hspec examples for the root package's console startup and exit integration.",
       "command": [
         "cabal",
         "test",
@@ -95,6 +96,26 @@
       ],
       "component": "hetoimasia-runtime:test:runtime-tests",
       "inputs": [],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.glfw",
+      "description": "Headless Hspec examples for the GLFW package's session, window, command, control, host, dynamic window, monitor, input, and mode models over the test seam, its link declarations against the native manifest, and its package boundaries. Initializes no GLFW and needs no display.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-glfw:glfw-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-glfw:test:glfw-tests",
+      "inputs": [
+        "tools/ci-image/",
+        "tools/native/"
+      ],
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,

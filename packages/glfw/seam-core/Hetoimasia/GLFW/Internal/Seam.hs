@@ -6,7 +6,7 @@
 -- everything here except the window drivers — 'seamDrive',
 -- 'seamDriveCancelledBeforeCommit', 'seamRejectCloseRequest', and
 -- 'seamSetModeTransition' — which only the package's own
--- @glfw-window-examples@ executable uses.
+-- @glfw-tests@ suite uses.
 --
 -- A 'Seam' is a native table that initializes nothing. It records every native
 -- operation the session model asks for as a 'NativeCall', answers each from a

@@ -115,6 +115,7 @@ identifier lists are sorted.
 | `test.engine` | `cabal test hetoimasia-tests --test-show-details=direct` | no | yes |
 | `test.foundation` | `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct` | no | yes |
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
+| `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
@@ -126,11 +127,21 @@ was already mandatory there. `test.runtime` runs the runtime package's own
 suite: the `Runtime` group's runner, application lifecycle, logging lifetime,
 reporting, supervision, inbox, opacity, resource smoke, and supervised channel
 and snapshot examples. It entered the floor for the same reason when those
-examples left `test.engine`. `test.engine` now runs the root suite: the
-`Console` group's startup and exit integration, and the `GLFW` group until the
-GLFW package has its own headless suite. An explicit request for `test.engine`
-therefore selects neither the foundation nor the runtime examples; request
-`test.foundation` and `test.runtime` beside it for that coverage.
+examples left `test.engine`. `test.glfw` runs the GLFW package's headless
+suite: the session examples over the test seam, the window model, command,
+control, host, dynamic window, monitor inventory, input feed, and window mode
+examples, the link declarations, and the external-client opacity examples. It
+initializes no GLFW and needs no display, so it runs on the `cpu` runner, and it
+entered the floor for the same reason when the root `GLFW` group and the
+window examples it ran as a subprocess left `test.engine`. Beside its Cabal
+closure it declares `tools/native/` and `tools/ci-image/`, because its linking
+example reads the native manifest those recipes provision; the manifest itself
+is an artifact of the prefix, already part of every candidate's native
+toolchain identity, and is never copied into the package. `test.engine` now runs
+the root suite: only the `Console` group's startup and exit integration. An
+explicit request for `test.engine` therefore selects none of the foundation,
+runtime, or GLFW examples; request `test.foundation`, `test.runtime`, and
+`test.glfw` beside it for that coverage.
 
 `test.workflow` runs only when affected or requested.
 
@@ -170,7 +181,7 @@ The closure is derived from **both** revisions and unioned, so a source that was
 removed or relocated — or an input a group has since stopped declaring — still
 counts for the group that used to own it. A change to the
 `hetoimasia-foundation` library therefore selects `test.foundation`,
-`test.runtime`, and `test.engine` even when none of those suites' sources
+`test.runtime`, `test.glfw`, and `test.engine` even when none of those suites' sources
 changed, and a change to `app/Main.hs` selects `test.engine` through the
 `build-tool-depends: hetoimasia:hetoimasia` edge.
 
@@ -362,7 +373,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native
 ```
@@ -476,7 +487,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native` |
 
@@ -1271,7 +1282,7 @@ native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -1307,10 +1318,12 @@ evidence only: it can never satisfy a Linux plan.
 
 `hetoimasia-glfw` declares `pkgconfig-depends: glfw3`, and Cabal solves every
 package `cabal.project` lists even for a focused target, so the ordinary project
-cannot build `hetoimasia-foundation:foundation-tests` or
-`hetoimasia-runtime:runtime-tests` on a machine where `pkg-config` finds no GLFW.
-`cabal.project.cpu` is the CPU-only configuration for that case. It lists
-`packages/foundation`, `packages/runtime`, and `tools/test-support` alone, and
+cannot build `hetoimasia-foundation:foundation-tests`,
+`hetoimasia-runtime:runtime-tests`, or the root `hetoimasia-tests` on a machine
+where `pkg-config` finds no GLFW. `cabal.project.cpu` is the CPU-only
+configuration for that case. It lists the root package, `packages/foundation`,
+`packages/runtime`, and `tools/test-support`, leaving out only
+`packages/glfw`, and
 imports `cabal.project.common` exactly as `cabal.project` does, so the compiler
 settings, `index-state` pin, and local `-Werror` policy are the same file rather
 than a copy that could drift:
@@ -1323,12 +1336,18 @@ env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent \
 env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent \
   cabal test hetoimasia-runtime:runtime-tests --project-file cabal.project.cpu \
   --builddir dist-dev --test-show-details=direct
+env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent \
+  cabal test hetoimasia-tests --project-file cabal.project.cpu \
+  --builddir dist-dev --test-show-details=direct
 ```
+
+The root suite joined this configuration when the GLFW examples moved into
+`hetoimasia-glfw:glfw-tests`, leaving it with no GLFW dependency.
 
 The same `cabal test` with the ordinary project fails to resolve
 `hetoimasia-glfw` under that environment. Clearing `PKG_CONFIG_PATH` matters:
 `native.py prepare` exports it to expose the pinned prefix, and
-`PKG_CONFIG_LIBDIR` alone does not hide it. Both suites' external clients find
+`PKG_CONFIG_LIBDIR` alone does not hide it. The package suites' external clients find
 the package database under the chosen build directory from the test
 executable's own location, so they pass under `dist-dev` too and expose the
 units that build registered rather than another worktree's. CI keeps
@@ -1951,7 +1970,7 @@ cannot answer at all leaves an obstacle and returns every group to execution.
 One reuse example uses this repository's own routing rather than a fixture's:
 the checked-in catalog, with every command replaced by `true`, and the worker
 declarations the workflow's plan step passes. It runs once for each package
-suite's group, `test.foundation` and `test.runtime`, and requires the plan to
+suite's group, `test.foundation`, `test.runtime`, and `test.glfw`, and requires the plan to
 assign that group to `haskell-engine` as a floor group, the workflow to publish a
 named receipt for every group that worker owns, the aggregate to fail while only
 the other engine groups have receipts, and a later prose-only candidate to reuse

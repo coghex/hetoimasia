@@ -1,9 +1,8 @@
 -- | Examples for scoped GLFW windows, driven through the private test seam.
 --
--- They live in the package's @glfw-window-examples@ executable, not in a
--- library, because they use the private window drivers of @seam-core@, which
--- no package outside @hetoimasia-glfw@ may name. @hetoimasia-tests@ runs this
--- executable from its @GLFW@ group.
+-- They live in the package's own @glfw-tests@ suite because they use the
+-- private window drivers of @seam-core@, which no package outside
+-- @hetoimasia-glfw@ may name.
 --
 -- Windows are created with the public "Hetoimasia.GLFW.Window" interface in a
 -- session over "Hetoimasia.GLFW.Seam"'s scripted native library, which creates

@@ -3,7 +3,7 @@ name: hetoimasia
 version: 0.1.0.0
 synopsis: Console bootstrap for a modular Haskell game engine
 description:
-    Application composition and its console and GLFW integration tests.
+    Application composition and its console integration tests.
     Rendering and Lua integration are planned components.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -118,27 +118,13 @@ test-suite hetoimasia-tests
     other-modules:
         Test.Engine.Spec
         Test.Engine.Console.Spec
-        Test.Engine.GLFW.Linking
-        Test.Engine.GLFW.Opacity
-        Test.Engine.GLFW.Session
-        Test.Engine.GLFW.Spec
-        Test.Engine.GLFW.WindowModel
     ghc-options: -threaded -rtsopts
-    build-tool-depends: hetoimasia:hetoimasia, hetoimasia-glfw:glfw-window-examples
+    build-tool-depends: hetoimasia:hetoimasia
     build-depends:
         base >=4.21 && <4.22,
-        bytestring >=0.12 && <0.13,
         directory >=1.3 && <1.4,
-        filepath >=1.5 && <1.6,
         hetoimasia:console,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
         text >=2.1 && <2.2,
-        hetoimasia-foundation ==0.1.0.0,
-        hetoimasia-glfw ==0.1.0.0,
-        hetoimasia-glfw:seam ==0.1.0.0,
-        -- No root module imports the runtime, but the GLFW window-host opacity
-        -- clients expose it, so the suite declares it rather than relying on
-        -- another component registering it incidentally.
-        hetoimasia-runtime ==0.1.0.0,
-        hetoimasia-test-support ==0.1.0.0
+        hetoimasia-foundation ==0.1.0.0

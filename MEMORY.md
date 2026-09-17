@@ -49,9 +49,9 @@ owning subsystem's contract/design when continuing its work.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
-- Test-support extraction #125/#132 and foundation migration #127/#137 are
-  complete; runtime migration #129 lands with its own PR. Epic #49 stays open
-  for GLFW headless #130.
+- Test-support extraction #125/#132, foundation migration #127/#137, and
+  runtime migration #129/#150 are complete; GLFW headless migration #130 lands
+  with its own PR, the last child of epic #49.
 - Audit at `9300962`: PRs #137, #132, #128 and #126 had no new confirmed repair.
   Local build/smoke, foundation 308 examples (GLFW discovery disabled), root
   209, workflow 333, consent 14 and scripted fixture 13 passed. No native
@@ -59,10 +59,13 @@ owning subsystem's contract/design when continuing its work.
   Counts are dated evidence, not permanent expectations.
 - Foundation owns `packages/foundation/test/` (`test.foundation`) and runtime
   owns `packages/runtime/test/` (`test.runtime`, 143 examples at #129, with the
-  per-example map in docs/runtime_tests_mapping.md). Root tests keep `Console`
-  and, pending #130, `GLFW`. Shared neutral helpers are test-only; no
-  production dependency on test support. CPU-only foundation and runtime builds
-  use `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
+  per-example map in docs/runtime_tests_mapping.md). GLFW owns
+  `packages/glfw/test/` (`test.glfw`, 234 examples at #130, including the 180
+  former window-executable examples, mapped in docs/glfw_tests_mapping.md);
+  `glfw-native-tests` stays separate. Root tests keep only `Console` and depend
+  on no GLFW package. Shared neutral helpers are test-only; no production
+  dependency on test support. CPU-only foundation, runtime, and root builds use
+  `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
 
 ## Contracts to preserve
 

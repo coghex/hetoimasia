@@ -6,6 +6,10 @@ including overlapping notes from master and docs-wip. They are not current
 instructions or a processing queue. Read [MEMORY.md](../../MEMORY.md) for the
 active handoff and the owning contract/design for a subsystem.
 
+The GLFW window examples' former executable is referred to below as the
+`window-examples` executable; #130 removed it and registered its examples
+directly in `hetoimasia-glfw:glfw-tests`.
+
 # Hetoimasia project memory
 
 Updated: 2026-09-16. Durable project context for future interactive sessions.
@@ -384,7 +388,7 @@ not a verdict that Synarchy's design should be discarded.
   implementation moved to the private `seam-core` sublibrary; its window drivers
   (`seamDrive`, `seamDriveCancelledBeforeCommit`, `seamRejectCloseRequest`) are
   not re-exported by the public `seam`, and only the package's
-  `glfw-window-examples` executable uses them. `hetoimasia-tests` runs that
+  `window-examples` executable uses them. `hetoimasia-tests` runs that
   executable from its `GLFW` group through `build-tool-depends`. The shared
   opacity harness exposes `-inplace` unit ids with `-package-id`, because
   sublibraries share their package's name.
@@ -407,7 +411,7 @@ not a verdict that Synarchy's design should be discarded.
   `synchronizeWindow` and names the committed revision. Execution
   (`executeNextWith`) is private; GLFW-3's owner loop is its production caller
   and the seam-core executor (`seamExecuteNext*`) drives it in tests. Its
-  examples live in `glfw-window-examples`. Contract: `docs/glfw.md`,
+  examples live in the `window-examples` executable. Contract: `docs/glfw.md`,
   "Window commands".
 - GLFW-7 (#93) delivered TEST-2's first shared native fixture and the
   `display` runner class. `glfw-native-tests` (`packages/glfw/native-tests/`)
@@ -533,7 +537,7 @@ not a verdict that Synarchy's design should be discarded.
   or cancelled attempt is recorded and not retried, and counts as complete for
   resumption. The private producer (`produceInput`, `recordCursor`,
   `produceButton`), warning, and `resumeInputWith` are driven only by
-  `glfw-window-examples`' `Test.GLFW.Input`. The window close protocol and host
+  the `window-examples` executable's `Test.GLFW.Input`. The window close protocol and host
   quiescence close feeds. GLFW-12 (#100) connects the native callbacks and the
   owner loop. Contract: `docs/glfw.md`, "Input feeds".
 - GLFW-12 (#100) registered per-window key, character, mouse button, cursor
