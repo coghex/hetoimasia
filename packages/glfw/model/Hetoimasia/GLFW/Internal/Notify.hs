@@ -14,6 +14,21 @@
 -- authoritative, so a notification that fails changes nothing about the work
 -- that had already been recorded.
 --
+-- = The obligation
+--
+-- An admission or a publication registers its notification obligation with
+-- 'registerNotification' in the very transaction that commits it, so a
+-- transaction that rolls back, or one that admitted or published nothing,
+-- registers none. From that commit the obligation is visible to every boundary,
+-- before the notifying thread has run another instruction.
+--
+-- 'dischargeNotification' discharges it exactly once: it makes at most one wake
+-- call, and then records what that call left and leaves the obligation in one
+-- transaction, so no boundary can see the obligation go without the degradation
+-- it caused beside it. A boundary that waits for 'awaitNotificationsSettled'
+-- has therefore seen every degradation that committed work could still cause.
+-- The wait is bounded by one empty-event post per obligation outstanding.
+--
 -- The first expected platform failure — the 'WakeFailed' outcome, with the
 -- evidence attributed to that call alone — degrades the session's wake path,
 -- retaining that evidence. Every later notification over that session then
@@ -36,13 +51,6 @@
 -- state, and are never retried. A sink failure and a cancellation propagate as
 -- themselves, as every logging attempt does. Neither undoes the degradation.
 --
--- A boundary that must not miss a degradation waits for
--- 'awaitNotificationsSettled' first. A notification enters the session's
--- in-flight count before its wake call and leaves it only in the transaction
--- that records whatever that call left, so a boundary that finds the count at
--- zero has already seen every degradation those calls caused. The wait is
--- bounded by one empty-event post per notification in flight.
---
 -- = State
 --
 -- This module owns none of its own. The 'WakePath' it reads and writes and the
@@ -56,8 +64,10 @@ module Hetoimasia.GLFW.Internal.Notify
 
     -- * Notifying the owner
   , WakeNotice (..)
-  , notifyOwner
+  , registerNotification
+  , dischargeNotification
   , awaitNotificationsSettled
+  , notificationsInFlight
 
     -- * Degradation and its one report
   , DegradationAttempt (..)
@@ -134,38 +144,42 @@ data WakeNotice
     -- ^ The session's wake path had already degraded: no native call was made.
   deriving (Eq, Show)
 
--- | Notify the session's owner that work was recorded, unless the path has
--- degraded.
+-- | Register the notification an admission or a publication owes, in the
+-- transaction that commits it. Never retries.
+registerNotification ∷ Notifier → STM ()
+registerNotification notifier = modifyTVar' (notifierInFlight notifier) (+ 1)
+
+-- | Discharge one registered obligation, waking the session's owner unless the
+-- path has already degraded.
 --
 -- It makes at most one wake call and never retries. An expected platform
 -- failure degrades the path and retains the first such call's evidence for the
--- owner's one report; anything else 'wakeSession' raises propagates unchanged.
-notifyOwner ∷ Notifier → IO WakeNotice
-notifyOwner notifier =
+-- owner's one report; anything else 'wakeSession' raises propagates unchanged,
+-- with the obligation discharged first either way.
+dischargeNotification ∷ Notifier → IO WakeNotice
+dischargeNotification notifier =
   readTVarIO (notifierState notifier) >>= \case
-    WakePathDegraded _ _ → pure NotificationSkipped
+    WakePathDegraded _ _ → NotificationSkipped <$ leave notifier Nothing
     WakePathHealthy → mask_ $ do
-      -- Entered before the call and left only once whatever it found has been
-      -- recorded, so a boundary that waits for the count to reach zero has
-      -- already seen every degradation these calls caused.
-      atomically (enter notifier)
       outcome ← wakeSession (notifierWake notifier) `onException` leave notifier Nothing
       case outcome of
         WakePosted → OwnerNotified <$ leave notifier Nothing
         WakeTerminal → NotificationTerminal <$ leave notifier Nothing
         WakeFailed reports → NotificationDegraded <$ leave notifier (Just reports)
 
--- | Wait until no notification is inside its wake call. It never retries on its
--- own and is bounded by one empty-event post per notification in flight, so an
--- owner boundary may wait on it.
+-- | Wait until every registered obligation has been discharged. It is bounded
+-- by one empty-event post per obligation outstanding, so an owner boundary may
+-- wait on it.
 awaitNotificationsSettled ∷ Notifier → STM ()
-awaitNotificationsSettled notifier = readTVar (notifierInFlight notifier) >>= check . (<= 0)
+awaitNotificationsSettled notifier = notificationsInFlight notifier >>= check . (<= 0)
 
-enter ∷ Notifier → STM ()
-enter notifier = modifyTVar' (notifierInFlight notifier) (+ 1)
+-- | How many obligations are registered and not yet discharged.
+notificationsInFlight ∷ Notifier → STM Int
+notificationsInFlight = readTVar . notifierInFlight
 
--- | Record whatever the call left, then leave the count, in one transaction, so
--- no boundary can see the count fall without the degradation beside it.
+-- | Record whatever the call left and discharge the obligation in one
+-- transaction, so no boundary can see the obligation go without the degradation
+-- it caused beside it.
 leave ∷ Notifier → Maybe Reports → IO ()
 leave notifier recorded =
   uninterruptibleMask_ . atomically $ do

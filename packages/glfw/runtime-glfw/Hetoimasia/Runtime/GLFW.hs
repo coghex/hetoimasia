@@ -153,9 +153,11 @@
 -- the session's wake path — reported once through 'loopLogger' under
 -- @glfw.wake@ — nothing is posted at all and the finite bound alone keeps work
 -- moving. The loop claims that report on every turn and once more as it ends,
--- however it ends, after waiting for every notification still inside its wake
--- call; 'reportHostWakeDegradation' is the application's own boundary for one
--- that began after the loop's last wait, and after quiescence it is complete. Native waits are safe foreign
+-- however it ends, after waiting for the notification obligations admissions
+-- and publications registered when they committed; 'runWindowApplication' makes
+-- the complete attempt after quiescence and the worker drain, and
+-- 'reportHostWakeDegradation' is that same boundary for an application that owns
+-- a different shutdown. Native waits are safe foreign
 -- calls, so background workers run while the owner is inside one.
 -- 'hostActivity' reports the turn and whether its owner has begun its finite
 -- wait: the flag is set immediately before the native call and cleared once it
@@ -195,7 +197,10 @@
 --
 -- 1. quiescence: every port's admission closes, queued callers settle, and every
 --    input feed closes;
--- 2. supervision requests every live worker to stop and drains them;
+-- 2. supervision requests every live worker to stop and drains them, and then
+--    the host waits for the notification obligations still outstanding and makes
+--    the wake path's one guarded reporting attempt, with the dependencies and
+--    the logger live;
 -- 3. the dependency scope unwinds: the host's own release closes every port's
 --    admission again (a no-op after quiescence), the collection's final exit
 --    releases every window still registered, closing ones included, once each
@@ -308,6 +313,7 @@ module Hetoimasia.Runtime.GLFW
 
     -- * The wake path
   , hostWakePath
+  , hostNotificationsInFlight
   , reportHostWakeDegradation
 
     -- * Demand

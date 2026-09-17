@@ -24,6 +24,7 @@ module Hetoimasia.Runtime.GLFW.Internal
 
     -- * The wake path
   , hostWakePath
+  , hostNotificationsInFlight
   , reportHostWakeDegradation
 
     -- * Demand
@@ -78,7 +79,13 @@ import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext, withResourceLabelled)
+import Hetoimasia.Foundation.Resource
+  ( Scoped
+  , allocResource
+  , cleanupFailuresInContext
+  , withResourceLabelled
+  , withScoped
+  )
 import Hetoimasia.Foundation.Resource.Collection
   ( Collection
   , CollectionError (..)
@@ -136,6 +143,7 @@ import Hetoimasia.GLFW.Internal.Notify
   , Notifier
   , attemptDegradationReport
   , awaitNotificationsSettled
+  , notificationsInFlight
   )
 import Hetoimasia.GLFW.Internal.Input
   ( InputFeed
@@ -180,8 +188,8 @@ import Hetoimasia.GLFW.Window
   , windowLocalIdentity
   , windowObservations
   )
-import Hetoimasia.Runtime.Application (runScopedApplicationWithQuiescence)
-import Hetoimasia.Runtime.Logging (LoggingLifetime)
+import Hetoimasia.Runtime.Application (runManagedApplication)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
 import Numeric.Natural (Natural)
 
@@ -441,6 +449,12 @@ closeEntryAdmission entry = do
 hostWakePath ∷ WindowHost → STM WakePath
 hostWakePath = readTVar . sessionWakePath . hostSession
 
+-- | How many notification obligations the session's admissions and publications
+-- have registered and not yet discharged. Any thread may read it; it is bounded
+-- by the work committed and not yet notified.
+hostNotificationsInFlight ∷ WindowHost → STM Int
+hostNotificationsInFlight = notificationsInFlight . hostNotifier
+
 -- | Claim the session's one degradation report, if one is still owed, at the
 -- application's own owner boundary.
 --
@@ -459,6 +473,40 @@ reportHostWakeDegradation logger host =
 
 hostNotifier ∷ WindowHost → Notifier
 hostNotifier = commandHostNotifier . hostCommands
+
+-- | Wait for every registered notification obligation to be discharged, then
+-- make the wake path's one guarded reporting attempt.
+--
+-- It is ordinary interruptible 'IO' on the owner thread, never a release
+-- callback: it waits and it writes through the injected logger, and neither
+-- belongs inside a release's mask.
+reportWhenSettled ∷ HasCallStack ⇒ Logger → WindowHost → IO ()
+reportWhenSettled logger host = void (reportHostWakeDegradation logger host)
+
+-- | Run @body@, then make the reporting attempt, whatever @body@ did.
+--
+-- A failure the attempt raises after a successful body fails the caller. After
+-- a failing or cancelled body the body's failure stays primary and the
+-- attempt's is retained beside it as cleanup evidence, carried by a release that
+-- only rethrows what was already caught.
+retainingReport ∷ IO () → IO r → IO r
+retainingReport attempt body = do
+  outcome ← tryWithContext body
+  reported ← tryWithContext attempt
+  case (outcome, reported) of
+    (Right result, Right ()) → pure result
+    (Right _, Left failed) → rethrowIO (failed ∷ ExceptionWithContext SomeException)
+    (Left primary, Right ()) → rethrowIO (primary ∷ ExceptionWithContext SomeException)
+    (Left primary, Left failed) →
+      withResourceLabelled
+        wakeReportLabel
+        (pure ())
+        (\() → rethrowIO (failed ∷ ExceptionWithContext SomeException))
+        (\() → rethrowIO (primary ∷ ExceptionWithContext SomeException))
+
+-- | The cleanup label a failed reporting attempt is retained under.
+wakeReportLabel ∷ Text
+wakeReportLabel = "glfw wake degradation report"
 
 -- ---------------------------------------------------------------------------
 -- Demand
@@ -852,23 +900,12 @@ runOwnerLoop host control hooks =
 
     -- However the loop ends — a result, a supervised failure, a native failure,
     -- or a cancellation — the wake path's one report is claimed before it
-    -- returns, after every notification in flight has settled, so a degradation
-    -- the last turn's own work caused is never left owed. A report failure on
-    -- the failing path is retained as cleanup evidence beside the loop's own
-    -- failure, which stays primary.
-    reportingAsItEnds body =
-      tryWithContext body >>= \case
-        Right result → result <$ settleAndReport
-        Left caught →
-          withResourceLabelled
-            "glfw wake degradation report"
-            (pure ())
-            (\() → settleAndReport)
-            (\() → rethrowIO (caught ∷ ExceptionWithContext SomeException))
+    -- returns, after every obligation registered by an admission or a
+    -- publication has been discharged, so a degradation the last turn's own work
+    -- caused is never left owed.
+    reportingAsItEnds body = retainingReport (settleAndReport (loopLogger hooks) host) body
 
-    settleAndReport = do
-      atomically (awaitNotificationsSettled notifier)
-      reportDegradation
+    settleAndReport = reportWhenSettled
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
@@ -1016,9 +1053,25 @@ rejectHostCloseRequest host request =
 -- ---------------------------------------------------------------------------
 -- Applications
 
--- | 'Hetoimasia.Runtime.Application.runScopedApplicationWithQuiescence' with
--- the host's quiescence action: the fourth argument finds the host among the
--- application's dependencies.
+-- | 'Hetoimasia.Runtime.Application.runManagedApplication' with the host's
+-- quiescence action and its final notification boundary: the fourth argument
+-- finds the host among the application's dependencies.
+--
+-- The host's dependencies are a managed lifetime rather than a bare scope, so
+-- the runner's own order gains one component-owned step and nothing else: the
+-- finite quiescence transaction closes admission, publication, and every input
+-- feed; supervision then stops and drains every worker; and only then, with
+-- every dependency and the application's logger still live, the host waits for
+-- the notification obligations its admissions and publications registered and
+-- makes the wake path's one guarded reporting attempt. Nothing new can be
+-- admitted or published by then, so that attempt cannot be outrun.
+--
+-- It is the ordinary boundary, so an application needs no reporting call of its
+-- own; 'reportHostWakeDegradation' stays available for one that owns a
+-- different shutdown. The attempt runs on the calling thread as ordinary
+-- interruptible work, not inside a release: a failing sink after a successful
+-- run fails the run, and after a failing or cancelled one the original failure
+-- stays primary with the attempt's retained beside it.
 runWindowApplication
   ∷ HasCallStack
   ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
@@ -1028,5 +1081,15 @@ runWindowApplication
   → (dependencies → RuntimeControl → IO services)
   → (services → RuntimeControl → IO a)
   → IO a
-runWindowApplication enterLifetime name dependencies host =
-  runScopedApplicationWithQuiescence enterLifetime name dependencies (quiesceWindowHost . host)
+runWindowApplication enterLifetime name dependencies host startup action =
+  enterLifetime $ \lifetime →
+    runManagedApplication
+      (\use → use lifetime)
+      name
+      ( \use →
+          withScoped dependencies $ \built →
+            retainingReport (reportWhenSettled (lifetimeLogger lifetime) (host built)) (use built)
+      )
+      (quiesceWindowHost . host)
+      startup
+      action

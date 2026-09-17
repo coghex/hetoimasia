@@ -34,7 +34,10 @@
 -- An admission that committed wakes the session's owner, through
 -- "Hetoimasia.GLFW.Internal.Notify"'s policy, so a command submitted while the
 -- owner sits in a native wait ends that wait. The command is recorded first and
--- the hint posted after. A full or closed answer wakes nothing. The obligation
+-- the hint posted after, and the admitting transaction registers the obligation
+-- to post it, so the owner's boundaries can see that a wake is owed before the
+-- submitting thread has run another instruction. A full or closed answer
+-- registers nothing and wakes nothing. The obligation
 -- is held from the commit onward — the commit and the wake run under a mask,
 -- and the wake itself uninterruptibly — so nothing delivered to the submitting
 -- thread can drop it. The waiting operation keeps that protection while staying
@@ -353,7 +356,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
 import Hetoimasia.GLFW.Internal.Attribute (Extent (..), Placement (..))
 import Hetoimasia.GLFW.Internal.Capture (Reports, rnfReports)
 import Hetoimasia.GLFW.Internal.Demand (DemandPublisher)
-import Hetoimasia.GLFW.Internal.Notify (Notifier, notifyOwner, sessionNotifier)
+import Hetoimasia.GLFW.Internal.Notify (Notifier, dischargeNotification, registerNotification, sessionNotifier)
 import Hetoimasia.GLFW.Internal.Input (InputControl, InputReader)
 import Hetoimasia.GLFW.Internal.Control
   ( ControlOutcome
@@ -1026,6 +1029,10 @@ submitWith hooks port context command = do
       send (portSender port) prepared >>= \case
         Accepted → do
           ticket ← reserve port origin
+          -- The obligation is registered here, in the admitting transaction, so
+          -- a rolled-back admission registers none and a committed one is
+          -- visible to every boundary at once.
+          registerNotification (portNotifier port)
           duringAdmission hooks
           pure (SubmitAccepted ticket)
         Full → pure SubmitFull
@@ -1055,6 +1062,7 @@ awaitSubmitWith hooks port context command = do
         send (portSender port) prepared >>= \case
           Accepted → do
             ticket ← reserve port origin
+            registerNotification (portNotifier port)
             duringAdmission hooks
             pure (Just (WaitAccepted ticket))
           Full → pure Nothing
@@ -1075,6 +1083,7 @@ awaitSubmitWith hooks port context command = do
         awaitSend (portSender port) prepared >>= \case
           Admitted → do
             ticket ← reserve port origin
+            registerNotification (portNotifier port)
             duringAdmission hooks
             pure (WaitAccepted ticket)
           AdmissionClosed → pure WaitClosed
@@ -1083,13 +1092,14 @@ awaitSubmitWith hooks port context command = do
         WaitClosed → pure ()
       pure submitted
 
--- | Discharge an admission's notification obligation, uninterruptibly, so
--- nothing delivered to the submitting thread can drop it. The wake's outcome
--- never changes the submission's answer; a programming or lifetime violation it
--- raises propagates with the command still admitted.
+-- | Discharge the obligation the admitting transaction registered,
+-- uninterruptibly, so nothing delivered to the submitting thread can drop it.
+-- The wake's outcome never changes the submission's answer; a programming or
+-- lifetime violation it raises propagates with the command still admitted and
+-- the obligation already discharged.
 notifyAdmission ∷ AdmissionHooks → WindowCommandPort → IO ()
 notifyAdmission hooks port =
-  uninterruptibleMask_ (afterAdmission hooks >> void (notifyOwner (portNotifier port)))
+  uninterruptibleMask_ (afterAdmission hooks >> void (dischargeNotification (portNotifier port)))
 
 -- | Issue a request identity and prepare the origin and the message.
 prepareSubmission

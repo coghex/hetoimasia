@@ -456,6 +456,7 @@ hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostActivity          ∷ WindowHost → STM HostActivity
 quiesceWindowHost     ∷ WindowHost → STM ()
 hostWakePath          ∷ WindowHost → STM WakePath
+hostNotificationsInFlight ∷ WindowHost → STM Int
 reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt  -- owner thread
 data WakePath = WakePathHealthy | WakePathDegraded Reports DegradationReport
 data DegradationReport = DegradationOwed | DegradationReporting | DegradationReported
@@ -714,21 +715,38 @@ Degradation owes exactly one guarded diagnostic attempt. The owner loop claims
 it at a safe boundary — outside transactions, callbacks, releases, and the
 [wake lifetime](#wake-lifetime)'s native exclusion — and writes one structured
 warning through the `Logger` the application injects on `LoopHooks`, under the
-`glfw.wake` component, with the retained evidence's counts and first report. Every
-turn claims it after reconciliation, and `runOwnerLoop` claims it once more as
-it ends — however it ends, with a result or a raised failure — after waiting for
-every notification still inside its wake call to record what that call left. So
-a degradation the last turn's own command work, events, or update caused is
-reported before the loop returns, and a report failure on a failing exit is
-retained as cleanup evidence beside the loop's own failure, which stays primary.
+`glfw.wake` component, with the retained evidence's counts and first report. Every admission and every publication registers the notification it owes in the
+very transaction that commits it, and discharges it exactly once, recording what
+the wake left and leaving the obligation together. So an obligation is visible
+from the commit — before the committing thread has run another instruction — and
+no boundary can see it go without the degradation it caused beside it. A
+transaction that rolled back, or that admitted or published nothing, registers
+none, and `hostNotificationsInFlight` reads how many are outstanding.
 
-One window stays open to the loop alone: a notification begun after that last
-wait, while admission is still open, can degrade the path after the loop has
-returned. `hostWakePath` reads whether a report is still owed, and
-`reportHostWakeDegradation` claims it at the application's own owner boundary,
-waiting for notifications in flight exactly as the loop's exit does. Called
-after quiescence, where admission and publication are closed and no new
-notification can begin, it is the complete final boundary.
+Every turn claims the report after reconciliation, and `runOwnerLoop` claims it
+once more as it ends — however it ends, with a result or a raised failure —
+after waiting for every outstanding obligation to be discharged. A degradation
+the last turn's own command work, events, or update caused is therefore reported
+before the loop returns.
+
+The complete boundary is the application's, and `runWindowApplication` installs
+it: after the finite quiescence transaction has closed admission, publication,
+and every feed, and after supervision has stopped and drained every worker, the
+host waits for the obligations that remain and makes the one guarded attempt,
+with every dependency and the application's logger still live. Nothing can be
+admitted or published by then, so nothing can outrun it, and an application
+needs no reporting call of its own. `reportHostWakeDegradation` is that same
+boundary for an application that owns a different shutdown, and `hostWakePath`
+reads whether an attempt is still owed.
+
+Neither boundary runs inside a release. Both wait and write as ordinary
+interruptible work on the owner thread, so a cancellation reaches the attempt
+and is recorded as one. A failing attempt after a successful run fails the run;
+after a failing or cancelled one the original failure stays primary and the
+attempt's failure is retained beside it as cleanup evidence. A host's shutdown
+closes its own admission, never the session's wake capability, so sequential
+hosts borrowing one session keep one degradation and one report between them
+and the session stays wakeable after each of them ends.
 
 The claim is spent whatever happens: an entry the logger filters out, a sink
 failure, and a cancellation each end the attempt and are recorded, and none is
@@ -1260,9 +1278,11 @@ recorded first and the hint posted after, never the reverse. `SubmitFull`,
 `SubmitClosed`, `WaitClosed`, and a rolled-back admission wake nothing, because
 they admitted nothing.
 
-The obligation is held from the commit onward, with no gap: the commit and the
-wake run under a mask, and the wake itself runs uninterruptibly, so no
-asynchronous exception delivered to the submitting thread can drop it. A
+The obligation is registered in the admitting transaction itself and held from
+that commit onward, with no gap: the commit and the wake run under a mask, and
+the wake itself runs uninterruptibly, so no asynchronous exception delivered to
+the submitting thread can drop it, and every boundary can see that a wake is
+owed from the instant the command was admitted. A
 cancellation before the commit admits nothing and wakes nothing. One requested
 after it takes effect only once the wake has been posted, and the command, whose
 caller may never have received its ticket, still executes and still settles
@@ -2320,7 +2340,8 @@ windows however many publishers there are and however often they publish.
 - **The same protection as an admission.** A cancellation before the publishing
   transaction commits publishes nothing. After it commits the request stays
   pending and its wake is owed uninterruptibly, even if the publisher never
-  learns its own answer.
+  learns its own answer. The publishing transaction registers that obligation,
+  so a boundary sees it from the commit.
 - **Closure is terminal.** A closed slot answers `DemandSlotClosed`, records
   nothing, and makes no native call, so a publisher retained after its window
   ended or its host quiesced is safe and can resurrect neither.
@@ -2377,7 +2398,10 @@ disposed by the final exit. On every exit from the supervised region, the ordina
    — its latched ones included — under
    [the failure table](resources.md#the-failure-table); and then the session ends
    if the host owns it;
-4. the terminal report, if the run failed, and the final flush.
+4. the wake path's one guarded reporting attempt, made by
+   `runWindowApplication` once the obligations outstanding at that point have
+   been discharged, with the dependencies and the logger still live;
+5. the terminal report, if the run failed, and the final flush.
 
 A close queued behind quiescence settles as `NotExecuted`, and its window is
 disposed once, by the final exit. A window whose earlier retirement failed is
@@ -2452,9 +2476,14 @@ the loop's injected logger while the finite idle bound continues; a degradation
 caused by the final update reported before the loop it finishes returns; a
 notification held inside its failing post across the loop's exit, waited for and
 reported; a degradation reported as a failing loop ends, with the loop's own
-failure primary; one begun after the loop claimed at the application's own
-boundary after quiescence; one
-degradation and one warning shared by sequential hosts borrowing one session;
+failure primary; one begun after the loop reported by the ordinary runner with
+no reporting call of its own, and one claimed explicitly after quiescence; a
+command and a demand publication each paused between their commit and their
+wake, waited for at the runner's boundary; the report made when startup fails,
+when the action fails, and when the run is cancelled; a reporting attempt
+cancelled at its sink, which only an attempt outside a release can be; one
+degradation and one warning shared by sequential hosts borrowing one session,
+whose wake capability neither shutdown closed;
 and a construction that rolls back lending nothing and waking nothing.
 
 The host's CPU examples run whole applications over the test seam in
@@ -2720,7 +2749,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
 | Wake gate and admitted count | The session | Wake calls enter and leave; the first release closes and drains it | Any; STM | Construction until the first release | Closed and never reopened; a retained capability stays terminal |
 | Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
-| Notifications in flight | The session | A notification enters before its wake call and leaves once it has recorded what that call left; owner boundaries wait for zero | Any; STM | The session | Zero whenever no notification is inside a wake call |
+| Notification obligations | The session | An admitting or publishing transaction registers one; the notifying thread discharges it in the transaction that records what its wake left; owner boundaries wait for zero | Any; STM | The session | Zero whenever every committed admission and publication has been notified |
 | Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |

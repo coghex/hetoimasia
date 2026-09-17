@@ -36,10 +36,14 @@ application, lent as `hostDemandPublisher`, and one per live window, lent on its
 `WindowClient` as `clientDemandPublisher`. Concurrent requests combine immediate
 demand and the earliest requested deadline, publication records before it wakes,
 and the owner captures a pending request with its revision and clears exactly
-what it captured. An expected platform wake failure degrades that session's wake
-path once, warns once under `glfw.wake` through the loop's injected logger, and
-leaves the owner's finite idle wait as the bounded fallback, without changing any
-ticket or slot. The host owns its windows through a scoped
+what it captured. An admission and a publication each register the notification they owe in the
+transaction that commits them, and discharge it exactly once. An expected
+platform wake failure degrades that session's wake path once, warns once under
+`glfw.wake`, and leaves the owner's finite idle wait as the bounded fallback,
+without changing any ticket or slot. `runWindowApplication` makes that one
+guarded warning itself, after quiescence and the worker drain and while the
+dependencies and logger are live, so an application needs no reporting call of
+its own. The host owns its windows through a scoped
 collection: applications create windows while running, receive each one's own
 command port and observations, and close them independently in any order
 through the host's close protocol. `Hetoimasia.GLFW.Input` gives each host

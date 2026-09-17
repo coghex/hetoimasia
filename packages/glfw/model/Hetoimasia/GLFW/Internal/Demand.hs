@@ -32,9 +32,10 @@
 --
 -- A cancellation delivered before that transaction commits publishes nothing. A
 -- cancellation delivered after it commits withdraws nothing: the request stays
--- pending and is notified, and the notification obligation is held
--- uninterruptibly from the commit onward, so no asynchronous exception can
--- separate the two. As with a command's ticket, a publisher cancelled at the
+-- pending and is notified. The obligation is registered in the publishing
+-- transaction itself, so it is visible to every boundary from the commit, and
+-- it is discharged uninterruptibly, so no asynchronous exception can separate
+-- the two. As with a command's ticket, a publisher cancelled at the
 -- instant of the commit may not learn its own answer; the request is still
 -- pending, and the owner's finite idle wait is the bounded fallback that serves
 -- it if the notification never happened.
@@ -103,7 +104,7 @@ import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, write
 import Control.Exception (mask_, uninterruptibleMask_)
 import Control.Monad (void)
 import Hetoimasia.Foundation.Time (Instant)
-import Hetoimasia.GLFW.Internal.Notify (Notifier, notifyOwner)
+import Hetoimasia.GLFW.Internal.Notify (Notifier, dischargeNotification, registerNotification)
 import Numeric.Natural (Natural)
 
 -- ---------------------------------------------------------------------------
@@ -274,7 +275,8 @@ publishDemandWith hooks publisher request = do
   mask_ $ do
     published ← atomically (record (publisherSlot publisher))
     case published of
-      DemandPublished _ → uninterruptibleMask_ (afterPublication hooks >> void (notifyOwner (publisherNotifier publisher)))
+      DemandPublished _ →
+        uninterruptibleMask_ (afterPublication hooks >> void (dischargeNotification (publisherNotifier publisher)))
       _ → pure ()
     pure published
   where
@@ -286,4 +288,8 @@ publishDemandWith hooks publisher request = do
           | otherwise → do
               let advanced = revision + 1
               writeTVar cell (SlotOpen advanced (pending <> request))
+              -- The obligation is registered in the transaction that publishes,
+              -- so it is visible from the commit rather than from whenever the
+              -- publishing thread runs next.
+              registerNotification (publisherNotifier publisher)
               pure (DemandPublished advanced)
