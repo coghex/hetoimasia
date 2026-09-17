@@ -25,7 +25,9 @@
 -- control module. Two are rejected for the window modes: one names a mode's,
 -- saved placement's, or mode record's constructor, or sets a record's saved
 -- placement through a field, and one reaches for the mode representation and the
--- owner's record updates in the private mode module. Five are rejected for the input feeds: one names the reader's,
+-- owner's record updates in the private mode module. One is rejected for
+-- reaching for the private window attachment model, which no public module
+-- exports. Five are rejected for the input feeds: one names the reader's,
 -- control's, event's, epoch's, and reset token's constructors; one coerces a
 -- number into an input epoch, so a token could be retargeted; one rewrites a
 -- token's epoch through record syntax; and one reaches for the feed, its
@@ -235,6 +237,20 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so a mode's representation is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Mode"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that reaches for the private window attachment model" $
+    withClient "Client.hs" attachmentModelClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the attachment model is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Attachment"
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -785,6 +801,20 @@ modeInternalsClient =
     , ""
     , "moved ∷ ModeRecord → ModeRecord"
     , "moved = recordSaved (savedPlacement (Placement 0 0) (Extent 1 1))"
+    ]
+
+-- | A client reaching for the attachment model, its owner's authority, and a
+-- retirement fact in the private model sublibrary.
+attachmentModelClient ∷ String
+attachmentModelClient =
+  unlines
+    [ "module Client (retire) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Attachment (AttachmentModel, OwnerAuthority, Registered (..), RetirementFact (..), recordRetirementFact)"
+    , ""
+    , "retire ∷ OwnerAuthority → Registered → AttachmentModel () → Bool"
+    , "retire owner registered model ="
+    , "  either (const False) (const True) (recordRetirementFact owner (registeredAttachment registered) (registeredAcknowledgement registered) DependentsDisposed model)"
     ]
 
 -- | A client naming the input capabilities' and values' data constructors.

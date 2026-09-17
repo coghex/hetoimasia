@@ -19,6 +19,7 @@
 -- module only composes.
 module Test.GLFW.Spec (spec) where
 
+import qualified Test.GLFW.Attachment as Attachment
 import qualified Test.GLFW.Command as Command
 import qualified Test.GLFW.Control as Control
 import qualified Test.GLFW.Dynamic as Dynamic
@@ -45,5 +46,6 @@ spec = describe "GLFW" $ do
   Monitor.spec
   Input.spec
   Mode.spec
+  Attachment.spec
   Linking.spec
   Opacity.spec

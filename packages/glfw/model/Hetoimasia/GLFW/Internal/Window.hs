@@ -362,6 +362,7 @@ module Hetoimasia.GLFW.Internal.Window
     -- * Identity
   , WindowId
   , windowLocalIdentity
+  , windowSessionIdentity
 
     -- * Observations
   , WindowObservation
@@ -716,6 +717,10 @@ instance NFData WindowId where
 -- | The window's number within its session, starting at one.
 windowLocalIdentity ∷ WindowId → Natural
 windowLocalIdentity (WindowId _ local) = local
+
+-- | The identity of the session that issued the window.
+windowSessionIdentity ∷ WindowId → Unique
+windowSessionIdentity (WindowId identity _) = identity
 
 -- | Where a window is in its lifetime.
 data WindowPhase
