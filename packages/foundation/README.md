@@ -137,3 +137,25 @@ never retries, and never reopens. See
 Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
+
+## Tests
+
+`foundation-tests` owns this package's contracts. Its sources live in `test/`
+alone: `Main.hs`, the composer `Test.Foundation.Spec`, and one component tree
+each for `Logging`, `Resources`, `Failures`, `Recovery`, `Workers`, and
+`Messaging`, with that component's own helpers beside its specs. A new example
+belongs in the component spec whose contract it asserts. It may use only this
+package, the neutral `hetoimasia-test-support` library, and third-party
+packages; an example that needs the runtime, GLFW, or the console belongs to the
+suite that owns that behaviour instead. Run the suite, or one component of it:
+
+```bash
+cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
+cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct \
+  --test-options='--match Messaging'
+```
+
+A selector that matches no example fails the suite. Without the GLFW SDK, add
+`--project-file cabal.project.cpu`; see
+[docs/validation.md](../../docs/validation.md#building-without-the-glfw-sdk).
+The validation catalog runs the suite as the floor group `test.foundation`.

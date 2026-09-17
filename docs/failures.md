@@ -268,8 +268,8 @@ the caller discarded.
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct --test-options='--match /Failures/'`
-runs the `Failures` examples from `test/Test/Engine/Failures/Spec.hs`. They
+`cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match /Failures/'`
+runs the `Failures` examples from `packages/foundation/test/Test/Foundation/Failures/Spec.hs`. They
 cover:
 
 - typed catch of the original payload, including through nested `withResource`,
@@ -299,5 +299,5 @@ cover:
   its own exception; and rollback of an escaping failure and of only the
   caught action's writes.
 
-The validation catalog covers them through the floor group `test.engine`; see
+The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

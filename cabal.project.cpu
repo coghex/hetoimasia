@@ -1,0 +1,10 @@
+-- A CPU-only configuration for package suites that must build without the
+-- GLFW SDK. It shares `cabal.project.common` with `cabal.project` and differs
+-- only in leaving out the packages that need GLFW: the root package, whose
+-- suite depends on it, and `hetoimasia-glfw` itself. Select it with
+-- `--project-file cabal.project.cpu`; see docs/validation.md.
+import: cabal.project.common
+
+packages:
+  packages/foundation
+  tools/test-support

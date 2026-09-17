@@ -117,35 +117,11 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Spec
-        Test.Engine.Failures.Spec
         Test.Engine.GLFW.Linking
         Test.Engine.GLFW.Opacity
         Test.Engine.GLFW.Session
         Test.Engine.GLFW.Spec
         Test.Engine.GLFW.WindowModel
-        Test.Engine.Logging.Component
-        Test.Engine.Logging.Configuration
-        Test.Engine.Logging.Context
-        Test.Engine.Logging.Filtering
-        Test.Engine.Logging.Layout
-        Test.Engine.Logging.Sink
-        Test.Engine.Logging.Spec
-        Test.Engine.Logging.Support
-        Test.Engine.Logging.Worker
-        Test.Engine.Messaging.Channel
-        Test.Engine.Messaging.Opacity
-        Test.Engine.Messaging.Snapshot
-        Test.Engine.Messaging.Turns
-        Test.Engine.Messaging.Spec
-        Test.Engine.Recovery.Spec
-        Test.Engine.Resources.Buffer
-        Test.Engine.Resources.Collection
-        Test.Engine.Resources.Cost
-        Test.Engine.Resources.Construction
-        Test.Engine.Resources.Journal
-        Test.Engine.Resources.Opacity
-        Test.Engine.Resources.Smoke
-        Test.Engine.Resources.Spec
         Test.Engine.Runtime.Application
         Test.Engine.Runtime.Composition
         Test.Engine.Runtime.Console
@@ -154,15 +130,14 @@ test-suite hetoimasia-tests
         Test.Engine.Runtime.InboxFinish
         Test.Engine.Runtime.Lifetime
         Test.Engine.Runtime.LogFixture
+        Test.Engine.Runtime.Messaging
         Test.Engine.Runtime.Opacity
         Test.Engine.Runtime.Reporting
+        Test.Engine.Runtime.ResourceSmoke
         Test.Engine.Runtime.Spec
         Test.Engine.Runtime.Supervision
         Test.Engine.Runtime.Supervision.Support
-        Test.Engine.Workers.Spec
-    -- -T keeps the runtime's allocation statistics available, which the
-    -- cleanup-evidence inspection cost examples read.
-    ghc-options: -threaded -rtsopts -with-rtsopts=-T
+    ghc-options: -threaded -rtsopts
     build-tool-depends: hetoimasia:hetoimasia, hetoimasia-glfw:glfw-window-examples
     build-depends:
         base >=4.21 && <4.22,

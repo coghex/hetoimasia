@@ -9,6 +9,7 @@
 module Reuse (spec) where
 
 import Control.Monad (forM_, void)
+import Data.List (isInfixOf)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Json (Json, asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox
@@ -488,6 +489,48 @@ spec = describe "Validation evidence reuse" $ do
         (result, _, errors) ← reuseWith fixture inspection []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "resolved without worker declarations"
+
+  describe "the checked-in engine routing" $
+    it "assigns test.foundation to the engine worker, requires it in the aggregate, and reuses its published receipt" $
+      withCheckedInRouting $ \fixture workers → do
+        -- The workflow publishes every engine group's receipt under the name
+        -- the lookup asks for, so a group routed to the worker but never
+        -- published could never be reused.
+        workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
+        change fixture "README.md" "a prose-only update\n"
+        plan ← planRouted fixture workers "routed-plan.json"
+        engine ← workerGroups plan "haskell-engine"
+        engine `shouldContain` ["test.foundation"]
+        forM_ engine $ \group → do
+          workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
+          workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
+        entryText plan "test.foundation" "reason" `shouldReturn` Just "floor"
+        entryText plan "test.engine" "reason" `shouldReturn` Just "floor"
+
+        -- Required: every other engine group passing does not stand in for it.
+        writeFixtureFile (stubDirectory fixture) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
+        exitOf <$> reuseWith fixture plan (restated workers) `shouldReturn` ExitSuccess
+        forM_ (filter (/= "test.foundation") engine) $ \group →
+          exitOf <$> runGroup fixture plan group engineRoute `shouldReturn` ExitSuccess
+        (missing, output, _) ← aggregate fixture plan (reportedSuccess workers)
+        missing `shouldBe` ExitFailure 1
+        output `shouldContain` "test.foundation"
+        output `shouldContain` "neither an execution nor an applicable earlier receipt"
+        exitOf <$> runGroup fixture plan "test.foundation" engineRoute `shouldReturn` ExitSuccess
+        exitOf <$> aggregate fixture plan (reportedSuccess workers) `shouldReturn` ExitSuccess
+
+        -- Reusable: a later prose-only candidate takes the published receipt.
+        let earlier = root fixture </> "foundation-earlier.json"
+        copyFile (receiptPath fixture "test.foundation") earlier
+        forM_ engine $ \group → removeFile (receiptPath fixture group)
+        change fixture "README.md" "another prose-only update\n"
+        later ← planRouted fixture workers "routed-later.json"
+        install fixture later "test.foundation" [passing earlier]
+        (looked, lookedUp, _) ← reuseWith fixture later (restated workers)
+        looked `shouldBe` ExitSuccess
+        lookedUp `shouldContain` "reused=test.foundation"
+        document ← applicability fixture
+        recordText document "test.foundation" "source_run_url" `shouldBe` Just (runUrl 41 1)
 
 -- ---------------------------------------------------------------------------
 -- Driving the tools
@@ -1007,3 +1050,125 @@ fixtureCatalogWith policy inputs =
     , "  ]"
     , "}"
     ]
+
+-- ---------------------------------------------------------------------------
+-- The checked-in routing
+
+-- | A fixture carrying this checkout's own catalog, with each group's command
+-- replaced by @true@ so an example decides outcomes without a compiler, one
+-- minimal package per component the catalog names, and the worker declarations
+-- the validation workflow's plan step passes.
+withCheckedInRouting ∷ (Fixture → [String] → IO a) → IO a
+withCheckedInRouting action = do
+  checkout ← getCurrentDirectory
+  workflow ← readFile (checkout </> ".github/workflows/validation.yml")
+  let workers = concat [["--worker", declaration] | declaration ← mapMaybe planDeclaration (lines workflow)]
+  settings ← sanitizedEnvironment
+  withSystemTempDirectory "hetoimasia-routing" $ \directory → do
+    let pinned = ("RUNNER_OS", "Linux") : filter ((/= "RUNNER_OS") . fst) settings
+        fixture = Fixture directory (checkout </> "tools/validation") pinned ""
+    writeFixtureFile directory ".gitignore" fixtureIgnore
+    writeFixtureFile directory "README.md" "ordinary prose\n"
+    writeFixtureFile directory ".github/workflows/validation.yml" workflow
+    (seeded', _, errors) ←
+      run
+        pinned
+        directory
+        "python3"
+        [ "-c"
+        , "import json, os, sys\n\
+          \catalog = json.load(open(sys.argv[1], encoding='utf-8'))\n\
+          \packages = {}\n\
+          \for group in catalog['groups']:\n\
+          \    group['command'] = ['true']\n\
+          \    if group['component'] not in (None, 'all'):\n\
+          \        package, kind, name = group['component'].split(':')\n\
+          \        packages.setdefault(package, []).append((kind, name))\n\
+          \catalog['generated_paths'] = json.loads(sys.argv[2])\n\
+          \os.makedirs('tools/validation', exist_ok=True)\n\
+          \json.dump(catalog, open('tools/validation/catalog.json', 'w'), indent=2)\n\
+          \stanza = {'test': 'test-suite', 'exe': 'executable', 'lib': 'library'}\n\
+          \for package, components in packages.items():\n\
+          \    os.makedirs(package, exist_ok=True)\n\
+          \    with open(os.path.join(package, package + '.cabal'), 'w') as description:\n\
+          \        description.write('cabal-version: 3.16\\nname: ' + package + '\\nversion: 0.1.0.0\\nbuild-type: Simple\\n')\n\
+          \        for kind, name in components:\n\
+          \            description.write('\\n' + stanza[kind] + ' ' + name + '\\n    main-is: Main.hs\\n    hs-source-dirs: ' + name + '\\n    default-language: GHC2024\\n    build-depends: base\\n')\n\
+          \open('cabal.project', 'w').write('packages:\\n' + ''.join('  ' + package + '\\n' for package in packages))\n"
+        , checkout </> "tools/validation/catalog.json"
+        , fixtureGenerated
+        ]
+    (seeded', errors) `shouldBe` (ExitSuccess, "")
+    void $ git pinned directory ["init", "-b", "master"]
+    void $ git pinned directory ["add", "."]
+    void $ git pinned directory ["commit", "-q", "-m", "Seed the checked-in routing"]
+    seed ← revision fixture "HEAD"
+    createDirectoryIfMissing True (receiptsDirectory fixture)
+    let stub = stubDirectory fixture </> "gh"
+    writeFixtureFile (stubDirectory fixture) "gh" stubScript
+    permissions ← getPermissions stub
+    setPermissions stub (setOwnerExecutable True permissions)
+    action fixture {seeded = seed} workers
+
+-- | One worker declaration of the plan step, such as
+-- @haskell-engine=cpu:build.all,test.engine@. The aggregate step's result
+-- declarations interpolate a job result instead, so they never match.
+planDeclaration ∷ String → Maybe String
+planDeclaration line = case breakOn "--worker \"" line of
+  Just rest
+    | '$' `notElem` declaration && ':' `elem` declaration → Just declaration
+    where
+      declaration = takeWhile (/= '"') rest
+  _ → Nothing
+  where
+    breakOn needle haystack
+      | null haystack = Nothing
+      | take (length needle) haystack == needle = Just (drop (length needle) haystack)
+      | otherwise = breakOn needle (drop 1 haystack)
+
+-- | The engine worker's route, as the workflow's engine job runs a group.
+engineRoute ∷ [String]
+engineRoute = ["--worker", "haskell-engine", "--runner-class", "cpu"]
+
+-- | The plan's workers as the reuse lookup restates them: groups only.
+restated ∷ [String] → [String]
+restated = map (\argument → if "=" `isInfixOf` argument then dropClass argument else argument)
+  where
+    dropClass declaration =
+      let (name, rest) = break (== '=') declaration
+       in name ++ "=" ++ drop 1 (dropWhile (/= ':') rest)
+
+-- | Every declared worker reporting success, as the aggregate step reports
+-- job results.
+reportedSuccess ∷ [String] → [String]
+reportedSuccess workers =
+  concat [["--worker", takeWhile (/= '=') declaration ++ "=success"] | declaration ← workers, '=' `elem` declaration]
+
+-- | Resolve a plan routed to the given worker declarations.
+planRouted ∷ Fixture → [String] → FilePath → IO FilePath
+planRouted fixture workers name = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      ( [ tools fixture </> "plan.py"
+        , "--base", seeded fixture
+        , "--head", "HEAD"
+        , "--candidate", "HEAD"
+        , "--toolchain", "ghc=9.12.2"
+        , "--runner-os", "Linux"
+        , "--json"
+        ]
+          ++ workers
+      )
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  let target = root fixture </> name
+  writeFile target output
+  pure target
+
+workerGroups ∷ FilePath → String → IO [String]
+workerGroups plan worker = do
+  document ← parseJson <$> readFile plan
+  maybe (fail ("no worker " ++ worker ++ " in " ++ plan)) pure $
+    document >>= field "workers" >>= entryFor "name" worker >>= field "groups" >>= asArray >>= traverse asString

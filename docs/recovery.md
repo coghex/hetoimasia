@@ -208,8 +208,8 @@ idempotent.
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct --test-options='--match /Recovery/'`
-runs the `Recovery` examples from `test/Test/Engine/Recovery/Spec.hs`. They use
+`cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match /Recovery/'`
+runs the `Recovery` examples from `packages/foundation/test/Test/Foundation/Recovery/Spec.hs`. They use
 injected typed failures, real CPU scopes, an ordered trace, and `MVar`
 coordination with no sleeps, and cover:
 
@@ -232,5 +232,5 @@ coordination with no sleeps, and cover:
 - cancellation during work, classification, the wait, and a fallback escaping
   with its own context and cleanup evidence.
 
-The validation catalog covers them through the floor group `test.engine`; see
+The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

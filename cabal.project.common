@@ -1,0 +1,26 @@
+-- Settings every project configuration of this repository shares, imported by
+-- `cabal.project` and `cabal.project.cpu` so neither carries its own copy of
+-- the index pin, the build settings, or the warning policy.
+
+-- Use the known index baseline from Synarchy; advance deliberately.
+index-state: 2026-08-14T00:00:00Z
+optimization: 2
+jobs: $ncpus
+-- Keep the existing multi-worktree toolchain's jobserver setting.
+semaphore: False
+
+-- Apply strict build policy only to our packages, never dependencies.
+package hetoimasia
+  ghc-options: -Werror -j
+
+package hetoimasia-foundation
+  ghc-options: -Werror -j
+
+package hetoimasia-runtime
+  ghc-options: -Werror -j
+
+package hetoimasia-test-support
+  ghc-options: -Werror -j
+
+package hetoimasia-glfw
+  ghc-options: -Werror -j

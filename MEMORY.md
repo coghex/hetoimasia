@@ -56,6 +56,17 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   own logger fixture and the console spec its own variable names, so no spec
   imports another component's helpers except the messaging Channel/Snapshot
   supervised cases, which TEST-4 splits.
+- TEST-4 (#127) moved the foundation contracts into
+  `hetoimasia-foundation:foundation-tests` (`packages/foundation/test/`,
+  `Test.Foundation.*`), catalog floor group `test.foundation` on the
+  `haskell-engine` worker. Root `hetoimasia-tests` keeps `Runtime` and `GLFW`
+  only; the console resource smoke (`Test.Engine.Runtime.ResourceSmoke`) and the
+  six supervised channel/snapshot waits (`Test.Engine.Runtime.Messaging`) sit
+  under root `Runtime` until TEST-5 moves them into the runtime package. Root
+  `--match Logging` still selects the runtime `Logging lifetime` subgroup.
+  `cabal.project` now imports the shared `cabal.project.common`, which
+  `cabal.project.cpu` also imports to build the foundation suite without the
+  GLFW SDK. The per-example mapping is `docs/foundation_tests_mapping.md`.
 - Next design: Vulkan ownership, window/surface retirement, completion, frame
   scheduling, and platform verification. The design remains exploring; the
   four GLFW repairs gate implementation. Completed runtime/messaging arcs need

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 7,
+  "policy_version": 8,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -29,6 +29,7 @@
   "floor": [
     "build.all",
     "test.engine",
+    "test.foundation",
     "smoke.console"
   ],
   "groups": [
@@ -50,7 +51,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the Logging, Runtime, Resources, Failures, Recovery, Workers, Messaging, and GLFW components.",
+      "description": "Focused Hspec examples for the root package's Runtime and GLFW components, including the console resource smoke and the supervised messaging waits.",
       "command": [
         "cabal",
         "test",
@@ -58,6 +59,23 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia:test:hetoimasia-tests",
+      "inputs": [],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.foundation",
+      "description": "Focused Hspec examples for the foundation package's Logging, Resources, Failures, Recovery, Workers, and Messaging contracts.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-foundation:foundation-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-foundation:test:foundation-tests",
       "inputs": [],
       "framework": "hspec",
       "runner": "cpu",
