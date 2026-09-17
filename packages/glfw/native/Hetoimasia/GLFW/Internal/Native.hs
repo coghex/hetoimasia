@@ -184,6 +184,7 @@ productionNative =
     , nativeClearWindowSizeLimits = \window →
         c_glfwSetWindowSizeLimits window glfwDontCare glfwDontCare glfwDontCare glfwDontCare
     , nativeWindowCapabilities = backendWindowCapabilities
+    , nativePlatformError = fromIntegral glfwPlatformError
     , nativeFeatureUnavailable = fromIntegral glfwFeatureUnavailable
     , nativeMonitor = productionMonitors
     }
@@ -842,6 +843,9 @@ foreign import capi "hetoimasia_glfw.h value GLFW_DECORATED" glfwDecorated ∷ C
 foreign import capi "hetoimasia_glfw.h value GLFW_DONT_CARE" glfwDontCare ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_CONNECTED" glfwConnected ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_DISCONNECTED" glfwDisconnected ∷ CInt
+
+-- | @GLFW_PLATFORM_ERROR@, the error an expected platform failure reports.
+foreign import capi "hetoimasia_glfw.h value GLFW_PLATFORM_ERROR" glfwPlatformError ∷ CInt
 
 -- | @GLFW_FEATURE_UNAVAILABLE@, the error a query reports for a property the
 -- platform cannot provide.

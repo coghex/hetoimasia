@@ -51,7 +51,8 @@
 -- A wake is a hint. It carries no message, may be coalesced with others, and
 -- proves nothing about work; whatever state made it worth waking is
 -- authoritative, and what to do after an expected platform failure is the
--- caller's policy.
+-- caller's policy. Only @GLFW_PLATFORM_ERROR@ evidence is such a failure; any
+-- other evidence is raised, as 'wakeSession' describes.
 --
 -- A wake makes at most one native call plus bounded, non-blocking bookkeeping:
 -- one STM transaction that never retries to be admitted, one to leave, and the
@@ -487,6 +488,8 @@ data Native = Native
     -- ^ Every size limit @GLFW_DONT_CARE@.
   , nativeWindowCapabilities ∷ Backend → WindowCapabilities
     -- ^ What windows cannot do or report on a backend.
+  , nativePlatformError ∷ !Int
+    -- ^ The error code of an expected platform failure: @GLFW_PLATFORM_ERROR@.
   , nativeFeatureUnavailable ∷ !Int
     -- ^ The error code a query reports for a property this platform cannot
     -- provide: @GLFW_FEATURE_UNAVAILABLE@.
@@ -553,11 +556,10 @@ data WakeOutcome
   | WakeTerminal
     -- ^ The session has begun closing, or has closed: GLFW was not entered.
   | WakeFailed !Reports
-    -- ^ The platform reported a failure during the call, attributed to this
-    -- call alone. The reports include every error the callback recorded for
-    -- it, those lost to the bound, and callback faults; a native error the call
-    -- left behind that no report recorded is counted as a callback fault, so
-    -- lost evidence is never a successful wake.
+    -- ^ An expected platform failure: every report recorded for this call alone
+    -- is @GLFW_PLATFORM_ERROR@, none was lost or faulted, and the error the call
+    -- left behind, if any, is that same code. Any other evidence is raised
+    -- instead; see 'wakeSession'.
   deriving (Eq, Show)
 
 -- | The session's wake capability.
@@ -652,6 +654,9 @@ synchronizeMonitorsOperation, reconcileMonitorsOperation, resolveMonitorOperatio
 synchronizeMonitorsOperation = operation "synchronize monitors"
 reconcileMonitorsOperation = operation "reconcile monitor events"
 resolveMonitorOperation = operation "resolve monitor"
+
+wakeOperation ∷ Operation
+wakeOperation = operation "wake session"
 
 takeReportsOperation, createWindowOperation, destroyWindowOperation ∷ Operation
 takeReportsOperation = operation "take asynchronous reports"
@@ -939,12 +944,23 @@ closeWakeGate gate = uninterruptibleMask_ $ do
 -- native wait in progress, or the next one, returns.
 --
 -- Any thread may call it, bound or unbound, including the owner. It answers
--- 'WakeTerminal' without entering GLFW once the session has begun closing. An
--- error reported during the call is attributed to this call alone and answered
--- as 'WakeFailed'; it is neither left among the session's asynchronous reports
--- nor taken from them or from a concurrent owner operation. A native table that
--- raises propagates its exception once the call's accounting has settled. The
--- wake does not retry, and does not decide what an expected failure means.
+-- 'WakeTerminal' without entering GLFW once the session has begun closing.
+--
+-- An error reported during the call is attributed to this call alone; it is
+-- neither left among the session's asynchronous reports nor taken from them or
+-- from a concurrent owner operation. The evidence is then classified. Only an
+-- expected platform failure — every recorded report @GLFW_PLATFORM_ERROR@, none
+-- lost or faulted, and the error the call left in its thread's native error
+-- state either that code or none — is answered as the ordinary 'WakeFailed'.
+-- Anything else — another code, such as @GLFW_NOT_INITIALIZED@, a report lost
+-- to the bound, a callback fault, or an error the call left that no report
+-- recorded — is a programming or lifetime violation, or evidence that cannot be
+-- classified, and is raised as a 'NativeFailure' attributed to @wake session@,
+-- carrying the call's reports with an unrecorded error counted as a callback
+-- fault. So lost evidence is never a successful wake, and never a recoverable
+-- one. A native table that raises propagates its exception. Either way the
+-- call's accounting has settled first. The wake does not retry, and does not
+-- decide what an expected failure means.
 wakeSession ∷ SessionWake → IO WakeOutcome
 wakeSession wake = mask_ $ do
   admitted ← atomically (enterWake (wakeGate wake))
@@ -955,15 +971,31 @@ wakeSession wake = mask_ $ do
         mark ← beginWakeReports capture
         code ← nativePostEmptyEvent (wakeNative wake) mark `onException` takeWakeReports capture mark
         reports ← takeWakeReports capture mark
-        pure $
-          if hasReports reports
-            then WakeFailed reports
-            else
-              if code /= 0
-                then WakeFailed reports {callbackFaults = callbackFaults reports + 1}
-                else WakePosted
+        classifyWake (nativePlatformError (wakeNative wake)) code reports
   where
     capture = wakeCapture wake
+
+-- | Classify what one wake call left: nothing is a posted wake, evidence of only
+-- the platform error is an expected failure, and anything else is raised.
+classifyWake ∷ Int → Int → Reports → IO WakeOutcome
+classifyWake platformError code reports
+  | not (hasReports evidence) = pure WakePosted
+  | expected = pure (WakeFailed evidence)
+  | otherwise = throwFailure glfwComponent wakeOperation [] (NativeFailure NativeCallReturned evidence)
+  where
+    recorded = reportedErrors reports
+    -- An error the call left with no evidence at all; a lost report or a
+    -- callback fault already accounts for one that was not recorded.
+    unrecorded = code /= 0 && not (hasReports reports)
+    evidence
+      | unrecorded = reports {callbackFaults = callbackFaults reports + 1}
+      | otherwise = reports
+    expected =
+      not (null recorded)
+        && all ((== platformError) . nativeErrorCode) recorded
+        && reportsLost reports == 0
+        && callbackFaults reports == 0
+        && (code == 0 || code == platformError)
 
 -- | Admit one wake call if the gate is open. Never retries.
 enterWake ∷ TVar WakeGate → STM Bool

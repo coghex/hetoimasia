@@ -576,10 +576,18 @@ an owner operation or a callback could hold.
 |---|---|
 | `WakePosted` | The empty event was posted and nothing was reported during the call. |
 | `WakeTerminal` | The session has begun closing or has closed. GLFW was not entered. |
-| `WakeFailed reports` | An expected platform failure, with the evidence [attributed to this call](#native-error-evidence). |
+| `WakeFailed reports` | An expected platform failure, with the evidence [attributed to this call](#native-error-evidence): every report recorded for the call is `GLFW_PLATFORM_ERROR`, none was lost or faulted, and the error the call left in its thread's GLFW error state is that code or none. |
 
-A native table that raises is a programming failure. Its exception propagates
-unchanged once the call's accounting has settled. No outcome retries the wake,
+Any other evidence is not an ordinary outcome. It raises a `NativeFailure`
+attributed to `glfw` `wake session` and carrying the call's reports. That covers
+another code (such as `GLFW_NOT_INITIALIZED`, alone or beside a platform error),
+a report lost to the bound, a callback fault, and an error the call left that no
+report recorded, which is counted as a callback fault. These are programming or
+lifetime violations, or evidence that cannot be classified, so they keep the
+package's typed-failure semantics rather than becoming a failure a caller might
+recover from by degrading. A native table that raises is a programming failure
+too. Its exception propagates unchanged. Either way, the call's accounting has
+settled first. No outcome retries the wake,
 reclassifies other work, or chooses a degradation policy. Warning once and
 falling back to bounded polling after an expected failure is the window host's
 concern, deferred to TIME-4 of the [runtime scheduling
@@ -644,9 +652,10 @@ Each class, and each wake call, keeps its first `errorEvidenceCapacity` reports
 and counts later ones in `reportsLost`. A lost report or a callback fault still
 counts as reported, so full storage can never turn a native failure into
 success. The same C call that posts also clears the calling thread's GLFW error
-state before the post and reads it after. If the post left an error that no
-report recorded for the call, the wake adds a callback fault, so lost evidence
-never becomes `WakePosted`.
+state before the post and reads it after. If the post left an error and the call
+has no evidence at all, the wake adds a callback fault. Lost or faulted evidence
+therefore never becomes `WakePosted`, and, being unclassifiable, is raised rather
+than answered as `WakeFailed` (see [Waking the owner](#waking-the-owner)).
 
 ## Teardown, poisoning, and controlled blocking
 
@@ -2448,13 +2457,15 @@ own on Linux, or a human's explicit approval on a real desktop.
   A scripted platform counts posts as pending for the next finite wait. Without
   sleeps, the examples prove: a wake before, during, and after the owner's wait,
   from unbound, bound, and owner threads; a scripted platform failure answered as
-  that call's `WakeFailed`, posted once and not retried; two overlapping wakes each
-  attributed their own report, beside a concurrent owner operation's report and
+  that call's `WakeFailed`, posted once and not retried; `GLFW_NOT_INITIALIZED`,
+  alone or beside a platform error, raised as a `NativeFailure` from `wake session`
+  with the gate still admitting afterwards; two overlapping wakes each
+  attributed their own platform-error report, beside a concurrent owner operation's report and
   an unrelated asynchronous one; one wake's reports bounded, truncated, and
-  counted as the capture bounds them, with a callback fault inside the wake
-  attributed to it and nothing left for a later owner read, asynchronous read,
-  or teardown; a report whose mark could not be read failing the wake from the
-  error it left; an admitted wake finishing before scripted termination, which
+  counted as the capture bounds them, and a callback fault inside the wake
+  attributed to it, both raised as unclassifiable, with nothing left for a later
+  owner read, asynchronous read, or teardown; a report whose mark could not be
+  read raising from the error it left; an admitted wake finishing before scripted termination, which
   observes none in flight, while wakes during the drain answer `WakeTerminal`; a
   worker waking until terminal while the session closes, with every post
   recorded before teardown and wakes issued from termination and the error

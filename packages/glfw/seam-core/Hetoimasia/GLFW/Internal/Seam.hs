@@ -958,6 +958,7 @@ seamNative seam =
     , nativeSetWindowDecorated = \handle decorated → control (SetWindowDecorated (windowKey handle) decorated)
     , nativeClearWindowSizeLimits = control . ClearWindowSizeLimits . windowKey
     , nativeWindowCapabilities = scriptWindowCapabilities script
+    , nativePlatformError = 0x00010008
     , nativeFeatureUnavailable = featureUnavailableCode
     , nativeMonitor =
         MonitorNative

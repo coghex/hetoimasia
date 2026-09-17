@@ -34,6 +34,8 @@ import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef,
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as Text
 import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
+import Hetoimasia.Foundation.Failure (FailureCause (..), FailureEvidence (..), FailureOrigin (..), failureEvidence, operationText)
+import Hetoimasia.Foundation.Log (componentText)
 import Hetoimasia.Foundation.Resource (withScoped)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Seam
@@ -46,15 +48,17 @@ spec = do
   describe "GLFW session wake" $ do
     it "wakes the owner before, during, and after its wait, from unbound, bound, and owner threads"
       (boundedExample testWakeAroundWait)
-    it "answers a platform failure reported during the post as that call's typed failure, without retrying"
+    it "answers a platform failure reported during the post as that call's expected failure, without retrying"
       (boundedExample testPlatformFailure)
+    it "raises a programming or lifetime error reported during the post, alone or beside a platform failure, as an attributed failure"
+      (boundedExample testUnexpectedErrorRaised)
 
   describe "GLFW session wake error attribution" $ do
     it "attributes each of two overlapping wakes its own report, apart from a concurrent owner operation's and an unrelated asynchronous report"
       (boundedExample testOverlappingAttribution)
-    it "bounds one wake's reports as the capture does, counts its callback faults, and leaves nothing for later reads or teardown"
+    it "bounds one wake's reports as the capture does, raises lost or faulted evidence, and leaves nothing for later reads or teardown"
       (boundedExample testWakeEvidenceBounded)
-    it "fails a wake whose report could not be attributed, from the error the call left behind"
+    it "raises a wake whose report could not be attributed, from the error the call left behind"
       (boundedExample testUnattributableReport)
 
   describe "GLFW session wake lifetime" $ do
@@ -123,12 +127,48 @@ testPlatformFailure = do
   -- One post per call: a failed wake is not retried.
   seamCalls seam `shouldReturn` entryCalls <> [PostEmptyEvent, PostEmptyEvent] <> exitCalls
 
+testUnexpectedErrorRaised ∷ Expectation
+testUnexpectedErrorRaised = do
+  step ← newIORef (0 ∷ Int)
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            call ← atomicModifyIORef' step (\next → (next + 1, next))
+            case call of
+              0 → reportError reporter notInitialized "The GLFW library is not initialized"
+              1 → do
+                reportError reporter platformErrorCode "platform"
+                reportError reporter notInitialized "not initialized"
+              _ → pure ()
+        }
+  (alone, beside, afterwards, asynchronous) ← asProcessMainThread seam $ entered seam $ \session → do
+    let wake = sessionWake session
+    alone ← onThread forkIO (caughtWakeFailure (wakeSession wake))
+    beside ← onThread forkIO (caughtWakeFailure (wakeSession wake))
+    -- Both calls left, so the gate still admits and close will not wait.
+    afterwards ← onThread forkIO (wakeSession wake)
+    asynchronous ← takeAsynchronousReports session
+    pure (alone, beside, afterwards, asynchronous)
+  fst alone
+    `shouldBe` NativeFailure NativeCallReturned (Reports [NativeError notInitialized "The GLFW library is not initialized" False OtherThread] 0 0)
+  originOf (snd alone) `shouldBe` Just ("glfw", "wake session")
+  fst beside
+    `shouldBe` NativeFailure
+      NativeCallReturned
+      (Reports [NativeError platformErrorCode "platform" False OtherThread, NativeError notInitialized "not initialized" False OtherThread] 0 0)
+  afterwards `shouldBe` WakePosted
+  asynchronous `shouldBe` Reports [] 0 0
+  seamCalls seam `shouldReturn` entryCalls <> [PostEmptyEvent, PostEmptyEvent, PostEmptyEvent] <> exitCalls
+  where
+    notInitialized = 0x00010001
+
 -- ---------------------------------------------------------------------------
 -- Attribution
 
 testOverlappingAttribution ∷ Expectation
 testOverlappingAttribution = do
-  codes ← newIORef []
+  names ← newIORef []
   inside ← newTVarIO (0 ∷ Int)
   opened ← newTVarIO False
   captured ← newEmptyMVar
@@ -137,8 +177,8 @@ testOverlappingAttribution = do
       defaultScript
         { scriptPostEmptyEvent = \reporter → do
             self ← myThreadId
-            code ← fromMaybe 0 . lookup self <$> readIORef codes
-            reportError reporter code (Char8.pack (show code))
+            name ← fromMaybe "unnamed" . lookup self <$> readIORef names
+            reportError reporter platformErrorCode name
             _ ← tryPutMVar captured reporter
             atomically (modifyTVar' inside (+ 1))
             atomically (readTVar opened >>= check)
@@ -146,11 +186,11 @@ testOverlappingAttribution = do
         }
   (ownerFailure, outcomes, asynchronous) ← asProcessMainThread seam $ entered seam $ \session → do
     let wake = sessionWake session
-    results ← forM [(forkIO, 0x00010101), (forkOS, 0x00010102)] $ \(fork, code) → do
+    results ← forM [(forkIO, "unbound waker"), (forkOS, "bound waker")] $ \(fork, name) → do
       result ← newEmptyMVar
       _ ← fork $ do
         self ← myThreadId
-        atomicModifyIORef' codes (\known → ((self, code) : known, ()))
+        atomicModifyIORef' names (\known → ((self, name) : known, ()))
         try (wakeSession wake) >>= putMVar result
       pure result
     -- Both wake calls are inside their native calls, and each has reported.
@@ -163,8 +203,8 @@ testOverlappingAttribution = do
     asynchronous ← takeAsynchronousReports session
     pure (ownerFailure, outcomes, asynchronous)
   outcomes
-    `shouldBe` [ WakeFailed (Reports [NativeError 0x00010101 (Text.pack (show (0x00010101 ∷ Int))) False OtherThread] 0 0)
-               , WakeFailed (Reports [NativeError 0x00010102 (Text.pack (show (0x00010102 ∷ Int))) False OtherThread] 0 0)
+    `shouldBe` [ WakeFailed (Reports [NativeError platformErrorCode "unbound waker" False OtherThread] 0 0)
+               , WakeFailed (Reports [NativeError platformErrorCode "bound waker" False OtherThread] 0 0)
                ]
   nativeReports ownerFailure `shouldBe` Reports [NativeError 0x00010003 "owner wait" False ProcessMainThread] 0 0
   asynchronous `shouldBe` Reports [NativeError 0x00010005 "unrelated" False OtherThread] 0 0
@@ -176,35 +216,35 @@ testWakeEvidenceBounded ∷ Expectation
 testWakeEvidenceBounded = do
   step ← newIORef (0 ∷ Int)
   let long = Char8.replicate (errorDescriptionLimit + 5) 'w'
-      codes = [1 .. errorEvidenceCapacity + 2]
+      count = errorEvidenceCapacity + 2
   seam ←
     newSeam
       defaultScript
         { scriptPostEmptyEvent = \reporter → do
             call ← atomicModifyIORef' step (\next → (next + 1, next))
             case call of
-              0 → mapM_ (\code → reportError reporter code (if code == 1 then long else "kept")) codes
-              1 → reportErrorWithFailingIdentity reporter 7 "unidentified"
+              0 → mapM_ (\index → reportError reporter platformErrorCode (if index == (1 ∷ Int) then long else "kept")) [1 .. count]
+              1 → reportErrorWithFailingIdentity reporter platformErrorCode "unidentified"
               _ → pure ()
         }
   (saturated, faulted, clean, asynchronous) ← asProcessMainThread seam $ entered seam $ \session → do
     let wake = sessionWake session
-    saturated ← onThread forkIO (wakeSession wake)
-    faulted ← onThread forkIO (wakeSession wake)
+    saturated ← onThread forkIO (fst <$> caughtWakeFailure (wakeSession wake))
+    faulted ← onThread forkIO (fst <$> caughtWakeFailure (wakeSession wake))
     clean ← onThread forkIO (wakeSession wake)
     -- An owner operation claims none of the wakes' reports.
     processWindowEvents session (AwaitEventsFor 0.5)
     asynchronous ← takeAsynchronousReports session
     pure (saturated, faulted, clean, asynchronous)
-  case saturated of
-    WakeFailed reports → do
-      map nativeErrorCode (reportedErrors reports) `shouldBe` take errorEvidenceCapacity codes
-      map nativeErrorTruncated (reportedErrors reports) `shouldBe` (True : replicate (errorEvidenceCapacity - 1) False)
-      map (Text.length . nativeErrorDescription) (take 1 (reportedErrors reports)) `shouldBe` [errorDescriptionLimit]
-      reportsLost reports `shouldBe` 2
-      callbackFaults reports `shouldBe` 0
-    other → expectationFailure ("the saturated wake answered " <> show other)
-  faulted `shouldBe` WakeFailed (Reports [] 0 1)
+  -- Every report is the platform error, but lost or faulted evidence cannot be
+  -- classified as an expected failure, so both calls raise it.
+  let reports = nativeReports saturated
+  map nativeErrorCode (reportedErrors reports) `shouldBe` replicate errorEvidenceCapacity platformErrorCode
+  map nativeErrorTruncated (reportedErrors reports) `shouldBe` (True : replicate (errorEvidenceCapacity - 1) False)
+  map (Text.length . nativeErrorDescription) (take 1 (reportedErrors reports)) `shouldBe` [errorDescriptionLimit]
+  reportsLost reports `shouldBe` 2
+  callbackFaults reports `shouldBe` 0
+  faulted `shouldBe` NativeFailure NativeCallReturned (Reports [] 0 1)
   clean `shouldBe` WakePosted
   asynchronous `shouldBe` Reports [] 0 0
   seamCalls seam `shouldReturn` entryCalls <> [PostEmptyEvent, PostEmptyEvent, PostEmptyEvent, WaitEvents 0.5] <> exitCalls
@@ -214,11 +254,11 @@ testUnattributableReport = do
   seam ←
     newSeam defaultScript {scriptPostEmptyEvent = \reporter → reportErrorWithFailingWakeMark reporter 0x00010008 "unmarked"}
   (outcome, asynchronous) ← asProcessMainThread seam $ entered seam $ \session →
-    (,) <$> onThread forkIO (wakeSession (sessionWake session)) <*> takeAsynchronousReports session
+    (,) <$> onThread forkIO (fst <$> caughtWakeFailure (wakeSession (sessionWake session))) <*> takeAsynchronousReports session
   -- The callback could not tell which call the report belonged to, so it kept
-  -- it as an asynchronous fault; the wake still fails, from the error code the
-  -- post left in its own thread's error state.
-  outcome `shouldBe` WakeFailed (Reports [] 0 1)
+  -- it as an asynchronous fault; the wake still raises, from the error code the
+  -- post left in its own thread's error state that no report recorded.
+  outcome `shouldBe` NativeFailure NativeCallReturned (Reports [] 0 1)
   asynchronous `shouldBe` Reports [] 0 1
 
 -- ---------------------------------------------------------------------------
@@ -525,6 +565,23 @@ onThread fork action = do
   finished ← newEmptyMVar
   _ ← fork (try action >>= putMVar finished)
   takeMVar finished >>= either (throwIO ∷ SomeException → IO a) pure
+
+-- | @GLFW_PLATFORM_ERROR@, the code the seam treats as an expected platform
+-- failure.
+platformErrorCode ∷ Int
+platformErrorCode = 0x00010008
+
+-- | The failure a wake raised, beside the exception as caught.
+caughtWakeFailure ∷ IO WakeOutcome → IO (NativeFailure, SomeException)
+caughtWakeFailure action =
+  try action >>= \case
+    Right outcome → unexpected ("the wake answered " <> show outcome <> " instead of failing")
+    Left caught → maybe (unexpected ("the wake failed with " <> displayException caught)) (\failure → pure (failure, caught)) (fromException caught)
+
+originOf ∷ SomeException → Maybe (Text.Text, Text.Text)
+originOf caught = case failureCause (failureEvidence caught) of
+  EngineOrigin origin → Just (componentText (originComponent origin), operationText (originOperation origin))
+  NativeCause → Nothing
 
 -- | The typed failure an action raised.
 expectFailure ∷ Exception e ⇒ IO a → IO e
