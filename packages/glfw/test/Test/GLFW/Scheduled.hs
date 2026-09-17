@@ -87,7 +87,7 @@ import Hetoimasia.Runtime.Supervision
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
 import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn)
 
 spec ∷ Spec
 spec = describe "GLFW scheduled owner turns" $ do
@@ -501,19 +501,48 @@ testFinishes = do
   pumps seam `shouldReturn` [WaitEvents 0.25]
   unread `shouldReturn` 0
 
--- | An idle wait above zero but below a nanosecond is no bound a scheduled turn
+-- | An idle wait of less than a whole nanosecond is no bound a scheduled turn
 -- could wait for, so the host refuses it before acquiring anything, exactly as
--- it refuses the waits the unscheduled loop cannot bound.
+-- it refuses the waits the unscheduled loop cannot bound. A wait that is not a
+-- whole number of nanoseconds is floored rather than rounded, because the
+-- fallback is an upper bound.
 testUnboundableIdleWait ∷ Expectation
 testUnboundableIdleWait = do
   (clock, _) ← scriptedClock []
   let base = settings [] clock
+      rejected = \case
+        Left (IdleWaitRejected _) → True
+        _ → False
   validateHostConfig base `shouldBe` Right ()
-  validateHostConfig base {hostIdleWait = 1e-12} `shouldSatisfy` \case
-    Left (IdleWaitRejected _) → True
-    _ → False
-  -- The smallest wait that is a whole nanosecond is still accepted.
+  -- Refused: nearest-nanosecond rounding would make each of these a one- or
+  -- two-nanosecond bound longer than the seconds configured.
+  map (rejected . validateHostConfig . (\wait → base {hostIdleWait = wait})) [1e-12, 0.5e-9, 0.75e-9, 0.9e-9]
+    `shouldBe` replicate 4 True
+  -- The smallest wait that is a whole nanosecond is accepted as itself.
   validateHostConfig base {hostIdleWait = 1e-9} `shouldBe` Right ()
+  boundedWaitOf 1e-9 `shouldReturn` (durationOf 1, WaitEvents 1e-9)
+  -- An upward-rounding wait is floored to the whole nanosecond below it, so the
+  -- bound never exceeds what was configured.
+  boundedWaitOf 1.6e-9 `shouldReturn` (durationOf 1, WaitEvents 1e-9)
+  boundedWaitOf 2.5e-9 `shouldReturn` (durationOf 2, WaitEvents 2e-9)
+  -- A wait already whole in nanoseconds is unchanged.
+  boundedWaitOf 0.25 `shouldReturn` (durationOf (millis 250), WaitEvents 0.25)
+  boundedWaitOf 0.1 `shouldReturn` (durationOf (millis 100), WaitEvents 0.1)
+
+-- | The fallback bound one quiet scheduled turn waited for, and the seconds it
+-- passed to the native wait.
+boundedWaitOf ∷ Double → IO (Duration, NativeCall)
+boundedWaitOf wait = do
+  seam ← newSeam defaultScript
+  (clock, _) ← scriptedClock [0, 1]
+  records ←
+    scheduled seam (settings [] clock) {hostIdleWait = wait} $ \_ →
+      turning NoUpdateDemand (\_ → pure (FinishWith ()))
+  case (map scheduledPacing records, take 1 <$> pumps seam) of
+    ([WaitedForFallback bound], pumped) → pumped >>= \case
+      [call] → pure (bound, call)
+      calls → unexpected ("expected one native step, found " <> show calls)
+    (pacings, _) → unexpected ("expected one turn waiting its bound, found " <> show pacings)
 
 -- ---------------------------------------------------------------------------
 -- Scripted clocks

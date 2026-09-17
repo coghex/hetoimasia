@@ -2423,13 +2423,16 @@ what arrived after it is inspected by the next turn. A wake with nothing due and
 no expired deadline is an ordinary turn that recomputes its wait and offers its
 one update opportunity, no more: an event wake does not itself require a redraw.
 The fallback bound stays finite and strictly positive whatever happens to the
-wake, so a configured `hostIdleWait` above zero but below a nanosecond is
-refused by `validateHostConfig` before anything is acquired, as an
-`IdleWaitRejected`.
+wake, and it is an upper bound, so a configured `hostIdleWait` becomes the whole
+nanosecond at or below it rather than the nearest one: `1.6e-9` is a
+one-nanosecond bound, not a two-nanosecond one, and a wait under a whole
+nanosecond, which nearest-rounding would otherwise lengthen to one, is refused
+by `validateHostConfig` before anything is acquired, as an `IdleWaitRejected`.
 
 The conversion from a `Duration` to the seconds `glfwWaitEventsTimeout` takes
 lives here, in the GLFW layer, and is the only one; a wait is only ever entered
-for a positive duration, so the value it passes is finite and above zero.
+for a positive duration, so the value it passes is finite, above zero, and never
+above the bound it came from.
 
 ### Demand slots
 
@@ -2649,7 +2652,10 @@ update surviving that turn's consumption of an older revision and being captured
 by the next, after which bounded waiting resumes; the saturated-queue checkpoint
 matrix stopping the scheduled turn at the same three points as the unscheduled
 one, with the same dispositions; the loop returning its update's own result; and
-an idle wait below a nanosecond refused before anything is acquired.
+the fallback bound floored to a whole nanosecond rather than rounded up —
+`1e-9`, `1.6e-9`, `2.5e-9`, `0.25`, and `0.1` each waited for exactly, and
+`1e-12`, `0.5e-9`, `0.75e-9`, and `0.9e-9` each refused before anything is
+acquired.
 
 The host's CPU examples run whole applications over the test seam in
 `glfw-tests`. The seam's native table scripts the poll and the finite

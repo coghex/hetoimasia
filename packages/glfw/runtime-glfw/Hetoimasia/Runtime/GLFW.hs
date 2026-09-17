@@ -185,7 +185,10 @@
 -- been reached, or waits the shorter of the time remaining to the earliest
 -- deadline and the configured fallback bound 'hostIdleWait'. A deadline only
 -- ever shortens a wait; no zero or negative timeout reaches GLFW; and a host
--- with no demand at all still waits the bound rather than spinning.
+-- with no demand at all still waits the bound rather than spinning. That bound
+-- is the whole nanosecond at or below the seconds configured, never the nearest
+-- one, so it can never exceed them; a wait under a whole nanosecond is refused
+-- by 'validateHostConfig' instead.
 --
 -- It then samples 'hostClock' once more and reconciles, dispatches, and offers
 -- 'scheduledUpdate' exactly as 'runOwnerLoop' does, with the same checkpoints,

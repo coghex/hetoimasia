@@ -127,7 +127,9 @@ import Hetoimasia.Foundation.Time
   , Instant
   , MonotonicSource
   , convertedDuration
+  , convertedRounding
   , deadlineReached
+  , durationFromNanoseconds
   , durationFromSeconds
   , durationNanoseconds
   , monotonicSource
@@ -257,8 +259,8 @@ data HostConfig = HostConfig
   , hostIdleWait ∷ !Double
     -- ^ The most seconds an idle turn waits for a native event, and the
     -- scheduled path's fallback bound. Finite, above zero, at most
-    -- 'maximumIdleWait', and at least one nanosecond, so it is always a
-    -- positive 'Duration'.
+    -- 'maximumIdleWait', and at least one whole nanosecond, so it is always a
+    -- positive 'Duration' that never exceeds the seconds configured.
   , hostClock ∷ !MonotonicSource
     -- ^ The monotonic source 'runScheduledOwnerLoop' samples, and the clock
     -- domain every deadline it is given belongs to. 'runOwnerLoop' never reads
@@ -329,8 +331,8 @@ validateHostConfig config
   | hostEventBudget config < 1 = Left (EventBudgetRejected (hostEventBudget config))
   -- Written so a NaN, which fails every comparison, is refused too.
   | not (wait > 0 && wait <= maximumIdleWait) = Left (IdleWaitRejected wait)
-  -- A wait above zero but below one nanosecond is no bound the scheduled path
-  -- could wait for, so it is refused here rather than rounded to nothing.
+  -- A wait of less than a whole nanosecond is no bound the scheduled path could
+  -- wait for, so it is refused here rather than rounded up to one.
   | Left _ ← idleWaitDuration config = Left (IdleWaitRejected wait)
   | limit < 1 || limit < length (hostWindowConfigs config) = Left (WindowLimitRejected limit)
   | input < 1 || input > maximumCapacity = Left (InputCapacityRejected input)
@@ -343,8 +345,20 @@ validateHostConfig config
 -- | The configured fallback bound as a positive 'Duration', or why those
 -- seconds are none. 'validateHostConfig' refuses a configuration this rejects,
 -- so an accepted host always has one.
+--
+-- The bound is an upper bound, so the conversion may never round up past the
+-- seconds configured: 'durationFromSeconds' rounds to the nearest nanosecond
+-- and reports the rounding it applied, and a positive rounding means the whole
+-- nanosecond below is the real bound. A wait that floors to no nanoseconds at
+-- all — anything under one, which nearest-rounding would otherwise accept as
+-- one — is refused rather than lengthened.
 idleWaitDuration ∷ HostConfig → Either DurationRejected Duration
-idleWaitDuration config = convertedDuration <$> durationFromSeconds RequirePositive (hostIdleWait config)
+idleWaitDuration config = do
+  converted ← durationFromSeconds RequirePositive (hostIdleWait config)
+  let nanoseconds = toInteger (durationNanoseconds (convertedDuration converted))
+  durationFromNanoseconds
+    RequirePositive
+    (if convertedRounding converted > 0 then nanoseconds - 1 else nanoseconds)
 
 -- | A duration as the seconds a native timed wait takes.
 --
