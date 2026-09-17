@@ -59,6 +59,16 @@ module Hetoimasia.Runtime.GLFW.Internal
   , TurnStep (..)
   , rejectHostCloseRequest
 
+    -- * The scheduled owner loop
+  , runScheduledOwnerLoop
+  , ScheduledHooks (..)
+  , defaultScheduledHooks
+  , noApplicationReadiness
+  , ScheduledTurn (..)
+  , TurnPacing (..)
+  , UpdateSchedule (..)
+  , ScheduledStep (..)
+
     -- * Applications
   , runWindowApplication
   ) where
@@ -110,6 +120,22 @@ import Hetoimasia.Foundation.Resource.Collection
   , retireMember
   , withMember
   )
+import Hetoimasia.Foundation.Time
+  ( Duration
+  , DurationRejected
+  , DurationRequirement (RequirePositive)
+  , Instant
+  , MonotonicSource
+  , convertedDuration
+  , convertedRounding
+  , deadlineReached
+  , durationFromNanoseconds
+  , durationFromSeconds
+  , durationNanoseconds
+  , monotonicSource
+  , readInstant
+  , remainingUntil
+  )
 import Hetoimasia.GLFW.Command
   ( CommandRejection (..)
   , CommandResult (..)
@@ -139,12 +165,14 @@ import Hetoimasia.GLFW.Internal.Command
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
 import Hetoimasia.GLFW.Internal.Demand
-  ( CapturedDemand
+  ( CapturedDemand (..)
   , DemandPublisher
   , DemandSlot
   , DemandStatus
   , captureDemand
   , closeDemandSlot
+  , demandDeadline
+  , demandIsImmediate
   , demandPublisher
   , demandStatus
   , newDemandSlot
@@ -229,14 +257,41 @@ data HostConfig = HostConfig
   , hostEventBudget ∷ !Int
     -- ^ The most application events one turn dispatches. At least one.
   , hostIdleWait ∷ !Double
-    -- ^ The most seconds an idle turn waits for a native event. Finite, above
-    -- zero, and at most 'maximumIdleWait'.
+    -- ^ The most seconds an idle turn waits for a native event, and the
+    -- scheduled path's fallback bound. Finite, above zero, at most
+    -- 'maximumIdleWait', and at least one whole nanosecond, so it is always a
+    -- positive 'Duration' that never exceeds the seconds configured.
+  , hostClock ∷ !MonotonicSource
+    -- ^ The monotonic source 'runScheduledOwnerLoop' samples, and the clock
+    -- domain every deadline it is given belongs to. 'runOwnerLoop' never reads
+    -- it. A seam example configures a 'Hetoimasia.Foundation.Time.scriptedSource'
+    -- here and scripts every reading exactly.
   }
-  deriving (Eq, Show)
+
+-- | Every field but the injected clock, which is an action rather than a value.
+instance Show HostConfig where
+  show config =
+    "HostConfig {hostSessionConfig = "
+      <> show (hostSessionConfig config)
+      <> ", hostWindowConfigs = "
+      <> show (hostWindowConfigs config)
+      <> ", hostWindowLimit = "
+      <> show (hostWindowLimit config)
+      <> ", hostCommandCapacity = "
+      <> show (hostCommandCapacity config)
+      <> ", hostInputCapacity = "
+      <> show (hostInputCapacity config)
+      <> ", hostCommandBudget = "
+      <> show (hostCommandBudget config)
+      <> ", hostEventBudget = "
+      <> show (hostEventBudget config)
+      <> ", hostIdleWait = "
+      <> show (hostIdleWait config)
+      <> ", hostClock = <injected>}"
 
 -- | The platform's own session, the given windows, a limit of 16 live windows,
--- a command capacity of 64, an input capacity of 256, budgets of 16, and a
--- 0.1-second idle wait.
+-- a command capacity of 64, an input capacity of 256, budgets of 16, a
+-- 0.1-second idle wait, and the process's monotonic clock.
 defaultHostConfig ∷ [WindowConfig] → HostConfig
 defaultHostConfig windows =
   HostConfig
@@ -248,6 +303,7 @@ defaultHostConfig windows =
     , hostCommandBudget = 16
     , hostEventBudget = 16
     , hostIdleWait = 0.1
+    , hostClock = monotonicSource
     }
 
 -- | A host configuration refused before anything was acquired.
@@ -275,6 +331,9 @@ validateHostConfig config
   | hostEventBudget config < 1 = Left (EventBudgetRejected (hostEventBudget config))
   -- Written so a NaN, which fails every comparison, is refused too.
   | not (wait > 0 && wait <= maximumIdleWait) = Left (IdleWaitRejected wait)
+  -- A wait of less than a whole nanosecond is no bound the scheduled path could
+  -- wait for, so it is refused here rather than rounded up to one.
+  | Left _ ← idleWaitDuration config = Left (IdleWaitRejected wait)
   | limit < 1 || limit < length (hostWindowConfigs config) = Left (WindowLimitRejected limit)
   | input < 1 || input > maximumCapacity = Left (InputCapacityRejected input)
   | otherwise = Right ()
@@ -282,6 +341,32 @@ validateHostConfig config
     wait = hostIdleWait config
     limit = hostWindowLimit config
     input = hostInputCapacity config
+
+-- | The configured fallback bound as a positive 'Duration', or why those
+-- seconds are none. 'validateHostConfig' refuses a configuration this rejects,
+-- so an accepted host always has one.
+--
+-- The bound is an upper bound, so the conversion may never round up past the
+-- seconds configured: 'durationFromSeconds' rounds to the nearest nanosecond
+-- and reports the rounding it applied, and a positive rounding means the whole
+-- nanosecond below is the real bound. A wait that floors to no nanoseconds at
+-- all — anything under one, which nearest-rounding would otherwise accept as
+-- one — is refused rather than lengthened.
+idleWaitDuration ∷ HostConfig → Either DurationRejected Duration
+idleWaitDuration config = do
+  converted ← durationFromSeconds RequirePositive (hostIdleWait config)
+  let nanoseconds = toInteger (durationNanoseconds (convertedDuration converted))
+  durationFromNanoseconds
+    RequirePositive
+    (if convertedRounding converted > 0 then nanoseconds - 1 else nanoseconds)
+
+-- | A duration as the seconds a native timed wait takes.
+--
+-- This is the GLFW layer's one conversion out of 'Duration', and the scheduled
+-- loop waits only for a positive duration, so the value it passes to
+-- 'AwaitEventsFor' is always finite and above zero.
+waitSeconds ∷ Duration → Double
+waitSeconds duration = fromIntegral (durationNanoseconds duration) / 1e9
 
 -- | The component a host's own failures are attributed to.
 hostComponent ∷ Component
@@ -957,47 +1042,67 @@ data TurnStep a
 -- hook's failure ends the loop and propagates.
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
 runOwnerLoop host control hooks =
-  ownerOperation (hostSession host) loopOperation [] (reportingAsItEnds (turn 1 False))
+  ownerOperation (hostSession host) loopOperation [] $
+    reportingAsItEnds (loopLogger hooks) host (turn 1 False)
   where
     settings = hostSettings host
-    notifier = hostNotifier host
-
-    -- However the loop ends — a result, a supervised failure, a native failure,
-    -- or a cancellation — the wake path's one report is claimed before it
-    -- returns, so a degradation this turn's own work already caused is reported
-    -- here rather than waiting for shutdown.
-    --
-    -- This boundary never waits for an obligation. Admission and publication are
-    -- still open, and a worker that keeps publishing until supervision stops it
-    -- would keep new obligations coming, so waiting here would hold the loop's
-    -- own result back from the quiescence and the drain that would end them. The
-    -- boundary that does wait is the one after quiescence, where nothing new can
-    -- be registered.
-    reportingAsItEnds = retainingReport (\restore → promptAttempt restore (loopLogger hooks) host)
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
       let waited = idle && queued == 0
-      processEvents host number waited
-      reconcileMonitorEvents (hostSession host)
-      reconcileWindowModes host
-      retirePending host
-      closes ← surfaceCloseRequests host
-      recoverFeeds (loopLogger hooks) host
-      reportDegradation
-      checkRuntime control
-      commands ← dispatchCommands host (hostCommandBudget settings)
-      recoverFeeds (loopLogger hooks) host
-      checkRuntime control
-      events ← dispatchEvents (loopEvent hooks) (hostEventBudget settings)
-      checkRuntime control
-      step ← loopUpdate hooks (Turn number waited commands events closes)
+      processEvents host number (if waited then AwaitEventsFor (hostIdleWait settings) else ProcessPending)
+      work ← turnWork host control (loopLogger hooks) (loopEvent hooks)
+      step ← loopUpdate hooks (turnSummary number waited work)
       checkRuntime control
       case step of
         Finish result → pure result
-        Continue → turn (number + 1) (commands == 0 && events == 0)
+        Continue → turn (number + 1) (workCommands work == 0 && workEvents work == 0)
 
-    reportDegradation = void (attemptDegradationReport (loopLogger hooks) notifier)
+-- | However a loop ends — a result, a supervised failure, a native failure, or
+-- a cancellation — the wake path's one report is claimed before it returns, so
+-- a degradation this turn's own work already caused is reported here rather
+-- than waiting for shutdown.
+--
+-- This boundary never waits for an obligation. Admission and publication are
+-- still open, and a worker that keeps publishing until supervision stops it
+-- would keep new obligations coming, so waiting here would hold the loop's own
+-- result back from the quiescence and the drain that would end them. The
+-- boundary that does wait is the one after quiescence, where nothing new can be
+-- registered.
+reportingAsItEnds ∷ Logger → WindowHost → IO r → IO r
+reportingAsItEnds logger host = retainingReport (\restore → promptAttempt restore logger host)
+
+-- | What one turn's reconciliation and bounded dispatch produced.
+data TurnWork = TurnWork
+  { workCommands ∷ !Int
+  , workEvents ∷ !Int
+  , workCloses ∷ ![CloseRequest]
+  }
+
+-- | The work of one turn after its native event processing, in the one order
+-- both loops use: reconciliation and feed recovery, a check, bounded command
+-- work and recovery again, a check, bounded application event work, and a
+-- check.
+turnWork ∷ WindowHost → RuntimeControl → Logger → IO Bool → IO TurnWork
+turnWork host control logger event = do
+  reconcileMonitorEvents (hostSession host)
+  reconcileWindowModes host
+  retirePending host
+  closes ← surfaceCloseRequests host
+  recoverFeeds logger host
+  void (attemptDegradationReport logger (hostNotifier host))
+  checkRuntime control
+  commands ← dispatchCommands host (hostCommandBudget settings)
+  recoverFeeds logger host
+  checkRuntime control
+  events ← dispatchEvents event (hostEventBudget settings)
+  checkRuntime control
+  pure (TurnWork commands events closes)
+  where
+    settings = hostSettings host
+
+turnSummary ∷ Natural → Bool → TurnWork → Turn
+turnSummary number waited work = Turn number waited (workCommands work) (workEvents work) (workCloses work)
 
 -- | Commands queued across every port.
 queuedCommands ∷ WindowHost → STM Natural
@@ -1007,16 +1112,16 @@ queuedCommands host = do
   windows ← forM (Map.elems entries) (fmap commandsQueued . commandStatistics . entryCommands)
   pure (queued + sum windows)
 
--- | Poll, or wait the configured bound, publishing the activity around it.
-processEvents ∷ WindowHost → Natural → Bool → IO ()
-processEvents host number waited = do
-  atomically (writeTVar (hostActivityState host) (HostActivity number waited))
+-- | Poll, or wait the chosen finite bound, publishing the activity around it.
+processEvents ∷ WindowHost → Natural → EventProcessing → IO ()
+processEvents host number processing = do
+  atomically (writeTVar (hostActivityState host) (HostActivity number waiting))
   processWindowEvents (hostSession host) processing
     `finally` atomically (writeTVar (hostActivityState host) (HostActivity number False))
   where
-    processing
-      | waited = AwaitEventsFor (hostIdleWait (hostSettings host))
-      | otherwise = ProcessPending
+    waiting = case processing of
+      AwaitEventsFor _ → True
+      ProcessPending → False
 
 -- | Reconcile the mode of every window the host holds that is not closing, in
 -- registration order, after the turn's monitor refresh: a window whose recovery
@@ -1117,6 +1222,210 @@ rejectHostCloseRequest host request =
           WindowEnded _ → pure False
   where
     target = closeRequestWindow request
+
+-- ---------------------------------------------------------------------------
+-- The scheduled owner loop
+
+-- | The application's own ongoing schedule: what its update opportunity last
+-- answered, which the loop stores until the next answer replaces it.
+--
+-- It is never combined with an earlier answer and never with a captured
+-- request, so an old request can never become permanent work and finishing an
+-- update implies no immediate demand for another.
+data UpdateSchedule
+  = NoUpdateDemand
+    -- ^ Continue with no deadline of its own.
+  | UpdateImmediately
+    -- ^ Continue, wanting the next turn now.
+  | UpdateBy !Instant
+    -- ^ Continue, wanting an opportunity by this absolute instant, in
+    -- 'hostClock'\'s domain.
+  deriving (Eq, Show)
+
+-- | Whether the scheduled loop continues, and with what schedule.
+data ScheduledStep a
+  = ContinueWith !UpdateSchedule
+  | FinishWith a
+  deriving (Eq, Show)
+
+-- | How a scheduled turn's native step was chosen.
+data TurnPacing
+  = PolledForWork
+    -- ^ Work was ready at the inspection: a command queued, an application
+    -- event ready, or immediate demand from the schedule or the captured
+    -- request.
+  | PolledForDeadline
+    -- ^ Nothing was ready and the earliest deadline had been reached, so the
+    -- turn polled rather than waiting no time at all.
+  | WaitedForDeadline !Duration
+    -- ^ The wait was the remaining time to the earliest deadline, which was
+    -- nearer than the fallback bound.
+  | WaitedForFallback !Duration
+    -- ^ The wait was the configured fallback bound, because no deadline was
+    -- nearer and none may extend it.
+  deriving (Eq, Show)
+
+-- | Whether a pacing made a finite native wait.
+pacingWaited ∷ TurnPacing → Bool
+pacingWaited = \case
+  WaitedForDeadline _ → True
+  WaitedForFallback _ → True
+  PolledForWork → False
+  PolledForDeadline → False
+
+-- | The native step a pacing takes. A wait is only ever entered for a positive
+-- duration, so no zero or negative timeout reaches GLFW.
+pacingProcessing ∷ TurnPacing → EventProcessing
+pacingProcessing = \case
+  PolledForWork → ProcessPending
+  PolledForDeadline → ProcessPending
+  WaitedForDeadline remaining → AwaitEventsFor (waitSeconds remaining)
+  WaitedForFallback bound → AwaitEventsFor (waitSeconds bound)
+
+-- | What one scheduled turn did, as its update opportunity sees it.
+data ScheduledTurn = ScheduledTurn
+  { scheduledTurn ∷ !Turn
+    -- ^ The same summary the unscheduled loop supplies: the turn number,
+    -- whether it waited, its dispatch counts, and the close requests it
+    -- surfaced.
+  , scheduledNow ∷ !Instant
+    -- ^ The instant sampled after the native call returned, so a deadline
+    -- reached during the wait is already visible here. Reconciliation,
+    -- dispatch, and this update consume the interval after it; the next turn
+    -- samples again.
+  , scheduledPacing ∷ !TurnPacing
+    -- ^ Whether the turn polled or waited, and why.
+  , scheduledDemand ∷ !(Maybe CapturedDemand)
+    -- ^ The request the turn's own inspection captured from the application's
+    -- demand slot, with its revision, or 'Nothing' when none was pending. It is
+    -- already consumed: a publication committed after that capture carries a
+    -- newer revision and is captured by a later turn.
+  }
+  deriving (Eq, Show)
+
+-- | What the application supplies to the scheduled owner loop.
+data ScheduledHooks a = ScheduledHooks
+  { scheduledLogger ∷ Logger
+    -- ^ The injected logger the overflow and wake warnings are written through,
+    -- as 'loopLogger' is.
+  , scheduledReady ∷ IO Bool
+    -- ^ Whether an application event is ready, answered without dispatching
+    -- one. It runs once per turn, before the native step, and only decides
+    -- whether that turn polls; it must neither dispatch nor consume anything,
+    -- and it spends none of 'hostEventBudget'. An event published after it
+    -- answered is not seen by that turn: a worker that needs prompt service
+    -- publishes demand, which wakes the owner.
+  , scheduledEvent ∷ IO Bool
+    -- ^ One application event opportunity, exactly as 'loopEvent'.
+  , scheduledUpdate ∷ ScheduledTurn → IO (ScheduledStep a)
+    -- ^ The application-owned update opportunity, once per turn, which answers
+    -- the schedule the turns after it are chosen from.
+  , scheduledStart ∷ UpdateSchedule
+    -- ^ The schedule in force before the first update opportunity has
+    -- answered. 'defaultScheduledHooks' leaves it 'NoUpdateDemand'.
+  }
+
+-- | An application event readiness query that never has anything ready.
+noApplicationReadiness ∷ IO Bool
+noApplicationReadiness = pure False
+
+-- | Hooks with no application events, nothing ever ready, and no initial
+-- schedule, for a caller that overrides only the fields it uses.
+defaultScheduledHooks ∷ Logger → (ScheduledTurn → IO (ScheduledStep a)) → ScheduledHooks a
+defaultScheduledHooks logger update =
+  ScheduledHooks
+    { scheduledLogger = logger
+    , scheduledReady = noApplicationReadiness
+    , scheduledEvent = noApplicationEvents
+    , scheduledUpdate = update
+    , scheduledStart = NoUpdateDemand
+    }
+
+-- | The deadline of a schedule, if it named one.
+scheduleDeadline ∷ UpdateSchedule → Maybe Instant
+scheduleDeadline = \case
+  UpdateBy due → Just due
+  UpdateImmediately → Nothing
+  NoUpdateDemand → Nothing
+
+-- | The earlier of the application's own deadline and the captured request's.
+earliestDeadline ∷ UpdateSchedule → Maybe CapturedDemand → Maybe Instant
+earliestDeadline schedule captured =
+  case (scheduleDeadline schedule, demandDeadline . capturedRequest =<< captured) of
+    (Nothing, requested) → requested
+    (own, Nothing) → own
+    (Just own, Just requested) → Just (min own requested)
+
+-- | Choose the turn's native step from the sampled instant, the earliest
+-- deadline, and whether work is ready.
+choosePacing ∷ Duration → Instant → Maybe Instant → Bool → TurnPacing
+choosePacing bound now deadline ready
+  | ready = PolledForWork
+  | Just due ← deadline =
+      if deadlineReached now due
+        then PolledForDeadline
+        else
+          let remaining = remainingUntil now due
+           in if remaining < bound then WaitedForDeadline remaining else WaitedForFallback bound
+  | otherwise = WaitedForFallback bound
+
+-- | Run scheduled owner turns until 'scheduledUpdate' answers 'FinishWith', on
+-- the session's owner thread, and return its result once a final control check
+-- has passed.
+--
+-- Each turn samples 'hostClock', captures the application's pending demand,
+-- reads the queued command count and the application's readiness in one
+-- inspection, and from those and the stored schedule chooses to poll or to wait
+-- a finite bound that is at most the earliest deadline and at most the
+-- configured fallback. It then resamples the clock and reconciles, dispatches,
+-- and offers the update opportunity exactly as 'runOwnerLoop' does, with the
+-- same checkpoints, budgets, fair dispatch, retirement, close-request
+-- surfacing, and feed recovery.
+--
+-- 'runOwnerLoop' is untouched by this path and keeps its own behaviour. Another
+-- thread is refused with 'Hetoimasia.GLFW.Session.NotSessionOwner' before
+-- anything runs, and every failure ends the loop exactly as it ends that one.
+runScheduledOwnerLoop ∷ WindowHost → RuntimeControl → ScheduledHooks a → IO a
+runScheduledOwnerLoop host control hooks =
+  ownerOperation (hostSession host) loopOperation [] $ do
+    bound ← either rejectedBound pure (idleWaitDuration settings)
+    reportingAsItEnds logger host (turn bound 1 (scheduledStart hooks))
+  where
+    settings = hostSettings host
+    logger = scheduledLogger hooks
+    -- Unreachable for a host the construction accepted, which validated these
+    -- seconds as a positive duration; a typed rejection rather than a partial
+    -- function keeps it that way if the two ever drift apart.
+    rejectedBound _ = throwFailure hostComponent loopOperation [] (IdleWaitRejected (hostIdleWait settings))
+    turn bound number schedule = do
+      checkRuntime control
+      inspected ← readInstant (hostClock settings)
+      (captured, queued) ←
+        atomically ((,) <$> captureDemand (hostDemandSlot host) <*> queuedCommands host)
+      ready ← scheduledReady hooks
+      let immediate =
+            schedule == UpdateImmediately
+              || maybe False (demandIsImmediate . capturedRequest) captured
+          pacing =
+            choosePacing bound inspected (earliestDeadline schedule captured) (queued > 0 || ready || immediate)
+      processEvents host number (pacingProcessing pacing)
+      -- The instant the update is given, so a deadline the wait itself reached
+      -- is due now rather than on the turn after.
+      sampled ← readInstant (hostClock settings)
+      work ← turnWork host control logger (scheduledEvent hooks)
+      step ←
+        scheduledUpdate
+          hooks
+          ScheduledTurn
+            { scheduledTurn = turnSummary number (pacingWaited pacing) work
+            , scheduledNow = sampled
+            , scheduledPacing = pacing
+            , scheduledDemand = captured
+            }
+      checkRuntime control
+      case step of
+        FinishWith result → pure result
+        ContinueWith next → turn bound (number + 1) next
 
 -- ---------------------------------------------------------------------------
 -- Applications

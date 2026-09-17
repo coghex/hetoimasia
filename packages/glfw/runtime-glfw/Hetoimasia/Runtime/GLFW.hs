@@ -20,6 +20,15 @@
 -- runtime as usual. It is the only production executor of the host's command
 -- port.
 --
+-- 'runScheduledOwnerLoop' is the additive scheduled path beside it, for an
+-- application that paces itself by absolute deadlines: it samples the host's
+-- injected 'hostClock', weighs the schedule its update last answered against
+-- the demand its own inspection captured, and waits at most the earlier
+-- deadline and at most the configured fallback bound. 'runOwnerLoop',
+-- 'LoopHooks', 'Turn', and 'TurnStep' are unchanged by it — same turn order,
+-- same idle-or-active choice, same fixed 'hostIdleWait' — and an application
+-- using them never reads a clock. See \"The scheduled owner turn\" below.
+--
 -- = The owner turn
 --
 -- Every turn performs, in order:
@@ -132,8 +141,8 @@
 -- thread and clear exactly what they took, so a publication committed after a
 -- capture stays pending for the next one. There is never a slot per worker or
 -- per request, and a closed slot answers a typed rejection and makes no native
--- call. What a captured deadline means for the next wait is not this loop's
--- concern yet.
+-- call. 'runOwnerLoop' captures nothing itself and makes nothing of a captured
+-- deadline; folding one into the next wait is the scheduled path's, below.
 --
 -- = Idle waits
 --
@@ -164,6 +173,43 @@
 -- wait: the flag is set immediately before the native call and cleared once it
 -- returns, so it is a hint that a wait is starting or in progress, not proof that
 -- the call has been entered.
+--
+-- = The scheduled owner turn
+--
+-- 'runScheduledOwnerLoop' runs the same turn with its native step chosen from
+-- time rather than from the turn before. Each turn samples 'hostClock' once for
+-- that choice; captures the application's pending demand and reads the queued
+-- command count in one transaction; asks 'scheduledReady' whether an
+-- application event is ready, without dispatching one and without spending any
+-- of 'hostEventBudget'; and then polls when anything is ready or a deadline has
+-- been reached, or waits the shorter of the time remaining to the earliest
+-- deadline and the configured fallback bound 'hostIdleWait'. A deadline only
+-- ever shortens a wait; no zero or negative timeout reaches GLFW; and a host
+-- with no demand at all still waits the bound rather than spinning. That bound
+-- is the whole nanosecond at or below the seconds configured, never the nearest
+-- one, so it can never exceed them; a wait under a whole nanosecond is refused
+-- by 'validateHostConfig' instead.
+--
+-- It then samples 'hostClock' once more and reconciles, dispatches, and offers
+-- 'scheduledUpdate' exactly as 'runOwnerLoop' does, with the same checkpoints,
+-- budgets, fair dispatch, retirement, close-request surfacing, and feed
+-- recovery, so a due update is never starved by continuous traffic. That second
+-- sample is the instant the update is given, so a deadline the wait itself
+-- reached is due in the same turn; deadlines stay absolute and the next turn
+-- samples afresh, so time spent in callbacks, dispatch, and the update consumes
+-- the interval instead of being pushed out by a fresh full wait.
+--
+-- 'UpdateSchedule' is the application's own ongoing schedule, replaced by each
+-- answer and never combined with an earlier one, so finishing an update implies
+-- no demand for another; 'scheduledStart' is what holds before the first
+-- answer. It is distinct from the coalesced request 'scheduledDemand' carries
+-- with its revision, which that turn's inspection already consumed, so an old
+-- request never becomes permanent work and an application that still wants an
+-- early-delivered deadline retains it in the schedule it answers. Demand
+-- arriving after the inspection ends the wait through the existing wake
+-- protocol and is inspected on the next turn; the loop adds no second
+-- notification mechanism, and a wake with nothing due is an ordinary turn that
+-- recomputes its wait.
 --
 -- = Close requests
 --
@@ -283,15 +329,18 @@
 -- |                          |           | event step; 'hostActivity' reads | any                  | referenced            |                                  |
 -- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
 --
--- The loop's turn number and idleness live in its own recursion and end with
--- it. None of this is application state, and every piece of it is bounded by
--- the live windows, never by how many were ever created.
+-- The loop's turn number and idleness — and, on the scheduled path, the
+-- application's ongoing 'UpdateSchedule' and the fallback bound it resolved
+-- once at entry — live in its own recursion and end with it. None of this is
+-- application state, and every piece of it is bounded by the live windows,
+-- never by how many were ever created.
 --
 -- = Logging
 --
 -- The component takes no logger and writes to no sink of its own. The owner
--- loop writes through the 'Logger' the application injects on 'LoopHooks': the
--- input overflow warning under @glfw.input@, and the wake path's one
+-- loop writes through the 'Logger' the application injects on 'LoopHooks', or
+-- on 'ScheduledHooks' for the scheduled path: the input overflow warning under
+-- @glfw.input@, and the wake path's one
 -- degradation warning under @glfw.wake@. Its failures are raised,
 -- never logged: a configuration rejection under the @glfw.runtime@ component
 -- and @construct window host@ operation, native failures under GLFW's own
@@ -349,6 +398,16 @@ module Hetoimasia.Runtime.GLFW
   , Turn (..)
   , TurnStep (..)
   , rejectHostCloseRequest
+
+    -- * The scheduled owner loop
+  , runScheduledOwnerLoop
+  , ScheduledHooks (..)
+  , defaultScheduledHooks
+  , noApplicationReadiness
+  , ScheduledTurn (..)
+  , TurnPacing (..)
+  , UpdateSchedule (..)
+  , ScheduledStep (..)
 
     -- * Applications
   , runWindowApplication

@@ -84,7 +84,10 @@ owning subsystem's contract/design when continuing its work.
   explicit. Escaping handler failures terminate the worker under normal policy.
 - [GLFW](docs/glfw.md): one main-thread owner, opaque capabilities, independently
   closing windows, bounded commands with persistent tickets, coherent state and
-  explicit input resets. A close acknowledgement is not native destruction.
+  explicit input resets. A close acknowledgement is not native destruction. The
+  owner has two loops: `runOwnerLoop`, unchanged and paced by the turn before
+  it, and the additive `runScheduledOwnerLoop`, paced by absolute deadlines from
+  the host's injected monotonic clock and bounded by the same finite fallback.
 - [Validation](docs/validation.md): mandatory floor plus affected non-optional
   and PR-requested groups. Optional probes remain opt-in. CI evidence and review
   approval have independent freshness rules; approved clean merges may retain

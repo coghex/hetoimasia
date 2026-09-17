@@ -25,8 +25,21 @@ import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocResource)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
+import Hetoimasia.Foundation.Time
+  ( Duration
+  , DurationRequirement (RequirePositive)
+  , Instant
+  , addDuration
+  , durationFromNanoseconds
+  )
 import Hetoimasia.GLFW.Command
-import Hetoimasia.GLFW.Internal.Native (noteProgressForCheck, requestCloseForCheck, takeWaitNotedForCheck)
+import qualified Hetoimasia.GLFW.Input as Input
+import Hetoimasia.GLFW.Internal.Native
+  ( noteProgressForCheck
+  , requestCloseForCheck
+  , takeLastWaitForCheck
+  , takeWaitNotedForCheck
+  )
 import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
@@ -107,6 +120,9 @@ spec shared = describe "window host" $ do
           )
     waits `shouldSatisfy` (>= 1)
 
+  it "runs the scheduled path on the real session, progressing deadline-driven updates with no native input delivered and still waiting when it has no demand" $
+    testScheduledDeadlines shared
+
   it "surfaces a real native close request to application policy without destroying the window, keeps the runtime running, and releases the host only after the drain" $ do
     (request, window, (endedAtSurface, phaseAtSurface, liveAfter), releasedWhileLive, endedAfter, finalPhase) ←
       owned shared $ \session → do
@@ -156,6 +172,172 @@ spec shared = describe "window host" $ do
       testHonouredCloseRequest shared
     it "disposes every remaining window, a created one included, only after the drain and with no retained cleanup failure" $
       testRemainingDisposedAfterDrain shared
+
+-- ---------------------------------------------------------------------------
+-- The scheduled path
+
+-- | What the measured scheduling interval counted. Its turns are the ones after
+-- the first, so the callbacks a window's own creation and first reconciliation
+-- deliver are outside it.
+data Measured = Measured
+  { measuredUpdates ∷ !Int
+    -- ^ Update opportunities the scheduled loop offered.
+  , measuredDueUpdates ∷ !Int
+    -- ^ Of those, the ones whose turn was paced by a deadline: it waited
+    -- towards one, or polled because one had expired.
+  , measuredWaits ∷ !Int
+    -- ^ Turns whose production native wait the shim recorded as entered and
+    -- returned, so the loop really blocked rather than spinning.
+  , measuredCommands ∷ !Int
+  , measuredEvents ∷ !Int
+  , measuredCloses ∷ !Int
+  }
+  deriving (Eq, Show)
+
+noneMeasured ∷ Measured
+noneMeasured = Measured 0 0 0 0 0 0
+
+-- | Which part of the example the loop is in.
+data SchedulePhase = Warmup | Deadlines | Quiet
+  deriving (Eq, Show)
+
+-- | The scheduled loop on the real shared session, proved by counting rather
+-- than by timing.
+--
+-- The window's input feed is admitted before the loop, so every native input
+-- event its callbacks deliver is counted; the example takes that count at the
+-- start of the measured interval and again at its end, and nothing is delivered
+-- on an isolated display. Progress is therefore the deadlines': the loop keeps
+-- answering an absolute deadline one 'schedulePeriod' out and counts the turns
+-- that reached one, while the shim's own production-wait instrumentation
+-- records that those turns entered and returned a real
+-- @glfwWaitEventsTimeout@. The last turn answers no demand at all and must
+-- still wait, for the configured fallback bound.
+testScheduledDeadlines ∷ Shared → Expectation
+testScheduledDeadlines shared = do
+  (measured, traffic, finalPacing, finalWaited) ←
+    owned shared $ \session → do
+      measures ← newIORef noneMeasured
+      phase ← newIORef Warmup
+      baseline ← newIORef 0
+      waitFloor ← newIORef 0
+      takeWaitSequence waitFloor >>= \(_, floor') → writeIORef waitFloor floor'
+      runWindowApplication lifetime "native scheduled" (allocWindowHostIn (pure session) (scheduledSettings "scheduled")) id
+        ( \host _ → do
+            client ← onlyClient host
+            enableWindowInput client
+            pure (host, client)
+        )
+        ( \(host, client) control →
+            runScheduledOwnerLoop host control $
+              defaultScheduledHooks quietLogger $ \turn → do
+                entered ← fst <$> takeWaitSequence waitFloor
+                when
+                  (turnNumber (scheduledTurn turn) >= turnBound)
+                  (failed "the scheduled loop did not reach its evidence within the turn bound")
+                readIORef phase >>= \case
+                  Warmup → do
+                    -- The measured interval starts here, after the window's own
+                    -- creation and first reconciliation.
+                    inputTraffic client >>= writeIORef baseline
+                    writeIORef phase Deadlines
+                    ContinueWith . UpdateBy <$> deadlineAfter (scheduledNow turn)
+                  Deadlines → do
+                    count turn entered measures
+                    due ← measuredDueUpdates <$> readIORef measures
+                    if due >= scheduledDeadlineEvidence
+                      then writeIORef phase Quiet >> pure (ContinueWith NoUpdateDemand)
+                      else ContinueWith . UpdateBy <$> deadlineAfter (scheduledNow turn)
+                  Quiet → do
+                    count turn entered measures
+                    final ← readIORef measures
+                    delivered ← subtract <$> readIORef baseline <*> inputTraffic client
+                    pure (FinishWith (final, delivered, scheduledPacing turn, entered))
+        )
+  -- Deadlines alone moved the loop on, with nothing native delivered to it.
+  measuredDueUpdates measured `shouldSatisfy` (>= scheduledDeadlineEvidence)
+  measuredUpdates measured `shouldSatisfy` (>= measuredDueUpdates measured)
+  measuredWaits measured `shouldSatisfy` (>= 1)
+  traffic `shouldBe` 0
+  (measuredCommands measured, measuredEvents measured, measuredCloses measured) `shouldBe` (0, 0, 0)
+  -- The turn with no demand at all still waited, for the configured fallback
+  -- bound, and the shim saw that wait enter and return.
+  finalPacing `shouldSatisfy` \case
+    WaitedForFallback _ → True
+    _ → False
+  finalWaited `shouldBe` True
+
+-- | How many deadline-paced update opportunities the example counts as evidence
+-- of progress.
+scheduledDeadlineEvidence ∷ Int
+scheduledDeadlineEvidence = 5
+
+count ∷ ScheduledTurn → Bool → IORef Measured → IO ()
+count turn entered measures = modifyIORef' measures $ \measured →
+  measured
+    { measuredUpdates = measuredUpdates measured + 1
+    , measuredDueUpdates = measuredDueUpdates measured + if deadlinePaced (scheduledPacing turn) then 1 else 0
+    , measuredWaits = measuredWaits measured + if entered then 1 else 0
+    , measuredCommands = measuredCommands measured + turnCommands (scheduledTurn turn)
+    , measuredEvents = measuredEvents measured + turnEvents (scheduledTurn turn)
+    , measuredCloses = measuredCloses measured + length (turnCloseRequests (scheduledTurn turn))
+    }
+
+deadlinePaced ∷ TurnPacing → Bool
+deadlinePaced = \case
+  WaitedForDeadline _ → True
+  PolledForDeadline → True
+  WaitedForFallback _ → False
+  PolledForWork → False
+
+-- | Whether a production wait returned since the last look, and the new floor.
+takeWaitSequence ∷ IORef Natural → IO (Bool, Natural)
+takeWaitSequence waitFloor = do
+  (returned, _) ← takeLastWaitForCheck
+  previous ← readIORef waitFloor
+  if returned > previous
+    then (True, returned) <$ writeIORef waitFloor returned
+    else pure (False, previous)
+
+-- | An absolute deadline one scheduled period after the turn's own sample.
+deadlineAfter ∷ Instant → IO Instant
+deadlineAfter now =
+  either (\overflow → failed ("the scheduled deadline overflowed: " <> show overflow)) pure (addDuration now schedulePeriod)
+
+-- | The period the scheduled example asks for: far inside the fallback bound,
+-- so a turn that waits is waiting towards the deadline rather than the bound.
+schedulePeriod ∷ Duration
+schedulePeriod = case durationFromNanoseconds RequirePositive 20000000 of
+  Right duration → duration
+  Left rejected → error ("the scheduled period was rejected: " <> show rejected)
+
+-- | Every native input event the window's owner boundary has seen: admitted,
+-- gated by focus or the application, unpaired, suppressed, or overflowing.
+inputTraffic ∷ WindowClient → IO Natural
+inputTraffic client = do
+  statistics ← atomically (Input.inputStatistics (clientInputReader client))
+  pure $
+    Input.statisticsAdmitted statistics
+      + Input.statisticsGated statistics
+      + Input.statisticsUnpaired statistics
+      + Input.statisticsSuppressed statistics
+      + Input.statisticsOverflowed statistics
+
+enableWindowInput ∷ WindowClient → IO ()
+enableWindowInput client =
+  atomically (Input.enableInput (clientInputControl client)) >>= \case
+    Input.AdmissionOpened → pure ()
+    other → failed ("the window's input was not admitted: " <> show other)
+
+-- | The client capabilities of the host's only window.
+onlyClient ∷ WindowHost → IO WindowClient
+onlyClient host =
+  atomically (hostWindowIdentities host) >>= \case
+    [identity] → atomically (hostWindowClient host identity) >>= maybe (failed "the listed window has no client") pure
+    windows → failed ("expected one window, found " <> show (length windows))
+
+scheduledSettings ∷ Text → HostConfig
+scheduledSettings name = (defaultHostConfig [hiddenTestWindowConfig name 160 120]) {hostIdleWait = 0.2}
 
 -- ---------------------------------------------------------------------------
 -- Dynamic windows
