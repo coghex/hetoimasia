@@ -29,6 +29,7 @@ with platform isolation proofs before production sandbox work.
 - [Runtime supervision](docs/supervision.md)
 - [Messaging contract](docs/messaging.md)
 - [Monotonic time contract](docs/time.md)
+- [Scheduling update policy](docs/scheduling.md)
 - [GLFW contract and native tests](docs/glfw.md)
 - [Validation and evidence reuse](docs/validation.md)
 - [Vulkan backend design — exploring](docs/vulkan_backend_design.md)

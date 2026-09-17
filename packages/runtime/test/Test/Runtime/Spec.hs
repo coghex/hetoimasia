@@ -4,7 +4,7 @@
 -- recovery and terminal-failure reporting adapter, worker supervision, the
 -- supervised inbox adapter and its graceful finish, the supervised and inbox
 -- handles' package boundaries, supervised waits on the foundation's channels
--- and snapshots, and the resource smoke sit under the @Runtime@ group this
+-- and snapshots, the resource smoke, and the update policy sit under the @Runtime@ group this
 -- module roots, so the paths and @--match@ selectors these examples carried in
 -- the root suite still select them here. A new example belongs in the
 -- component that owns the behaviour it asserts; this module only composes.
@@ -23,6 +23,7 @@ import qualified Test.Runtime.Opacity as Opacity
 import qualified Test.Runtime.Reporting as Reporting
 import qualified Test.Runtime.ResourceSmoke as ResourceSmoke
 import qualified Test.Runtime.Supervision as Supervision
+import qualified Test.Runtime.UpdatePolicy as UpdatePolicy
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -37,3 +38,4 @@ spec = describe "Runtime" $ do
   Supervision.spec
   Messaging.spec
   ResourceSmoke.spec
+  UpdatePolicy.spec

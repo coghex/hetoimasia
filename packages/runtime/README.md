@@ -62,6 +62,16 @@ borrower in its own protected boundary and drain after the workers and before
 its parents are released. The contract is
 [The application runner](../../docs/resources.md#the-application-runner).
 
+`Hetoimasia.Runtime.UpdatePolicy` is the caller-owned update policy over the
+foundation's monotonic time values: `Demand` and `queryDemand` express and query
+no demand, immediate demand, or an absolute deadline; `boundElapsed` caps a
+variable-step sample and reports what it clipped; `advanceFixedStep` turns
+elapsed time into a bounded number of whole steps, retains only the sub-step
+remainder, reports discarded time, and places the next step absolutely; and
+`pauseFixedStep` and `resumeFixedStep` rebase time so a paused interval is never
+simulated. It reads no clock, starts no thread, and owns no rendering decision.
+The contract is [Scheduling](../../docs/scheduling.md).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before
@@ -73,7 +83,7 @@ they are introduced; the current runner is not a resource manager.
 alone: `Main.hs`, the composer `Test.Runtime.Spec`, which roots the `Runtime`
 group, one module per component — the runner, application lifecycle, inbox
 services and their finish, logging lifetime, opacity, reporting, supervision,
-supervised messaging waits, and the resource smoke — and the supervision, inbox,
+supervised messaging waits, the resource smoke, and the update policy — and the supervision, inbox,
 and logger fixtures beside them. Examples run against real foundation services
 through their public APIs rather than mocks, and a foundation primitive's own
 contract belongs to `foundation-tests`, not here. A new runtime example belongs
