@@ -35,6 +35,20 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   engine examples, 331 workflow examples, and 8 scripted fixture examples passed
   locally. Linux native CI ran 55 examples with no failures and one physical
   hotplug example pending. The audit did not rerun interactive Cocoa tests.
+- Owner rule for local native testing (#124): the native suite disrupts the
+  desktop, so an agent describes the expected disruption, asks the human user
+  for explicit approval, and waits for acceptance before starting a native
+  session; the approval covers one agreed session only and is not reprompted
+  during it. An issue acceptance command, a PR approval, a persistent shell
+  setting, or a periodic testing request grants nothing. The suite enforces
+  this as an operational guard, not as proof of the conversation: it refuses
+  every native operation and private-session child unless the run carries
+  `HETOIMASIA_NATIVE_SESSION=desktop`, supplied on the approved command
+  itself, or the `isolated-x11:<display>` value `tools/display/x11.sh` gives
+  only the command it isolates. A bare `DISPLAY` or `CI` is not consent. Dry
+  runs, `--match "with a scripted owner"`, and `--match "the native opt-in"`
+  need none. Remote Linux CI is unchanged: the wrapper's consent reaches the
+  runner, cabal, the suite, and its children by inheritance.
 - Next design: Vulkan ownership, window/surface retirement, completion, frame
   scheduling, and platform verification. The design remains exploring; the
   four GLFW repairs gate implementation. Completed runtime/messaging arcs need

@@ -56,15 +56,36 @@ Build and check, after preparing the native prefix on macOS with
 ```bash
 cabal build all
 cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
-cabal test glfw-native-tests --test-show-details=direct
 ```
 
-List the native examples without entering a session:
+`cabal build all` compiles `glfw-native-tests` without running it. List its
+examples, or run the selections that never enter a session, without any
+approval:
 
 ```bash
 cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
+cabal test glfw-native-tests --test-show-details=direct --test-options='--match "with a scripted owner"'
+cabal test glfw-native-tests --test-show-details=direct --test-options='--match "the native opt-in"'
 ```
 
-`glfw-native-tests` runs the real session through the shared native fixture and
-needs a windowing session: Cocoa locally, or on Linux an isolated X11 display
-from `tools/display/x11.sh`. See [docs/glfw.md](../../docs/glfw.md#the-native-suite).
+The full suite runs the real session through the shared native fixture, and
+its examples show, focus, resize, minimize, maximize, and take fullscreen
+windows on the desktop they run on. It refuses to enter a session without
+per-run consent. On Linux, the isolated display helper supplies that consent
+for the private X11 display it starts, and needs no approval:
+
+```bash
+bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct
+```
+
+On a real desktop — Cocoa on macOS — an agent first describes that
+disruption, asks the human user for explicit approval, and waits for
+acceptance; the approved run, and only that run, then carries the consent on
+its own command:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct
+```
+
+Never put that variable in a shell profile or in a script an agent runs on its
+own. See [docs/glfw.md](../../docs/glfw.md#the-native-suite).

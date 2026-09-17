@@ -7,10 +7,21 @@
 -- example runs, so a dry run or a selection that never reaches a native
 -- operation acquires nothing, and a selection matching no example fails.
 --
+-- No native operation runs without consent. The run's environment is read
+-- once, before anything else ("Test.GLFW.Native.Consent"): a run with no
+-- consent still builds, lists, and filters the tree, and still runs every
+-- example that needs no session, but each example that uses the shared
+-- session or starts a private-session child is refused before its body runs,
+-- the session is never acquired, and the run ends with one line on stderr
+-- naming what was missing and a non-zero exit. A human's approval for one run
+-- is @HETOIMASIA_NATIVE_SESSION=desktop@ on that command;
+-- @tools/display/x11.sh@ supplies its own consent for the isolated X11
+-- display it starts.
+--
 -- After the run this prints how many times the shared session was acquired,
 -- what the owner served, and every native thread check, and fails if Hspec
--- failed, the owner failed, the session was acquired more than once, or any
--- thread check did not hold.
+-- failed, the owner failed, the session was acquired more than once, any
+-- thread check did not hold, or any operation was refused.
 --
 -- Given @--private-session SCENARIO@ it is instead a private-session child;
 -- see "Test.GLFW.Native.Private".
@@ -23,6 +34,7 @@ import Data.Maybe (isNothing)
 import System.Environment (getArgs)
 import System.Exit (ExitCode, exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
+import Test.GLFW.Native.Consent (Consent, Refusal, readConsent, refusalMessage)
 import Test.GLFW.Native.Fixture (OwnerReport (..), runOwned)
 import qualified Test.GLFW.Native.Private as Private
 import qualified Test.GLFW.Native.Spec as Native
@@ -30,28 +42,33 @@ import Test.GLFW.Native.Support
   ( Shared (..)
   , ThreadCheck (..)
   , ThreadFacts
+  , newGate
   , newThreadEvidence
   , onOwnerThread
+  , refusals
   , sharedSessionOwner
   , threadChecks
   )
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWithResult, isSuccess)
 
 main ∷ IO ()
-main =
+main = do
+  consent ← readConsent
   getArgs >>= \case
-    [flag, scenario] | flag == Private.privateSessionFlag → Private.runScenario scenario
-    _ → runSuite
+    [flag, scenario] | flag == Private.privateSessionFlag → Private.runScenario consent scenario
+    _ → runSuite consent
 
-runSuite ∷ IO ()
-runSuite = do
+runSuite ∷ Either Refusal Consent → IO ()
+runSuite consent = do
   evidence ← newThreadEvidence
+  gate ← newGate consent
   (outcome, report) ←
-    runOwned (sharedSessionOwner evidence) $ \fixture →
-      hspecWithResult defaultConfig {configFailOnEmpty = True} (Native.spec (Shared fixture evidence))
+    runOwned (sharedSessionOwner evidence gate) $ \fixture →
+      hspecWithResult defaultConfig {configFailOnEmpty = True} (Native.spec (Shared fixture evidence gate))
   checks ← threadChecks evidence
+  refused ← refusals gate
   putStrLn (summary report checks)
-  let problems = ownerProblems report checks
+  let problems = ownerProblems report checks <> refusalProblems consent refused
   mapM_ (hPutStrLn stderr . ("glfw-native-tests: " <>)) problems
   hFlush stdout
   unless (null problems) exitFailure
@@ -100,3 +117,15 @@ ownerProblems report checks =
        ]
   where
     acquired = reportAcquisitions report
+
+-- | The one line a refused run ends with: how many native examples the gate
+-- refused before their bodies, and the refusal itself, which names the missing
+-- consent and the isolated alternative. A run that refused nothing — a dry
+-- run, a listing, or a selection outside the native examples — reports
+-- nothing here.
+refusalProblems ∷ Either Refusal Consent → Int → [String]
+refusalProblems consent refused =
+  [ show refused <> " native example(s) refused before any native operation or child, so this is not a native pass: " <> refusalMessage refusal
+  | Left refusal ← [consent]
+  , refused > 0
+  ]

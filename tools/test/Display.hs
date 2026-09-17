@@ -4,9 +4,10 @@
 -- only the utilities it needs and stub display programs, so what is asserted is
 -- the script's own contract rather than whichever X server a machine happens to
 -- have: the command runs inside the display the script established, with
--- Wayland removed, and a missing or failing server or window manager stops the
--- run before the command starts. The real server is exercised by the
--- @test.glfw-native@ group itself.
+-- Wayland removed and with the native suite's isolated-display consent set for
+-- that display, and a missing or failing server or window manager stops the
+-- run before the command starts, so the consent reaches nothing. The real
+-- server is exercised by the @test.glfw-native@ group itself.
 module Display (spec) where
 
 import Control.Monad (forM_)
@@ -34,7 +35,7 @@ data Display = Display
 
 spec ∷ Spec
 spec = describe "Isolated X11 display" $ do
-  it "runs the command inside the display it established, with Wayland removed, and stops the display after it" $
+  it "runs the command inside the display it established, with Wayland removed and that display's consent set, and stops the display after it" $
     withDisplay $ \display → do
       installStubs display workingStubs
       (result, output, errors) ←
@@ -42,7 +43,9 @@ spec = describe "Isolated X11 display" $ do
       (result, errors) `shouldBe` (ExitSuccess, "")
       output `shouldContain` "display :42"
       output `shouldContain` "window manager \"Openbox\""
-      readFile (directory display </> "environment.txt") `shouldReturn` ":42 unset x11\n"
+      -- The consent names the display the script established, and only the
+      -- command sees it: the helper's own environment carried none.
+      readFile (directory display </> "environment.txt") `shouldReturn` ":42 unset x11 isolated-x11::42\n"
       readFile (directory display </> "summary.md") >>= (`shouldContain` "## Isolated X11 display")
       server ← readFile (directory display </> "server.pid")
       stopped (takeWhile (/= '\n') server) `shouldReturn` True
@@ -68,6 +71,14 @@ spec = describe "Isolated X11 display" $ do
         )
       refused display "the window manager exited before taking :42"
 
+  it "refuses to run the command when the window manager never takes the display within the bound" $
+    withDisplay $ \display → do
+      -- A window manager that stays alive but never announces itself exhausts
+      -- the helper's ten-second bound; this example waits that bound out. The
+      -- server's own thirty-second bound ends in the same refusal.
+      installStubs display (("xprop", "#!/bin/sh\nexit 0\n") : filter ((/= "xprop") . fst) workingStubs)
+      refused display "the window manager did not take :42 within 10 seconds"
+
   it "exits with the command's own status once the display is established" $
     withDisplay $ \display → do
       installStubs display workingStubs
@@ -81,10 +92,13 @@ spec = describe "Isolated X11 display" $ do
       result `shouldBe` ExitFailure 2
       errors `shouldContain` "usage"
 
--- | A shell command that records the display environment the helper gave it.
+-- | A shell command that records the display environment the helper gave it,
+-- including the native suite's consent variable.
 recordEnvironment ∷ Display → String
 recordEnvironment display =
-  "echo \"$DISPLAY ${WAYLAND_DISPLAY-unset} $XDG_SESSION_TYPE\" > '" ++ (directory display </> "environment.txt") ++ "'"
+  "echo \"$DISPLAY ${WAYLAND_DISPLAY-unset} $XDG_SESSION_TYPE ${HETOIMASIA_NATIVE_SESSION-unset}\" > '"
+    ++ (directory display </> "environment.txt")
+    ++ "'"
 
 -- | Stub display programs that behave like a server and window manager that
 -- come up: the server reports display 42 and records its process, the window
@@ -106,16 +120,19 @@ workingStubs =
   ]
 
 -- | Run the helper with a PATH holding only the toolbox, where an example wants
--- the command it names to leave a marker if it ever runs.
+-- the command it names to record its environment if it ever runs. A refusal
+-- runs it never, so no consent reaches anything: the record is absent.
 refused ∷ Display → String → IO ()
 refused display reason = do
-  let marker = directory display </> "command-ran"
-  (result, _, errors) ← helper display ["--", "sh", "-c", "touch '" ++ marker ++ "'"]
+  (result, _, errors) ← helper display ["--", "sh", "-c", recordEnvironment display]
   result `shouldBe` ExitFailure 1
   errors `shouldContain` reason
   errors `shouldContain` "the command did not run"
-  doesFileExist marker `shouldReturn` False
+  doesFileExist (directory display </> "environment.txt") `shouldReturn` False
 
+-- | Run the helper in a Wayland-looking environment that carries no native
+-- consent, whatever the developer's own shell holds, so what the command
+-- records can only have come from the helper.
 helper ∷ Display → [String] → IO (ExitCode, String, String)
 helper display arguments = do
   inherited ← sanitizedEnvironment
@@ -125,7 +142,8 @@ helper display arguments = do
         , ("XDG_SESSION_TYPE", "wayland")
         , ("TMPDIR", directory display)
         ]
-      settings = overrides ++ filter ((`notElem` map fst overrides) . fst) inherited
+      removed = "HETOIMASIA_NATIVE_SESSION" : map fst overrides
+      settings = overrides ++ filter ((`notElem` removed) . fst) inherited
   bash ← findExecutable "bash" >>= maybe (fail "bash is not on PATH") pure
   run settings (directory display) bash (script display : arguments)
 

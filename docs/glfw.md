@@ -2303,12 +2303,15 @@ Then:
 ```bash
 cabal build all
 cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
-cabal test glfw-native-tests --test-show-details=direct
+cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
 ```
 
 `cabal.project` sets `tests: True` for this package alone. `cabal build all`
 therefore compiles `glfw-native-tests` from a clean configuration without
-running it.
+running it, and the dry run lists its examples without entering a session.
+Running the native examples themselves takes the per-run consent
+[the native suite](#the-native-suite) describes: the isolated display helper's
+own on Linux, or a human's explicit approval on a real desktop.
 
 - **The `GLFW` group** in `hetoimasia-tests` is headless and initializes nothing.
   It proves the session model through the seam, checks the link declarations,
@@ -2426,9 +2429,10 @@ running it.
   and the inventory closing, waking its waiters, before the callback is detached
   ahead of termination and freed last.
 - **`glfw-native-tests`** needs a windowing session: Cocoa locally, or an
-  isolated X11 display. It is not part of `hetoimasia-tests` or the console
-  smoke; it is the `test.glfw-native` validation group, which only the display
-  worker runs. See [The native suite](#the-native-suite).
+  isolated X11 display, and per-run consent to enter it. It is not part of
+  `hetoimasia-tests` or the console smoke; it is the `test.glfw-native`
+  validation group, which only the display worker runs. See
+  [The native suite](#the-native-suite).
 
 ## The native suite
 
@@ -2446,9 +2450,10 @@ test environment.
 | Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
 | Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
+| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is a human's approval for this one run on the local desktop; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`. Anything else — the variable unset, empty, or another value, a bare `DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
 | Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
 
 The fixture's settlement rules are proven against a scripted owner that records
@@ -2464,6 +2469,24 @@ an acquisition failure —
 and the failing and cancelled cases again against the real shared session.
 Every deliberate failure is inside a nested run or a forked borrower and is
 asserted as expected, so the suite itself passes.
+
+The consent gate is proven the same way, under `the native opt-in`, without a
+session, a display, or a child: how consent is read from an environment on
+each platform, including that a bare `DISPLAY`, `CI`, an empty value, an
+unrecognized value, an isolated authorization for another display, and an
+isolated authorization on macOS are each refused; that an unapproved run's
+operations are refused before they are dispatched, so a scripted owner records
+no acquisition, while a dry run and an empty selection still acquire nothing
+and refuse nothing; that a consented example is refused before its body, so a
+body that forks an operation and waits on it never starts, while a consented
+run's body runs; that an approved run, under either consent, is served
+with one acquisition; that a refusal reaching the real shared owner fails its
+acquisition before the setup check, so before any native step; that the
+private-session parent starts no child without consent and starts one with
+it, through a recorded launcher; and that a directly invoked child refuses
+before its scenario is looked up, keeping the unknown-scenario exit for an
+approved one. Each refusal message names the variable, the approved command,
+and the isolated alternative.
 
 The native examples cover:
 
@@ -2574,15 +2597,45 @@ The native examples cover:
   readable after the session; and every identity from a completed real session
   answered `MonitorDisconnected` in the next.
 
+Without consent, these list the examples and run the ones that never enter a
+session, acquiring nothing and starting no child:
+
 ```bash
-cabal test glfw-native-tests --test-show-details=direct
 cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
-cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
+cabal test glfw-native-tests --test-show-details=direct --test-options='--match "with a scripted owner"'
+cabal test glfw-native-tests --test-show-details=direct --test-options='--match "the native opt-in"'
 ```
 
-On Linux, run it inside the display helper, exactly as the display worker does:
-`bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct`.
-See [validation.md](validation.md#the-display-worker).
+On Linux, run the native examples inside the display helper, exactly as the
+display worker does. The helper starts a private X11 display and gives the
+command, and only the command, the consent for that display, so this needs
+no approval and touches no desktop:
+
+```bash
+bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct
+```
+
+On a real desktop — Cocoa on macOS, or an X11 desktop of a person's own — the
+examples show, focus, resize, minimize, maximize, and take fullscreen windows
+there. An agent first describes that disruption, asks the human user for
+explicit approval, and waits for acceptance. The approved run then carries the
+consent on its own command, and nowhere else:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct
+HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
+```
+
+The approval covers that one agreed session and is not reprompted during it;
+it does not carry to a later run. An issue acceptance command, a PR approval,
+a persistent shell setting, or a periodic testing request is not that
+approval. Never set the variable in a shell profile or in a script an agent
+runs on its own: the suite cannot tell that a conversation happened, only that
+the command it was given carries the value. Without it, the full command
+fails before initializing GLFW, with the refusal on stderr and zero
+acquisitions in its report, and `--private-session <scenario>` invoked
+directly refuses the same way. See
+[validation.md](validation.md#the-display-worker).
 
 Record native evidence with the manifest and compiler identities it ran under:
 

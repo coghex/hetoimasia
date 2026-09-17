@@ -9,10 +9,23 @@
 -- child runs that scenario's checks in order on its own process main thread,
 -- prints one line per check, and exits non-zero if any failed. A dry run or a
 -- selection that skips these examples starts no child.
+--
+-- Neither side starts without consent. The parent asks the run's 'Gate' before
+-- it starts a child, so an unapproved run refuses the example and launches
+-- nothing; the child inherits the parent's environment, so an approved run's
+-- consent carries to it and it is never asked again. A child started directly
+-- from an unapproved shell reads its own environment and refuses, on stderr
+-- with 'refusedExit', before any scenario is looked up or any session entered.
 module Test.GLFW.Native.Private
   ( spec
   , privateSessionFlag
   , runScenario
+
+    -- * For the headless regressions
+  , launchWith
+  , childPlan
+  , refusedExit
+  , unknownScenarioExit
   ) where
 
 import Control.Concurrent.STM (atomically)
@@ -52,39 +65,66 @@ import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Process (readProcessWithExitCode)
-import Test.GLFW.Native.Support (hostBackend)
+import Test.GLFW.Native.Consent (Consent, Refusal, refusalMessage)
+import Test.GLFW.Native.Support (Gate, admit, hostBackend)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldContain)
 
 -- | The argument that makes this executable a private-session child.
 privateSessionFlag ∷ String
 privateSessionFlag = "--private-session"
 
-spec ∷ Spec
-spec = describe "private sessions in a child process" $ do
+spec ∷ Gate → Spec
+spec gate = describe "private sessions in a child process" $ do
   it "enters and leaves real sessions in sequence, fails a forced initialization, and enters again after its rollback" $
-    privateScenario "session-lifecycle"
+    privateScenario gate "session-lifecycle"
 
   it "rethrows a fault raised inside a real native callback at the owner boundary" $
-    privateScenario "callback-fault"
+    privateScenario gate "callback-fault"
 
   it "detaches the real monitor callback before termination, frees it last, and never resolves an ended session's identity" $
-    privateScenario "monitor-lifecycle"
+    privateScenario gate "monitor-lifecycle"
 
-privateScenario ∷ String → IO ()
-privateScenario name = do
+privateScenario ∷ Gate → String → IO ()
+privateScenario gate = launchWith gate $ \name → do
   executable ← getExecutablePath
-  (status, out, err) ← readProcessWithExitCode executable [privateSessionFlag, name] ""
+  readProcessWithExitCode executable [privateSessionFlag, name] ""
+
+-- | Run one scenario through a launcher, once the gate admits the run, and
+-- check that the child reported every check passed. A refused run raises the
+-- refusal on the example's thread and never calls the launcher.
+launchWith ∷ Gate → (String → IO (ExitCode, String, String)) → String → IO ()
+launchWith gate launch name = do
+  _ ← admit gate
+  (status, out, err) ← launch name
   unless (status == ExitSuccess) $
     expectationFailure ("the private " <> name <> " process exited " <> show status <> ":\n" <> out <> err)
   out `shouldContain` ("glfw-native-tests " <> name <> ": every check passed")
 
+-- | The child's exit when its own environment carries no consent.
+refusedExit ∷ ExitCode
+refusedExit = ExitFailure 3
+
+-- | The child's exit for a scenario it does not know.
+unknownScenarioExit ∷ ExitCode
+unknownScenarioExit = ExitFailure 2
+
+-- | What the child does with its consent and scenario name: exit with a
+-- message, or run these checks. Consent is decided before the scenario is
+-- looked up, so an unapproved child refuses whatever it was asked for.
+childPlan ∷ Either Refusal Consent → String → Either (ExitCode, String) [(String, IO String)]
+childPlan consent name = case consent of
+  Left refusal → Left (refusedExit, "glfw-native-tests " <> name <> ": " <> refusalMessage refusal)
+  Right _ → case lookup name scenarios of
+    Nothing → Left (unknownScenarioExit, "glfw-native-tests: unknown private session scenario " <> show name)
+    Just checks → Right checks
+
 -- | Run one scenario as the child process, then exit.
-runScenario ∷ String → IO ()
-runScenario name = case lookup name scenarios of
-  Nothing → do
-    hPutStrLn stderr ("glfw-native-tests: unknown private session scenario " <> show name)
-    exitWith (ExitFailure 2)
-  Just checks → do
+runScenario ∷ Either Refusal Consent → String → IO ()
+runScenario consent name = case childPlan consent name of
+  Left (code, message) → do
+    hPutStrLn stderr message
+    exitWith code
+  Right checks → do
     failures ← newIORef (0 ∷ Int)
     mapM_ (runCheck failures) checks
     count ← readIORef failures
