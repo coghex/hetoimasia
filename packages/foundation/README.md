@@ -134,6 +134,21 @@ with engine origin before anything is inspected. Close keeps the final value,
 never retries, and never reopens. See
 [docs/messaging.md](../../docs/messaging.md#latest-value-snapshots).
 
+`Hetoimasia.Foundation.Time` is the monotonic time boundary. A
+`MonotonicSource` is injected: `monotonicSource` reads the process's monotonic
+clock, whose epoch every use shares, and `scriptedSource` scripts readings for
+tests. `Instant` and `Duration` are opaque whole nanoseconds that are never
+negative and have no wall-clock, numeric, or serializable representation.
+Durations from caller input are validated as `AllowZero` or `RequirePositive`
+and a refusal names its reason; a `Double` seconds conversion reports its
+rounding. Deadline arithmetic reports overflow rather than wrapping, and
+`sampleElapsed` reports zero on a first, repeated, or backward sample and the
+full difference otherwise, always storing the latest raw sample. A clock failure
+is attributed to `foundation.time` through the failure module, and cancellation
+propagates unchanged. The foundation owns these values and this arithmetic; the
+runtime owns step policy and GLFW owns native wait conversion. See
+[docs/time.md](../../docs/time.md).
+
 Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
@@ -142,8 +157,8 @@ it has an independent purpose; this is not a miscellaneous bucket.
 
 `foundation-tests` owns this package's contracts. Its sources live in `test/`
 alone: `Main.hs`, the composer `Test.Foundation.Spec`, and one component tree
-each for `Logging`, `Resources`, `Failures`, `Recovery`, `Workers`, and
-`Messaging`, with that component's own helpers beside its specs. A new example
+each for `Logging`, `Resources`, `Failures`, `Recovery`, `Workers`,
+`Messaging`, and `Time`, with that component's own helpers beside its specs. A new example
 belongs in the component spec whose contract it asserts. It may use only this
 package, the neutral `hetoimasia-test-support` library, and third-party
 packages; an example that needs the runtime, GLFW, or the console belongs to the

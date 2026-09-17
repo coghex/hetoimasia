@@ -4,7 +4,7 @@ A modular Haskell/Vulkan game engine with a planned Lua scripting host and
 separate 2D and 3D rendering modules. Synarchy is a potential future client.
 
 **Current implementation:** logging, scoped CPU resources, failures and bounded
-recovery, application composition, supervised workers, bounded messaging, and
+recovery, monotonic time values, application composition, supervised workers, bounded messaging, and
 GLFW with dynamic windows, controls, monitor-aware modes, and input feeds.
 Vulkan, Lua, fonts, and rendering remain planned; their directories contain
 ownership notes and are not in the Cabal package list.
@@ -28,6 +28,7 @@ with platform isolation proofs before production sandbox work.
 - [Resource ownership contract](docs/resources.md)
 - [Runtime supervision](docs/supervision.md)
 - [Messaging contract](docs/messaging.md)
+- [Monotonic time contract](docs/time.md)
 - [GLFW contract and native tests](docs/glfw.md)
 - [Validation and evidence reuse](docs/validation.md)
 - [Vulkan backend design — exploring](docs/vulkan_backend_design.md)

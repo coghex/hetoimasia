@@ -15,7 +15,10 @@ description:
     and immutable message payloads fully evaluated through NFData on the
     producer's thread before publication, carried by bounded FIFO channels with
     separate send, receive, and owner-control endpoints, a terminal state, and
-    atomic counters, and by latest-value snapshots read through checked cursors.
+    atomic counters, and by latest-value snapshots read through checked cursors;
+    and a monotonic time boundary: an injected monotonic clock, opaque
+    non-negative instants and durations with validated construction, and
+    non-wrapping deadline arithmetic and elapsed sampling.
     This library has no application state, graphics, scripting, or game
     dependencies.
 license: GPL-3.0-only
@@ -42,6 +45,7 @@ library
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
         Hetoimasia.Foundation.Resource.Collection
+        Hetoimasia.Foundation.Time
         Hetoimasia.Foundation.Worker
     -- Shares the Scoped representation and the composite ledger between the
     -- resource API and the scoped constructors of other foundation modules
@@ -93,6 +97,8 @@ test-suite foundation-tests
         Test.Foundation.Resources.Journal
         Test.Foundation.Resources.Opacity
         Test.Foundation.Resources.Spec
+        Test.Foundation.Time.Opacity
+        Test.Foundation.Time.Spec
         Test.Foundation.Workers.Spec
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
