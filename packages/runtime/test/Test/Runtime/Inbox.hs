@@ -3,14 +3,14 @@
 -- Every example starts a real inbox service with real 'withSupervision',
 -- 'startInboxService', and 'awaitSupervised', inside a logging lifetime over a
 -- collecting sink, with synthetic typed failures. The traced component contexts
--- and handlers come from "Test.Engine.Runtime.Inbox.Support"; the graceful
--- finish examples live in "Test.Engine.Runtime.InboxFinish".
+-- and handlers come from "Test.Runtime.Inbox.Support"; the graceful
+-- finish examples live in "Test.Runtime.InboxFinish".
 --
 -- Coordination is explicit: a handler signals entry through an 'MVar' and
 -- waits on a gate, and 'awaitBlockedOnSTM' decides when the application thread
 -- has reached closing's drain. No example sleeps; 'boundedSupervision' only
 -- stops an example that has already hung.
-module Test.Engine.Runtime.Inbox (spec) where
+module Test.Runtime.Inbox (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
@@ -41,8 +41,8 @@ import Hetoimasia.Runtime.Supervision
   , checkRuntime
   , withSupervision
   )
-import Test.Engine.Runtime.Inbox.Support
-import Test.Engine.Runtime.Supervision.Support
+import Test.Runtime.Inbox.Support
+import Test.Runtime.Supervision.Support
   ( Broken (..)
   , CollectedLifetime (..)
   , Trace

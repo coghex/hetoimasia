@@ -1,7 +1,7 @@
 -- | Examples for supervised waits on the foundation's messaging primitives.
 --
 -- Each example runs the real 'withSupervision' and 'awaitSupervised' with the
--- fixtures of "Test.Engine.Runtime.Supervision.Support", around a channel or
+-- fixtures of "Test.Runtime.Supervision.Support", around a channel or
 -- snapshot wait, and asserts that a worker outcome already published is settled
 -- before the wait commits. Worker outcomes are read raw with 'awaitTerminal'
 -- before the supervised wait is entered; no example sleeps, and
@@ -9,7 +9,7 @@
 --
 -- The primitive channel and snapshot contracts these examples sit beside are
 -- owned by the foundation package's own suite.
-module Test.Engine.Runtime.Messaging (spec) where
+module Test.Runtime.Messaging (spec) where
 
 import Control.Concurrent.STM (STM, atomically, newTVarIO, orElse, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException)
@@ -27,7 +27,7 @@ import Hetoimasia.Runtime.Supervision
   , withSupervision
   , workerStatus
   )
-import Test.Engine.Runtime.Supervision.Support
+import Test.Runtime.Supervision.Support
   ( Broken (..)
   , awaitTerminal
   , boundedSupervision

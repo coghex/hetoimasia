@@ -57,3 +57,30 @@ Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before
 they are introduced; the current runner is not a resource manager.
+
+## Tests
+
+`runtime-tests` owns this package's contracts. Its sources live in `test/`
+alone: `Main.hs`, the composer `Test.Runtime.Spec`, which roots the `Runtime`
+group, one module per component — the runner, application lifecycle, inbox
+services and their finish, logging lifetime, opacity, reporting, supervision,
+supervised messaging waits, and the resource smoke — and the supervision, inbox,
+and logger fixtures beside them. Examples run against real foundation services
+through their public APIs rather than mocks, and a foundation primitive's own
+contract belongs to `foundation-tests`, not here. A new runtime example belongs
+in the component module whose behaviour it asserts. It may use only this
+package, the foundation, the neutral `hetoimasia-test-support` library, and
+third-party packages; an example that launches the console executable belongs
+in the root suite's `Console` group instead. Run the suite, or one component of
+it:
+
+```bash
+cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
+cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct \
+  --test-options='--match Supervision'
+```
+
+A selector that matches no example fails the suite. Without the GLFW SDK, add
+`--project-file cabal.project.cpu`; see
+[docs/validation.md](../../docs/validation.md#building-without-the-glfw-sdk).
+The validation catalog runs the suite as the floor group `test.runtime`.

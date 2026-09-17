@@ -438,8 +438,8 @@ lifetime owner.
 | The final flush attempt | Finalization | Finalization, at most once | None: its outcome is the lifetime's result or evidence on its failure | The thread that called `withLoggingLifetime` | Not stored; decided and made once per call. |
 
 The `Logging lifetime` group in
-[`test/Test/Engine/Runtime/Lifetime.hs`](../test/Test/Engine/Runtime/Lifetime.hs),
-selected by `--match Runtime`, drives each row above with injected sinks,
+[`packages/runtime/test/Test/Runtime/Lifetime.hs`](../packages/runtime/test/Test/Runtime/Lifetime.hs),
+in `hetoimasia-runtime:runtime-tests` and selected by `--match 'Logging lifetime'`, drives each row above with injected sinks,
 release traces, and a temporary borrowed handle.
 
 ## Context and precedence
@@ -870,8 +870,8 @@ release callback or between an acquisition and the installation of its
 release; see [Application lifecycle](resources.md#application-lifecycle).
 
 The `Outcome reporting` group in
-[`test/Test/Engine/Runtime/Reporting.hs`](../test/Test/Engine/Runtime/Reporting.hs),
-selected by `--match Runtime`, drives each rule above with an injected sink.
+[`packages/runtime/test/Test/Runtime/Reporting.hs`](../packages/runtime/test/Test/Runtime/Reporting.hs),
+in `hetoimasia-runtime:runtime-tests` and selected by `--match 'Outcome reporting'`, drives each rule above with an injected sink.
 `resourceSmoke` is the adapter's existing runtime consumer.
 
 **A terminal report's outcome can be handed on.** `reportTerminalFailure`

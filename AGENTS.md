@@ -48,26 +48,31 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Routine build: `cabal build all`.
 - Console smoke: `cabal run exe:hetoimasia -- --smoke`.
 - Current focused tests:
-  `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct`
+  `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct`,
+  `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
   `Recovery`, `Workers`, and `Messaging` components, composed by
   `Test.Foundation.Spec`; it depends on no runtime, GLFW, or console code.
-  Root `hetoimasia-tests` (`test/`) owns `Runtime` and `GLFW`, composed by
-  `Test.Engine.Spec`, including the console resource smoke and the supervised
-  channel and snapshot waits until the runtime suite exists. A new example
-  belongs in the component spec that owns the behaviour it asserts, beside
-  that component's own helpers. Run one component with
+  `runtime-tests` (`packages/runtime/test/`) owns the `Runtime` group, composed
+  by `Test.Runtime.Spec`: the runner and application lifecycle, logging
+  lifetime, reporting, supervision, inbox services, runtime opacity, the
+  resource smoke, and the supervised channel and snapshot waits, against real
+  foundation services; it depends on no GLFW or console code. Root
+  `hetoimasia-tests` (`test/`) owns `Console` (the executable's startup and
+  exit mapping, run as a child process) and `GLFW`, composed by
+  `Test.Engine.Spec`. A new runtime example belongs in `runtime-tests`, beside
+  that component's own helpers; a console example belongs in root `Console`;
+  in general a new example belongs in the component spec that owns the
+  behaviour it asserts. Run one component with
   `--test-options='--match <Component>'` on the suite that owns it; a selector
   that matches no example fails the suite rather than reporting a silent pass.
-  The foundation selectors moved with their examples: on the root suite,
-  `--match Resources`, `Recovery`, `Workers`, and `Messaging` now select
-  nothing and fail, while `--match Logging` and `--match Failures` still select
-  the root `Logging lifetime` and `Failures during finish` subgroups of
-  `Runtime`; the anchored `/Failures/` form the component docs use selects
-  nothing there.
-- Without the GLFW SDK, build and run the foundation suite with
+  Selectors moved with their examples: on the root suite, `--match Runtime`,
+  `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, and `Failures`
+  now select nothing and fail; on `runtime-tests`, `--match Supervision` or
+  `--match 'Logging lifetime'` select runtime subgroups as they did at root.
+- Without the GLFW SDK, build and run the foundation and runtime suites with
   `--project-file cabal.project.cpu`, which shares `cabal.project.common` with
   `cabal.project` and leaves out the packages that need GLFW.
 - Never import a helper from another component's spec module. Neutral

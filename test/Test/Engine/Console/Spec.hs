@@ -1,9 +1,13 @@
 -- | Examples for the console executable's startup, run as a child process.
 --
+-- They root the suite's @Console@ group, so @--match Console@ selects them and
+-- nothing else. They import no runtime spec module: an example asserting a
+-- runtime contract belongs to @hetoimasia-runtime:runtime-tests@.
+--
 -- The console owns the variable names its startup reads, so these examples
 -- state them here rather than borrowing the logging configuration examples'
 -- own copy.
-module Test.Engine.Runtime.Console (spec) where
+module Test.Engine.Console.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -44,7 +48,7 @@ import Test.Hspec
   )
 
 spec ∷ Spec
-spec = describe "Console startup" $ do
+spec = describe "Console" $ describe "Console startup" $ do
   it "emits the smoke records under the default configuration" testConsoleDefault
   it "applies a threshold and an exact override to the smoke path" testConsoleThreshold
   it "emits the owned-resource lifecycle records on the resource-smoke path"

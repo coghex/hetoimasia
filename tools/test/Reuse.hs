@@ -491,46 +491,50 @@ spec = describe "Validation evidence reuse" $ do
         errors `shouldContain` "resolved without worker declarations"
 
   describe "the checked-in engine routing" $
-    it "assigns test.foundation to the engine worker, requires it in the aggregate, and reuses its published receipt" $
-      withCheckedInRouting $ \fixture workers → do
-        -- The workflow publishes every engine group's receipt under the name
-        -- the lookup asks for, so a group routed to the worker but never
-        -- published could never be reused.
-        workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
-        change fixture "README.md" "a prose-only update\n"
-        plan ← planRouted fixture workers "routed-plan.json"
-        engine ← workerGroups plan "haskell-engine"
-        engine `shouldContain` ["test.foundation"]
-        forM_ engine $ \group → do
-          workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
-          workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
-        entryText plan "test.foundation" "reason" `shouldReturn` Just "floor"
-        entryText plan "test.engine" "reason" `shouldReturn` Just "floor"
+    -- Each package suite's group took over coverage the root suite's group
+    -- used to carry, so each is proven routed, required, and reusable on its
+    -- own rather than through the root group's pass.
+    forM_ ["test.foundation", "test.runtime"] $ \packageGroup →
+      it ("assigns " ++ packageGroup ++ " to the engine worker, requires it in the aggregate, and reuses its published receipt") $
+        withCheckedInRouting $ \fixture workers → do
+          -- The workflow publishes every engine group's receipt under the name
+          -- the lookup asks for, so a group routed to the worker but never
+          -- published could never be reused.
+          workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
+          change fixture "README.md" "a prose-only update\n"
+          plan ← planRouted fixture workers "routed-plan.json"
+          engine ← workerGroups plan "haskell-engine"
+          engine `shouldContain` [packageGroup]
+          forM_ engine $ \group → do
+            workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
+            workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
+          entryText plan packageGroup "reason" `shouldReturn` Just "floor"
+          entryText plan "test.engine" "reason" `shouldReturn` Just "floor"
 
-        -- Required: every other engine group passing does not stand in for it.
-        writeFixtureFile (stubDirectory fixture) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
-        exitOf <$> reuseWith fixture plan (restated workers) `shouldReturn` ExitSuccess
-        forM_ (filter (/= "test.foundation") engine) $ \group →
-          exitOf <$> runGroup fixture plan group engineRoute `shouldReturn` ExitSuccess
-        (missing, output, _) ← aggregate fixture plan (reportedSuccess workers)
-        missing `shouldBe` ExitFailure 1
-        output `shouldContain` "test.foundation"
-        output `shouldContain` "neither an execution nor an applicable earlier receipt"
-        exitOf <$> runGroup fixture plan "test.foundation" engineRoute `shouldReturn` ExitSuccess
-        exitOf <$> aggregate fixture plan (reportedSuccess workers) `shouldReturn` ExitSuccess
+          -- Required: every other engine group passing does not stand in for it.
+          writeFixtureFile (stubDirectory fixture) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
+          exitOf <$> reuseWith fixture plan (restated workers) `shouldReturn` ExitSuccess
+          forM_ (filter (/= packageGroup) engine) $ \group →
+            exitOf <$> runGroup fixture plan group engineRoute `shouldReturn` ExitSuccess
+          (missing, output, _) ← aggregate fixture plan (reportedSuccess workers)
+          missing `shouldBe` ExitFailure 1
+          output `shouldContain` packageGroup
+          output `shouldContain` "neither an execution nor an applicable earlier receipt"
+          exitOf <$> runGroup fixture plan packageGroup engineRoute `shouldReturn` ExitSuccess
+          exitOf <$> aggregate fixture plan (reportedSuccess workers) `shouldReturn` ExitSuccess
 
-        -- Reusable: a later prose-only candidate takes the published receipt.
-        let earlier = root fixture </> "foundation-earlier.json"
-        copyFile (receiptPath fixture "test.foundation") earlier
-        forM_ engine $ \group → removeFile (receiptPath fixture group)
-        change fixture "README.md" "another prose-only update\n"
-        later ← planRouted fixture workers "routed-later.json"
-        install fixture later "test.foundation" [passing earlier]
-        (looked, lookedUp, _) ← reuseWith fixture later (restated workers)
-        looked `shouldBe` ExitSuccess
-        lookedUp `shouldContain` "reused=test.foundation"
-        document ← applicability fixture
-        recordText document "test.foundation" "source_run_url" `shouldBe` Just (runUrl 41 1)
+          -- Reusable: a later prose-only candidate takes the published receipt.
+          let earlier = root fixture </> "package-earlier.json"
+          copyFile (receiptPath fixture packageGroup) earlier
+          forM_ engine $ \group → removeFile (receiptPath fixture group)
+          change fixture "README.md" "another prose-only update\n"
+          later ← planRouted fixture workers "routed-later.json"
+          install fixture later packageGroup [passing earlier]
+          (looked, lookedUp, _) ← reuseWith fixture later (restated workers)
+          looked `shouldBe` ExitSuccess
+          lookedUp `shouldContain` ("reused=" ++ packageGroup)
+          document ← applicability fixture
+          recordText document packageGroup "source_run_url" `shouldBe` Just (runUrl 41 1)
 
 -- ---------------------------------------------------------------------------
 -- Driving the tools

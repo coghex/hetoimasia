@@ -9,7 +9,7 @@
 -- application thread has parked in the finish's supervised wait, and a
 -- classifier waiting on a gate holds that wait between two outcomes. No example
 -- sleeps; 'boundedSupervision' only stops an example that has already hung.
-module Test.Engine.Runtime.InboxFinish (spec) where
+module Test.Runtime.InboxFinish (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
@@ -58,8 +58,8 @@ import Hetoimasia.Runtime.Supervision
   , withSupervision
   , workerStatus
   )
-import Test.Engine.Runtime.Inbox.Support
-import Test.Engine.Runtime.Supervision.Support
+import Test.Runtime.Inbox.Support
+import Test.Runtime.Supervision.Support
   ( Broken (..)
   , CollectedLifetime (..)
   , Gate

@@ -7,8 +7,9 @@
 -- 'boundedExample' only stops an example that has already hung.
 --
 -- The examples that settle a supervised worker's outcome around a snapshot wait
--- exercise the runtime's supervision and are registered by the root suite's
--- @Runtime@ group, in "Test.Engine.Runtime.Messaging".
+-- exercise the runtime's supervision and are registered by the runtime
+-- package's suite, @hetoimasia-runtime:runtime-tests@, under its @Runtime@
+-- group, in "Test.Runtime.Messaging".
 module Test.Foundation.Messaging.Snapshot (spec) where
 
 import Control.Concurrent (forkIO, myThreadId)

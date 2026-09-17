@@ -13,7 +13,7 @@
 --
 -- Concurrency is coordinated with 'MVar's, never with a sleep; 'boundedExample'
 -- only stops an example that has already hung.
-module Test.Engine.Runtime.ResourceSmoke (spec) where
+module Test.Runtime.ResourceSmoke (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar

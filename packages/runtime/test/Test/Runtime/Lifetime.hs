@@ -8,7 +8,7 @@
 --
 -- Cancellation is coordinated with 'MVar's, never with a sleep; 'bounded' only
 -- stops an example that has already hung.
-module Test.Engine.Runtime.Lifetime (spec) where
+module Test.Runtime.Lifetime (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar

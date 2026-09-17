@@ -39,3 +39,46 @@ library
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0
+
+-- The runtime's own contracts, exercised against real foundation services. It
+-- depends on this package, the foundation, the neutral test-support library,
+-- and third-party packages alone, so it builds without GLFW, the console
+-- library, or the executable. The only processes it launches are the compiler
+-- and the external clients the opacity examples compile, link, and run.
+test-suite runtime-tests
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Runtime.Spec
+        Test.Runtime.Application
+        Test.Runtime.Composition
+        Test.Runtime.Inbox
+        Test.Runtime.Inbox.Support
+        Test.Runtime.InboxFinish
+        Test.Runtime.Lifetime
+        Test.Runtime.LogFixture
+        Test.Runtime.Messaging
+        Test.Runtime.Opacity
+        Test.Runtime.Reporting
+        Test.Runtime.ResourceSmoke
+        Test.Runtime.Supervision
+        Test.Runtime.Supervision.Support
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    build-depends:
+        base >=4.21 && <4.22,
+        containers >=0.7 && <0.8,
+        deepseq >=1.5.1 && <1.6,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        time >=1.14 && <1.15,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0

@@ -1267,7 +1267,7 @@ main = exitOnFailure $ do
           ...
 ```
 
-`test/Test/Engine/Runtime/Composition.hs` is the worked example: two unrelated
+`packages/runtime/test/Test/Runtime/Composition.hs` is the worked example: two unrelated
 applications — a workshop whose services carry a supervised service, and a
 station whose services publish an optional radio's availability — run through
 the same runner.
@@ -1566,8 +1566,9 @@ an unbounded traversal fails these examples in seconds instead of running for
 hours.
 
 The `Console resource smoke` examples in
-`test/Test/Engine/Runtime/ResourceSmoke.hs`, registered by the root suite under
-`Runtime` because they exercise the runtime's demonstration, cover
+`packages/runtime/test/Test/Runtime/ResourceSmoke.hs`, registered by the runtime
+package's suite under `Runtime` because they exercise the runtime's
+demonstration, cover
 [Application lifecycle](#application-lifecycle) by running
 `Hetoimasia.Runtime.Resources.resourceSmoke` — the body the console executable
 runs — with a failure injected into the work, into one release, into two
@@ -1582,20 +1583,23 @@ records that reached the sink, and which releases ran. One further example
 drives the body through a handle sink over a temporary file the example owns,
 and closes that handle only after the scope has unwound, so every cleanup
 record is in the file and the borrowed handle was neither closed nor rebuffered
-by the sink. The `Console startup` group in `test/Test/Engine/Runtime/Console.hs` runs
+by the sink. The `Console startup` group in the root suite's
+`test/Test/Engine/Console/Spec.hs` runs
 `--resource-smoke` as a child process for the record sequence and for the quiet
 path at a `warn` threshold. The validation catalog covers the foundation
-examples above through the floor group `test.foundation`, and the console
-resource smoke and startup examples through the floor group `test.engine`; see
+examples above through the floor group `test.foundation`, the resource smoke
+through the floor group `test.runtime`, and the console startup examples through
+the floor group `test.engine`; see
 [validation.md](validation.md).
 
 The `Application lifecycle` examples in
-`test/Test/Engine/Runtime/Composition.hs`, selected by `--match Runtime`,
+`packages/runtime/test/Test/Runtime/Composition.hs`, selected by
+`--match 'Application lifecycle'` on `hetoimasia-runtime:runtime-tests`,
 cover [The application runner](#the-application-runner) with two
 application-owned dependency and services types through the same runner, an
 injected sink traced beside the releases, real CPU scopes, real foundation
 workers under supervision, and the supervision fixtures of
-`Test.Engine.Runtime.Supervision.Support`, coordinated with gates, STM, and
+`Test.Runtime.Supervision.Support`, coordinated with gates, STM, and
 `threadStatus` and no sleeps. They show startup and the action on the calling
 thread; boot in dependency order and disposal of dependents before
 dependencies with a composite's declared order kept; an optional component's
@@ -1607,7 +1611,7 @@ supervised failure and a failure arriving while closing each failing a run
 whose action returned; a component cleanup failure in the one terminal report,
 after disposal and before the flush; a final flush failure attempted once,
 failing the run with no report; and no terminal report once an optional
-worker's warning has failed. The `Exit mapping` examples in
-`test/Test/Engine/Runtime/Console.hs` run both smoke paths with a broken stderr
+worker's warning has failed. The `Exit mapping` examples in the root suite's
+`test/Test/Engine/Console/Spec.hs` run both smoke paths with a broken stderr
 for a non-zero exit, and drive `exitOnFailure` directly for cancellation and
 for an explicit status passing through.
