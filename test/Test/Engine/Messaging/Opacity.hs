@@ -4,7 +4,7 @@
 -- clients outside the foundation package.
 --
 -- These examples compile separate single-module clients with the harness from
--- "Test.Engine.Resources.Opacity", exposing @base@, @deepseq@, and
+-- "Test.Support.ExternalClient", exposing @base@, @deepseq@, and
 -- @hetoimasia-foundation@ and hiding everything else; @deepseq@ is exposed
 -- because every client that defines a payload imports "Control.DeepSeq".
 --
@@ -37,8 +37,8 @@ module Test.Engine.Messaging.Opacity (spec) where
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
-import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, withPackageClient)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
+import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
 
 spec ∷ Spec
 spec = do

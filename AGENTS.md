@@ -54,6 +54,13 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   composes them. Run one component with
   `--test-options='--match <Component>'`; a selector that matches no example
   fails the suite rather than reporting a silent pass.
+- Never import a helper from another component's spec module. Neutral
+  utilities shared by more than one suite, currently the external-client
+  compiler harness (`Test.Support.ExternalClient`) and the bounded test wait
+  (`Test.Support.Bounded`), live in the test-only `hetoimasia-test-support`
+  library at `tools/test-support/`; only test suites depend on it. Domain
+  fixtures stay beside their owning suite, built through public APIs; see
+  [its README](tools/test-support/README.md) for what belongs there.
 - Every validation group is declared once in `tools/validation/catalog.json`.
   Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
   groups a change requires and why; see [validation.md](docs/validation.md) for

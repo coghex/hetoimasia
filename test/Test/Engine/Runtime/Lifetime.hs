@@ -105,7 +105,6 @@ import System.IO
   )
 import System.IO.Error (ioeGetErrorString)
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Engine.Logging.Support (bounded)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -115,6 +114,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "Logging lifetime" $ do

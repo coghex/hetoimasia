@@ -50,9 +50,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Process (createPipe)
 import System.Timeout (timeout)
 import Test.Engine.Logging.Support
-  ( boundMicroseconds
-  , bounded
-  , fixedMetadata
+  ( fixedMetadata
   , gpuComponent
   , newCollector
   , testComponent
@@ -68,6 +66,7 @@ import Test.Hspec
   , shouldSatisfy
   , shouldThrow
   )
+import Test.Support.Bounded (boundMicroseconds, bounded)
 import Text.Read (readMaybe)
 
 spec ∷ Spec

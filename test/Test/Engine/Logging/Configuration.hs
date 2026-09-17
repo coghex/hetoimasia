@@ -1,6 +1,6 @@
 -- | Examples for parsing logging configuration values and for resolving a
 -- startup filter from them.
-module Test.Engine.Logging.Configuration (spec, consoleVariables) where
+module Test.Engine.Logging.Configuration (spec) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Monad (forM_, void)
@@ -45,9 +45,9 @@ spec = do
     it "leaves the master and source switches programmatic" testResolveProgrammatic
     it "consults each variable exactly once and nothing afterwards" testResolveOnce
 
--- | The variable names the console application chooses, used by both the
--- injected-lookup assembly cases and the child-process startup cases so the two
--- describe one contract.
+-- | The variable names the console application chooses, used by the
+-- injected-lookup assembly cases. The console's child-process startup examples
+-- state the same names beside their own suite.
 consoleVariables ∷ LogVariables
 consoleVariables = LogVariables
   { variableGlobalLevel = "HETOIMASIA_LOG_LEVEL"

@@ -4,7 +4,7 @@
 -- outside the package.
 --
 -- These examples compile separate single-module clients with the harness from
--- "Test.Engine.Resources.Opacity", exposing @base@, @text@, @stm@,
+-- "Test.Support.ExternalClient", exposing @base@, @text@, @stm@,
 -- @hetoimasia-foundation@, and @hetoimasia-glfw@ and hiding everything else.
 -- Five clients must be rejected, each for the diagnostic naming its cause: one
 -- names the session's data constructor; one reaches for the native window
@@ -70,8 +70,8 @@ module Test.Engine.GLFW.Opacity (spec) where
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
-import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, withPackageClient)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
+import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
 
 spec ∷ Spec
 spec = describe "GLFW session opacity across the package boundary" $ do

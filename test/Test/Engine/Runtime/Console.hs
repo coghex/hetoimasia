@@ -1,8 +1,8 @@
 -- | Examples for the console executable's startup, run as a child process.
 --
--- The variable names come from the logging component that declares them, so the
--- injected-lookup cases there and the child-process cases here describe one
--- contract rather than two copies of it.
+-- The console owns the variable names its startup reads, so these examples
+-- state them here rather than borrowing the logging configuration examples'
+-- own copy.
 module Test.Engine.Runtime.Console (spec) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -14,7 +14,8 @@ import Data.Maybe (mapMaybe)
 import qualified Data.Text as Text
 import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode)
 import Hetoimasia.Foundation.Log
-  ( variableComponentLevels
+  ( LogVariables (..)
+  , variableComponentLevels
   , variableDebug
   , variableGlobalLevel
   )
@@ -31,7 +32,6 @@ import System.Process
   , waitForProcess
   , withCreateProcess
   )
-import Test.Engine.Logging.Configuration (consoleVariables)
 import Test.Hspec
   ( Spec
   , describe
@@ -60,6 +60,14 @@ spec = describe "Console startup" $ do
     it "exits non-zero when a runtime failure propagates out of a path" testConsolePropagatedFailure
     it "maps a cancellation to the cancellation status" testExitCancellation
     it "passes an explicit exit status through unchanged" testExitPassthrough
+
+-- | The variable names the console application chooses.
+consoleVariables ∷ LogVariables
+consoleVariables = LogVariables
+  { variableGlobalLevel = "HETOIMASIA_LOG_LEVEL"
+  , variableComponentLevels = "HETOIMASIA_LOG_LEVELS"
+  , variableDebug = "HETOIMASIA_DEBUG"
+  }
 
 -- | The three variable names the console application reads, as the environment
 -- spells them.

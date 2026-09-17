@@ -7,7 +7,7 @@ module Test.Engine.Runtime.Application (spec) where
 import Hetoimasia.Foundation.Log
 import Hetoimasia.Runtime (runApplication)
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Logging.Support (fixedMetadata, newCollector, summaries)
+import Test.Engine.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldThrow)
 
 spec ∷ Spec

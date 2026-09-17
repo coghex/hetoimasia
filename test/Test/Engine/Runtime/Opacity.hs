@@ -11,7 +11,7 @@
 -- a request against the wrong worker and report the wrong status.
 --
 -- These examples compile separate single-module clients with the harness from
--- "Test.Engine.Resources.Opacity", exposing @base@, @text@, @stm@,
+-- "Test.Support.ExternalClient", exposing @base@, @text@, @stm@,
 -- @hetoimasia-foundation@, and @hetoimasia-runtime@ and hiding everything
 -- else. For the supervised handle two clients must be rejected, and for the
 -- inbox service's handle, definition, start result, exit record, and drain
@@ -26,8 +26,8 @@ module Test.Engine.Runtime.Opacity (spec) where
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
-import Test.Engine.Resources.Opacity (Client (..), Mode (..), rejectedBecause, withPackageClient)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
+import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
 
 spec ∷ Spec
 spec = do

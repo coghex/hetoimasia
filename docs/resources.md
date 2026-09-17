@@ -1481,7 +1481,9 @@ preempts the consumer and still releases every part.
 
 The first two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
 [The continuation facade](#the-continuation-facade) and
-[The evidence boundary](#the-evidence-boundary). They compile eight
+[The evidence boundary](#the-evidence-boundary). Through the shared
+external-client harness `Test.Support.ExternalClient`, in the test-only
+`hetoimasia-test-support` library, they compile eight
 single-module clients with the compiler on `PATH` against the package database
 this build produced, exposing only `base`, `text`, and
 `hetoimasia-foundation`, so what a client can say is exactly what the package

@@ -78,7 +78,7 @@ import Hetoimasia.Runtime.Supervision
   , workerStatus
   )
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Logging.Support (fixedMetadata)
+import Test.Engine.Runtime.LogFixture (fixedMetadata)
 import Test.Engine.Runtime.Supervision.Support
   ( Broken (..)
   , Trace

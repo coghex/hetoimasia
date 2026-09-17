@@ -81,10 +81,12 @@ observations, not a new test execution:
   `Test.Engine.Resources.Smoke` exercises runtime's `resourceSmoke`, and the
   messaging Channel/Snapshot files contain `awaitSupervised` integration cases.
   Directory names currently do not consistently identify the contract owner.
-- Runtime, messaging, and GLFW opacity specs import a compilation harness from
-  `Test.Engine.Resources.Opacity`. Runtime also imports logging test helpers;
-  console tests import configuration values from a logging spec. These are
-  source-level coupling points to remove before separating Cabal components.
+- Runtime, messaging, and GLFW opacity specs imported a compilation harness from
+  `Test.Engine.Resources.Opacity`. Runtime also imported logging test helpers;
+  console tests imported configuration values from a logging spec. TEST-3
+  (#125) removed these coupling points: the harness and bounded wait now live in
+  `hetoimasia-test-support` at `tools/test-support/`, runtime builds its own
+  logger fixture, and the console spec states its own variable names.
 - GLFW's `window-examples/` executable already owns the scripted window/host
   examples and can use private libraries. One root Hspec example launches it as
   a subprocess, obscuring its individual examples from root Hspec selection.

@@ -31,7 +31,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Logging.Support (bounded, fixedMetadata, newCollector, summaries)
+import Test.Engine.Logging.Support (fixedMetadata, newCollector, summaries)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -42,6 +42,7 @@ import Test.Hspec
   , shouldContain
   , shouldReturn
   )
+import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "Worker reporting boundary" $ do
