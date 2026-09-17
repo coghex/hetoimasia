@@ -133,8 +133,9 @@ approved ledger changes can accumulate in `docs-wip` for a requested batch landi
 
 ## Local checks
 
-Use `cabal build all`, the console smoke, and the focused `hetoimasia-tests`
-Hspec suite for the current bootstrap. Prefer Hspec for future integration and
+Use `cabal build all`, the console smoke, and the focused
+`hetoimasia-foundation:foundation-tests` and `hetoimasia-tests` Hspec suites for
+the current bootstrap. Prefer Hspec for future integration and
 resource tests too; use Python probes only where Hspec cannot reasonably exercise
 the boundary. Run `cabal check` in the root and each active
 package directory when editing package metadata. Vulkan validation, offscreen

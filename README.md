@@ -42,6 +42,7 @@ to build/cache it and prepare the local environment. Linux CI uses the pinned im
 cabal build all
 cabal run exe:hetoimasia -- --smoke
 cabal run exe:hetoimasia -- --resource-smoke
+cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 

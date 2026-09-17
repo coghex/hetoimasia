@@ -87,6 +87,14 @@ observations, not a new test execution:
   (#125) removed these coupling points: the harness and bounded wait now live in
   `hetoimasia-test-support` at `tools/test-support/`, runtime builds its own
   logger fixture, and the console spec states its own variable names.
+- TEST-4 (#127) moved the foundation contracts into `foundation-tests` under
+  `packages/foundation/test/`, registered as the floor group `test.foundation`
+  on the existing `haskell-engine` worker, with the per-example mapping in
+  [foundation_tests_mapping.md](foundation_tests_mapping.md). The console
+  resource smoke and the six supervised Channel/Snapshot cases now sit under
+  the root `Runtime` group for TEST-5. P-6's clean CPU-only check needed a
+  `cabal.project.cpu` that imports the shared `cabal.project.common`; see
+  [validation.md](validation.md#building-without-the-glfw-sdk).
 - GLFW's `window-examples/` executable already owns the scripted window/host
   examples and can use private libraries. One root Hspec example launches it as
   a subprocess, obscuring its individual examples from root Hspec selection.

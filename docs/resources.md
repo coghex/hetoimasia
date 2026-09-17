@@ -351,7 +351,7 @@ it is still applied to a scope and a continuation.
 
 Nothing counts entries or refuses a second one at run time; the guarantee is
 that the rewrite cannot be expressed, and it is checked when the client is
-compiled. `test/Test/Engine/Resources/Opacity.hs` holds it there, compiling
+compiled. `packages/foundation/test/Test/Foundation/Resources/Opacity.hs` holds it there, compiling
 clients against the built package: a client that replaces the continuation and
 a client that names the constructor must both be rejected for exactly that
 reason, while a client using only the runner and the allocators compiles,
@@ -769,7 +769,7 @@ into the scope that created it.
 
 A component that owns resources follows these conventions. They are
 [the working agreements](../AGENTS.md)' architecture rules made concrete, and
-`test/Test/Engine/Resources/Journal.hs` is the worked example.
+`packages/foundation/test/Test/Foundation/Resources/Journal.hs` is the worked example.
 
 - **One constructor.** A component exposes one construction function in
   `Scoped` — over `allocResource`, `allocComposite`, or `allocComponent` —
@@ -1423,8 +1423,9 @@ and
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct` runs the `Resources`
-examples from `test/Test/Engine/Resources/Spec.hs`, which drive every row of
+`cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match Resources'`
+runs the `Resources` examples from
+`packages/foundation/test/Test/Foundation/Resources/Spec.hs`, which drive every row of
 the failure table, the failed acquisition, ordered nested evidence, the
 cancellation and throwing-release cases of the mask discipline, inspection
 through `WhileHandling`, each internal rethrow site, and both evidence losses
@@ -1441,7 +1442,7 @@ One further example owns two real file handles and asserts both are closed and
 the rejected stage's file was never opened, and one asserts that an earlier
 stage's failure stays primary when a later part's metadata would have thrown.
 They drive it through the fake buffer of
-`test/Test/Engine/Resources/Buffer.hs`, which models exactly the four steps
+`packages/foundation/test/Test/Foundation/Resources/Buffer.hs`, which models exactly the four steps
 this contract needs and ships in no library.
 
 The facade examples in the same file add the cleanup point observed from the
@@ -1455,10 +1456,10 @@ through the facade keeping their declared order while the scope unwinds in
 reverse.
 
 The `Scoped component construction` examples in
-`test/Test/Engine/Resources/Construction.hs` cover
+`packages/foundation/test/Test/Foundation/Resources/Construction.hs` cover
 [Component construction](#component-construction) with typed synthetic
 failures, real CPU scopes, and ordered traces. Through the synthetic journal
-component of `test/Test/Engine/Resources/Journal.hs` they show a configuration
+component of `packages/foundation/test/Test/Foundation/Resources/Journal.hs` they show a configuration
 fault observed before any acquisition, private state reachable only through the
 handle, a fallback handle live for the whole consumer with the consumer run
 once, an exhausted optional component bound as `Unavailable` data with its
@@ -1479,7 +1480,7 @@ with the rollback evidence, invoking neither another alternative nor the
 consumer — and leave a cancellation pending as construction completes, which
 preempts the consumer and still releases every part.
 
-The first two opacity groups in `test/Test/Engine/Resources/Opacity.hs` cover
+The first two opacity groups in `packages/foundation/test/Test/Foundation/Resources/Opacity.hs` cover
 [The continuation facade](#the-continuation-facade) and
 [The evidence boundary](#the-evidence-boundary). Through the shared
 external-client harness `Test.Support.ExternalClient`, in the test-only
@@ -1504,7 +1505,7 @@ fails in three places at once, the evidence reachable only through an entry's
 own carried context, and that reattaching entries already present reports each
 of them once.
 
-The `Resource collection` groups in `test/Test/Engine/Resources/Collection.hs`
+The `Resource collection` groups in `packages/foundation/test/Test/Foundation/Resources/Collection.hs`
 cover [Scoped resource collections](#scoped-resource-collections) with real CPU
 scopes and ordered traces, coordinated with `MVar`s and `threadStatus` and no
 sleeps. Admission: a limit below one, rejection at the live-member limit before
@@ -1537,7 +1538,7 @@ reverse registration order with each member's declared ranks, and a successful
 body failing with the first of several final release failures.
 
 The `Collection opacity across the package boundary` group in
-`test/Test/Engine/Resources/Opacity.hs` compiles seven more clients the same
+`packages/foundation/test/Test/Foundation/Resources/Opacity.hs` compiles seven more clients the same
 way. Six must be rejected: one naming each of the `Collection` and `Member`
 constructors, one each rewriting a collection through `liveMemberCount` and a
 token through `memberStatus` with record update, one coercing a `Member
@@ -1549,7 +1550,7 @@ public operations to acquire three members, borrow two together, observe
 reverse order, and read both retained tokens' terminal states afterwards.
 
 The `Resource evidence inspection cost` examples in
-`test/Test/Engine/Resources/Cost.hs` cover
+`packages/foundation/test/Test/Foundation/Resources/Cost.hs` cover
 [What inspection costs](#what-inspection-costs). They build twenty and then
 forty nested scopes whose releases each run the next scope, with the innermost
 release throwing, and hold each of `cleanupFailures` and
@@ -1565,7 +1566,8 @@ an unbounded traversal fails these examples in seconds instead of running for
 hours.
 
 The `Console resource smoke` examples in
-`test/Test/Engine/Resources/Smoke.hs` cover
+`test/Test/Engine/Runtime/ResourceSmoke.hs`, registered by the root suite under
+`Runtime` because they exercise the runtime's demonstration, cover
 [Application lifecycle](#application-lifecycle) by running
 `Hetoimasia.Runtime.Resources.resourceSmoke` — the body the console executable
 runs — with a failure injected into the work, into one release, into two
@@ -1580,10 +1582,12 @@ records that reached the sink, and which releases ran. One further example
 drives the body through a handle sink over a temporary file the example owns,
 and closes that handle only after the scope has unwound, so every cleanup
 record is in the file and the borrowed handle was neither closed nor rebuffered
-by the sink. The `Console startup` group in `test/Main.hs` runs
+by the sink. The `Console startup` group in `test/Test/Engine/Runtime/Console.hs` runs
 `--resource-smoke` as a child process for the record sequence and for the quiet
-path at a `warn` threshold. The validation catalog covers all of them through
-the floor group `test.engine`; see [validation.md](validation.md).
+path at a `warn` threshold. The validation catalog covers the foundation
+examples above through the floor group `test.foundation`, and the console
+resource smoke and startup examples through the floor group `test.engine`; see
+[validation.md](validation.md).
 
 The `Application lifecycle` examples in
 `test/Test/Engine/Runtime/Composition.hs`, selected by `--match Runtime`,

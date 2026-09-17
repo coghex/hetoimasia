@@ -47,7 +47,8 @@ consumed =
   , ("tools/validation/review_replay.py", "ReviewReplay.hs and ApprovalProvenance.hs run it")
   , ("tools/validation/timings.py", "Timings.hs and TimingStep.hs run it")
   , (".github/workflows/review-gate.yml", "DismissalStep.hs extracts its dismissal step")
-  , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps")
+  , ("tools/validation/catalog.json", "Reuse.hs routes its groups through the workflow's worker declarations")
+  , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, and Reuse.hs reads its worker declarations")
   ]
 
 -- | The packaging declaration the inventory is derived from.

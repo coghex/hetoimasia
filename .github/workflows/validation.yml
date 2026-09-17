@@ -149,7 +149,7 @@ jobs:
           # declared once. The planner refuses a routing no worker could honour —
           # a display group on a CPU-only worker, or a group owned twice or by
           # nobody — and every later step reads the assignment out of the plan.
-          arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,smoke.console")
+          arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,smoke.console")
           arguments+=(--worker "haskell-workflow=cpu:test.workflow")
           arguments+=(--worker "glfw-native=display:test.glfw-native")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -245,7 +245,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /opt/hetoimasia/cabal/store
-          key: cabal-store-${{ steps.image.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ steps.image.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}
           lookup-only: true
 
       - name: Decide whether to seed the dependency cache
@@ -368,7 +368,7 @@ jobs:
           # `cabal.project` carries the pinned Hackage index state and the
           # `.cabal` files the dependency bounds. The fallback stays inside the
           # same environment: no restore may cross an image or native change.
-          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}
           restore-keys: |
             cabal-store-${{ needs.plan.outputs.environment }}-
 
@@ -377,11 +377,11 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           # A partial match still saves most of the compile: a cache miss costs
           # time and can never change a result.
           restore-keys: |
-            dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-engine-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-
             dist-newstyle-engine-${{ needs.plan.outputs.environment }}-
 
       - name: Record the cache results
@@ -499,6 +499,21 @@ jobs:
           # before it; the newest attempt is the one that should stand.
           overwrite: true
 
+      - name: Publish the test.foundation receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/test.foundation.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.foundation-${{ needs.plan.outputs.identity }}
+          path: receipts/test.foundation.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
       - name: Publish the smoke.console receipt as reusable evidence
         # Named by the candidate's input identity, so a later run asks for
         # evidence about *these* inputs rather than fetching every receipt the
@@ -573,7 +588,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /opt/hetoimasia/cabal/store
-          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}
           restore-keys: |
             cabal-store-${{ needs.plan.outputs.environment }}-
 
@@ -582,9 +597,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           restore-keys: |
-            dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-
             dist-newstyle-workflow-${{ needs.plan.outputs.environment }}-
 
       - name: Record the cache results
@@ -743,7 +758,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /opt/hetoimasia/cabal/store
-          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}
           restore-keys: |
             cabal-store-${{ needs.plan.outputs.environment }}-
 
@@ -752,9 +767,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: dist-newstyle
-          key: dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
+          key: dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-${{ hashFiles('**/*.hs') }}
           restore-keys: |
-            dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}-
+            dist-newstyle-native-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}-
             dist-newstyle-native-${{ needs.plan.outputs.environment }}-
 
       - name: Record the cache results
@@ -915,7 +930,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /opt/hetoimasia/cabal/store
-          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', '**/*.cabal') }}
+          key: cabal-store-${{ needs.plan.outputs.environment }}-${{ hashFiles('cabal.project', 'cabal.project.common', '**/*.cabal') }}
           restore-keys: |
             cabal-store-${{ needs.plan.outputs.environment }}-
 

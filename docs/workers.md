@@ -329,8 +329,8 @@ startup receives. See [messaging.md](messaging.md#supervised-inbox-services).
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct --test-options='--match /Workers/'`
-runs the `Workers` examples from `test/Test/Engine/Workers/Spec.hs`. They use
+`cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match /Workers/'`
+runs the `Workers` examples from `packages/foundation/test/Test/Foundation/Workers/Spec.hs`. They use
 injected CPU actions, real CPU scopes, ordered release traces, and explicit
 `MVar`, STM, and `threadStatus` coordination with no sleeps and no wall-clock
 assertion, and cover:
@@ -357,5 +357,5 @@ assertion, and cover:
 - retirement that keeps retained handles' results, and an observed failure kept
   through retirement and an exceptional group exit.
 
-The validation catalog covers them through the floor group `test.engine`; see
+The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

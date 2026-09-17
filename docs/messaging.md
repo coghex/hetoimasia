@@ -693,7 +693,7 @@ value, and `awaitSnapshot` from that value's cursor reports `EndOfStream`.
 
 ### Bounded turns
 
-`test/Test/Engine/Messaging/Turns.hs` writes a custom multi-input loop from the
+`packages/foundation/test/Test/Foundation/Messaging/Turns.hs` writes a custom multi-input loop from the
 public channel and snapshot operations, with no engine scheduling or batching
 interface. Each input has an explicit, finite per-turn budget — two
 opportunities for commands, one for events, one for a settings snapshot — and
@@ -755,9 +755,10 @@ rows are documented above.
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct --test-options='--match Messaging'`
-runs the `Messaging` examples from `test/Test/Engine/Messaging/Spec.hs` and
-`test/Test/Engine/Messaging/Opacity.hs`. Evaluation is observed through side
+`cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match Messaging'`
+runs the `Messaging` examples from
+`packages/foundation/test/Test/Foundation/Messaging/Spec.hs` and
+`packages/foundation/test/Test/Foundation/Messaging/Opacity.hs`. Evaluation is observed through side
 effects in each payload's own `NFData` instance, and cancellation is coordinated
 with `MVar`s, never with a sleep. They cover:
 
@@ -780,11 +781,12 @@ with `MVar`s, never with a sleep. They cover:
   that prepares, reads, forwards through unconstrained polymorphic functions,
   and sees a nested failure raised by `prepare`.
 
-The channel examples live in `test/Test/Engine/Messaging/Channel.hs`, with
-their external clients in `test/Test/Engine/Messaging/Opacity.hs`. Blocked waits
-are detected with `awaitBlockedOnSTM`, producers start from a gate, and worker
-outcomes are read raw before a supervised wait begins; no example sleeps or
-asserts an order only timing could decide. They cover:
+The channel examples live in
+`packages/foundation/test/Test/Foundation/Messaging/Channel.hs`, with their
+external clients in `packages/foundation/test/Test/Foundation/Messaging/Opacity.hs`.
+Blocked waits are detected with `awaitBlockedOnSTM` and producers start from a
+gate; no example sleeps or asserts an order only timing could decide. They
+cover:
 
 - zero, negative, and above-maximum capacities rejected with
   `ChannelCapacityRejected`, the `foundation.messaging` engine origin, the
@@ -809,18 +811,14 @@ asserts an order only timing could decide. They cover:
   and sent to another with the count unchanged;
 - blocked waits composed with a real worker's `awaitStopRequest` through
   `orElse`, leaving through the stop branch with the channel unchanged;
-- real `withSupervision` and `awaitSupervised`: an optional worker's published
-  failure settled, and its warning written while the entry was still queued or
-  the send not yet admitted, before the receive or send commits exactly once;
-  and a required worker's published failure rethrown with the receive or send
-  never committed;
 - external clients: receiving from a `Sender`, closing from a `Sender` or a
   `Receiver`, naming the `Sender` constructor, and record update of
   `channelSender` each rejected for its named cause, and a linked client using
   every send, receive, control, and statistics operation.
 
-The snapshot examples live in `test/Test/Engine/Messaging/Snapshot.hs`, with
-their external clients in `test/Test/Engine/Messaging/Opacity.hs`. Blocked waits
+The snapshot examples live in
+`packages/foundation/test/Test/Foundation/Messaging/Snapshot.hs`, with their
+external clients in `packages/foundation/test/Test/Foundation/Messaging/Opacity.hs`. Blocked waits
 are detected with `awaitBlockedOnSTM`, concurrent readers start from a gate, and
 a read that must not wait is run under `orElse`, which only a `retry` can
 select. They cover:
@@ -850,15 +848,25 @@ select. They cover:
   replacement of a closed earlier lifetime;
 - a blocked waiting read composed with a real worker's `awaitStopRequest`,
   leaving through the stop branch;
-- real `withSupervision` and `awaitSupervised`: an optional worker's published
-  failure settled, and its warning written, before a ready waiting read commits;
-  and a required worker's published failure rethrown with the read never
-  committed;
 - external clients: forging a cursor or an observation, record update of
   `observedValue` or `snapshotReader`, and publishing or closing through a
   `SnapshotReader` each rejected for its named cause, and a linked client using
   every publish, read, wait, and close operation, the observation readers, and
   the cursor-mismatch failure.
+
+The supervised waits on channels and snapshots exercise the runtime's
+supervision, so the root suite registers them under `Runtime`, in
+`test/Test/Engine/Runtime/Messaging.hs`, as `Channel composition` and
+`Snapshot composition`. Worker outcomes are read raw before a supervised wait
+begins. They cover real `withSupervision` and `awaitSupervised`:
+
+- an optional worker's published failure settled, and its warning written while
+  the entry was still queued or the send not yet admitted, before a channel
+  receive or send commits exactly once; and a required worker's published
+  failure rethrown with the receive or send never committed;
+- an optional worker's published failure settled, and its warning written,
+  before a ready snapshot waiting read commits; and a required worker's
+  published failure rethrown with the read never committed.
 
 The inbox adapter's examples live under `Runtime`, in
 `test/Test/Engine/Runtime/Inbox.hs`, with their external clients in
@@ -933,8 +941,11 @@ outcomes. They cover:
   cancelled handler and the component release and released only afterwards;
 - the commands-and-snapshots example above.
 
-The bounded-turn example lives in `test/Test/Engine/Messaging/Turns.hs`, under
+The bounded-turn example lives in
+`packages/foundation/test/Test/Foundation/Messaging/Turns.hs`, under
 `Messaging`; `--match 'Bounded turns'` selects it.
 
-The validation catalog covers them through the floor group `test.engine`; see
+The validation catalog covers the foundation examples through the floor group
+`test.foundation`, and the supervised waits and inbox examples through the floor
+group `test.engine`; see
 [validation.md](validation.md).
