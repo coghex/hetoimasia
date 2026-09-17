@@ -671,6 +671,17 @@ duringTheWait platform action =
     atomically (readTVar (platformWaiting platform) >>= check)
     action
 
+-- | The disposition a ticket settled to, read twice so a settled cell is shown
+-- to be written once and never written again.
+settledExactlyOnce ∷ CompletionTicket → IO Disposition
+settledExactlyOnce ticket = do
+  first ← atomically (pollCompletion ticket)
+  again ← atomically (pollCompletion ticket)
+  case (first, again) of
+    (Just disposition, Just repeated)
+      | disposition == repeated → pure disposition
+    _ → unexpected ("the ticket did not settle exactly once: " <> show (first, again))
+
 -- | How many empty-event posts the seam recorded.
 posts ∷ Seam → IO Int
 posts seam = length . filter (== PostEmptyEvent) <$> seamCalls seam
@@ -679,23 +690,34 @@ testCommandWakesIdleWait ∷ Expectation
 testCommandWakesIdleWait = do
   platform ← newWakePlatform
   seam ← newSeam (wakePlatformScript platform defaultScript)
-  turns ←
+  (settled, turns) ←
     hosted seam (settings [windowNamed "woken"]) (\host _ → pure host) $ \host control → do
       window ← onlyWindow host
       summaries ← newIORef []
-      duringTheWait platform (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
+      ticket ← newEmptyMVar
+      duringTheWait
+        platform
+        (submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted >>= putMVar ticket)
       runOwnerLoop host control $
         LoopHooks
           { loopLogger = quietLogger
           , loopEvent = noApplicationEvents
           , loopUpdate = \turn → do
               modifyIORef' summaries (<> [summary turn])
-              if turnNumber turn == 3 then Finish <$> readIORef summaries else pure Continue
+              if turnNumber turn == 3
+                then do
+                  settled ← takeMVar ticket >>= settledExactlyOnce
+                  Finish . (,) settled <$> readIORef summaries
+                else pure Continue
           }
   -- The second turn's wait ended only because the admission woke the owner, so
   -- that turn's own command work served the command instead of the wait running
   -- to its bound.
   turns `shouldBe` [(1, False, 0, 0), (2, True, 1, 0), (3, False, 0, 0)]
+  -- The woken turn's own command work settled the command exactly once.
+  settled `shouldSatisfy` \case
+    Performed (ObservationPublished _ _) → True
+    _ → False
   pumps seam `shouldReturn` [PollEvents, WaitEvents 0.25, PollEvents]
   posts seam `shouldReturn` 1
 
@@ -810,20 +832,34 @@ testDegradationReportedByLoop = do
       defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
   warnings ← newIORef ([] ∷ [LogEntry])
   let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
-  hosted seam (settings [windowNamed "degraded"]) (\host _ → pure host) $ \host control → do
+  queued ← hosted seam (settings [windowNamed "degraded"]) (\host _ → pure host) $ \host control → do
     window ← onlyWindow host
     -- The first admission's wake fails as an expected platform failure. The
     -- answer, and the ticket, are the ordinary ones.
-    _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+    degraded ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+    later ← newEmptyMVar
     runOwnerLoop host control $
       LoopHooks
         { loopLogger = capturing
         , loopEvent = noApplicationEvents
         , loopUpdate = \turn → do
             -- A later admission, after the degraded path has skipped its wake.
-            when (turnNumber turn == 4) (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
-            pure (if turnNumber turn == 4 then Finish () else Continue)
+            when (turnNumber turn == 4) $ do
+              queued ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+              putMVar later queued
+            if turnNumber turn == 4
+              then do
+                -- The first admission's ticket was unaffected by its failed
+                -- wake; the second is settled by the shutdown that follows.
+                settled ← settledExactlyOnce degraded
+                settled `shouldSatisfy` \case
+                  Performed (ObservationPublished _ _) → True
+                  _ → False
+                Finish <$> takeMVar later
+              else pure Continue
         }
+  -- Quiescence settled the command still queued at shutdown, exactly once.
+  settledExactlyOnce queued `shouldReturn` NotExecuted
   written ← readIORef warnings
   map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
   map entryLevel written `shouldBe` [Warning]
@@ -852,16 +888,20 @@ testDegradationSharedByBorrowedHosts = do
       application session name =
         runWindowApplication lifetime name (borrowed session) id (\host _ → pure host) $ \host control → do
           window ← onlyWindow host
-          _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+          ticket ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
           runOwnerLoop host control $
             LoopHooks
               { loopLogger = capturing
               , loopEvent = noApplicationEvents
               , loopUpdate = \turn → pure (if turnNumber turn == 2 then Finish () else Continue)
               }
-  asProcessMainThread seam $ entered seam $ \session → do
-    application session "borrowed-host-first"
-    application session "borrowed-host-second"
+          settledExactlyOnce ticket
+  dispositions ← asProcessMainThread seam $ entered seam $ \session → do
+    firstHost ← application session "borrowed-host-first"
+    secondHost ← application session "borrowed-host-second"
+    pure [firstHost, secondHost]
+  -- Each host's admitted command settled exactly once through its own loop.
+  dispositions `shouldSatisfy` all (\case Performed (ObservationPublished _ _) → True; _ → False)
   written ← readIORef warnings
   -- One warning across both hosts, and only the first host's admission entered
   -- the library.

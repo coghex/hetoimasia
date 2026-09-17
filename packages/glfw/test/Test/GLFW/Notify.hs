@@ -23,7 +23,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM_, void)
+import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
@@ -78,10 +78,8 @@ spec = do
       (boundedExample testConcurrentPublishers)
     it "coalesces continuous republication into one pending request the next capture takes"
       (boundedExample testCoalescedRepublication)
-    it "captures a publication that committed first and leaves a later one pending with a newer revision"
+    it "captures a live publisher in both commit orders, taking every revision in order and coalescing what falls between two captures"
       (boundedExample testCaptureRacesPublication)
-    it "captures a concurrently republishing worker's every revision in order, coalescing what falls between two captures"
-      (boundedExample testCaptureRacesPublicationConcurrently)
     it "publishes and wakes nothing for a request demanding nothing, or for a closed slot"
       (boundedExample testRefusedPublication)
     it "records and wakes for a publication cancelled after its commit, and records neither before it"
@@ -108,12 +106,12 @@ testAdmissionWakesAroundWait ∷ Expectation
 testAdmissionWakesAroundWait = do
   platform ← newPlatform
   seam ← newSeam (platformScript platform defaultScript)
-  (queued, waits) ← withPorts seam $ \session hostCommands windowCommands window → do
+  (queued, waits, dispositions) ← withPorts seam $ \session hostCommands windowCommands window → do
     let hostPort = windowCommandPort hostCommands
         windowPort = windowCommandPort windowCommands
         command = observeOf window
     -- Before the wait: the post it left is pending, so the wait returns at once.
-    _ ← onWorker (submitWindowCommand hostPort [] command) >>= accepted
+    beforeTicket ← onWorker (submitWindowCommand hostPort [] command) >>= accepted
     processWindowEvents session (AwaitEventsFor 1)
     -- During the wait: the worker admits only once the owner is inside it.
     during ← newEmptyMVar
@@ -121,18 +119,24 @@ testAdmissionWakesAroundWait = do
       atomically (readTVar (platformWaiting platform) >>= check)
       try (awaitSubmitWindowCommand windowPort [] command) >>= putMVar during
     processWindowEvents session (AwaitEventsFor 1)
-    _ ← takeMVar during >>= either (throwIO ∷ SomeException → IO a) pure >>= admittedWaited
+    duringTicket ← takeMVar during >>= either (throwIO ∷ SomeException → IO a) pure >>= admittedWaited
     -- After the wait, with no wait in progress, each still posts.
-    _ ← onWorker (submitWindowCommand windowPort [] command) >>= accepted
-    _ ← onWorker (awaitSubmitWindowCommand hostPort [] command) >>= admittedWaited
+    afterTicket ← onWorker (submitWindowCommand windowPort [] command) >>= accepted
+    waitedTicket ← onWorker (awaitSubmitWindowCommand hostPort [] command) >>= admittedWaited
     queued ←
       atomically ((+) <$> (commandsQueued <$> commandStatistics hostCommands) <*> (commandsQueued <$> commandStatistics windowCommands))
     waits ← readTVarIO (platformWaitsEntered platform)
-    pure (queued, waits)
+    -- One of the four is executed and the rest are settled by closure, so every
+    -- admitted command settles exactly once.
+    _ ← seamExecuteNext seam hostCommands [window]
+    mapM_ settleHost [hostCommands, windowCommands]
+    dispositions ← mapM settledOnce [beforeTicket, duringTicket, afterTicket, waitedTicket]
+    pure (queued, waits, dispositions)
   -- Four admissions, four posts, and both waits returned on one.
   queued `shouldBe` 4
   waits `shouldBe` 2
   posts seam `shouldReturn` 4
+  map settledKind (map Just dispositions) `shouldBe` ["performed", "not executed", "not executed", "not executed"]
 
 testRefusedAdmissionWakesNothing ∷ Expectation
 testRefusedAdmissionWakesNothing = do
@@ -170,9 +174,7 @@ testCancelledBeforeCommit = do
     killThread submitter
     cancelled ← takeMVar outcome
     cancelled `shouldSatisfy` cancellation
-    statistics ← atomically (commandStatistics hostCommands)
-    commandsQueued statistics `shouldBe` 0
-    commandsPending statistics `shouldBe` 0
+    settleHost hostCommands
     posts seam `shouldReturn` 0
 
 testCancelledAfterCommit ∷ Expectation
@@ -206,8 +208,7 @@ testCancelledAfterCommit = do
       _ → False
     again ← seamExecuteNext seam hostCommands [window]
     again `shouldBe` NothingQueued
-    statistics ← atomically (commandStatistics hostCommands)
-    commandsPending statistics `shouldBe` 0
+    settleHost hostCommands
 
 -- | The waiting admission owes its wake from its commit onward exactly as the
 -- immediate one does, and its own wait for capacity stays cancellable.
@@ -232,8 +233,7 @@ testWaitedAdmissionCancelledAfterCommit = do
     step `shouldSatisfy` \case
       Executed _ (Performed (ObservationPublished _ _)) → True
       _ → False
-    statistics ← atomically (commandStatistics windowCommands)
-    commandsPending statistics `shouldBe` 0
+    settleHost windowCommands
 
 -- | A cancellation delivered while a waiter is blocked for capacity, racing the
 -- capacity that would admit it. Both outcomes are correct; what must hold either
@@ -280,8 +280,7 @@ testCancellationRacesCapacity = do
     -- Whatever the split between the two outcomes, every round held the
     -- invariant, and nothing is left pending.
     length rounds `shouldBe` 20
-    statistics ← atomically (commandStatistics hostCommands)
-    (commandsQueued statistics, commandsPending statistics) `shouldBe` (0, 0)
+    settleHost hostCommands
 
 -- | Execute whatever is queued, so the next round starts from an empty port.
 drainCommands ∷ Seam → WindowCommandHost → Window → IO ()
@@ -333,39 +332,6 @@ testConcurrentPublishers = do
   afterCapture `shouldBe` Nothing
   posts seam `shouldReturn` 4
 
--- | A worker republishing continuously while the owner captures. Every
--- publication is taken, in revision order, and whatever falls between two
--- captures is coalesced into the request the second one takes: with deadlines
--- that increase by revision, each capture carries the earliest deadline of the
--- revisions it covers.
-testCaptureRacesPublicationConcurrently ∷ Expectation
-testCaptureRacesPublicationConcurrently = do
-  seam ← newSeam defaultScript
-  (published, captures, afterwards) ← withSlot seam $ \_ slot publisher → do
-    let rounds = 50 ∷ Integer
-    finished ← newEmptyMVar
-    _ ← forkIO $ do
-      outcomes ← mapM (\index → publishDemand publisher (deadlineDemand (instantAt index))) [1 .. rounds]
-      putMVar finished outcomes
-    let capture taken
-          | any ((== fromIntegral rounds) . capturedRevision) taken = pure (reverse taken)
-          | otherwise =
-              atomically (captureDemand slot) >>= \case
-                Just captured → capture (captured : taken)
-                Nothing → yield >> capture taken
-    captures ← capture []
-    published ← takeMVar finished
-    afterwards ← atomically (captureDemand slot)
-    pure (published, captures, afterwards)
-  map acceptedRevision published `shouldBe` [1 .. 50]
-  map capturedRevision captures `shouldSatisfy` increasing
-  map capturedRevision captures `shouldSatisfy` ((== Just 50) . lastOf)
-  -- Each capture covers the revisions after the previous capture's, so its
-  -- deadline is the earliest of those: the one published right after it.
-  zip (0 : map capturedRevision captures) captures
-    `shouldSatisfy` all (\(previous, captured) → demandDeadline (capturedRequest captured) == Just (instantAt (fromIntegral previous + 1)))
-  afterwards `shouldBe` Nothing
-
 testCoalescedRepublication ∷ Expectation
 testCoalescedRepublication = do
   seam ← newSeam defaultScript
@@ -380,23 +346,59 @@ testCoalescedRepublication = do
   fmap capturedRevision captured `shouldBe` Just 20
   next `shouldBe` Nothing
 
+-- | A publisher and the owner's capture interleaved without a sleep: the
+-- publisher stops halfway and waits, so the first capture is taken while half
+-- the revisions are still to come, and the capture that follows it sees an empty
+-- slot the resumed publisher then fills. Both commit orders are forced, and the
+-- coalescing each capture performs is checked exactly: with deadlines that
+-- increase by revision, a capture carries the earliest deadline of the
+-- revisions it covers.
 testCaptureRacesPublication ∷ Expectation
 testCaptureRacesPublication = do
   seam ← newSeam defaultScript
-  (firstCapture, secondCapture, third) ← withSlot seam $ \_ slot publisher → do
-    _ ← publishDemand publisher (deadlineDemand (instantAt 500))
-    firstCapture ← atomically (captureDemand slot)
-    -- Committed after the capture: it is a newer revision and stays pending,
-    -- which the capture that took the older one cannot erase.
-    _ ← publishDemand publisher (deadlineDemand (instantAt 700))
-    secondCapture ← atomically (captureDemand slot)
-    third ← atomically (captureDemand slot)
-    pure (firstCapture, secondCapture, third)
-  fmap capturedRevision firstCapture `shouldBe` Just 1
-  fmap (demandDeadline . capturedRequest) firstCapture `shouldBe` Just (Just (instantAt 500))
-  fmap capturedRevision secondCapture `shouldBe` Just 2
-  fmap (demandDeadline . capturedRequest) secondCapture `shouldBe` Just (Just (instantAt 700))
-  third `shouldBe` Nothing
+  (published, halfway, emptyAfterCapture, rest, afterwards) ← withSlot seam $ \_ slot publisher → do
+    let rounds = 50 ∷ Integer
+        half = rounds `div` 2
+    reached ← newEmptyMVar
+    resume ← newEmptyMVar
+    finished ← newEmptyMVar
+    _ ← forkIO $ do
+      outcomes ← forM [1 .. rounds] $ \index → do
+        outcome ← publishDemand publisher (deadlineDemand (instantAt index))
+        when (index == half) (putMVar reached () >> takeMVar resume)
+        pure outcome
+      putMVar finished outcomes
+    -- Publication before capture: half the revisions are pending, and half are
+    -- still to be published.
+    takeMVar reached
+    halfway ← atomically (captureDemand slot)
+    -- Capture before publication: the slot it just cleared is empty, and the
+    -- publisher is still holding its next publication.
+    emptyAfterCapture ← atomically (captureDemand slot)
+    putMVar resume ()
+    let capture taken
+          | any ((== fromIntegral rounds) . capturedRevision) taken = pure (reverse taken)
+          | otherwise =
+              atomically (captureDemand slot) >>= \case
+                Just captured → capture (captured : taken)
+                Nothing → yield >> capture taken
+    rest ← capture []
+    published ← takeMVar finished
+    afterwards ← atomically (captureDemand slot)
+    pure (published, halfway, emptyAfterCapture, rest, afterwards)
+  map acceptedRevision published `shouldBe` [1 .. 50]
+  -- The first capture took the twenty-five revisions published so far,
+  -- coalesced, with the earliest deadline among them.
+  fmap capturedRevision halfway `shouldBe` Just 25
+  fmap (demandDeadline . capturedRequest) halfway `shouldBe` Just (Just (instantAt 1))
+  emptyAfterCapture `shouldBe` Nothing
+  -- Everything published after that capture stayed pending for a later one, in
+  -- revision order, each carrying the earliest deadline of what it covered.
+  map capturedRevision rest `shouldSatisfy` increasing
+  map capturedRevision rest `shouldSatisfy` ((== Just 50) . lastOf)
+  zip (25 : map capturedRevision rest) rest
+    `shouldSatisfy` all (\(previous, captured) → demandDeadline (capturedRequest captured) == Just (instantAt (fromIntegral previous + 1)))
+  afterwards `shouldBe` Nothing
 
 testRefusedPublication ∷ Expectation
 testRefusedPublication = do
@@ -477,10 +479,10 @@ testDegradationSharedBySession = do
     third ← submitWindowCommand (windowCommandPort laterCommands) [] command >>= accepted
     path ← readTVarIO (sessionWakePath session)
     forM_ [hostCommands, hostCommands] (\host → void (seamExecuteNext seam host [window]))
-    dispositions ← atomically (mapM pollCompletion [first, second])
     void (seamExecuteNext seam laterCommands [window])
-    thirdDisposition ← atomically (pollCompletion third)
-    pure (first, second, third, path, dispositions <> [thirdDisposition])
+    mapM_ settleHost [hostCommands, laterCommands]
+    dispositions ← mapM (fmap Just . settledOnce) [first, second, third]
+    pure (first, second, third, path, dispositions)
   first `shouldSatisfy` (/= second)
   third `shouldSatisfy` (/= first)
   path `shouldSatisfy` \case
@@ -502,6 +504,7 @@ testDegradationReported = do
     firstAttempt ← attemptDegradationReport (recording entries) notifier
     secondAttempt ← attemptDegradationReport (recording entries) notifier
     path ← readTVarIO (sessionWakePath session)
+    settleHost hostCommands
     pure (firstAttempt, secondAttempt, (), path)
   firstAttempt `shouldBe` DegradationReportAttempted
   secondAttempt `shouldBe` NoDegradationDue
@@ -518,7 +521,9 @@ testDegradationReported = do
   (attempt, quietPath) ← withPorts quiet $ \session hostCommands _ window → do
     _ ← submitWindowCommand (windowCommandPort hostCommands) [] (observeOf window) >>= accepted
     attempt ← attemptDegradationReport (dropping filtered) (commandHostNotifier hostCommands)
-    (,) attempt <$> readTVarIO (sessionWakePath session)
+    quietPath ← readTVarIO (sessionWakePath session)
+    settleHost hostCommands
+    pure (attempt, quietPath)
   attempt `shouldBe` DegradationReportAttempted
   readIORef filtered `shouldReturn` []
   quietPath `shouldSatisfy` \case
@@ -533,7 +538,9 @@ testDegradationReportFails = do
     let notifier = commandHostNotifier hostCommands
     failure ← try (attemptDegradationReport failingLogger notifier) ∷ IO (Either SomeException DegradationAttempt)
     second ← attemptDegradationReport failingLogger notifier
-    (,,) failure second <$> readTVarIO (sessionWakePath session)
+    path ← readTVarIO (sessionWakePath session)
+    settleHost hostCommands
+    pure (failure, second, path)
   failure `shouldSatisfy` \case
     Left _ → True
     Right _ → False
@@ -552,7 +559,10 @@ testLifetimeViolationStaysTyped = do
     -- A programming or lifetime violation is not degraded around, so the next
     -- admission tries the wake again.
     _ ← try (submitWindowCommand (windowCommandPort hostCommands) [] (observeOf window)) ∷ IO (Either SomeException SubmitResult)
-    (,,) raised queued <$> readTVarIO (sessionWakePath session)
+    path ← readTVarIO (sessionWakePath session)
+    -- Both commands the raising admissions committed settle through closure.
+    settleHost hostCommands
+    pure (raised, queued, path)
   nativeOutcome failure `shouldBe` NativeCallReturned
   map nativeErrorCode (reportedErrors (nativeReports failure)) `shouldBe` [notInitialisedCode]
   -- The admission that raised still committed its command.
@@ -570,7 +580,7 @@ testStaleCapabilities = do
     slot ← newDemandSlot
     let publisher = demandPublisher slot (sessionNotifier session)
     _ ← publishDemand publisher immediateDemand
-    void (atomically (closeWindowCommands hostCommands))
+    settleHost hostCommands
     atomically (closeDemandSlot slot)
     pure (windowCommandPort hostCommands, publisher, slot)
   postsAfterFirst ← countPosts seam
@@ -619,6 +629,7 @@ testOverlappingFailuresDegradeOnce = do
     second ← attemptDegradationReport (recording entries) notifier
     -- A third admission over the degraded path enters nothing.
     afterwards ← submitWindowCommand port [] command
+    settleHost hostCommands
     pure (submissions, path, first, second, afterwards)
   map accepting submissions `shouldBe` [True, True]
   accepting afterwards `shouldBe` True
@@ -756,6 +767,26 @@ increasing values = and (zipWith (<) values (drop 1 values))
 lastOf ∷ [a] → Maybe a
 lastOf [] = Nothing
 lastOf values = Just (last values)
+
+-- | The disposition a ticket settled to, read twice so a settled cell is shown
+-- to be written once and never written again.
+settledOnce ∷ CompletionTicket → IO Disposition
+settledOnce ticket = do
+  first ← atomically (pollCompletion ticket)
+  again ← atomically (pollCompletion ticket)
+  case (first, again) of
+    (Just disposition, Just repeated)
+      | disposition == repeated → pure disposition
+    _ → unexpected ("the ticket did not settle exactly once: " <> show (first, again))
+
+-- | End a host's admission, settling whatever it still holds, and check that it
+-- keeps no cell afterwards. Every example that admits a command ends this way,
+-- so no example leaves a ticket unsettled.
+settleHost ∷ WindowCommandHost → IO ()
+settleHost host = do
+  _ ← atomically (closeWindowCommands host)
+  statistics ← atomically (commandStatistics host)
+  (commandsQueued statistics, commandsPending statistics) `shouldBe` (0, 0)
 
 -- | Run an action on a new, unbound thread, which is never the owner, and wait
 -- for its outcome.

@@ -2402,10 +2402,11 @@ commit admitting and waking nothing, and after one keeping the command, its
 wake, and its single settlement, for both the immediate and the waiting
 operation; publishers released together from one gate combining immediate demand and the
 earliest deadline; twenty republications coalescing into one captured request; a
-capture racing a publication in both orders, and a worker republishing
-concurrently while the owner captures, every revision taken in order with what
-fell between two captures coalesced; twenty rounds of a waiter cancelled exactly
-as capacity frees, each leaving either no admission and no wake or an admitted
+live publisher captured in both commit orders — a capture taken while half its
+revisions are still to come, the empty slot the capture left, and then every
+later revision taken in order with what fell between two captures coalesced into
+the earliest deadline it covered; twenty rounds of a waiter cancelled exactly as
+capacity frees, each leaving either no admission and no wake or an admitted
 command with its own; a request demanding nothing and a closed
 slot recording nothing; publication cancelled before and after its commit; an
 expected platform failure degrading the session's path once, keeping every
@@ -2415,7 +2416,9 @@ evidence; the one
 report written, filtered, and failed, each spending the attempt without
 retrying or undoing the degradation; a lifetime violation staying a typed
 failure with the command still admitted; and a retained port and publisher
-answering a later session without a native call.
+answering a later session without a native call. Every example that admits a
+command ends by executing or closing its host and reading each ticket twice, so
+no example leaves a cell unsettled or lets a settled one be written again.
 
 The host's own examples add, over whole applications: an idle turn's wait ended
 by a worker's admitted command and served by that same turn; a wait ended by a
