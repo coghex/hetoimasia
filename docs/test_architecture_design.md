@@ -73,8 +73,9 @@ remains in this document.
 
 ## Current implementation
 
-Rechecked 2026-09-17 at `master@9300962`. These are source and tracker
-observations, not a new test execution:
+Rechecked 2026-09-17 against the TEST-5 (#129) branch based on
+`master@79d4425`; each item describes the tree once that change lands. These are
+source and tracker observations; the TEST-5 PR records its own test execution:
 
 - Foundation now owns `foundation-tests` and runtime owns `runtime-tests`; the
   GLFW headless suite still awaits TEST-6. Root `hetoimasia-tests` retains
@@ -97,9 +98,10 @@ observations, not a new test execution:
 - TEST-4 (#127) moved the foundation contracts into `foundation-tests` under
   `packages/foundation/test/`, registered as the floor group `test.foundation`
   on the existing `haskell-engine` worker, with the per-example mapping in
-  [foundation_tests_mapping.md](foundation_tests_mapping.md). The console
-  resource smoke and the six supervised Channel/Snapshot cases now sit under
-  the root `Runtime` group for TEST-5. P-6's clean CPU-only check needed a
+  [foundation_tests_mapping.md](foundation_tests_mapping.md). It left the
+  console resource smoke and the six supervised Channel/Snapshot cases under
+  the root `Runtime` group, which TEST-5 then moved into `runtime-tests` as
+  described above. P-6's clean CPU-only check needed a
   `cabal.project.cpu` that imports the shared `cabal.project.common`; see
   [validation.md](validation.md#building-without-the-glfw-sdk).
 - GLFW's `window-examples/` executable already owns the scripted window/host
