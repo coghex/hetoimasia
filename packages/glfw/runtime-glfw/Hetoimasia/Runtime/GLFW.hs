@@ -153,11 +153,12 @@
 -- the session's wake path — reported once through 'loopLogger' under
 -- @glfw.wake@ — nothing is posted at all and the finite bound alone keeps work
 -- moving. The loop claims that report on every turn and once more as it ends,
--- however it ends, after waiting for the notification obligations admissions
--- and publications registered when they committed; 'runWindowApplication' makes
--- the complete attempt after quiescence and the worker drain, and
--- 'reportHostWakeDegradation' is that same boundary for an application that owns
--- a different shutdown. Native waits are safe foreign
+-- however it ends, without ever waiting for a notification obligation:
+-- admission and publication are still open there, and a worker may keep
+-- registering more until supervision stops it. 'runWindowApplication' makes the
+-- attempt that does wait, after quiescence and the worker drain, where no new
+-- obligation can be registered; 'reportHostWakeDegradation' is that same
+-- boundary for an application that owns a different shutdown. Native waits are safe foreign
 -- calls, so background workers run while the owner is inside one.
 -- 'hostActivity' reports the turn and whether its owner has begun its finite
 -- wait: the flag is set immediately before the native call and cleared once it

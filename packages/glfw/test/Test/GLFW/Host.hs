@@ -14,10 +14,10 @@
 module Test.GLFW.Host (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, displayException, fromException, throwIO, try)
-import Control.Monad (forM, join, replicateM, void, when)
+import Control.Monad (forM, join, replicateM, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
@@ -201,6 +201,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testCancelledAsTheActionReturns)
     it "spends the reporting attempt when a custom shutdown's own boundary is cancelled at its wait"
       (boundedExample testCancelledDuringACustomShutdown)
+    it "ends a run whose worker keeps publishing until supervision stops it, on a finish and on a cancellation"
+      (boundedExample testPublisherUntilStopped)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -917,9 +919,10 @@ durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
   Right duration → duration
   Left rejected → error ("the scripted duration was rejected: " <> show rejected)
 
--- | A notification that is still inside its post when the loop ends: the owner
--- waits for it at its final boundary and reports what it left, rather than
--- returning with the attempt owed.
+-- | A notification still inside its post when the loop ends. The loop's own
+-- boundary waits for nothing and claims nothing, because there is nothing
+-- recorded yet; the runner's boundary, after quiescence has closed every source,
+-- waits for that obligation and reports what it left.
 testDegradationInFlightAtExit ∷ Expectation
 testDegradationInFlightAtExit = do
   held ← newEmptyMVar
@@ -936,9 +939,9 @@ testDegradationInFlightAtExit = do
             when first (putMVar held () >> takeMVar release)
         }
   warnings ← newIORef ([] ∷ [LogEntry])
-  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  let capturing = recordingLogger warnings
   (duringUpdate, admitted') ←
-    hosted seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
+    hostedLogging capturing seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
       window ← onlyWindow host
       owner ← myThreadId
       submitted ← newEmptyMVar
@@ -953,7 +956,7 @@ testDegradationInFlightAtExit = do
               takeMVar held
               duringUpdate ← readIORef warnings
               -- The post is released only once the owner is waiting for it at
-              -- the boundary that ends the loop.
+              -- the runner's own boundary, after quiescence and the drain.
               _ ← forkIO (awaitBlockedOnSTM owner >> putMVar release ())
               pure (Finish (duringUpdate, submitted))
           }
@@ -1112,6 +1115,83 @@ testReportsOnEveryExit = do
   -- A cancelled run makes no terminal report, and the wake path's own is still
   -- written.
   warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
+
+-- | A worker that publishes demand until its stop request arrives, so
+-- obligations keep being registered for as long as the application runs.
+publishingUntilStopped ∷ WindowHost → MVar () → WorkerDefinition ()
+publishingUntilStopped host published =
+  workerDefinition "publishing" (\_ → pure ()) (\token () → keepPublishing token)
+  where
+    keepPublishing token = do
+      stopping ← atomically ((True <$ awaitStopRequest token) `orElse` pure False)
+      unless stopping $ do
+        _ ← publishDemand (hostDemandPublisher host) immediateDemand
+        -- The first publication is announced, so an example can wait for the
+        -- degradation it caused rather than race it.
+        _ ← tryPutMVar published ()
+        yield
+        keepPublishing token
+
+-- | A run whose worker publishes until supervision stops it. The loop's own
+-- boundary must not wait for obligations, because this worker keeps registering
+-- them until the quiescence and drain that only the loop's result can reach; a
+-- boundary that waited there would deadlock the shutdown. The run ends, on a
+-- finish and on a cancellation, and the one report is still made.
+testPublisherUntilStopped ∷ Expectation
+testPublisherUntilStopped = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  warnings ← newIORef ([] ∷ [LogEntry])
+  published ← newEmptyMVar
+  hostedLogging
+    (recordingLogger warnings)
+    seam
+    (settings [windowNamed "publishing"])
+    ( \host control →
+        startSupervised control (required Service) (publishingUntilStopped host published) >>= expectStarted >> pure host
+    )
+    (\host control → readMVar published >> runOwnerLoop host control (turningUntil (recordingLogger warnings) 3))
+  warningComponents warnings `shouldReturn` ["glfw.wake"]
+
+  cancelledSeam ← newSeam (failingPostScript "scripted wake failure")
+  cancelledWarnings ← newIORef ([] ∷ [LogEntry])
+  turning ← newEmptyMVar
+  never ← newEmptyMVar
+  publishedAgain ← newEmptyMVar
+  (runner, finished) ←
+    onMainThread cancelledSeam $
+      runWindowApplication
+        (withLoggingLifetime (recordingLogger cancelledWarnings))
+        "host-example"
+        (hostOver cancelledSeam (settings [windowNamed "publishing"]))
+        id
+        ( \host control →
+            startSupervised control (required Service) (publishingUntilStopped host publishedAgain)
+              >>= expectStarted
+              >> pure host
+        )
+        ( \host control → do
+            readMVar publishedAgain
+            runOwnerLoop host control (turningUntil (recordingLogger cancelledWarnings) 3)
+            putMVar turning ()
+            takeMVar never
+        )
+  takeMVar turning
+  killThread runner
+  cancelled ← takeMVar finished
+  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+  warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
+
+-- | Turn until the numbered turn, then finish, writing through the given
+-- logger. Which boundary claims the wake path's report depends on when the
+-- degradation happened, so an example that asserts on it injects the same
+-- logger here as the run's own.
+turningUntil ∷ Logger → Natural → LoopHooks ()
+turningUntil logger final =
+  LoopHooks
+    { loopLogger = logger
+    , loopEvent = noApplicationEvents
+    , loopUpdate = \turn → pure (if turnNumber turn == final then Finish () else Continue)
+    }
 
 -- | A run cancelled while its final boundary is waiting for a notification that
 -- is still inside its failing post. The cancellation stays the run's failure,

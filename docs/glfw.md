@@ -724,32 +724,36 @@ transaction that rolled back, or that admitted or published nothing, registers
 none, and `hostNotificationsInFlight` reads how many are outstanding.
 
 Every turn claims the report after reconciliation, and `runOwnerLoop` claims it
-once more as it ends — however it ends, with a result or a raised failure —
-after waiting for every outstanding obligation to be discharged. A degradation
-the last turn's own command work, events, or update caused is therefore reported
-before the loop returns.
+once more as it ends, however it ends, so a degradation this turn's own work
+already caused is reported without waiting for shutdown. Neither of those claims
+waits for an obligation: admission and publication are still open there, and a
+worker may keep registering obligations until supervision stops it, so waiting
+would hold back the very result that reaches the quiescence which ends them.
 
-The complete boundary is the application's, and `runWindowApplication` installs
-it: after the finite quiescence transaction has closed admission, publication,
-and every feed, and after supervision has stopped and drained every worker, the
-host waits for the obligations that remain and makes the one guarded attempt,
-with every dependency and the application's logger still live. Nothing can be
-admitted or published by then, so nothing can outrun it, and an application
-needs no reporting call of its own. `reportHostWakeDegradation` is that same
-boundary for an application that owns a different shutdown, and `hostWakePath`
+The boundary that waits is the one where waiting is bounded, and
+`runWindowApplication` installs it: after the finite quiescence transaction has
+closed admission, publication, and every feed, and after supervision has stopped
+and drained every worker, the host waits for the obligations that remain and
+makes the one guarded attempt, with every dependency and the application's
+logger still live. No new obligation can be registered by then, so the wait ends
+and nothing can outrun the attempt, and an application needs no reporting call of
+its own. `reportHostWakeDegradation` is that same boundary for an application
+that owns a different shutdown — call it after quiescence, since its wait is
+bounded only once admission and publication have closed — and `hostWakePath`
 reads whether an attempt is still owed.
 
-Neither boundary runs inside a release. Both hold the sequence from the work
-ending to the attempt being claimed under a mask, so nothing can be delivered in
-the handoff between them, and both write through the injected logger as ordinary
+No boundary runs inside a release. Each holds the sequence from the work ending
+to the attempt being claimed under a mask, so nothing can be delivered in the
+handoff between them, and each writes through the injected logger as ordinary
 interruptible work on the owner thread, so a cancellation delivered while the
-attempt is writing reaches it and is recorded as one. The wait for an obligation
-is interruptible too, but a cancellation there may not abandon it: an obligation
-may be inside a failing post that has not yet recorded what it found, so the wait
-is completed uninterruptibly — bounded by one empty-event post each, with no new
-obligation possible — and the attempt is spent before the cancellation is
-re-raised as the primary failure. `reportHostWakeDegradation` is the same
-sequence, so a custom shutdown's boundary behaves exactly as the runner's. A failing attempt after a successful run fails the run;
+attempt is writing reaches it and is recorded as one. The waiting boundary's
+wait is interruptible too, but a cancellation there may not abandon it: an
+obligation may be inside a failing post that has not yet recorded what it found,
+so the wait is completed uninterruptibly — bounded by one empty-event post each,
+with no new obligation possible after quiescence — and the attempt is spent
+before the cancellation is re-raised as the primary failure.
+`reportHostWakeDegradation` is that same sequence, so a custom shutdown's
+boundary behaves exactly as the runner's. A failing attempt after a successful run fails the run;
 after a failing or cancelled one the original failure stays primary and the
 attempt's failure is retained beside it as cleanup evidence. A host's shutdown
 closes its own admission, never the session's wake capability, so sequential
@@ -2451,9 +2455,11 @@ is not broadened.
 The admission-wake, demand, and degradation examples (`--match "wake"`) drive
 the production admission, publication, and notification code over the seam,
 whose scripted platform counts an empty-event post as pending for the next
-finite wait. Without sleeps they prove: a wake after each admission before,
-during, and after the owner's wait, through both admission operations and both
-port kinds; full and closed admission waking nothing; cancellation before a
+finite wait. Without sleeps they prove: a wake after each of the twelve
+admissions the contract's matrix names — both admission operations, on the
+host's port and on a window's own, before the owner's wait, inside it, and
+outside one — each wait ending on the post that reached it and every ticket
+settling exactly once; full and closed admission waking nothing; cancellation before a
 commit admitting and waking nothing, and after one keeping the command, its
 wake, and its single settlement, for both the immediate and the waiting
 operation; publishers released together from one gate combining immediate demand and the

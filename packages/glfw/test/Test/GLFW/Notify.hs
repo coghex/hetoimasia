@@ -101,41 +101,77 @@ spec = do
 -- ---------------------------------------------------------------------------
 -- Admission
 
+-- | Every combination the contract names: both admission operations, on the
+-- host's port and on a window's own, admitted before the owner's wait, while it
+-- is inside one, and while none is in progress. Each of the twelve admissions
+-- posts its own wake, each wait ends on the post that preceded or reached it,
+-- and every ticket settles exactly once.
 testAdmissionWakesAroundWait ∷ Expectation
 testAdmissionWakesAroundWait = do
   platform ← newPlatform
   seam ← newSeam (platformScript platform defaultScript)
   (queued, waits, dispositions) ← withPorts seam $ \session hostCommands windowCommands window → do
-    let hostPort = windowCommandPort hostCommands
-        windowPort = windowCommandPort windowCommands
-        command = observeOf window
-    -- Before the wait: the post it left is pending, so the wait returns at once.
-    beforeTicket ← onWorker (submitWindowCommand hostPort [] command) >>= accepted
-    processWindowEvents session (AwaitEventsFor 1)
-    -- During the wait: the worker admits only once the owner is inside it.
-    during ← newEmptyMVar
-    _ ← forkIO $ do
-      atomically (readTVar (platformWaiting platform) >>= check)
-      try (awaitSubmitWindowCommand windowPort [] command) >>= putMVar during
-    processWindowEvents session (AwaitEventsFor 1)
-    duringTicket ← takeMVar during >>= either (throwIO ∷ SomeException → IO a) pure >>= admittedWaited
-    -- After the wait, with no wait in progress, each still posts.
-    afterTicket ← onWorker (submitWindowCommand windowPort [] command) >>= accepted
-    waitedTicket ← onWorker (awaitSubmitWindowCommand hostPort [] command) >>= admittedWaited
+    let command = observeOf window
+        portOf HostPort = windowCommandPort hostCommands
+        portOf WindowPort = windowCommandPort windowCommands
+        admit Immediately kind = submitWindowCommand (portOf kind) [] command >>= accepted
+        admit Waiting kind = awaitSubmitWindowCommand (portOf kind) [] command >>= admittedWaited
+
+        -- Before the wait: the post it left is already pending, so the wait
+        -- returns on it at once.
+        around BeforeTheWait operation kind = do
+          ticket ← onWorker (admit operation kind)
+          processWindowEvents session (AwaitEventsFor 1)
+          pure ticket
+        -- During the wait: the worker admits only once the owner is inside it,
+        -- and the wait returns on that post.
+        around DuringTheWait operation kind = do
+          admitted' ← newEmptyMVar
+          _ ← forkIO $ do
+            atomically (readTVar (platformWaiting platform) >>= check)
+            try (admit operation kind) >>= putMVar admitted'
+          processWindowEvents session (AwaitEventsFor 1)
+          takeMVar admitted' >>= either (throwIO ∷ SomeException → IO a) pure
+        -- Outside any wait, each still posts.
+        around AfterTheWait operation kind = onWorker (admit operation kind)
+
+    tickets ←
+      forM
+        [ (timing, operation, kind)
+        | timing ← [BeforeTheWait, DuringTheWait, AfterTheWait]
+        , operation ← [Immediately, Waiting]
+        , kind ← [HostPort, WindowPort]
+        ]
+        (\(timing, operation, kind) → around timing operation kind)
+
     queued ←
       atomically ((+) <$> (commandsQueued <$> commandStatistics hostCommands) <*> (commandsQueued <$> commandStatistics windowCommands))
     waits ← readTVarIO (platformWaitsEntered platform)
-    -- One of the four is executed and the rest are settled by closure, so every
-    -- admitted command settles exactly once.
+    -- One command is executed and the rest are settled by closure, so every one
+    -- of the twelve settles exactly once.
     _ ← seamExecuteNext seam hostCommands [window]
     mapM_ settleHost [hostCommands, windowCommands]
-    dispositions ← mapM settledOnce [beforeTicket, duringTicket, afterTicket, waitedTicket]
+    dispositions ← mapM settledOnce tickets
     pure (queued, waits, dispositions)
-  -- Four admissions, four posts, and both waits returned on one.
-  queued `shouldBe` 4
-  waits `shouldBe` 2
-  posts seam `shouldReturn` 4
-  map settledKind (map Just dispositions) `shouldBe` ["performed", "not executed", "not executed", "not executed"]
+  -- Twelve admissions, twelve posts, and the eight waits each ended on one.
+  queued `shouldBe` 12
+  waits `shouldBe` 8
+  posts seam `shouldReturn` 12
+  length dispositions `shouldBe` 12
+  filter (== "performed") (map (settledKind . Just) dispositions) `shouldBe` ["performed"]
+  filter (/= "performed") (map (settledKind . Just) dispositions) `shouldBe` replicate 11 "not executed"
+
+-- | Which admission operation an example uses.
+data AdmissionOperation = Immediately | Waiting
+  deriving (Eq, Show)
+
+-- | Which port kind an example admits through.
+data PortKind = HostPort | WindowPort
+  deriving (Eq, Show)
+
+-- | Where an admission falls relative to the owner's finite wait.
+data AdmissionTiming = BeforeTheWait | DuringTheWait | AfterTheWait
+  deriving (Eq, Show)
 
 testRefusedAdmissionWakesNothing ∷ Expectation
 testRefusedAdmissionWakesNothing = do

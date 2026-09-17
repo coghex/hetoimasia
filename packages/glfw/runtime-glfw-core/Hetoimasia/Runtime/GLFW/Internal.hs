@@ -470,12 +470,15 @@ hostNotificationsInFlight = notificationsInFlight . hostNotifier
 -- | Claim the session's one degradation report, if one is still owed, at the
 -- application's own owner boundary.
 --
--- 'runOwnerLoop' claims it on every turn and once more as it ends, after every
--- notification in flight has settled, so an application normally never needs
--- this. It exists for the one window the loop cannot close by itself: a
--- notification begun after the loop's last wait, while admission is still open.
--- Called after quiescence, where no new notification can begin, it is the
--- complete final boundary. Refuses other threads with
+-- 'runWindowApplication' makes this attempt itself, after quiescence and the
+-- worker drain, so an application that uses the ordinary runner never needs it.
+-- It is here for one that owns a different shutdown.
+--
+-- Call it after quiescence. It waits for the notification obligations
+-- outstanding, which is bounded only once admission and publication have closed;
+-- called while they are open it can wait as long as a worker keeps publishing.
+-- A cancellation during that wait completes it uninterruptibly and spends the
+-- attempt before it is re-raised. Refuses other threads with
 -- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
 reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt
 reportHostWakeDegradation logger host =
@@ -494,6 +497,11 @@ hostNotifier = commandHostNotifier . hostCommands
 
 -- | Wait for every registered notification obligation to be discharged, then
 -- make the wake path's one guarded reporting attempt.
+--
+-- The wait is bounded only where no new obligation can be registered — after
+-- quiescence has closed admission and publication. A boundary that runs while
+-- they are open must use 'promptAttempt' instead, which claims what has already
+-- been recorded and waits for nothing.
 --
 -- The caller has masked, and lends its @restore@ for the one part that must
 -- stay interruptible: the write through the injected logger, so a cancellation
@@ -524,6 +532,16 @@ settledAttempt restore logger host =
   where
     notifier = hostNotifier host
     attempt = attemptDegradationReportWith restore logger notifier
+
+-- | The wake path's one guarded reporting attempt, without waiting for
+-- anything.
+--
+-- It claims a degradation already recorded and leaves one still being recorded
+-- to the boundary that runs after quiescence, so it can be used while
+-- admissions and publications are still being made without ever waiting on a
+-- worker that keeps making them.
+promptAttempt ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO ()
+promptAttempt restore logger host = void (attemptDegradationReportWith restore logger (hostNotifier host))
 
 -- | Run @body@, then make the reporting attempt, whatever @body@ did.
 --
@@ -946,10 +964,16 @@ runOwnerLoop host control hooks =
 
     -- However the loop ends — a result, a supervised failure, a native failure,
     -- or a cancellation — the wake path's one report is claimed before it
-    -- returns, after every obligation registered by an admission or a
-    -- publication has been discharged, so a degradation the last turn's own work
-    -- caused is never left owed.
-    reportingAsItEnds = retainingReport (\restore → void (settledAttempt restore (loopLogger hooks) host))
+    -- returns, so a degradation this turn's own work already caused is reported
+    -- here rather than waiting for shutdown.
+    --
+    -- This boundary never waits for an obligation. Admission and publication are
+    -- still open, and a worker that keeps publishing until supervision stops it
+    -- would keep new obligations coming, so waiting here would hold the loop's
+    -- own result back from the quiescence and the drain that would end them. The
+    -- boundary that does wait is the one after quiescence, where nothing new can
+    -- be registered.
+    reportingAsItEnds = retainingReport (\restore → promptAttempt restore (loopLogger hooks) host)
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
