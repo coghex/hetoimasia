@@ -39,7 +39,9 @@
 --    'loopEvent' that dispatched something;
 -- 8. a control check;
 -- 9. the application-owned update opportunity, 'loopUpdate', which sees the
---    turn's 'Turn' summary and answers whether to continue;
+--    turn's 'Turn' summary and answers whether to continue, and then the wake
+--    path's degradation report again, for a degradation this turn's own work
+--    caused, since this turn may be the last;
 -- 10. a control check, before a 'Finish' result is returned or the next turn
 --     begins.
 --

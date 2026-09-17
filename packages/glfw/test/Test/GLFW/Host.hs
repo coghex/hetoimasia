@@ -163,6 +163,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testRollbackLendsNothing)
     it "shares one degradation and one report between sequential hosts borrowing the same session"
       (boundedExample testDegradationSharedByBorrowedHosts)
+    it "reports a degradation the final update caused before the loop it finishes returns"
+      (boundedExample testDegradationOnTheFinalTurn)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -872,6 +874,39 @@ durationOf ∷ Integer → Duration
 durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
   Right duration → duration
   Left rejected → error ("the scripted duration was rejected: " <> show rejected)
+
+-- | The last turn is the one that degrades the path: its update submits a
+-- command whose wake fails and finishes the loop at once. The report is still
+-- claimed before that turn ends, rather than left owed to a loop that has
+-- already returned.
+testDegradationOnTheFinalTurn ∷ Expectation
+testDegradationOnTheFinalTurn = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  (ticket, duringUpdate) ←
+    hosted seam (settings [windowNamed "late"]) (\host _ → pure host) $ \host control → do
+      window ← onlyWindow host
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \_ → do
+              queued ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+              -- Nothing was written yet: the degradation happened inside this
+              -- update, after the turn's earlier reporting boundary.
+              duringUpdate ← readIORef warnings
+              pure (Finish (queued, duringUpdate))
+          }
+  duringUpdate `shouldBe` []
+  written ← readIORef warnings
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+  -- The command the failed wake announced is untouched, and quiescence settles
+  -- it exactly once.
+  settledExactlyOnce ticket `shouldReturn` NotExecuted
+  posts seam `shouldReturn` 1
 
 -- | Two hosts in turn over one borrowed session: the first degrades the
 -- session's wake path and writes its one warning, and the second, a separate

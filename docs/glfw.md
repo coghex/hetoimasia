@@ -707,7 +707,11 @@ Degradation owes exactly one guarded diagnostic attempt. The owner loop claims
 it at a safe boundary — outside transactions, callbacks, releases, and the
 [wake lifetime](#wake-lifetime)'s native exclusion — and writes one structured
 warning through the `Logger` the application injects on `LoopHooks`, under the
-`glfw.wake` component, with the retained evidence's counts and first report. The
+`glfw.wake` component, with the retained evidence's counts and first report. A
+turn claims it twice: after reconciliation, for a degradation that happened
+before the turn, and again after the update opportunity, for one the turn's own
+command work, events, or update caused, because that turn may be the last one.
+Only a loop that ends by raising can leave the attempt unclaimed. The
 claim is spent whatever happens: an entry the logger filters out, a sink
 failure, and a cancellation each end the attempt and are recorded, and none is
 retried. A sink failure and a cancellation propagate as themselves, as every
@@ -2426,7 +2430,8 @@ publication the same turn's update captures; a window's demand slot closed by it
 close protocol and every slot by quiescence, with retained publishers rejected
 afterwards; a creation claimed before quiescence registering a window whose port
 and demand slot are already closed; the degradation warning written once through
-the loop's injected logger while the finite idle bound continues; one
+the loop's injected logger while the finite idle bound continues; a degradation
+caused by the final update reported before the loop it finishes returns; one
 degradation and one warning shared by sequential hosts borrowing one session;
 and a construction that rolls back lending nothing and waking nothing.
 

@@ -814,7 +814,7 @@ runOwnerLoop host control hooks =
       retirePending host
       closes ← surfaceCloseRequests host
       recoverFeeds (loopLogger hooks) host
-      void (attemptDegradationReport (loopLogger hooks) (commandHostNotifier (hostCommands host)))
+      reportDegradation
       checkRuntime control
       commands ← dispatchCommands host (hostCommandBudget settings)
       recoverFeeds (loopLogger hooks) host
@@ -822,10 +822,19 @@ runOwnerLoop host control hooks =
       events ← dispatchEvents (loopEvent hooks) (hostEventBudget settings)
       checkRuntime control
       step ← loopUpdate hooks (Turn number waited commands events closes)
+      -- The turn's own work — a command's admission, an application event, or
+      -- the update itself — can be what degrades the wake path, and this turn
+      -- may be the last. Claiming the report here, before the check that a
+      -- latched failure would raise, is what keeps the one attempt from being
+      -- owed for ever by a loop that is about to end.
+      reportDegradation
       checkRuntime control
       case step of
         Finish result → pure result
         Continue → turn (number + 1) (commands == 0 && events == 0)
+
+    reportDegradation =
+      void (attemptDegradationReport (loopLogger hooks) (commandHostNotifier (hostCommands host)))
 
 -- | Commands queued across every port.
 queuedCommands ∷ WindowHost → STM Natural
