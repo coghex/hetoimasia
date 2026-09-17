@@ -407,13 +407,13 @@ supervision only reads and appends to them.
 
 ## Verification
 
-`cabal test hetoimasia-tests --test-show-details=direct --test-options='--match Supervision'`
-runs the examples in `test/Test/Engine/Runtime/Supervision.hs`, inside the
-`Runtime` component. They use real foundation workers, a logging lifetime over
+`cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct --test-options='--match Supervision'`
+runs the examples in `packages/runtime/test/Test/Runtime/Supervision.hs`, inside
+the runtime suite's `Runtime` group. They use real foundation workers, a logging lifetime over
 an injected collecting sink, synthetic typed failures, and explicit `MVar`,
 STM, and `threadStatus` coordination — no sleeps, no wall-clock assertions, no
 window or GPU, and no application runner. Their fixtures live in
-`Test.Engine.Runtime.Supervision.Support` for the application runner's examples
+`Test.Runtime.Supervision.Support` for the application runner's examples
 to reuse. They cover:
 
 - a required failure waking an active supervised wait and a startup wait, with
@@ -443,9 +443,9 @@ to reuse. They cover:
   published before closing observed before the boundary returns, an expected
   owner-requested cancellation, and a rejected start after closing.
 
-`test/Test/Engine/Runtime/Opacity.hs`, also under `Runtime`, checks the
+`packages/runtime/test/Test/Runtime/Opacity.hs`, also under `Runtime`, checks the
 read-only handle at the package boundary; `--test-options='--match opacity'`
-selects it together with the resource opacity examples. It compiles separate single-module clients against this
+selects it together with the inbox service's opacity examples. It compiles separate single-module clients against this
 build's package database with the external-client harness from
 `Test.Support.ExternalClient` in `hetoimasia-test-support`, exposing only `base`, `text`, `stm`,
 `hetoimasia-foundation`, and `hetoimasia-runtime`. A client that replaces the
@@ -458,5 +458,5 @@ another, and reporting `completed`, `stopped`, and `stopped`. The inbox
 adapter's examples, its graceful finish examples, and its own package-boundary
 clients are listed in [messaging.md](messaging.md#verification).
 
-The validation catalog covers them through the floor group `test.engine`; see
+The validation catalog covers them through the floor group `test.runtime`; see
 [validation.md](validation.md).

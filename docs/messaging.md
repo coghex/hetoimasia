@@ -679,7 +679,7 @@ and `WorkerStopped` alone is not read as an ordinary exit.
 
 ### Commands and snapshots
 
-`test/Test/Engine/Runtime/InboxFinish.hs` composes the pieces the way an
+`packages/runtime/test/Test/Runtime/InboxFinish.hs` composes the pieces the way an
 application would. A small application-owned command protocol — `Add` and
 `Reset` for a counter, with its own `NFData` instance — runs as a scoped inbox
 service. The application creates the snapshot and keeps only its
@@ -855,8 +855,8 @@ select. They cover:
   the cursor-mismatch failure.
 
 The supervised waits on channels and snapshots exercise the runtime's
-supervision, so the root suite registers them under `Runtime`, in
-`test/Test/Engine/Runtime/Messaging.hs`, as `Channel composition` and
+supervision, so the runtime package's suite registers them under `Runtime`, in
+`packages/runtime/test/Test/Runtime/Messaging.hs`, as `Channel composition` and
 `Snapshot composition`. Worker outcomes are read raw before a supervised wait
 begins. They cover real `withSupervision` and `awaitSupervised`:
 
@@ -868,9 +868,10 @@ begins. They cover real `withSupervision` and `awaitSupervised`:
   before a ready snapshot waiting read commits; and a required worker's
   published failure rethrown with the read never committed.
 
-The inbox adapter's examples live under `Runtime`, in
-`test/Test/Engine/Runtime/Inbox.hs`, with their external clients in
-`test/Test/Engine/Runtime/Opacity.hs`; `--match Runtime` selects them, and
+The inbox adapter's examples live in `hetoimasia-runtime:runtime-tests` under
+`Runtime`, in `packages/runtime/test/Test/Runtime/Inbox.hs`, with their external
+clients in `packages/runtime/test/Test/Runtime/Opacity.hs`; `--match Runtime`
+selects them with the rest of that suite, and
 `--match 'Inbox'` selects only them. Each uses real `withSupervision`,
 `startInboxService`, and `awaitSupervised` over a collecting logging lifetime.
 A component context's traced release records whether the inbox still admits a
@@ -910,7 +911,7 @@ example sleeps. They cover:
   finishes a service and prints both exit-record accessors and the handle's
   acknowledgement.
 
-The graceful finish examples live in `test/Test/Engine/Runtime/InboxFinish.hs`,
+The graceful finish examples live in `packages/runtime/test/Test/Runtime/InboxFinish.hs`,
 also under `Runtime`; `--match 'Inbox finish'` selects only them. They use the
 same real supervision, fixtures, and coordination, plus a classifier that waits
 on a gate where an example must hold the finish's supervised wait between two
@@ -947,5 +948,5 @@ The bounded-turn example lives in
 
 The validation catalog covers the foundation examples through the floor group
 `test.foundation`, and the supervised waits and inbox examples through the floor
-group `test.engine`; see
+group `test.runtime`; see
 [validation.md](validation.md).

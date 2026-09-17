@@ -4,7 +4,7 @@
 -- Every fixture hands its caller fresh state. Coordination is explicit: a gate
 -- is an 'MVar' a worker waits on, and 'awaitBlockedOnSTM' decides that the
 -- application thread has parked in a supervised wait. No fixture sleeps.
-module Test.Engine.Runtime.Supervision.Support
+module Test.Runtime.Supervision.Support
   ( -- * Failures
     Broken (..)
   , brokenIs
@@ -87,7 +87,7 @@ import Hetoimasia.Runtime.Supervision
   , WorkerPolicy (..)
   )
 import System.Timeout (timeout)
-import Test.Engine.Runtime.LogFixture (fixedMetadata)
+import Test.Runtime.LogFixture (fixedMetadata)
 import Test.Hspec (Expectation, expectationFailure)
 
 -- Failures ---------------------------------------------------------------------

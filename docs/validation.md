@@ -114,6 +114,7 @@ identifier lists are sorted.
 | `build.all` | `cabal build all` | no | yes |
 | `test.engine` | `cabal test hetoimasia-tests --test-show-details=direct` | no | yes |
 | `test.foundation` | `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct` | no | yes |
+| `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
@@ -121,11 +122,15 @@ identifier lists are sorted.
 `test.foundation` runs the foundation package's own suite: the `Logging`,
 `Resources`, `Failures`, `Recovery`, `Workers`, and `Messaging` examples. It
 entered the floor when those examples left `test.engine`, because their coverage
-was already mandatory there. `test.engine` now runs the root suite, whose
-`Runtime` and `GLFW` groups include the console resource smoke and the supervised
-channel and snapshot waits until the runtime package has its own suite. An
-explicit request for `test.engine` therefore no longer selects the foundation
-examples; request `test.foundation` beside it for that coverage.
+was already mandatory there. `test.runtime` runs the runtime package's own
+suite: the `Runtime` group's runner, application lifecycle, logging lifetime,
+reporting, supervision, inbox, opacity, resource smoke, and supervised channel
+and snapshot examples. It entered the floor for the same reason when those
+examples left `test.engine`. `test.engine` now runs the root suite: the
+`Console` group's startup and exit integration, and the `GLFW` group until the
+GLFW package has its own headless suite. An explicit request for `test.engine`
+therefore selects neither the foundation nor the runtime examples; request
+`test.foundation` and `test.runtime` beside it for that coverage.
 
 `test.workflow` runs only when affected or requested.
 
@@ -164,8 +169,9 @@ A group's inputs are the union of:
 The closure is derived from **both** revisions and unioned, so a source that was
 removed or relocated — or an input a group has since stopped declaring — still
 counts for the group that used to own it. A change to the
-`hetoimasia-foundation` library therefore selects both `test.foundation` and
-`test.engine` even when neither suite's sources changed, and a change to `app/Main.hs` selects it through the
+`hetoimasia-foundation` library therefore selects `test.foundation`,
+`test.runtime`, and `test.engine` even when none of those suites' sources
+changed, and a change to `app/Main.hs` selects `test.engine` through the
 `build-tool-depends: hetoimasia:hetoimasia` edge.
 
 There is no hand-maintained module dependency list. Cabal's `extra-doc-files`
@@ -356,7 +362,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native
 ```
@@ -470,7 +476,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native` |
 
@@ -1265,7 +1271,7 @@ native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -1301,9 +1307,10 @@ evidence only: it can never satisfy a Linux plan.
 
 `hetoimasia-glfw` declares `pkgconfig-depends: glfw3`, and Cabal solves every
 package `cabal.project` lists even for a focused target, so the ordinary project
-cannot build `hetoimasia-foundation:foundation-tests` on a machine where
-`pkg-config` finds no GLFW. `cabal.project.cpu` is the CPU-only configuration for
-that case. It lists `packages/foundation` and `tools/test-support` alone, and
+cannot build `hetoimasia-foundation:foundation-tests` or
+`hetoimasia-runtime:runtime-tests` on a machine where `pkg-config` finds no GLFW.
+`cabal.project.cpu` is the CPU-only configuration for that case. It lists
+`packages/foundation`, `packages/runtime`, and `tools/test-support` alone, and
 imports `cabal.project.common` exactly as `cabal.project` does, so the compiler
 settings, `index-state` pin, and local `-Werror` policy are the same file rather
 than a copy that could drift:
@@ -1313,14 +1320,18 @@ env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent pkg-config --exists glfw3 
 env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent \
   cabal test hetoimasia-foundation:foundation-tests --project-file cabal.project.cpu \
   --builddir dist-dev --test-show-details=direct
+env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR=/nonexistent \
+  cabal test hetoimasia-runtime:runtime-tests --project-file cabal.project.cpu \
+  --builddir dist-dev --test-show-details=direct
 ```
 
 The same `cabal test` with the ordinary project fails to resolve
 `hetoimasia-glfw` under that environment. Clearing `PKG_CONFIG_PATH` matters:
 `native.py prepare` exports it to expose the pinned prefix, and
-`PKG_CONFIG_LIBDIR` alone does not hide it. The foundation suite's external
-clients find the package database under the chosen build directory from the
-test executable's own location, so they pass under `dist-dev` too. CI keeps
+`PKG_CONFIG_LIBDIR` alone does not hide it. Both suites' external clients find
+the package database under the chosen build directory from the test
+executable's own location, so they pass under `dist-dev` too and expose the
+units that build registered rather than another worktree's. CI keeps
 using `cabal.project`; the CPU-only configuration is local evidence of the
 suite's build independence, not a second CI route.
 
@@ -1939,11 +1950,12 @@ cannot answer at all leaves an obstacle and returns every group to execution.
 
 One reuse example uses this repository's own routing rather than a fixture's:
 the checked-in catalog, with every command replaced by `true`, and the worker
-declarations the workflow's plan step passes. It requires the plan to assign
-`test.foundation` to `haskell-engine`, the workflow to publish a named receipt
-for every group that worker owns, the aggregate to fail while only the other
-engine groups have receipts, and a later prose-only candidate to reuse the
-published `test.foundation` receipt.
+declarations the workflow's plan step passes. It runs once for each package
+suite's group, `test.foundation` and `test.runtime`, and requires the plan to
+assign that group to `haskell-engine` as a floor group, the workflow to publish a
+named receipt for every group that worker owns, the aggregate to fail while only
+the other engine groups have receipts, and a later prose-only candidate to reuse
+that group's published receipt.
 
 The aggregate examples cover a covered group satisfied and its worker excused, a
 selected group with neither an execution nor a record, a record resolved for

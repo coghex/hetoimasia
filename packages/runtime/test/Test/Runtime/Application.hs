@@ -2,12 +2,12 @@
 --
 -- The logger fixtures come from the logging component that owns them, so the
 -- runtime examples observe the same collector the logging examples do.
-module Test.Engine.Runtime.Application (spec) where
+module Test.Runtime.Application (spec) where
 
 import Hetoimasia.Foundation.Log
 import Hetoimasia.Runtime (runApplication)
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
+import Test.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldThrow)
 
 spec ∷ Spec

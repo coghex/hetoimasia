@@ -10,11 +10,11 @@
 -- may be left waiting on.
 --
 -- The examples prove the composition, not the matrices it reuses: supervision's
--- classification and closing are proven by "Test.Engine.Runtime.Supervision",
+-- classification and closing are proven by "Test.Runtime.Supervision",
 -- whose fixtures these examples borrow, and the finalization matrix by
--- "Test.Engine.Runtime.Lifetime". Coordination is explicit, through gates,
+-- "Test.Runtime.Lifetime". Coordination is explicit, through gates,
 -- STM, and 'awaitBlockedOnSTM'; nothing sleeps.
-module Test.Engine.Runtime.Composition (spec) where
+module Test.Runtime.Composition (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -78,8 +78,8 @@ import Hetoimasia.Runtime.Supervision
   , workerStatus
   )
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Runtime.LogFixture (fixedMetadata)
-import Test.Engine.Runtime.Supervision.Support
+import Test.Runtime.LogFixture (fixedMetadata)
+import Test.Runtime.Supervision.Support
   ( Broken (..)
   , Trace
   , awaitBlockedOnSTM

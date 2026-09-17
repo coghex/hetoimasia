@@ -4,7 +4,7 @@
 -- runtime examples do not borrow the foundation logging suite's own helpers.
 -- Everything here is a value or a freshly constructed collector: each caller
 -- gets its own state, so no example can observe another's.
-module Test.Engine.Runtime.LogFixture
+module Test.Runtime.LogFixture
   ( fixedMetadata
   , newCollector
   , summaries

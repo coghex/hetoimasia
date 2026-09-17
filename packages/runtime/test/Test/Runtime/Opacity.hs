@@ -21,7 +21,7 @@
 -- inbox — one stopping a service, one finishing it — must be accepted, linked,
 -- and run, which is both the environment control and the evidence that the
 -- supported readers and operations stay usable.
-module Test.Engine.Runtime.Opacity (spec) where
+module Test.Runtime.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))

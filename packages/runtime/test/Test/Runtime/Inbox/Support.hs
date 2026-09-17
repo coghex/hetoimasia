@@ -1,11 +1,11 @@
--- | Fixtures shared by the inbox service examples in "Test.Engine.Runtime.Inbox"
--- and "Test.Engine.Runtime.InboxFinish".
+-- | Fixtures shared by the inbox service examples in "Test.Runtime.Inbox"
+-- and "Test.Runtime.InboxFinish".
 --
 -- Each component context is a traced resource whose release records whether
 -- the inbox still admits a message, through the send endpoint the start
 -- returned, so a trace shows the inbox closed before the component was torn
 -- down. Handlers signal entry through an 'MVar' and wait on a gate.
-module Test.Engine.Runtime.Inbox.Support
+module Test.Runtime.Inbox.Support
   ( -- * Policies
     ignoreWrites
   , requiredInbox
@@ -48,7 +48,7 @@ import Hetoimasia.Foundation.Worker (Completion (..), Result (..))
 import Hetoimasia.Runtime.Inbox
 import Hetoimasia.Runtime.Supervision (Disposition (..), Recognition (..), WorkerStatus (..))
 import Numeric.Natural (Natural)
-import Test.Engine.Runtime.Supervision.Support (Broken (..), Gate, Trace, record, supervisionComponent)
+import Test.Runtime.Supervision.Support (Broken (..), Gate, Trace, record, supervisionComponent)
 
 ignoreWrites ∷ LogEntry → IO ()
 ignoreWrites _ = pure ()

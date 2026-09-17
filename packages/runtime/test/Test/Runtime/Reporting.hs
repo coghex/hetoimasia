@@ -8,7 +8,7 @@
 --
 -- Cancellation is coordinated with 'MVar's, never with a sleep; 'bounded' only
 -- stops an example that has already hung.
-module Test.Engine.Runtime.Reporting (spec) where
+module Test.Runtime.Reporting (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
@@ -85,7 +85,7 @@ import Hetoimasia.Runtime.Reporting
   , terminalReportAttempted
   )
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
+import Test.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -393,10 +393,10 @@ testOriginDistinctFromReportingSite = do
   -- The entry's source is where the boundary was called.
   source ← maybe (fail "the entry recorded no source") pure (entrySource entry)
   sourceFunction source `shouldBe` "reportTerminalFailure"
-  sourceFile source `shouldSatisfy` Text.isSuffixOf "Test/Engine/Runtime/Reporting.hs"
+  sourceFile source `shouldSatisfy` Text.isSuffixOf "Test/Runtime/Reporting.hs"
   -- The origin is where the failure was raised, in its own fields.
   field "origin.function" entry `shouldBe` Just "throwFailure"
-  field "origin.site" entry `shouldSatisfy` maybe False (Text.isInfixOf "Test/Engine/Runtime/Reporting.hs:")
+  field "origin.site" entry `shouldSatisfy` maybe False (Text.isInfixOf "Test/Runtime/Reporting.hs:")
   field "origin.site" entry
     `shouldNotBe` Just (sourceFile source <> ":" <> Text.pack (show (sourceLine source)))
 

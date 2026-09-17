@@ -3,8 +3,8 @@ name: hetoimasia
 version: 0.1.0.0
 synopsis: Console bootstrap for a modular Haskell game engine
 description:
-    Application composition and focused tests for Hetoimasia's foundation
-    and runtime libraries. Rendering and Lua integration are planned components.
+    Application composition and its console and GLFW integration tests.
+    Rendering and Lua integration are planned components.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -117,44 +117,28 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Spec
+        Test.Engine.Console.Spec
         Test.Engine.GLFW.Linking
         Test.Engine.GLFW.Opacity
         Test.Engine.GLFW.Session
         Test.Engine.GLFW.Spec
         Test.Engine.GLFW.WindowModel
-        Test.Engine.Runtime.Application
-        Test.Engine.Runtime.Composition
-        Test.Engine.Runtime.Console
-        Test.Engine.Runtime.Inbox
-        Test.Engine.Runtime.Inbox.Support
-        Test.Engine.Runtime.InboxFinish
-        Test.Engine.Runtime.Lifetime
-        Test.Engine.Runtime.LogFixture
-        Test.Engine.Runtime.Messaging
-        Test.Engine.Runtime.Opacity
-        Test.Engine.Runtime.Reporting
-        Test.Engine.Runtime.ResourceSmoke
-        Test.Engine.Runtime.Spec
-        Test.Engine.Runtime.Supervision
-        Test.Engine.Runtime.Supervision.Support
     ghc-options: -threaded -rtsopts
     build-tool-depends: hetoimasia:hetoimasia, hetoimasia-glfw:glfw-window-examples
     build-depends:
         base >=4.21 && <4.22,
         bytestring >=0.12 && <0.13,
-        containers >=0.7 && <0.8,
-        deepseq >=1.5.1 && <1.6,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hetoimasia:console,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
-        stm >=2.5.3 && <2.6,
-        temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
-        time >=1.14 && <1.15,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:seam ==0.1.0.0,
+        -- No root module imports the runtime, but the GLFW window-host opacity
+        -- clients expose it, so the suite declares it rather than relying on
+        -- another component registering it incidentally.
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0

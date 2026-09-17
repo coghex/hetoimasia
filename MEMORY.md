@@ -50,16 +50,19 @@ owning subsystem's contract/design when continuing its work.
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
 - Test-support extraction #125/#132 and foundation migration #127/#137 are
-  complete. Epic #49 stays open for runtime #129 and GLFW headless #130.
+  complete; runtime migration #129 lands with its own PR. Epic #49 stays open
+  for GLFW headless #130.
 - Audit at `9300962`: PRs #137, #132, #128 and #126 had no new confirmed repair.
   Local build/smoke, foundation 308 examples (GLFW discovery disabled), root
   209, workflow 333, consent 14 and scripted fixture 13 passed. No native
   session was started by that audit. Linux native CI passed on those PRs.
   Counts are dated evidence, not permanent expectations.
-- Foundation owns `packages/foundation/test/`; runtime/GLFW/console still live
-  in root tests pending #129/#130. Shared neutral helpers are test-only; no
-  production dependency on test support. CPU-only foundation builds use
-  `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
+- Foundation owns `packages/foundation/test/` (`test.foundation`) and runtime
+  owns `packages/runtime/test/` (`test.runtime`, 143 examples at #129, with the
+  per-example map in docs/runtime_tests_mapping.md). Root tests keep `Console`
+  and, pending #130, `GLFW`. Shared neutral helpers are test-only; no
+  production dependency on test support. CPU-only foundation and runtime builds
+  use `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
 
 ## Contracts to preserve
 
@@ -89,8 +92,8 @@ owning subsystem's contract/design when continuing its work.
 - All three pre-Vulkan documents are fully processed into tracker artifacts;
   processing completion does not mean implementation completion. Their canonical
   approval comments amend the issue bodies and must be included by solvers.
-- [Test ownership](docs/test_architecture_design.md), epic #49: #129 and #130
-  remain. Their migrations are not hard prerequisites of TIME/LIFE, but finishing
+- [Test ownership](docs/test_architecture_design.md), epic #49: #130
+  remains. Their migrations are not hard prerequisites of TIME/LIFE, but finishing
   them early reduces test/Cabal/catalog edit conflicts.
 - [Scheduling](docs/runtime_scheduling_design.md), epic #131: #133, #134, #135,
   #136, #138, #139. Accepted: event/deadline/fixed-step updates with bounded

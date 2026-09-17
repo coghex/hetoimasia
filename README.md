@@ -46,6 +46,7 @@ cabal build all
 cabal run exe:hetoimasia -- --smoke
 cabal run exe:hetoimasia -- --resource-smoke
 cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
+cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 

@@ -12,7 +12,7 @@
 -- needs. No example sleeps, asserts a wall-clock bound, expects arbitrary
 -- blocking IO to be interrupted, or uses a generic application runner;
 -- 'boundedSupervision' only stops an example that has already hung.
-module Test.Engine.Runtime.Supervision (spec) where
+module Test.Runtime.Supervision (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
@@ -56,7 +56,7 @@ import Hetoimasia.Foundation.Worker
 import Hetoimasia.Runtime.Logging (recordedReports)
 import Hetoimasia.Runtime.Reporting (ReportResult (..))
 import Hetoimasia.Runtime.Supervision
-import Test.Engine.Runtime.Supervision.Support
+import Test.Runtime.Supervision.Support
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 spec ∷ Spec

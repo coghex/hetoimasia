@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 8,
+  "policy_version": 9,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -30,6 +30,7 @@
     "build.all",
     "test.engine",
     "test.foundation",
+    "test.runtime",
     "smoke.console"
   ],
   "groups": [
@@ -51,7 +52,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the root package's Runtime and GLFW components, including the console resource smoke and the supervised messaging waits.",
+      "description": "Focused Hspec examples for the root package's console startup and exit integration, and its GLFW component until that package has its own suite.",
       "command": [
         "cabal",
         "test",
@@ -76,6 +77,23 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia-foundation:test:foundation-tests",
+      "inputs": [],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.runtime",
+      "description": "Focused Hspec examples for the runtime package's application runner and lifecycle, logging lifetime, reporting, supervision, inbox services, package boundaries, resource smoke, and supervised messaging waits.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-runtime:runtime-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-runtime:test:runtime-tests",
       "inputs": [],
       "framework": "hspec",
       "runner": "cpu",

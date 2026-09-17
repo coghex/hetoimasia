@@ -47,8 +47,8 @@ records the merged fixture repair, and includes TEST-3 through TEST-6 with the
 reviewed ownership, dependency and validation contracts. The tracker edit was
 verified; its title, `epic`/`tests` labels and open state are unchanged.
 All children have since been filed and approved. TEST-3/#125 merged in PR #132
-and TEST-4/#127 in PR #137. Epic #49's checklist was reconciled on 2026-09-17;
-TEST-5/#129 and TEST-6/#130 remain open. Read each child's canonical approval
+and TEST-4/#127 in PR #137. Epic #49's checklist was reconciled on 2026-09-17.
+TEST-5/#129 is implemented by its own PR; TEST-6/#130 remains open. Read each child's canonical approval
 amendments as part of its implementation specification. No processing entry
 remains in this document.
 
@@ -76,14 +76,18 @@ remains in this document.
 Rechecked 2026-09-17 at `master@9300962`. These are source and tracker
 observations, not a new test execution:
 
-- Foundation now owns `foundation-tests`; runtime and GLFW headless suites
-  still await TEST-5/TEST-6. Root `hetoimasia-tests` retains runtime, GLFW and
-  console coverage plus the `glfw-window-examples` build tool. Hspec filtering
+- Foundation now owns `foundation-tests` and runtime owns `runtime-tests`; the
+  GLFW headless suite still awaits TEST-6. Root `hetoimasia-tests` retains
+  console and GLFW coverage plus the `glfw-window-examples` build tool. Hspec filtering
   chooses examples at execution time; it does not remove build dependencies.
-- `Test.Engine.Runtime.Console` exercises the application. Conversely,
-  `Test.Engine.Runtime.ResourceSmoke` exercises runtime's `resourceSmoke`, and
-  `Test.Engine.Runtime.Messaging` now holds the six supervised channel/snapshot
-  integration cases. TEST-5 moves these with their owning runtime contracts.
+- TEST-5 (#129) moved the runtime contracts into `runtime-tests` under
+  `packages/runtime/test/`, registered as the floor group `test.runtime` on the
+  existing `haskell-engine` worker, including `Test.Runtime.ResourceSmoke` and
+  the six supervised channel/snapshot cases in `Test.Runtime.Messaging`. The
+  per-example mapping is [runtime_tests_mapping.md](runtime_tests_mapping.md).
+  The console startup and exit examples, which launch the application, stay at
+  root as `Test.Engine.Console.Spec` under a `Console` group, and
+  `cabal.project.cpu` now also lists the runtime package.
 - Runtime, messaging, and GLFW opacity specs imported a compilation harness from
   `Test.Engine.Resources.Opacity`. Runtime also imported logging test helpers;
   console tests imported configuration values from a logging spec. TEST-3
@@ -105,8 +109,8 @@ observations, not a new test execution:
   acquires a main-thread session, dispatches from Hspec, and retains private
   lifecycle cases. Linux X11 runs remotely when affected; Cocoa runs locally.
   Keep this ownership and fixture contract; GPU fixtures remain future work.
-- `workflow-tests` already owns `tools/test`. Catalog policy version 8 has
-  `build.all`, `test.foundation`, `test.engine`, and `smoke.console` in its mandatory floor;
+- `workflow-tests` already owns `tools/test`. Catalog policy version 9 has
+  `build.all`, `test.engine`, `test.foundation`, `test.runtime`, and `smoke.console` in its mandatory floor;
   `test.workflow` and `test.glfw-native` are non-optional affected groups. The
   workflow explicitly assigns group IDs to workers and publishes receipts.
 
