@@ -760,9 +760,14 @@ processEvents host number waited = do
       | otherwise = ProcessPending
 
 -- | Reconcile the mode of every window the host holds that is not closing, in
--- registration order, after the turn's monitor refresh: a window whose settled
--- mode's monitor identity has ended takes its recorded fallback without another
--- command, whatever observations intervened since the disconnect.
+-- registration order, after the turn's monitor refresh: a window whose recovery
+-- obligation names an ended monitor identity takes its recorded fallback
+-- without another command, whatever observations intervened since the
+-- disconnect. The obligation is the monitor the last settlement established,
+-- or the live monitor an earlier turn's reconciliation confirmed a borderless
+-- window had moved onto while both were connected; a move folded in the same
+-- turn as a disconnect is judged only by a later turn, against the refreshed
+-- inventory, so it never re-points the obligation to an ended monitor.
 reconcileWindowModes ∷ WindowHost → IO ()
 reconcileWindowModes host = do
   entries ← readTVarIO (hostEntries host)

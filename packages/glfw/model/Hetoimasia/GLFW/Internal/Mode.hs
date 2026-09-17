@@ -28,8 +28,10 @@
 -- the applied mode is derived from what the platform reported — the window's
 -- fullscreen monitor, its decoration, and its placement against the monitors'
 -- work areas ('deriveApplied') — and never copied from a request, while the
--- recovery obligation is established only by a settlement's own sample
--- ('recordSettled'), so an ordinary observation that follows the monitor's
+-- recovery obligation is established by a settlement's own sample
+-- ('recordSettled') and moved only by a reconciliation against a refreshed
+-- inventory that finds a borderless window confirmed on another live monitor
+-- ('followedMonitor'), so an ordinary observation that follows the monitor's
 -- native departure reports the truth without erasing the unresolved recovery.
 -- A window reporting no fullscreen monitor and decoration is windowed; one
 -- reporting a fullscreen monitor is fullscreen on it; an undecorated one
@@ -171,9 +173,11 @@ module Hetoimasia.GLFW.Internal.Mode
   , modeSavedPlacement
   , modeLastOutcome
   , modeRecoveryObligation
+  , followedMonitor
   , recordApplied
   , recordSaved
   , recordRecoveryCleared
+  , recordRecoveryFollowed
   , recordSettled
   , deriveApplied
   , inertRequest
@@ -447,7 +451,9 @@ data ModeRecord = ModeRecord
     -- ^ The monitor identity the recorded recovery is owed to, established by
     -- the last settlement's own sample. Ordinary observations rewrite the
     -- applied mode without touching it, so one that follows the monitor's
-    -- native departure cannot erase an unresolved recovery.
+    -- native departure cannot erase an unresolved recovery. It moves only
+    -- when a reconciliation against a refreshed inventory confirms a
+    -- borderless window on another live monitor ('followedMonitor').
   }
   deriving (Eq, Show)
 
@@ -479,10 +485,28 @@ modeLastOutcome ∷ ModeRecord → Maybe ModeOutcome
 modeLastOutcome = recLast
 
 -- | The monitor identity whose end obliges the recorded windowed fallback:
--- the one the last settlement's own sample established the applied mode on.
--- 'Nothing' owes no recovery.
+-- the one the last settlement's own sample established the applied mode on,
+-- or the live monitor a borderless window was since confirmed on
+-- ('recordRecoveryFollowed'). 'Nothing' owes no recovery.
 modeRecoveryObligation ∷ ModeRecord → Maybe MonitorId
 modeRecoveryObligation = recRecovery
+
+-- | The live monitor a borderless window's recovery obligation follows, judged
+-- against the monitors a refresh just observed: the settled borderless request
+-- owes its recovery to one live monitor, and the applied mode is borderless on
+-- another live monitor, so the window legitimately moved between two connected
+-- monitors and its recovery is owed to the one it now stands on. 'Nothing'
+-- leaves the obligation where it is: an applied mode observed before the
+-- refresh that ends the owed monitor derives against the stale inventory, so
+-- an owed monitor that is not live keeps the obligation, as does an observed
+-- monitor that is not live, an indeterminate or windowed observation, and a
+-- fullscreen request, whose obligation stays on the monitor its settlement
+-- established.
+followedMonitor ∷ [MonitorId] → ModeRecord → Maybe MonitorId
+followedMonitor live record = case (recRequested record, recRecovery record, recApplied record) of
+  (BorderlessMode _, Just owed, AppliedBorderless observed)
+    | observed /= owed && owed `elem` live && observed `elem` live → Just observed
+  _ → Nothing
 
 recordApplied ∷ AppliedMode → ModeRecord → ModeRecord
 recordApplied applied record = record {recApplied = applied}
@@ -497,11 +521,19 @@ recordSaved saved record = record {recSaved = Just saved}
 recordRecoveryCleared ∷ ModeRecord → ModeRecord
 recordRecoveryCleared record = record {recRecovery = Nothing}
 
+-- | Owe the recovery to the monitor 'followedMonitor' answered: the
+-- reconciliation that confirmed the move records it, so the disconnect of the
+-- monitor the window now stands on triggers the recovery, and the disconnect
+-- of the one it left does not.
+recordRecoveryFollowed ∷ MonitorId → ModeRecord → ModeRecord
+recordRecoveryFollowed monitor record = record {recRecovery = Just monitor}
+
 -- | Record a request that executed and how it settled. The settlement's sample
 -- has already been folded into the record, so the recovery now owed is the one
 -- the settled applied mode stands on: a newer settled request thereby replaces
--- a pending recovery, whatever its outcome, while a request refused before any
--- native call is never recorded here and leaves one pending.
+-- a pending recovery, whatever its outcome, and a followed obligation alike,
+-- while a request refused before any native call is never recorded here and
+-- leaves one pending.
 recordSettled ∷ ModeRequest → ModeOutcome → ModeRecord → ModeRecord
 recordSettled (ModeRequest mode fallback) outcome record =
   record

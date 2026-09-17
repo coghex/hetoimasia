@@ -1606,6 +1606,28 @@ whose applied mode is indeterminate without an ended obligation is resampled. If
 no placement is reachable the fallback reports exhaustion and the saved
 placement is preserved.
 
+A borderless window may legitimately be moved between two connected monitors —
+by the user, or by a window manager's late placement — and its observations
+follow it: a move callback or a full sample re-derives the applied mode as
+borderless over the monitor whose work area now contains its content origin.
+Its recovery obligation follows that move too, but only at the reconciliation
+after a monitor refresh, and only when that refreshed inventory finds both the
+monitor the recovery was owed to and the one the window now stands on live. The
+reconciliation that confirms the move records the new obligation and publishes
+the record, so disconnecting the window's current monitor afterwards triggers
+the configured fallback, or the single answering resample without one, while
+disconnecting the monitor it left does not: the window keeps its borderless
+presentation on its connected monitor with no fallback and no setter. That
+judgment tells legitimate movement apart from an observation made after a
+disconnect: a move observed after a monitor's native disconnect and before the
+refresh that ends its identity derives against the inventory the refresh has
+not yet corrected, so it never re-points the obligation to an ended monitor,
+and the recovery owed to that monitor still runs. An observation that derives
+indeterminate — over no live work area — or windowed never re-points or clears
+the obligation, and a fullscreen window's obligation stays on the monitor its
+settlement established. A request that settles afterwards replaces a followed
+obligation as it replaces any other.
+
 ### Fullscreen claims
 
 The session holds at most one claim per monitor identity, recording the claiming

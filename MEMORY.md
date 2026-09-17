@@ -17,7 +17,9 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   under repeated cancellation. #115 is repaired (PR #119); #116 is repaired:
   the mode record keeps the monitor identity a settled request's recovery is
   owed to, so observations between the disconnect and the reconciliation no
-  longer erase it; #117 is repaired: a departure from an applied windowed
+  longer erase it, and (#123) that obligation follows a borderless window's
+  confirmed move between two live monitors at the reconciliation after the
+  refresh, never at observation time; #117 is repaired: a departure from an applied windowed
   presentation retains the geometry it departs from as the saved placement,
   whether the attempt's steps all return, one reports partway, or the attempt
   is interrupted after a native step; and #118 is repaired: the fixture's
