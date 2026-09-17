@@ -36,10 +36,18 @@
 -- state, and are never retried. A sink failure and a cancellation propagate as
 -- themselves, as every logging attempt does. Neither undoes the degradation.
 --
+-- A boundary that must not miss a degradation waits for
+-- 'awaitNotificationsSettled' first. A notification enters the session's
+-- in-flight count before its wake call and leaves it only in the transaction
+-- that records whatever that call left, so a boundary that finds the count at
+-- zero has already seen every degradation those calls caused. The wait is
+-- bounded by one empty-event post per notification in flight.
+--
 -- = State
 --
--- This module owns none of its own. The 'WakePath' it reads and writes belongs
--- to the session, lives as long as the session does, and is never reset.
+-- This module owns none of its own. The 'WakePath' it reads and writes and the
+-- in-flight count it keeps both belong to the session, live as long as it does,
+-- and are never reset.
 module Hetoimasia.GLFW.Internal.Notify
   ( -- * Notifiers
     Notifier
@@ -49,6 +57,7 @@ module Hetoimasia.GLFW.Internal.Notify
     -- * Notifying the owner
   , WakeNotice (..)
   , notifyOwner
+  , awaitNotificationsSettled
 
     -- * Degradation and its one report
   , DegradationAttempt (..)
@@ -56,15 +65,18 @@ module Hetoimasia.GLFW.Internal.Notify
   , wakeComponent
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
+  , onException
   , SomeAsyncException
   , SomeException
   , fromException
   , mask
+  , mask_
   , rethrowIO
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -79,6 +91,7 @@ import Hetoimasia.GLFW.Internal.Session
   , SessionWake
   , WakeOutcome (..)
   , WakePath (..)
+  , sessionNotificationsInFlight
   , sessionWake
   , sessionWakePath
   , wakeSession
@@ -90,12 +103,14 @@ import Hetoimasia.GLFW.Internal.Session
 data Notifier = Notifier
   { notifierWake ∷ !SessionWake
   , notifierState ∷ !(TVar WakePath)
+  , notifierInFlight ∷ !(TVar Int)
   }
 
 -- | The notifier for a session. Every notifier for one session shares its
 -- degradation.
 sessionNotifier ∷ Session → Notifier
-sessionNotifier session = Notifier (sessionWake session) (sessionWakePath session)
+sessionNotifier session =
+  Notifier (sessionWake session) (sessionWakePath session) (sessionNotificationsInFlight session)
 
 -- | The wake-path state a notifier follows, for the owner boundary that reports
 -- a degradation and for examples that assert one.
@@ -129,11 +144,33 @@ notifyOwner ∷ Notifier → IO WakeNotice
 notifyOwner notifier =
   readTVarIO (notifierState notifier) >>= \case
     WakePathDegraded _ _ → pure NotificationSkipped
-    WakePathHealthy →
-      wakeSession (notifierWake notifier) >>= \case
-        WakePosted → pure OwnerNotified
-        WakeTerminal → pure NotificationTerminal
-        WakeFailed reports → NotificationDegraded <$ atomically (degrade notifier reports)
+    WakePathHealthy → mask_ $ do
+      -- Entered before the call and left only once whatever it found has been
+      -- recorded, so a boundary that waits for the count to reach zero has
+      -- already seen every degradation these calls caused.
+      atomically (enter notifier)
+      outcome ← wakeSession (notifierWake notifier) `onException` leave notifier Nothing
+      case outcome of
+        WakePosted → OwnerNotified <$ leave notifier Nothing
+        WakeTerminal → NotificationTerminal <$ leave notifier Nothing
+        WakeFailed reports → NotificationDegraded <$ leave notifier (Just reports)
+
+-- | Wait until no notification is inside its wake call. It never retries on its
+-- own and is bounded by one empty-event post per notification in flight, so an
+-- owner boundary may wait on it.
+awaitNotificationsSettled ∷ Notifier → STM ()
+awaitNotificationsSettled notifier = readTVar (notifierInFlight notifier) >>= check . (<= 0)
+
+enter ∷ Notifier → STM ()
+enter notifier = modifyTVar' (notifierInFlight notifier) (+ 1)
+
+-- | Record whatever the call left, then leave the count, in one transaction, so
+-- no boundary can see the count fall without the degradation beside it.
+leave ∷ Notifier → Maybe Reports → IO ()
+leave notifier recorded =
+  uninterruptibleMask_ . atomically $ do
+    mapM_ (degrade notifier) recorded
+    modifyTVar' (notifierInFlight notifier) (subtract 1)
 
 -- | Record the degradation, keeping the evidence of the failure that degraded
 -- the path first. Never retries.

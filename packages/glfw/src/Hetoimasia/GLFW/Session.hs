@@ -38,6 +38,9 @@ module Hetoimasia.GLFW.Session
   , sessionWake
   , wakeSession
   , WakeOutcome (..)
+  , WakePath (..)
+  , DegradationReport (..)
+  , DegradationAttempt (..)
 
     -- * Configuration
   , SessionConfig (..)
@@ -63,10 +66,12 @@ module Hetoimasia.GLFW.Session
 
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite, withScoped)
 import Hetoimasia.GLFW.Internal.Native (productionNative)
+import Hetoimasia.GLFW.Internal.Notify (DegradationAttempt (..))
 import Hetoimasia.GLFW.Internal.Session
   ( AsynchronousErrorsUnobserved (..)
   , Backend (..)
   , BackendNotSelected (..)
+  , DegradationReport (..)
   , NativeError (..)
   , NativeFailure (..)
   , NativeOutcome (..)
@@ -78,6 +83,7 @@ import Hetoimasia.GLFW.Internal.Session
   , SessionWake
   , UnsupportedBackend (..)
   , WakeOutcome (..)
+  , WakePath (..)
   , defaultSessionConfig
   , errorDescriptionLimit
   , errorEvidenceCapacity

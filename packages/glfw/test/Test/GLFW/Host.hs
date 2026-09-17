@@ -13,7 +13,7 @@
 -- sleep; a seam wait that must block blocks on a transaction.
 module Test.GLFW.Host (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, yield)
+import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, displayException, fromException, throwIO, try)
@@ -68,7 +68,13 @@ import Hetoimasia.GLFW.Internal.Seam
   , seamSetMonitorTopology
   )
 import Hetoimasia.GLFW.Monitor (inventoryMonitors, inventoryRevision)
-import Hetoimasia.GLFW.Session (SessionMisuse (..), defaultSessionConfig)
+import Hetoimasia.GLFW.Session
+  ( DegradationAttempt (..)
+  , DegradationReport (..)
+  , SessionMisuse (..)
+  , WakePath (..)
+  , defaultSessionConfig
+  )
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
@@ -165,6 +171,12 @@ spec = describe "GLFW window host" $ do
       (boundedExample testDegradationSharedByBorrowedHosts)
     it "reports a degradation the final update caused before the loop it finishes returns"
       (boundedExample testDegradationOnTheFinalTurn)
+    it "waits for a notification still inside its post as the loop ends, and reports the degradation it leaves"
+      (boundedExample testDegradationInFlightAtExit)
+    it "reports a degradation as a failing loop ends, keeping the loop's own failure primary"
+      (boundedExample testDegradationReportedOnFailingExit)
+    it "claims a degradation begun after the loop, at the application's own boundary after quiescence"
+      (boundedExample testDegradationAfterTheLoop)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -874,6 +886,113 @@ durationOf ∷ Integer → Duration
 durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
   Right duration → duration
   Left rejected → error ("the scripted duration was rejected: " <> show rejected)
+
+-- | A notification that is still inside its post when the loop ends: the owner
+-- waits for it at its final boundary and reports what it left, rather than
+-- returning with the attempt owed.
+testDegradationInFlightAtExit ∷ Expectation
+testDegradationInFlightAtExit = do
+  held ← newEmptyMVar
+  release ← newEmptyMVar
+  firstPost ← newIORef True
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            reportError reporter 0x00010008 "scripted wake failure"
+            first ← atomicModifyIORef' firstPost (\flag → (False, flag))
+            -- The first notification reports its failure and then stays inside
+            -- its post until the example lets it leave.
+            when first (putMVar held () >> takeMVar release)
+        }
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  (duringUpdate, admitted') ←
+    hosted seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
+      window ← onlyWindow host
+      owner ← myThreadId
+      submitted ← newEmptyMVar
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \_ → do
+              -- A worker admits during the final update and is left inside its
+              -- failing post.
+              _ ← forkIO (submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= putMVar submitted)
+              takeMVar held
+              duringUpdate ← readIORef warnings
+              -- The post is released only once the owner is waiting for it at
+              -- the boundary that ends the loop.
+              _ ← forkIO (awaitBlockedOnSTM owner >> putMVar release ())
+              pure (Finish (duringUpdate, submitted))
+          }
+  -- Nothing was written while the notification was still in flight.
+  duringUpdate `shouldBe` []
+  written ← readIORef warnings
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+  takeMVar admitted' >>= (`shouldSatisfy` \case SubmitAccepted _ → True; _ → False)
+  posts seam `shouldReturn` 1
+
+-- | A loop that ends by raising still claims the report, and the failure it
+-- raised stays primary.
+testDegradationReportedOnFailingExit ∷ Expectation
+testDegradationReportedOnFailingExit = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  (broken, _) ←
+    caughtAs $
+      hosted seam (settings [windowNamed "failing"]) (\host _ → pure host) $ \host control → do
+        window ← onlyWindow host
+        runOwnerLoop host control $
+          LoopHooks
+            { loopLogger = capturing
+            , loopEvent = noApplicationEvents
+            , loopUpdate = \_ → do
+                _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window)
+                throwIO (Broken "the update failed")
+            }
+  broken `shouldBe` Broken "the update failed"
+  written ← readIORef warnings
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+
+-- | A degradation begun after the loop returned, while admission is still open:
+-- the loop cannot claim it, and the application's own boundary after quiescence
+-- does.
+testDegradationAfterTheLoop ∷ Expectation
+testDegradationAfterTheLoop = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  (afterLoop, attempt, again) ←
+    hosted seam (settings [windowNamed "after"]) (\host _ → pure host) $ \host control → do
+      window ← onlyWindow host
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = capturing
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \_ → pure (Finish ())
+          }
+      -- Nothing degraded while the loop ran, so it wrote nothing.
+      readIORef warnings `shouldReturn` []
+      _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+      afterLoop ← atomically (hostWakePath host)
+      atomically (quiesceWindowHost host)
+      attempt ← reportHostWakeDegradation capturing host
+      again ← reportHostWakeDegradation capturing host
+      pure (afterLoop, attempt, again)
+  afterLoop `shouldSatisfy` \case
+    WakePathDegraded _ DegradationOwed → True
+    _ → False
+  attempt `shouldBe` DegradationReportAttempted
+  again `shouldBe` NoDegradationDue
+  written ← readIORef warnings
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
 
 -- | The last turn is the one that degrades the path: its update submits a
 -- command whose wake fails and finishes the loop at once. The report is still

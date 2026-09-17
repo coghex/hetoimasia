@@ -22,6 +22,10 @@ module Hetoimasia.Runtime.GLFW.Internal
   , hostActivity
   , hostWindowCapabilities
 
+    -- * The wake path
+  , hostWakePath
+  , reportHostWakeDegradation
+
     -- * Demand
   , hostDemandPublisher
   , captureHostDemand
@@ -74,7 +78,7 @@ import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext, withResourceLabelled)
 import Hetoimasia.Foundation.Resource.Collection
   ( Collection
   , CollectionError (..)
@@ -127,7 +131,12 @@ import Hetoimasia.GLFW.Internal.Demand
   , demandStatus
   , newDemandSlot
   )
-import Hetoimasia.GLFW.Internal.Notify (attemptDegradationReport)
+import Hetoimasia.GLFW.Internal.Notify
+  ( DegradationAttempt
+  , Notifier
+  , attemptDegradationReport
+  , awaitNotificationsSettled
+  )
 import Hetoimasia.GLFW.Internal.Input
   ( InputFeed
   , attemptOverflowWarning
@@ -137,7 +146,13 @@ import Hetoimasia.GLFW.Internal.Input
   , newInputFeed
   , resumeInput
   )
-import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents, sessionWindowCapabilities)
+import Hetoimasia.GLFW.Internal.Session
+  ( WakePath
+  , ownerOperation
+  , reconcileMonitorEvents
+  , sessionWakePath
+  , sessionWindowCapabilities
+  )
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
   , attachWindowInputFeed
@@ -252,7 +267,7 @@ validateHostConfig config
 hostComponent ∷ Component
 hostComponent = unsafeComponent "glfw.runtime"
 
-constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation ∷ Operation
+constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation ∷ Operation
 constructOperation = operation "construct window host"
 loopOperation = operation "run owner loop"
 rejectOperation = operation "reject close request"
@@ -261,6 +276,7 @@ closeOperation = operation "close host window"
 honourOperation = operation "honour close request"
 bookkeepingOperation = operation "read host bookkeeping"
 captureOperation = operation "capture demand"
+reportOperation = operation "report wake degradation"
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -415,6 +431,34 @@ closeEntryAdmission entry = do
   void (closeWindowCommands (entryCommands entry))
   closeInputFeed (entryInput entry)
   closeDemandSlot (entryDemand entry)
+
+-- ---------------------------------------------------------------------------
+-- The wake path
+
+-- | Whether the session's wake path has degraded, and how its one diagnostic
+-- report went. Any thread may read it; every host over the session sees the
+-- same state.
+hostWakePath ∷ WindowHost → STM WakePath
+hostWakePath = readTVar . sessionWakePath . hostSession
+
+-- | Claim the session's one degradation report, if one is still owed, at the
+-- application's own owner boundary.
+--
+-- 'runOwnerLoop' claims it on every turn and once more as it ends, after every
+-- notification in flight has settled, so an application normally never needs
+-- this. It exists for the one window the loop cannot close by itself: a
+-- notification begun after the loop's last wait, while admission is still open.
+-- Called after quiescence, where no new notification can begin, it is the
+-- complete final boundary. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt
+reportHostWakeDegradation logger host =
+  ownerOperation (hostSession host) reportOperation [] $ do
+    atomically (awaitNotificationsSettled (hostNotifier host))
+    attemptDegradationReport logger (hostNotifier host)
+
+hostNotifier ∷ WindowHost → Notifier
+hostNotifier = commandHostNotifier . hostCommands
 
 -- ---------------------------------------------------------------------------
 -- Demand
@@ -801,9 +845,30 @@ data TurnStep a
 -- hook's failure ends the loop and propagates.
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
 runOwnerLoop host control hooks =
-  ownerOperation (hostSession host) loopOperation [] (turn 1 False)
+  ownerOperation (hostSession host) loopOperation [] (reportingAsItEnds (turn 1 False))
   where
     settings = hostSettings host
+    notifier = hostNotifier host
+
+    -- However the loop ends — a result, a supervised failure, a native failure,
+    -- or a cancellation — the wake path's one report is claimed before it
+    -- returns, after every notification in flight has settled, so a degradation
+    -- the last turn's own work caused is never left owed. A report failure on
+    -- the failing path is retained as cleanup evidence beside the loop's own
+    -- failure, which stays primary.
+    reportingAsItEnds body =
+      tryWithContext body >>= \case
+        Right result → result <$ settleAndReport
+        Left caught →
+          withResourceLabelled
+            "glfw wake degradation report"
+            (pure ())
+            (\() → settleAndReport)
+            (\() → rethrowIO (caught ∷ ExceptionWithContext SomeException))
+
+    settleAndReport = do
+      atomically (awaitNotificationsSettled notifier)
+      reportDegradation
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
@@ -822,19 +887,12 @@ runOwnerLoop host control hooks =
       events ← dispatchEvents (loopEvent hooks) (hostEventBudget settings)
       checkRuntime control
       step ← loopUpdate hooks (Turn number waited commands events closes)
-      -- The turn's own work — a command's admission, an application event, or
-      -- the update itself — can be what degrades the wake path, and this turn
-      -- may be the last. Claiming the report here, before the check that a
-      -- latched failure would raise, is what keeps the one attempt from being
-      -- owed for ever by a loop that is about to end.
-      reportDegradation
       checkRuntime control
       case step of
         Finish result → pure result
         Continue → turn (number + 1) (commands == 0 && events == 0)
 
-    reportDegradation =
-      void (attemptDegradationReport (loopLogger hooks) (commandHostNotifier (hostCommands host)))
+    reportDegradation = void (attemptDegradationReport (loopLogger hooks) notifier)
 
 -- | Commands queued across every port.
 queuedCommands ∷ WindowHost → STM Natural

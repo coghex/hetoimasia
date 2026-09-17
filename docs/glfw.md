@@ -455,6 +455,12 @@ hostCommandPort       ∷ WindowHost → WindowCommandPort
 hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostActivity          ∷ WindowHost → STM HostActivity
 quiesceWindowHost     ∷ WindowHost → STM ()
+hostWakePath          ∷ WindowHost → STM WakePath
+reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt  -- owner thread
+data WakePath = WakePathHealthy | WakePathDegraded Reports DegradationReport
+data DegradationReport = DegradationOwed | DegradationReporting | DegradationReported
+                       | DegradationReportFailed | DegradationReportInterrupted
+data DegradationAttempt = NoDegradationDue | DegradationReportAttempted
 hostDemandPublisher   ∷ WindowHost → DemandPublisher
 captureHostDemand     ∷ WindowHost → IO (Maybe CapturedDemand)          -- owner thread
 captureWindowDemand   ∷ WindowHost → WindowId → IO (Maybe CapturedDemand)  -- owner thread
@@ -527,7 +533,8 @@ the origin back without a logger. The host's own failures are raised under the
 `glfw.runtime` component: a configuration rejection under
 `construct window host`, and an owner-thread refusal under `run owner loop`,
 `reject close request`, `borrow host window`, `close host window`,
-`honour close request`, `capture demand`, or `read host bookkeeping`. The one
+`honour close request`, `capture demand`, `report wake degradation`, or
+`read host bookkeeping`. The one
 diagnostic the host's own boundary writes, besides the input overflow warning,
 is the wake path's degradation warning, under `glfw.wake`.
 
@@ -707,12 +714,23 @@ Degradation owes exactly one guarded diagnostic attempt. The owner loop claims
 it at a safe boundary — outside transactions, callbacks, releases, and the
 [wake lifetime](#wake-lifetime)'s native exclusion — and writes one structured
 warning through the `Logger` the application injects on `LoopHooks`, under the
-`glfw.wake` component, with the retained evidence's counts and first report. A
-turn claims it twice: after reconciliation, for a degradation that happened
-before the turn, and again after the update opportunity, for one the turn's own
-command work, events, or update caused, because that turn may be the last one.
-Only a loop that ends by raising can leave the attempt unclaimed. The
-claim is spent whatever happens: an entry the logger filters out, a sink
+`glfw.wake` component, with the retained evidence's counts and first report. Every
+turn claims it after reconciliation, and `runOwnerLoop` claims it once more as
+it ends — however it ends, with a result or a raised failure — after waiting for
+every notification still inside its wake call to record what that call left. So
+a degradation the last turn's own command work, events, or update caused is
+reported before the loop returns, and a report failure on a failing exit is
+retained as cleanup evidence beside the loop's own failure, which stays primary.
+
+One window stays open to the loop alone: a notification begun after that last
+wait, while admission is still open, can degrade the path after the loop has
+returned. `hostWakePath` reads whether a report is still owed, and
+`reportHostWakeDegradation` claims it at the application's own owner boundary,
+waiting for notifications in flight exactly as the loop's exit does. Called
+after quiescence, where admission and publication are closed and no new
+notification can begin, it is the complete final boundary.
+
+The claim is spent whatever happens: an entry the logger filters out, a sink
 failure, and a cancellation each end the attempt and are recorded, and none is
 retried. A sink failure and a cancellation propagate as themselves, as every
 logging attempt does, and neither undoes the degradation.
@@ -2431,7 +2449,11 @@ close protocol and every slot by quiescence, with retained publishers rejected
 afterwards; a creation claimed before quiescence registering a window whose port
 and demand slot are already closed; the degradation warning written once through
 the loop's injected logger while the finite idle bound continues; a degradation
-caused by the final update reported before the loop it finishes returns; one
+caused by the final update reported before the loop it finishes returns; a
+notification held inside its failing post across the loop's exit, waited for and
+reported; a degradation reported as a failing loop ends, with the loop's own
+failure primary; one begun after the loop claimed at the application's own
+boundary after quiescence; one
 degradation and one warning shared by sequential hosts borrowing one session;
 and a construction that rolls back lending nothing and waking nothing.
 
@@ -2698,6 +2720,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
 | Wake gate and admitted count | The session | Wake calls enter and leave; the first release closes and drains it | Any; STM | Construction until the first release | Closed and never reopened; a retained capability stays terminal |
 | Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
+| Notifications in flight | The session | A notification enters before its wake call and leaves once it has recorded what that call left; owner boundaries wait for zero | Any; STM | The session | Zero whenever no notification is inside a wake call |
 | Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |

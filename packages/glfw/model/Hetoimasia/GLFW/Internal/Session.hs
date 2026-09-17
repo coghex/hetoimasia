@@ -200,6 +200,7 @@ module Hetoimasia.GLFW.Internal.Session
   , WakePath (..)
   , DegradationReport (..)
   , sessionWakePath
+  , sessionNotificationsInFlight
 
     -- * The monitor inventory
   , monitorInventory
@@ -537,6 +538,10 @@ data Session = Session
   , sessionWakeHealth ∷ !(TVar WakePath)
     -- ^ Whether this session's wake path has degraded, and how its one
     -- diagnostic report went. Every host over this session shares it.
+  , sessionNotifying ∷ !(TVar Int)
+    -- ^ Notifications of "Hetoimasia.GLFW.Internal.Notify" that have entered
+    -- their wake call and not yet recorded what it left. A boundary that finds
+    -- this at zero has seen every degradation the notifications so far caused.
   }
 
 -- | The capability to wake one session's owner from any thread. It holds no
@@ -608,6 +613,13 @@ sessionWake = sessionWakes
 -- carries across sessions.
 sessionWakePath ∷ Session → TVar WakePath
 sessionWakePath = sessionWakeHealth
+
+-- | How many of the session's notifications are inside their wake call, with
+-- what it left still unrecorded. A notification leaves this count only after
+-- recording whatever degradation it found, so a boundary that waits for zero
+-- cannot miss one.
+sessionNotificationsInFlight ∷ Session → TVar Int
+sessionNotificationsInFlight = sessionNotifying
 
 -- | The backend the session initialized.
 sessionBackend ∷ Session → Backend
@@ -756,6 +768,7 @@ sessionAssembly native config = do
   claims ← restoredStep (newIORef Map.empty)
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native) (nativeCurrentWakeMark native))
   health ← restoredStep (newTVarIO WakePathHealthy)
+  notifying ← restoredStep (newTVarIO 0)
   acquirePart
     "glfw session occupancy"
     (releaseRank 6)
@@ -823,6 +836,7 @@ sessionAssembly native config = do
       , sessionClaims = claims
       , sessionWakes = SessionWake native capture gate
       , sessionWakeHealth = health
+      , sessionNotifying = notifying
       }
 
 admit ∷ Native → SessionConfig → IO Backend

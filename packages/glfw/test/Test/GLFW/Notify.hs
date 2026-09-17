@@ -43,13 +43,12 @@ import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Command (commandHostNotifier, newWindowPortHost)
 import Hetoimasia.GLFW.Internal.Demand
 import Hetoimasia.GLFW.Internal.Notify
-  ( DegradationAttempt (..)
-  , attemptDegradationReport
+  ( attemptDegradationReport
   , sessionNotifier
   , wakeComponent
   )
 import Hetoimasia.GLFW.Internal.Seam
-import Hetoimasia.GLFW.Internal.Session (DegradationReport (..), WakePath (..), sessionWakePath)
+import Hetoimasia.GLFW.Internal.Session (sessionWakePath)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window

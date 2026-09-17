@@ -39,9 +39,7 @@
 --    'loopEvent' that dispatched something;
 -- 8. a control check;
 -- 9. the application-owned update opportunity, 'loopUpdate', which sees the
---    turn's 'Turn' summary and answers whether to continue, and then the wake
---    path's degradation report again, for a degradation this turn's own work
---    caused, since this turn may be the last;
+--    turn's 'Turn' summary and answers whether to continue;
 -- 10. a control check, before a 'Finish' result is returned or the next turn
 --     begins.
 --
@@ -154,7 +152,10 @@
 -- hint that they changed. After an expected platform wake failure has degraded
 -- the session's wake path — reported once through 'loopLogger' under
 -- @glfw.wake@ — nothing is posted at all and the finite bound alone keeps work
--- moving. Native waits are safe foreign
+-- moving. The loop claims that report on every turn and once more as it ends,
+-- however it ends, after waiting for every notification still inside its wake
+-- call; 'reportHostWakeDegradation' is the application's own boundary for one
+-- that began after the loop's last wait, and after quiescence it is complete. Native waits are safe foreign
 -- calls, so background workers run while the owner is inside one.
 -- 'hostActivity' reports the turn and whether its owner has begun its finite
 -- wait: the flag is set immediately before the native call and cleared once it
@@ -304,6 +305,10 @@ module Hetoimasia.Runtime.GLFW
   , HostActivity (..)
   , hostActivity
   , hostWindowCapabilities
+
+    -- * The wake path
+  , hostWakePath
+  , reportHostWakeDegradation
 
     -- * Demand
   , hostDemandPublisher
