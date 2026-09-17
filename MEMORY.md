@@ -49,6 +49,13 @@ Working rules live in [AGENTS.md](AGENTS.md); design proposals live in
   runs, `--match "with a scripted owner"`, and `--match "the native opt-in"`
   need none. Remote Linux CI is unchanged: the wrapper's consent reaches the
   runner, cabal, the suite, and its children by inheritance.
+- TEST-3 (#125) of epic #49 added the test-only package
+  `hetoimasia-test-support` (`tools/test-support/`), holding the
+  external-client compiler harness and the bounded test wait. Only test suites
+  depend on it, and it depends on no engine package. Runtime specs build their
+  own logger fixture and the console spec its own variable names, so no spec
+  imports another component's helpers except the messaging Channel/Snapshot
+  supervised cases, which TEST-4 splits.
 - Next design: Vulkan ownership, window/surface retirement, completion, frame
   scheduling, and platform verification. The design remains exploring; the
   four GLFW repairs gate implementation. Completed runtime/messaging arcs need

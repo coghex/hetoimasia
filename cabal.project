@@ -3,6 +3,7 @@ packages:
   packages/foundation
   packages/runtime
   packages/glfw
+  tools/test-support
 
 -- Use the known index baseline from Synarchy; advance deliberately.
 index-state: 2026-08-14T00:00:00Z
@@ -19,6 +20,9 @@ package hetoimasia-foundation
   ghc-options: -Werror -j
 
 package hetoimasia-runtime
+  ghc-options: -Werror -j
+
+package hetoimasia-test-support
   ghc-options: -Werror -j
 
 package hetoimasia-glfw

@@ -87,7 +87,7 @@ import Hetoimasia.Runtime.Supervision
   , WorkerPolicy (..)
   )
 import System.Timeout (timeout)
-import Test.Engine.Logging.Support (fixedMetadata)
+import Test.Engine.Runtime.LogFixture (fixedMetadata)
 import Test.Hspec (Expectation, expectationFailure)
 
 -- Failures ---------------------------------------------------------------------

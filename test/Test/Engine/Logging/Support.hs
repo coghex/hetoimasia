@@ -1,9 +1,9 @@
 -- | Fixtures shared by the logging examples.
 --
 -- Everything here is a value or a freshly constructed collector: a helper hands
--- each caller its own state, so no example can observe another's. The runtime
--- examples borrow 'newCollector', 'fixedMetadata', and 'summaries' from here
--- rather than keeping a second copy of the logging fixtures.
+-- each caller its own state, so no example can observe another's. They belong
+-- to the logging examples alone; the runtime examples construct their own
+-- logger fixture, and the bounded wait comes from "Test.Support.Bounded".
 module Test.Engine.Logging.Support
   ( testComponent
   , gpuComponent
@@ -14,17 +14,13 @@ module Test.Engine.Logging.Support
   , fixedMetadata
   , newCollector
   , summaries
-  , boundMicroseconds
-  , bounded
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (ErrorCall (ErrorCall), throwIO)
 import Data.Text (Text)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
 import Hetoimasia.Foundation.Log
-import System.Timeout (timeout)
 
 testComponent ∷ Component
 testComponent = unsafeComponent "test"
@@ -66,15 +62,3 @@ summaries = map summary
   where
     summary entry =
       (entryLevel entry, componentText (entryComponent entry), entryMessage entry)
-
--- | Long enough to bound a stuck test, never long enough to matter otherwise.
-boundMicroseconds ∷ Int
-boundMicroseconds = 10000000
-
--- | A call that must return rather than wait on serialization state a failed
--- or interrupted write should have released. Timing out is a test failure, not
--- an exception the assertion under it could mistake for the expected one.
-bounded ∷ IO a → IO a
-bounded action =
-  timeout boundMicroseconds action
-    >>= maybe (throwIO (ErrorCall "a logging call never returned")) pure

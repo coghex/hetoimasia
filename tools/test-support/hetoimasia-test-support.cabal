@@ -1,0 +1,39 @@
+cabal-version: 3.16
+name: hetoimasia-test-support
+version: 0.1.0.0
+synopsis: Neutral utilities shared by Hetoimasia's test suites
+description:
+    A test-only library holding what more than one independently built test
+    suite needs: the external-client compiler harness the opacity examples use
+    to prove what a package boundary exposes, and a bounded wait. It registers
+    no examples, depends on no engine package, initializes nothing native, and
+    holds no global fixture. Only test suites may depend on it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Testing
+build-type: Simple
+tested-with: GHC ==9.12.2
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: tools/test-support
+
+library
+    exposed-modules:
+        Test.Support.Bounded
+        Test.Support.ExternalClient
+    hs-source-dirs: src
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    build-depends:
+        base >=4.21 && <4.22,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        temporary >=1.3 && <1.4

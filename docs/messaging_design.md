@@ -737,7 +737,7 @@ Prefer a `Test.Engine.Messaging` group composed by `Test.Engine.Spec`, with
 integration assertions in `Runtime` or `Workers` where those contracts are the
 subject. Reuse the CPU coordination helpers in
 `Test.Engine.Runtime.Supervision.Support` and the external-client harness in
-`Test.Engine.Resources.Opacity`, following `Test.Engine.Runtime.Opacity` for
+`Test.Support.ExternalClient` (`hetoimasia-test-support`), following `Test.Engine.Runtime.Opacity` for
 runtime clients. Exercise the production public scope and worker APIs. Epic #49
 is still open; its shared graphics-fixture slice is deferred and is not a
 prerequisite or an existing fixture for this arc.

@@ -85,7 +85,7 @@ import Hetoimasia.Runtime.Reporting
   , terminalReportAttempted
   )
 import System.IO.Error (ioeGetErrorString)
-import Test.Engine.Logging.Support (bounded, fixedMetadata, newCollector, summaries)
+import Test.Engine.Runtime.LogFixture (fixedMetadata, newCollector, summaries)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -97,6 +97,7 @@ import Test.Hspec
   , shouldReturn
   , shouldSatisfy
   )
+import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "Outcome reporting" $ do
