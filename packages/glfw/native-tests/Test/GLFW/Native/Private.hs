@@ -3,8 +3,8 @@
 -- GLFW allows one session per process, and the shared fixture holds that one
 -- for the whole run, so entering and leaving sessions in sequence, a forced
 -- initialization failure and its rollback, a session over a faulting or tracing
--- native table, and a monitor identity carried from one session into the next
--- each need a process of their own. Each example here starts this same
+-- native table, a monitor identity carried from one session into the next, and
+-- wakes racing a session's termination each need a process of their own. Each example here starts this same
 -- executable as a child with 'privateSessionFlag' and a scenario name; the
 -- child runs that scenario's checks in order on its own process main thread,
 -- prints one line per check, and exits non-zero if any failed. A dry run or a
@@ -28,9 +28,12 @@ module Test.GLFW.Native.Private
   , unknownScenarioExit
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent (forkIO, forkOS)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import qualified Control.Concurrent.STM as STM
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
-import Control.Monad (unless, when)
+import Control.Monad (unless, when, (>=>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Ptr (nullFunPtr)
 import qualified Data.Text as Text
@@ -54,6 +57,7 @@ import Hetoimasia.GLFW.Internal.Native
   , productionNative
   , setWindowSizeForCheck
   , waitEventsForCheck
+  , wakeCountsForCheck
   )
 import Hetoimasia.GLFW.Internal.Monitor (MonitorCallbackStorage (..), MonitorNative (..))
 import Hetoimasia.GLFW.Internal.Session (Native (..), WindowCallbacks (..), sessionAssembly)
@@ -84,10 +88,23 @@ spec gate = describe "private sessions in a child process" $ do
   it "detaches the real monitor callback before termination, frees it last, and never resolves an ended session's identity" $
     privateScenario gate "monitor-lifecycle"
 
+  it "lets no production wake enter GLFW once termination begins, with every admitted wake returned before it" $
+    privateScenarioReporting gate "wake-teardown"
+
 privateScenario ∷ Gate → String → IO ()
 privateScenario gate = launchWith gate $ \name → do
   executable ← getExecutablePath
   readProcessWithExitCode executable [privateSessionFlag, name] ""
+
+-- | 'privateScenario', printing the child's report of each check, so the run
+-- retains the scenario's evidence and not only its verdict.
+privateScenarioReporting ∷ Gate → String → IO ()
+privateScenarioReporting gate = launchWith gate $ \name → do
+  executable ← getExecutablePath
+  launched@(_, out, _) ← readProcessWithExitCode executable [privateSessionFlag, name] ""
+  putStr out
+  hFlush stdout
+  pure launched
 
 -- | Run one scenario through a launcher, once the gate admits the run, and
 -- check that the child reported every check passed. A refused run raises the
@@ -149,6 +166,13 @@ scenarios =
   , ( "monitor-lifecycle"
     , [ ("detaches the installed monitor callback before termination and frees it after the last native call", monitorTeardown)
       , ("never resolves a monitor identity from a completed session in a later session", monitorAcrossSessions)
+      ]
+    )
+  , ( "wake-teardown"
+    , [ ( "workers on bound and unbound threads wake until terminal while their session closes, and none enters GLFW once termination begins"
+        , wakeTeardown
+        )
+      , ("a capability retained from a closed session stays terminal in a later session and never enters GLFW", wakeAcrossSessions)
       ]
     )
   ]
@@ -272,6 +296,92 @@ monitorTeardown = do
       Observed descriptions → Right descriptions
       Unavailable → Left ()
     intercalate' = foldr1 (\event rest → event <> ", " <> rest)
+
+-- | Close sessions while workers wake them, over a production table that records,
+-- immediately before @glfwTerminate@, how many production wake calls have
+-- entered and returned from @glfwPostEmptyEvent@. Every round must find the two
+-- equal there — no wake in flight as termination begins — and find the entered
+-- count unchanged once the session has closed — no wake entered after it. Each
+-- worker wakes until its capability answers 'WakeTerminal', and the close begins
+-- only once every worker has posted, so wakes race the close in every round.
+wakeTeardown ∷ IO String
+wakeTeardown = do
+  atTerminate ← newIORef Nothing
+  let traced =
+        productionNative
+          { nativeTerminate = do
+              wakeCountsForCheck >>= writeIORef atTerminate . Just
+              nativeTerminate productionNative
+          }
+      forks = [forkIO, forkOS, forkIO, forkOS]
+      round' index = do
+        writeIORef atTerminate Nothing
+        (before, _) ← wakeCountsForCheck
+        (workers, stale) ←
+          withScoped (allocComposite (sessionAssembly traced defaultSessionConfig)) $ \session → do
+            let wake = sessionWake session
+            posted ← mapM (const (newTVarIO False)) forks
+            workers ← mapM (\(fork, flag) → startWaker fork wake flag) (zip forks posted)
+            atomically (mapM_ (readTVar >=> STM.check) posted)
+            pure (workers, wake)
+        counts ← mapM (takeMVar >=> either (\failure → failCheck ("a waking worker failed: " <> displayException (failure ∷ SomeException))) pure) workers
+        terminated ← readIORef atTerminate >>= maybe (failCheck "termination recorded no wake counts") pure
+        afterClose ← wakeCountsForCheck
+        staleOutcome ← wakeSession stale
+        afterStale ← wakeCountsForCheck
+        let (enteredAtTerminate, returnedAtTerminate) = terminated
+        unless (enteredAtTerminate == returnedAtTerminate) $
+          failCheck ("round " <> show index <> ": termination began with wake calls in flight: " <> show terminated)
+        unless (fst afterClose == enteredAtTerminate && afterClose == afterStale) $
+          failCheck ("round " <> show index <> ": wake calls entered GLFW after termination began: " <> show (terminated, afterClose, afterStale))
+        unless (staleOutcome == WakeTerminal) $
+          failCheck ("round " <> show index <> ": a stale capability answered " <> show staleOutcome)
+        unless (fromIntegral (sum counts) == enteredAtTerminate - before) $
+          failCheck ("round " <> show index <> ": workers posted " <> show counts <> " but " <> show (enteredAtTerminate - before) <> " calls entered")
+        pure (sum counts)
+  posts ← mapM round' [1 .. wakeRounds]
+  (entered, returned) ← wakeCountsForCheck
+  pure
+    ( show wakeRounds
+        <> " rounds of 4 workers; wakes posted per round "
+        <> show posts
+        <> "; in every round the wake calls entered equalled those returned when termination began, and none entered afterwards; "
+        <> show entered
+        <> " entered and "
+        <> show returned
+        <> " returned in total"
+    )
+  where
+    startWaker fork wake posted = do
+      done ← newEmptyMVar
+      let loop count =
+            wakeSession wake >>= \case
+              WakePosted → atomically (writeTVar posted True) >> loop (count + 1)
+              WakeTerminal → pure (count ∷ Int)
+              WakeFailed reports → failCheck ("a wake failed: " <> show reports)
+      _ ← fork (try (loop 0) >>= putMVar done)
+      pure done
+
+-- | Keep one real session's capability and use it during and after a later
+-- session: it answers 'WakeTerminal' each time and no call enters GLFW.
+wakeAcrossSessions ∷ IO String
+wakeAcrossSessions = do
+  stale ← withSession defaultSessionConfig (pure . sessionWake)
+  (duringLater, before, after) ← withSession defaultSessionConfig $ \_ → do
+    before ← wakeCountsForCheck
+    duringLater ← wakeSession stale
+    after ← wakeCountsForCheck
+    pure (duringLater, before, after)
+  afterLater ← wakeSession stale
+  unless (duringLater == WakeTerminal && afterLater == WakeTerminal) $
+    failCheck ("the stale capability answered " <> show (duringLater, afterLater))
+  unless (before == after) $
+    failCheck ("a stale wake entered GLFW: " <> show (before, after))
+  pure ("the stale capability answered " <> show duringLater <> " during a later session and " <> show afterLater <> " after it, with wake counts " <> show after <> " unchanged")
+
+-- | How many sessions 'wakeTeardown' closes while workers wake them.
+wakeRounds ∷ Int
+wakeRounds = 20
 
 -- | Carry every identity from one real session into the next.
 monitorAcrossSessions ∷ IO String

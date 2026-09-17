@@ -9,16 +9,28 @@
 -- and returns. It invokes no sink, takes no lock, waits for nothing, and lets no
 -- Haskell exception unwind into C.
 --
--- Reports are kept in two buckets, chosen by the OS identity of the reporting
--- thread, never by its Haskell 'Control.Concurrent.ThreadId': a callback that
--- re-enters Haskell runs in a thread of its own. A report made on the process
--- main thread while a session operation's native call is running belongs to
--- that operation, which takes it with 'takeOwnerReports' after the call
--- returns. Every other report is asynchronous: it stays in the other bucket
--- until 'takeOtherReports' reads it, and is never attributed to whichever
--- operation happens to be running when it is observed.
+-- Reports are kept in buckets chosen by facts about the reporting OS thread,
+-- never by its Haskell 'Control.Concurrent.ThreadId': a callback that re-enters
+-- Haskell runs in a thread of its own.
 --
--- Both buckets are bounded. Each keeps the first 'errorEvidenceCapacity'
+-- * A report made while a wake call's native call runs on that OS thread
+--   belongs to that wake call. The binding makes the call with the call's
+--   /wake mark/ in the calling OS thread's native thread-local storage, and the
+--   callback reads that storage on the thread GLFW invokes it on, so the mark,
+--   the native call, and the report share one OS thread by construction.
+--   'beginWakeReports' opens the call's own bucket and 'takeWakeReports'
+--   removes it once the call returns, so concurrent wake calls each keep their
+--   own reports.
+-- * Otherwise, a report made on the process main thread while a session
+--   operation's native call is running belongs to that operation, which takes
+--   it with 'takeOwnerReports' after the call returns.
+-- * Every other report is asynchronous: it stays in the other bucket until
+--   'takeOtherReports' reads it, and is never attributed to whichever operation
+--   happens to be running when it is observed. A report carrying a mark with no
+--   open bucket, or made while the mark could not be read, cannot be attributed
+--   and is counted there as a callback fault.
+--
+-- Every bucket is bounded. Each keeps the first 'errorEvidenceCapacity'
 -- reports it receives and counts the rest in 'reportsLost', and each
 -- description is copied up to 'errorDescriptionLimit' bytes, with truncation
 -- recorded. A lost report still makes 'hasReports' true, so full storage can
@@ -26,8 +38,9 @@
 -- record is counted in 'callbackFaults' rather than rethrown into C.
 --
 -- The buckets live in one 'IORef' updated with 'atomicModifyIORef'', so a
--- callback invoked synchronously from inside an owner call, or concurrently
--- from another thread, never blocks on the owner.
+-- callback invoked synchronously from inside an owner or wake call, or
+-- concurrently from another thread, never blocks on the owner or on another
+-- wake call.
 --
 -- An owner operation that took reports made during its native call raises them
 -- with 'raiseReported' as a 'NativeFailure' attributed to the @glfw@ component,
@@ -56,6 +69,12 @@ module Hetoimasia.GLFW.Internal.Capture
   , settleStrayOwnerReports
   , takeOwnerReports
   , takeOtherReports
+
+    -- * Wake calls
+  , WakeMark
+  , noWakeMark
+  , beginWakeReports
+  , takeWakeReports
   ) where
 
 import Control.DeepSeq (rnf)
@@ -63,10 +82,12 @@ import Control.Exception (Exception, SomeException, try, uninterruptibleMask_)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8Lenient)
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt)
 import Foreign.Ptr (nullPtr)
@@ -177,70 +198,128 @@ emptyBucket = Bucket 0 [] 0 0
 data Buckets = Buckets
   { mainBucket ∷ !Bucket
   , otherBucket ∷ !Bucket
+  , wakeBuckets ∷ !(Map WakeMark Bucket)
+    -- ^ One per wake call whose native call may still report.
+  , nextWakeMark ∷ !WakeMark
   }
+
+-- | Which bucket a report belongs to.
+data Destination
+  = OwnerReports
+  | OtherReports
+  | WakeReports !WakeMark
+
+-- | Identifies one wake call's reports for as long as its bucket is open. Marks
+-- start at one and are never reissued within a capture; 'noWakeMark' is what
+-- a thread outside any wake call reads.
+type WakeMark = Word64
+
+-- | The mark a thread outside any wake call reads.
+noWakeMark ∷ WakeMark
+noWakeMark = 0
 
 -- | The capture state of one session.
 data Capture = Capture
   { captureIdentity ∷ IO Bool
     -- ^ Whether the calling OS thread is the process main thread.
+  , captureWakeMark ∷ IO WakeMark
+    -- ^ The wake mark of the wake call running on the calling OS thread, or
+    -- 'noWakeMark'.
   , captureBuckets ∷ !(IORef Buckets)
   }
 
--- | Empty capture storage, identifying reporting threads with the given query.
-newCapture ∷ IO Bool → IO Capture
-newCapture identity = Capture identity <$> newIORef (Buckets emptyBucket emptyBucket)
+-- | Empty capture storage, identifying reporting threads with the given
+-- queries: whether the calling OS thread is the process main thread, and the
+-- mark of the wake call running on it.
+newCapture ∷ IO Bool → IO WakeMark → IO Capture
+newCapture identity wakeMark =
+  Capture identity wakeMark <$> newIORef (Buckets emptyBucket emptyBucket Map.empty 1)
 
 -- | The error callback a session installs.
 --
 -- It runs uninterruptibly: its work is bounded by 'errorDescriptionLimit' and
 -- one non-blocking update, and nothing may unwind through the C frame that
--- called it. A failure to identify the thread is counted as a fault among
--- asynchronous reports, since it cannot be attributed; a failure to copy or
--- record is counted in the bucket of the thread it happened on.
+-- called it. The wake mark is read first. A failure to read it is counted as a
+-- fault among asynchronous reports, since the report cannot be attributed. Inside
+-- a wake call, a failure to identify the thread, copy, or record is counted in
+-- that call's bucket; outside one, a failure to identify the thread is counted
+-- among asynchronous reports, and a failure to copy or record in the bucket of
+-- the thread it happened on.
 captureCallback ∷ Capture → ErrorCallback
 captureCallback capture code description = uninterruptibleMask_ $ do
-  identified ← try (captureIdentity capture)
-  case identified of
-    Left (_ ∷ SomeException) → update (onBucket False countFault)
-    Right onMain → do
-      recorded ← try $ do
-        (text, truncated) ← copyDescription description
-        let !entry =
-              NativeError
-                { nativeErrorCode = fromIntegral code
-                , nativeErrorDescription = text
-                , nativeErrorTruncated = truncated
-                , nativeErrorThread = if onMain then ProcessMainThread else OtherThread
-                }
-        update (onBucket onMain (store entry))
-      case recorded of
-        Right () → pure ()
-        Left (_ ∷ SomeException) → update (onBucket onMain countFault)
+  marked ← try (captureWakeMark capture)
+  case marked of
+    Left (_ ∷ SomeException) → update (onBucket OtherReports countFault)
+    Right mark → do
+      identified ← try (captureIdentity capture)
+      case identified of
+        Left (_ ∷ SomeException) → update (onBucket (unidentified mark) countFault)
+        Right onMain → do
+          let destination
+                | mark /= noWakeMark = WakeReports mark
+                | onMain = OwnerReports
+                | otherwise = OtherReports
+          recorded ← try $ do
+            (text, truncated) ← copyDescription description
+            let !entry =
+                  NativeError
+                    { nativeErrorCode = fromIntegral code
+                    , nativeErrorDescription = text
+                    , nativeErrorTruncated = truncated
+                    , nativeErrorThread = if onMain then ProcessMainThread else OtherThread
+                    }
+            update (onBucket destination (store entry))
+          case recorded of
+            Right () → pure ()
+            Left (_ ∷ SomeException) → update (onBucket destination countFault)
   where
     update change = atomicModifyIORef' (captureBuckets capture) (\buckets → (change buckets, ()))
+    unidentified mark = if mark /= noWakeMark then WakeReports mark else OtherReports
 
 -- | Move reports made on the process main thread outside any operation's native
 -- call into the asynchronous bucket, so the next operation cannot claim them.
 settleStrayOwnerReports ∷ Capture → IO ()
 settleStrayOwnerReports capture =
-  atomicModifyIORef' (captureBuckets capture) $ \(Buckets stray other) →
-    (Buckets emptyBucket (absorb other stray), ())
+  atomicModifyIORef' (captureBuckets capture) $ \buckets →
+    (buckets {mainBucket = emptyBucket, otherBucket = absorb (otherBucket buckets) (mainBucket buckets)}, ())
 
 -- | Take, and empty, the reports made on the process main thread.
 takeOwnerReports ∷ Capture → IO Reports
 takeOwnerReports capture =
-  atomicModifyIORef' (captureBuckets capture) $ \(Buckets owned other) →
-    (Buckets emptyBucket other, reportsOf owned)
+  atomicModifyIORef' (captureBuckets capture) $ \buckets →
+    (buckets {mainBucket = emptyBucket}, reportsOf (mainBucket buckets))
 
 -- | Take, and empty, the asynchronous reports.
 takeOtherReports ∷ Capture → IO Reports
 takeOtherReports capture =
-  atomicModifyIORef' (captureBuckets capture) $ \(Buckets owned other) →
-    (Buckets owned emptyBucket, reportsOf other)
+  atomicModifyIORef' (captureBuckets capture) $ \buckets →
+    (buckets {otherBucket = emptyBucket}, reportsOf (otherBucket buckets))
 
-onBucket ∷ Bool → (Bucket → Bucket) → Buckets → Buckets
-onBucket True change buckets = buckets {mainBucket = change (mainBucket buckets)}
-onBucket False change buckets = buckets {otherBucket = change (otherBucket buckets)}
+-- | Open an empty bucket for one wake call and answer its fresh mark. The call
+-- makes its native call with that mark, then takes the bucket with
+-- 'takeWakeReports'.
+beginWakeReports ∷ Capture → IO WakeMark
+beginWakeReports capture =
+  atomicModifyIORef' (captureBuckets capture) $ \buckets →
+    let mark = nextWakeMark buckets
+     in (buckets {wakeBuckets = Map.insert mark emptyBucket (wakeBuckets buckets), nextWakeMark = mark + 1}, mark)
+
+-- | Remove a wake call's bucket and answer the reports it held. A report that
+-- arrives with this mark afterwards has no bucket and is counted as an
+-- asynchronous callback fault.
+takeWakeReports ∷ Capture → WakeMark → IO Reports
+takeWakeReports capture mark =
+  atomicModifyIORef' (captureBuckets capture) $ \buckets →
+    ( buckets {wakeBuckets = Map.delete mark (wakeBuckets buckets)}
+    , maybe (Reports [] 0 0) reportsOf (Map.lookup mark (wakeBuckets buckets))
+    )
+
+onBucket ∷ Destination → (Bucket → Bucket) → Buckets → Buckets
+onBucket OwnerReports change buckets = buckets {mainBucket = change (mainBucket buckets)}
+onBucket OtherReports change buckets = buckets {otherBucket = change (otherBucket buckets)}
+onBucket (WakeReports mark) change buckets = case Map.lookup mark (wakeBuckets buckets) of
+  Just bucket → buckets {wakeBuckets = Map.insert mark (change bucket) (wakeBuckets buckets)}
+  Nothing → buckets {otherBucket = countFault (otherBucket buckets)}
 
 store ∷ NativeError → Bucket → Bucket
 store entry (Bucket kept entries lost faults)

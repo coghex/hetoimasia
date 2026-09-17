@@ -55,6 +55,7 @@ module Hetoimasia.GLFW.Seam
   , reportError
   , reportErrorFromOtherThread
   , reportErrorWithFailingIdentity
+  , reportErrorWithFailingWakeMark
 
     -- * What the models asked of the native library
   , NativeCall (..)
@@ -82,6 +83,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , reportError
   , reportErrorFromOtherThread
   , reportErrorWithFailingIdentity
+  , reportErrorWithFailingWakeMark
   , seamCalls
   , seamLiveCallbacks
   , seamLiveMonitorCallbacks

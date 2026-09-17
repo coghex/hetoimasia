@@ -25,6 +25,15 @@
 -- Each seam has its own guard, so examples never share occupancy with each
 -- other or with a production session.
 --
+-- A wake's empty-event post is recorded as 'PostEmptyEvent' and runs the
+-- script's 'scriptPostEmptyEvent' step on the calling thread. While that step
+-- runs the calling thread's wake mark is the call's, so an error the step
+-- reports through 'reportError' is attributed to that wake call, as GLFW's
+-- callback attributes one on the posting OS thread. The seam also keeps, per
+-- calling thread, the last code a step reported, and the post answers the code
+-- its own step left, as the binding answers the thread's GLFW error state.
+-- 'reportErrorWithFailingWakeMark' reports while the wake mark cannot be read.
+--
 -- Windows are created through the public "Hetoimasia.GLFW.Window" interface
 -- in a seam session. The seam hands each a scripted native handle, keeps the
 -- callbacks the model attached to it, and delivers scripted 'WindowEvent's to
@@ -135,6 +144,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , reportError
   , reportErrorFromOtherThread
   , reportErrorWithFailingIdentity
+  , reportErrorWithFailingWakeMark
 
     -- * What the model asked of the native library
   , NativeCall (..)
@@ -155,7 +165,7 @@ import Foreign.C.Types (CFloat, CInt)
 import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
 import Hetoimasia.Foundation.Failure (operation)
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite)
-import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
+import Hetoimasia.GLFW.Internal.Capture (ErrorCallback, WakeMark, noWakeMark)
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
 import Hetoimasia.GLFW.Internal.Command
   ( AdmissionHooks (..)
@@ -235,6 +245,8 @@ data NativeCall
   | PollEvents
   | WaitEvents Double
     -- ^ A finite wait, with its bound in seconds.
+  | PostEmptyEvent
+    -- ^ A wake's cross-thread empty-event post, from whichever thread made it.
   | CreateMonitorCallback
   | AttachMonitorCallback
   | DetachMonitorCallback
@@ -387,6 +399,9 @@ data SeamScript = SeamScript
   , scriptWaitEvents ∷ Double → Reporter → IO ()
     -- ^ Runs inside a finite wait, given its bound, before the events queued
     -- for it are delivered. It may block, as a native wait does.
+  , scriptPostEmptyEvent ∷ Reporter → IO ()
+    -- ^ Runs inside a wake's empty-event post, on the thread that made it, with
+    -- that call's wake mark current.
   , scriptMonitorTopology ∷ MonitorTopology
     -- ^ The monitors enumerated until a driver changes them.
   , scriptMonitorQuery ∷ Int → MonitorQuery → Reporter → IO ()
@@ -425,6 +440,7 @@ defaultScript =
     , scriptWindowAttribute = \_ _ → pure False
     , scriptPollEvents = \_ → pure ()
     , scriptWaitEvents = \_ _ → pure ()
+    , scriptPostEmptyEvent = \_ → pure ()
     , scriptMonitorTopology = noMonitors
     , scriptMonitorQuery = \_ _ _ → pure ()
     , scriptMonitorEnumeration = \_ → pure ()
@@ -474,6 +490,11 @@ data Seam = Seam
   , seamReplacedModes ∷ IORef [(Int, Maybe NativeVideoMode)]
     -- ^ The current mode each monitor had before a fullscreen window changed it,
     -- by scripted address.
+  , seamWakeMarks ∷ IORef [(ThreadId, WakeMark)]
+    -- ^ The wake mark current on each thread inside a post.
+  , seamWakeMarkFails ∷ IORef Bool
+  , seamThreadErrors ∷ IORef [(ThreadId, Int)]
+    -- ^ The last code a scripted step reported on each thread.
   }
 
 -- | A window's tracked decoration, monitor address, size, and position.
@@ -510,6 +531,9 @@ newSeam script =
     <*> newIORef []
     <*> newIORef []
     <*> newIORef 0
+    <*> newIORef []
+    <*> newIORef []
+    <*> newIORef False
     <*> newIORef []
 
 -- | Enter a session over this seam's native table.
@@ -757,6 +781,8 @@ asProcessMainThread seam action = runInBoundThread (designateProcessMainThread s
 reportError ∷ Reporter → Int → ByteString → IO ()
 reportError (Reporter seam) code description = do
   atomicModifyIORef' (seamReported seam) (\count → (count + 1, ()))
+  self ← myThreadId
+  atomicModifyIORef' (seamThreadErrors seam) (\codes → ((self, code) : filter ((/= self) . fst) codes, ()))
   attached ← readIORef (seamAttached seam)
   callbacks ← readIORef (seamCallbacks seam)
   case attached >>= (`lookup` callbacks) of
@@ -780,6 +806,13 @@ reportErrorWithFailingIdentity ∷ Reporter → Int → ByteString → IO ()
 reportErrorWithFailingIdentity reporter@(Reporter seam) code description = do
   atomicWriteIORef (seamIdentityFails seam) True
   reportError reporter code description `finally` atomicWriteIORef (seamIdentityFails seam) False
+
+-- | Invoke the attached error callback on the calling thread while the wake
+-- mark query fails.
+reportErrorWithFailingWakeMark ∷ Reporter → Int → ByteString → IO ()
+reportErrorWithFailingWakeMark reporter@(Reporter seam) code description = do
+  atomicWriteIORef (seamWakeMarkFails seam) True
+  reportError reporter code description `finally` atomicWriteIORef (seamWakeMarkFails seam) False
 
 -- | Change what the seam tracks of a window.
 trackWindow ∷ Seam → Int → (Tracked → Tracked) → IO ()
@@ -888,6 +921,21 @@ seamNative seam =
         record (WaitEvents seconds)
         scriptWaitEvents script seconds reporter
         deliverQueued
+    , nativePostEmptyEvent = \mark → do
+        record PostEmptyEvent
+        self ← myThreadId
+        let others ∷ [(ThreadId, a)] → [(ThreadId, a)]
+            others = filter ((/= self) . fst)
+        atomicModifyIORef' (seamThreadErrors seam) (\codes → (others codes, ()))
+        atomicModifyIORef' (seamWakeMarks seam) (\marks → ((self, mark) : others marks, ()))
+        scriptPostEmptyEvent script reporter
+          `finally` atomicModifyIORef' (seamWakeMarks seam) (\marks → (others marks, ()))
+        atomicModifyIORef' (seamThreadErrors seam) (\codes → (others codes, maybe 0 id (lookup self codes)))
+    , nativeCurrentWakeMark = do
+        failing ← readIORef (seamWakeMarkFails seam)
+        when failing (throwIO (userError "the scripted wake mark query failed"))
+        self ← myThreadId
+        maybe noWakeMark id . lookup self <$> readIORef (seamWakeMarks seam)
     , nativeSetWindowTitle = \handle title → control (SetWindowTitle (windowKey handle) title)
     , nativeSetWindowSize = \handle width height → control (SetWindowSize (windowKey handle) width height)
     , nativeSetWindowPosition = \handle x y → control (SetWindowPosition (windowKey handle) x y)
@@ -910,6 +958,7 @@ seamNative seam =
     , nativeSetWindowDecorated = \handle decorated → control (SetWindowDecorated (windowKey handle) decorated)
     , nativeClearWindowSizeLimits = control . ClearWindowSizeLimits . windowKey
     , nativeWindowCapabilities = scriptWindowCapabilities script
+    , nativePlatformError = 0x00010008
     , nativeFeatureUnavailable = featureUnavailableCode
     , nativeMonitor =
         MonitorNative
