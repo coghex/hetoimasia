@@ -9,9 +9,10 @@ D-3); this document describes what the code does today.
 Scope: the values, the arithmetic over them, the injected clock, and how a
 clock failure is reported. Update policy, including capping a long sample,
 turning elapsed time into steps, and pausing, belongs to the runtime. Converting
-a duration into a native timed wait belongs to GLFW. Neither exists yet, and
-nothing in the owner loop, the command path, or the logging clock uses this
-module today.
+a duration into a native timed wait belongs to GLFW. The runtime's update
+policy is described in [scheduling](scheduling.md); native wait conversion does
+not exist yet, and nothing in the owner loop, the command path, or the logging
+clock uses this module today.
 
 The module owns no state, imports no runtime, GLFW, or wall-clock module, and
 chooses no simulation rate. It takes the validated `Component` from
