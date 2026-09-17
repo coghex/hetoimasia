@@ -197,16 +197,17 @@
 --
 -- 1. quiescence: every port's admission closes, queued callers settle, and every
 --    input feed closes;
--- 2. supervision requests every live worker to stop and drains them, and then
---    the host waits for the notification obligations still outstanding and makes
---    the wake path's one guarded reporting attempt, with the dependencies and
---    the logger live;
--- 3. the dependency scope unwinds: the host's own release closes every port's
+-- 2. supervision requests every live worker to stop and drains them;
+-- 3. the host waits for the notification obligations still outstanding and makes
+--    the wake path's one guarded reporting attempt, with every dependency and
+--    the logger still live; a cancellation delivered during that wait completes
+--    it uninterruptibly and spends the attempt before it is re-raised;
+-- 4. the dependency scope unwinds: the host's own release closes every port's
 --    admission again (a no-op after quiescence), the collection's final exit
 --    releases every window still registered, closing ones included, once each
 --    and newest first, retaining every cleanup failure it latched or observed,
 --    and then the session, when the host owns it, is terminated;
--- 4. the runtime's terminal report and final flush.
+-- 5. the runtime's terminal report and final flush.
 --
 -- As "Hetoimasia.Runtime.Application" specifies, the stop requests the fatal
 -- latch makes, and the drain of a worker whose managed startup was abandoned or

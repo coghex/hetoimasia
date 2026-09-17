@@ -195,6 +195,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testReportsOnEveryExit)
     it "records a reporting attempt cancelled at its sink, outside any uninterruptible release"
       (boundedExample testReportingIsInterruptible)
+    it "spends the reporting attempt for a notification still in its post when the run is cancelled at that wait"
+      (boundedExample testCancelledDuringTheFinalWait)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -1106,6 +1108,51 @@ testReportsOnEveryExit = do
   -- A cancelled run makes no terminal report, and the wake path's own is still
   -- written.
   warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
+
+-- | A run cancelled while its final boundary is waiting for a notification that
+-- is still inside its failing post. The cancellation stays the run's failure,
+-- and the degradation that post records afterwards is still reported: the wait
+-- is completed uninterruptibly and the one attempt is spent before the
+-- cancellation is re-raised.
+testCancelledDuringTheFinalWait ∷ Expectation
+testCancelledDuringTheFinalWait = do
+  inside ← newEmptyMVar
+  release ← newEmptyMVar
+  firstPost ← newIORef True
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            reportError reporter 0x00010008 "scripted wake failure"
+            first ← atomicModifyIORef' firstPost (\flag → (False, flag))
+            when first (putMVar inside () >> takeMVar release)
+        }
+  warnings ← newIORef ([] ∷ [LogEntry])
+  (runner, finished) ←
+    onMainThread seam $
+      runWindowApplication
+        (withLoggingLifetime (recordingLogger warnings))
+        "host-example"
+        (hostOver seam (settings [windowNamed "cancelled wait"]))
+        id
+        (\host _ → pure host)
+        ( \host _ → do
+            window ← onlyWindow host
+            -- A worker's admission commits, registering its obligation, and
+            -- stays inside its failing post. The action then returns, so the
+            -- runner's boundary waits for that obligation.
+            _ ← forkIO (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
+            takeMVar inside
+        )
+  -- The boundary is waiting for the obligation; cancel it there.
+  awaitBlockedOnSTM runner
+  duringWait ← readIORef warnings
+  killThread runner
+  putMVar release ()
+  cancelled ← takeMVar finished
+  duringWait `shouldBe` []
+  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+  warningComponents warnings `shouldReturn` ["glfw.wake"]
 
 -- | Admit one command, whose wake fails and degrades the session's wake path.
 degradeWakePath ∷ WindowHost → IO ()

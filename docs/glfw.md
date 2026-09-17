@@ -739,9 +739,14 @@ needs no reporting call of its own. `reportHostWakeDegradation` is that same
 boundary for an application that owns a different shutdown, and `hostWakePath`
 reads whether an attempt is still owed.
 
-Neither boundary runs inside a release. Both wait and write as ordinary
-interruptible work on the owner thread, so a cancellation reaches the attempt
-and is recorded as one. A failing attempt after a successful run fails the run;
+Neither boundary runs inside a release. Both write through the injected logger
+as ordinary interruptible work on the owner thread, so a cancellation delivered
+while the attempt is writing reaches it and is recorded as one. A cancellation
+delivered while a boundary is still waiting for an obligation is not allowed to
+abandon it: an obligation may be inside a failing post that has not yet recorded
+what it found, so the wait is completed uninterruptibly — bounded by one
+empty-event post each, with no new obligation possible — and the attempt is
+spent before the cancellation is re-raised as the primary failure. A failing attempt after a successful run fails the run;
 after a failing or cancelled one the original failure stays primary and the
 attempt's failure is retained beside it as cleanup evidence. A host's shutdown
 closes its own admission, never the session's wake capability, so sequential
@@ -2392,15 +2397,17 @@ disposed by the final exit. On every exit from the supervised region, the ordina
    executed, and every input feed closes;
 2. supervision asks every live worker to stop and drains them, with every window
    still registered — closing ones included — live;
-3. the dependency scope unwinds: the host closes every port's admission again, a
+3. the wake path's one guarded reporting attempt, made by `runWindowApplication`
+   once every notification obligation outstanding at that point has been
+   discharged, with every dependency and the logger still live. A cancellation
+   delivered while it is still waiting completes that bounded wait
+   uninterruptibly and spends the attempt before it is re-raised;
+4. the dependency scope unwinds: the host closes every port's admission again, a
    no-op after quiescence; the collection's final exit releases each remaining
    window exactly once, newest registration first, keeping every cleanup failure
    — its latched ones included — under
    [the failure table](resources.md#the-failure-table); and then the session ends
    if the host owns it;
-4. the wake path's one guarded reporting attempt, made by
-   `runWindowApplication` once the obligations outstanding at that point have
-   been discharged, with the dependencies and the logger still live;
 5. the terminal report, if the run failed, and the final flush.
 
 A close queued behind quiescence settles as `NotExecuted`, and its window is
@@ -2481,7 +2488,10 @@ no reporting call of its own, and one claimed explicitly after quiescence; a
 command and a demand publication each paused between their commit and their
 wake, waited for at the runner's boundary; the report made when startup fails,
 when the action fails, and when the run is cancelled; a reporting attempt
-cancelled at its sink, which only an attempt outside a release can be; one
+cancelled at its sink, which only an attempt outside a release can be; a run
+cancelled at that boundary's own wait, whose notification was still inside its
+failing post, keeping the cancellation primary and still spending the attempt;
+one
 degradation and one warning shared by sequential hosts borrowing one session,
 whose wake capability neither shutdown closed;
 and a construction that rolls back lending nothing and waking nothing.

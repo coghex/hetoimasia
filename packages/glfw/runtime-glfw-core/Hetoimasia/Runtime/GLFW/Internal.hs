@@ -64,7 +64,17 @@ module Hetoimasia.Runtime.GLFW.Internal
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, finally, fromException, rethrowIO, tryWithContext)
+import Control.Exception
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeException
+  , bracket_
+  , finally
+  , fromException
+  , rethrowIO
+  , tryWithContext
+  , uninterruptibleMask_
+  )
 import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -471,6 +481,12 @@ reportHostWakeDegradation logger host =
     atomically (awaitNotificationsSettled (hostNotifier host))
     attemptDegradationReport logger (hostNotifier host)
 
+-- | The runner's own final boundary: 'reportWhenSettled' on the owner thread,
+-- checked as an owner operation exactly as 'reportHostWakeDegradation' is.
+reportHostWakeDegradationAtExit ∷ HasCallStack ⇒ Logger → WindowHost → IO ()
+reportHostWakeDegradationAtExit logger host =
+  ownerOperation (hostSession host) reportOperation [] (reportWhenSettled logger host)
+
 hostNotifier ∷ WindowHost → Notifier
 hostNotifier = commandHostNotifier . hostCommands
 
@@ -478,10 +494,35 @@ hostNotifier = commandHostNotifier . hostCommands
 -- make the wake path's one guarded reporting attempt.
 --
 -- It is ordinary interruptible 'IO' on the owner thread, never a release
--- callback: it waits and it writes through the injected logger, and neither
--- belongs inside a release's mask.
+-- callback: the attempt writes through the injected logger, which does not
+-- belong inside a release's mask, and a cancellation delivered while it writes
+-- is recorded as one.
+--
+-- A cancellation delivered while it is still waiting is a different matter: an
+-- obligation registered before quiescence may be inside a failing post that has
+-- not yet recorded what it found, and abandoning the wait there would leave that
+-- degradation owed with no boundary left to claim it. So the wait is completed
+-- uninterruptibly — bounded by one empty-event post per obligation outstanding,
+-- with no new one possible — and the attempt is then made, before the
+-- cancellation is re-raised as the primary failure it is. A failure the attempt
+-- raises is retained beside it.
 reportWhenSettled ∷ HasCallStack ⇒ Logger → WindowHost → IO ()
-reportWhenSettled logger host = void (reportHostWakeDegradation logger host)
+reportWhenSettled logger host =
+  tryWithContext (atomically (awaitNotificationsSettled notifier)) >>= \case
+    Right () → attempt
+    Left interrupted → do
+      uninterruptibleMask_ (atomically (awaitNotificationsSettled notifier))
+      tryWithContext attempt >>= \case
+        Right () → rethrowIO (interrupted ∷ ExceptionWithContext SomeException)
+        Left failed →
+          withResourceLabelled
+            wakeReportLabel
+            (pure ())
+            (\() → rethrowIO (failed ∷ ExceptionWithContext SomeException))
+            (\() → rethrowIO interrupted)
+  where
+    notifier = hostNotifier host
+    attempt = void (attemptDegradationReport logger notifier)
 
 -- | Run @body@, then make the reporting attempt, whatever @body@ did.
 --
@@ -903,9 +944,7 @@ runOwnerLoop host control hooks =
     -- returns, after every obligation registered by an admission or a
     -- publication has been discharged, so a degradation the last turn's own work
     -- caused is never left owed.
-    reportingAsItEnds body = retainingReport (settleAndReport (loopLogger hooks) host) body
-
-    settleAndReport = reportWhenSettled
+    reportingAsItEnds body = retainingReport (reportWhenSettled (loopLogger hooks) host) body
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
@@ -1088,7 +1127,7 @@ runWindowApplication enterLifetime name dependencies host startup action =
       name
       ( \use →
           withScoped dependencies $ \built →
-            retainingReport (reportWhenSettled (lifetimeLogger lifetime) (host built)) (use built)
+            retainingReport (reportHostWakeDegradationAtExit (lifetimeLogger lifetime) (host built)) (use built)
       )
       (quiesceWindowHost . host)
       startup
