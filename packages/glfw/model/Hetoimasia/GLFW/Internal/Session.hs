@@ -197,6 +197,10 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionWake
   , wakeSession
   , WakeOutcome (..)
+  , WakePath (..)
+  , DegradationReport (..)
+  , sessionWakePath
+  , sessionNotificationsInFlight
 
     -- * The monitor inventory
   , monitorInventory
@@ -531,6 +535,13 @@ data Session = Session
     -- ^ The fullscreen claims on the current monitors, by window.
   , sessionWakes ∷ !SessionWake
     -- ^ The capability that wakes this session's owner.
+  , sessionWakeHealth ∷ !(TVar WakePath)
+    -- ^ Whether this session's wake path has degraded, and how its one
+    -- diagnostic report went. Every host over this session shares it.
+  , sessionNotifying ∷ !(TVar Int)
+    -- ^ Notifications of "Hetoimasia.GLFW.Internal.Notify" that have entered
+    -- their wake call and not yet recorded what it left. A boundary that finds
+    -- this at zero has seen every degradation the notifications so far caused.
   }
 
 -- | The capability to wake one session's owner from any thread. It holds no
@@ -562,9 +573,53 @@ data WakeOutcome
     -- instead; see 'wakeSession'.
   deriving (Eq, Show)
 
+-- | Whether a session's wake path still posts, and the evidence and reporting
+-- state of the expected platform failure that degraded it.
+--
+-- The session owns one of these. It is not the wake capability's own state:
+-- 'wakeSession' classifies one call and chooses no policy, while this records
+-- the policy every notifier over the session then follows.
+data WakePath
+  = WakePathHealthy
+    -- ^ Notifications post.
+  | WakePathDegraded !Reports !DegradationReport
+    -- ^ An expected platform failure degraded the path, with the evidence
+    -- attributed to the call that failed. Nothing posts afterwards; the owner's
+    -- finite idle wait is the bounded fallback.
+  deriving (Eq, Show)
+
+-- | How the degradation's one diagnostic report went. It is claimed once, at a
+-- safe owner boundary, and never retried, whatever it records.
+data DegradationReport
+  = DegradationOwed
+    -- ^ No attempt has been claimed yet.
+  | DegradationReporting
+    -- ^ An attempt is in progress.
+  | DegradationReported
+    -- ^ The attempt completed. The logger may have filtered the entry; the
+    -- attempt is spent either way.
+  | DegradationReportFailed
+    -- ^ The attempt's sink failed. The failure propagated to the owner.
+  | DegradationReportInterrupted
+    -- ^ The attempt was cancelled. The cancellation propagated to the owner.
+  deriving (Eq, Show)
+
 -- | The session's wake capability.
 sessionWake ∷ Session → SessionWake
 sessionWake = sessionWakes
+
+-- | The session's wake-path state, which every notifier and every host over
+-- this session shares. A later session has its own, so degradation never
+-- carries across sessions.
+sessionWakePath ∷ Session → TVar WakePath
+sessionWakePath = sessionWakeHealth
+
+-- | How many of the session's notifications are inside their wake call, with
+-- what it left still unrecorded. A notification leaves this count only after
+-- recording whatever degradation it found, so a boundary that waits for zero
+-- cannot miss one.
+sessionNotificationsInFlight ∷ Session → TVar Int
+sessionNotificationsInFlight = sessionNotifying
 
 -- | The backend the session initialized.
 sessionBackend ∷ Session → Backend
@@ -712,6 +767,8 @@ sessionAssembly native config = do
   windows ← restoredStep (newIORef 1)
   claims ← restoredStep (newIORef Map.empty)
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native) (nativeCurrentWakeMark native))
+  health ← restoredStep (newTVarIO WakePathHealthy)
+  notifying ← restoredStep (newTVarIO 0)
   acquirePart
     "glfw session occupancy"
     (releaseRank 6)
@@ -778,6 +835,8 @@ sessionAssembly native config = do
       , sessionCapabilities = nativeWindowCapabilities native backend
       , sessionClaims = claims
       , sessionWakes = SessionWake native capture gate
+      , sessionWakeHealth = health
+      , sessionNotifying = notifying
       }
 
 admit ∷ Native → SessionConfig → IO Backend

@@ -124,6 +124,7 @@ module Hetoimasia.GLFW.Command
   , clientObservations
   , clientInputReader
   , clientInputControl
+  , clientDemandPublisher
   , pollWindowClient
 
     -- * Misuse
@@ -165,6 +166,7 @@ import Hetoimasia.GLFW.Internal.Command
   , awaitCompletion
   , awaitSubmitWindowCommand
   , clientCommandPort
+  , clientDemandPublisher
   , clientInputControl
   , clientInputReader
   , clientObservations

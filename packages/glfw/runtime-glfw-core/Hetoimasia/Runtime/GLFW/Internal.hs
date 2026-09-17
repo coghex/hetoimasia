@@ -22,6 +22,18 @@ module Hetoimasia.Runtime.GLFW.Internal
   , hostActivity
   , hostWindowCapabilities
 
+    -- * The wake path
+  , hostWakePath
+  , hostNotificationsInFlight
+  , reportHostWakeDegradation
+
+    -- * Demand
+  , hostDemandPublisher
+  , captureHostDemand
+  , captureWindowDemand
+  , hostDemandStatus
+  , windowDemandStatus
+
     -- * Windows
   , hostWindowIdentities
   , hostWindowClient
@@ -52,8 +64,19 @@ module Hetoimasia.Runtime.GLFW.Internal
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, finally, fromException, rethrowIO, tryWithContext)
-import Control.Monad (forM, forM_, unless, void)
+import Control.Exception
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeException
+  , bracket_
+  , finally
+  , fromException
+  , mask
+  , rethrowIO
+  , tryWithContext
+  , uninterruptibleMask_
+  )
+import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -67,7 +90,13 @@ import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (maximumCapacity)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (Scoped, allocResource, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource
+  ( Scoped
+  , allocResource
+  , cleanupFailuresInContext
+  , withResourceLabelled
+  , withScoped
+  )
 import Hetoimasia.Foundation.Resource.Collection
   ( Collection
   , CollectionError (..)
@@ -98,6 +127,8 @@ import Hetoimasia.GLFW.Internal.Command
   , Execution (..)
   , ExecutionStep (..)
   , WindowCommand (..)
+  , commandHostNotifier
+  , commandsAdmissionClosed
   , executeNextWith
   , nativeRejectionOf
   , newWindowClient
@@ -107,6 +138,25 @@ import Hetoimasia.GLFW.Internal.Command
   , observeWindow
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
+import Hetoimasia.GLFW.Internal.Demand
+  ( CapturedDemand
+  , DemandPublisher
+  , DemandSlot
+  , DemandStatus
+  , captureDemand
+  , closeDemandSlot
+  , demandPublisher
+  , demandStatus
+  , newDemandSlot
+  )
+import Hetoimasia.GLFW.Internal.Notify
+  ( DegradationAttempt
+  , Notifier
+  , attemptDegradationReport
+  , attemptDegradationReportWith
+  , awaitNotificationsSettled
+  , notificationsInFlight
+  )
 import Hetoimasia.GLFW.Internal.Input
   ( InputFeed
   , attemptOverflowWarning
@@ -116,7 +166,13 @@ import Hetoimasia.GLFW.Internal.Input
   , newInputFeed
   , resumeInput
   )
-import Hetoimasia.GLFW.Internal.Session (ownerOperation, reconcileMonitorEvents, sessionWindowCapabilities)
+import Hetoimasia.GLFW.Internal.Session
+  ( WakePath
+  , ownerOperation
+  , reconcileMonitorEvents
+  , sessionWakePath
+  , sessionWindowCapabilities
+  )
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
   , attachWindowInputFeed
@@ -144,8 +200,8 @@ import Hetoimasia.GLFW.Window
   , windowLocalIdentity
   , windowObservations
   )
-import Hetoimasia.Runtime.Application (runScopedApplicationWithQuiescence)
-import Hetoimasia.Runtime.Logging (LoggingLifetime)
+import Hetoimasia.Runtime.Application (runManagedApplication)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
 import Numeric.Natural (Natural)
 
@@ -231,7 +287,7 @@ validateHostConfig config
 hostComponent ∷ Component
 hostComponent = unsafeComponent "glfw.runtime"
 
-constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation ∷ Operation
+constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation ∷ Operation
 constructOperation = operation "construct window host"
 loopOperation = operation "run owner loop"
 rejectOperation = operation "reject close request"
@@ -239,6 +295,8 @@ borrowOperation = operation "borrow host window"
 closeOperation = operation "close host window"
 honourOperation = operation "honour close request"
 bookkeepingOperation = operation "read host bookkeeping"
+captureOperation = operation "capture demand"
+reportOperation = operation "report wake degradation"
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -259,6 +317,8 @@ data WindowHost = WindowHost
   , hostSurfaced ∷ !(IORef (Map WindowId CloseRequest))
   , hostCursor ∷ !(IORef PortKey)
     -- ^ The port the last dispatch attempt served.
+  , hostDemandSlot ∷ !DemandSlot
+    -- ^ The application's one demand slot, lent to workers as a publisher.
   , hostActivityState ∷ !(TVar HostActivity)
   , hostHooks ∷ !HostHooks
   }
@@ -282,6 +342,7 @@ data HostEntry = HostEntry
   { entryMember ∷ !(Member Window)
   , entryCommands ∷ !WindowCommandHost
   , entryInput ∷ !InputFeed
+  , entryDemand ∷ !DemandSlot
   , entryClient ∷ !WindowClient
   , entryClosing ∷ !Bool
   }
@@ -330,14 +391,17 @@ allocWindowHostWith hooks sessionScope config = do
   collection ← allocCollection (hostWindowLimit config)
   commands ← liftIO (newWindowCommandHost session (hostCommandCapacity config))
   entries ← liftIO (newTVarIO Map.empty)
-  -- Released first: every port's admission closes before any window is released.
-  allocResource (pure ()) (\() → atomically (closeAdmission commands entries))
+  demand ← liftIO newDemandSlot
+  -- Released first: every port's admission and every demand slot close before
+  -- any window is released.
+  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand))
   host ←
     liftIO $
       WindowHost session collection commands config entries
         <$> newIORef Map.empty
         <*> newIORef Map.empty
         <*> newIORef HostPortKey
+        <*> pure demand
         <*> newTVarIO (HostActivity 0 False)
         <*> pure hooks
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
@@ -372,12 +436,180 @@ hostActivity = readTVar . hostActivityState
 -- the calling transaction. Finite, non-retrying, and idempotent; it destroys
 -- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
 quiesceWindowHost ∷ WindowHost → STM ()
-quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host)
+quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host) (hostDemandSlot host)
 
-closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → STM ()
-closeAdmission commands entries = do
+closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → DemandSlot → STM ()
+closeAdmission commands entries demand = do
   void (closeWindowCommands commands)
-  readTVar entries >>= mapM_ (\entry → void (closeWindowCommands (entryCommands entry)) >> closeInputFeed (entryInput entry))
+  closeDemandSlot demand
+  readTVar entries >>= mapM_ closeEntryAdmission
+
+-- | Close one window's admission: its port, its input feed, and its demand
+-- slot. Finite, never retries, and idempotent.
+closeEntryAdmission ∷ HostEntry → STM ()
+closeEntryAdmission entry = do
+  void (closeWindowCommands (entryCommands entry))
+  closeInputFeed (entryInput entry)
+  closeDemandSlot (entryDemand entry)
+
+-- ---------------------------------------------------------------------------
+-- The wake path
+
+-- | Whether the session's wake path has degraded, and how its one diagnostic
+-- report went. Any thread may read it; every host over the session sees the
+-- same state.
+hostWakePath ∷ WindowHost → STM WakePath
+hostWakePath = readTVar . sessionWakePath . hostSession
+
+-- | How many notification obligations the session's admissions and publications
+-- have registered and not yet discharged. Any thread may read it; it is bounded
+-- by the work committed and not yet notified.
+hostNotificationsInFlight ∷ WindowHost → STM Int
+hostNotificationsInFlight = notificationsInFlight . hostNotifier
+
+-- | Claim the session's one degradation report, if one is still owed, at the
+-- application's own owner boundary.
+--
+-- 'runWindowApplication' makes this attempt itself, after quiescence and the
+-- worker drain, so an application that uses the ordinary runner never needs it.
+-- It is here for one that owns a different shutdown.
+--
+-- Call it after quiescence. It waits for the notification obligations
+-- outstanding, which is bounded only once admission and publication have closed;
+-- called while they are open it can wait as long as a worker keeps publishing.
+-- A cancellation during that wait completes it uninterruptibly and spends the
+-- attempt before it is re-raised. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt
+reportHostWakeDegradation logger host =
+  ownerOperation (hostSession host) reportOperation [] $
+    mask (\restore → settledAttempt restore logger host)
+
+-- | The runner's own final boundary: the same attempt, over the restore its
+-- caller already holds, checked as an owner operation exactly as
+-- 'reportHostWakeDegradation' is.
+reportHostWakeDegradationAtExit ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO ()
+reportHostWakeDegradationAtExit restore logger host =
+  ownerOperation (hostSession host) reportOperation [] (void (settledAttempt restore logger host))
+
+hostNotifier ∷ WindowHost → Notifier
+hostNotifier = commandHostNotifier . hostCommands
+
+-- | Wait for every registered notification obligation to be discharged, then
+-- make the wake path's one guarded reporting attempt.
+--
+-- The wait is bounded only where no new obligation can be registered — after
+-- quiescence has closed admission and publication. A boundary that runs while
+-- they are open must use 'promptAttempt' instead, which claims what has already
+-- been recorded and waits for nothing.
+--
+-- The caller has masked, and lends its @restore@ for the one part that must
+-- stay interruptible: the write through the injected logger, so a cancellation
+-- delivered while the attempt writes reaches it and is recorded as one. This is
+-- never a release callback.
+--
+-- The wait is interruptible too, but a cancellation there may not abandon it: an
+-- obligation may be inside a failing post that has not yet recorded what it
+-- found, and nothing would be left to claim that degradation. So the wait is
+-- completed uninterruptibly — bounded by one empty-event post per obligation
+-- outstanding, with no new one possible once admission has closed — and the
+-- attempt is then made before the cancellation is re-raised as the primary
+-- failure. A failure the attempt raises is retained beside it.
+settledAttempt ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO DegradationAttempt
+settledAttempt restore logger host =
+  tryWithContext (restore (atomically (awaitNotificationsSettled notifier))) >>= \case
+    Right () → attempt
+    Left interrupted → do
+      uninterruptibleMask_ (atomically (awaitNotificationsSettled notifier))
+      tryWithContext attempt >>= \case
+        Right _ → rethrowIO (interrupted ∷ ExceptionWithContext SomeException)
+        Left failed →
+          withResourceLabelled
+            wakeReportLabel
+            (pure ())
+            (\() → rethrowIO (failed ∷ ExceptionWithContext SomeException))
+            (\() → rethrowIO interrupted)
+  where
+    notifier = hostNotifier host
+    attempt = attemptDegradationReportWith restore logger notifier
+
+-- | The wake path's one guarded reporting attempt, without waiting for
+-- anything.
+--
+-- It claims a degradation already recorded and leaves one still being recorded
+-- to the boundary that runs after quiescence, so it can be used while
+-- admissions and publications are still being made without ever waiting on a
+-- worker that keeps making them.
+promptAttempt ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO ()
+promptAttempt restore logger host = void (attemptDegradationReportWith restore logger (hostNotifier host))
+
+-- | Run @body@, then make the reporting attempt, whatever @body@ did.
+--
+-- The whole sequence is masked and @body@ runs under the restore, so nothing can
+-- be delivered in the handoff between the body ending and the attempt being
+-- protected; the attempt is lent that same restore for its logger write.
+--
+-- A failure the attempt raises after a successful body fails the caller. After a
+-- failing or cancelled body the body's failure stays primary and the attempt's
+-- is retained beside it as cleanup evidence, carried by a release that only
+-- rethrows what was already caught.
+retainingReport ∷ ((∀ a. IO a → IO a) → IO ()) → IO r → IO r
+retainingReport attempt body = mask $ \restore → do
+  outcome ← tryWithContext (restore body)
+  reported ← tryWithContext (attempt restore)
+  case (outcome, reported) of
+    (Right result, Right ()) → pure result
+    (Right _, Left failed) → rethrowIO (failed ∷ ExceptionWithContext SomeException)
+    (Left primary, Right ()) → rethrowIO (primary ∷ ExceptionWithContext SomeException)
+    (Left primary, Left failed) →
+      withResourceLabelled
+        wakeReportLabel
+        (pure ())
+        (\() → rethrowIO (failed ∷ ExceptionWithContext SomeException))
+        (\() → rethrowIO (primary ∷ ExceptionWithContext SomeException))
+
+-- | The cleanup label a failed reporting attempt is retained under.
+wakeReportLabel ∷ Text
+wakeReportLabel = "glfw wake degradation report"
+
+-- ---------------------------------------------------------------------------
+-- Demand
+
+-- | The application's demand publisher: the capability a worker uses to ask
+-- the owner for a turn, immediately or by a deadline. It is one slot for every
+-- worker, so concurrent requests combine rather than replace, and it is
+-- rejected once the host has quiesced.
+hostDemandPublisher ∷ WindowHost → DemandPublisher
+hostDemandPublisher host = demandPublisher (hostDemandSlot host) (commandHostNotifier (hostCommands host))
+
+-- | Take the application demand pending for the owner, clearing exactly what
+-- was taken, on the owner thread. A publication that commits afterwards stays
+-- pending for the next capture. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+captureHostDemand ∷ WindowHost → IO (Maybe CapturedDemand)
+captureHostDemand host =
+  ownerOperation (hostSession host) captureOperation [] (atomically (captureDemand (hostDemandSlot host)))
+
+-- | 'captureHostDemand' for one window's slot. A window the host no longer
+-- holds, and one whose slot has closed, answer 'Nothing'.
+captureWindowDemand ∷ WindowHost → WindowId → IO (Maybe CapturedDemand)
+captureWindowDemand host target =
+  ownerOperation (hostSession host) captureOperation (windowIdentifiers target) $
+    atomically $
+      Map.lookup target <$> readTVar (hostEntries host) >>= \case
+        Nothing → pure Nothing
+        Just entry → captureDemand (entryDemand entry)
+
+-- | The application slot's state, read in one transaction without capturing
+-- anything. Any thread may read it.
+hostDemandStatus ∷ WindowHost → STM DemandStatus
+hostDemandStatus = demandStatus . hostDemandSlot
+
+-- | One window's slot state, or 'Nothing' for a window the host no longer
+-- holds. Any thread may read it.
+windowDemandStatus ∷ WindowHost → WindowId → STM (Maybe DemandStatus)
+windowDemandStatus host target =
+  Map.lookup target <$> readTVar (hostEntries host) >>= traverse (demandStatus . entryDemand)
 
 -- ---------------------------------------------------------------------------
 -- Windows
@@ -488,8 +720,7 @@ commitClosing host target =
   Map.lookup target <$> readTVar (hostEntries host) >>= \case
     Just entry | not (entryClosing entry) → do
       modifyTVar' (hostEntries host) (Map.insert target entry {entryClosing = True})
-      void (closeWindowCommands (entryCommands entry))
-      closeInputFeed (entryInput entry)
+      closeEntryAdmission entry
       pure True
     _ → pure False
 
@@ -545,8 +776,19 @@ registerWindow host config =
         attachWindowInputFeed window feed
         pure (identity, reader, feed)
     commands ← newWindowPortHost (hostSession host) (hostCommandCapacity (hostSettings host)) identity
-    let client = newWindowClient identity commands reader (feedReader feed) (feedControl feed)
-    atomically (modifyTVar' (hostEntries host) (Map.insert identity (HostEntry member commands feed client False)))
+    demand ← newDemandSlot
+    let client =
+          newWindowClient identity commands reader (feedReader feed) (feedControl feed) $
+            demandPublisher demand (commandHostNotifier (hostCommands host))
+        entry = HostEntry member commands feed demand client False
+    -- Registration and the quiescence check commit together, so a window whose
+    -- creation was claimed before quiescence and finished after it is
+    -- registered already closed: its port, its feed, and its demand slot admit
+    -- nothing, and the client its ticket hands over can revive none of them.
+    atomically $ do
+      quiesced ← commandsAdmissionClosed (hostCommands host)
+      when quiesced (closeEntryAdmission entry)
+      modifyTVar' (hostEntries host) (Map.insert identity entry)
     afterRegistration (hostHooks host)
     pure client
 
@@ -715,9 +957,23 @@ data TurnStep a
 -- hook's failure ends the loop and propagates.
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
 runOwnerLoop host control hooks =
-  ownerOperation (hostSession host) loopOperation [] (turn 1 False)
+  ownerOperation (hostSession host) loopOperation [] (reportingAsItEnds (turn 1 False))
   where
     settings = hostSettings host
+    notifier = hostNotifier host
+
+    -- However the loop ends — a result, a supervised failure, a native failure,
+    -- or a cancellation — the wake path's one report is claimed before it
+    -- returns, so a degradation this turn's own work already caused is reported
+    -- here rather than waiting for shutdown.
+    --
+    -- This boundary never waits for an obligation. Admission and publication are
+    -- still open, and a worker that keeps publishing until supervision stops it
+    -- would keep new obligations coming, so waiting here would hold the loop's
+    -- own result back from the quiescence and the drain that would end them. The
+    -- boundary that does wait is the one after quiescence, where nothing new can
+    -- be registered.
+    reportingAsItEnds = retainingReport (\restore → promptAttempt restore (loopLogger hooks) host)
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
@@ -728,6 +984,7 @@ runOwnerLoop host control hooks =
       retirePending host
       closes ← surfaceCloseRequests host
       recoverFeeds (loopLogger hooks) host
+      reportDegradation
       checkRuntime control
       commands ← dispatchCommands host (hostCommandBudget settings)
       recoverFeeds (loopLogger hooks) host
@@ -739,6 +996,8 @@ runOwnerLoop host control hooks =
       case step of
         Finish result → pure result
         Continue → turn (number + 1) (commands == 0 && events == 0)
+
+    reportDegradation = void (attemptDegradationReport (loopLogger hooks) notifier)
 
 -- | Commands queued across every port.
 queuedCommands ∷ WindowHost → STM Natural
@@ -862,9 +1121,25 @@ rejectHostCloseRequest host request =
 -- ---------------------------------------------------------------------------
 -- Applications
 
--- | 'Hetoimasia.Runtime.Application.runScopedApplicationWithQuiescence' with
--- the host's quiescence action: the fourth argument finds the host among the
--- application's dependencies.
+-- | 'Hetoimasia.Runtime.Application.runManagedApplication' with the host's
+-- quiescence action and its final notification boundary: the fourth argument
+-- finds the host among the application's dependencies.
+--
+-- The host's dependencies are a managed lifetime rather than a bare scope, so
+-- the runner's own order gains one component-owned step and nothing else: the
+-- finite quiescence transaction closes admission, publication, and every input
+-- feed; supervision then stops and drains every worker; and only then, with
+-- every dependency and the application's logger still live, the host waits for
+-- the notification obligations its admissions and publications registered and
+-- makes the wake path's one guarded reporting attempt. Nothing new can be
+-- admitted or published by then, so that attempt cannot be outrun.
+--
+-- It is the ordinary boundary, so an application needs no reporting call of its
+-- own; 'reportHostWakeDegradation' stays available for one that owns a
+-- different shutdown. The attempt runs on the calling thread as ordinary
+-- interruptible work, not inside a release: a failing sink after a successful
+-- run fails the run, and after a failing or cancelled one the original failure
+-- stays primary with the attempt's retained beside it.
 runWindowApplication
   ∷ HasCallStack
   ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
@@ -874,5 +1149,17 @@ runWindowApplication
   → (dependencies → RuntimeControl → IO services)
   → (services → RuntimeControl → IO a)
   → IO a
-runWindowApplication enterLifetime name dependencies host =
-  runScopedApplicationWithQuiescence enterLifetime name dependencies (quiesceWindowHost . host)
+runWindowApplication enterLifetime name dependencies host startup action =
+  enterLifetime $ \lifetime →
+    runManagedApplication
+      (\use → use lifetime)
+      name
+      ( \use →
+          withScoped dependencies $ \built →
+            retainingReport
+              (\restore → reportHostWakeDegradationAtExit restore (lifetimeLogger lifetime) (host built))
+              (use built)
+      )
+      (quiesceWindowHost . host)
+      startup
+      action

@@ -134,6 +134,7 @@ module Hetoimasia.GLFW.Internal.Seam
   , AdmissionHooks (..)
   , noAdmissionHooks
   , submitWith
+  , awaitSubmitWith
 
     -- * Thread identity
   , asProcessMainThread
@@ -176,6 +177,7 @@ import Hetoimasia.GLFW.Internal.Command
   , ExecutionStep (..)
   , WindowCommand
   , WindowCommandHost
+  , awaitSubmitWith
   , commandHostSession
   , executeCommand
   , executeNextWith

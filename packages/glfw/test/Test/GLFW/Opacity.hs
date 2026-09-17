@@ -122,6 +122,22 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that forges a demand request or publisher, or reaches for a demand slot" $ do
+    withClient "Client.hs" demandConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "DemandRequest"
+    withClient "Client.hs" demandInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a demand slot is reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Demand"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that names the window or observation constructor" $
     withClient "Client.hs" windowConstructorClient $ \compile → do
       outcome ← compile Typecheck
@@ -961,6 +977,36 @@ wakeInternalsClient =
     , ""
     , "table ∷ SessionWake → Native"
     , "table = wakeNative"
+    ]
+
+-- | A client naming a demand request's and a publisher's data constructors.
+demandConstructorClient ∷ String
+demandConstructorClient =
+  unlines
+    [ "module Client (forged, publisher) where"
+    , ""
+    , "import Hetoimasia.GLFW.Demand (DemandPublisher (DemandPublisher), DemandRequest (DemandRequest))"
+    , ""
+    , "forged ∷ Maybe DemandRequest"
+    , "forged = Nothing"
+    , ""
+    , "publisher ∷ Maybe DemandPublisher"
+    , "publisher = Nothing"
+    ]
+
+-- | A client reaching for the demand slot a publisher writes into, and for the
+-- capture only the owner performs, whose module belongs to a private
+-- sublibrary.
+demandInternalsClient ∷ String
+demandInternalsClient =
+  unlines
+    [ "module Client (capture) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.GLFW.Internal.Demand (CapturedDemand, DemandSlot, captureDemand)"
+    , ""
+    , "capture ∷ DemandSlot → STM (Maybe CapturedDemand)"
+    , "capture = captureDemand"
     ]
 
 -- | A client naming the window's and the observation's data constructors.
