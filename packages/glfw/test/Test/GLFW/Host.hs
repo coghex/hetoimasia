@@ -161,6 +161,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testDegradationReportedByLoop)
     it "lends no port or demand publisher, and wakes nothing, when host construction rolls back"
       (boundedExample testRollbackLendsNothing)
+    it "shares one degradation and one report between sequential hosts borrowing the same session"
+      (boundedExample testDegradationSharedByBorrowedHosts)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -834,6 +836,37 @@ durationOf ∷ Integer → Duration
 durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
   Right duration → duration
   Left rejected → error ("the scripted duration was rejected: " <> show rejected)
+
+-- | Two hosts in turn over one borrowed session: the first degrades the
+-- session's wake path and writes its one warning, and the second, a separate
+-- 'WindowHost' over the same session, inherits both.
+testDegradationSharedByBorrowedHosts ∷ Expectation
+testDegradationSharedByBorrowedHosts = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+      -- The session outlives both hosts, because neither owns its scope.
+      borrowed session = allocWindowHostIn (pure session) (settings [windowNamed "borrowed"])
+      application session name =
+        runWindowApplication lifetime name (borrowed session) id (\host _ → pure host) $ \host control → do
+          window ← onlyWindow host
+          _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+          runOwnerLoop host control $
+            LoopHooks
+              { loopLogger = capturing
+              , loopEvent = noApplicationEvents
+              , loopUpdate = \turn → pure (if turnNumber turn == 2 then Finish () else Continue)
+              }
+  asProcessMainThread seam $ entered seam $ \session → do
+    application session "borrowed-host-first"
+    application session "borrowed-host-second"
+  written ← readIORef warnings
+  -- One warning across both hosts, and only the first host's admission entered
+  -- the library.
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+  posts seam `shouldReturn` 1
 
 -- | A construction that rolls back hands no capability to anyone, so nothing
 -- can be admitted or published through a half-built host, and nothing wakes.

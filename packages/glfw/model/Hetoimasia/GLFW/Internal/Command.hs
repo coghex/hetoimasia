@@ -37,8 +37,11 @@
 -- the hint posted after. A full or closed answer wakes nothing. The obligation
 -- is held from the commit onward — the commit and the wake run under a mask,
 -- and the wake itself uninterruptibly — so nothing delivered to the submitting
--- thread can drop it; only the waiting operation's own wait for capacity stays
--- interruptible, which is what makes it cancellable. The answer and the ticket
+-- thread can drop it. The waiting operation keeps that protection while staying
+-- cancellable: its wait for capacity blocks in a transaction, which is an
+-- interruptible operation even under the mask, so a cancellation delivered
+-- while it waits aborts it and admits nothing, and no interruptible point
+-- separates the commit that follows from the wake it owes. The answer and the ticket
 -- never depend on the wake's outcome: an expected platform failure degrades the
 -- session's wake path and leaves both untouched, and a programming or lifetime
 -- violation propagates to the submitter with the command still admitted and
@@ -1060,13 +1063,15 @@ awaitSubmitWith hooks port context command = do
         Just (WaitAccepted _) → notifyAdmission hooks port
         _ → pure ()
       maybe (throwFailure glfwComponent submitOperation (originIdentifiers origin) OwnerThreadWouldWait) pure submitted
-    else mask $ \restore → do
-      -- The wait for capacity is the one interruptible part: a cancellation
-      -- there admits nothing. The admission commits inside it, so only the
-      -- instant between that commit and this mask is unprotected, and a
-      -- notification lost there costs the command nothing but the owner's
-      -- finite idle wait.
-      submitted ← restore $ atomically $
+    else mask_ $ do
+      -- The mask is never restored around this transaction, and it does not
+      -- have to be: a transaction blocked in 'retry' is an interruptible
+      -- operation, so a cancellation is still delivered to a waiter that is
+      -- waiting for capacity, and it aborts that transaction without admitting
+      -- anything. Once the transaction has committed there is no interruptible
+      -- point before the notification, so no admission can lose the wake it
+      -- owes.
+      submitted ← atomically $
         awaitSend (portSender port) prepared >>= \case
           Admitted → do
             ticket ← reserve port origin

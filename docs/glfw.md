@@ -1238,16 +1238,23 @@ recorded first and the hint posted after, never the reverse. `SubmitFull`,
 `SubmitClosed`, `WaitClosed`, and a rolled-back admission wake nothing, because
 they admitted nothing.
 
-The obligation is held from the commit onward: the commit and the wake run under
-a mask, and the wake itself runs uninterruptibly, so no asynchronous exception
-delivered to the submitting thread can drop it. A cancellation before the commit
-admits nothing and wakes nothing. One requested after it takes effect only once
-the wake has been posted, and the command, whose caller may never have received
-its ticket, still executes and still settles exactly once. Only the waiting
-operation's own wait for capacity stays interruptible, which is what makes it
-cancellable; a cancellation delivered in the instant between that wait's commit
-and the mask costs the command nothing but the owner's finite idle wait, which
-serves it anyway.
+The obligation is held from the commit onward, with no gap: the commit and the
+wake run under a mask, and the wake itself runs uninterruptibly, so no
+asynchronous exception delivered to the submitting thread can drop it. A
+cancellation before the commit admits nothing and wakes nothing. One requested
+after it takes effect only once the wake has been posted, and the command, whose
+caller may never have received its ticket, still executes and still settles
+exactly once.
+
+The waiting operation stays cancellable under that same protection, because its
+wait for capacity blocks in a transaction and a blocked transaction is an
+interruptible operation even under a mask. A cancellation delivered while it
+waits therefore aborts it and admits nothing, and nothing interruptible
+separates the commit that ends the wait from the wake it owes. Cancelling that
+waiter exactly as capacity frees is a race with two correct outcomes, and the
+host's own bookkeeping, not the caller's answer, says which happened: either
+nothing was admitted and nothing woke, or the command was admitted and its wake
+posted, whether or not its caller lived to receive the ticket.
 
 The submission's answer and its ticket never depend on the wake's outcome. A
 wake that fails as an expected platform failure degrades the session's wake path
@@ -2393,12 +2400,18 @@ during, and after the owner's wait, through both admission operations and both
 port kinds; full and closed admission waking nothing; cancellation before a
 commit admitting and waking nothing, and after one keeping the command, its
 wake, and its single settlement, for both the immediate and the waiting
-operation; concurrent publishers combining immediate demand and the earliest
-deadline; twenty republications coalescing into one captured request; a capture
-racing a publication in both orders; a request demanding nothing and a closed
+operation; publishers released together from one gate combining immediate demand and the
+earliest deadline; twenty republications coalescing into one captured request; a
+capture racing a publication in both orders, and a worker republishing
+concurrently while the owner captures, every revision taken in order with what
+fell between two captures coalesced; twenty rounds of a waiter cancelled exactly
+as capacity frees, each leaving either no admission and no wake or an admitted
+command with its own; a request demanding nothing and a closed
 slot recording nothing; publication cancelled before and after its commit; an
 expected platform failure degrading the session's path once, keeping every
-ticket, and being skipped by a second host over the same session; the one
+ticket, and being skipped by a second host over the same session; two failures
+overlapping inside their own posts degrading once and keeping one call's
+evidence; the one
 report written, filtered, and failed, each spending the attempt without
 retrying or undoing the degradation; a lifetime violation staying a typed
 failure with the command still admitted; and a retained port and publisher
@@ -2410,8 +2423,9 @@ publication the same turn's update captures; a window's demand slot closed by it
 close protocol and every slot by quiescence, with retained publishers rejected
 afterwards; a creation claimed before quiescence registering a window whose port
 and demand slot are already closed; the degradation warning written once through
-the loop's injected logger while the finite idle bound continues; and a
-construction that rolls back lending nothing and waking nothing.
+the loop's injected logger while the finite idle bound continues; one
+degradation and one warning shared by sequential hosts borrowing one session;
+and a construction that rolls back lending nothing and waking nothing.
 
 The host's CPU examples run whole applications over the test seam in
 `glfw-tests`. The seam's native table scripts the poll and the finite

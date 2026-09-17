@@ -10,8 +10,8 @@
 -- 'MVar's, STM, and the runtime's own report of what a thread is blocked on.
 module Test.GLFW.Notify (spec) where
 
-import Control.Concurrent (forkIO, killThread, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -25,6 +25,8 @@ import Control.Concurrent.STM
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.List (sort)
+import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
 import Hetoimasia.Foundation.Log
   ( LogEntry (..)
   , LogLevel (Error)
@@ -52,6 +54,7 @@ import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvent
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
 import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
+import Numeric.Natural (Natural)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -67,6 +70,8 @@ spec = do
       (boundedExample testCancelledAfterCommit)
     it "keeps a waiting admission's command and wake for a cancellation after its commit"
       (boundedExample testWaitedAdmissionCancelledAfterCommit)
+    it "leaves every command a cancelled waiter admitted with its own wake, whichever side of the commit the cancellation lands"
+      (boundedExample testCancellationRacesCapacity)
 
   describe "GLFW demand publication and wake" $ do
     it "combines concurrent immediate and deadline demand, keeping the earliest deadline, and wakes once for each"
@@ -75,6 +80,8 @@ spec = do
       (boundedExample testCoalescedRepublication)
     it "captures a publication that committed first and leaves a later one pending with a newer revision"
       (boundedExample testCaptureRacesPublication)
+    it "captures a concurrently republishing worker's every revision in order, coalescing what falls between two captures"
+      (boundedExample testCaptureRacesPublicationConcurrently)
     it "publishes and wakes nothing for a request demanding nothing, or for a closed slot"
       (boundedExample testRefusedPublication)
     it "records and wakes for a publication cancelled after its commit, and records neither before it"
@@ -83,6 +90,8 @@ spec = do
   describe "GLFW wake degradation" $ do
     it "degrades once on an expected platform failure, keeping tickets and skipping later wakes across hosts sharing the session"
       (boundedExample testDegradationSharedBySession)
+    it "degrades once for two failures overlapping inside their posts, keeping the evidence of the one that degraded first"
+      (boundedExample testOverlappingFailuresDegradeOnce)
     it "reports the degradation once through the injected logger, and spends the attempt on a filtered entry"
       (boundedExample testDegradationReported)
     it "records a failing report without retrying it or undoing the degradation"
@@ -226,6 +235,71 @@ testWaitedAdmissionCancelledAfterCommit = do
     statistics ← atomically (commandStatistics windowCommands)
     commandsPending statistics `shouldBe` 0
 
+-- | A cancellation delivered while a waiter is blocked for capacity, racing the
+-- capacity that would admit it. Both outcomes are correct; what must hold either
+-- way is that an admission that committed left a wake behind, so the owner is
+-- never left with a command it was not told about.
+testCancellationRacesCapacity ∷ Expectation
+testCancellationRacesCapacity = do
+  seam ← newSeam defaultScript
+  withPortsOf seam 1 $ \_ hostCommands _ window → do
+    let port = windowCommandPort hostCommands
+        command = observeOf window
+
+        oneRound = do
+          -- One command fills the capacity, so the next waiter blocks.
+          _ ← submitWindowCommand port [] command >>= accepted
+          outcome ← newEmptyMVar
+          waiter ← forkIO (try (awaitSubmitWindowCommand port [] command) >>= putMVar outcome)
+          awaitBlockedOnSTM waiter
+          before ← countPosts seam
+          -- The cancellation and the capacity that would admit the waiter are
+          -- requested together, so neither order is scripted.
+          _ ← forkIO (throwTo waiter ThreadKilled)
+          _ ← seamExecuteNext seam hostCommands [window]
+          settled ← takeMVar outcome
+          after ← countPosts seam
+          -- Whether the admission committed is the host's bookkeeping, not the
+          -- waiter's answer: a cancellation delivered as the masked admission
+          -- returns keeps its command and its wake while the caller still sees
+          -- the cancellation.
+          statistics ← atomically (commandStatistics hostCommands)
+          let admitted = commandsPending statistics > 0
+          after `shouldBe` before + (if admitted then 1 else 0)
+          case settled of
+            Right (WaitAccepted _) → admitted `shouldBe` True
+            Right WaitClosed → unexpected "the port closed unexpectedly"
+            Left caught
+              | fromException caught == Just ThreadKilled → pure ()
+            Left caught → unexpected ("the waiter failed with " <> show caught)
+          -- Leave the port empty for the next round.
+          drainCommands seam hostCommands window
+          pure admitted
+
+    rounds ← mapM (const oneRound) [1 .. 20 ∷ Int]
+    -- Whatever the split between the two outcomes, every round held the
+    -- invariant, and nothing is left pending.
+    length rounds `shouldBe` 20
+    statistics ← atomically (commandStatistics hostCommands)
+    (commandsQueued statistics, commandsPending statistics) `shouldBe` (0, 0)
+
+-- | Execute whatever is queued, so the next round starts from an empty port.
+drainCommands ∷ Seam → WindowCommandHost → Window → IO ()
+drainCommands seam host window =
+  seamExecuteNext seam host [window] >>= \case
+    Executed _ _ → drainCommands seam host window
+    _ → pure ()
+
+-- | Wait until a thread is blocked in a transaction, so an example knows a wait
+-- has begun without guessing at a delay.
+awaitBlockedOnSTM ∷ ThreadId → IO ()
+awaitBlockedOnSTM target =
+  threadStatus target >>= \case
+    ThreadBlocked BlockedOnSTM → pure ()
+    ThreadFinished → unexpected "the thread finished instead of waiting"
+    ThreadDied → unexpected "the thread died instead of waiting"
+    _ → yield *> awaitBlockedOnSTM target
+
 -- ---------------------------------------------------------------------------
 -- Demand
 
@@ -233,20 +307,64 @@ testConcurrentPublishers ∷ Expectation
 testConcurrentPublishers = do
   seam ← newSeam defaultScript
   (results, captured, afterCapture) ← withSlot seam $ \_ slot publisher → do
+    -- Every publisher is started, waits at the gate, and publishes when it
+    -- opens, so the four publications race rather than follow one another.
     results ←
-      forM [deadlineDemand (instantAt 900), immediateDemand, deadlineDemand (instantAt 300), deadlineDemand (instantAt 1200)] $ \request →
-        onWorker (publishDemand publisher request)
+      concurrently
+        [ publishDemand publisher request
+        | request ←
+            [ deadlineDemand (instantAt 900)
+            , immediateDemand
+            , deadlineDemand (instantAt 300)
+            , deadlineDemand (instantAt 1200)
+            ]
+        ]
     captured ← atomically (captureDemand slot)
     afterCapture ← atomically (captureDemand slot)
     pure (results, captured, afterCapture)
-  results `shouldBe` map DemandPublished [1, 2, 3, 4]
-  -- Immediate demand from one publisher, the earliest deadline of the three,
-  -- and no later publication displacing it.
+  -- Each publication was accepted and given its own revision; which publisher
+  -- took which is the race's business.
+  sort (map acceptedRevision results) `shouldBe` [1, 2, 3, 4]
+  -- Immediate demand because one publisher asked for it, the earliest deadline
+  -- of the three, and no later publication displacing it.
   fmap capturedRevision captured `shouldBe` Just 4
   fmap (demandIsImmediate . capturedRequest) captured `shouldBe` Just True
   fmap (demandDeadline . capturedRequest) captured `shouldBe` Just (Just (instantAt 300))
   afterCapture `shouldBe` Nothing
   posts seam `shouldReturn` 4
+
+-- | A worker republishing continuously while the owner captures. Every
+-- publication is taken, in revision order, and whatever falls between two
+-- captures is coalesced into the request the second one takes: with deadlines
+-- that increase by revision, each capture carries the earliest deadline of the
+-- revisions it covers.
+testCaptureRacesPublicationConcurrently ∷ Expectation
+testCaptureRacesPublicationConcurrently = do
+  seam ← newSeam defaultScript
+  (published, captures, afterwards) ← withSlot seam $ \_ slot publisher → do
+    let rounds = 50 ∷ Integer
+    finished ← newEmptyMVar
+    _ ← forkIO $ do
+      outcomes ← mapM (\index → publishDemand publisher (deadlineDemand (instantAt index))) [1 .. rounds]
+      putMVar finished outcomes
+    let capture taken
+          | any ((== fromIntegral rounds) . capturedRevision) taken = pure (reverse taken)
+          | otherwise =
+              atomically (captureDemand slot) >>= \case
+                Just captured → capture (captured : taken)
+                Nothing → yield >> capture taken
+    captures ← capture []
+    published ← takeMVar finished
+    afterwards ← atomically (captureDemand slot)
+    pure (published, captures, afterwards)
+  map acceptedRevision published `shouldBe` [1 .. 50]
+  map capturedRevision captures `shouldSatisfy` increasing
+  map capturedRevision captures `shouldSatisfy` ((== Just 50) . lastOf)
+  -- Each capture covers the revisions after the previous capture's, so its
+  -- deadline is the earliest of those: the one published right after it.
+  zip (0 : map capturedRevision captures) captures
+    `shouldSatisfy` all (\(previous, captured) → demandDeadline (capturedRequest captured) == Just (instantAt (fromIntegral previous + 1)))
+  afterwards `shouldBe` Nothing
 
 testCoalescedRepublication ∷ Expectation
 testCoalescedRepublication = do
@@ -470,6 +588,52 @@ testStaleCapabilities = do
   atomically (captureDemand retainedSlot) `shouldReturn` Nothing
   posts seam `shouldReturn` postsAfterFirst
 
+-- | Two notifications failing inside their own posts at the same time. Only one
+-- degradation is recorded, with that call's evidence, and only one report is
+-- ever owed.
+testOverlappingFailuresDegradeOnce ∷ Expectation
+testOverlappingFailuresDegradeOnce = do
+  inside ← newTVarIO (0 ∷ Int)
+  released ← newTVarIO False
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            reportError reporter platformErrorCode "overlapping failure"
+            -- Both calls report, then wait inside their own post, so neither
+            -- has classified its evidence when the other reports.
+            atomically (modifyTVar' inside (+ 1))
+            atomically (readTVar released >>= check)
+        }
+  entries ← newIORef []
+  (submissions, path, first, second, afterwards) ← withPorts seam $ \session hostCommands _ window → do
+    let port = windowCommandPort hostCommands
+        command = observeOf window
+    outcomes ← mapM (const (forkResult (submitWindowCommand port [] command))) [1 .. 2 ∷ Int]
+    atomically (readTVar inside >>= check . (== 2))
+    atomically (writeTVar released True)
+    submissions ← mapM awaitResult outcomes
+    path ← readTVarIO (sessionWakePath session)
+    let notifier = commandHostNotifier hostCommands
+    first ← attemptDegradationReport (recording entries) notifier
+    second ← attemptDegradationReport (recording entries) notifier
+    -- A third admission over the degraded path enters nothing.
+    afterwards ← submitWindowCommand port [] command
+    pure (submissions, path, first, second, afterwards)
+  map accepting submissions `shouldBe` [True, True]
+  accepting afterwards `shouldBe` True
+  -- Both calls entered the library, and exactly one degradation was recorded,
+  -- keeping the evidence of one failing call rather than merging them.
+  posts seam `shouldReturn` 2
+  path `shouldSatisfy` \case
+    WakePathDegraded reports DegradationOwed →
+      map nativeErrorCode (reportedErrors reports) == [platformErrorCode]
+        && reportsLost reports == 0
+    _ → False
+  first `shouldBe` DegradationReportAttempted
+  second `shouldBe` NoDegradationDue
+  readIORef entries >>= \written → length written `shouldBe` 1
+
 -- ---------------------------------------------------------------------------
 -- Support
 
@@ -546,6 +710,52 @@ accepted other = unexpected ("the submission was not admitted: " <> show other)
 admittedWaited ∷ WaitedSubmission → IO CompletionTicket
 admittedWaited (WaitAccepted ticket) = pure ticket
 admittedWaited other = unexpected ("the waiting submission was not admitted: " <> show other)
+
+-- | Start every action on its own unbound thread, hold them at one gate, and
+-- release them together, so they run concurrently rather than in sequence.
+concurrently ∷ [IO a] → IO [a]
+concurrently actions = do
+  gate ← newTVarIO False
+  ready ← newTVarIO (0 ∷ Int)
+  waiting ← forM actions $ \action → do
+    outcome ← newEmptyMVar
+    _ ← forkIO $ do
+      atomically (modifyTVar' ready (+ 1))
+      atomically (readTVar gate >>= check)
+      try action >>= putMVar outcome
+    pure outcome
+  atomically (readTVar ready >>= check . (== length actions))
+  atomically (writeTVar gate True)
+  mapM awaitResult waiting
+
+-- | Run an action on a new, unbound thread and hand back its outcome.
+forkResult ∷ IO a → IO (MVar (Either SomeException a))
+forkResult action = do
+  outcome ← newEmptyMVar
+  _ ← forkIO (try action >>= putMVar outcome)
+  pure outcome
+
+awaitResult ∷ MVar (Either SomeException a) → IO a
+awaitResult outcome = takeMVar outcome >>= either (throwIO ∷ SomeException → IO a) pure
+
+-- | The revision an accepted publication was given.
+acceptedRevision ∷ PublishResult → Natural
+acceptedRevision = \case
+  DemandPublished revision → revision
+  other → error ("the publication was not accepted: " <> show other)
+
+-- | Whether a submission was accepted, without naming its ticket.
+accepting ∷ SubmitResult → Bool
+accepting = \case
+  SubmitAccepted _ → True
+  _ → False
+
+increasing ∷ Ord a ⇒ [a] → Bool
+increasing values = and (zipWith (<) values (drop 1 values))
+
+lastOf ∷ [a] → Maybe a
+lastOf [] = Nothing
+lastOf values = Just (last values)
 
 -- | Run an action on a new, unbound thread, which is never the owner, and wait
 -- for its outcome.
