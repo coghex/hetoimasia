@@ -103,6 +103,21 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - The current executable is console-only and safe to run. Future windowed
   launches must be explicit; default automated checks should use headless or
   offscreen modes once implemented. No debug server or port is defined yet.
+- `glfw-native-tests` shows, focuses, resizes, minimizes, maximizes, and takes
+  fullscreen windows on the desktop it runs on, and refuses to enter a session
+  without per-run consent. Before starting a native session on a person's
+  desktop, describe that disruption, ask the human user for explicit approval,
+  and wait for acceptance; then supply `HETOIMASIA_NATIVE_SESSION=desktop` on
+  that one command, as [docs/glfw.md](docs/glfw.md#the-native-suite) shows.
+  Approval covers only the agreed session: do not reprompt during it, and do
+  not carry it forward. An issue acceptance command, a PR approval, a
+  persistent shell setting, or a periodic testing request is not permission
+  for later desktop disruption, and the opt-in is an operational guard, never
+  proof that the conversation happened. Never set the variable in a profile
+  or in a script an agent runs on its own. On Linux,
+  `bash tools/display/x11.sh -- <command>` runs the suite on an isolated X11
+  display, supplies its own consent for that display alone, and needs no
+  approval. Dry runs and the approval-free selections need none either.
 - Keep build output, captures, profiling output, local configuration, secrets,
   and scratch data untracked. Retain requested evidence deliberately with its
   issue; an ignored capture alone is not a delivered artifact.

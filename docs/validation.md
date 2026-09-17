@@ -124,7 +124,10 @@ fixture and its small, stable session, thread, and window examples, described in
 [docs/glfw.md](glfw.md#the-native-suite). It requires the `display` runner class,
 so only the [display worker](#the-display-worker) may execute it, and like
 `test.workflow` it is outside the mandatory floor and runs only when affected or
-requested. Its inputs are the native suite's Cabal closure — the suite, the GLFW
+requested. The suite enters no session without per-run consent: in CI the
+display helper supplies it for the isolated display it starts, and on a
+person's desktop only the human's explicit approval does, as
+[the native suite](glfw.md#the-native-suite) describes. Its inputs are the native suite's Cabal closure — the suite, the GLFW
 package, and the foundation library — plus `tools/display/`, `tools/native/`,
 and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
@@ -519,15 +522,20 @@ queries the server with `xdpyinfo`; starts the `openbox` window manager and wait
 — for at most ten seconds — for it to announce itself on the root window; removes
 `WAYLAND_DISPLAY`, sets `XDG_SESSION_TYPE=x11`, and exports the new `DISPLAY`.
 It records the display, the server vendor, and the window manager in the job
-summary. The native suite then refuses any session that is not X11 on that
-display, so neither a dummy or null platform nor an XWayland session nor an
-accidental backend fallback can stand in for it.
+summary. Then, and only then, it runs the command with
+`HETOIMASIA_NATIVE_SESSION=isolated-x11:<display>`, the consent the native
+suite accepts for that isolated display alone: the runner, `cabal`, the suite,
+and its private-session children inherit it, and nothing else does. The native
+suite then refuses any session that is not X11 on that display, so neither a
+dummy or null platform nor an XWayland session nor an accidental backend
+fallback can stand in for it, and the consent names the display it must match.
 
 A missing server or window manager, a server that exits before reporting a
 display, one that does not answer, and a window manager that exits or never
 takes the display each end the helper with status `1` before the command
-starts. The group then writes no receipt and the job fails, and `build-test`
-reports both the worker's failure and the missing receipt. Nothing retries it,
+starts, so the consent reaches nothing and no real desktop is ever authorized
+by a failed isolation. The group then writes no receipt and the job fails, and
+`build-test` reports both the worker's failure and the missing receipt. Nothing retries it,
 skips it, or makes it optional, and another worker's success does not hide it.
 Receipts carry the runner OS this worker recorded, so a macOS run's receipt
 never satisfies the Linux candidate, or the other way around.
@@ -1254,17 +1262,27 @@ python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts rec
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the
-windowing session:
+windowing session. The group's catalog command is fixed, and the suite refuses
+to enter a session without consent, so the consent is supplied on the runner's
+own command and inherited by `cabal` and the suite. This is a run on the
+person's desktop: the examples show, focus, resize, minimize, maximize, and
+take fullscreen windows there, so an agent first describes that disruption,
+asks the human user for explicit approval, and waits for acceptance, exactly as
+[the native suite](glfw.md#the-native-suite) requires. Only then:
 
 ```bash
-python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
+HETOIMASIA_NATIVE_SESSION=desktop \
+  python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native"
 ```
 
-That receipt records `Darwin` as its runner OS, and remote CI never runs macOS,
-so it is local evidence only: it can never satisfy a Linux plan.
+Without the consent the group fails before initializing GLFW and writes no
+passing receipt. The approval covers this one run; it is never a profile
+setting or part of a script an agent runs on its own. That receipt records
+`Darwin` as its runner OS, and remote CI never runs macOS, so it is local
+evidence only: it can never satisfy a Linux plan.
 
 ## The review gate
 

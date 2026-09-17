@@ -7,6 +7,17 @@
 -- before the session is released, and after it has been; any check that fails
 -- fails its operation or its release, and 'Main' reports the whole record.
 --
+-- Nothing reaches the session without consent. Every example that uses the
+-- session or starts a child runs under 'consented', a hook that asks the run's
+-- 'Gate' before the example's body: a run whose environment carries no consent
+-- ("Test.GLFW.Native.Consent") has the example fail with
+-- 'NativeSessionRefused' before it forks, waits, or dispatches anything, so
+-- nothing is left waiting on an operation that never ran. Every operation
+-- 'owned' dispatches asks the gate again on the example's own thread, and the
+-- owner's acquisition asks once more before initializing GLFW, so no path
+-- around the hook enters a session either. The gate counts what it refused,
+-- and 'Main' reports the refusal once; the report shows no acquisition.
+--
 -- On Linux the session is only entered on an isolated X11 display: @DISPLAY@
 -- must name one and @WAYLAND_DISPLAY@ must be absent, and the session's backend
 -- must be X11. On macOS it must be Cocoa. Anything else is 'DisplayUnavailable'
@@ -18,6 +29,15 @@ module Test.GLFW.Native.Support
   , sharedSessionOwner
   , owned
   , acquisitions
+
+    -- * Consent
+  , Gate
+  , newGate
+  , gateConsent
+  , admit
+  , consented
+  , gated
+  , refusals
 
     -- * Native thread identity
   , ThreadEvidence
@@ -55,14 +75,56 @@ import Hetoimasia.GLFW.Session (Backend (..), Session, allocSession, defaultSess
 import Hetoimasia.GLFW.Window (Window, WindowObservation, windowObservations)
 import System.Environment (lookupEnv)
 import System.Info (os)
+import Test.GLFW.Native.Consent (Consent, NativeSessionRefused (..), Refusal)
 import Test.GLFW.Native.Fixture (Fixture, Owner (..), acquisitionCount, dispatch)
-import Test.Hspec (expectationFailure)
+import Test.Hspec (SpecWith, before_, expectationFailure)
 
--- | The fixture over the shared production session, and its thread evidence.
+-- | The fixture over the shared production session, its thread evidence, and
+-- the run's consent gate.
 data Shared = Shared
   { sharedFixture ∷ Fixture Session
   , sharedEvidence ∷ ThreadEvidence
+  , sharedGate ∷ Gate
   }
+
+-- | The run's consent, read once, and a count of what it has refused.
+--
+-- The count is written by whichever thread asked and read by 'Main' once the
+-- run has finished.
+data Gate = Gate
+  { gateConsent ∷ Either Refusal Consent
+  , gateRefusals ∷ IORef Int
+  }
+
+newGate ∷ Either Refusal Consent → IO Gate
+newGate consent = Gate consent <$> newIORef 0
+
+-- | The consent this run carries, or the refusal raised on the calling thread,
+-- counted.
+admit ∷ Gate → IO Consent
+admit gate = case gateConsent gate of
+  Right consent → pure consent
+  Left refusal → do
+    atomicModifyIORef' (gateRefusals gate) (\count → (count + 1, ()))
+    throwIO (NativeSessionRefused refusal)
+
+-- | Dispatch an operation to a fixture only once the gate admits the run. A
+-- refused operation is never dispatched, so the owner never attempts its
+-- acquisition.
+gated ∷ Gate → Fixture r → (r → IO a) → IO a
+gated gate fixture action = do
+  _ ← admit gate
+  dispatch fixture action
+
+-- | Run these examples only under consent: each is refused before its body,
+-- so a body that forks, waits, or dispatches never starts without it. A dry
+-- run and a listing run no hook and refuse nothing.
+consented ∷ Gate → SpecWith a → SpecWith a
+consented gate = before_ (() <$ admit gate)
+
+-- | How many examples, operations, or launches the gate has refused so far.
+refusals ∷ Gate → IO Int
+refusals = readIORef . gateRefusals
 
 -- | Where native thread identity was checked.
 data ThreadCheck
@@ -132,14 +194,16 @@ recordCheck evidence check = do
 
 -- | The production session as the fixture's owner.
 --
+-- The gate is asked before GLFW is initialized, so a refusal that somehow
+-- reached the owner fails the acquisition rather than entering a session.
 -- Releases run in reverse: the check before release, the session itself, then
 -- the check after it.
-sharedSessionOwner ∷ ThreadEvidence → Owner Session
-sharedSessionOwner evidence =
+sharedSessionOwner ∷ ThreadEvidence → Gate → Owner Session
+sharedSessionOwner evidence gate =
   Owner
     { ownerAcquire = do
         allocResource claimOwner (\() → recordCheck evidence AfterReleaseCheck)
-        allocResource requireDisplay pure
+        allocResource (admit gate >> requireDisplay) pure
         session ← allocSession defaultSessionConfig
         allocResource
           (recordCheck evidence SetupCheck >> requireBackend session)
@@ -150,11 +214,11 @@ sharedSessionOwner evidence =
   where
     claimOwner = myThreadId >>= atomicWriteIORef (evidenceOwner evidence) . Just
 
--- | Run an operation on the shared session's owner thread, checking native
--- thread identity there first.
+-- | Run an operation on the shared session's owner thread, once the run's gate
+-- admits it, checking native thread identity there first.
 owned ∷ Shared → (Session → IO a) → IO a
 owned shared action =
-  dispatch (sharedFixture shared) $ \session → do
+  gated (sharedGate shared) (sharedFixture shared) $ \session → do
     recordCheck (sharedEvidence shared) OperationCheck
     action session
 

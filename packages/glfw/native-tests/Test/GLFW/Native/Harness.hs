@@ -72,7 +72,7 @@ import Test.GLFW.Native.Fixture
   , queuedCount
   , runOwned
   )
-import Test.GLFW.Native.Support (Shared (..), acquisitions, failed, hostBackend, owned)
+import Test.GLFW.Native.Support (Shared (..), acquisitions, consented, failed, hostBackend, owned)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldReturn)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -382,7 +382,7 @@ spec shared = describe "the shared fixture" $ do
       failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
       fromException failure `shouldBe` Just AcquisitionFailed
 
-  describe "with the shared session" $ do
+  consented (sharedGate shared) . describe "with the shared session" $ do
     it "settles a deliberately failing example that used the session, and keeps serving" $ do
       nested ←
         runNested id . it "fails after a native operation" $

@@ -216,15 +216,20 @@ executable glfw-window-examples
 -- private child process of this same executable. It needs a windowing session —
 -- Cocoa locally, an isolated X11 display in the test.glfw-native validation
 -- group — so it is neither part of hetoimasia-tests nor of the CPU groups, and
--- `cabal build all` compiles it without running it.
+-- `cabal build all` compiles it without running it. It enters no session and
+-- starts no child without the per-run consent Test.GLFW.Native.Consent reads:
+-- the human's HETOIMASIA_NATIVE_SESSION=desktop on one approved command, or
+-- the value tools/display/x11.sh gives the command it isolates.
 test-suite glfw-native-tests
     import: language
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: native-tests
     other-modules:
+        Test.GLFW.Native.Consent
         Test.GLFW.Native.Control
         Test.GLFW.Native.Fixture
+        Test.GLFW.Native.Guard
         Test.GLFW.Native.Harness
         Test.GLFW.Native.Host
         Test.GLFW.Native.Input

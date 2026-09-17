@@ -49,7 +49,10 @@ Run `cabal update` if the local Hackage index does not cover the pinned
 `index-state` in `cabal.project`. Local packages build with warnings as errors.
 `cabal build all` compiles the GLFW native test suite under this project's
 configuration but runs no tests or native session. Engine tests initialize no
-GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux.
+GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux,
+and refuses to enter a session without the per-run consent
+[docs/glfw.md](docs/glfw.md#the-native-suite) describes — on a person's
+desktop, a human's explicit approval for that one run.
 
 Expected smoke output on stderr — three `INFO` records in the
 [logging record layout](docs/logging.md#record-layout), with the timestamp,

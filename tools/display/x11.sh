@@ -10,6 +10,15 @@
 # starts, so a requested native group is blocked rather than passed, retried,
 # or skipped.
 #
+# The native suite enters no session without consent. Once the display is up,
+# and only then, the command runs with HETOIMASIA_NATIVE_SESSION set to
+# isolated-x11:DISPLAY, the authorization the suite accepts for that isolated
+# display alone: the child chain (the validation runner, cabal, the suite, and
+# its private-session children) inherits it, nothing else does, and a run that
+# never establishes the display gives it to nothing. This never stands in for
+# the human's HETOIMASIA_NATIVE_SESSION=desktop on a real desktop, which no
+# script supplies.
+#
 #   tools/display/x11.sh [--summary FILE] -- COMMAND [ARGUMENT...]
 #
 # Exit status: the command's own once it ran; 1 when the display could not be
@@ -128,5 +137,8 @@ if [ -n "$summary" ]; then
   printf '## Isolated X11 display\n\n%s.\n\n' "$report" >>"$summary"
 fi
 
+# The isolated display exists and is served; the command, and only the
+# command, may enter a native session on it.
+export HETOIMASIA_NATIVE_SESSION="isolated-x11:$DISPLAY"
 "$@"
 exit "$?"
