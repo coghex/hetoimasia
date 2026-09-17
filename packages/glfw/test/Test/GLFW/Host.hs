@@ -37,9 +37,11 @@ import Hetoimasia.Foundation.Log
   , unsafeComponent
   )
 import Hetoimasia.Foundation.Resource (Scoped, allocResource)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Command
+import Hetoimasia.GLFW.Demand
 import qualified Hetoimasia.GLFW.Input as Input
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
@@ -55,6 +57,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , designateProcessMainThread
   , newSeam
   , noMonitors
+  , reportError
   , scriptedMonitor
   , seamCalls
   , seamLiveWindowCallbacks
@@ -144,6 +147,20 @@ spec = describe "GLFW window host" $ do
       (boundedExample testSupervisorDetectedFailure)
     it "drains an abandoned managed startup before quiescence, then settles queued callers and releases the window after the drain"
       (boundedExample testAbandonedStartup)
+
+  describe "wake and demand" $ do
+    it "ends an idle turn's finite wait when a worker's admitted command wakes the owner, and serves it in that turn's own command work"
+      (boundedExample testCommandWakesIdleWait)
+    it "ends an idle turn's finite wait when a worker publishes demand, which that turn's update captures with its revision"
+      (boundedExample testDemandWakesIdleWait)
+    it "closes a window's demand slot with its close protocol and every slot at quiescence, rejecting retained publishers afterwards"
+      (boundedExample testDemandSlotsClosed)
+    it "registers a window whose creation was claimed before quiescence with its port and demand slot already closed"
+      (boundedExample testCreationRacingQuiescence)
+    it "reports a degraded wake path once through the loop logger, and keeps waiting its finite idle bound"
+      (boundedExample testDegradationReportedByLoop)
+    it "lends no port or demand publisher, and wakes nothing, when host construction rolls back"
+      (boundedExample testRollbackLendsNothing)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -612,6 +629,224 @@ testOwnerLoopRecoversFeedAfterCommand = do
   messages `shouldBe` ["Input overflowed; the feed was reset"]
   phase `shouldBe` Input.InputRunning
   epoch `shouldBe` 2
+
+-- ---------------------------------------------------------------------------
+-- Wake and demand
+
+-- | The scripted platform's pending empty-event posts and whether the owner is
+-- inside a finite wait. A wait ends only when something posted, so a loop that
+-- continues proves it was woken rather than timed out.
+data WakePlatform = WakePlatform
+  { platformPending ∷ TVar Int
+  , platformWaiting ∷ TVar Bool
+  }
+
+newWakePlatform ∷ IO WakePlatform
+newWakePlatform = WakePlatform <$> newTVarIO 0 <*> newTVarIO False
+
+wakePlatformScript ∷ WakePlatform → SeamScript → SeamScript
+wakePlatformScript platform script =
+  script
+    { scriptPostEmptyEvent = \reporter → do
+        atomically (modifyTVar' (platformPending platform) (+ 1))
+        scriptPostEmptyEvent script reporter
+    , scriptPollEvents = \reporter → do
+        atomically (writeTVar (platformPending platform) 0)
+        scriptPollEvents script reporter
+    , scriptWaitEvents = \seconds reporter → do
+        atomically (writeTVar (platformWaiting platform) True)
+        atomically $ do
+          readTVar (platformPending platform) >>= check . (> 0)
+          writeTVar (platformPending platform) 0
+          writeTVar (platformWaiting platform) False
+        scriptWaitEvents script seconds reporter
+    }
+
+-- | Run an action once the owner has entered its finite wait.
+duringTheWait ∷ WakePlatform → IO () → IO ()
+duringTheWait platform action =
+  void . forkIO $ do
+    atomically (readTVar (platformWaiting platform) >>= check)
+    action
+
+-- | How many empty-event posts the seam recorded.
+posts ∷ Seam → IO Int
+posts seam = length . filter (== PostEmptyEvent) <$> seamCalls seam
+
+testCommandWakesIdleWait ∷ Expectation
+testCommandWakesIdleWait = do
+  platform ← newWakePlatform
+  seam ← newSeam (wakePlatformScript platform defaultScript)
+  turns ←
+    hosted seam (settings [windowNamed "woken"]) (\host _ → pure host) $ \host control → do
+      window ← onlyWindow host
+      summaries ← newIORef []
+      duringTheWait platform (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn → do
+              modifyIORef' summaries (<> [summary turn])
+              if turnNumber turn == 3 then Finish <$> readIORef summaries else pure Continue
+          }
+  -- The second turn's wait ended only because the admission woke the owner, so
+  -- that turn's own command work served the command instead of the wait running
+  -- to its bound.
+  turns `shouldBe` [(1, False, 0, 0), (2, True, 1, 0), (3, False, 0, 0)]
+  pumps seam `shouldReturn` [PollEvents, WaitEvents 0.25, PollEvents]
+  posts seam `shouldReturn` 1
+
+testDemandWakesIdleWait ∷ Expectation
+testDemandWakesIdleWait = do
+  platform ← newWakePlatform
+  seam ← newSeam (wakePlatformScript platform defaultScript)
+  (turns, captured, again) ←
+    hosted seam (settings []) (\host _ → pure host) $ \host control → do
+      summaries ← newIORef []
+      taken ← newIORef Nothing
+      duringTheWait platform (void (publishDemand (hostDemandPublisher host) immediateDemand))
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \turn → do
+              modifyIORef' summaries (<> [summary turn])
+              if turnWaited turn
+                then do
+                  writeIORef taken =<< captureHostDemand host
+                  again ← captureHostDemand host
+                  finished ← readIORef summaries
+                  captured ← readIORef taken
+                  pure (Finish (finished, captured, again))
+                else pure Continue
+          }
+  -- The wait ended on the publication's wake, and the update of that same turn
+  -- captured what had been published.
+  turns `shouldBe` [(1, False, 0, 0), (2, True, 0, 0)]
+  fmap capturedRevision captured `shouldBe` Just 1
+  fmap (demandIsImmediate . capturedRequest) captured `shouldBe` Just True
+  again `shouldBe` Nothing
+  posts seam `shouldReturn` 1
+
+testDemandSlotsClosed ∷ Expectation
+testDemandSlotsClosed = do
+  seam ← newSeam defaultScript
+  (published, afterClose, hostPublished, afterQuiescence, retained) ←
+    hosted seam (settings [windowNamed "slotted"]) (\host _ → pure host) $ \host _ → do
+      window ← onlyWindow host
+      client ← windowClient host window
+      let publisher = clientDemandPublisher client
+      published ← publishDemand publisher immediateDemand
+      closeHostWindow host (windowIdentity window) `shouldReturn` CloseStarted
+      afterClose ← publishDemand publisher immediateDemand
+      hostPublished ← publishDemand (hostDemandPublisher host) (deadlineDemand (scriptedInstant (durationOf 1000)))
+      atomically (quiesceWindowHost host)
+      afterQuiescence ← publishDemand (hostDemandPublisher host) immediateDemand
+      pure (published, afterClose, hostPublished, afterQuiescence, (publisher, hostDemandPublisher host))
+  published `shouldBe` DemandPublished 1
+  afterClose `shouldBe` DemandSlotClosed
+  hostPublished `shouldBe` DemandPublished 1
+  afterQuiescence `shouldBe` DemandSlotClosed
+  -- Retained after the whole application ended: still typed rejections, and no
+  -- native call.
+  before ← posts seam
+  publishDemand (fst retained) immediateDemand `shouldReturn` DemandSlotClosed
+  publishDemand (snd retained) immediateDemand `shouldReturn` DemandSlotClosed
+  posts seam `shouldReturn` before
+
+testCreationRacingQuiescence ∷ Expectation
+testCreationRacingQuiescence = do
+  claimed ← newEmptyMVar
+  release ← newEmptyMVar
+  firstCreation ← newIORef True
+  seam ←
+    newSeam
+      defaultScript
+        { scriptCreateWindow = \_ → do
+            first ← atomicModifyIORef' firstCreation (\flag → (False, flag))
+            when first (putMVar claimed () >> takeMVar release)
+            pure True
+        }
+  (disposition, submission, publication, identities) ←
+    hosted seam (settings []) (\host _ → pure host) $ \host control → do
+      ticket ←
+        submitWindowCommand (hostCommandPort host) [] (createWindowCommand (windowNamed "late")) >>= admitted
+      -- Quiescence commits while the creation is claimed and inside its native
+      -- call, so the window is registered after admission has already ended.
+      void . forkIO $ do
+        takeMVar claimed
+        atomically (quiesceWindowHost host)
+        putMVar release ()
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \_ → do
+              disposition ← atomically (pollCompletion ticket)
+              client ← atomically (pollWindowClient ticket)
+              case (disposition, client) of
+                (Just settled, Just capabilities) → do
+                  submission ← submitWindowCommand (clientCommandPort capabilities) [] (observeWindowCommand (clientWindow capabilities))
+                  publication ← publishDemand (clientDemandPublisher capabilities) immediateDemand
+                  identities ← atomically (hostWindowIdentities host)
+                  pure (Finish (settled, submission, publication, identities))
+                _ → pure Continue
+          }
+  disposition `shouldSatisfy` \case
+    Performed (WindowCreated _) → True
+    _ → False
+  -- The window exists and is disposed at shutdown, but nothing about it admits.
+  length identities `shouldBe` 1
+  submission `shouldBe` SubmitClosed
+  publication `shouldBe` DemandSlotClosed
+
+testDegradationReportedByLoop ∷ Expectation
+testDegradationReportedByLoop = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' warnings (<> [entry])))
+  hosted seam (settings [windowNamed "degraded"]) (\host _ → pure host) $ \host control → do
+    window ← onlyWindow host
+    -- The first admission's wake fails as an expected platform failure. The
+    -- answer, and the ticket, are the ordinary ones.
+    _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted
+    runOwnerLoop host control $
+      LoopHooks
+        { loopLogger = capturing
+        , loopEvent = noApplicationEvents
+        , loopUpdate = \turn → do
+            -- A later admission, after the degraded path has skipped its wake.
+            when (turnNumber turn == 4) (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
+            pure (if turnNumber turn == 4 then Finish () else Continue)
+        }
+  written ← readIORef warnings
+  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+  map entryLevel written `shouldBe` [Warning]
+  -- One post: the degraded path skips every later admission's wake, and the
+  -- loop keeps its finite idle bound.
+  posts seam `shouldReturn` 1
+  pumps seam `shouldReturn` [PollEvents, PollEvents, WaitEvents 0.25, WaitEvents 0.25]
+
+durationOf ∷ Integer → Duration
+durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
+  Right duration → duration
+  Left rejected → error ("the scripted duration was rejected: " <> show rejected)
+
+-- | A construction that rolls back hands no capability to anyone, so nothing
+-- can be admitted or published through a half-built host, and nothing wakes.
+testRollbackLendsNothing ∷ Expectation
+testRollbackLendsNothing = do
+  seam ← newSeam defaultScript
+  started ← newIORef False
+  (rejection, _) ←
+    caughtAs $
+      hosted seam (settings [windowNamed "built", windowNamed "bad\NUL"]) (\_ _ → writeIORef started True) (\_ _ → pure ())
+  rejection `shouldBe` WindowTitleRejected
+  readIORef started `shouldReturn` False
+  posts seam `shouldReturn` 0
 
 windowClient ∷ WindowHost → Window → IO WindowClient
 windowClient host window =

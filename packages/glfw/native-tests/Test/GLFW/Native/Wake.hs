@@ -1,5 +1,5 @@
--- | The session's wake capability against a real native wait in the shared
--- session.
+-- | The session's wake capability, and the admission that owes one, against a
+-- real native wait in the shared session.
 --
 -- Each example runs inside one dispatched operation, so the production finite
 -- wait runs on the process main thread that owns the session, through the same
@@ -23,9 +23,20 @@ import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (SomeException, displayException, finally, try)
 import Control.Monad (replicateM, when)
 import GHC.Clock (getMonotonicTime)
+import Hetoimasia.GLFW.Command
+  ( Disposition (NotExecuted)
+  , SubmitResult (..)
+  , closeWindowCommands
+  , createWindowCommand
+  , newWindowCommandHost
+  , pollCompletion
+  , submitWindowCommand
+  , windowCommandPort
+  )
 import Hetoimasia.GLFW.Internal.Native (blockedWaitForCheck, takeLastWaitForCheck)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Session (Session, SessionWake, WakeOutcome (..), sessionWake, wakeSession)
+import Hetoimasia.GLFW.Window (hiddenTestWindowConfig)
 import Numeric.Natural (Natural)
 import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Support (Shared, failed, owned)
@@ -59,6 +70,29 @@ spec shared = describe "session wake" $ do
     waitWoken next `shouldBe` True
     waitSpurious next `shouldSatisfy` (<= 1)
 
+  it "ends an entered wait through the production admission path, with a command a worker submitted" $ do
+    (evidence, disposition, settled) ← owned shared $ \session → do
+      settle session
+      -- The wake is the production admission's own, not a wake this example
+      -- posts: the worker only submits a command through the ordinary port.
+      host ← newWindowCommandHost session 4
+      let port = windowCommandPort host
+          command = createWindowCommand (hiddenTestWindowConfig "native admission wake" 64 48)
+      evidence ← wokenWaitBy forkIO session 0 (submitWindowCommand port [] command)
+      -- Nothing executed it, so no window was created in the shared session:
+      -- closure settles the command the wake announced.
+      settled ← atomically (closeWindowCommands host)
+      disposition ← case waitOutcomes evidence of
+        SubmitAccepted ticket → atomically (pollCompletion ticket)
+        other → failed ("the submission was not admitted: " <> show other)
+      pure (evidence, disposition, settled)
+    evidenceLine "admission wake" evidence
+    waitReturned evidence `shouldBe` Just (waitBlocked evidence)
+    waitWoken evidence `shouldBe` True
+    waitSpurious evidence `shouldBe` 0
+    settled `shouldBe` 1
+    disposition `shouldBe` Just NotExecuted
+
   it "returns at most one wait early for spurious wakes posted while no wait was in progress" $ do
     (spurious, evidence) ← owned shared $ \session → do
       let wake = sessionWake session
@@ -71,11 +105,11 @@ spec shared = describe "session wake" $ do
     waitWoken evidence `shouldBe` True
     waitSpurious evidence `shouldSatisfy` (<= 1)
 
--- | What one woken wait showed.
-data WaitEvidence = WaitEvidence
+-- | What one woken wait showed, with whatever the worker's own action answered.
+data WaitEvidence a = WaitEvidence
   { waitBlocked ∷ Natural
     -- ^ The sequence number of the wait the worker observed blocked, and woke.
-  , waitOutcomes ∷ [WakeOutcome]
+  , waitOutcomes ∷ a
   , waitReturned ∷ Maybe Natural
     -- ^ The sequence number of the wait that returned woken, if one did.
   , waitWoken ∷ Bool
@@ -88,8 +122,14 @@ data WaitEvidence = WaitEvidence
 -- | Wait on the owner thread until a worker started by @fork@, having observed a
 -- wait later than @after@ blocked inside GLFW, wakes it @wakes@ times. Waits
 -- that return unwoken first are counted as spurious, up to 'spuriousLimit'.
-wokenWait ∷ (IO () → IO ThreadId) → Session → SessionWake → Int → Natural → IO WaitEvidence
-wokenWait fork session wake wakes after = do
+wokenWait ∷ (IO () → IO ThreadId) → Session → SessionWake → Int → Natural → IO (WaitEvidence [WakeOutcome])
+wokenWait fork session wake wakes after = wokenWaitBy fork session after (replicateM wakes (wakeSession wake))
+
+-- | 'wokenWait' over any action the worker runs once it has observed a wait
+-- later than @after@ blocked inside GLFW — a wake, or an admission that owes
+-- one.
+wokenWaitBy ∷ (IO () → IO ThreadId) → Session → Natural → IO a → IO (WaitEvidence a)
+wokenWaitBy fork session after act = do
   ownerDone ← newTVarIO False
   worker ← newEmptyMVar
   _ ← fork (try (observeAndWake ownerDone) >>= putMVar worker)
@@ -125,7 +165,7 @@ wokenWait fork session wake wakes after = do
         else
           blockedWaitForCheck >>= \case
             Just blocked | blocked > after → do
-              outcomes ← replicateM wakes (wakeSession wake)
+              outcomes ← act
               pure (Just (blocked, outcomes))
             _ → yield >> observeAndWake ownerDone
 
@@ -147,16 +187,14 @@ waitBound = 60
 spuriousLimit ∷ Int
 spuriousLimit = 3
 
-evidenceLine ∷ String → WaitEvidence → IO ()
+evidenceLine ∷ Show a ⇒ String → WaitEvidence a → IO ()
 evidenceLine label evidence = do
   putStrLn
     ( "glfw-native-tests wake evidence: "
         <> label
         <> ": wait "
         <> show (waitBlocked evidence)
-        <> " observed blocked before "
-        <> show (length (waitOutcomes evidence))
-        <> " wake(s) "
+        <> " observed blocked before the worker's "
         <> show (waitOutcomes evidence)
         <> "; wait "
         <> maybe "none" show (waitReturned evidence)

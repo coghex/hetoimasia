@@ -31,6 +31,19 @@
 -- submission that was not admitted; they identify a request, and they do not
 -- order requests.
 --
+-- An admission that committed wakes the session's owner, through
+-- "Hetoimasia.GLFW.Internal.Notify"'s policy, so a command submitted while the
+-- owner sits in a native wait ends that wait. The command is recorded first and
+-- the hint posted after. A full or closed answer wakes nothing. The obligation
+-- is held from the commit onward — the commit and the wake run under a mask,
+-- and the wake itself uninterruptibly — so nothing delivered to the submitting
+-- thread can drop it; only the waiting operation's own wait for capacity stays
+-- interruptible, which is what makes it cancellable. The answer and the ticket
+-- never depend on the wake's outcome: an expected platform failure degrades the
+-- session's wake path and leaves both untouched, and a programming or lifetime
+-- violation propagates to the submitter with the command still admitted and
+-- still settling exactly once.
+--
 -- = Dispositions
 --
 -- Every admitted command settles exactly once, to one 'Disposition':
@@ -178,6 +191,9 @@
 -- | Port scope           | The host    | Fixed at creation; the      | Any                    | The host              | Immutable                  |
 -- |                      |             | executor reads it           |                        |                       |                            |
 -- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
+-- | Notifier             | The session | Every admission notifies    | Any                    | The session           | The degradation is the     |
+-- |                      |             | through it                  |                        |                       | session's; never reset     |
+-- +----------------------+-------------+-----------------------------+------------------------+-----------------------+----------------------------+
 --
 -- None of this is application state, and none of it holds a native handle.
 module Hetoimasia.GLFW.Internal.Command
@@ -248,6 +264,7 @@ module Hetoimasia.GLFW.Internal.Command
   , clientObservations
   , clientInputReader
   , clientInputControl
+  , clientDemandPublisher
   , pollWindowClient
 
     -- * Misuse
@@ -258,6 +275,9 @@ module Hetoimasia.GLFW.Internal.Command
   , AdmissionHooks (..)
   , noAdmissionHooks
   , submitWith
+  , awaitSubmitWith
+  , commandsAdmissionClosed
+  , commandHostNotifier
   , ExecutionStep (..)
   , Execution (..)
   , executeNextWith
@@ -276,13 +296,16 @@ module Hetoimasia.GLFW.Internal.Command
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.DeepSeq (NFData (rnf))
+import Control.Monad (void)
 import Control.Exception
   ( Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , mask
+  , mask_
   , rethrowIO
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (find)
@@ -326,6 +349,8 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue
 import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader)
 import Hetoimasia.GLFW.Internal.Attribute (Extent (..), Placement (..))
 import Hetoimasia.GLFW.Internal.Capture (Reports, rnfReports)
+import Hetoimasia.GLFW.Internal.Demand (DemandPublisher)
+import Hetoimasia.GLFW.Internal.Notify (Notifier, notifyOwner, sessionNotifier)
 import Hetoimasia.GLFW.Internal.Input (InputControl, InputReader)
 import Hetoimasia.GLFW.Internal.Control
   ( ControlOutcome
@@ -739,6 +764,7 @@ data WindowClient = WindowClient
   , clientReader ∷ !(SnapshotReader WindowObservation)
   , clientInput ∷ !InputReader
   , clientAdmission ∷ !InputControl
+  , clientDemand ∷ !DemandPublisher
   }
 
 instance Show WindowClient where
@@ -769,10 +795,22 @@ clientInputReader = clientInput
 clientInputControl ∷ WindowClient → InputControl
 clientInputControl = clientAdmission
 
+-- | The window's demand publisher: the capability a worker uses to ask the
+-- owner for a turn for this window. It is rejected once the window's slot has
+-- closed, and it can never resurrect the window.
+clientDemandPublisher ∷ WindowClient → DemandPublisher
+clientDemandPublisher = clientDemand
+
 -- | Build the capabilities for a window from its own command host and input
 -- feed.
 newWindowClient
-  ∷ WindowId → WindowCommandHost → SnapshotReader WindowObservation → InputReader → InputControl → WindowClient
+  ∷ WindowId
+  → WindowCommandHost
+  → SnapshotReader WindowObservation
+  → InputReader
+  → InputControl
+  → DemandPublisher
+  → WindowClient
 newWindowClient identity host = WindowClient identity (hostPort host)
 
 -- | Which commands a host's executor serves.
@@ -804,6 +842,8 @@ data WindowCommandPort = WindowCommandPort
   , portPending ∷ !(TVar (Map Natural Cell))
   , portClosed ∷ !(TVar Bool)
   , portNext ∷ !(IORef Natural)
+  , portNotifier ∷ !Notifier
+    -- ^ How an admission that committed reaches the owner.
   }
 
 -- | A persistent, non-consuming view of one admitted command's completion. Its
@@ -845,7 +885,15 @@ newScopedHost session capacity scope =
     next ← newIORef 1
     active ← newTVarIO 0
     notExecuted ← prepare NotExecuted
-    let port = WindowCommandPort identity (sessionOwner session) (channelSender control) pending closed next
+    let port =
+          WindowCommandPort
+            identity
+            (sessionOwner session)
+            (channelSender control)
+            pending
+            closed
+            next
+            (sessionNotifier session)
     pure (WindowCommandHost session control port active notExecuted scope)
 
 -- | The rejection a command outside the host's scope settles with, if it is.
@@ -864,6 +912,16 @@ windowCommandPort = hostPort
 -- | The session a host serves, for the private executor.
 commandHostSession ∷ WindowCommandHost → Session
 commandHostSession = hostSession
+
+-- | The notifier the host's admissions reach the owner through, for the host
+-- that lends demand publishers over the same session.
+commandHostNotifier ∷ WindowCommandHost → Notifier
+commandHostNotifier = portNotifier . hostPort
+
+-- | Whether the host's admission has ended, read in the calling transaction.
+-- Never retries.
+commandsAdmissionClosed ∷ WindowCommandHost → STM Bool
+commandsAdmissionClosed = readTVar . portClosed . hostPort
 
 -- | One coherent observation of a host's bookkeeping.
 data CommandStatistics = CommandStatistics
@@ -958,18 +1016,21 @@ submitWith ∷ HasCallStack ⇒ AdmissionHooks → WindowCommandPort → [(Text,
 submitWith hooks port context command = do
   (origin, prepared) ← prepareSubmission port callStack context command
   beforeAdmission hooks
-  submitted ← atomically $
-    send (portSender port) prepared >>= \case
-      Accepted → do
-        ticket ← reserve port origin
-        duringAdmission hooks
-        pure (SubmitAccepted ticket)
-      Full → pure SubmitFull
-      Closed → pure SubmitClosed
-  case submitted of
-    SubmitAccepted _ → afterAdmission hooks
-    _ → pure ()
-  pure submitted
+  -- The admission never retries, so under this mask nothing can be delivered
+  -- between its commit and the notification it owes.
+  mask_ $ do
+    submitted ← atomically $
+      send (portSender port) prepared >>= \case
+        Accepted → do
+          ticket ← reserve port origin
+          duringAdmission hooks
+          pure (SubmitAccepted ticket)
+        Full → pure SubmitFull
+        Closed → pure SubmitClosed
+    case submitted of
+      SubmitAccepted _ → notifyAdmission hooks port
+      _ → pure ()
+    pure submitted
 
 -- | Submit a command, waiting for capacity while admission is open.
 --
@@ -977,21 +1038,53 @@ submitWith hooks port context command = do
 -- commits admits nothing. On the owner thread a full host fails with
 -- 'OwnerThreadWouldWait' instead of waiting.
 awaitSubmitWindowCommand ∷ HasCallStack ⇒ WindowCommandPort → [(Text, Text)] → WindowCommand → IO WaitedSubmission
-awaitSubmitWindowCommand port context command = do
+awaitSubmitWindowCommand = awaitSubmitWith noAdmissionHooks
+
+-- | 'awaitSubmitWindowCommand', interrupted where the hooks say.
+awaitSubmitWith ∷ HasCallStack ⇒ AdmissionHooks → WindowCommandPort → [(Text, Text)] → WindowCommand → IO WaitedSubmission
+awaitSubmitWith hooks port context command = do
   (origin, prepared) ← prepareSubmission port callStack context command
+  beforeAdmission hooks
   caller ← myThreadId
   if caller == portOwner port
-    then do
+    then mask_ $ do
       submitted ← atomically $
         send (portSender port) prepared >>= \case
-          Accepted → Just . WaitAccepted <$> reserve port origin
+          Accepted → do
+            ticket ← reserve port origin
+            duringAdmission hooks
+            pure (Just (WaitAccepted ticket))
           Full → pure Nothing
           Closed → pure (Just WaitClosed)
+      case submitted of
+        Just (WaitAccepted _) → notifyAdmission hooks port
+        _ → pure ()
       maybe (throwFailure glfwComponent submitOperation (originIdentifiers origin) OwnerThreadWouldWait) pure submitted
-    else atomically $
-      awaitSend (portSender port) prepared >>= \case
-        Admitted → WaitAccepted <$> reserve port origin
-        AdmissionClosed → pure WaitClosed
+    else mask $ \restore → do
+      -- The wait for capacity is the one interruptible part: a cancellation
+      -- there admits nothing. The admission commits inside it, so only the
+      -- instant between that commit and this mask is unprotected, and a
+      -- notification lost there costs the command nothing but the owner's
+      -- finite idle wait.
+      submitted ← restore $ atomically $
+        awaitSend (portSender port) prepared >>= \case
+          Admitted → do
+            ticket ← reserve port origin
+            duringAdmission hooks
+            pure (WaitAccepted ticket)
+          AdmissionClosed → pure WaitClosed
+      case submitted of
+        WaitAccepted _ → notifyAdmission hooks port
+        WaitClosed → pure ()
+      pure submitted
+
+-- | Discharge an admission's notification obligation, uninterruptibly, so
+-- nothing delivered to the submitting thread can drop it. The wake's outcome
+-- never changes the submission's answer; a programming or lifetime violation it
+-- raises propagates with the command still admitted.
+notifyAdmission ∷ AdmissionHooks → WindowCommandPort → IO ()
+notifyAdmission hooks port =
+  uninterruptibleMask_ (afterAdmission hooks >> void (notifyOwner (portNotifier port)))
 
 -- | Issue a request identity and prepare the origin and the message.
 prepareSubmission

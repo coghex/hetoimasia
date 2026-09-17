@@ -56,14 +56,14 @@ There is no default close policy or rendering operation.
 
 | Component | Visibility | Holds |
 |---|---|---|
-| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, and `Hetoimasia.GLFW.Input`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. Binds nothing. |
+| `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, `Hetoimasia.GLFW.Demand`, and `Hetoimasia.GLFW.Input`, the supported interface |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the notification policy over the session's wake capability and the bounded demand slots, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session and session wake examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the window attachment model examples, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the window attachment model examples, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -111,6 +111,25 @@ data SessionWake                            -- opaque; no native handle, no sess
 sessionWake ∷ Session → SessionWake
 wakeSession ∷ SessionWake → IO WakeOutcome  -- any thread
 data WakeOutcome = WakePosted | WakeTerminal | WakeFailed Reports
+```
+
+```haskell
+-- Hetoimasia.GLFW.Demand
+data DemandRequest                           -- Eq, Show, Semigroup, Monoid; built and read with:
+noDemand          ∷ DemandRequest
+immediateDemand   ∷ DemandRequest
+deadlineDemand    ∷ Instant → DemandRequest
+demandIsImmediate ∷ DemandRequest → Bool
+demandDeadline    ∷ DemandRequest → Maybe Instant
+demandRequested   ∷ DemandRequest → Bool
+
+data DemandPublisher                         -- opaque; publication only
+publishDemand ∷ DemandPublisher → DemandRequest → IO PublishResult   -- any thread
+data PublishResult = DemandPublished Natural | NoDemandPublished | DemandSlotClosed
+
+data CapturedDemand = CapturedDemand { capturedRevision ∷ Natural, capturedRequest ∷ DemandRequest }
+data DemandStatus   = DemandStatus { statusOpen ∷ Bool, statusRevision ∷ Natural
+                                   , statusPending ∷ Maybe DemandRequest }
 ```
 
 ```haskell
@@ -296,6 +315,7 @@ clientCommandPort  ∷ WindowClient → WindowCommandPort
 clientObservations ∷ WindowClient → SnapshotReader WindowObservation
 clientInputReader  ∷ WindowClient → InputReader
 clientInputControl ∷ WindowClient → InputControl
+clientDemandPublisher ∷ WindowClient → DemandPublisher
 pollWindowClient   ∷ CompletionTicket → STM (Maybe WindowClient)
 ```
 
@@ -435,6 +455,11 @@ hostCommandPort       ∷ WindowHost → WindowCommandPort
 hostCommandStatistics ∷ WindowHost → STM CommandStatistics
 hostActivity          ∷ WindowHost → STM HostActivity
 quiesceWindowHost     ∷ WindowHost → STM ()
+hostDemandPublisher   ∷ WindowHost → DemandPublisher
+captureHostDemand     ∷ WindowHost → IO (Maybe CapturedDemand)          -- owner thread
+captureWindowDemand   ∷ WindowHost → WindowId → IO (Maybe CapturedDemand)  -- owner thread
+hostDemandStatus      ∷ WindowHost → STM DemandStatus
+windowDemandStatus    ∷ WindowHost → WindowId → STM (Maybe DemandStatus)
 data HostActivity = HostActivity { activityTurn ∷ Natural, activityWaiting ∷ Bool }
 hostWindowCapabilities ∷ WindowHost → WindowCapabilities
 
@@ -478,7 +503,7 @@ runWindowApplication
 `Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
 `WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
 `CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, `WindowClient`, `InputReader`,
-`InputControl`, `InputEvent`, `InputEpoch`, and `ResetToken` are exported
+`InputControl`, `InputEvent`, `InputEpoch`, `DemandRequest`, `DemandPublisher`, and `ResetToken` are exported
 without their constructors, and their readers are functions rather than record
 fields, so no client can build or rewrite one. No public
 type holds a native window or monitor pointer, and no snapshot publisher is
@@ -502,7 +527,9 @@ the origin back without a logger. The host's own failures are raised under the
 `glfw.runtime` component: a configuration rejection under
 `construct window host`, and an owner-thread refusal under `run owner loop`,
 `reject close request`, `borrow host window`, `close host window`,
-`honour close request`, or `read host bookkeeping`.
+`honour close request`, `capture demand`, or `read host bookkeeping`. The one
+diagnostic the host's own boundary writes, besides the input overflow warning,
+is the wake path's degradation warning, under `glfw.wake`.
 
 ## Entry
 
@@ -588,10 +615,10 @@ package's typed-failure semantics rather than becoming a failure a caller might
 recover from by degrading. A native table that raises is a programming failure
 too. Its exception propagates unchanged. Either way, the call's accounting has
 settled first. No outcome retries the wake,
-reclassifies other work, or chooses a degradation policy. Warning once and
-falling back to bounded polling after an expected failure is the window host's
-concern, deferred to TIME-4 of the [runtime scheduling
-design](runtime_scheduling_design.md).
+reclassifies other work, or chooses a degradation policy. That policy is the
+notifier's, described under [the degradation
+policy](#the-degradation-policy): what command admission and demand publication
+do with an expected failure, and the one warning it owes.
 
 ### Wake lifetime
 
@@ -656,6 +683,35 @@ state before the post and reads it after. If the post left an error and the call
 has no evidence at all, the wake adds a callback fault. Lost or faulted evidence
 therefore never becomes `WakePosted`, and, being unclassifiable, is raised rather
 than answered as `WakeFailed` (see [Waking the owner](#waking-the-owner)).
+
+### The degradation policy
+
+Command admission and demand publication reach the owner through one notifier
+per session, which pairs the session's wake capability with the session's own
+wake-path state. Every host over that session shares it, including hosts that
+borrow the session in turn; a later session has a capability and a state of its
+own and starts healthy.
+
+The first `WakeFailed` — an expected platform failure, with the evidence
+attributed to that call alone — degrades that session's wake path and retains
+that evidence. Every later admission and publication in the session then skips
+the native call, and the owner's finite idle wait is the bounded polling that
+keeps work moving. Nothing is retried, no ticket or slot changes, and no
+admitted work is reclassified as rejected. A concurrent second failure changes
+nothing and keeps the first call's evidence. A programming or lifetime violation
+is not degraded around: `wakeSession` raises it, it propagates to whichever
+thread was notifying, and the work that thread had already committed stays
+committed and still settles.
+
+Degradation owes exactly one guarded diagnostic attempt. The owner loop claims
+it at a safe boundary — outside transactions, callbacks, releases, and the
+[wake lifetime](#wake-lifetime)'s native exclusion — and writes one structured
+warning through the `Logger` the application injects on `LoopHooks`, under the
+`glfw.wake` component, with the retained evidence's counts and first report. The
+claim is spent whatever happens: an entry the logger filters out, a sink
+failure, and a cancellation each end the attempt and are recorded, and none is
+retried. A sink failure and a cancellation propagate as themselves, as every
+logging attempt does, and neither undoes the degradation.
 
 ## Teardown, poisoning, and controlled blocking
 
@@ -1173,6 +1229,32 @@ cancellation after it commits withdraws nothing: the command stays queued and
 settles even if its caller never received the ticket. Request identities are
 never reissued, even for a submission that was not admitted. They identify
 requests and do not order them; order is the order admissions committed.
+
+**The wake an admission owes.** Once the transaction has committed — through
+either operation, on the host's port or a window's own — the admission wakes the
+session's owner, so a command submitted while the owner sits in its idle native
+wait ends that wait instead of waiting for it to run out. The command is
+recorded first and the hint posted after, never the reverse. `SubmitFull`,
+`SubmitClosed`, `WaitClosed`, and a rolled-back admission wake nothing, because
+they admitted nothing.
+
+The obligation is held from the commit onward: the commit and the wake run under
+a mask, and the wake itself runs uninterruptibly, so no asynchronous exception
+delivered to the submitting thread can drop it. A cancellation before the commit
+admits nothing and wakes nothing. One requested after it takes effect only once
+the wake has been posted, and the command, whose caller may never have received
+its ticket, still executes and still settles exactly once. Only the waiting
+operation's own wait for capacity stays interruptible, which is what makes it
+cancellable; a cancellation delivered in the instant between that wait's commit
+and the mask costs the command nothing but the owner's finite idle wait, which
+serves it anyway.
+
+The submission's answer and its ticket never depend on the wake's outcome. A
+wake that fails as an expected platform failure degrades the session's wake path
+under [the degradation policy](#the-degradation-policy) and leaves the ticket
+untouched; one that raises a programming or lifetime violation propagates to the
+submitter with the command still admitted. Neither turns an accepted command
+into a rejection, and neither resubmits it.
 
 ### Dispositions
 
@@ -2151,13 +2233,72 @@ application event, and no command is queued at its entry. Active turns poll.
 Idle turns wait at most `hostIdleWait` seconds, so a checkpoint follows even when
 no native input arrives. No wait is indefinite, a host with no windows waits on
 each idle turn instead of spinning, and the bound is a latency rather than a
-shutdown deadline. There is no wake-on-post: a command
-submitted during a wait waits for the wait to end, and the same turn's command
-work then serves it. Native waits are safe foreign calls, so background workers
+shutdown deadline.
+
+A wait ends early when something wakes the owner: an
+[admission](#admission) that committed, or a
+[demand publication](#demand-slots). The turn that waited then goes on to its own
+command work and its update opportunity, so a command admitted during the wait
+is served by that same turn, subject to the budget and
+[fair dispatch](#fair-dispatch), and a request published during it is there for
+that turn's capture. A wake that arrives before the wait is entered ends the
+wait it precedes, because the post outlives the call that made it; one that
+arrives while the owner is consuming an earlier wake is seen by the next wait.
+Wakes may be coalesced and may be spurious, and neither repeats a command's
+execution or a capture: the queue and the slots are authoritative, and the wake
+is only the hint that they changed. `hostIdleWait` remains the fallback bound
+whatever happens to the wake — including after
+[the wake path has degraded](#the-degradation-policy), when nothing is posted at
+all and the bound alone keeps work moving.
+
+Native waits are safe foreign calls, so background workers
 run while the owner is inside one. `hostActivity` publishes the current turn and
 whether its owner has begun its finite wait; the flag is set immediately before
 the native call and cleared once it returns, so it signals a wait starting or in
 progress rather than proving the call was entered.
+
+### Demand slots
+
+A worker that wants a turn — now, or by a deadline — says so through a
+`DemandPublisher`: the application's, from `hostDemandPublisher`, or one
+window's, from `clientDemandPublisher` on its `WindowClient`. `publishDemand`
+combines the request into the slot, advances the slot's revision, and only then
+wakes the owner, so the state that matters is authoritative before the hint that
+announces it. The owner takes it with `captureHostDemand` or
+`captureWindowDemand`, on its own thread.
+
+There is one slot for the application and one per live window, created with the
+window and closed in its closing transaction. There is never a slot per worker,
+per request, or per deadline, so the notification state is bounded by the live
+windows however many publishers there are and however often they publish.
+
+- **Requests combine, they do not replace.** A `DemandRequest` states immediate
+  demand, an absolute `Instant` deadline, or both, and requests combine as a
+  monoid: immediate if any publisher asked for it, and the earliest deadline any
+  of them requested. A later request can never postpone an earlier pending
+  deadline, and one publisher's `noDemand` can never cancel another's request —
+  it changes nothing and answers `NoDemandPublished`.
+- **Capture is the acknowledgement.** `captureDemand` takes the pending request
+  with its revision and clears exactly what it took, in one transaction. A
+  publication that commits after that capture carries a newer revision and stays
+  pending for the next one, so no acknowledgement of an older revision can erase
+  a newer request and a continuously republishing worker cannot monopolize a
+  turn: its republications coalesce into the one request the next capture takes.
+- **Slots hold requests, not schedules.** An ongoing periodic schedule is the
+  owner's own state, so a captured request never becomes permanent work. What
+  the owner does with a captured request — including how it folds into the next
+  wait — is the scheduled loop's, and is not part of this slice.
+- **The same protection as an admission.** A cancellation before the publishing
+  transaction commits publishes nothing. After it commits the request stays
+  pending and its wake is owed uninterruptibly, even if the publisher never
+  learns its own answer.
+- **Closure is terminal.** A closed slot answers `DemandSlotClosed`, records
+  nothing, and makes no native call, so a publisher retained after its window
+  ended or its host quiesced is safe and can resurrect neither.
+
+Deadlines are opaque `Instant` values in the publisher's own clock domain: this
+package compares and stores them, reads no clock, and infers nothing about what
+a deadline means.
 
 ### Close requests in the owner loop
 
@@ -2181,11 +2322,21 @@ honours, a close request.
 [`runScopedApplicationWithQuiescence`](resources.md#quiescence), and
 `runWindowApplication` is that runner with the action installed. In one finite,
 non-retrying transaction it closes the admission of the host's port and of every
-window's port, settles every command queued in any of them as `NotExecuted`, and
+window's port, settles every command queued in any of them as `NotExecuted`,
 closes every window's input feed, ending its reads even while a reset waits for
-an acknowledgement. It destroys nothing, pumps nothing, waits on nothing, and
-repeating it changes nothing. A window's close protocol closes that window's
-feed in its closing transaction the same way. On every exit from the supervised region, the ordinary order is:
+an acknowledgement, and closes the application's demand slot and every window's.
+It destroys nothing, pumps nothing, waits on nothing, and repeating it changes
+nothing. A window's close protocol closes that window's feed and its demand slot
+in its closing transaction the same way.
+
+Quiescence does not disable wake support: the session's capability stays usable
+for the progress that still has to happen, and internal retirement keeps its own.
+What closes is admission and publication, so a retained port or publisher
+answers a typed rejection and makes no native call. A window whose creation was
+claimed before quiescence and finishes after it is registered already closed —
+its port, its feed, and its demand slot admit nothing, and the `WindowClient` its
+ticket hands over revives none of them — while the window itself is still
+disposed by the final exit. On every exit from the supervised region, the ordinary order is:
 
 1. quiescence: every port's admission closes, queued callers settle as not
    executed, and every input feed closes;
@@ -2226,10 +2377,41 @@ awaitOrStop token ticket =
       `orElse` (Nothing <$ awaitStopRequest token)
 ```
 
+A worker never waits to publish demand: `publishDemand` records and answers
+without blocking, whether the slot is open or closed.
+
 These are obligations on application and worker code; the runtime's guarantee
 is not broadened.
 
 ### CPU examples
+
+The admission-wake, demand, and degradation examples (`--match "wake"`) drive
+the production admission, publication, and notification code over the seam,
+whose scripted platform counts an empty-event post as pending for the next
+finite wait. Without sleeps they prove: a wake after each admission before,
+during, and after the owner's wait, through both admission operations and both
+port kinds; full and closed admission waking nothing; cancellation before a
+commit admitting and waking nothing, and after one keeping the command, its
+wake, and its single settlement, for both the immediate and the waiting
+operation; concurrent publishers combining immediate demand and the earliest
+deadline; twenty republications coalescing into one captured request; a capture
+racing a publication in both orders; a request demanding nothing and a closed
+slot recording nothing; publication cancelled before and after its commit; an
+expected platform failure degrading the session's path once, keeping every
+ticket, and being skipped by a second host over the same session; the one
+report written, filtered, and failed, each spending the attempt without
+retrying or undoing the degradation; a lifetime violation staying a typed
+failure with the command still admitted; and a retained port and publisher
+answering a later session without a native call.
+
+The host's own examples add, over whole applications: an idle turn's wait ended
+by a worker's admitted command and served by that same turn; a wait ended by a
+publication the same turn's update captures; a window's demand slot closed by its
+close protocol and every slot by quiescence, with retained publishers rejected
+afterwards; a creation claimed before quiescence registering a window whose port
+and demand slot are already closed; the degradation warning written once through
+the loop's injected logger while the finite idle bound continues; and a
+construction that rolls back lending nothing and waking nothing.
 
 The host's CPU examples run whole applications over the test seam in
 `glfw-tests`. The seam's native table scripts the poll and the finite
@@ -2493,6 +2675,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Teardown safety flag | The session | Releases clear it; the guard release reads it | Owner | The session | Read once |
 | Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
 | Wake gate and admitted count | The session | Wake calls enter and leave; the first release closes and drains it | Any; STM | Construction until the first release | Closed and never reopened; a retained capability stays terminal |
+| Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
 | Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
@@ -2520,6 +2703,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Completion cell | Its tickets | Settled once; tickets read | Settle: owner; read: any | While a ticket references it | Never reset |
 | Admission flag | The command host | Closure sets it; direct performance reads it | Owner | The host | Never cleared |
 | Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
+| Demand slots: the application's and one per window | The window host | Publishers combine into them; the owner captures and clears; the close protocol and quiescence close | Publish: any; capture and close: owner | The host, and a window's until it is forgotten | Cleared by each capture; closed and never reopened |
 | Release failure | The window | A failing release part sets it; the observation release reads it | Owner | The window | Read at release |
 | Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |
 | Window registry | The window host | Registration inserts; the close protocol marks closing; a retirement that succeeded or failed removes; ports, clients, and dispatch read | Write: owner; read: any | Registration until retirement | Emptied as windows retire; the collection's exit releases what remains |
@@ -2872,6 +3056,12 @@ The native examples cover:
   production finite wait the owner thread entered and was blocked inside:
   `blockedWaitForCheck` observes that wait's sequence number around the kernel
   report, and the same wait returns woken before its 60-second bound;
+- a worker's admitted command ending such a wait through the production
+  admission path rather than a wake this example posts: the worker submits an
+  ordinary command through an ordinary port once it has observed the wait
+  blocked, the same wait returns woken before its bound, and closure then
+  settles the command it announced as `NotExecuted`, so no window is created in
+  the shared session;
 - three wakes from a bound worker returning that blocked wait once, then a
   later wait that at most one spurious return precedes, blocking again until
   one more wake ends it; and three wakes the owner posts while no wait is in

@@ -11,8 +11,9 @@
 -- application already owns — 'hostCommandPort', a window's
 -- 'Hetoimasia.GLFW.Command.WindowClient' with its "Hetoimasia.GLFW.Input" reader
 -- and admission control, the monitor inventory's read endpoint
--- 'hostMonitors', 'hostActivity', and 'hostWindowCapabilities' — and startup
--- transfers no native ownership to anyone.
+-- 'hostMonitors', 'hostActivity', 'hostWindowCapabilities', and the demand
+-- publishers of 'Hetoimasia.GLFW.Demand' — and startup transfers no native
+-- ownership to anyone.
 --
 -- 'runOwnerLoop' is the owner loop. The application's action runs it on the
 -- process main thread, the session's owner, while background workers use the
@@ -119,6 +120,21 @@
 -- collection latches the failure, which poisons creation and is kept for its
 -- final exit, and the window's observations report the failed disposal.
 --
+-- = Demand
+--
+-- A worker that wants a turn without submitting a command publishes demand:
+-- 'hostDemandPublisher' is the application's one slot, and
+-- 'Hetoimasia.GLFW.Command.clientDemandPublisher' is a window's own, created
+-- with the window and closed in its closing transaction. A publication combines
+-- immediate demand and the earliest requested deadline into the slot, advances
+-- its revision, and then wakes the owner; 'captureHostDemand' and
+-- 'captureWindowDemand' take the pending request with its revision on the owner
+-- thread and clear exactly what they took, so a publication committed after a
+-- capture stays pending for the next one. There is never a slot per worker or
+-- per request, and a closed slot answers a typed rejection and makes no native
+-- call. What a captured deadline means for the next wait is not this loop's
+-- concern yet.
+--
 -- = Idle waits
 --
 -- A turn is idle when the turn before it attempted no command and dispatched no
@@ -126,9 +142,17 @@
 -- polls; an idle turn waits at most 'hostIdleWait' seconds for a native event,
 -- so a checkpoint follows even when no native input arrives. No wait is
 -- indefinite, and a host with no windows waits on each idle turn rather than
--- spinning. The bound is a latency, not a shutdown deadline. There is no
--- wake-on-post: a command submitted during a wait waits for the wait to end, and
--- the same turn's command work then serves it. Native waits are safe foreign
+-- spinning. The bound is a latency, not a shutdown deadline.
+--
+-- An idle wait ends early when an admission or a publication wakes the owner,
+-- and that same turn's command work and update opportunity then serve what
+-- arrived, so nothing admitted or published waits for the bound to run out.
+-- Wakes may be coalesced or spurious, and neither repeats an execution nor a
+-- capture: the queue and the slots are authoritative and the wake is only the
+-- hint that they changed. After an expected platform wake failure has degraded
+-- the session's wake path — reported once through 'loopLogger' under
+-- @glfw.wake@ — nothing is posted at all and the finite bound alone keeps work
+-- moving. Native waits are safe foreign
 -- calls, so background workers run while the owner is inside one.
 -- 'hostActivity' reports the turn and whether its owner has begun its finite
 -- wait: the flag is set immediately before the native call and cleared once it
@@ -153,9 +177,14 @@
 -- 'Hetoimasia.Runtime.Application.runScopedApplicationWithQuiescence', which
 -- 'runWindowApplication' installs. In one finite, non-retrying transaction it
 -- closes the admission of the host's port and of every window's port, settles
--- every queued command as 'Hetoimasia.GLFW.Command.NotExecuted', and closes every
+-- every queued command as 'Hetoimasia.GLFW.Command.NotExecuted', closes every
 -- window's input feed, ending its reads without awaiting any reset
--- acknowledgement. It destroys nothing, pumps nothing, waits on nothing, and is
+-- acknowledgement, and closes the application's demand slot and every window's.
+-- It does not disable wake support: a retained port or publisher answers a typed
+-- rejection and makes no native call, while the progress that still has to
+-- happen keeps its own capability. A window whose creation was claimed before
+-- quiescence and finishes after it is registered already closed, and the
+-- 'Hetoimasia.GLFW.Command.WindowClient' its ticket hands over revives nothing. It destroys nothing, pumps nothing, waits on nothing, and is
 -- idempotent. The
 -- runner runs it on every exit from the supervised region before supervision's
 -- boundary drain, so a worker awaiting a ticket is released to observe its stop
@@ -224,6 +253,10 @@
 -- | Borrow counts            | The host  | Borrows raise and lower them;    | Owner                | The host              | Dropped on every exit from a     |
 -- |                          |           | retirement reads them            |                      |                       | borrow                           |
 -- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
+-- | Demand slots: the        | The host  | Publishers combine into them;    | Publish: any;        | The host, and a       | Cleared by each capture; closed  |
+-- | application's and one    |           | the owner captures and clears;   | capture and close:   | window's until it is  | by the close protocol,           |
+-- | per window               |           | closure closes them              | owner                | forgotten             | quiescence, or release           |
+-- +--------------------------+-----------+----------------------------------+----------------------+-----------------------+----------------------------------+
 -- | Input feeds: one per     | The host  | The consumer reads and           | Owner operations:    | A window's until it is| Closed by the close protocol,    |
 -- | window                   |           | acknowledges; the application    | owner; capabilities: | forgotten             | quiescence, or release; never    |
 -- |                          |           | enables and suspends; closure    | any                  |                       | reopened                         |
@@ -246,7 +279,10 @@
 --
 -- = Logging
 --
--- The component takes no logger and writes to no sink. Its failures are raised,
+-- The component takes no logger and writes to no sink of its own. The owner
+-- loop writes through the 'Logger' the application injects on 'LoopHooks': the
+-- input overflow warning under @glfw.input@, and the wake path's one
+-- degradation warning under @glfw.wake@. Its failures are raised,
 -- never logged: a configuration rejection under the @glfw.runtime@ component
 -- and @construct window host@ operation, native failures under GLFW's own
 -- operations, and supervised failures as the runtime delivers them. The
@@ -266,6 +302,13 @@ module Hetoimasia.Runtime.GLFW
   , HostActivity (..)
   , hostActivity
   , hostWindowCapabilities
+
+    -- * Demand
+  , hostDemandPublisher
+  , captureHostDemand
+  , captureWindowDemand
+  , hostDemandStatus
+  , windowDemandStatus
 
     -- * Windows
   , hostWindowIdentities

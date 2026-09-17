@@ -53,7 +53,9 @@ library model
         Hetoimasia.GLFW.Internal.Attribute
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Control
+        Hetoimasia.GLFW.Internal.Demand
         Hetoimasia.GLFW.Internal.Input
+        Hetoimasia.GLFW.Internal.Notify
         Hetoimasia.GLFW.Internal.Mode
         Hetoimasia.GLFW.Internal.Monitor
         Hetoimasia.GLFW.Internal.Session
@@ -97,6 +99,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GLFW.Command
+        Hetoimasia.GLFW.Demand
         Hetoimasia.GLFW.Input
         Hetoimasia.GLFW.Mode
         Hetoimasia.GLFW.Monitor
@@ -202,6 +205,7 @@ test-suite glfw-tests
         Test.GLFW.Linking
         Test.GLFW.Mode
         Test.GLFW.Monitor
+        Test.GLFW.Notify
         Test.GLFW.Opacity
         Test.GLFW.Session
         Test.GLFW.Spec

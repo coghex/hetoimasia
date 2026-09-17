@@ -9,7 +9,8 @@ initialization and termination, bounded evidence of native error reports,
 poisoning when teardown cannot finish safely, and an opaque wake capability
 (`sessionWake`, `wakeSession`) that any thread may use to end the owner's native
 event wait. A wake is only a hint; it is terminal once its session begins closing,
-and what to do after a failed wake is left to the host. `Hetoimasia.GLFW.Monitor`
+and what to do after a failed wake is the notification policy's, not the
+capability's. `Hetoimasia.GLFW.Monitor`
 publishes that session's monitor inventory: copied descriptions with opaque
 identities that end on disconnect and re-resolve on the owner thread.
 `Hetoimasia.GLFW.Window` creates
@@ -17,7 +18,8 @@ lexically scoped NoAPI windows in that session, publishes what the platform
 observed through read-only snapshots, contains their native callbacks, and
 releases them when their scopes end. `Hetoimasia.GLFW.Command` admits prepared
 window commands through bounded ports and reports each through a persistent
-completion ticket; its control commands change a window's title, size,
+completion ticket, waking the session's owner once an admission has committed,
+so a command submitted during the owner's idle wait ends it; its control commands change a window's title, size,
 position, size constraints, visibility, focus and attention, and minimized or
 maximized state, validated on the owner thread and settled as rejected,
 unsupported, or attempted with the revision a post-call sample published.
@@ -28,7 +30,16 @@ finite budget when a monitor disappears or a mode is unavailable. The public `ru
 `Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
 runs its supervised owner loop, which processes native events, drains those
 ports fairly, refreshes the monitor inventory when monitors change, and surfaces
-close requests to application policy. The host owns its windows through a scoped
+close requests to application policy. `Hetoimasia.GLFW.Demand` is how a worker
+asks that owner for a turn without a command: one bounded demand slot for the
+application, lent as `hostDemandPublisher`, and one per live window, lent on its
+`WindowClient` as `clientDemandPublisher`. Concurrent requests combine immediate
+demand and the earliest requested deadline, publication records before it wakes,
+and the owner captures a pending request with its revision and clears exactly
+what it captured. An expected platform wake failure degrades that session's wake
+path once, warns once under `glfw.wake` through the loop's injected logger, and
+leaves the owner's finite idle wait as the bounded fallback, without changing any
+ticket or slot. The host owns its windows through a scoped
 collection: applications create windows while running, receive each one's own
 command port and observations, and close them independently in any order
 through the host's close protocol. `Hetoimasia.GLFW.Input` gives each host
@@ -45,15 +56,16 @@ public module exports it, and no public attachment exists yet.
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on
 `hetoimasia-runtime`, and no library depends on it. No component imports a game, Lua, or rendering
-module, and only the input feed's overflow warning takes a logger, injected by
-its owner. Its native handles, foreign imports,
+module, and only the input feed's overflow warning and the wake path's
+degradation warning take a logger, injected by its owner. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the
 test seam the package's headless `glfw-tests` suite drives without initializing
 GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
 monitor identity, observation, callback-containment, release-order, window
-command, window control, window mode, input feed, and window attachment model rules, is
+command, admission wake, demand slot, wake degradation, window control, window
+mode, input feed, and window attachment model rules, is
 [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with
@@ -68,7 +80,8 @@ cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 `glfw-tests` (`test/`) is the headless suite, composed by `Test.GLFW.Spec` under
 one `GLFW` group: the session examples over the seam, the window model, command,
 control, host, dynamic window, monitor inventory, input feed, and window mode
-examples that use the private drivers and executor, the link declarations, and
+examples that use the private drivers and executor, the admission-wake, demand,
+and degradation examples (`--match "wake"`), the link declarations, and
 the external-client opacity examples. It initializes no GLFW, opens no window,
 and needs no display, and a selector that matches nothing fails it. Focus a
 component with its group name, for example

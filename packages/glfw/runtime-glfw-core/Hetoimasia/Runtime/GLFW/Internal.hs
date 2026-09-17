@@ -22,6 +22,13 @@ module Hetoimasia.Runtime.GLFW.Internal
   , hostActivity
   , hostWindowCapabilities
 
+    -- * Demand
+  , hostDemandPublisher
+  , captureHostDemand
+  , captureWindowDemand
+  , hostDemandStatus
+  , windowDemandStatus
+
     -- * Windows
   , hostWindowIdentities
   , hostWindowClient
@@ -53,7 +60,7 @@ module Hetoimasia.Runtime.GLFW.Internal
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, finally, fromException, rethrowIO, tryWithContext)
-import Control.Monad (forM, forM_, unless, void)
+import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -98,6 +105,8 @@ import Hetoimasia.GLFW.Internal.Command
   , Execution (..)
   , ExecutionStep (..)
   , WindowCommand (..)
+  , commandHostNotifier
+  , commandsAdmissionClosed
   , executeNextWith
   , nativeRejectionOf
   , newWindowClient
@@ -107,6 +116,18 @@ import Hetoimasia.GLFW.Internal.Command
   , observeWindow
   )
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
+import Hetoimasia.GLFW.Internal.Demand
+  ( CapturedDemand
+  , DemandPublisher
+  , DemandSlot
+  , DemandStatus
+  , captureDemand
+  , closeDemandSlot
+  , demandPublisher
+  , demandStatus
+  , newDemandSlot
+  )
+import Hetoimasia.GLFW.Internal.Notify (attemptDegradationReport)
 import Hetoimasia.GLFW.Internal.Input
   ( InputFeed
   , attemptOverflowWarning
@@ -231,7 +252,7 @@ validateHostConfig config
 hostComponent ∷ Component
 hostComponent = unsafeComponent "glfw.runtime"
 
-constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation ∷ Operation
+constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation ∷ Operation
 constructOperation = operation "construct window host"
 loopOperation = operation "run owner loop"
 rejectOperation = operation "reject close request"
@@ -239,6 +260,7 @@ borrowOperation = operation "borrow host window"
 closeOperation = operation "close host window"
 honourOperation = operation "honour close request"
 bookkeepingOperation = operation "read host bookkeeping"
+captureOperation = operation "capture demand"
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -259,6 +281,8 @@ data WindowHost = WindowHost
   , hostSurfaced ∷ !(IORef (Map WindowId CloseRequest))
   , hostCursor ∷ !(IORef PortKey)
     -- ^ The port the last dispatch attempt served.
+  , hostDemandSlot ∷ !DemandSlot
+    -- ^ The application's one demand slot, lent to workers as a publisher.
   , hostActivityState ∷ !(TVar HostActivity)
   , hostHooks ∷ !HostHooks
   }
@@ -282,6 +306,7 @@ data HostEntry = HostEntry
   { entryMember ∷ !(Member Window)
   , entryCommands ∷ !WindowCommandHost
   , entryInput ∷ !InputFeed
+  , entryDemand ∷ !DemandSlot
   , entryClient ∷ !WindowClient
   , entryClosing ∷ !Bool
   }
@@ -330,14 +355,17 @@ allocWindowHostWith hooks sessionScope config = do
   collection ← allocCollection (hostWindowLimit config)
   commands ← liftIO (newWindowCommandHost session (hostCommandCapacity config))
   entries ← liftIO (newTVarIO Map.empty)
-  -- Released first: every port's admission closes before any window is released.
-  allocResource (pure ()) (\() → atomically (closeAdmission commands entries))
+  demand ← liftIO newDemandSlot
+  -- Released first: every port's admission and every demand slot close before
+  -- any window is released.
+  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand))
   host ←
     liftIO $
       WindowHost session collection commands config entries
         <$> newIORef Map.empty
         <*> newIORef Map.empty
         <*> newIORef HostPortKey
+        <*> pure demand
         <*> newTVarIO (HostActivity 0 False)
         <*> pure hooks
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
@@ -372,12 +400,60 @@ hostActivity = readTVar . hostActivityState
 -- the calling transaction. Finite, non-retrying, and idempotent; it destroys
 -- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
 quiesceWindowHost ∷ WindowHost → STM ()
-quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host)
+quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host) (hostDemandSlot host)
 
-closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → STM ()
-closeAdmission commands entries = do
+closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → DemandSlot → STM ()
+closeAdmission commands entries demand = do
   void (closeWindowCommands commands)
-  readTVar entries >>= mapM_ (\entry → void (closeWindowCommands (entryCommands entry)) >> closeInputFeed (entryInput entry))
+  closeDemandSlot demand
+  readTVar entries >>= mapM_ closeEntryAdmission
+
+-- | Close one window's admission: its port, its input feed, and its demand
+-- slot. Finite, never retries, and idempotent.
+closeEntryAdmission ∷ HostEntry → STM ()
+closeEntryAdmission entry = do
+  void (closeWindowCommands (entryCommands entry))
+  closeInputFeed (entryInput entry)
+  closeDemandSlot (entryDemand entry)
+
+-- ---------------------------------------------------------------------------
+-- Demand
+
+-- | The application's demand publisher: the capability a worker uses to ask
+-- the owner for a turn, immediately or by a deadline. It is one slot for every
+-- worker, so concurrent requests combine rather than replace, and it is
+-- rejected once the host has quiesced.
+hostDemandPublisher ∷ WindowHost → DemandPublisher
+hostDemandPublisher host = demandPublisher (hostDemandSlot host) (commandHostNotifier (hostCommands host))
+
+-- | Take the application demand pending for the owner, clearing exactly what
+-- was taken, on the owner thread. A publication that commits afterwards stays
+-- pending for the next capture. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+captureHostDemand ∷ WindowHost → IO (Maybe CapturedDemand)
+captureHostDemand host =
+  ownerOperation (hostSession host) captureOperation [] (atomically (captureDemand (hostDemandSlot host)))
+
+-- | 'captureHostDemand' for one window's slot. A window the host no longer
+-- holds, and one whose slot has closed, answer 'Nothing'.
+captureWindowDemand ∷ WindowHost → WindowId → IO (Maybe CapturedDemand)
+captureWindowDemand host target =
+  ownerOperation (hostSession host) captureOperation (windowIdentifiers target) $
+    atomically $
+      Map.lookup target <$> readTVar (hostEntries host) >>= \case
+        Nothing → pure Nothing
+        Just entry → captureDemand (entryDemand entry)
+
+-- | The application slot's state, read in one transaction without capturing
+-- anything. Any thread may read it.
+hostDemandStatus ∷ WindowHost → STM DemandStatus
+hostDemandStatus = demandStatus . hostDemandSlot
+
+-- | One window's slot state, or 'Nothing' for a window the host no longer
+-- holds. Any thread may read it.
+windowDemandStatus ∷ WindowHost → WindowId → STM (Maybe DemandStatus)
+windowDemandStatus host target =
+  Map.lookup target <$> readTVar (hostEntries host) >>= traverse (demandStatus . entryDemand)
 
 -- ---------------------------------------------------------------------------
 -- Windows
@@ -488,8 +564,7 @@ commitClosing host target =
   Map.lookup target <$> readTVar (hostEntries host) >>= \case
     Just entry | not (entryClosing entry) → do
       modifyTVar' (hostEntries host) (Map.insert target entry {entryClosing = True})
-      void (closeWindowCommands (entryCommands entry))
-      closeInputFeed (entryInput entry)
+      closeEntryAdmission entry
       pure True
     _ → pure False
 
@@ -545,8 +620,19 @@ registerWindow host config =
         attachWindowInputFeed window feed
         pure (identity, reader, feed)
     commands ← newWindowPortHost (hostSession host) (hostCommandCapacity (hostSettings host)) identity
-    let client = newWindowClient identity commands reader (feedReader feed) (feedControl feed)
-    atomically (modifyTVar' (hostEntries host) (Map.insert identity (HostEntry member commands feed client False)))
+    demand ← newDemandSlot
+    let client =
+          newWindowClient identity commands reader (feedReader feed) (feedControl feed) $
+            demandPublisher demand (commandHostNotifier (hostCommands host))
+        entry = HostEntry member commands feed demand client False
+    -- Registration and the quiescence check commit together, so a window whose
+    -- creation was claimed before quiescence and finished after it is
+    -- registered already closed: its port, its feed, and its demand slot admit
+    -- nothing, and the client its ticket hands over can revive none of them.
+    atomically $ do
+      quiesced ← commandsAdmissionClosed (hostCommands host)
+      when quiesced (closeEntryAdmission entry)
+      modifyTVar' (hostEntries host) (Map.insert identity entry)
     afterRegistration (hostHooks host)
     pure client
 
@@ -728,6 +814,7 @@ runOwnerLoop host control hooks =
       retirePending host
       closes ← surfaceCloseRequests host
       recoverFeeds (loopLogger hooks) host
+      void (attemptDegradationReport (loopLogger hooks) (commandHostNotifier (hostCommands host)))
       checkRuntime control
       commands ← dispatchCommands host (hostCommandBudget settings)
       recoverFeeds (loopLogger hooks) host
