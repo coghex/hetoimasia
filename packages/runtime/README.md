@@ -53,6 +53,15 @@ the inbox before the component is torn down on every exit, returning an
 or restart policy. The contract is
 [Supervised inbox services](../../docs/messaging.md#supervised-inbox-services).
 
+`Hetoimasia.Runtime.Application` is the generic application lifecycle.
+`runScopedApplication` and `runScopedApplicationWithQuiescence` construct the
+application's dependencies from a `Scoped` value, and are unchanged.
+`runManagedApplication` runs the same lifecycle over a managed dependency
+lifetime, `∀ r. (dependencies → IO r) → IO r`, so a component can enclose every
+borrower in its own protected boundary and drain after the workers and before
+its parents are released. The contract is
+[The application runner](../../docs/resources.md#the-application-runner).
+
 Future lifecycle and scheduling APIs belong here. Concrete Vulkan creation and
 game binding registration belong in application composition. Resource-owning
 APIs need scoped cleanup and explicit exception/cancellation behavior before

@@ -1,17 +1,18 @@
 -- | The generic application lifecycle.
 --
--- 'runScopedApplication' and 'runScopedApplicationWithQuiescence' sit beside
--- 'Hetoimasia.Runtime.runApplication', the thin runner over a supplied logger,
--- which keeps its module, signature, behavior, and examples. They compose the
--- runtime's other boundaries in one fixed order and add no mechanics of their
--- own:
+-- 'runScopedApplication', 'runScopedApplicationWithQuiescence', and
+-- 'runManagedApplication' sit beside 'Hetoimasia.Runtime.runApplication', the
+-- thin runner over a supplied logger, which keeps its module, signature,
+-- behavior, and examples. They compose the runtime's other boundaries in one
+-- fixed order and add no mechanics of their own:
 --
 -- 1. Configuration parsing and logger construction happen before it, in the
 --    caller. A failure there propagates as its own typed failure, with no
 --    record promised, because no managed logger exists yet.
 -- 2. The logging lifetime is entered ("Hetoimasia.Runtime.Logging").
 -- 3. The application's dependencies are constructed inside it, as one 'Scoped'
---    value run by 'withScoped', in the order the composition allocates them.
+--    value run by 'withScoped', in the order the composition allocates them,
+--    or by the managed dependency lifetime 'runManagedApplication' is given.
 --    A required component built with
 --    'Hetoimasia.Foundation.Recovery.allocComponent' propagates its failure
 --    after cleanup of what was acquired; an optional one binds its
@@ -32,7 +33,8 @@
 --    stop, every worker is drained, and every outcome not yet handled is
 --    settled, with the fatal latch rethrown.
 -- 10. The dependency scope unwinds: dependents are disposed before their
---     dependencies, and each composite keeps its declared internal order.
+--     dependencies, and each composite keeps its declared internal order. A
+--     managed lifetime's release runs here, workers drained and logger live.
 -- 11. A failed run gets one managed terminal report while the logger is live.
 -- 12. The logging lifetime makes its one permitted final flush.
 -- 13. The result is returned, or the failure is rethrown preservingly.
@@ -92,6 +94,32 @@
 -- dependency unwind, the reporting and flushing matrix, and the protected wait
 -- for a worker that cannot stop, which is never detached.
 --
+-- __Managed dependency lifetimes.__ 'runManagedApplication' takes, in place of
+-- a 'Scoped' value, a lifetime of shape @∀ r. (dependencies → IO r) → IO r@,
+-- so a component can enclose every borrower of its resources — startup, the
+-- action, quiescence, and the whole worker group — in a protected IO boundary
+-- of its own, and run component-owned drain work in its release: after
+-- supervision has drained every worker and before any parent dependency it
+-- built on is released, with the logger live and the terminal report still to
+-- come. 'runScopedApplicationWithQuiescence' is exactly that runner over
+-- @'withScoped' dependencies@, and 'runScopedApplication' keeps delegating to
+-- it, so neither's signature, order, or failure semantics changes. The runner
+-- adds no shutdown callback list, second supervisor, or resource registry.
+--
+-- The lifetime is trusted, as the continuation of
+-- 'Hetoimasia.Foundation.Recovery.allocComponent' is, and the runner does not
+-- police arbitrary 'IO' for violations. Once construction succeeds it invokes
+-- its consumer exactly once, subject to cancellation before entry,
+-- synchronously on the calling thread, with every dependency it built live;
+-- when construction fails it invokes the consumer zero times, so the runner
+-- enters no supervision and runs no quiescence. It never forks, retains,
+-- retries, or re-enters the consumer, and never turns the consumer's failure
+-- into success. It owns acquisition, rollback, and protected release under the
+-- resource failure table and mask discipline: a consumer failure or
+-- cancellation stays primary with release failures retained beside it, and a
+-- release failure after a successful consumer fails the run. 'withScoped'
+-- honours this contract.
+--
 -- __The application owns its types.__ The runner is polymorphic over the
 -- dependencies and the services value. It enumerates no field of either,
 -- imports no concrete application, and passes each callback only what it was
@@ -141,9 +169,9 @@
 -- them.
 --
 -- __State.__ The runner holds no mutable state of its own. The dependency
--- scope's releases belong to 'withScoped', the worker and supervision state to
--- the one 'withSupervision' invocation, and the recorded reporting outcomes to
--- the logging lifetime, each under its own documented table. The services value
+-- scope's releases belong to 'withScoped' or the managed lifetime, the worker
+-- and supervision state to the one 'withSupervision' invocation, and the
+-- recorded reporting outcomes to the logging lifetime, each under its own documented table. The services value
 -- is the application's: created once by the startup callback on the calling
 -- thread, read by the action on the same thread, never written, and gone when
 -- the invocation returns. Nothing is shared between invocations or reset.
@@ -153,6 +181,7 @@
 module Hetoimasia.Runtime.Application
   ( runScopedApplication
   , runScopedApplicationWithQuiescence
+  , runManagedApplication
   , applicationComponent
   ) where
 
@@ -212,10 +241,28 @@ runScopedApplicationWithQuiescence
   → (dependencies → RuntimeControl → IO services)
   → (services → RuntimeControl → IO a)
   → IO a
-runScopedApplicationWithQuiescence enterLifetime name dependencies quiesce startup action =
+runScopedApplicationWithQuiescence enterLifetime name dependencies =
+  runManagedApplication enterLifetime name (withScoped dependencies)
+
+-- | 'runScopedApplicationWithQuiescence' over a managed dependency lifetime, the
+-- third argument, in place of a 'Scoped' value, as the module header's
+-- "Managed dependency lifetimes" describes. The lifetime occupies steps 3 and
+-- 10; every other step keeps its order, thread, and labels.
+--
+-- The report's entry records the site that called this function.
+runManagedApplication
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
+  → Text
+  → (∀ r. (dependencies → IO r) → IO r)
+  → (dependencies → STM ())
+  → (dependencies → RuntimeControl → IO services)
+  → (services → RuntimeControl → IO a)
+  → IO a
+runManagedApplication enterLifetime name manage quiesce startup action =
   enterLifetime $ \lifetime →
     reportOnce lifetime name $
-      withScoped dependencies $ \built →
+      manage $ \built →
         withSupervision lifetime $ \control →
           withResourceLabelled quiescenceLabel (pure ()) (\() → atomically (quiesce built)) $ \() → do
             -- The guard is installed before the first checkpoint, so every exit

@@ -1,5 +1,5 @@
--- | Examples for 'runScopedApplication' and
--- 'runScopedApplicationWithQuiescence', the generic application lifecycle.
+-- | Examples for 'runScopedApplication', 'runScopedApplicationWithQuiescence',
+-- and 'runManagedApplication', the generic application lifecycle.
 --
 -- Two unrelated applications drive the same runner: a workshop whose
 -- dependencies are a store and a composite bench, whose services carry a
@@ -7,7 +7,9 @@
 -- logbook and an optional radio built with 'allocComponent', whose services
 -- publish the radio's availability. Neither type is known to the runtime. The
 -- quiescence examples add a counter, whose dependency is a reply desk a worker
--- may be left waiting on.
+-- may be left waiting on. The managed-lifetime examples add a hub, a scripted
+-- component built on a parent whose lifetime encloses every borrower and
+-- drains in its release.
 --
 -- The examples prove the composition, not the matrices it reuses: supervision's
 -- classification and closing are proven by "Test.Runtime.Supervision",
@@ -16,8 +18,8 @@
 -- STM, and 'awaitBlockedOnSTM'; nothing sleeps.
 module Test.Runtime.Composition (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -27,6 +29,7 @@ import Control.Exception
   , throwIO
   , try
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
@@ -61,9 +64,12 @@ import Hetoimasia.Foundation.Resource
   , cleanupFailuresInContext
   , releaseRank
   , restoredStep
+  , withResourceLabelled
+  , withScoped
   )
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, stopRequested, workerDefinition)
-import Hetoimasia.Runtime.Application (runScopedApplication, runScopedApplicationWithQuiescence)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadFinished), threadStatus)
+import Hetoimasia.Runtime.Application (runManagedApplication, runScopedApplication, runScopedApplicationWithQuiescence)
 import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( Disposition (..)
@@ -162,6 +168,30 @@ spec = describe "Application lifecycle" $ do
       testQuiescenceFailureAfterSuccess
     it "leaves runScopedApplication identical to a no-op quiescence action"
       testNoOpQuiescenceIdentical
+  describe "Managed lifetime" $ do
+    it "invokes the consumer once on the calling thread with dependencies live, draining after workers and before the parent"
+      testManagedOrder
+    it "invokes the consumer zero times and enters no supervision when construction fails"
+      testManagedConstructionFailure
+    describe "drains workers, then the hub, then the parent, before the report and the flush" $ do
+      it "startup failure" (testManagedExit ManagedStartupFails)
+      it "action failure" (testManagedExit ManagedActionFails)
+      it "latched supervised failure" (testManagedExit ManagedSupervisedFails)
+      it "omitted quiescence" (testManagedExit ManagedWithoutQuiescence)
+    describe "propagates cancellation unreported and unflushed, releasing everything once" $ do
+      it "at the handoff into the consumer" (testManagedCancellation AtConsumerEntry)
+      it "during the consumer" (testManagedCancellation DuringConsumer)
+      it "requested during quiescence" (testManagedCancellation DuringQuiescence)
+      it "during the worker drain" (testManagedCancellation DuringWorkerDrain)
+      it "requested during the managed release" (testManagedCancellation DuringManagedRelease)
+    it "keeps an action failure primary while quiescence and the managed release fail"
+      testManagedCleanupFailuresDuringFailure
+    it "keeps cancellation primary while quiescence and the managed release fail"
+      testManagedCleanupFailuresDuringCancellation
+    it "fails a successful run whose managed release fails, then reports and flushes"
+      testManagedReleaseFailureAfterSuccess
+    it "leaves the Scoped entry points identical to the managed runner over withScoped"
+      testScopedIdenticalToManaged
 
 -- Harness ----------------------------------------------------------------------
 
@@ -835,3 +865,343 @@ testNoOpQuiescenceIdentical = boundedSupervision $ do
     plain ← scenario runIn failing
     quiescent ← scenario noOp failing
     quiescent `shouldBe` plain
+
+-- Managed lifetime ---------------------------------------------------------------
+
+-- | The runner over a managed lifetime, over the harness's logger.
+runManagedIn
+  ∷ Harness
+  → (∀ r. (d → IO r) → IO r)
+  → (d → STM ())
+  → (d → RuntimeControl → IO s)
+  → (s → RuntimeControl → IO a)
+  → IO a
+runManagedIn harness = runManagedApplication (withLoggingLifetime (harnessLogger harness)) "test-app"
+
+-- | The hub: a scripted component built on a parent. It records its
+-- construction, each consumer entry and its thread, its quiescence, and its
+-- drain into the harness trace.
+data Hub = Hub
+  { hubTrace ∷ Trace
+  , hubLive ∷ TVar Bool
+  , hubQuiesced ∷ TVar Bool
+  , hubEntries ∷ IORef [ThreadId]
+  }
+
+-- | Injected steps: one after the hub's acquisition is recorded, one after its
+-- drain is recorded, each inside the protection of its own phase.
+data HubScript = HubScript
+  { scriptAcquire ∷ IO ()
+  , scriptDrain ∷ IO ()
+  }
+
+plainHub ∷ HubScript
+plainHub = HubScript (pure ()) (pure ())
+
+newHub ∷ Trace → IO Hub
+newHub trace = Hub trace <$> newTVarIO False <*> newTVarIO False <*> newIORef []
+
+-- | The hub's managed lifetime. The parent is acquired first and released
+-- last; the hub, built on it, encloses the consumer in its own protected
+-- boundary and runs its drain as its release, labelled @hub release@.
+managedHub ∷ Hub → HubScript → (Hub → IO r) → IO r
+managedHub hub script consume =
+  withResourceLabelled "parent release" (record trace "acquire parent") (\() → record trace "release parent") $ \() →
+    withResourceLabelled "hub release" acquireHub drainHub $ \() → do
+      thread ← myThreadId
+      atomicModifyIORef' (hubEntries hub) (\seen → (seen <> [thread], ()))
+      record trace "enter hub"
+      consume hub
+  where
+    trace = hubTrace hub
+    acquireHub = do
+      record trace "acquire hub"
+      scriptAcquire script
+      atomically (writeTVar (hubLive hub) True)
+    drainHub () = do
+      quiesced ← readTVarIO (hubQuiesced hub)
+      record trace (if quiesced then "drain hub after quiescence" else "drain hub")
+      atomically (writeTVar (hubLive hub) False)
+      scriptDrain script
+
+-- | Fail unless the hub is live.
+expectLive ∷ Hub → IO ()
+expectLive hub = readTVarIO (hubLive hub) >>= \live → when (not live) (throwIO (userError "the hub was not live"))
+
+-- | Quiesce the hub, which must still be live.
+quiesceHub ∷ Hub → STM ()
+quiesceHub hub =
+  readTVar (hubLive hub) >>= \live →
+    if live then writeTVar (hubQuiesced hub) True else throwSTM (Broken "quiesced a released hub")
+
+-- | Start the polisher with the hub live, and publish the hub.
+hubStartup ∷ Hub → RuntimeControl → IO Hub
+hubStartup hub control = do
+  record (hubTrace hub) "startup"
+  expectLive hub
+  _ ← startSupervised control (required Service) (serviceUntilStopped (hubTrace hub) "polisher") >>= expectStarted
+  pure hub
+
+-- | Record the action with the hub live.
+hubAction ∷ Hub → IO ()
+hubAction hub = record (hubTrace hub) "action" >> expectLive hub
+
+hubBoot ∷ [Text]
+hubBoot = ["acquire parent", "acquire hub", "enter hub", "startup", "acquire polisher"]
+
+hubEntryCount ∷ Hub → IO Int
+hubEntryCount hub = length <$> readIORef (hubEntries hub)
+
+testManagedOrder ∷ Expectation
+testManagedOrder = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  caller ← myThreadId
+  result ← runManagedIn harness (managedHub hub plainHub) quiesceHub hubStartup (\h _ → hubAction h >> pure (42 ∷ Int))
+  result `shouldBe` 42
+  readIORef (hubEntries hub) `shouldReturn` [caller]
+  -- The polisher drains before the hub, the hub drains before its parent, and
+  -- both precede the flush, with nothing reported.
+  traced trace `shouldReturn`
+    hubBoot <> ["action", "release polisher", "drain hub after quiescence", "release parent", "flush"]
+  errorEntries harness `shouldReturn` []
+
+testManagedConstructionFailure ∷ Expectation
+testManagedConstructionFailure = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  propagated ←
+    expectFailure $
+      runManagedIn harness (managedHub hub plainHub {scriptAcquire = throwIO (Broken "hub failed")}) quiesceHub
+        hubStartup
+        (\h _ → hubAction h)
+  propagated `shouldSatisfy` brokenIs "hub failed"
+  hubEntryCount hub `shouldReturn` 0
+  readTVarIO (hubQuiesced hub) `shouldReturn` False
+  traced trace `shouldReturn` ["acquire parent", "acquire hub", "release parent", "write Application failed", "flush"]
+  void (expectOneReport harness)
+
+-- | How a managed run leaves the supervised region.
+data ManagedExit
+  = ManagedStartupFails
+  | ManagedActionFails
+  | ManagedSupervisedFails
+  | ManagedWithoutQuiescence
+  deriving (Eq, Show)
+
+testManagedExit ∷ ManagedExit → Expectation
+testManagedExit exit = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  gate ← newGate
+  let quiesce = if exit == ManagedWithoutQuiescence then \_ → pure () else quiesceHub
+      startup h control = case exit of
+        ManagedStartupFails → hubStartup h control >> throwIO (Broken "startup failed")
+        ManagedSupervisedFails → do
+          record trace "startup"
+          _ ← startSupervised control (required Service) (failingAfter trace "grinder" gate (Broken "grinder failed")) >>= expectStarted
+          pure h
+        _ → hubStartup h control
+      action h control = do
+        hubAction h
+        case exit of
+          ManagedActionFails → throwIO (Broken "action failed")
+          ManagedSupervisedFails → openGate gate >> awaitSupervised control retry
+          _ → pure ()
+  outcome ← tryWithContext (runManagedIn harness (managedHub hub plainHub) quiesce startup action)
+  hubEntryCount hub `shouldReturn` 1
+  let failed = ["write Application failed", "flush"]
+  case (exit, outcome) of
+    (ManagedWithoutQuiescence, Right ()) → do
+      traced trace `shouldReturn` hubBoot <> ["action", "release polisher", "drain hub", "release parent", "flush"]
+      errorEntries harness `shouldReturn` []
+    (ManagedWithoutQuiescence, Left _) → expectationFailure "a successful run failed"
+    (_, Right ()) → expectationFailure "a failing run returned"
+    (ManagedStartupFails, Left failure) → do
+      failure `shouldSatisfy` brokenIs "startup failed"
+      traced trace `shouldReturn`
+        hubBoot <> ["release polisher", "drain hub after quiescence", "release parent"] <> failed
+      void (expectOneReport harness)
+    (ManagedActionFails, Left failure) → do
+      failure `shouldSatisfy` brokenIs "action failed"
+      traced trace `shouldReturn`
+        hubBoot <> ["action", "release polisher", "drain hub after quiescence", "release parent"] <> failed
+      void (expectOneReport harness)
+    (ManagedSupervisedFails, Left failure) → do
+      failure `shouldSatisfy` brokenIs "grinder failed"
+      traced trace `shouldReturn`
+        ["acquire parent", "acquire hub", "enter hub", "startup", "acquire grinder", "action", "release grinder"]
+          <> ["drain hub after quiescence", "release parent"]
+          <> failed
+      void (expectOneReport harness)
+
+-- | Where a cancellation reaches a managed run.
+data Handoff
+  = AtConsumerEntry
+  | DuringConsumer
+  | DuringQuiescence
+  | DuringWorkerDrain
+  | DuringManagedRelease
+  deriving (Eq, Show)
+
+-- | Ask a thread to cancel from a helper thread, and wait until the request is
+-- delivered or pending behind the target's mask.
+requestCancel ∷ ThreadId → IO ()
+requestCancel target = do
+  canceller ← forkIO (killThread target)
+  let settled =
+        threadStatus canceller >>= \case
+          ThreadFinished → pure ()
+          ThreadBlocked BlockedOnException → pure ()
+          _ → yield >> settled
+  settled
+
+-- | Run on a forked thread, let the arrangement cancel it, and require the
+-- failure it propagates.
+cancelledRun ∷ (ThreadId → IO ()) → IO a → IO (ExceptionWithContext SomeException)
+cancelledRun arrange run = do
+  outcome ← newEmptyMVar
+  runner ← forkIO (tryWithContext run >>= putMVar outcome)
+  arrange runner
+  takeMVar outcome >>= either pure (\_ → throwIO (userError "the cancelled application returned"))
+
+isThreadKilled ∷ ExceptionWithContext SomeException → Bool
+isThreadKilled (ExceptionWithContext _ failure) = (fromException failure ∷ Maybe AsyncException) == Just ThreadKilled
+
+testManagedCancellation ∷ Handoff → Expectation
+testManagedCancellation handoff = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  entered ← newEmptyMVar
+  gate ← newGate
+  opened ← newTVarIO False
+  let signal = putMVar entered ()
+      script = case handoff of
+        -- The acquisition finishes uninterruptibly with the request pending, so
+        -- it is delivered when the hub's boundary restores the caller's mask.
+        AtConsumerEntry → plainHub {scriptAcquire = signal >> uninterruptibleMask_ (readMVar gate)}
+        DuringManagedRelease → plainHub {scriptDrain = signal >> readMVar gate}
+        _ → plainHub
+      quiesce h
+        | handoff == DuringQuiescence = readTVar opened >>= \open → if open then quiesceHub h else retry
+        | otherwise = quiesceHub h
+      stopper =
+        workerDefinition "stopper" (\_ → owned trace "stopper") $ \token () → do
+          atomically (awaitStopRequest token)
+          signal
+          readMVar gate
+      startup h control
+        | handoff == DuringWorkerDrain = do
+            record trace "startup"
+            _ ← startSupervised control (required Service) stopper >>= expectStarted
+            pure h
+        | otherwise = hubStartup h control
+      action h control = do
+        hubAction h
+        case handoff of
+          DuringConsumer → signal >> awaitSupervised control retry
+          DuringQuiescence → signal
+          _ → pure ()
+      arrange runner = do
+        takeMVar entered
+        case handoff of
+          DuringConsumer → awaitBlockedOnSTM runner >> killThread runner
+          DuringQuiescence → do
+            awaitBlockedOnSTM runner
+            requestCancel runner
+            atomically (writeTVar opened True)
+          _ → requestCancel runner >> openGate gate
+  propagated ← cancelledRun arrange (runManagedIn harness (managedHub hub script) quiesce startup action)
+  propagated `shouldSatisfy` isThreadKilled
+  traced trace `shouldReturn` case handoff of
+    AtConsumerEntry → ["acquire parent", "acquire hub", "drain hub", "release parent"]
+    DuringWorkerDrain →
+      ["acquire parent", "acquire hub", "enter hub", "startup", "acquire stopper", "action", "release stopper"]
+        <> ["drain hub after quiescence", "release parent"]
+    _ → hubBoot <> ["action", "release polisher", "drain hub after quiescence", "release parent"]
+  hubEntryCount hub `shouldReturn` (if handoff == AtConsumerEntry then 0 else 1)
+  errorEntries harness `shouldReturn` []
+  flushes harness `shouldReturn` 0
+
+testManagedCleanupFailuresDuringFailure ∷ Expectation
+testManagedCleanupFailuresDuringFailure = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  propagated ←
+    expectFailure $
+      runManagedIn harness (managedHub hub plainHub {scriptDrain = throwIO (Broken "hub drain failed")}) failingQuiescence
+        hubStartup
+        (\h _ → hubAction h >> throwIO (Broken "action failed"))
+  propagated `shouldSatisfy` brokenIs "action failed"
+  quiescenceLabels propagated `shouldBe` ["application quiescence", "hub release"]
+  traced trace `shouldReturn`
+    hubBoot <> ["action", "release polisher", "drain hub", "release parent", "write Application failed", "flush"]
+  entry ← expectOneReport harness
+  Map.lookup "cleanup.labels" (entryFields entry) `shouldBe` Just "application quiescence,hub release"
+
+testManagedCleanupFailuresDuringCancellation ∷ Expectation
+testManagedCleanupFailuresDuringCancellation = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  entered ← newEmptyMVar
+  propagated ←
+    cancelledRun (\runner → takeMVar entered >> awaitBlockedOnSTM runner >> killThread runner) $
+      runManagedIn harness (managedHub hub plainHub {scriptDrain = throwIO (Broken "hub drain failed")}) failingQuiescence
+        hubStartup
+        (\h control → hubAction h >> putMVar entered () >> awaitSupervised control retry)
+  propagated `shouldSatisfy` isThreadKilled
+  quiescenceLabels propagated `shouldBe` ["application quiescence", "hub release"]
+  traced trace `shouldReturn` hubBoot <> ["action", "release polisher", "drain hub", "release parent"]
+  errorEntries harness `shouldReturn` []
+  flushes harness `shouldReturn` 0
+
+testManagedReleaseFailureAfterSuccess ∷ Expectation
+testManagedReleaseFailureAfterSuccess = boundedSupervision $ do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  propagated ←
+    expectFailure $
+      runManagedIn harness (managedHub hub plainHub {scriptDrain = throwIO (Broken "hub drain failed")}) quiesceHub
+        hubStartup
+        (\h _ → hubAction h >> pure (8 ∷ Int))
+  propagated `shouldSatisfy` brokenIs "hub drain failed"
+  quiescenceLabels propagated `shouldBe` ["hub release"]
+  hubEntryCount hub `shouldReturn` 1
+  traced trace `shouldReturn`
+    hubBoot
+      <> ["action", "release polisher", "drain hub after quiescence", "release parent"]
+      <> ["write Application failed", "flush"]
+  entry ← expectOneReport harness
+  Map.lookup "cleanup.labels" (entryFields entry) `shouldBe` Just "hub release"
+
+testScopedIdenticalToManaged ∷ Expectation
+testScopedIdenticalToManaged = boundedSupervision $ do
+  let scenario
+        ∷ (∀ d s a. Harness → Scoped d → (d → RuntimeControl → IO s) → (s → RuntimeControl → IO a) → IO a)
+        → Bool
+        → IO ([Text], [(Text, Map.Map Text Text)])
+      scenario runner failing = do
+        harness ← newHarness ignoreWrites (pure ())
+        let trace = harnessTrace harness
+        _ ←
+          tryWithContext
+            ( runner harness (workshop trace (pure ())) (openFloor trace) $ \_ _ → do
+                record trace "action"
+                when failing (throwIO (Broken "action failed"))
+            )
+            ∷ IO (Either (ExceptionWithContext SomeException) ())
+        entries ← errorEntries harness
+        (,) <$> traced trace <*> pure [(entryMessage entry, entryFields entry) | entry ← entries]
+      quiescent harness dependencies = runQuiescentIn harness dependencies (\_ → pure ())
+      managed harness dependencies = runManagedIn harness (withScoped dependencies) (\_ → pure ())
+  for_ [False, True] $ \failing → do
+    viaManaged ← scenario managed failing
+    scenario runIn failing `shouldReturn` viaManaged
+    scenario quiescent failing `shouldReturn` viaManaged
