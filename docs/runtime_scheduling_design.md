@@ -6,8 +6,9 @@ Hetoimasia's bounded dispatch, supervision, and scoped ownership.
 
 Design state: `ready for issue processing`
 
-Owner: `coghex/hetoimasia`. Started 2026-09-16. No tracker items have been created
-from this document. Final review requested by the owner completed on 2026-09-16
+Owner: `coghex/hetoimasia`. Started 2026-09-16. All tracker items are filed and
+approved under epic #131; the ledger records processing, not implementation.
+Read canonical approval amendments with each issue. Final review completed on 2026-09-16
 against `master@e2d30ea`. P-1 through P-5 specify the reviewed contracts for
 D-1 through D-4; D-5 records the review and processing handoff.
 
@@ -17,13 +18,13 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish monotonic scheduling and responsive native waits
-- [ ] TIME-1. Add the monotonic time and deadline boundary
-- [ ] TIME-2. Add bounded variable and fixed-step update policies
-- [ ] TIME-3. Own a cross-thread native wake capability with the GLFW session
-- [ ] TIME-4. Connect admitted commands and published demand to native wake
-- [ ] TIME-5. Drive owner turns from ready work and absolute deadlines
-- [ ] TIME-6. Compose per-window render demand with application simulation
+- [x] EPIC. Establish monotonic scheduling and responsive native waits — [#131]
+- [x] TIME-1. Add the monotonic time and deadline boundary — [#133]
+- [x] TIME-2. Add bounded variable and fixed-step update policies — [#134]
+- [x] TIME-3. Own a cross-thread native wake capability with the GLFW session — [#135]
+- [x] TIME-4. Connect admitted commands and published demand to native wake — [#136]
+- [x] TIME-5. Drive owner turns from ready work and absolute deadlines — [#138]
+- [x] TIME-6. Compose per-window render demand with application simulation — [#139]
 
 ## Epic contract
 
@@ -40,7 +41,9 @@ concrete precondition
 
 ## Current state and evidence
 
-Verified at `master@e2d30ea` on 2026-09-16:
+Source observations verified at `master@e2d30ea` on 2026-09-16 still describe
+the unimplemented scheduling boundary at `9300962`. Tracker state below was
+refreshed on 2026-09-17:
 
 - `packages/glfw/runtime-glfw-core/Hetoimasia/Runtime/GLFW/Internal.hs`:
   `runOwnerLoop` decides the next turn is idle from command/event counts only.
@@ -59,9 +62,9 @@ Verified at `master@e2d30ea` on 2026-09-16:
   recorded `064a255f` baseline, injects a monotonic source, sanitizes intervals,
   caps a sample at 0.25 seconds, and drops excess by advancing the raw baseline.
   Keep the ownership and interruption lessons, not its global game state.
-- Open issues are #123 (monitor-recovery repair), #124 (native-test opt-in),
-  #86 (delivered GLFW arc), and #49 (test architecture). Their bodies contain
-  no scheduling/wake child.
+- #123 and #124 are merged and #86 is closed. Epic #131 now owns TIME-1 through
+  TIME-6 as #133, #134, #135, #136, #138 and #139. Epic #49 still owns the
+  independent test migrations, #129/#130.
   The older Vulkan design P-6/Q-6 now delegates this prerequisite to this doc.
 
 ## Desired experience and scope
@@ -443,7 +446,6 @@ buckets are repository behavior, not a per-call attribution mechanism.
 
 This is the scheduling owner; the [Vulkan design](vulkan_backend_design.md)
 links here rather than drafting duplicate children. The test opt-in follow-up
-is [#124](https://github.com/coghex/hetoimasia/issues/124), not a prerequisite
-for CPU work. #123 should precede
-new changes to the window controller, but does not block TIME-1/2/3. Final
-issue processing must recheck the tracker and record current prerequisites.
+is [#124](https://github.com/coghex/hetoimasia/issues/124), now merged. Monitor
+repair #123 is also merged, satisfying the window-controller prerequisite.
+Solvers must use the current suite layout and their issue's approved amendments.

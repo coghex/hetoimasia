@@ -8,8 +8,9 @@ Design state: `ready for issue processing`
 Owner: `coghex/hetoimasia`. Started 2026-09-16. The owner accepted one exclusive
 graphics owner per window and protected retirement after worker drain, before
 dependency release. The owner's requested final review completed on 2026-09-16
-against `master@e2d30ea`; D-5 records its clarifications. No implementation issues
-have been created from this doc.
+against `master@e2d30ea`; D-5 records its clarifications. Epic #140 and all four
+children (#141–#144) are now filed and approved. The ledger records processing,
+not implementation; canonical approval amendments are part of each issue's spec.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -17,11 +18,11 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Retain windows until graphics dependents safely retire
-- [ ] LIFE-1. Model exclusive window attachments and retirement evidence
-- [ ] LIFE-2. Compose managed dependency lifetimes around application supervision
-- [ ] LIFE-3. Establish the protected host retirement boundary
-- [ ] LIFE-4. Expose exclusive attachments with independent dynamic retirement
+- [x] EPIC. Retain windows until graphics dependents safely retire — [#140]
+- [x] LIFE-1. Model exclusive window attachments and retirement evidence — [#141]
+- [x] LIFE-2. Compose managed dependency lifetimes around application supervision — [#142]
+- [x] LIFE-3. Establish the protected host retirement boundary — [#143]
+- [x] LIFE-4. Expose exclusive attachments with independent dynamic retirement — [#144]
 
 ## Epic contract
 
@@ -39,7 +40,9 @@ concrete precondition
 
 ## Current state and evidence
 
-Verified at `master@e2d30ea` on 2026-09-16:
+Source observations verified at `master@e2d30ea` on 2026-09-16 still describe
+the unimplemented attachment boundary at `9300962`. Tracker state below was
+refreshed on 2026-09-17:
 
 - `Runtime/GLFW/Internal.hs` under `packages/glfw/runtime-glfw-core/Hetoimasia`:
   `beginClose` publishes closing, closes command admission and input, and calls
@@ -54,10 +57,11 @@ Verified at `master@e2d30ea` on 2026-09-16:
   its parent window/device alive. CPU scope exit proves no GPU completion.
 - Ordinary window borrows end when their callback returns. There is no surface
   integration or durable graphics attachment. Vulkan is still a package note.
-- #115–#118 merged through #119–#122. Review found the follow-up #123 in monitor
-  recovery; this is separate from the missing lifetime integration.
-- #86 and #49 contain no graphics-owner or GPU-completion child. The Vulkan
-  design P-5/Q-7 previously captured this gap and now links here.
+- #115–#118 merged through #119–#122. Monitor follow-up #123 merged in #126;
+  LIFE-4's external repair gate is satisfied. GLFW epic #86 is closed.
+- Epic #140 owns this CPU lifetime work; #131 owns its wake/scheduling
+  prerequisites. Vulkan surface and actual GPU completion remain owned by
+  the Vulkan design's P-5/Q-7 and are not implemented by these issues.
 
 ## Scope and desired experience
 
@@ -442,8 +446,8 @@ prove implementation; solving waits for its prerequisites to merge.
 - **Phase:** usable pre-Vulkan boundary.
 - **Depends on:** LIFE-3.
 - **External prerequisite:** scheduling TIME-5 (deadline-driven owner turns)
-  and repair #123 (monitor association).
-- **Ordering:** completes this arc; #123 must be repaired before changing the
+  and the satisfied repair #123 (monitor association, merged in PR #126).
+- **Ordering:** completes this arc; #123 is repaired before changing the
   window controller in this slice.
 - **Relevant decisions:** D-1, D-2, D-3, D-4.
 - **Acceptance signals:** two-window retirement stays independent; close and

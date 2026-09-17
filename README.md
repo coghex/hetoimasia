@@ -9,12 +9,15 @@ GLFW with dynamic windows, controls, monitor-aware modes, and input feeds.
 Vulkan, Lua, fonts, and rendering remain planned; their directories contain
 ownership notes and are not in the Cabal package list.
 
-All fourteen original GLFW PRs are merged. The
-[completion review](docs/project_review_114-101.md) identified four open repairs
-([#115](https://github.com/coghex/hetoimasia/issues/115),
-[#116](https://github.com/coghex/hetoimasia/issues/116),
-[#117](https://github.com/coghex/hetoimasia/issues/117),
-[#118](https://github.com/coghex/hetoimasia/issues/118)) to verify before Vulkan.
+The original GLFW arc and its completion repairs (#115–#118 and #123) are
+merged and reviewed; epic #86 is complete. Native desktop tests now require
+explicit per-session consent (#124). The active pre-Vulkan work is
+[package-owned tests](docs/test_architecture_design.md) (#49),
+[scheduling and native wake](docs/runtime_scheduling_design.md) (#131), and
+[window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140).
+Their issues are filed; remaining implementation is tracked in those epics.
+The [Lua design](docs/lua_runtime_design.md) is ready for staged processing,
+with platform isolation proofs before production sandbox work.
 
 ## Start here
 
@@ -114,14 +117,15 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `app/` | Application composition and console consumer | Buildable |
 | `packages/foundation/` | Logging, CPU scopes/collections, failures, recovery, workers and messaging | Buildable |
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
-| `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; four repairs open |
+| `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; original arc and repairs complete |
 | `packages/render-api/` | Backend-independent rendering contracts | Planned |
 | `packages/gpu-vulkan/` | Vulkan resource and submission ownership | Planned |
 | `packages/render-2d/`, `packages/render-3d/` | Dedicated rendering paths | Planned |
 | `packages/scripting-lua/` | Lua host and registration mechanism | Planned |
 | `samples/` | Future independent rendering consumers | Planned |
 | `integrations/` | Game adapters | Planned |
-| `test/` | Component-owned, display-free engine Hspec examples | Buildable |
+| `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
+| `test/` | Root runtime, GLFW and console coverage until #129/#130 finish migration | Buildable |
 | `packages/glfw/native-tests/` | Shared native Hspec fixture and platform verification | Cocoa locally; Linux X11 in CI |
 | `tools/test/` | Workflow, validation and provisioning Hspec examples | Buildable |
 

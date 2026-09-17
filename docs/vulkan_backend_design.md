@@ -36,7 +36,7 @@ yet.
   consumers; agents implementing and testing its bounded parts.
 - **Arc label:** none proposed yet.
 
-## Current handoff at `e2d30ea`
+## Current handoff at `9300962` — 2026-09-17
 
 The CPU runtime, messaging, and independent GLFW implementation are now present.
 Logging, resources, runtime, and messaging arcs are complete. GLFW issues
@@ -45,17 +45,19 @@ windows, native input, and shared native fixture. The
 [completion review](project_review_114-101.md) produced repairs #115–#118,
 now merged through #119–#122. The [repair review](project_review_122-119.md)
 found follow-up #123 (the recovery association after a move between live
-monitors). Resolve it before graphics/window-controller integration. This
-design remains exploring.
+monitors), now merged in PR #126. Native desktop-test consent #124 merged in
+PR #128. Epic #86 is closed; none of these repairs remains an implementation
+gate. This design remains exploring.
 
 The owner requested a pre-Vulkan backlog on 2026-09-16. Scheduling now has its
 own [design](runtime_scheduling_design.md), with six reviewed slices; CPU-side
 graphics lifetime integration has its own
 [design](window_graphics_lifetime_design.md), with four reviewed slices.
-Both prerequisite documents are ready for issue processing after the final
-review on 2026-09-16; actual Vulkan scope here remains exploring.
-Those documents own these prerequisite contracts and their future tracker
-items. This Vulkan document owns actual surface integration and GPU completion;
+Both prerequisite documents have now been fully processed: scheduling epic #131
+owns #133/#134/#135/#136/#138/#139, and lifetime epic #140 owns #141–#144.
+Those approved issues, including their canonical approval amendments, own the
+prerequisite implementations. This Vulkan document owns actual surface
+integration and GPU completion;
 do not draft duplicate TIME or LIFE slices here.
 
 The active work is to settle window/surface borrowing and dynamic retirement,
@@ -92,62 +94,22 @@ Runtime-host source above is under
 filed fixture cancellation repair [#118](https://github.com/coghex/hetoimasia/issues/118)
 was also required for reliable native lifecycle evidence. All four repairs in
 this historical review subsequently merged; the current handoff above records
-their review and the remaining follow-up #123.
+their review and the subsequently merged follow-up #123. This table is a dated
+historical assessment, not a list of current open defects.
 
-## Historical pre-GLFW baseline and evidence
+## Completed foundations and prior evidence
 
-Hetoimasia inspected at `7e92e73d5eed7e564e9752ee49cce0eb5ba150c2`:
+The historical pre-GLFW inventory is superseded by implemented contracts:
+[CPU resources](resources.md), [runtime/supervision](supervision.md),
+[messaging](messaging.md), and [GLFW](glfw.md). The continuation facade,
+application composition, component state, worker ownership and failure evidence
+are delivered; do not rebuild Synarchy's combined Reader/State EngineEnv.
 
-- Issue #47 / PR #48 closes public record updates of retained cleanup failures.
-  Its three readers remain available; the hidden positional representation
-  binds failure identity to unchanged evidence. External-client tests cover
-  rejected updates and permitted inspection/reattachment.
-- TEST-1, issue #50 / PR #51, composes Logging, Runtime, and Resources without
-  changing the resource spec tree. The moved 59 example descriptions and 102
-  typed test/helper bindings match their pre-refactor versions.
-- Independent review passed all 145 engine and 262 workflow examples, build,
-  console smoke, and focused Logging/Runtime/Resources selections (49/10/86).
-  An unmatched selection exits unsuccessfully. No current repair was found in
-  these two PRs. This verification was local on macOS; the same revision's
-  [Linux validation run](https://github.com/coghex/hetoimasia/actions/runs/34727412167)
-  also passed. These checks exercised no graphics backend.
-- `packages/gpu-vulkan/README.md` reserves ownership only. No GLFW/Vulkan
-  implementation or dependency is present. Foundation and runtime are CPU-only.
-- The [resource contract](resources.md) now provides CPU scopes, composite
-  construction, the continuation facade, and retained cleanup evidence. GPU
-  completion is deliberately outside that guarantee.
-
-### Continuation and application-initialization status
-
-Verified against the same revision after the owner's sequencing clarification:
-
-| Piece | Implemented state |
-|---|---|
-| Resource continuation | `Hetoimasia.Foundation.Resource` defines opaque `Scoped a`, with `Functor`, `Applicative`, `Monad`, and `MonadIO`; `withScoped` is its runner. |
-| Scoped initialization building blocks | `allocResource`, `allocComposite`, and `locally` exist over the CPU resource contracts. Hspec covers callback lifetime, normal/failing/cancelled unwinds, skipped later acquisition, and nested scope exit. |
-| Integration example | `Hetoimasia.Runtime.Resources.resourceSmoke` composes logging, scoped allocations, and injected work. Its `Channel` is a demonstration using in-memory slots, not the messaging transport. |
-| Application runner | `Hetoimasia.Runtime.runApplication` logs around a supplied `IO` action. It constructs no engine context and starts no workers. |
-| Application context/state and boot lifecycle | No counterpart of Synarchy's combined Reader/State `EngineM`, `initializeEngine`, or `defaultEngineState` exists. The console assembles its logger and chooses a smoke action. |
-| Messaging, threading, GLFW | No reusable production implementation exists yet. These are now work before Vulkan, under D-6. |
-
-Synarchy's `Engine.Core.Monad` combines continuations with a concrete Reader
-environment and IORef-backed state. Its `Engine.Core.Init.initializeEngineWith`
-constructs queues, references, and subsystems into EngineEnv. Hetoimasia has
-implemented the resource-continuation responsibility. The separate
-[runtime foundation design](runtime_foundation_design.md) now specifies
-application context, component state, and initialization composition under
-epic #52. Its eight children and supervision repairs were subsequently merged
-and verified; current runtime contracts live in `supervision.md` and related
-implementation documents.
-
-This arc refines FND-2/FND-3 of the
-[broader foundation design](engine_foundation_design.md). The owner's chosen
-window-and-triangle milestone takes precedence over that document's older
-offscreen-first sequence. Reuse completed resource work and TEST-1; do not draft
-duplicate foundation or test-reorganization issues. TEST-2 in the
-[test design](test_architecture_design.md) was fulfilled by GLFW-7/#93 for the
-GLFW-only fixture. This Vulkan arc owns the additional GPU fixture and completion
-proof; it does not reopen or expand #93 retroactively.
+This arc refines FND-2/FND-3 of the older [foundation design](engine_foundation_design.md).
+D-1 supersedes that document's early offscreen-first sequence. TEST-2/#93 and
+its repair #118 delivered the GLFW-only shared fixture; actual GPU completion
+and GPU fixtures belong here. Prior reviews and Git history retain the original
+bootstrap inventories; they are not current prerequisite lists.
 
 ### Synarchy behavior to carry forward
 
@@ -255,7 +217,7 @@ consumers before it is needed by rendering. Do not postpone threading solely
 because a triangle could run without it.
 
 The runtime, worker, messaging, and GLFW slices subsequently landed, followed by
-the four GLFW repairs. Their review produced #123. The agreed main-thread
+the four GLFW repairs and follow-up #123. The agreed main-thread
 GLFW/render ownership still holds:
 reusable worker support does not move GLFW operations to a worker. Remote
 Linux/local macOS validation and deliberate reuse of Synarchy remain accepted.
@@ -310,87 +272,17 @@ that never occurred. Recovery policy and full completion behavior remain Q-2.
 
 ### P-3. Establish a small message-passing foundation before its GLFW consumer
 
-The owner asked whether Synarchy's queues and command processing should precede
-the backend and accepted that prerequisite in D-6. Establish the reusable queue
-contract with headless Hspec tests and use it in runtime/GLFW consumers before
-Vulkan. The detailed transport contract below remains a proposal to refine;
-worker lifecycle is also part of the pre-Vulkan work.
-
-Synarchy has three distinct pieces worth retaining: generic transport in
-`Engine.Core.Queue`, component-specific message types and dispatchers, and worker
-lifecycle in `Engine.Core.Thread`. Keep those responsibilities separate here:
-
-| Responsibility | Proposed placement and timing |
-|---|---|
-| Generic queue transport | Foundation: opaque typed queues, the first consumers' send/read/drain operations, explicit ordering and evaluation rules, and useful backlog diagnostics. No window, Vulkan, Lua, or game imports. |
-| Window events and commands | GLFW component and its application integration: typed messages, event handling, and owned window state. Add these with the actual window consumer. |
-| Background worker ownership | Runtime, in the pre-Vulkan infrastructure phase: startup outcome, stop/wakeup, completion observation, failure propagation, and joining before borrowed resources end. Exercise the contract through headless Hspec workers and component integration. |
-
-Suggested first flow:
-
-```text
-GLFW callback -> typed window-event queue -> main-thread window-state/command handling
-```
-
-Deferring handling until after callback return is useful even when producer and
-consumer run on the same thread. Enqueueing does not automatically create a
-worker or invoke subscribers. Let each receiving component own its message
-types and draining; give producers only the send capability they need. Avoid a
-central message sum that imports every subsystem, or a registry of all queues.
-
-Before implementing this proposal, settle these transport/policy boundaries:
-
-- FIFO preserves the queue's committed ordering; it does not promise a fixed
-  ordering between racing producers or broadcast a message to multiple readers.
-- A command requesting an action, an event reporting a transition, and a current
-  state snapshot have different requirements. Only coalesce messages whose
-  component contract permits it. For example, retaining just the latest size
-  must not erase a minimize/restore transition or reorder it across a barrier.
-- State the capacity and overload policy for each use. Synarchy's underlying
-  [TQueue](https://hackage.haskell.org/package/stm-2.5.3.1/docs/Control-Concurrent-STM-TQueue.html)
-  is unbounded; [TBQueue](https://hackage.haskell.org/package/stm-2.5.3.1/docs/Control-Concurrent-STM-TBQueue.html)
-  blocks writes when full. A callback cannot wait for capacity that only its own
-  main-thread consumer can free. A bounded channel needs an explicit
-  non-blocking admission/coalescing/failure policy for that use.
-- Define how much queued work one loop turn processes and how remaining work
-  survives. Queue capacity and the processing budget solve different problems;
-  a continuous producer must not starve drawing or exit handling. Taking one
-  whole-queue snapshot also does not bound the cost of handling that snapshot.
-- Preserve short STM transactions and consistent telemetry. A timed read must
-  race its timeout transactionally, following Synarchy's implementation. This
-  alone does not make handling reliable after dequeue: cancellation, abandoned
-  requests, acknowledgements, and shutdown need the consumer's own contract.
-
-The first transport implementation should test its own observable guarantees
-and adaptations with deterministic coordination. Worker supervision gets its
-own pre-Vulkan lifecycle contract. Lua scheduling, game commands, and save/load
-barriers get separate designs with their consumers. CPU message delivery proves
-no GPU completion.
+Completed by messaging epic #73; Q-4 is resolved. Use bounded channels,
+prepared payloads, snapshots and supervised inboxes from [messaging.md](messaging.md).
+The historical transport proposal is superseded by that implemented contract;
+no additional queue abstraction or event-bus delivery belongs in this arc.
 
 ### P-4. Design scoped application composition and component-owned state
 
-Preserve Synarchy's convenient initialization flow and scoped `do` notation.
-Define each component's configuration, private state, borrowed services, and
-initialization result. The application assembles those constructors under
-explicit lifetimes; consumers receive the capabilities they use. An environment
-record can group one component's dependencies without collecting every engine
-subsystem into it.
-
-The existing `Scoped` supplies the resource-lifetime layer. The runtime design
-selects explicit `IO` arguments and narrow opaque handles for component operations.
-Do not introduce an application-wide mutable state record
-as a prerequisite to writing initialization functions. A constructor should
-either establish a usable component or unwind its partial work; lifecycle
-states and reinitialization behavior need explicit contracts.
-
-Worker completion is specified by the runtime design: the group owns a protected
-drain that retains borrowed dependencies until children and cancellation helpers
-finish. Joining does not run as an `allocResource` release. Runtime supervision
-uses explicit checkpoints and supervised waits over the raw worker group.
-The continuation abstraction alone does not supervise children.
-
-Q-5 is resolved and implemented by that accepted runtime design. This backend
-draft does not redefine those APIs or the completed CPU resource primitives.
+Completed by runtime epic #52 and its repairs; Q-5 is resolved. Use narrow
+services and explicit application composition under the existing failure and
+supervision contracts. LIFE-2/#142 adds the managed dependency lifetime needed
+by graphics; it is not a reason to rebuild the runtime or add EngineEnv.
 
 ### P-5. Integrate graphics retirement with both window close and host exit
 
@@ -494,6 +386,198 @@ this additive extension lands. Reducing that constant alone supplies neither
 frame pacing nor a wake protocol. Scheduling gives a chosen wait budget, not a
 hard real-time guarantee for arbitrary hooks, native calls, or GPU backpressure.
 
+### P-7. Establish one loader and a narrow surface bridge
+
+Proposal added after the independent readiness review on 2026-09-17; it is not
+an approved package/API declaration. Surface integration already had a design
+home in P-1/P-5, but has no delivery issue and is excluded from LIFE-4.
+
+Own the Vulkan loader outside both the GLFW session and Vulkan instances. Give
+the backend and GLFW the same loader's `vkGetInstanceProcAddr`; do not mix a
+direct MoltenVK instance with a different loader's dispatch. Resolve platform
+loading and ABI details through the Q-2 compatibility proof first.
+
+An additive session-construction option supplies the loader function before
+`glfwInit` on the process main thread, after session exclusivity is established.
+Preserve the ordinary window-only entry point. GLFW 3.4 documents that this
+setting survives termination and only takes effect at initialization: explicitly
+select a loader or the default for every session and clear retained borrowed
+configuration before unloading its library, including failed initialization.
+The loader remains live through its last GLFW and Vulkan use. No arbitrary
+user initialization callback belongs in a bounded release or admission lock.
+See [GLFW's loader contract](https://www.glfw.org/docs/3.4/group__init.html).
+
+The bridge copies required instance-extension names while the session is live,
+creates a surface only under the protected window attachment, and hands typed
+ownership to the backend. Partial construction, cancellation, failed destruction
+and instance/window mismatch need explicit outcomes. A borrowed raw window
+pointer is never a persistent surface lifetime. The backend disposes the surface
+before acknowledging the attachment's retirement and before destroying the
+instance; GLFW does not destroy Vulkan surfaces for it.
+
+Use a dedicated public interop sublibrary only if the selected binding needs
+that boundary. The ordinary GLFW API stays independent of the Haskell Vulkan
+package and of game renderers. Keep ABI representation in a private, verified
+adapter; do not invent unchecked `Ptr ()` conversions to avoid headers. Decide
+whether the bridge's implementation uses Vulkan headers in its own build once
+the binding is chosen. Extend the small GLFW scripted seam for the operations
+actually added; do not mirror all Vulkan entry points. Instance proc lookup can
+come from the already owned loader/binding rather than a redundant GLFW wrapper.
+
+Device selection may query a real surface without making a shared device's
+lifetime a child of the first window. Record the final ownership graph and how
+subsequent windows validate presentation support before multi-window rendering.
+Closing the bootstrap window must not accidentally release another window's
+device. This is distinct from the already accepted first main-thread owner.
+
+### P-8. Retire GPU generations beneath the window attachment
+
+Agree with the missing boundary, but start it inside `gpu-vulkan`. A private
+pure retirement model with abstract completion facts is testable without a GPU;
+that does not require a new foundation-wide resource framework or public
+backend-independent API before a second backend exists.
+
+The model distinguishes logical release, ended CPU uses capable of future
+submission, recorded-but-unsubmitted references, and completion of every
+submitted use. A queued or executable command buffer can retain a resource even
+before a submission fence exists. Key obligations by device/queue and resource
+generation; one scalar completed serial is valid only after proving a common
+submission order. Presentation obligations remain separate from submission
+fences. Resetting/re-recording a command buffer and abandoning an unsubmitted
+batch must discharge the right references explicitly.
+
+A successful submission publishes its completion obligation atomically with the
+owner's bookkeeping under a protected handoff. Cancellation or failed submission
+must not leave an unsignallable fence treated as pending work, nor release a
+resource whose native submission outcome is uncertain. Terminal device loss is
+a distinct policy path, not a synthetic completed fence. Q-2 must establish
+which evidence authorizes which destruction on that path.
+
+Use bounded frame arenas, reusable command/descriptor pools and generation
+records owned by a small number of scoped roots. Reclaim a frame slot only after
+its CPU and GPU obligations end. Bound retired bytes/objects and apply explicit
+backpressure when the bound is reached; an indefinitely unsignalled device must
+not produce an unbounded deletion queue. Stop admission, retain parent resources,
+and preserve disposal failures without replay when safe release is unknown.
+
+The existing Collection is a single-owner CPU primitive, not inherently limited
+to windows: a render owner could own its own collection. Do not share one across
+threads or turn it into a concurrent GPU registry. `Scoped` is useful beyond
+startup whenever lexical ownership fits; it does not supply deferred completion.
+Per-frame native allocations should not be the default strategy. There is no
+claim that masks alone have been measured as this engine's bottleneck.
+
+### P-9. Prove the toolchain before building the renderer
+
+The first proposed Vulkan work is a compatibility proof, not a triangle or a
+general renderer API. Synarchy's inspected local build plan uses GHC 9.12.2,
+`vulkan-3.26.6` and `vulkan-utils-0.5.10.6`; both projects pin the Hackage index
+at 2026-08-14. This is a useful candidate baseline, not evidence that Hetoimasia
+already builds those components on Linux and macOS. Inspect the binding's actual
+loader, callback and FFI modes; potentially blocking calls and Haskell callbacks
+must remain compatible with the threaded RTS and the chosen failure boundary.
+
+Record exact compiler/binding, loader, driver, validation-layer and shader-tool
+versions. Query real capabilities: advertised Vulkan API version alone does not
+establish the presentation-completion extensions Q-2 needs. Evaluate the standard
+loader with MoltenVK on local macOS and pinned Mesa Lavapipe in the Linux image;
+explicitly select the intended ICD so CI cannot silently run another driver.
+Software Vulkan gives useful API and image correctness evidence, not hardware
+performance coverage. Preserve portability enumeration/subset requirements from
+Synarchy and verify them against the selected versions.
+
+Provisioning is its own code-and-docs delivery: extend the existing image recipe,
+publish and verify a new digest, update the native/toolchain evidence identity,
+and reuse the existing cache path. Do not rebuild/install Vulkan dependencies in
+every test job. CPU-only projects must still build without this SDK. Select one
+pinned build-time SPIR-V compiler; track shader sources, target environment,
+flags and tool identity, and make generated artifacts reproducible/packageable.
+Runtime shader compilation and shader hot reload are outside this first arc.
+
+No native Vulkan proof was run during this review. Q-2/Q-3 stay open until the
+chosen profile has evidence on both platforms and its failure path is specified.
+
+### P-10. Test the decisions and the native boundary at different levels
+
+Use pure planning/state tests for capabilities, queue selection, resize, frame
+transitions and retirement. Add small injected operation interfaces where they
+prove effects that pure tests cannot: partial acquisition, failed submission,
+callback containment and disposal ordering. Do not build a second implementation
+of hundreds of Vulkan calls for tests, or rely on real-device success to prove
+rare failure/cancellation paths.
+
+Real integration groups exercise the selected Vulkan implementation with
+validation and image/lifecycle assertions; a small isolated Linux software group
+should be required when affected, outside the universal floor (proposal for
+Q-3). Lengthy stress, performance and extra-hardware probes remain optional.
+Local disruptive macOS evidence needs the human's explicit approval each session.
+Use the package-owned suite layout from #129/#130; these moves are useful early
+landings, not an excuse to block independent compatibility research.
+
+External-client compilation tests prove important public opacity boundaries;
+they are not required for every helper. Contract docs should describe ownership,
+failure states and usage once, with implementation detail beside its owner.
+Neither a test/code line ratio nor component count alone establishes waste.
+
+### P-11. Contain validation callbacks and measure before RTS tuning
+
+The synchronous logger is behaving as designed. `newHandleSinkWith` can disable
+per-entry flush, but writes can still block; buffering that handle alone does
+not make the render path nonblocking. Avoid changing the foundation logger's
+semantics to accommodate a future consumer.
+
+Before enabling validation, provide component-owned bounded diagnostic capture.
+The native callback copies capped data into owned storage, contains every
+exception, and never formats to a user sink, waits for queue space or calls back
+into Vulkan. Preserve a latched error/overflow indication independently of
+successful logging. Saturation is visible through counts/truncation and cannot
+be presented by an integration test as complete, clean validation evidence.
+[The Vulkan callback contract](https://docs.vulkan.org/refpages/latest/refpages/source/PFN_vkDebugUtilsMessengerCallbackEXT.html)
+forbids Vulkan calls from the callback.
+
+Report outside the callback and graphics critical path through a bounded,
+component-owned consumer. If that consumer is a worker, its lifetime extends
+through backend teardown and the last possible callback; do not put it in an
+application worker group that drains before graphics retirement. Detach/quiesce
+callbacks, drain or account for captured diagnostics, join the consumer, then
+release its logger/storage. Sink failure cannot replace the primary Vulkan
+failure or authorize unsafe GPU retirement. This is a Vulkan diagnostic adapter,
+not approval of an engine-wide asynchronous logger rewrite.
+
+Record an optional reproducible baseline before optimizing: idle CPU use,
+allocations and service latency at increasing window/port counts, deadline
+lateness under command bursts, and later frame-time distributions/GC pauses.
+Existing resource allocation-cost tests are useful but are not a frame baseline.
+Record hardware, revision, native/toolchain identity and RTS flags. Choose
+capabilities, nursery size and GC mode from measured representative workloads;
+do not guess permanent `-N`, `-A` or nonmoving-GC defaults now. Performance probes
+belong outside correctness CI and must not turn timing noise into Hspec failures.
+
+### P-12. Make waits cooperative without promising driver preemption
+
+Prefer finite fence/timeline/acquire timeouts, with explicit Pending/Timeout,
+stop checks and owner progress between attempts. Normal owner-loop retirement
+uses nonblocking progress opportunities so one closing window does not stall
+another. Stop ends new admission; it does not end outstanding GPU use. Protected
+shutdown may still retain dependencies while completion cannot be established.
+
+Audit each actual API: queue/device idle have no timeout parameter and are not
+the normal frame pacing or blanket retirement mechanism. Some driver calls can
+block despite having no explicit wait in their name. Neither a Haskell timeout,
+async exception nor safe FFI can promise to interrupt arbitrary foreign code.
+Keep GPU waits out of foundation's uninterruptible release callbacks and specify
+the behavior of native destroy calls under the chosen backend policy.
+
+The review's claim that device loss necessarily leaves a Vulkan wait stuck is
+too strong: [Vulkan requires those waits to return in finite time after device loss](https://docs.vulkan.org/spec/latest/chapters/devsandqueues.html#devsandqueues-lost-device).
+A defective driver can violate that guarantee. A caller-selected finite timeout
+is also not a hard wall-clock bound. Preserve the accepted retain-and-wait
+policy, report a stalled condition without flooding logs, and document external
+process termination as the operator escape. Hard in-process shutdown guarantees
+or a separately killable renderer process would be a new design, not an implied
+change to worker drain. Presentation still needs its own Q-2 completion proof;
+queue/device idle alone does not supply it.
+
 ## Open questions
 
 ### Q-1. Accept P-1's component ownership and first thread model?
@@ -503,6 +587,10 @@ Frame work can delay event handling; a future render worker requires its own
 handoff and lifetime contract. Exact package names follow the agreed boundaries.
 
 ### Q-2. What compatibility and completion contract should the backend require?
+
+P-7/P-8/P-9/P-12 now identify the loader, ABI, GPU-generation and wait-policy
+proofs this answer must include. No SDK/binding/API version or completion
+extension has been adopted merely because a source advertises it.
 
 Inspect the actual macOS/MoltenVK and Linux environments before selecting the
 minimum Vulkan version, extensions, shader compiler/toolchain, and presentation
@@ -528,6 +616,10 @@ This is backend lifecycle work, not another repair of the CPU resource library.
 Settle it before any slice submits GPU work or promises complete cleanup.
 
 ### Q-3. Accept P-2's window scope, and where will Linux graphics execute?
+
+P-10 proposes a small required-when-affected software Vulkan group plus optional
+stress/performance/hardware groups. Confirm that policy with the measured native
+profile; do not add all graphics work to the mandatory floor by inheritance.
 
 Remote CI remains Linux-only; local macOS validation is settled by D-3. Determine
 whether Linux windowed evidence uses an available desktop/GPU, a Linux CI display
@@ -555,15 +647,16 @@ including D-13 through D-18 and P-10 through P-13. Epic #52 and children #53–#
 plus repairs #69/#70, delivered errors, recovery, construction, worker ownership,
 logging lifetime, supervision, and application integration. GLFW subsequently
 added the pre-drain quiescence hook. Use those contracts; do not reopen them.
-The remaining gates are follow-up #123 and the scheduling, dependent-lifetime,
-and GPU lifecycle/platform designs.
+The remaining gates are the scheduling and dependent-lifetime implementations
+and the GPU lifecycle/platform choices here. Follow-up #123 is satisfied.
 
 ### Q-6. What timing, suspension, and wake policy should the first consumer use?
 
 Delegated to [runtime_scheduling_design.md](runtime_scheduling_design.md).
 Owner accepted event/deadline/fixed-step support with configurable limits and
 per-window render suspension independent of simulation. That document's D-5
-records its completed final review and readiness. No fixed 0.25-second cap
+records its completed final review and readiness; epic #131 owns delivery.
+No fixed 0.25-second cap
 or simulation rate has been silently inherited from Synarchy.
 
 ### Q-7. What scoped attachment API connects graphics owners to windows?
@@ -571,8 +664,17 @@ or simulation rate has been silently inherited from Synarchy.
 Delegated to [window_graphics_lifetime_design.md](window_graphics_lifetime_design.md).
 The owner accepted one exclusive graphics owner per window. That document's
 D-5 records review of its protected IO host lifetime and managed application
-composition. Vulkan Q-2 still owns real GPU-completion proof and the backend
-surface bridge; no attachment acknowledgement may substitute for it.
+composition; epic #140 owns delivery. The attachment API itself is settled
+there. Vulkan-specific surface interop remains open under P-7/Q-2, and no
+attachment acknowledgement may substitute for real GPU-completion proof.
+
+### Q-8. What diagnostic and measurement policy should the backend adopt?
+
+P-11 proposes bounded callback capture and an off-owner diagnostic consumer,
+with visible loss and a lifetime through the final teardown callback. Confirm
+its delivery scope and capacity/overflow policy before enabling validation.
+Measure optional owner-loop and frame workloads before choosing permanent RTS
+settings. This is not a request to reopen the completed synchronous logger.
 
 ## Verification strategy
 
@@ -627,26 +729,31 @@ Required contracts and evidence belong in each implementation PR.
 
 ## Delivery plan
 
-No Vulkan child slice is ready for processing. Runtime, messaging, GLFW, and
-repairs #115–#118 are merged. Follow-up #123 remains. As of the 2026-09-16 tracker
-check there are no scheduling or lifetime implementation issues. The new
-prerequisite designs contain the ready TIME and LIFE ledgers; process them
-separately. Refine this document's Q-2/Q-3 before actual Vulkan work, and do not
-bury completion or surface lifetime under a triangle delivery issue.
+No Vulkan child slice is ready for processing. The owner has not signed off
+P-7 through P-12 or selected the Q-2/Q-3/Q-8 profiles. Existing TIME/LIFE issues
+already own the CPU prerequisites; #123 is merged. The first three pre-Vulkan
+documents require no more processing. The older foundation umbrella must not
+create duplicate GPU issues beside this document.
 
-Recommended sequencing, not yet approved child specifications: finish #123;
-establish the CPU-testable clock/deadline model and native wake
-integration; establish the dependent-window retirement contract and narrow
-surface integration; then implement submission/presentation completion and the
-first graphical consumer. Scheduling design and GPU-lifetime design can advance
-independently. The latter must settle all exit paths before any slice creates
-GPU work, even if completion implementation lands after the surface seam.
+Recommended work order for the next design session (candidate boundaries, not
+filed issues or approved child specifications):
 
-When graphics work resumes, derive dependency-ordered Vulkan-only slices and
-mirror them in this processing ledger, depending on the TIME/LIFE work rather
-than reimplementing it. Keep GPU fixture work distinct from the completed
-GLFW-only TEST-2 delivery. No tracker item is created by this design edit.
+1. Prove the binding, shared loader and platform capability profile, including
+   viable presentation retirement on macOS/MoltenVK and Linux software Vulkan.
+   Use bounded research and candidate provisioning; do not claim a renderer.
+2. Deliver the pinned native recipe/image and shader build inputs, with cached
+   artifacts and accurate CI identity. Keep code, evidence and docs in that PR.
+3. Add loader-aware GLFW construction and the narrow surface bridge, staged so
+   protected LIFE ownership is in place before a surface outlives a CPU borrow.
+4. Deliver backend-local generation/retirement planning and its injected failure
+   proofs, then connect concrete submission and presentation completion. Pure
+   model work can proceed alongside the bridge; live submissions wait for both.
+5. Establish bounded validation capture before enabling validation and real GPU
+   fixture checks, then integrate frame/swapchain behavior with TIME scheduling.
+6. Add the triangle consumer and both-platform lifecycle/image evidence. Record
+   an optional performance baseline and tune only against actual measurements.
 
-The older foundation document supplies architectural context, not a second
-tracker for the same work. This design remains exploring until the relevant
-choices and delivery slices receive review and explicit readiness.
+Split these into one-PR slices after the compatibility evidence determines their
+scope; mirror those IDs in the ledger before readiness. Surfaces, submission,
+presentation completion and diagnostics must not disappear into one oversized
+triangle issue. No new tracker artifact is created by this review.

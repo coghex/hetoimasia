@@ -32,10 +32,10 @@ concrete precondition
 - [x] EPIC. Establish component-owned tests and scoped shared fixtures — [#49]
 - [x] TEST-1. Split the headless engine suite into component specs — [#50]
 - [x] TEST-2. Add a shared fixture for the first concrete graphics suite — [#93]
-- [ ] TEST-3. Extract neutral support shared by independently built test suites
-- [ ] TEST-4. Move foundation contracts into a foundation-owned suite
-- [ ] TEST-5. Move runtime contracts into a runtime-owned suite
-- [ ] TEST-6. Move GLFW headless coverage into a GLFW-owned suite
+- [x] TEST-3. Extract neutral support shared by independently built test suites — [#125]
+- [x] TEST-4. Move foundation contracts into a foundation-owned suite — [#127]
+- [x] TEST-5. Move runtime contracts into a runtime-owned suite — [#129]
+- [x] TEST-6. Move GLFW headless coverage into a GLFW-owned suite — [#130]
 
 The ledger records issue processing, not implementation completion. TEST-1/#50
 merged through PR #51. TEST-2's single implementation, GLFW-7/#93, merged through
@@ -46,7 +46,11 @@ directly authorized the epic amendment: #49 now marks TEST-1/TEST-2 complete,
 records the merged fixture repair, and includes TEST-3 through TEST-6 with the
 reviewed ownership, dependency and validation contracts. The tracker edit was
 verified; its title, `epic`/`tests` labels and open state are unchanged.
-No new child issue was created. TEST-3 is the next processing entry.
+All children have since been filed and approved. TEST-3/#125 merged in PR #132
+and TEST-4/#127 in PR #137. Epic #49's checklist was reconciled on 2026-09-17;
+TEST-5/#129 and TEST-6/#130 remain open. Read each child's canonical approval
+amendments as part of its implementation specification. No processing entry
+remains in this document.
 
 ## Epic contract
 
@@ -69,18 +73,17 @@ No new child issue was created. TEST-3 is the next processing entry.
 
 ## Current implementation
 
-Rechecked 2026-09-16 at `master@e2d30ea`. These are source and tracker
+Rechecked 2026-09-17 at `master@9300962`. These are source and tracker
 observations, not a new test execution:
 
-- Foundation and runtime declare libraries but no Cabal test suites. Root
-  `hetoimasia-tests` composes their specs and GLFW specs under `test/Test/Engine`.
-  Its dependencies include all three packages, the GLFW seam, the console
-  library/executable, and the `glfw-window-examples` build tool. Hspec filtering
-  chooses examples at execution time; it does not remove these build dependencies.
+- Foundation now owns `foundation-tests`; runtime and GLFW headless suites
+  still await TEST-5/TEST-6. Root `hetoimasia-tests` retains runtime, GLFW and
+  console coverage plus the `glfw-window-examples` build tool. Hspec filtering
+  chooses examples at execution time; it does not remove build dependencies.
 - `Test.Engine.Runtime.Console` exercises the application. Conversely,
-  `Test.Engine.Resources.Smoke` exercises runtime's `resourceSmoke`, and the
-  messaging Channel/Snapshot files contain `awaitSupervised` integration cases.
-  Directory names currently do not consistently identify the contract owner.
+  `Test.Engine.Runtime.ResourceSmoke` exercises runtime's `resourceSmoke`, and
+  `Test.Engine.Runtime.Messaging` now holds the six supervised channel/snapshot
+  integration cases. TEST-5 moves these with their owning runtime contracts.
 - Runtime, messaging, and GLFW opacity specs imported a compilation harness from
   `Test.Engine.Resources.Opacity`. Runtime also imported logging test helpers;
   console tests imported configuration values from a logging spec. TEST-3
@@ -102,14 +105,14 @@ observations, not a new test execution:
   acquires a main-thread session, dispatches from Hspec, and retains private
   lifecycle cases. Linux X11 runs remotely when affected; Cocoa runs locally.
   Keep this ownership and fixture contract; GPU fixtures remain future work.
-- `workflow-tests` already owns `tools/test`. Catalog policy version 7 has
-  `build.all`, `test.engine`, and `smoke.console` in its mandatory floor;
+- `workflow-tests` already owns `tools/test`. Catalog policy version 8 has
+  `build.all`, `test.foundation`, `test.engine`, and `smoke.console` in its mandatory floor;
   `test.workflow` and `test.glfw-native` are non-optional affected groups. The
   workflow explicitly assigns group IDs to workers and publishes receipts.
 
-Tracker recheck found open epic #49 for this arc, with no separate package-suite
-migration issue. Open #124 owns the local native-test opt-in guard, and #123 owns
-disconnect recovery. Neither should be absorbed into this refactor. See
+Tracker recheck found open epic #49 and approved migration issues #129/#130.
+Native-test consent #124 and monitor recovery #123 are merged; preserve their
+behavior through the remaining test moves. See
 [glfw.md](glfw.md#the-native-suite) for native-fixture instructions.
 
 ## Historical design evidence
@@ -617,6 +620,8 @@ lands before this migration. No Python probe is needed to prove a source move.
 
 ### TEST-3. Extract neutral support shared by independently built test suites
 
+> Linked to #125 on 2026-09-17 as a new issue.
+
 - **Outcome:** existing root specs use a reusable test-only compiler harness
   without importing it from a resource spec.
 - **Scope:** P-4's minimal support package, project registration, current client
@@ -634,6 +639,8 @@ lands before this migration. No Python probe is needed to prove a source move.
 - **Open questions:** None.
 
 ### TEST-4. Move foundation contracts into a foundation-owned suite
+
+> Linked to #127 on 2026-09-17 as a new issue.
 
 - **Outcome:** `foundation-tests` owns foundation contracts and runs without
   runtime or GLFW dependencies.
@@ -656,6 +663,8 @@ lands before this migration. No Python probe is needed to prove a source move.
 
 ### TEST-5. Move runtime contracts into a runtime-owned suite
 
+> Linked to #129 on 2026-09-17 as a new issue.
+
 - **Outcome:** `runtime-tests` owns runtime behavior and composition with real
   foundation services, while root retains console/application integration.
 - **Scope:** runtime specs/helpers, resource smoke and supervised messaging
@@ -676,6 +685,8 @@ lands before this migration. No Python probe is needed to prove a source move.
 - **Open questions:** None.
 
 ### TEST-6. Move GLFW headless coverage into a GLFW-owned suite
+
+> Linked to #130 on 2026-09-17 as a new issue.
 
 - **Outcome:** `glfw-tests` directly selects all headless GLFW examples beside
   the existing native suite; the root suite no longer depends on GLFW.

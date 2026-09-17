@@ -123,9 +123,8 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Files, launches, and documentation
 
-- The current executable is console-only and safe to run. Future windowed
-  launches must be explicit; default automated checks should use headless or
-  offscreen modes once implemented. No debug server or port is defined yet.
+- The current executable is console-only and safe to run. Routine local
+  checks must stay headless; future windowed launches must be explicit. No debug server or port is defined yet.
 - `glfw-native-tests` shows, focuses, resizes, minimizes, maximizes, and takes
   fullscreen windows on the desktop it runs on, and refuses to enter a session
   without per-run consent. Before starting a native session on a person's
