@@ -207,6 +207,7 @@ test-suite glfw-tests
         Test.GLFW.Monitor
         Test.GLFW.Notify
         Test.GLFW.Opacity
+        Test.GLFW.Scheduled
         Test.GLFW.Session
         Test.GLFW.Spec
         Test.GLFW.Wake

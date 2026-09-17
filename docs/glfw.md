@@ -483,8 +483,10 @@ data HostBookkeeping = HostBookkeeping { bookkeepingWindows, bookkeepingClosing,
 
 data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
                              , hostWindowLimit ∷ Int, hostCommandCapacity, hostInputCapacity ∷ Integer
-                             , hostCommandBudget, hostEventBudget ∷ Int, hostIdleWait ∷ Double }
-defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, budgets 16, idle wait 0.1 s
+                             , hostCommandBudget, hostEventBudget ∷ Int, hostIdleWait ∷ Double
+                             , hostClock ∷ MonotonicSource }   -- Show omits the clock; there is no Eq
+defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, budgets 16, idle wait 0.1 s,
+                                                   -- and the process's monotonicSource
 validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
 data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | IdleWaitRejected Double
                         | WindowLimitRejected Int | InputCapacityRejected Integer
@@ -497,6 +499,18 @@ data Turn = Turn { turnNumber ∷ Natural, turnWaited ∷ Bool, turnCommands, tu
                  , turnCloseRequests ∷ [CloseRequest] }
 data TurnStep a = Continue | Finish a
 rejectHostCloseRequest ∷ WindowHost → CloseRequest → IO Bool
+
+runScheduledOwnerLoop ∷ WindowHost → RuntimeControl → ScheduledHooks a → IO a
+data ScheduledHooks a = ScheduledHooks { scheduledLogger ∷ Logger, scheduledReady, scheduledEvent ∷ IO Bool
+                                       , scheduledUpdate ∷ ScheduledTurn → IO (ScheduledStep a)
+                                       , scheduledStart ∷ UpdateSchedule }
+defaultScheduledHooks ∷ Logger → (ScheduledTurn → IO (ScheduledStep a)) → ScheduledHooks a
+noApplicationReadiness ∷ IO Bool
+data ScheduledTurn = ScheduledTurn { scheduledTurn ∷ Turn, scheduledNow ∷ Instant
+                                   , scheduledPacing ∷ TurnPacing, scheduledDemand ∷ Maybe CapturedDemand }
+data TurnPacing = PolledForWork | PolledForDeadline | WaitedForDeadline Duration | WaitedForFallback Duration
+data UpdateSchedule = NoUpdateDemand | UpdateImmediately | UpdateBy Instant
+data ScheduledStep a = ContinueWith UpdateSchedule | FinishWith a
 
 runWindowApplication
   ∷ HasCallStack
@@ -2318,6 +2332,105 @@ whether its owner has begun its finite wait; the flag is set immediately before
 the native call and cleared once it returns, so it signals a wait starting or in
 progress rather than proving the call was entered.
 
+### The scheduled owner turn
+
+`runScheduledOwnerLoop` is the additive path for an application that paces
+itself by absolute deadlines. It is a second entry point beside `runOwnerLoop`,
+not a change to it: `runOwnerLoop`, `LoopHooks`, `Turn`, and `TurnStep` keep the
+behaviour [The owner turn](#the-owner-turn) and [Idle waits](#idle-waits)
+describe exactly, including that loop's initial poll, and an application that
+uses them sees nothing new.
+
+Time enters only through the injected `MonotonicSource` on the host's
+`hostClock`. The loop reads no wall clock, starts no timer thread, and sleeps
+never; a seam example configures a `scriptedSource` and scripts every reading.
+Every deadline it is given — its own and a publisher's — is an absolute
+`Instant` in that source's clock domain.
+
+Each scheduled turn performs, in order:
+
+1. `checkRuntime`;
+2. **the inspection**: one sample of `hostClock`, and, in one transaction, the
+   capture of the application's pending demand and the queued command count,
+   then the application's own `scheduledReady` query;
+3. **the choice**, from the stored schedule, the captured request, the queued
+   commands, and that readiness:
+   - anything ready — a command queued, an event ready, or immediate demand from
+     either the schedule or the captured request — polls, as `PolledForWork`;
+   - otherwise a deadline already reached at the sampled instant polls, as
+     `PolledForDeadline`, so no zero or negative timeout reaches GLFW;
+   - otherwise the turn waits the shorter of the time remaining to the earliest
+     deadline, as `WaitedForDeadline`, and the configured fallback bound
+     `hostIdleWait`, as `WaitedForFallback`. With no deadline at all the turn
+     waits that bound. A deadline can only shorten a wait, never extend it, and
+     a host with no windows waits rather than spins;
+4. the native step the choice named, publishing `hostActivity` around it exactly
+   as an unscheduled turn does;
+5. **the resample**: one more sample of `hostClock`, which is the instant the
+   turn's update opportunity is given;
+6. steps 3 through 8 of [the owner turn](#the-owner-turn), unchanged and in the
+   same order: reconciliation, the checkpoints, bounded command work and its
+   feed recovery, and bounded application event work;
+7. `scheduledUpdate`, once per turn, with the turn's `ScheduledTurn`;
+8. `checkRuntime`, before a `FinishWith` result is returned or the next turn
+   begins.
+
+A turn therefore reads the clock exactly twice. The pre-native sample chooses
+the wait; the post-native sample is what the update sees, so a deadline the wait
+itself reached is due in that same turn rather than the one after. Deadlines
+stay absolute and the next turn samples again, so reconciliation, dispatch, and
+the update itself consume the interval: a deadline a turn's own work ate into is
+honoured by the next turn's shortened wait, never pushed out by a fresh full
+one.
+
+**The schedule and the captured request are separate.** The schedule is what
+`scheduledUpdate` last answered, and the loop stores it until the next answer
+replaces it: `NoUpdateDemand`, `UpdateImmediately`, `UpdateBy` an absolute
+instant, or `FinishWith`. It is never combined with an earlier answer, so
+finishing an update implies no immediate demand for another. The captured
+request is [a demand slot's](#demand-slots) coalesced request, taken with its
+revision by that turn's own inspection and consumed there, so an old request can
+never become permanent work. Both are weighed for the wait, and both reach the
+update: `scheduledDemand` carries the captured request and its revision, and an
+application that still wants a deadline an early wake delivered before it was
+due must retain it in the schedule it answers. `scheduledStart` is the schedule
+in force before the first update opportunity; `defaultScheduledHooks` leaves it
+`NoUpdateDemand`, and the ordinary ready-state and deadline rules apply to that
+first turn like any other.
+
+**Readiness is inspected, not dispatched.** `scheduledReady` answers whether an
+application event is ready without dispatching one. It runs once per turn,
+before the native step, decides only whether that turn polls, and spends none of
+`hostEventBudget`; the event opportunity itself is still only `scheduledEvent`,
+in the turn's own bounded event work. An arbitrary application queue is not
+connected to the loop by this: an event published after the inspection answered
+is not seen by that turn, and a worker that needs prompt service publishes
+demand, which wakes the owner.
+
+**Budgets and checkpoints are the unscheduled loop's.** The same finite command
+and event budgets end each batch, so between two consecutive update
+opportunities at most those bounded dispatch attempts occur and a due update is
+never starved by continuous traffic. Fair dispatch across ports, retirement,
+close-request surfacing, feed recovery, quiescence, shutdown order, supervised
+failure propagation, native failure, callback faults, and the owner-thread
+refusals are all the same code and behave identically.
+
+**Waking.** A publication or an admission that arrives between the inspection
+and the wait's entry, or during the wait, ends or pre-empts that wait through
+the [wake protocol](#idle-waits) already in place; the scheduled path adds no
+second notification mechanism. Because the capture is the turn's own inspection,
+what arrived after it is inspected by the next turn. A wake with nothing due and
+no expired deadline is an ordinary turn that recomputes its wait and offers its
+one update opportunity, no more: an event wake does not itself require a redraw.
+The fallback bound stays finite and strictly positive whatever happens to the
+wake, so a configured `hostIdleWait` above zero but below a nanosecond is
+refused by `validateHostConfig` before anything is acquired, as an
+`IdleWaitRejected`.
+
+The conversion from a `Duration` to the seconds `glfwWaitEventsTimeout` takes
+lives here, in the GLFW layer, and is the only one; a wait is only ever entered
+for a positive duration, so the value it passes is finite and above zero.
+
 ### Demand slots
 
 A worker that wants a turn — now, or by a deadline — says so through a
@@ -2348,7 +2461,8 @@ windows however many publishers there are and however often they publish.
 - **Slots hold requests, not schedules.** An ongoing periodic schedule is the
   owner's own state, so a captured request never becomes permanent work. What
   the owner does with a captured request — including how it folds into the next
-  wait — is the scheduled loop's, and is not part of this slice.
+  wait — is [the scheduled owner turn's](#the-scheduled-owner-turn);
+  `runOwnerLoop` captures nothing and leaves both to the application.
 - **The same protection as an admission.** A cancellation before the publishing
   transaction commits publishes nothing. After it commits the request stays
   pending and its wake is owed uninterruptibly, even if the publisher never
@@ -2507,6 +2621,35 @@ one
 degradation and one warning shared by sequential hosts borrowing one session,
 whose wake capability neither shutdown closed;
 and a construction that rolls back lending nothing and waking nothing.
+
+The scheduled owner turn's examples (`--match "scheduled"`) run whole
+applications over the same seam with a scripted clock, which a scheduled turn
+reads exactly twice, so a script of `2n` instants covers `n` turns and a reading
+past the end fails the example. No example sleeps or asserts elapsed
+wall-clock time: the waits asserted are the exact seconds the production code
+passed to the seam's `glfwWaitEventsTimeout`. They prove: a deadline nearer than
+the fallback bound waited for exactly, with the update seeing the instant that
+wait reached; a deadline beyond the bound waiting the bound instead, twice over,
+never extended; an expired deadline polling; the immediate schedule a caller
+supplied before the first update polling, and an answer of no demand returning
+to the bound; three turns with no demand at all, and no windows, each waiting
+the bound; a publisher's deadline taken when it is earlier than the
+application's schedule and the schedule kept when it is earlier than the
+publisher's; three turns whose own work consumes most of each interval, each
+next wait shortened by what the last one spent rather than started afresh; an
+already-ready application event polling with no schedule and nothing published,
+with the readiness query dispatching nothing and spending none of the event
+budget; four turns of a continuously refilled command queue and four of an
+always-ready event source, each batch ending at its budget with the due update
+still offered every turn; a publication during the wait ending it and inspected
+by the next turn, which polls for it; a publication during the wait whose
+deadline is not yet due ending it too, the next turn recomputing an ordinary
+bounded wait and offering one update and no more; a publication made during the
+update surviving that turn's consumption of an older revision and being captured
+by the next, after which bounded waiting resumes; the saturated-queue checkpoint
+matrix stopping the scheduled turn at the same three points as the unscheduled
+one, with the same dispositions; the loop returning its update's own result; and
+an idle wait below a nanosecond refused before anything is acquired.
 
 The host's CPU examples run whole applications over the test seam in
 `glfw-tests`. The seam's native table scripts the poll and the finite
@@ -3148,6 +3291,16 @@ The native examples cover:
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;
+- the scheduled owner turn on that session, counted rather than timed: with the
+  window's input feed admitted before the loop, at least five update
+  opportunities paced by an absolute deadline 20 ms out, and no native input
+  event at all delivered to that feed over the measured interval, which begins
+  after the first turn so the window's own creation callbacks are outside it. At
+  least one of those turns entered and returned a real
+  `glfwWaitEventsTimeout`, as the shim's own wait sequence records, and the
+  turn that finally answers no demand still waits, for the configured fallback
+  bound. No command, application event, or close request reaches the loop in
+  that interval;
 - a worker's production wake, `wakeSession` on an unbound thread, ending a
   production finite wait the owner thread entered and was blocked inside:
   `blockedWaitForCheck` observes that wait's sequence number around the kernel

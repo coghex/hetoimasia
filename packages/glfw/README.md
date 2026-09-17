@@ -30,7 +30,14 @@ finite budget when a monitor disappears or a mode is unavailable. The public `ru
 `Hetoimasia.Runtime.GLFW` builds a window host as an application dependency and
 runs its supervised owner loop, which processes native events, drains those
 ports fairly, refreshes the monitor inventory when monitors change, and surfaces
-close requests to application policy. `Hetoimasia.GLFW.Demand` is how a worker
+close requests to application policy. Beside that loop it offers an additive
+scheduled path, `runScheduledOwnerLoop`, for an application that paces itself by
+absolute deadlines: each turn samples the host's injected monotonic clock,
+weighs the schedule its update last answered against the demand its own
+inspection captured, and polls or waits at most the earlier deadline and at most
+the configured finite fallback bound, with the same checkpoints, budgets, and
+reconciliation. `runOwnerLoop` and its `LoopHooks`, `Turn`, and `TurnStep` are
+unchanged by it, and an application that keeps using them reads no clock. `Hetoimasia.GLFW.Demand` is how a worker
 asks that owner for a turn without a command: one bounded demand slot for the
 application, lent as `hostDemandPublisher`, and one per live window, lent on its
 `WindowClient` as `clientDemandPublisher`. Concurrent requests combine immediate
