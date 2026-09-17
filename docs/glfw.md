@@ -57,13 +57,13 @@ There is no default close policy or rendering operation.
 | Component | Visibility | Holds |
 |---|---|---|
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, and `Hetoimasia.GLFW.Input`, the supported interface |
-| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the input feed model with its private producer, warning, resumption, and closure, and bounded input staging at the window callbacks. Binds nothing. |
+| `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session and session wake examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session and session wake examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the window attachment model examples, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -2317,6 +2317,172 @@ obligation, no warning for suspension alone, and closure winning every
 suspension and resumption race while a suspension or focus loss leaves a
 candidate unpublished.
 
+## Window attachments
+
+A graphics integration — a future surface and the work submitted through it —
+depends on a window for longer than a borrow. The private
+`Hetoimasia.GLFW.Internal.Attachment` module in the `model` sublibrary models
+that dependency: which window an integration has attached to, where the
+attachment is in its lifetime, what evidence retires it, and whether it still
+vetoes the window's destruction. It is the LIFE-1 slice of
+[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+(P-1, P-5, D-1, D-2, D-4).
+
+**No public attachment exists yet.** No module under `packages/glfw/src/`
+exports the model, an external client cannot import it, and no production
+component uses it: the window host, its close protocol, retirement by borrow
+count, and every public module behave exactly as before. The protected host
+lifetime (LIFE-3) and the public attachment contract (LIFE-4) follow. The model
+names no Vulkan, native, or GPU type, performs no native call, and owns no
+thread; it is a pure state machine with bounded bookkeeping and one bounded
+notice inbox.
+
+### Ownership and trusted inputs
+
+The host owns per-window registration and close state; the graphics integration
+owns its dependent resources, their retirement work, and the evidence that none
+can still use the window. The model does not establish its own premises; the
+owning boundary supplies them and is responsible for them:
+
+- the host identity is fresh, made from a `Unique` created for that host alone;
+- the session identity is the session issuing the host's windows, and windows
+  are registered in the order that session issued them;
+- every operation taking the owner's authority runs on the owner thread. A pure
+  transition cannot observe the executing OS thread, so the boundary checks it
+  first, as window operations check theirs.
+
+### Identities
+
+An attachment identity binds four identities: the host, the session, the
+`WindowId`, and an incarnation. A model issues incarnations from one, never
+reissuing one, and its host identity is fresh, so together they name one
+attachment in the process. Every operation carrying authority compares all four
+against its target, and a mismatch in any is typed misuse that changes nothing:
+a refused transition returns no model at all.
+
+### Phases and transitions
+
+| From | To | By |
+|---|---|---|
+| none | registering | attaching reserves an open, unoccupied window of this host and session |
+| registering | active | construction succeeds; the only way a usable capability is represented |
+| registering | retiring | detach, cancellation, the window beginning to close, or construction failing |
+| active | retiring | detach, cancellation, or the window beginning to close |
+| retiring | retired | the last missing retirement fact is recorded |
+
+No other transition exists. Attaching to a window recorded as closing or ended,
+to an unregistered window, to one already holding a live or retiring
+attachment, with another host's identity, or with a window of another session is
+refused before any incarnation is issued, so the boundary can refuse before any
+acquisition effect. Retirement once begun is never undone: a construction that
+succeeds afterwards publishes nothing, and its dependents stay registered for
+retirement. Construction is tracked beside the phase, and while it is pending no
+retirement fact is accepted, so a cancellation at any handoff — before
+construction, after it created dependents but before publication, or after
+publication — leaves no constructed dependent outside registration. A retired
+attachment is removed, freeing the window's slot; attaching again yields a fresh
+incarnation.
+
+Failure evidence is stored beside the phase, never as one. A failed construction
+records its original failure and its rollback outcome and moves the attachment
+to retiring. A safe rollback establishes every retirement fact, explicitly
+discharging obligations the construction never created, and retires the
+attachment. An unsafe rollback records no fact: the attachment keeps its window
+until each fact is certified. A failed disposal step is recorded without
+establishing anything. The first failure is kept and later ones are counted;
+cancellations are counted and establish nothing.
+
+### Retirement facts
+
+Three facts stay distinct: logical release (the application stops wanting a
+frame), CPU-use retirement, and backend retirement. The model records the
+latter two as four independent facts, each certifying an obligation that has
+irrevocably ended:
+
+| Fact | Certifies |
+|---|---|
+| CPU use retired | No retained capability or pending producer can submit another use |
+| Submitted work ended | Work already submitted has completed |
+| Presentation ended | Presentation obligations have ended |
+| Dependents disposed | Dependent resources are disposed |
+
+None is accepted before retirement begins, while further use is still possible.
+An attachment is retired, and stops vetoing its window, only when all four are
+recorded; the model reports which are missing. No single fact, elapsed time,
+cancellation, body return, or failure stands in for another. A window with no
+attachment veto is not thereby destroyable: destruction still requires the
+host's close protocol and its ordinary CPU borrows.
+
+### Acknowledgements
+
+Attaching returns an acknowledgement bound to the new incarnation. It is the
+integration's completion authority, taken with the target identity by every
+attachment transition, and the two must name the same host, session, window, and
+incarnation. It prevents accidental cross-window and cross-incarnation misuse;
+it is not proof that a backend really finished, which the backend's own tested
+contract supplies. A target resolves in order:
+
+1. An acknowledgement naming another host, session, window, or incarnation is
+   misuse.
+2. A target of another host or session is misuse, as is an incarnation the model
+   never issued.
+3. If the window holds an attachment of another incarnation, the target was
+   replaced, which is misuse. This identity mismatch takes precedence over
+   terminal idempotence, so a late report never alters a replacement.
+4. An absent target has retired, because an issued attachment leaves the
+   bookkeeping only by retiring. Any report for it is accepted and changes
+   nothing, and no entry is recreated.
+
+Recording the same fact twice for a live incarnation is accepted and idempotent.
+
+### The owner-thread rule and completion notices
+
+Every operation that registers, closes, forgets, attaches, constructs, retires,
+or removes takes the owner's authority value, which the model's creation
+returns; another model's authority is misuse. Observation — an attachment's
+status, a window's veto, and the counts — takes none.
+
+Another thread never changes the model. It offers a completion notice to a
+bounded inbox, which never waits and answers admitted, coalesced when an equal
+notice is already pending, or rejected when the inbox holds its capacity of
+distinct notices. An admitted notice stays pending until the owner takes the
+inbox's notices and folds them, revalidating each exactly as a direct report,
+so a notice queued for an attachment replaced before the fold is misuse and
+never touches the replacement.
+
+### Bookkeeping
+
+The model holds one record per registered, not yet forgotten window — at most
+the host's window limit — and at most one attachment per record. A window with
+a live or retiring attachment cannot be forgotten. Stale identities are rejected
+by comparing incarnations and local window numbers against the model's
+counters, never by remembering them: a window numbered at or below the highest
+registered with no record has ended. No set grows with the number of windows or
+attachments ever made.
+
+### Attachment model examples
+
+The examples in `glfw-tests` (`--match "attachment"`) script pure transitions
+over window identities from seam sessions, with no sleep. They prove every
+refused attachment — closing, ended, unregistered, occupied, and retiring
+windows, another host, another session, and another owner's authority — issuing
+no incarnation; issue-order registration and the window limit; the transition
+table, including closing during construction publishing nothing; the
+acknowledgement of another window, of an earlier incarnation, of another host
+or session, a replaced target, and an incarnation never issued, each changing
+nothing; each retirement fact alone keeping the window vetoed and the full set
+releasing it; cancellations and disposal failures releasing nothing while
+keeping the first failure; a scripted owner whose render thread publishes CPU
+retirement and submission completion through the inbox while presentation
+stays owed and the window stays vetoed; duplicate completion idempotent before
+and after retirement; failed construction with safe and with unsafe rollback;
+cancellation at each handoff; two windows where only one can retire;
+bookkeeping equal to the live count after five hundred attach-and-retire cycles
+and forty window cycles; inbox admission, coalescing, capacity rejection, and
+retention until taken; and a notice queued for a replaced attachment refused
+when folded. The opacity examples compile an external client that imports the
+model and is refused because its module belongs to a hidden private sublibrary.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
@@ -2366,6 +2532,8 @@ candidate unpublished.
 | Input channel generation | The input feed | Production sends; reads receive; a reset or closure aborts and drops it; resumption installs the next | Produce and resume: owner; read: any | One generation | Aborted and dropped by a reset or closure |
 | Input phase, epoch, gates, held baseline, episode, and counters | The input feed | Production, admission changes, acknowledgement, warning, resumption, and closure write; statistics read | Any, through the owner operations and capabilities | The feed | Held baseline cleared by focus loss, reset, and closure; the rest frozen at closure; counters never reset |
 | Latest cursor sample | The input feed | The producer records it; button production copies it | Owner | The feed | Replaced by the next sample |
+| Window attachment records | The owning host boundary; no production component yet | Owner transitions write; any holder observes | Owner | The host | A record is removed when its window is forgotten, an attachment when it retires; counters never reissued |
+| Attachment completion inbox | The owning host boundary; no production component yet | Any thread offers; the owner takes and folds | Any; STM | While referenced | Emptied by each take |
 
 The guard holds only occupancy and poison. None of this is application state.
 
@@ -2555,6 +2723,10 @@ own on Linux, or a human's explicit approval on a real desktop.
   while another window is served; windowed constraints suspended and restored
   with a placement they exclude refused; and the named revision carrying the
   applied mode and geometry.
+- **The window attachment model examples** in the same suite
+  (`--match "attachment"`) drive the private attachment model's pure
+  transitions over seam window identities; see
+  [the attachment model examples](#attachment-model-examples).
 - **The monitor inventory examples** in the same suite use the seam's
   private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
   and `seamQueueMonitorEvents` — over scripted monitors whose native pointers

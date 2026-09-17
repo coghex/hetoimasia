@@ -37,7 +37,10 @@ scroll, and focus events tagged with a window and a non-wrapping epoch, and on
 overflow or temporary suspension a visible reset the consumer must acknowledge
 before the owner resumes a fresh epoch. Native key, character, button, cursor,
 and scroll callbacks copy a fixed payload and return; the owner boundary
-publishes ordered events into the feed.
+publishes ordered events into the feed. The private `model` sublibrary also
+holds a backend-neutral model of exclusive window attachments and the
+retirement evidence that frees a window for a future graphics integration; no
+public module exports it, and no public attachment exists yet.
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on
@@ -50,7 +53,7 @@ GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
 monitor identity, observation, callback-containment, release-order, window
-command, window control, window mode, and input feed rules, is
+command, window control, window mode, input feed, and window attachment model rules, is
 [docs/glfw.md](../../docs/glfw.md).
 
 Build and check, after preparing the native prefix on macOS with

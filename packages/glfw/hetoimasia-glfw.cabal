@@ -41,14 +41,15 @@ common language
 -- construction and rollback, bounded error capture, window observations, the
 -- monitor inventory and its identities, contained callbacks, window command
 -- admission, execution, and completion, and bounded input feeds with their
--- acknowledged reset, and bounded input staging at the window callbacks,
--- written over a table of native operations. It binds nothing, so the test seam
+-- acknowledged reset, bounded input staging at the window callbacks, and the
+-- pure window attachment model, written over a table of native operations. It binds nothing, so the test seam
 -- can drive it without linking GLFW.
 library model
     import: language
     visibility: private
     hs-source-dirs: model
     exposed-modules:
+        Hetoimasia.GLFW.Internal.Attachment
         Hetoimasia.GLFW.Internal.Attribute
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Control
@@ -179,7 +180,8 @@ library seam-core
 -- the window model, window command, window control, window host, dynamic
 -- window, monitor inventory, input feed, and window mode examples that use the
 -- private window and monitor drivers, the private command executor, and the
--- host's private test hooks, the link-declaration check against the native
+-- host's private test hooks, the pure window attachment model examples, the
+-- link-declaration check against the native
 -- manifest, and the external-client opacity examples. It initializes no GLFW,
 -- opens no window, and needs no display; it links the pinned native SDK only
 -- through the libraries it depends on. Every library the suite or its external
@@ -191,6 +193,7 @@ test-suite glfw-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.GLFW.Attachment
         Test.GLFW.Command
         Test.GLFW.Control
         Test.GLFW.Dynamic
