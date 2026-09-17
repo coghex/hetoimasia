@@ -1083,13 +1083,28 @@ runScopedApplicationWithQuiescence
   → (dependencies → RuntimeControl → IO services)    -- startup
   → (services → RuntimeControl → IO a)               -- the action
   → IO a
+
+runManagedApplication
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)            -- enters the logging lifetime
+  → Text                                             -- the application's name
+  → (∀ r. (dependencies → IO r) → IO r)              -- managed dependency lifetime
+  → (dependencies → STM ())                          -- quiescence
+  → (dependencies → RuntimeControl → IO services)    -- startup
+  → (services → RuntimeControl → IO a)               -- the action
+  → IO a
 ```
 
 `runScopedApplication` is the generic lifecycle an application runs through.
 `runScopedApplicationWithQuiescence` is the same lifecycle with one added
 dependency-local step, [quiescence](#quiescence); `runScopedApplication` is
 exactly that runner with the quiescence action `\_ → pure ()`, which adds no
-observable step. Both record the application's call site in the terminal report.
+observable step. `runManagedApplication` is the same lifecycle again over a
+[managed dependency lifetime](#managed-dependency-lifetimes) in place of a
+`Scoped` value; `runScopedApplicationWithQuiescence` is exactly that runner over
+`withScoped dependencies`, so both `Scoped` entry points keep their signatures,
+order, and failure semantics unchanged. All three record the application's call
+site in the terminal report.
 They sit in their own module beside `Hetoimasia.Runtime.runApplication`, which
 keeps its module, signature, behavior, and examples as the thin runner over a
 supplied logger. The runner composes the runtime's existing boundaries and adds
@@ -1107,7 +1122,8 @@ release follows this document's failure table and mask discipline.
 2. The runner enters the logging lifetime through its first argument — for the
    console, `withHandleLoggingLifetime configuration stderr`.
 3. The dependencies are constructed inside it, by `withScoped` over the
-   application's `Scoped` value, in the order that value allocates them. A
+   application's `Scoped` value, in the order that value allocates them, or by
+   the managed lifetime `runManagedApplication` was given. A
    required component propagates its failure after cleanup of what it
    acquired; an optional one built with
    [`allocComponent`](#component-construction) binds `Unavailable` only after
@@ -1129,7 +1145,8 @@ release follows this document's failure table and mask discipline.
    settled, including a failure that arrived while closing, and a latched
    failure is rethrown.
 10. The dependency scope unwinds. Dependents are disposed before their
-    dependencies, and a composite keeps its declared internal order.
+    dependencies, and a composite keeps its declared internal order. A managed
+    lifetime's release, including any component-owned drain work, runs here.
 11. A failed run gets one managed terminal report, while the logger is live.
 12. The logging lifetime makes its one permitted final flush.
 13. The runner returns the action's result, or rethrows.
@@ -1139,6 +1156,42 @@ Steps 9 onwards happen on every exit path — construction failure (from step
 cancellation, which skips steps 11 and 12. Step 8 happens on every exit after
 the guard is installed and never after a construction failure; see
 [quiescence](#quiescence).
+
+#### Managed dependency lifetimes
+
+`runManagedApplication` takes the dependencies as a lifetime of shape
+`∀ r. (dependencies → IO r) → IO r` instead of a `Scoped` value. The lifetime
+occupies steps 3 and 10: its consumer is everything from step 4 through step 9
+— supervision, the quiescence guard, startup, the action, quiescence, and the
+worker drain — so a component can enclose every borrower of its resources in a
+protected IO boundary of its own. Work the lifetime places in its release runs
+after supervision has drained every worker and before any parent dependency the
+lifetime built on is released, with the logger still live and the terminal
+report and flush still to come. Every other step keeps its order, thread, and
+labels, including `application quiescence` and the single report. The runner
+adds no shutdown callback list, no second supervisor, and no resource registry.
+
+The lifetime is trusted code, under the same contract as the continuation of
+[`allocComponent`](#the-protected-handoff-and-the-once-only-consumer); the
+runner does not police arbitrary `IO` for violations, and `withScoped` honours
+it:
+
+- Once construction succeeds, it invokes its consumer exactly once, subject to
+  cancellation before entry, synchronously on the calling thread, with every
+  dependency it built live.
+- When construction fails, it invokes the consumer zero times: the runner
+  enters no supervision and runs no quiescence, and the failure is reported
+  once and flushed like any construction failure.
+- It never forks, retains, retries, or later re-enters the consumer, and never
+  turns the consumer's failure into success.
+- It owns acquisition, rollback, and protected release under
+  [the failure table](#the-failure-table) and
+  [mask discipline](#mask-discipline). A consumer failure or cancellation stays
+  primary with every release failure retained beside it; a release failure
+  after a successful consumer fails the run, which is then reported and flushed.
+  A cancellation requested while a release runs is not delivered into it; it
+  stays pending as the mask discipline describes, then propagates with the
+  evidence of every release that ran, with no report and no flush.
 
 #### Quiescence
 
@@ -1279,7 +1332,7 @@ the same runner.
 | The action returned, nothing fatal was settled, every disposal succeeded, the flush succeeded | Returns the action's result |
 | Construction, startup, or the action failed synchronously | Drains, disposes, reports once, flushes, and rethrows the failure with its type, value, and context |
 | A supervised failure was latched — even one the action caught and ignored, or one that arrived while closing | The same: a latched failure cannot become a successful run |
-| The action succeeded and a component's disposal failed | The same, with the cleanup failure primary and retained; the report carries `cleanup.failures` and `cleanup.labels` |
+| The action succeeded and a component's disposal failed, including a managed lifetime's release | The same, with the cleanup failure primary and retained; the report carries `cleanup.failures` and `cleanup.labels` |
 | The action succeeded and quiescence failed | The same: the result is discarded, the quiescence failure is primary and retained under `application quiescence`, and supervision closes as for a failing body |
 | Quiescence failed while another failure or cancellation was already propagating | That failure or cancellation propagates unchanged under its own row, with the quiescence failure retained under `application quiescence` |
 | The run succeeded and the final flush failed | The flush's failure propagates, with no report attempted and no retry |
@@ -1313,7 +1366,7 @@ needs the new runner, and no console path was added for it.
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 |---|---|---|---|---|---|
-| The dependencies value | The application; its releases belong to the runner's `withScoped` | Built by construction; read by startup and by quiescence | The calling thread | From construction until the dependency scope unwinds, after workers drain | Released once, in reverse allocation order with each composite's declared order; never reset |
+| The dependencies value | The application; its releases belong to the runner's `withScoped`, or to the managed lifetime | Built by construction; read by startup and by quiescence | The calling thread | From construction until the dependency scope unwinds, after workers drain | Released once, in reverse allocation order with each composite's declared order; never reset |
 | The services value | The application | Written once, by startup's return; read by the action | The calling thread | From startup's return until the action returns or throws | Immutable; nothing re-publishes it and nothing disposes it |
 | Worker, supervision, and latch state | The one `withSupervision` invocation | As [supervision.md](supervision.md#state) records | As recorded there | One invocation | As recorded there |
 | Recorded reporting outcomes | The logging lifetime the runner entered | As [logging.md](logging.md#logging-lifetime) records; the runner reads them once before its report | As recorded there | One lifetime | As recorded there |
@@ -1342,9 +1395,10 @@ blocking would break the release contract, and never runs before the cleanup
 whose records it is meant to carry. A lifetime is never entered from a release
 callback.
 
-`runScopedApplication` and `runScopedApplicationWithQuiescence` perform steps 1
-to 4 in exactly this order: quiescence and supervision closing are step 1, the
-dependency scope's unwind is step 2, the one report is step 3, and the lifetime
+`runScopedApplication`, `runScopedApplicationWithQuiescence`, and
+`runManagedApplication` perform steps 1 to 4 in exactly this order: quiescence
+and supervision closing are step 1, the dependency scope's unwind — or the
+managed lifetime's release, drain work included — is step 2, the one report is step 3, and the lifetime
 the runner entered makes step 4.
 
 The console executable owns no handle: its sink borrows the process's `stderr`,
@@ -1611,7 +1665,20 @@ supervised failure and a failure arriving while closing each failing a run
 whose action returned; a component cleanup failure in the one terminal report,
 after disposal and before the flush; a final flush failure attempted once,
 failing the run with no report; and no terminal report once an optional
-worker's warning has failed. The `Exit mapping` examples in the root suite's
+worker's warning has failed. Their `Managed lifetime` subgroup, selected by
+`--match 'Managed lifetime'`, drives `runManagedApplication` with a scripted hub
+built on a parent: the consumer entered once on the calling thread with the hub
+live; the hub's drain after the worker drain, before the parent's release, and
+before the report and flush; a construction failure entering the consumer and
+supervision zero times; startup failure, action failure, a latched supervised
+failure, and a no-op quiescence each draining in that order; cancellation at
+the handoff into the consumer, during it, requested during quiescence, during
+the worker drain, and requested during the managed release, each releasing
+everything once, unreported and unflushed; a failing quiescence and a failing
+managed release retained in order beside a propagating action failure and
+beside a cancellation; a managed release failure failing a successful run; and
+both `Scoped` entry points producing the managed runner's trace and report over
+`withScoped`. The `Exit mapping` examples in the root suite's
 `test/Test/Engine/Console/Spec.hs` run both smoke paths with a broken stderr
 for a non-zero exit, and drive `exitOnFailure` directly for cancellation and
 for an explicit status passing through.
