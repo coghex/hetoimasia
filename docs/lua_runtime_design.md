@@ -26,13 +26,13 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish isolated UI and gameplay Lua execution
-- [ ] LUA-1. Establish the Lua binding and foreign-call boundary
-- [ ] LUA-14. Prove Linux confinement and resource-limit feasibility
-- [ ] LUA-15. Prove macOS confinement and resource-limit feasibility
-- [ ] LUA-2. Own the VM through a protected IO lifetime
+- [x] EPIC. Establish isolated UI and gameplay Lua execution — [#145]
+- [x] LUA-1. Establish the Lua binding and foreign-call boundary — [#146]
+- [x] LUA-14. Prove Linux confinement and resource-limit feasibility — [#147]
+- [x] LUA-15. Prove macOS confinement and resource-limit feasibility — [#148]
+- [ ] LUA-2. Own the VM through a protected IO lifetime — [deferred]: #146 must merge with its package contract recording the Q-3 selection (binding and Lua versions, safe FFI paths, cancellation-delivery points, close and finalizer behavior)
 - [ ] LUA-3. Add application-owned modules and bounded value bindings
-- [ ] LUA-4. Model bounded script tasks and execution protocols
+- [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime
 - [ ] LUA-10. Establish Linux mod-process confinement
 - [ ] LUA-11. Establish macOS mod-process confinement
@@ -1058,6 +1058,12 @@ and verified policy, with adversarial regression coverage.
   dependent drafting and returns to design under D-11.
 
 ### LUA-2. Own the VM through a protected IO lifetime
+
+> Deferred on 2026-09-17: this slice's own gate says Q-3 must be resolved
+> before processing it, and Q-3 is delivered by #146's implementation. Draft
+> once #146 has merged and its package contract records the selected binding,
+> safe FFI paths, cancellation-delivery points, and close/finalizer behavior.
+> LUA-4 is labeled independent of LUA-2/LUA-3 and may be processed meanwhile.
 
 - **Outcome:** one owner constructs, uses, and closes a VM while preserving
   primary/cleanup evidence and callback dependencies on every supported exit.
