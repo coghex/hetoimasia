@@ -104,8 +104,10 @@ spec = describe "GLFW window modes" $ do
       (boundedExample (testMoveBeforeRefresh MovedByCallback))
     it "keeps the obligation on the ended monitor when the move is observed by a full sample after its native disconnect and before the refresh"
       (boundedExample (testMoveBeforeRefresh MovedBySample))
-    it "recovers from a confirmed monitor's disconnect across an observation made before the refresh that ends it"
-      (boundedExample testConfirmedMonitorDisconnectBeforeRefresh)
+    it "recovers from a confirmed monitor's disconnect across a move callback folded before the refresh that ends it"
+      (boundedExample (testConfirmedMonitorDisconnectBeforeRefresh MovedByCallback))
+    it "recovers from a confirmed monitor's disconnect across a full sample taken before the refresh that ends it"
+      (boundedExample (testConfirmedMonitorDisconnectBeforeRefresh MovedBySample))
     it "only resamples a confirmed monitor's disconnect with no fallback configured, answering the followed obligation once"
       (boundedExample testMovedBorderlessWithoutFallback)
     it "recovers through the owner loop when the monitor a borderless window was moved onto disconnects a turn after the move was confirmed"
@@ -898,17 +900,17 @@ testMoveBeforeRefresh path = withDesk tracked $ \desk → withWindowIn desk "fir
 
 -- | After a confirmed move onto the right monitor, the right monitor
 -- disconnects natively and a further observation — another move, still over
--- the right monitor's work area, and a full sample — intervenes before the
--- refresh that ends its identity. The obligation followed the window, so the
--- refresh triggers the configured fallback into the remaining monitor.
-testConfirmedMonitorDisconnectBeforeRefresh ∷ Expectation
-testConfirmedMonitorDisconnectBeforeRefresh = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+-- the right monitor's work area, through the given path alone — intervenes
+-- before the refresh that ends its identity, still deriving borderless on the
+-- right against the stale inventory. The obligation followed the window, so
+-- the refresh triggers the configured fallback into the remaining monitor.
+testConfirmedMonitorDisconnectBeforeRefresh ∷ MovePath → Expectation
+testConfirmedMonitorDisconnectBeforeRefresh path = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
   let seam = deskSeam desk
-  movedBorderlessConfirmed MovedByCallback desk window
+  movedBorderlessConfirmed path desk window
   seamSetMonitorTopology seam leftOnly
   seamDeliverMonitorEvents seam [MonitorDetached 2]
-  movedAgain ← observeMove MovedByCallback desk window 120 220
-  sampled ← synchronizeWindow window
+  movedAgain ← observeMove path desk window 120 220
   beforeRefresh ← recordOf window
   reconcileMonitorEvents (deskSession desk)
   reconciled ← reconcileWindowMode window
@@ -916,7 +918,6 @@ testConfirmedMonitorDisconnectBeforeRefresh = withDesk tracked $ \desk → withW
   restored ← geometry window
   repeated ← reconcileWindowMode window
   movedAgain `shouldBe` AppliedBorderless (deskRight desk)
-  appliedOf sampled `shouldBe` Just (AppliedBorderless (deskRight desk))
   modeRecoveryObligation beforeRefresh `shouldBe` Just (deskRight desk)
   reconciled `shouldBe` WindowAvailable (Just recoveredOnLeft)
   modeApplied record `shouldBe` AppliedWindowed
