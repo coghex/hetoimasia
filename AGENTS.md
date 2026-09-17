@@ -50,6 +50,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Current focused tests:
   `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct`,
   `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
+  `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
@@ -59,22 +60,32 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   by `Test.Runtime.Spec`: the runner and application lifecycle, logging
   lifetime, reporting, supervision, inbox services, runtime opacity, the
   resource smoke, and the supervised channel and snapshot waits, against real
-  foundation services; it depends on no GLFW or console code. Root
-  `hetoimasia-tests` (`test/`) owns `Console` (the executable's startup and
-  exit mapping, run as a child process) and `GLFW`, composed by
-  `Test.Engine.Spec`. A new runtime example belongs in `runtime-tests`, beside
-  that component's own helpers; a console example belongs in root `Console`;
+  foundation services; it depends on no GLFW or console code. `glfw-tests`
+  (`packages/glfw/test/`) owns the headless `GLFW` group, composed by
+  `Test.GLFW.Spec`: the session, window, command, control, host, dynamic
+  window, monitor, input, and mode examples over the test seam, the link
+  declarations, and the external-client opacity examples; it initializes no
+  GLFW and needs no display. Root `hetoimasia-tests` (`test/`) owns only
+  `Console` (the executable's startup and exit mapping, run as a child
+  process), composed by `Test.Engine.Spec`, and depends on no GLFW package. A
+  new runtime example belongs in `runtime-tests`, beside that component's own
+  helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
+  real native session in `glfw-native-tests`; a console example belongs in root
+  `Console`;
   in general a new example belongs in the component spec that owns the
   behaviour it asserts. Run one component with
   `--test-options='--match <Component>'` on the suite that owns it; a selector
   that matches no example fails the suite rather than reporting a silent pass.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
-  `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, and `Failures`
-  now select nothing and fail; on `runtime-tests`, `--match Supervision` or
-  `--match 'Logging lifetime'` select runtime subgroups as they did at root.
-- Without the GLFW SDK, build and run the foundation and runtime suites with
-  `--project-file cabal.project.cpu`, which shares `cabal.project.common` with
-  `cabal.project` and leaves out the packages that need GLFW.
+  `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
+  `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`
+  or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
+  and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
+  select what they selected at root or in the removed window-examples executable.
+- Without the GLFW SDK, build and run the foundation, runtime, and root suites
+  with `--project-file cabal.project.cpu`, which shares `cabal.project.common`
+  with `cabal.project` and leaves out `hetoimasia-glfw`, the package that needs
+  GLFW.
 - Never import a helper from another component's spec module. Neutral
   utilities shared by more than one suite, currently the external-client
   compiler harness (`Test.Support.ExternalClient`) and the bounded test wait

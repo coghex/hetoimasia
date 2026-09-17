@@ -42,7 +42,8 @@ the `runtime-glfw` sublibrary, among its libraries, depends on
 module, and only the input feed's overflow warning takes a logger, injected by
 its owner. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the
-test seam `hetoimasia-tests` drives without initializing GLFW.
+test seam the package's headless `glfw-tests` suite drives without initializing
+GLFW.
 
 The contract, including owner, thread, lifetime, poison, error-evidence,
 monitor identity, observation, callback-containment, release-order, window
@@ -55,8 +56,19 @@ Build and check, after preparing the native prefix on macOS with
 
 ```bash
 cabal build all
-cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
+cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 ```
+
+`glfw-tests` (`test/`) is the headless suite, composed by `Test.GLFW.Spec` under
+one `GLFW` group: the session examples over the seam, the window model, command,
+control, host, dynamic window, monitor inventory, input feed, and window mode
+examples that use the private drivers and executor, the link declarations, and
+the external-client opacity examples. It initializes no GLFW, opens no window,
+and needs no display, and a selector that matches nothing fails it. Focus a
+component with its group name, for example
+`--test-options='--match "GLFW window modes"'`. A new example that needs no
+native session belongs here, beside the spec that owns its behaviour; one that
+must initialize GLFW or open a real window belongs in `glfw-native-tests`.
 
 `cabal build all` compiles `glfw-native-tests` without running it. List its
 examples, or run the selections that never enter a session, without any

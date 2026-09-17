@@ -47,14 +47,15 @@ cabal run exe:hetoimasia -- --smoke
 cabal run exe:hetoimasia -- --resource-smoke
 cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
 cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
+cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 
 Run `cabal update` if the local Hackage index does not cover the pinned
 `index-state` in `cabal.project`. Local packages build with warnings as errors.
 `cabal build all` compiles the GLFW native test suite under this project's
-configuration but runs no tests or native session. Engine tests initialize no
-GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux,
+configuration but runs no tests or native session. The package and root suites,
+`glfw-tests` included, initialize no GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux,
 and refuses to enter a session without the per-run consent
 [docs/glfw.md](docs/glfw.md#the-native-suite) describes — on a person's
 desktop, a human's explicit approval for that one run.

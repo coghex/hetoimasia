@@ -19,12 +19,12 @@
 -- other or with a production session. Windows are created in a seam session
 -- through the public "Hetoimasia.GLFW.Window" interface.
 --
--- This component is public only so the root package's test suite can depend on
--- it. It exposes no native handle, no session or window constructor, and no way
+-- This component is public so external clients compiled by the package's
+-- opacity examples can be given it. It exposes no native handle, no session or window constructor, and no way
 -- to deliver window or monitor callbacks, change the scripted monitors after
 -- entry, or change a window's close intent: those drivers
 -- live in the package's private @seam-core@ sublibrary and are used only by its
--- own @glfw-window-examples@ executable.
+-- own @glfw-tests@ suite.
 module Hetoimasia.GLFW.Seam
   ( -- * Seams
     Seam

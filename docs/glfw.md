@@ -63,14 +63,13 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-window-examples` | executable, test-only | The window model, window command, window control, window host, monitor inventory, and input feed examples that use those drivers, that executor, the private input producer, and scripted input callbacks. `hetoimasia-tests` runs it. |
+| `glfw-tests` | test suite | The headless suite: the session examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
 `runtime-glfw` depends on both, and no library depends on it; only the
-package's own `glfw-window-examples` and `glfw-native-tests`, and
-`hetoimasia-tests`, use it. The runtime integration therefore inverts no
+package's own `glfw-tests` and `glfw-native-tests` use it. The runtime integration therefore inverts no
 dependency. It is a sublibrary with its own source root rather than a separate
 package because the native suite must depend on it, and Cabal refuses that as a
 cycle between packages. The package's logging imports are `Component`, for
@@ -2127,7 +2126,7 @@ is not broadened.
 ### CPU examples
 
 The host's CPU examples run whole applications over the test seam in
-`glfw-window-examples`. The seam's native table scripts the poll and the finite
+`glfw-tests`. The seam's native table scripts the poll and the finite
 wait — recorded as `PollEvents` and `WaitEvents`, with `scriptPollEvents` and
 `scriptWaitEvents` steps — and its private `seamQueueEvents` driver leaves
 callback events, such as a close request, for the next poll or wait to deliver
@@ -2176,7 +2175,7 @@ acknowledgement.
 
 ### Input feed examples
 
-The input feed examples in `glfw-window-examples` drive the feed model through
+The input feed examples in `glfw-tests` drive the feed model through
 its private producer and through scripted native callbacks, with window
 identities from a seam session and no GLFW.
 Threads are coordinated with `MVar`s and STM; a wait is observed through
@@ -2279,7 +2278,7 @@ if os(linux)
     extra-libraries: rt m dl
 ```
 
-The `GLFW link declarations` examples in `hetoimasia-tests` compare these, for the
+The `GLFW link declarations` examples in `glfw-tests` compare these, for the
 platform they run on, with the `libs_static` the native manifest recorded. Any
 drift fails the suite. No GLFW library-path override is needed on either
 platform. The [validation planner](validation.md#how-a-groups-inputs-are-derived)
@@ -2302,18 +2301,20 @@ Then:
 
 ```bash
 cabal build all
-cabal test hetoimasia-tests --test-show-details=direct --test-options='--match GLFW'
+cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test glfw-native-tests --test-show-details=direct --test-options='--dry-run'
 ```
 
 `cabal.project` sets `tests: True` for this package alone. `cabal build all`
-therefore compiles `glfw-native-tests` from a clean configuration without
-running it, and the dry run lists its examples without entering a session.
+therefore compiles `glfw-tests` and `glfw-native-tests` from a clean
+configuration without running either, and the dry run lists the native examples
+without entering a session.
 Running the native examples themselves takes the per-run consent
 [the native suite](#the-native-suite) describes: the isolated display helper's
 own on Linux, or a human's explicit approval on a real desktop.
 
-- **The `GLFW` group** in `hetoimasia-tests` is headless and initializes nothing.
+- **`glfw-tests`** is the package's headless suite, rooted at one `GLFW` group,
+  and initializes nothing, opens no window, and needs no display.
   It proves the session model through the seam, checks the link declarations,
   and compiles external clients against the package, including clients refused
   for naming a command host's, port's, or ticket's constructor or reaching for
@@ -2327,12 +2328,23 @@ own on Linux, or a human's explicit approval on a real desktop.
   command, performs every control command constructor, reads the capability
   descriptions, requests modes and a startup mode, reads a mode record, and
   resolves monitors.
-  It also runs the `glfw-window-examples` executable, reached through the suite's
-  `build-tool-depends`, and fails with that executable's report if any window
-  model example fails. It runs in the `test.engine` validation group.
-- **`glfw-window-examples`** holds the window model and window command
-  examples, as an Hspec executable that initializes no GLFW. The window model
-  examples use the seam's private drivers: `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
+  The window model, command, control, host, dynamic window, monitor, input, and
+  mode examples below are registered in the same tree, under the group names
+  they always carried, so `--match "GLFW window modes"` or
+  `--match "across the package boundary"` selects them, and a selector that
+  matches nothing fails the suite. Because the suite belongs to
+  `hetoimasia-glfw`, its own modules may import the private sublibraries; that
+  access is not boundary evidence, which comes only from the external clients.
+  The linking example reads `hetoimasia-glfw.cabal` from the package directory
+  Cabal runs the suite in, and the manifest through `pkg-config`. It runs in the
+  `test.glfw` validation group on the CPU worker.
+
+  A new example that needs no native session — a model, seam, host, or boundary
+  contract — belongs in `glfw-tests`, beside the component spec that owns it. An
+  example that must initialize GLFW, open a real window, or observe the platform
+  belongs in `glfw-native-tests` and its shared fixture.
+- **The window model examples** in the same suite use the seam's private
+  drivers: `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
   owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
   reconciliation's preparation point, and `seamRejectCloseRequest` is the
   private close-request transition. None is a public command. They live in the
@@ -2340,7 +2352,7 @@ own on Linux, or a human's explicit approval on a real desktop.
   no package outside `hetoimasia-glfw` can name them; the `GLFW` opacity
   examples compile clients proving it. Each driver also refuses, with
   `ForeignSeamWindow`, a window its own seam did not create.
-- **The window command examples** in the same executable drive the private
+- **The window command examples** in the same suite drive the private
   command executor — `seamExecuteNext`, `seamExecuteNextInterrupted`, and
   `seamExecuteNextScripted` — and the admission hooks of `submitWith`, both
   also private to `seam-core`. Without sleeps, they prove immediate
@@ -2355,7 +2367,7 @@ own on Linux, or a human's explicit approval on a real desktop.
   Haskell exception with its context; owner-thread waits refused rather than
   blocking; and the observation request settling with a revision published
   first, while unserved and ended windows are rejected.
-- **The window control examples** in the same executable submit the public
+- **The window control examples** in the same suite submit the public
   control commands to the private command executor and to the window host's
   owner loop over seam sessions, whose native table records every control call
   with its window key and arguments and runs a scripted `scriptWindowControl`
@@ -2376,7 +2388,7 @@ own on Linux, or a human's explicit approval on a real desktop.
   update failures naming their calls, refusing sizes while indeterminate, and a
   complete update restoring known state; and post-call revisions ordered while
   the latest snapshot moves beyond them.
-- **The window mode examples** in the same executable submit mode requests to the
+- **The window mode examples** in the same suite submit mode requests to the
   private command executor and to the window host's owner loop over seam
   sessions whose native table tracks each window's decoration, monitor, size, and
   position, and takes windows off a disconnected monitor as GLFW does. Two
@@ -2411,7 +2423,7 @@ own on Linux, or a human's explicit approval on a real desktop.
   while another window is served; windowed constraints suspended and restored
   with a placement they exclude refused; and the named revision carrying the
   applied mode and geometry.
-- **The monitor inventory examples** in the same executable use the seam's
+- **The monitor inventory examples** in the same suite use the seam's
   private monitor drivers — `seamSetMonitorTopology`, `seamDeliverMonitorEvents`,
   and `seamQueueMonitorEvents` — over scripted monitors whose native pointers
   stand for scripted addresses, and the seam raises if the model queries an
@@ -2430,7 +2442,7 @@ own on Linux, or a human's explicit approval on a real desktop.
   ahead of termination and freed last.
 - **`glfw-native-tests`** needs a windowing session: Cocoa locally, or an
   isolated X11 display, and per-run consent to enter it. It is not part of
-  `hetoimasia-tests` or the console smoke; it is the `test.glfw-native`
+  `glfw-tests` or the console smoke; it is the `test.glfw-native`
   validation group, which only the display worker runs. See
   [The native suite](#the-native-suite).
 

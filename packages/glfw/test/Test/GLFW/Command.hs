@@ -1,9 +1,8 @@
 -- | Examples for window command admission and completion, driven through the
 -- test seam's private command executor.
 --
--- They live in the package's @glfw-window-examples@ executable because the
--- executor and the admission hooks belong to the private @seam-core@
--- sublibrary. Hosts, ports, and tickets are the public "Hetoimasia.GLFW.Command"
+-- They live in the package's own @glfw-tests@ suite because the executor and
+-- the admission hooks belong to the private @seam-core@ sublibrary. Hosts, ports, and tickets are the public "Hetoimasia.GLFW.Command"
 -- interface, over a session and windows of "Hetoimasia.GLFW.Seam"'s scripted
 -- native library: admission, claim, settlement, closure, and the observation
 -- request's execution are the production protocol, and nothing initializes

@@ -10,9 +10,11 @@
 -- that drifted, fails here rather than at some later link.
 --
 -- The manifest is found the way Cabal found the library: through @pkg-config@,
--- whose @glfw3@ prefix holds @hetoimasia-native-manifest.json@. The package
--- description is read out of the checkout this suite runs in.
-module Test.Engine.GLFW.Linking (spec) where
+-- whose @glfw3@ prefix holds @hetoimasia-native-manifest.json@. The manifest is
+-- an artifact of the native prefix, not a file of this package. The package
+-- description is read from the package's own directory, which is the working
+-- directory Cabal runs this suite in, so no repository layout is assumed.
+module Test.GLFW.Linking (spec) where
 
 import Data.Char (isSpace)
 import Data.List (isPrefixOf, stripPrefix)
@@ -43,7 +45,7 @@ spec = describe "GLFW link declarations" $ do
     description `shouldContain` "pkgconfig-depends: glfw3 >=3.4 && <3.5"
 
 packageDescription ∷ FilePath
-packageDescription = "packages/glfw/hetoimasia-glfw.cabal"
+packageDescription = "hetoimasia-glfw.cabal"
 
 data Requirement = Framework String | Library String
   deriving (Eq, Show)

@@ -48,7 +48,7 @@ reviewed ownership, dependency and validation contracts. The tracker edit was
 verified; its title, `epic`/`tests` labels and open state are unchanged.
 All children have since been filed and approved. TEST-3/#125 merged in PR #132
 and TEST-4/#127 in PR #137. Epic #49's checklist was reconciled on 2026-09-17.
-TEST-5/#129 is implemented by its own PR; TEST-6/#130 remains open. Read each child's canonical approval
+TEST-5/#129 merged in PR #150; TEST-6/#130 is implemented by its own PR. Read each child's canonical approval
 amendments as part of its implementation specification. No processing entry
 remains in this document.
 
@@ -73,14 +73,22 @@ remains in this document.
 
 ## Current implementation
 
-Rechecked 2026-09-17 against the TEST-5 (#129) branch based on
-`master@79d4425`; each item describes the tree once that change lands. These are
-source and tracker observations; the TEST-5 PR records its own test execution:
+Rechecked 2026-09-17 against the TEST-6 (#130) branch based on
+`master@0fd66e6`; each item describes the tree once that change lands. These are
+source and tracker observations; the TEST-6 PR records its own test execution:
 
-- Foundation now owns `foundation-tests` and runtime owns `runtime-tests`; the
-  GLFW headless suite still awaits TEST-6. Root `hetoimasia-tests` retains
-  console and GLFW coverage plus the `glfw-window-examples` build tool. Hspec filtering
+- Foundation owns `foundation-tests`, runtime owns `runtime-tests`, and GLFW
+  owns `glfw-tests`. Root `hetoimasia-tests` retains only console coverage and
+  the `hetoimasia` build tool, and depends on no GLFW package. Hspec filtering
   chooses examples at execution time; it does not remove build dependencies.
+- TEST-6 (#130) moved the root GLFW Session, Linking, and Opacity specs and the
+  window examples executable's eight modules into `glfw-tests` under
+  `packages/glfw/test/`, registered directly under one `GLFW` group with their
+  paths unchanged, removed the executable and the root subprocess wrapper, and
+  registered the floor group `test.glfw` on the existing `haskell-engine`
+  worker with `tools/native/` and `tools/ci-image/` as declared inputs. The
+  per-example mapping is [glfw_tests_mapping.md](glfw_tests_mapping.md).
+  `cabal.project.cpu` now also lists the root package.
 - TEST-5 (#129) moved the runtime contracts into `runtime-tests` under
   `packages/runtime/test/`, registered as the floor group `test.runtime` on the
   existing `haskell-engine` worker, including `Test.Runtime.ResourceSmoke` and
@@ -104,19 +112,22 @@ source and tracker observations; the TEST-5 PR records its own test execution:
   described above. P-6's clean CPU-only check needed a
   `cabal.project.cpu` that imports the shared `cabal.project.common`; see
   [validation.md](validation.md#building-without-the-glfw-sdk).
-- GLFW's `window-examples/` executable already owns the scripted window/host
-  examples and can use private libraries. One root Hspec example launches it as
-  a subprocess, obscuring its individual examples from root Hspec selection.
+- Before TEST-6, GLFW's `window-examples/` executable owned the scripted
+  window/host examples so they could use private libraries, and one root Hspec
+  example launched it as a subprocess, obscuring its individual examples from
+  root Hspec selection. `glfw-tests` now registers them directly.
 - `packages/glfw/native-tests/` already belongs to `glfw-native-tests`. It lazily
   acquires a main-thread session, dispatches from Hspec, and retains private
   lifecycle cases. Linux X11 runs remotely when affected; Cocoa runs locally.
   Keep this ownership and fixture contract; GPU fixtures remain future work.
-- `workflow-tests` already owns `tools/test`. Catalog policy version 9 has
-  `build.all`, `test.engine`, `test.foundation`, `test.runtime`, and `smoke.console` in its mandatory floor;
+- `workflow-tests` already owns `tools/test`. Catalog policy version 10 has
+  `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`,
+  and `smoke.console` in its mandatory floor;
   `test.workflow` and `test.glfw-native` are non-optional affected groups. The
   workflow explicitly assigns group IDs to workers and publishes receipts.
 
-Tracker recheck found open epic #49 and approved migration issues #129/#130.
+Tracker recheck found open epic #49 with TEST-5 merged in PR #150 and TEST-6
+(#130) as its last open child.
 Native-test consent #124 and monitor recovery #123 are merged; preserve their
 behavior through the remaining test moves. See
 [glfw.md](glfw.md#the-native-suite) for native-fixture instructions.

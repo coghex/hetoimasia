@@ -12,7 +12,7 @@
 -- 'forkOS' and 'forkIO' threads the seam does not. Threads are coordinated with
 -- 'MVar's, never with a sleep; 'boundedExample' only stops an example that has
 -- already hung.
-module Test.Engine.GLFW.Session (spec) where
+module Test.GLFW.Session (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS, isCurrentThreadBound)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
