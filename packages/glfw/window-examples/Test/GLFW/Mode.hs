@@ -31,10 +31,10 @@ import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (cleanupFailures)
 import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Control (ConstraintState (ConstraintsIndeterminate))
-import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), abandonClaims, savedPlacement, windowedPlacement, windowedPlan)
+import Hetoimasia.GLFW.Internal.Mode (ClaimState (..), NativeConstraints (..), WindowClaim (..), abandonClaims, modeRecoveryObligation, savedPlacement, windowedPlacement, windowedPlan)
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (monitorClaims, reconcileMonitorEvents)
-import Hetoimasia.GLFW.Internal.Window (reconcileWindowMode, transitionWindowWith)
+import Hetoimasia.GLFW.Internal.Window (EventProcessing (ProcessPending), processWindowEvents, reconcileWindowMode, transitionWindowWith)
 import Hetoimasia.GLFW.Mode
 import Hetoimasia.GLFW.Monitor
 import Hetoimasia.GLFW.Session
@@ -92,6 +92,26 @@ spec = describe "GLFW window modes" $ do
       (boundedExample testObservationWithoutFallback)
     it "lets a request settled after the disconnect supersede the pending recovery"
       (boundedExample testSupersededRecovery)
+    it "recovers a borderless window moved onto another live monitor by a callback when that monitor disconnects, and never repeats it"
+      (boundedExample (testMovedBorderlessCurrentDisconnect MovedByCallback))
+    it "recovers a borderless window moved onto another live monitor by a full sample when that monitor disconnects, and never repeats it"
+      (boundedExample (testMovedBorderlessCurrentDisconnect MovedBySample))
+    it "keeps a borderless window moved by a callback on its live monitor, with no fallback, when the monitor it left disconnects"
+      (boundedExample (testMovedBorderlessFormerDisconnect MovedByCallback))
+    it "keeps a borderless window moved by a full sample on its live monitor, with no fallback, when the monitor it left disconnects"
+      (boundedExample (testMovedBorderlessFormerDisconnect MovedBySample))
+    it "keeps the obligation on the ended monitor when the move is observed by a callback after its native disconnect and before the refresh"
+      (boundedExample (testMoveBeforeRefresh MovedByCallback))
+    it "keeps the obligation on the ended monitor when the move is observed by a full sample after its native disconnect and before the refresh"
+      (boundedExample (testMoveBeforeRefresh MovedBySample))
+    it "recovers from a confirmed monitor's disconnect across a move callback folded before the refresh that ends it"
+      (boundedExample (testConfirmedMonitorDisconnectBeforeRefresh MovedByCallback))
+    it "recovers from a confirmed monitor's disconnect across a full sample taken before the refresh that ends it"
+      (boundedExample (testConfirmedMonitorDisconnectBeforeRefresh MovedBySample))
+    it "only resamples a confirmed monitor's disconnect with no fallback configured, answering the followed obligation once"
+      (boundedExample testMovedBorderlessWithoutFallback)
+    it "recovers through the owner loop when the monitor a borderless window was moved onto disconnects a turn after the move was confirmed"
+      (boundedExample testHostedMovedBorderlessDisconnect)
     it "settles borderless placement the platform cannot perform as unsupported, never as fullscreen"
       (boundedExample testUnsupportedBorderless)
     it "reports a partial native failure with its completed steps and retains the pre-departure geometry for a later return"
@@ -725,6 +745,293 @@ testSupersededRecovery = withDesk tracked $ \desk → withWindowIn desk "first" 
   reconciled `shouldBe` WindowAvailable Nothing
   modeApplied record `shouldBe` AppliedWindowed
   afterReconciliation `shouldBe` afterSettled
+
+-- | How a borderless window's move onto the right monitor's work area is
+-- observed: a move callback folded at a poll boundary, re-deriving the applied
+-- mode from the folded placement alone, or a full sample taken after the poll
+-- delivered the callback, re-deriving it from the sample.
+data MovePath = MovedByCallback | MovedBySample
+  deriving (Eq, Show)
+
+-- | Observe the window moved to a placement through the given path, and answer
+-- its published applied mode.
+observeMove ∷ MovePath → Desk → Window → Int → Int → IO AppliedMode
+observeMove path desk window x y = do
+  let seam = deskSeam desk
+  case path of
+    MovedByCallback → do
+      _ ← seamDrive seam window DuringPoll [MovedTo x y]
+      pure ()
+    MovedBySample → do
+      seamQueueEvents seam window [MovedTo x y]
+      processWindowEvents (deskSession desk) ProcessPending
+      _ ← synchronizeWindow window
+      pure ()
+  modeApplied <$> recordOf window
+
+-- | Enter borderless over the left monitor with one fallback attempt, move the
+-- window onto the right monitor's work area while both are connected, and
+-- confirm the move at a reconciliation against the unchanged inventory: no
+-- outcome, no setter, and the recovery now owed to the right monitor.
+movedBorderlessConfirmed ∷ MovePath → Desk → Window → IO ()
+movedBorderlessConfirmed path desk window = do
+  entering ← execute desk [window] (mode window (modeRequest (borderlessMode (deskLeft desk)) (windowedFallback 1)))
+  entered' ← recordOf window
+  moved ← observeMove path desk window 100 200
+  beforeConfirmation ← setterCalls desk
+  confirmed ← reconcileWindowMode window
+  afterConfirmation ← setterCalls desk
+  confirmedRecord ← recordOf window
+  entering `shouldSatisfy` appliedCleanly
+  modeRecoveryObligation entered' `shouldBe` Just (deskLeft desk)
+  moved `shouldBe` AppliedBorderless (deskRight desk)
+  confirmed `shouldBe` WindowAvailable Nothing
+  afterConfirmation `shouldBe` beforeConfirmation
+  modeRecoveryObligation confirmedRecord `shouldBe` Just (deskRight desk)
+  modeApplied confirmedRecord `shouldBe` AppliedBorderless (deskRight desk)
+
+-- | The right monitor alone, and the left alone, as the scripted platform
+-- enumerates them after the other's disconnect.
+rightOnly, leftOnly ∷ MonitorTopology
+rightOnly = MonitorTopology (Just [(2, rightMonitor)]) 2
+leftOnly = MonitorTopology (Just [(1, leftMonitor)]) 1
+
+-- | The windowed fallback's return to the saved placement, which lies inside
+-- the right monitor's work area, and its centred placement in the left
+-- monitor's work area when only the left remains.
+recoveredOnRight, recoveredOnLeft ∷ ModeOutcome
+recoveredOnRight = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement 40 30) (Extent 800 600)] []
+recoveredOnLeft = ModeApplied WindowedFallbackAttempt [DecorationStep True, PlacementStep (Placement (-1360) 240) (Extent 800 600)] []
+
+-- | A borderless window moved onto the right monitor while both were connected,
+-- then the right monitor's disconnect: the recovery follows the window, so the
+-- configured fallback runs, placing the window in the remaining monitor's work
+-- area and keeping the saved placement; once settled, neither another
+-- reconciliation nor another observation repeats it.
+testMovedBorderlessCurrentDisconnect ∷ MovePath → Expectation
+testMovedBorderlessCurrentDisconnect path = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  movedBorderlessConfirmed path desk window
+  seamSetMonitorTopology seam leftOnly
+  seamDeliverMonitorEvents seam [MonitorDetached 2]
+  reconcileMonitorEvents (deskSession desk)
+  reconciled ← reconcileWindowMode window
+  settledCalls ← setterCalls desk
+  record ← recordOf window
+  restored ← geometry window
+  repeated ← reconcileWindowMode window
+  reobserved ← synchronizeWindow window
+  repeatedAgain ← reconcileWindowMode window
+  afterSettlement ← setterCalls desk
+  reconciled `shouldBe` WindowAvailable (Just recoveredOnLeft)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recoveredOnLeft
+  modeRecoveryObligation record `shouldBe` Nothing
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  restored `shouldBe` (Observed (Placement (-1360) 240), Observed (Extent 800 600))
+  repeated `shouldBe` WindowAvailable Nothing
+  appliedOf reobserved `shouldBe` Just AppliedWindowed
+  repeatedAgain `shouldBe` WindowAvailable Nothing
+  afterSettlement `shouldBe` settledCalls
+
+-- | The same move, then the left monitor's disconnect instead: the window
+-- stands on its connected monitor, so no fallback runs and no setter is
+-- called, the borderless presentation is kept, and later reconciliations and
+-- observations leave it alone.
+testMovedBorderlessFormerDisconnect ∷ MovePath → Expectation
+testMovedBorderlessFormerDisconnect path = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  movedBorderlessConfirmed path desk window
+  seamSetMonitorTopology seam rightOnly
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  reconcileMonitorEvents (deskSession desk)
+  beforeReconciliation ← seamCalls seam
+  reconciled ← reconcileWindowMode window
+  afterReconciliation ← seamCalls seam
+  record ← recordOf window
+  placed ← geometry window
+  reobserved ← synchronizeWindow window
+  repeated ← reconcileWindowMode window
+  finalCalls ← setterCalls desk
+  reconciled `shouldBe` WindowAvailable Nothing
+  afterReconciliation `shouldBe` beforeReconciliation
+  modeApplied record `shouldBe` AppliedBorderless (deskRight desk)
+  modeRecoveryObligation record `shouldBe` Just (deskRight desk)
+  modeLastOutcome record `shouldSatisfy` \case
+    Just (ModeApplied TargetAttempt _ []) → True
+    _ → False
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  -- Borderless over the left work area keeps that area's extent; only the
+  -- position moved.
+  placed `shouldBe` (Observed (Placement 100 200), Observed (Extent 1880 1000))
+  appliedOf reobserved `shouldBe` Just (AppliedBorderless (deskRight desk))
+  repeated `shouldBe` WindowAvailable Nothing
+  finalCalls `shouldSatisfy` all (\case SetWindowMonitor {} → True; SetWindowDecorated {} → True; _ → False)
+
+-- | The left monitor disconnects natively, and before the refresh that ends
+-- its identity a move onto the right monitor is observed — a callback folded
+-- against the inventory the refresh has not yet corrected, or a full sample
+-- taken against it. The observation reports borderless on the right, but the
+-- move was never confirmed while both monitors were live, so the obligation
+-- stays with the ended monitor and the configured fallback runs from the
+-- refresh.
+testMoveBeforeRefresh ∷ MovePath → Expectation
+testMoveBeforeRefresh path = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (modeRequest (borderlessMode (deskLeft desk)) (windowedFallback 1)))
+  seamSetMonitorTopology seam rightOnly
+  seamDeliverMonitorEvents seam [MonitorDetached 1]
+  moved ← observeMove path desk window 100 200
+  beforeRefresh ← recordOf window
+  reconcileMonitorEvents (deskSession desk)
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  restored ← geometry window
+  repeated ← reconcileWindowMode window
+  entering `shouldSatisfy` appliedCleanly
+  moved `shouldBe` AppliedBorderless (deskRight desk)
+  modeRecoveryObligation beforeRefresh `shouldBe` Just (deskLeft desk)
+  reconciled `shouldBe` WindowAvailable (Just recoveredOnRight)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recoveredOnRight
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  restored `shouldBe` original
+  repeated `shouldBe` WindowAvailable Nothing
+
+-- | After a confirmed move onto the right monitor, the right monitor
+-- disconnects natively and a further observation — another move, still over
+-- the right monitor's work area, through the given path alone — intervenes
+-- before the refresh that ends its identity, still deriving borderless on the
+-- right against the stale inventory. The obligation followed the window, so
+-- the refresh triggers the configured fallback into the remaining monitor.
+testConfirmedMonitorDisconnectBeforeRefresh ∷ MovePath → Expectation
+testConfirmedMonitorDisconnectBeforeRefresh path = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  movedBorderlessConfirmed path desk window
+  seamSetMonitorTopology seam leftOnly
+  seamDeliverMonitorEvents seam [MonitorDetached 2]
+  movedAgain ← observeMove path desk window 120 220
+  beforeRefresh ← recordOf window
+  reconcileMonitorEvents (deskSession desk)
+  reconciled ← reconcileWindowMode window
+  record ← recordOf window
+  restored ← geometry window
+  repeated ← reconcileWindowMode window
+  movedAgain `shouldBe` AppliedBorderless (deskRight desk)
+  modeRecoveryObligation beforeRefresh `shouldBe` Just (deskRight desk)
+  reconciled `shouldBe` WindowAvailable (Just recoveredOnLeft)
+  modeApplied record `shouldBe` AppliedWindowed
+  modeLastOutcome record `shouldBe` Just recoveredOnLeft
+  modeRecoveryObligation record `shouldBe` Nothing
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  restored `shouldBe` (Observed (Placement (-1360) 240), Observed (Extent 800 600))
+  repeated `shouldBe` WindowAvailable Nothing
+
+-- | With no fallback configured, the confirmed monitor's disconnect is only
+-- resampled: the one resample reports the window left over no live work area
+-- and answers the followed obligation, no setter is called, and the saved
+-- placement is preserved. Once a later observation establishes the window
+-- over the remaining monitor, a further reconciliation samples nothing.
+testMovedBorderlessWithoutFallback ∷ Expectation
+testMovedBorderlessWithoutFallback = withDesk tracked $ \desk → withWindowIn desk "first" $ \window → do
+  let seam = deskSeam desk
+  entering ← execute desk [window] (mode window (borderlessOn (deskLeft desk)))
+  moved ← observeMove MovedByCallback desk window 100 200
+  confirmed ← reconcileWindowMode window
+  confirmedRecord ← recordOf window
+  settersBefore ← setterCalls desk
+  seamSetMonitorTopology seam leftOnly
+  seamDeliverMonitorEvents seam [MonitorDetached 2]
+  reconcileMonitorEvents (deskSession desk)
+  beforeAnswer ← seamCalls seam
+  reconciled ← reconcileWindowMode window
+  afterAnswer ← seamCalls seam
+  answered ← recordOf window
+  _ ← observeMove MovedBySample desk window (-1500) 100
+  relocated ← recordOf window
+  beforeRepeat ← seamCalls seam
+  repeated ← reconcileWindowMode window
+  afterRepeat ← seamCalls seam
+  settersAfter ← setterCalls desk
+  entering `shouldSatisfy` appliedCleanly
+  moved `shouldBe` AppliedBorderless (deskRight desk)
+  confirmed `shouldBe` WindowAvailable Nothing
+  modeRecoveryObligation confirmedRecord `shouldBe` Just (deskRight desk)
+  reconciled `shouldBe` WindowAvailable Nothing
+  length afterAnswer `shouldSatisfy` (> length beforeAnswer)
+  modeApplied answered `shouldBe` AppliedIndeterminate
+  modeRecoveryObligation answered `shouldBe` Nothing
+  placementOf <$> modeSavedPlacement answered `shouldBe` Just (Placement 40 30, Extent 800 600)
+  modeApplied relocated `shouldBe` AppliedBorderless (deskLeft desk)
+  modeRecoveryObligation relocated `shouldBe` Nothing
+  repeated `shouldBe` WindowAvailable Nothing
+  afterRepeat `shouldBe` beforeRepeat
+  settersAfter `shouldBe` settersBefore
+
+-- | The window host's owner loop: a borderless request over the left monitor
+-- with a fallback, a move callback onto the right monitor delivered by a poll,
+-- a further turn for the loop's reconciliation to confirm the move while both
+-- monitors are connected, then the right monitor's disconnect delivered by a
+-- later poll. The loop's reconciliation after that turn's refresh takes the
+-- configured fallback into the remaining monitor.
+testHostedMovedBorderlessDisconnect ∷ Expectation
+testHostedMovedBorderlessDisconnect = do
+  seam ← newSeam tracked
+  stage ← newIORef (0 ∷ Int)
+  ticket ← newIORef Nothing
+  observedAt ← newIORef Nothing
+  (record, placed, settled) ←
+    hosted seam configuration $ \host control →
+      looping host control $ \turn → do
+        client ← onlyClient host
+        let target = clientWindow client
+        inventory ← preparedValue . observedValue <$> atomically (readSnapshot (hostMonitors host))
+        latest ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+        readIORef stage >>= \case
+          0 → do
+            left ← named "left" inventory
+            submitted ← submitWindowCommand (clientCommandPort client) [] (setWindowModeCommand target (modeRequest (borderlessMode left) (windowedFallback 1)))
+            case submitted of
+              SubmitAccepted accepted → writeIORef ticket (Just accepted) >> writeIORef stage 1
+              other → unexpected ("the borderless request was not admitted: " <> show other)
+            pure Continue
+          1 → do
+            accepted ← readIORef ticket >>= maybe (unexpected "no ticket was stored") pure
+            atomically (pollCompletion accepted) >>= \case
+              Nothing → pure Continue
+              Just disposition → do
+                when (not (appliedCleanly disposition)) (unexpected ("the borderless request settled as " <> show disposition))
+                _ ← withHostWindow host target (\window → seamQueueEvents seam window [MovedTo 100 200])
+                writeIORef stage 2
+                pure Continue
+          2 → do
+            right ← named "right" inventory
+            when (modeApplied (observedMode latest) == AppliedBorderless right) $ do
+              writeIORef observedAt (Just (turnNumber turn))
+              writeIORef stage 3
+            pure Continue
+          3 → do
+            observed ← readIORef observedAt >>= maybe (unexpected "no observation turn was stored") pure
+            -- The turn after the move was published has reconciled the window
+            -- against an inventory holding both monitors.
+            when (turnNumber turn > observed) $ do
+              seamSetMonitorTopology seam leftOnly
+              seamQueueMonitorEvents seam [MonitorDetached 2]
+              writeIORef stage 4
+            pure Continue
+          _ → do
+            let latestRecord = observedMode latest
+            pure $ case modeLastOutcome latestRecord of
+              Just outcome@(ModeApplied WindowedFallbackAttempt _ _) →
+                Finish (latestRecord, (observedPlacement latest, observedLogicalExtent latest), outcome)
+              _ → Continue
+  settled `shouldBe` recoveredOnLeft
+  modeApplied record `shouldBe` AppliedWindowed
+  modeRecoveryObligation record `shouldBe` Nothing
+  placementOf <$> modeSavedPlacement record `shouldBe` Just (Placement 40 30, Extent 800 600)
+  placed `shouldBe` (Observed (Placement (-1360) 240), Observed (Extent 800 600))
+  where
+    configuration = (defaultHostConfig [hiddenTestWindowConfig "first" 800 600]) {hostIdleWait = 0.01}
 
 testUnsupportedBorderless ∷ Expectation
 testUnsupportedBorderless =

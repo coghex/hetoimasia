@@ -203,7 +203,11 @@
 -- indeterminate is resampled. The obligation is the monitor identity the last
 -- settlement's own sample established, so the observations that truthfully
 -- report the platform's post-disconnect state — before the refresh or after it
--- — do not erase it.
+-- — do not erase it. Only that reconciliation moves it, and only for a
+-- borderless window whose observed monitor and owed monitor are both live in
+-- the refreshed inventory: a legitimate move between two connected monitors is
+-- thereby told apart from an observation made after a disconnect, which
+-- derives against the inventory the refresh has not yet corrected.
 --
 -- A 'WindowConfig' may carry a startup mode, transitioned during creation after
 -- the initial observation seeded the saved placement. A required startup mode
@@ -528,6 +532,7 @@ import Hetoimasia.GLFW.Internal.Mode
   , deriveApplied
   , effectiveConstraints
   , fallbackAttempts
+  , followedMonitor
   , fullscreenPlan
   , inertRequest
   , initialModeRecord
@@ -543,6 +548,7 @@ import Hetoimasia.GLFW.Internal.Mode
   , pruneClaims
   , recordApplied
   , recordRecoveryCleared
+  , recordRecoveryFollowed
   , recordSaved
   , recordSettled
   , requestedFallback
@@ -2124,7 +2130,10 @@ samplePresentation forced window adjust =
       live ← liveMonitors session
       atomicModifyIORef' (sessionClaims session) $ \claims →
         (settleClaims (windowLocalIdentity (windowId window)) observed (pruneClaims live claims), ())
-    withRecord change observation = observation {obsMode = change (obsMode observation)}
+
+-- | Apply a change to an observation's mode record.
+withRecord ∷ (ModeRecord → ModeRecord) → WindowObservation → WindowObservation
+withRecord change observation = observation {obsMode = change (obsMode observation)}
 
 -- | Transition a window to its startup mode during creation. An optional
 -- startup request refused before any native call, or whose target the
@@ -2194,9 +2203,15 @@ restoreLeftWindowed window disturbed = do
 -- reports the platform's post-disconnect state — windowed at the desktop origin,
 -- or indeterminate for a borderless window left over no live work area — does
 -- not erase it, and the refresh that ends the identity triggers it however the
--- two were ordered. With no fallback the resample answers the obligation, so a
--- settled window is not resampled again on later turns. A closing window, and
--- one inside a transition, are left alone.
+-- two were ordered. The obligation follows a borderless window only here, and
+-- only when the refreshed inventory finds both the owed monitor and the one the
+-- applied mode now stands on live ('followedMonitor'): the move is then a
+-- legitimate one between connected monitors, recorded and published before any
+-- disconnect is judged against it, while an observation made after a native
+-- disconnect and before the refresh leaves the obligation owed to the ended
+-- identity, so the recovery still runs. With no fallback the resample answers
+-- the obligation, so a settled window is not resampled again on later turns. A
+-- closing window, and one inside a transition, are left alone.
 reconcileWindowMode ∷ Window → IO (WindowResult (Maybe ModeOutcome))
 reconcileWindowMode window =
   atBoundary (pure ()) window reconcileModeOperation $ do
@@ -2207,19 +2222,22 @@ reconcileWindowMode window =
         ended = any (`notElem` live) (modeRecoveryObligation record)
     if obsPhase current /= WindowOpen || transition
       then pure Nothing
-      else
-        if ended && fallbackAttempts (modeFallback record) > 0
-          then
-            runTransition (pure ()) window ModeOptional (modeRequest (modeRequested record) (modeFallback record)) WindowedFallbackAttempt >>= \case
-              ModeSettled outcome _ → pure (Just outcome)
-              _ → pure Nothing
-          else
-            Nothing
-              <$ when
-                (ended || modeApplied record == AppliedIndeterminate)
-                -- A resample reached through an ended obligation carries no
-                -- fallback: publishing the truth answers the obligation.
-                (void (samplePresentation False window (if ended then recordRecoveryCleared else id)))
+      else case followedMonitor live record of
+        -- A confirmed move between live monitors: the obligation moves with
+        -- the window, and nothing has ended.
+        Just followed → Nothing <$ reconcileAdjusted False (withRecord (recordRecoveryFollowed followed)) (pure ()) window Nothing
+        Nothing
+          | ended && fallbackAttempts (modeFallback record) > 0 →
+              runTransition (pure ()) window ModeOptional (modeRequest (modeRequested record) (modeFallback record)) WindowedFallbackAttempt >>= \case
+                ModeSettled outcome _ → pure (Just outcome)
+                _ → pure Nothing
+          | otherwise →
+              Nothing
+                <$ when
+                  (ended || modeApplied record == AppliedIndeterminate)
+                  -- A resample reached through an ended obligation carries no
+                  -- fallback: publishing the truth answers the obligation.
+                  (void (samplePresentation False window (if ended then recordRecoveryCleared else id)))
 
 -- | How an owner turn processes native events.
 data EventProcessing
