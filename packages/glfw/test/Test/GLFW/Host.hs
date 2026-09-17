@@ -13,7 +13,7 @@
 -- sleep; a seam wait that must block blocks on a transaction.
 module Test.GLFW.Host (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, displayException, fromException, throwIO, try)
@@ -197,6 +197,10 @@ spec = describe "GLFW window host" $ do
       (boundedExample testReportingIsInterruptible)
     it "spends the reporting attempt for a notification still in its post when the run is cancelled at that wait"
       (boundedExample testCancelledDuringTheFinalWait)
+    it "spends the reporting attempt for a cancellation requested as the action returns, before the attempt is protected"
+      (boundedExample testCancelledAsTheActionReturns)
+    it "spends the reporting attempt when a custom shutdown's own boundary is cancelled at its wait"
+      (boundedExample testCancelledDuringACustomShutdown)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -1145,6 +1149,83 @@ testCancelledDuringTheFinalWait = do
             takeMVar inside
         )
   -- The boundary is waiting for the obligation; cancel it there.
+  awaitBlockedOnSTM runner
+  duringWait ← readIORef warnings
+  killThread runner
+  putMVar release ()
+  cancelled ← takeMVar finished
+  duringWait `shouldBe` []
+  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+  warningComponents warnings `shouldReturn` ["glfw.wake"]
+
+-- | A cancellation requested at the instant the action returns. It lands in the
+-- tail of the action, in the handoff to the reporting attempt, inside the
+-- attempt's own write, or after the run has already finished — the rounds
+-- sample all of it. The handoff is masked and the attempt is claimed before
+-- anything it could be delivered at, so wherever it lands the one report is
+-- still made and the run ends either cancelled or complete, never some other
+-- failure.
+testCancelledAsTheActionReturns ∷ Expectation
+testCancelledAsTheActionReturns = do
+  outcomes ← mapM (const oneRound) [1 .. 10 ∷ Int]
+  map snd outcomes `shouldBe` replicate 10 ["glfw.wake"]
+  map fst outcomes `shouldSatisfy` all id
+  where
+    oneRound = do
+      seam ← newSeam (failingPostScript "scripted wake failure")
+      warnings ← newIORef ([] ∷ [LogEntry])
+      returning ← newEmptyMVar
+      (runner, finished) ←
+        onMainThread seam $
+          runWindowApplication
+            (withLoggingLifetime (recordingLogger warnings))
+            "host-example"
+            (hostOver seam (settings [windowNamed "returning"]))
+            id
+            (\host _ → pure host)
+            (\host _ → degradeWakePath host >> putMVar returning ())
+      -- Requested as the action's last act, so its delivery races the handoff.
+      takeMVar returning
+      _ ← forkIO (throwTo runner ThreadKilled)
+      outcome ← takeMVar finished
+      recorded ← warningComponents warnings
+      -- Cancelled, or finished before the cancellation could land; nothing else.
+      pure (either (\caught → fromException caught == Just ThreadKilled) (const True) outcome, recorded)
+
+-- | An application that owns its own shutdown and calls
+-- 'reportHostWakeDegradation' itself: a cancellation at that boundary's wait
+-- completes the wait, spends the attempt, and propagates.
+testCancelledDuringACustomShutdown ∷ Expectation
+testCancelledDuringACustomShutdown = do
+  inside ← newEmptyMVar
+  release ← newEmptyMVar
+  firstPost ← newIORef True
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            reportError reporter 0x00010008 "scripted wake failure"
+            first ← atomicModifyIORef' firstPost (\flag → (False, flag))
+            when first (putMVar inside () >> takeMVar release)
+        }
+  warnings ← newIORef ([] ∷ [LogEntry])
+  let capturing = recordingLogger warnings
+  (runner, finished) ←
+    onMainThread seam $
+      runWindowApplication
+        (withLoggingLifetime quietLogger)
+        "host-example"
+        (hostOver seam (settings [windowNamed "custom"]))
+        id
+        (\host _ → pure host)
+        ( \host _ → do
+            window ← onlyWindow host
+            _ ← forkIO (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
+            takeMVar inside
+            -- The application's own boundary, with the obligation still in its
+            -- post: this call waits for it.
+            void (reportHostWakeDegradation capturing host)
+        )
   awaitBlockedOnSTM runner
   duringWait ← readIORef warnings
   killThread runner

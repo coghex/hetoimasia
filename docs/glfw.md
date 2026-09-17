@@ -739,14 +739,17 @@ needs no reporting call of its own. `reportHostWakeDegradation` is that same
 boundary for an application that owns a different shutdown, and `hostWakePath`
 reads whether an attempt is still owed.
 
-Neither boundary runs inside a release. Both write through the injected logger
-as ordinary interruptible work on the owner thread, so a cancellation delivered
-while the attempt is writing reaches it and is recorded as one. A cancellation
-delivered while a boundary is still waiting for an obligation is not allowed to
-abandon it: an obligation may be inside a failing post that has not yet recorded
-what it found, so the wait is completed uninterruptibly — bounded by one
-empty-event post each, with no new obligation possible — and the attempt is
-spent before the cancellation is re-raised as the primary failure. A failing attempt after a successful run fails the run;
+Neither boundary runs inside a release. Both hold the sequence from the work
+ending to the attempt being claimed under a mask, so nothing can be delivered in
+the handoff between them, and both write through the injected logger as ordinary
+interruptible work on the owner thread, so a cancellation delivered while the
+attempt is writing reaches it and is recorded as one. The wait for an obligation
+is interruptible too, but a cancellation there may not abandon it: an obligation
+may be inside a failing post that has not yet recorded what it found, so the wait
+is completed uninterruptibly — bounded by one empty-event post each, with no new
+obligation possible — and the attempt is spent before the cancellation is
+re-raised as the primary failure. `reportHostWakeDegradation` is the same
+sequence, so a custom shutdown's boundary behaves exactly as the runner's. A failing attempt after a successful run fails the run;
 after a failing or cancelled one the original failure stays primary and the
 attempt's failure is retained beside it as cleanup evidence. A host's shutdown
 closes its own admission, never the session's wake capability, so sequential
@@ -2491,6 +2494,9 @@ when the action fails, and when the run is cancelled; a reporting attempt
 cancelled at its sink, which only an attempt outside a release can be; a run
 cancelled at that boundary's own wait, whose notification was still inside its
 failing post, keeping the cancellation primary and still spending the attempt;
+ten rounds of a cancellation requested as the action returns, landing wherever
+the race puts it and never losing the report; the same cancellation at a custom
+shutdown's own `reportHostWakeDegradation` boundary;
 one
 degradation and one warning shared by sequential hosts borrowing one session,
 whose wake capability neither shutdown closed;

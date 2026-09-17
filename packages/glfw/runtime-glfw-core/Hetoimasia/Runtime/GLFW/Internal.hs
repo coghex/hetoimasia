@@ -71,6 +71,7 @@ import Control.Exception
   , bracket_
   , finally
   , fromException
+  , mask
   , rethrowIO
   , tryWithContext
   , uninterruptibleMask_
@@ -152,6 +153,7 @@ import Hetoimasia.GLFW.Internal.Notify
   ( DegradationAttempt
   , Notifier
   , attemptDegradationReport
+  , attemptDegradationReportWith
   , awaitNotificationsSettled
   , notificationsInFlight
   )
@@ -477,15 +479,15 @@ hostNotificationsInFlight = notificationsInFlight . hostNotifier
 -- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
 reportHostWakeDegradation ∷ HasCallStack ⇒ Logger → WindowHost → IO DegradationAttempt
 reportHostWakeDegradation logger host =
-  ownerOperation (hostSession host) reportOperation [] $ do
-    atomically (awaitNotificationsSettled (hostNotifier host))
-    attemptDegradationReport logger (hostNotifier host)
+  ownerOperation (hostSession host) reportOperation [] $
+    mask (\restore → settledAttempt restore logger host)
 
--- | The runner's own final boundary: 'reportWhenSettled' on the owner thread,
--- checked as an owner operation exactly as 'reportHostWakeDegradation' is.
-reportHostWakeDegradationAtExit ∷ HasCallStack ⇒ Logger → WindowHost → IO ()
-reportHostWakeDegradationAtExit logger host =
-  ownerOperation (hostSession host) reportOperation [] (reportWhenSettled logger host)
+-- | The runner's own final boundary: the same attempt, over the restore its
+-- caller already holds, checked as an owner operation exactly as
+-- 'reportHostWakeDegradation' is.
+reportHostWakeDegradationAtExit ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO ()
+reportHostWakeDegradationAtExit restore logger host =
+  ownerOperation (hostSession host) reportOperation [] (void (settledAttempt restore logger host))
 
 hostNotifier ∷ WindowHost → Notifier
 hostNotifier = commandHostNotifier . hostCommands
@@ -493,27 +495,26 @@ hostNotifier = commandHostNotifier . hostCommands
 -- | Wait for every registered notification obligation to be discharged, then
 -- make the wake path's one guarded reporting attempt.
 --
--- It is ordinary interruptible 'IO' on the owner thread, never a release
--- callback: the attempt writes through the injected logger, which does not
--- belong inside a release's mask, and a cancellation delivered while it writes
--- is recorded as one.
+-- The caller has masked, and lends its @restore@ for the one part that must
+-- stay interruptible: the write through the injected logger, so a cancellation
+-- delivered while the attempt writes reaches it and is recorded as one. This is
+-- never a release callback.
 --
--- A cancellation delivered while it is still waiting is a different matter: an
--- obligation registered before quiescence may be inside a failing post that has
--- not yet recorded what it found, and abandoning the wait there would leave that
--- degradation owed with no boundary left to claim it. So the wait is completed
--- uninterruptibly — bounded by one empty-event post per obligation outstanding,
--- with no new one possible — and the attempt is then made, before the
--- cancellation is re-raised as the primary failure it is. A failure the attempt
--- raises is retained beside it.
-reportWhenSettled ∷ HasCallStack ⇒ Logger → WindowHost → IO ()
-reportWhenSettled logger host =
-  tryWithContext (atomically (awaitNotificationsSettled notifier)) >>= \case
+-- The wait is interruptible too, but a cancellation there may not abandon it: an
+-- obligation may be inside a failing post that has not yet recorded what it
+-- found, and nothing would be left to claim that degradation. So the wait is
+-- completed uninterruptibly — bounded by one empty-event post per obligation
+-- outstanding, with no new one possible once admission has closed — and the
+-- attempt is then made before the cancellation is re-raised as the primary
+-- failure. A failure the attempt raises is retained beside it.
+settledAttempt ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO DegradationAttempt
+settledAttempt restore logger host =
+  tryWithContext (restore (atomically (awaitNotificationsSettled notifier))) >>= \case
     Right () → attempt
     Left interrupted → do
       uninterruptibleMask_ (atomically (awaitNotificationsSettled notifier))
       tryWithContext attempt >>= \case
-        Right () → rethrowIO (interrupted ∷ ExceptionWithContext SomeException)
+        Right _ → rethrowIO (interrupted ∷ ExceptionWithContext SomeException)
         Left failed →
           withResourceLabelled
             wakeReportLabel
@@ -522,18 +523,22 @@ reportWhenSettled logger host =
             (\() → rethrowIO interrupted)
   where
     notifier = hostNotifier host
-    attempt = void (attemptDegradationReport logger notifier)
+    attempt = attemptDegradationReportWith restore logger notifier
 
 -- | Run @body@, then make the reporting attempt, whatever @body@ did.
 --
--- A failure the attempt raises after a successful body fails the caller. After
--- a failing or cancelled body the body's failure stays primary and the
--- attempt's is retained beside it as cleanup evidence, carried by a release that
--- only rethrows what was already caught.
-retainingReport ∷ IO () → IO r → IO r
-retainingReport attempt body = do
-  outcome ← tryWithContext body
-  reported ← tryWithContext attempt
+-- The whole sequence is masked and @body@ runs under the restore, so nothing can
+-- be delivered in the handoff between the body ending and the attempt being
+-- protected; the attempt is lent that same restore for its logger write.
+--
+-- A failure the attempt raises after a successful body fails the caller. After a
+-- failing or cancelled body the body's failure stays primary and the attempt's
+-- is retained beside it as cleanup evidence, carried by a release that only
+-- rethrows what was already caught.
+retainingReport ∷ ((∀ a. IO a → IO a) → IO ()) → IO r → IO r
+retainingReport attempt body = mask $ \restore → do
+  outcome ← tryWithContext (restore body)
+  reported ← tryWithContext (attempt restore)
   case (outcome, reported) of
     (Right result, Right ()) → pure result
     (Right _, Left failed) → rethrowIO (failed ∷ ExceptionWithContext SomeException)
@@ -944,7 +949,7 @@ runOwnerLoop host control hooks =
     -- returns, after every obligation registered by an admission or a
     -- publication has been discharged, so a degradation the last turn's own work
     -- caused is never left owed.
-    reportingAsItEnds body = retainingReport (reportWhenSettled (loopLogger hooks) host) body
+    reportingAsItEnds = retainingReport (\restore → void (settledAttempt restore (loopLogger hooks) host))
     turn number idle = do
       checkRuntime control
       queued ← atomically (queuedCommands host)
@@ -1127,7 +1132,9 @@ runWindowApplication enterLifetime name dependencies host startup action =
       name
       ( \use →
           withScoped dependencies $ \built →
-            retainingReport (reportHostWakeDegradationAtExit (lifetimeLogger lifetime) (host built)) (use built)
+            retainingReport
+              (\restore → reportHostWakeDegradationAtExit restore (lifetimeLogger lifetime) (host built))
+              (use built)
       )
       (quiesceWindowHost . host)
       startup

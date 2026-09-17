@@ -72,6 +72,7 @@ module Hetoimasia.GLFW.Internal.Notify
     -- * Degradation and its one report
   , DegradationAttempt (..)
   , attemptDegradationReport
+  , attemptDegradationReportWith
   , wakeComponent
   ) where
 
@@ -209,7 +210,16 @@ data DegradationAttempt
 -- A sink failure or a cancellation is recorded in the state and propagates as
 -- itself. Neither is retried, and neither undoes the degradation.
 attemptDegradationReport ∷ HasCallStack ⇒ Logger → Notifier → IO DegradationAttempt
-attemptDegradationReport logger notifier = mask $ \restore →
+attemptDegradationReport logger notifier =
+  mask (\restore → attemptDegradationReportWith restore logger notifier)
+
+-- | 'attemptDegradationReport' for a caller that has already masked, and whose
+-- own @restore@ it uses for the one part that must stay interruptible: the
+-- write through the logger. Claiming and settling the attempt are non-blocking
+-- transactions, so nothing can be delivered between them.
+attemptDegradationReportWith
+  ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → Notifier → IO DegradationAttempt
+attemptDegradationReportWith restore logger notifier =
   atomically claim >>= \case
     Nothing → pure NoDegradationDue
     Just reports →
