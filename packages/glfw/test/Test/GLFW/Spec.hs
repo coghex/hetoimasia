@@ -30,6 +30,7 @@ import qualified Test.GLFW.Linking as Linking
 import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
 import qualified Test.GLFW.Opacity as Opacity
+import qualified Test.GLFW.Protected as Protected
 import qualified Test.GLFW.Scheduled as Scheduled
 import qualified Test.GLFW.Session as Session
 import qualified Test.GLFW.Notify as Notify
@@ -46,6 +47,7 @@ spec = describe "GLFW" $ do
   Command.spec
   Control.spec
   Host.spec
+  Protected.spec
   Scheduled.spec
   Dynamic.spec
   Monitor.spec

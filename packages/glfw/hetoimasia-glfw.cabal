@@ -138,6 +138,7 @@ library runtime-glfw-core
     hs-source-dirs: runtime-glfw-core
     exposed-modules:
         Hetoimasia.Runtime.GLFW.Internal
+        Hetoimasia.Runtime.GLFW.Internal.Retirement
     build-depends:
         base >=4.21 && <4.22,
         containers >=0.7 && <0.8,
@@ -207,6 +208,7 @@ test-suite glfw-tests
         Test.GLFW.Monitor
         Test.GLFW.Notify
         Test.GLFW.Opacity
+        Test.GLFW.Protected
         Test.GLFW.Scheduled
         Test.GLFW.Session
         Test.GLFW.Spec
@@ -276,4 +278,5 @@ test-suite glfw-native-tests
         hetoimasia-glfw,
         hetoimasia-glfw:model,
         hetoimasia-glfw:native,
-        hetoimasia-glfw:runtime-glfw
+        hetoimasia-glfw:runtime-glfw,
+        hetoimasia-glfw:runtime-glfw-core

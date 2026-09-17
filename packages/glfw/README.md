@@ -61,8 +61,16 @@ before the owner resumes a fresh epoch. Native key, character, button, cursor,
 and scroll callbacks copy a fixed payload and return; the owner boundary
 publishes ordered events into the feed. The private `model` sublibrary also
 holds a backend-neutral model of exclusive window attachments and the
-retirement evidence that frees a window for a future graphics integration; no
-public module exports it, and no public attachment exists yet.
+retirement evidence that frees a window for a future graphics integration.
+`withProtectedWindowHost` builds the same host inside a dedicated IO
+continuation boundary that owns that state: on every exit it ends new graphics
+use, retires every remaining attachment on the main thread while the windows,
+the session, and every parent are still live, and retains them all when it
+cannot. The `Scoped` constructors — `allocWindowHost` and `allocWindowHostIn` —
+keep their signatures and behaviour and accept no attachment: they are issued no
+attachment identity, so a registration against such a host is refused before any
+effect. No public module exports an attachment operation or type, and no public
+attachment exists yet.
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on

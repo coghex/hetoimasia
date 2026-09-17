@@ -46,7 +46,17 @@ import Hetoimasia.Foundation.Failure
   , operation
   , operationText
   )
-import Hetoimasia.Foundation.Log (componentText)
+import Hetoimasia.Foundation.Log
+  ( callbackSink
+  , componentText
+  , defaultLogFilter
+  , mkLoggerWith
+  , systemMetadata
+  )
+import Hetoimasia.Foundation.Recovery (Disposition (Required))
+import Hetoimasia.GLFW.Internal.Attachment (RetirementFact, RollbackOutcome (RollbackSafe), allRetirementFacts)
+import qualified Hetoimasia.Runtime.GLFW.Internal as Runtime
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocComposite, withScoped)
@@ -90,6 +100,9 @@ spec gate = describe "private sessions in a child process" $ do
 
   it "lets no production wake enter GLFW once termination begins, with every admitted wake returned before it" $
     privateScenarioReporting gate "wake-teardown"
+
+  it "destroys a real window only after a scripted owner retires through the protected host, and terminates after that" $
+    privateScenarioReporting gate "protected-retirement"
 
 privateScenario ∷ Gate → String → IO ()
 privateScenario gate = launchWith gate $ \name → do
@@ -166,6 +179,12 @@ scenarios =
   , ( "monitor-lifecycle"
     , [ ("detaches the installed monitor callback before termination and frees it after the last native call", monitorTeardown)
       , ("never resolves a monitor identity from a completed session in a later session", monitorAcrossSessions)
+      ]
+    )
+  , ( "protected-retirement"
+    , [ ( "destroys the window only after the scripted owner certified every retirement fact, and terminates with no native call afterwards"
+        , protectedRetirement
+        )
       ]
     )
   , ( "wake-teardown"
@@ -378,6 +397,106 @@ wakeAcrossSessions = do
   unless (before == after) $
     failCheck ("a stale wake entered GLFW: " <> show (before, after))
   pure ("the stale capability answered " <> show duringLater <> " during a later session and " <> show afterLater <> " after it, with wake counts " <> show after <> " unchanged")
+
+-- | One real window, one scripted graphics owner, and the protected host
+-- lifetime, in a session of this child's own.
+--
+-- The native destruction of the window must follow the owner's completion, and
+-- the session's termination must follow that destruction, with no event
+-- processing, wake, or window call entering GLFW afterwards. It claims nothing
+-- about GPU synchronisation: the owner is a script and the facts it certifies
+-- are CPU facts, exactly as the headless examples' are. What the real session
+-- adds is that the destruction and the termination are the platform's own.
+protectedRetirement ∷ IO String
+protectedRetirement = do
+  journal ← newIORef []
+  calls ← newIORef (0 ∷ Int)
+  remaining ← newIORef allRetirementFacts
+  atTerminate ← newIORef Nothing
+  let counted action = modifyIORef' calls (+ 1) >> action
+      traced =
+        productionNative
+          { nativePollEvents = counted (nativePollEvents productionNative)
+          , nativeWaitEventsTimeout = \seconds → counted (nativeWaitEventsTimeout productionNative seconds)
+          , nativeDestroyWindow = \handle → do
+              modifyIORef' journal (<> ["window destroyed"])
+              counted (nativeDestroyWindow productionNative handle)
+          , nativeTerminate = do
+              modifyIORef' journal (<> ["session terminated"])
+              wakes ← wakeCountsForCheck
+              made ← readIORef calls
+              writeIORef atTerminate (Just (wakes, made))
+              nativeTerminate productionNative
+          }
+      config =
+        (Runtime.defaultHostConfig [hiddenTestWindowConfig (Text.pack "protected") 64 48])
+          {Runtime.hostIdleWait = 0.01}
+      logger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+  Runtime.runProtectedWindowApplication
+    (withLoggingLifetime logger)
+    (Text.pack "protected-retirement")
+    ( \_ use →
+        Runtime.withProtectedWindowHostIn
+          logger
+          (allocComposite (sessionAssembly traced defaultSessionConfig))
+          config
+          ( \host → do
+              window ← onlyHostWindow host
+              Runtime.attachHostWindow host window (scriptedOwner journal remaining host) >>= \case
+                Runtime.AttachmentEstablished _ _ → pure ()
+                other → failCheck ("the attachment was not established: " <> show other)
+              use host
+          )
+    )
+    id
+    (\host _ → pure host)
+    (\_ _ → pure ())
+  entries ← readIORef journal
+  let expected = map (\fact → "certified " <> show fact) allRetirementFacts <> ["window destroyed", "session terminated"]
+  unless (entries == expected) $
+    failCheck ("the protected host's order was " <> show entries <> ", not " <> show expected)
+  (wakes, made) ← readIORef atTerminate >>= maybe (failCheck "termination recorded nothing") pure
+  afterWakes ← wakeCountsForCheck
+  afterCalls ← readIORef calls
+  unless (afterWakes == wakes) $
+    failCheck ("a wake entered GLFW after termination began: " <> show (wakes, afterWakes))
+  unless (afterCalls == made) $
+    failCheck ("a native event or window call was made after termination began: " <> show (made, afterCalls))
+  pure
+    ( "the order was "
+        <> show entries
+        <> "; "
+        <> show made
+        <> " event and window call(s) and wake counts "
+        <> show wakes
+        <> " when termination began, unchanged afterwards"
+    )
+
+-- | The scripted graphics owner: it certifies one retirement fact per bounded
+-- opportunity, in order, and stalls once it has none left.
+scriptedOwner
+  ∷ IORef [String] → IORef [RetirementFact] → Runtime.WindowHost → Runtime.AttachmentProtocol
+scriptedOwner journal remaining host =
+  Runtime.AttachmentProtocol
+    { Runtime.protocolConstruct = \_ _ → pure ()
+    , Runtime.protocolRollback = pure RollbackSafe
+    , Runtime.protocolStep = \_ acknowledgement →
+        readIORef remaining >>= \case
+          [] → pure Runtime.RetirementStalled
+          fact : rest → do
+            writeIORef remaining rest
+            modifyIORef' journal (<> ["certified " <> show fact])
+            _ ← Runtime.reportHostRetirementFact host acknowledgement fact
+            pure Runtime.RetirementAdvanced
+    , Runtime.protocolDisposition = Required
+    , Runtime.protocolRecognizes = \_ → pure False
+    }
+
+onlyHostWindow ∷ Runtime.WindowHost → IO WindowId
+onlyHostWindow host =
+  atomically (Runtime.hostWindowIdentities host) >>= \case
+    [identity] → pure identity
+    windows → failCheck ("expected one window, found " <> show (length windows))
 
 -- | How many sessions 'wakeTeardown' closes while workers wake them.
 wakeRounds ∷ Int

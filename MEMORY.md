@@ -88,6 +88,11 @@ owning subsystem's contract/design when continuing its work.
   owner has two loops: `runOwnerLoop`, unchanged and paced by the turn before
   it, and the additive `runScheduledOwnerLoop`, paced by absolute deadlines from
   the host's injected monotonic clock and bounded by the same finite fallback.
+  `withProtectedWindowHost` builds the same host inside an IO continuation
+  boundary that owns attachment retirement; the `Scoped` constructors keep their
+  behaviour and accept no attachment. On every exit that boundary ends new
+  graphics use, retires attachments on the main thread with the windows, the
+  session, and the parents live, and retains them all when it cannot.
 - [Validation](docs/validation.md): mandatory floor plus affected non-optional
   and PR-requested groups. Optional probes remain opt-in. CI evidence and review
   approval have independent freshness rules; approved clean merges may retain
@@ -107,10 +112,12 @@ owning subsystem's contract/design when continuing its work.
   owned; committed demand retained across cancellation; expected wake failure
   keeps accepted work, reports once under logging policy and degrades to polling.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
-  #141–#144. One exclusive graphics owner per window. Protected main-thread
+  #141 and #142 are merged; the protected host #143 lands with its own PR, and
+  #144 remains. One exclusive graphics owner per window. Protected main-thread
   retirement follows worker drain and precedes dependency release on every exit.
-  Unknown safety retains resources. #143 depends on #136; #144 on #138 and #143.
-  Completed #123 no longer blocks this work.
+  Unknown safety retains resources. #144 depends on #138 and #143.
+  Completed #123 no longer blocks this work. The attachment seam #143 adds stays
+  private to `runtime-glfw-core`; #144 owns the public contract.
 - [Lua](docs/lua_runtime_design.md) is ready for staged processing. Independent
   UI/gameplay execution domains; stop unsafe authoritative gameplay while keeping
   UI available. Untrusted mods require separate processes per mod/domain,
