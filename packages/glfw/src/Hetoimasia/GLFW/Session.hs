@@ -10,8 +10,13 @@
 -- A session is entered, its asynchronous error reports read, windows created
 -- in it through "Hetoimasia.GLFW.Window" and commanded through
 -- "Hetoimasia.GLFW.Command", and it ends. The window host's owner loop in
--- "Hetoimasia.Runtime.GLFW" processes its native events; there is no input
--- operation yet.
+-- "Hetoimasia.Runtime.GLFW" processes its native events.
+--
+-- 'sessionWake' lends the session's wake capability: any thread may pass it to
+-- 'wakeSession' to end the owner's native event wait. A wake is a hint, answered
+-- with a typed 'WakeOutcome', and the capability is terminal once its session
+-- begins closing; see the internal module's /Waking the owner/ and /Wake
+-- lifetime/ sections.
 --
 -- @
 -- main ∷ IO ()
@@ -27,6 +32,12 @@ module Hetoimasia.GLFW.Session
   , withSession
   , sessionBackend
   , takeAsynchronousReports
+
+    -- * Waking the owner
+  , SessionWake
+  , sessionWake
+  , wakeSession
+  , WakeOutcome (..)
 
     -- * Configuration
   , SessionConfig (..)
@@ -64,14 +75,18 @@ import Hetoimasia.GLFW.Internal.Session
   , Session
   , SessionConfig (..)
   , SessionMisuse (..)
+  , SessionWake
   , UnsupportedBackend (..)
+  , WakeOutcome (..)
   , defaultSessionConfig
   , errorDescriptionLimit
   , errorEvidenceCapacity
   , glfwComponent
   , sessionAssembly
   , sessionBackend
+  , sessionWake
   , takeAsynchronousReports
+  , wakeSession
   )
 
 -- | Enter a GLFW session for the rest of the enclosing scope.

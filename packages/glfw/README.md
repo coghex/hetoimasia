@@ -5,8 +5,11 @@ Buildable package: `hetoimasia-glfw`.
 Owns the small private binding to upstream GLFW 3.4 and the one scoped session
 over it. `Hetoimasia.GLFW.Session` enters a session on the process main thread:
 backend selection (X11 on Linux, Cocoa on macOS, never Wayland), exclusive
-initialization and termination, bounded evidence of native error reports, and
-poisoning when teardown cannot finish safely. `Hetoimasia.GLFW.Monitor`
+initialization and termination, bounded evidence of native error reports,
+poisoning when teardown cannot finish safely, and an opaque wake capability
+(`sessionWake`, `wakeSession`) that any thread may use to end the owner's native
+event wait. A wake is only a hint; it is terminal once its session begins closing,
+and what to do after a failed wake is left to the host. `Hetoimasia.GLFW.Monitor`
 publishes that session's monitor inventory: copied descriptions with opaque
 identities that end on disconnect and re-resolve on the owner thread.
 `Hetoimasia.GLFW.Window` creates

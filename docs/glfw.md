@@ -63,7 +63,7 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session and session wake examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -106,6 +106,11 @@ data NativeOutcome       = NativeCallReturned | NativeCallFailed
 data NativeFailure       = NativeFailure { nativeOutcome ∷ NativeOutcome, nativeReports ∷ Reports }
 newtype AsynchronousErrorsUnobserved = AsynchronousErrorsUnobserved Reports
 glfwComponent ∷ Component                   -- "glfw"
+
+data SessionWake                            -- opaque; no native handle, no session
+sessionWake ∷ Session → SessionWake
+wakeSession ∷ SessionWake → IO WakeOutcome  -- any thread
+data WakeOutcome = WakePosted | WakeTerminal | WakeFailed Reports
 ```
 
 ```haskell
@@ -549,6 +554,58 @@ owner (`NotSessionOwner`) and that the session is still live (`SessionEnded`).
 The session lives until its enclosing `withScoped` continuation returns or
 throws. Like any scoped value, it must not escape that scope.
 
+### Waking the owner
+
+`sessionWake` lends the session's wake capability, and `wakeSession` posts
+GLFW's documented cross-thread empty event, so an owner blocked in a native
+event wait returns. It is the only native call this package makes off the owner
+thread: event pumping, timed waits, and every window and monitor operation stay
+owner-only. The capability is opaque. It exposes no native handle, no session
+representation, and no other authority, which the external-client opacity
+examples prove.
+
+A wake is a hint. It carries no message, may be coalesced with other wakes, and
+proves nothing about work: whatever state made the wake worthwhile stays
+authoritative. Any thread may call it — bound, unbound, or the owner itself. A
+call makes at most one empty-event post plus bounded, non-blocking bookkeeping:
+a never-retrying transaction to be admitted, one to leave, and the error
+capture's own updates. It invokes no caller-supplied IO and takes no lock that
+an owner operation or a callback could hold.
+
+| Outcome | Meaning |
+|---|---|
+| `WakePosted` | The empty event was posted and nothing was reported during the call. |
+| `WakeTerminal` | The session has begun closing or has closed. GLFW was not entered. |
+| `WakeFailed reports` | An expected platform failure, with the evidence [attributed to this call](#native-error-evidence). |
+
+A native table that raises is a programming failure. Its exception propagates
+unchanged once the call's accounting has settled. No outcome retries the wake,
+reclassifies other work, or chooses a degradation policy. Warning once and
+falling back to bounded polling after an expected failure is the window host's
+concern, deferred to TIME-4 of the [runtime scheduling
+design](runtime_scheduling_design.md).
+
+### Wake lifetime
+
+Each session owns a wake gate: open, closing with a count of admitted calls, or
+closed. A wake is admitted by raising that count in the same transaction that
+finds the gate open, and leaves by lowering it once its native call returns.
+Admission, the call, and leaving run masked, so no asynchronous exception can
+separate the accounting from the call it accounts for. A cancelled waker, cancelled
+inside its native call or with a cancellation pending when the call completes,
+still leaves, and the cancellation stays observable.
+
+The session's first release closes the gate and then waits, uninterruptibly,
+until every admitted call has left (see
+[teardown](#teardown-poisoning-and-controlled-blocking)). A new wake from then
+on answers `WakeTerminal` without entering GLFW. So `glfwTerminate` never runs
+while a wake is inside GLFW, no wake enters GLFW once termination has begun, and
+no callback storage is freed while a wake could report through it. This is a
+real exclusion, not a flag read before the FFI call. A capability retained past
+its session is terminal forever. It cannot reach a later session, even one with
+the same backend, because that session has its own gate. A construction that
+rolls back never lends a capability.
+
 ## Native error evidence
 
 GLFW reports an error through one process-wide callback, possibly on another
@@ -561,18 +618,35 @@ made synchronously from inside an owner call cannot deadlock. No Haskell
 exception unwinds into C: a callback that cannot record its report adds to
 `callbackFaults` instead.
 
-Reports are sorted by the OS identity of the reporting thread, never by Haskell
+Reports are sorted by facts about the reporting OS thread, never by Haskell
 thread identity (a callback runs in a Haskell thread of its own):
 
-- A report made on the process main thread during an operation's native call
-  belongs to that operation. The operation takes it after the call returns and
-  fails with a `NativeFailure` naming whether the call itself failed.
+- A report made during a wake call's native call, on the OS thread making it,
+  belongs to that wake call. The binding makes the post with the call's own
+  wake mark in that OS thread's thread-local storage. The callback reads the
+  mark on the thread GLFW invokes it on, so the post, the report, and the
+  attribution share one OS thread whichever Haskell thread called
+  `wakeSession`. Each call has its own bucket, removed when the call returns,
+  so two concurrent wakes each receive their own reports. Neither takes a
+  report from a concurrent owner operation or from the asynchronous reports,
+  and neither leaves one behind for `takeAsynchronousReports`,
+  `AsynchronousErrorsUnobserved`, or another operation to raise again.
+- Otherwise, a report made on the process main thread during an operation's
+  native call belongs to that operation. The operation takes it after the call
+  returns and fails with a `NativeFailure` naming whether the call itself
+  failed.
 - Any other report is asynchronous. It is never attributed to whichever
   operation is running when it is observed. `takeAsynchronousReports` reads it.
+  A report whose wake mark could not be read, or that names a call whose bucket
+  has closed, cannot be attributed and is counted here as a callback fault.
 
-Each class keeps its first `errorEvidenceCapacity` reports and counts later ones
-in `reportsLost`. A lost report or a callback fault still counts as reported, so
-full storage can never turn a native failure into success.
+Each class, and each wake call, keeps its first `errorEvidenceCapacity` reports
+and counts later ones in `reportsLost`. A lost report or a callback fault still
+counts as reported, so full storage can never turn a native failure into
+success. The same C call that posts also clears the calling thread's GLFW error
+state before the post and reads it after. If the post left an error that no
+report recorded for the call, the wake adds a callback fault, so lost evidence
+never becomes `WakePosted`.
 
 ## Teardown, poisoning, and controlled blocking
 
@@ -580,6 +654,7 @@ The composite declares its release order:
 
 | Release | What it does |
 |---|---|
+| `glfw wake gate` | Closes the wake gate to new calls, then waits uninterruptibly until every admitted wake call has returned from its native call and left. No native call. |
 | `glfw monitor inventory` | Ends every monitor identity, publishes the last descriptions as the `InventoryClosed` inventory, and closes the snapshot, in one transaction. No native call. |
 | `glfw monitor callback` | Takes any monitor callback fault latched since the last boundary, detaches the callback, then raises any report made during that call, and then the fault |
 | `glfw terminate` | Marks the session ended, calls `glfwTerminate`, then raises any report made during that call |
@@ -609,7 +684,13 @@ GLFW can no longer invoke it.
 These releases satisfy [what a release may do](resources.md#what-a-release-may-do).
 Each native call is a bounded GLFW call on the owner thread that waits for no
 other thread and no event, and the bookkeeping is a non-blocking atomic `IORef`
-update. No release contains a queue, fence, device wait, or logger.
+update. The wake gate's wait is the one wait on another thread, and it is
+bounded: it waits only for calls already admitted, each making one empty-event
+post and non-blocking bookkeeping, and no new call can be admitted once it has
+begun. No release contains a queue, fence, device wait, or logger. Closing the
+gate never changes teardown safety. A session whose teardown was otherwise safe
+is not poisoned by it, including when the owner is cancelled while the wait
+runs.
 
 ## The binding
 
@@ -624,9 +705,11 @@ Only the operations the models use are bound: `glfwPlatformSupported`,
 `glfwGetWindowContentScale`, `glfwGetWindowPos`, `glfwGetWindowAttrib`, and the
 size, framebuffer size, content scale, position, focus, iconify, maximize,
 refresh, close, key, character, mouse button, cursor position, cursor enter,
-and scroll callback setters, and the owner loop's `glfwPollEvents` and
-`glfwWaitEventsTimeout`. `glfwSetWindowSize` and `glfwPostEmptyEvent` are called
-for the native examples only; no production path calls them. The native
+and scroll callback setters, the owner loop's `glfwPollEvents` and
+`glfwWaitEventsTimeout`, and the wake capability's `glfwPostEmptyEvent` with
+`glfwGetError`. `glfwSetWindowSize` is called for the native examples only, as
+is the progress note's own `glfwPostEmptyEvent`; no production path calls
+them. The native
 examples also invoke the registered input trampolines through
 `hetoimasia_glfw_inject_*_for_check`.
 
@@ -646,7 +729,17 @@ examples also invoke the registered input trampolines through
   beside a null array, is reported as inconsistent rather than read.
 - Every GLFW import is `safe`. Any of them may re-enter Haskell through the
   error callback, and a safe call lets other Haskell threads run while it is in
-  C. The thread-identity shim calls nothing and is `unsafe`.
+  C. The thread-identity and wake-mark shims call nothing and are `unsafe`.
+- The production wake is made through the shim's
+  `hetoimasia_glfw_post_empty_event`, a `safe` import callable from any thread.
+  In one C call on the calling OS thread it clears that thread's GLFW error
+  state with `glfwGetError`, sets the call's wake mark in C11 thread-local
+  storage, calls `glfwPostEmptyEvent`, clears the mark, and returns the code
+  `glfwGetError` then reads. The error callback reads the mark through the
+  `unsafe` `hetoimasia_glfw_current_wake_mark`. The shim also counts calls that
+  entered and returned from the post, and records the sequence number of the
+  wait in progress as it posts. Only the native examples read these records,
+  through `wakeCountsForCheck` and `takeLastWaitForCheck`.
 - The production finite wait is made through the shim's
   `hetoimasia_glfw_wait_events_timeout`, a `safe` import that records the
   waiting OS thread and gives each wait an odd sequence number, then calls
@@ -655,7 +748,11 @@ examples also invoke the registered input trampolines through
   the same wait's sequence number surrounds a kernel report that the waiting
   thread is blocked — `TH_STATE_WAITING` on macOS, state `S` in
   `/proc/self/task/<tid>/stat` on Linux — so it lands only inside GLFW's own
-  wait. The shim holds no queue or game logic.
+  wait. `blockedWaitForCheck` makes the same observation and posts nothing, so
+  the wake examples can prove a wait was blocked without a test wake that would
+  confound the production one. As each wait returns, the shim records its
+  sequence number and whether a production wake named it. The shim holds no
+  queue or game logic.
 
 The window callback setters are `ccall` imports for the same reason. Each
 callback wrapper only drops the window pointer and calls the model's callback,
@@ -2220,6 +2317,8 @@ candidate unpublished.
 | Callback storage | The session | Installed at entry; freed at teardown | Owner | Until detached | Freed after a safe detach; leaked when poisoned |
 | Teardown safety flag | The session | Releases clear it; the guard release reads it | Owner | The session | Read once |
 | Liveness | The session | Termination clears it; owner operations read it | Owner | The session | Never set again |
+| Wake gate and admitted count | The session | Wake calls enter and leave; the first release closes and drains it | Any; STM | Construction until the first release | Closed and never reopened; a retained capability stays terminal |
+| Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
 | Monitor connections and current inventory | The session | Committed refreshes write them; resolution reads them | Owner | The session | Emptied when the inventory closes |
@@ -2343,6 +2442,28 @@ own on Linux, or a human's explicit approval on a real desktop.
   contract — belongs in `glfw-tests`, beside the component spec that owns it. An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
+- **The session wake examples** (`--match "GLFW session wake"`) use only the
+  public seam. The seam records each post as `PostEmptyEvent` and makes the
+  call's wake mark current on the posting thread while its scripted step runs.
+  A scripted platform counts posts as pending for the next finite wait. Without
+  sleeps, the examples prove: a wake before, during, and after the owner's wait,
+  from unbound, bound, and owner threads; a scripted platform failure answered as
+  that call's `WakeFailed`, posted once and not retried; two overlapping wakes each
+  attributed their own report, beside a concurrent owner operation's report and
+  an unrelated asynchronous one; one wake's reports bounded, truncated, and
+  counted as the capture bounds them, with a callback fault inside the wake
+  attributed to it and nothing left for a later owner read, asynchronous read,
+  or teardown; a report whose mark could not be read failing the wake from the
+  error it left; an admitted wake finishing before scripted termination, which
+  observes none in flight, while wakes during the drain answer `WakeTerminal`; a
+  worker waking until terminal while the session closes, with every post
+  recorded before teardown and wakes issued from termination and the error
+  callback's detach answering `WakeTerminal`; a capability reused after close
+  and against a later session; a construction rollback that never lends one; a
+  waker cancelled inside its native call, and a wake completing with a
+  cancellation pending, both leaving the gate; and an owner cancelled while its
+  close drains an admitted wake, terminating only after the wake returns and
+  leaving the guard vacant.
 - **The window model examples** in the same suite use the seam's private
   drivers: `seamDrive` delivers scripted callbacks from inside a setter- or poll-origin
   owner step, `seamDriveCancelledBeforeCommit` delivers a cancellation at the
@@ -2462,7 +2583,7 @@ test environment.
 | Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
 | Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, and a session over a faulting native table cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
 | Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is a human's approval for this one run on the local desktop; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`. Anything else — the variable unset, empty, or another value, a bare `DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
@@ -2564,6 +2685,23 @@ The native examples cover:
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;
+- a worker's production wake, `wakeSession` on an unbound thread, ending a
+  production finite wait the owner thread entered and was blocked inside:
+  `blockedWaitForCheck` observes that wait's sequence number around the kernel
+  report, and the same wait returns woken before its 60-second bound;
+- three wakes from a bound worker returning that blocked wait once, then a
+  later wait that at most one spurious return precedes, blocking again until
+  one more wake ends it; and three wakes the owner posts while no wait is in
+  progress returning at most one wait early before the next wait blocks. Each
+  example prints an evidence line with the sequence numbers observed blocked
+  and returned woken, the spurious returns, and the time against the bound;
+- in a private process, twenty sessions closed while four workers, on bound
+  and unbound threads, wake them until each capability answers `WakeTerminal`.
+  Immediately before `glfwTerminate`, every admitted wake has returned from
+  `glfwPostEmptyEvent` (the calls entered equal those returned), and none
+  enters it afterwards. A capability retained from a closed session stays
+  terminal, entering nothing, during and after a later session. The run prints
+  the child's report of both checks;
 - a supervised worker progressing while the owner is blocked inside the
   production `glfwWaitEventsTimeout`: the worker's progress note lands only
   inside GLFW's own wait, as [the binding](#the-binding) describes, and wakes

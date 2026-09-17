@@ -104,6 +104,22 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that constructs a wake capability, or reaches through one for the native table" $ do
+    withClient "Client.hs" wakeConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "SessionWake"
+    withClient "Client.hs" wakeInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a wake capability's native table is reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.GLFW.Internal.Session"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that names the window or observation constructor" $
     withClient "Client.hs" windowConstructorClient $ \compile → do
       outcome ← compile Typecheck
@@ -420,6 +436,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "constraints = (Extent {extentWidth = 1, extentHeight = 1},Extent {extentWidth = 64, extentHeight = 48},Just (AspectRatio {aspectNumerator = 4, aspectDenominator = 3}))"
                    , "wayland cannot perform = [SetPositionOperation,FocusOperation,BorderlessOperation], report = [PlacementReport,IconifiedReport]"
                    , "mode = (2,Just (Extent {extentWidth = 1920, extentHeight = 1080},Just 60),WindowedPresentation)"
+                   , "wake outcomes = [WakePosted,WakeTerminal,WakeFailed (Reports {reportedErrors = [], reportsLost = 0, callbackFaults = 1})]"
                    ]
 
 -- | Compile a client that can also see the runtime and the window host's
@@ -891,6 +908,31 @@ nativeHandleClient =
     , "table = productionNative"
     ]
 
+-- | A client naming the wake capability's data constructor.
+wakeConstructorClient ∷ String
+wakeConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.GLFW.Session (SessionWake (SessionWake))"
+    , ""
+    , "forged ∷ Maybe SessionWake"
+    , "forged = Nothing"
+    ]
+
+-- | A client reaching through a wake capability for the native table it posts
+-- through, whose module belongs to a private sublibrary.
+wakeInternalsClient ∷ String
+wakeInternalsClient =
+  unlines
+    [ "module Client (table) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Session (Native, SessionWake (..))"
+    , ""
+    , "table ∷ SessionWake → Native"
+    , "table = wakeNative"
+    ]
+
 -- | A client naming the window's and the observation's data constructors.
 windowConstructorClient ∷ String
 windowConstructorClient =
@@ -972,6 +1014,7 @@ publicClient =
     , "  let wayland = backendWindowCapabilities Wayland"
     , "  putStrLn (\"wayland cannot perform = \" <> show (map fst (unperformableOperations wayland)) <> \", report = \" <> show (map fst (unreportableAttributes wayland)))"
     , "  putStrLn (\"mode = \" <> show (fallbackAttempts (windowedFallback 2), preferredVideoMode (exactVideoMode (Extent 1920 1080) (Just 60)), modePresentation windowedMode))"
+    , "  putStrLn (\"wake outcomes = \" <> show [WakePosted, WakeTerminal, WakeFailed (Reports [] 0 1)])"
     , ""
     , "starting ∷ WindowConfig"
     , "starting = (hiddenTestWindowConfig (Text.pack \"tool\") 64 48) {windowStartupMode = Just (startupMode (modeRequest windowedMode noModeFallback) ModeOptional)}"
@@ -985,6 +1028,7 @@ publicClient =
     , ""
     , "monitors ∷ Session → IO [Attribute MonitorPosition]"
     , "monitors session = do"
+    , "  _ ← wakeSession (sessionWake session)"
     , "  inventory ← synchronizeMonitors session"
     , "  latest ← preparedValue . observedValue <$> atomically (readSnapshot (monitorInventory session))"
     , "  case (inventoryMonitors inventory, inventoryPhase latest) of"

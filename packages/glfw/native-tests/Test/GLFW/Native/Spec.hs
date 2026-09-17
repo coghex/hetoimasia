@@ -5,8 +5,8 @@
 -- against a scripted owner and then against the real shared session; the
 -- native opt-in examples prove the consent gate against a scripted owner and
 -- a recorded launcher, and need no consent themselves; the
--- session, window, window control, window mode, monitor inventory, and window
--- host examples
+-- session, session wake, window, window control, window mode, monitor
+-- inventory, and window host examples
 -- use that shared session; the
 -- private-session examples run lifecycles no shared session can host in a child
 -- process. Every group that uses the session or starts a child runs under the
@@ -23,6 +23,7 @@ import qualified Test.GLFW.Native.Input as Input
 import qualified Test.GLFW.Native.Monitor as Monitor
 import qualified Test.GLFW.Native.Private as Private
 import qualified Test.GLFW.Native.Session as Session
+import qualified Test.GLFW.Native.Wake as Wake
 import Test.GLFW.Native.Support (Shared (sharedGate), consented)
 import qualified Test.GLFW.Native.Window as Window
 import Test.Hspec (Spec, describe)
@@ -33,6 +34,7 @@ spec shared = describe "GLFW native" $ do
   Guard.spec
   consented (sharedGate shared) $ do
     Session.spec shared
+    Wake.spec shared
     Window.spec shared
     Control.spec shared
     Mode.spec shared

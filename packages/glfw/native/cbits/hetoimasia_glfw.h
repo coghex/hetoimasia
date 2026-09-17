@@ -69,6 +69,33 @@ int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits);
  * examples read. Call it on the session's owner thread. */
 void hetoimasia_glfw_wait_events_timeout(double timeout);
 
+/* The production cross-thread wake: glfwPostEmptyEvent, callable from any
+ * thread while GLFW is initialized. For the duration of the call the calling
+ * thread's wake mark is the one given, which the error callback reads on the
+ * same thread with hetoimasia_glfw_current_wake_mark; the thread's GLFW error
+ * state is cleared before the post and read after it, and the code read is the
+ * answer, zero for none. It also records, for the native examples only, which
+ * wait was in progress and how many calls entered and returned. */
+int hetoimasia_glfw_post_empty_event(unsigned long long mark);
+
+/* The wake mark of the post running on the calling thread, or zero. It reads
+ * thread-local storage and calls nothing. */
+unsigned long long hetoimasia_glfw_current_wake_mark(void);
+
+/* For the native examples only: the odd sequence number of the production wait
+ * in progress, if its thread is blocked inside GLFW's wait, otherwise zero. It
+ * observes only; it posts nothing. */
+unsigned long hetoimasia_glfw_blocked_wait_for_check(void);
+
+/* For the native examples only: the sequence number of the most recent
+ * production wait to return, and through woken whether a production wake was
+ * posted while that wait was in progress, cleared by reading it. */
+unsigned long hetoimasia_glfw_take_last_wait_for_check(int* woken);
+
+/* For the native examples only: how many production wake calls have entered
+ * glfwPostEmptyEvent and how many have returned from it, process-wide. */
+void hetoimasia_glfw_wake_counts_for_check(unsigned long* entered, unsigned long* returned);
+
 /* For the native examples only: record progress in the wait in progress, only
  * while its thread is blocked inside GLFW's wait, and wake that wait. Non-zero
  * when a note landed. Any thread may call it during a session. */

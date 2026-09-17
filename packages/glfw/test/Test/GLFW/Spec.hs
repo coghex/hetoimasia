@@ -1,8 +1,8 @@
 -- | The GLFW package's headless suite, composed from its component specs.
 --
 -- None of them initializes GLFW, opens a window, or needs a display. The
--- session examples in "Test.GLFW.Session" drive the production session model
--- through the test seam; the window model, window command, window control,
+-- session examples in "Test.GLFW.Session" and the wake examples in
+-- "Test.GLFW.Wake" drive the production session model through the test seam; the window model, window command, window control,
 -- window host, dynamic window, monitor inventory, input feed, and window mode
 -- examples use the seam's private drivers, the private command executor, and the
 -- runtime integration's private host hooks, which this suite may name because it
@@ -29,12 +29,14 @@ import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
 import qualified Test.GLFW.Opacity as Opacity
 import qualified Test.GLFW.Session as Session
+import qualified Test.GLFW.Wake as Wake
 import qualified Test.GLFW.Window as Window
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
 spec = describe "GLFW" $ do
   Session.spec
+  Wake.spec
   Window.spec
   Command.spec
   Control.spec

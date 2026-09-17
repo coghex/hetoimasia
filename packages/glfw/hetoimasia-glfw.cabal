@@ -202,6 +202,7 @@ test-suite glfw-tests
         Test.GLFW.Opacity
         Test.GLFW.Session
         Test.GLFW.Spec
+        Test.GLFW.Wake
         Test.GLFW.Window
     ghc-options: -threaded -rtsopts
     build-depends:
@@ -252,6 +253,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec
         Test.GLFW.Native.Support
+        Test.GLFW.Native.Wake
         Test.GLFW.Native.Window
     ghc-options: -threaded
     build-depends:

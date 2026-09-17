@@ -9,7 +9,13 @@
 -- production finite event wait is made through the shim's
 -- @hetoimasia_glfw_wait_events_timeout@, which records the waiting thread and a
 -- per-wait sequence number for the native examples, then calls
--- @glfwWaitEventsTimeout@. The monitor enumeration, name, and video mode getters
+-- @glfwWaitEventsTimeout@. The production cross-thread wake is made through
+-- the shim's @hetoimasia_glfw_post_empty_event@, which calls
+-- @glfwPostEmptyEvent@ with the call's wake mark in the calling OS thread's
+-- thread-local storage, clears that thread's GLFW error state before the post
+-- and reads it after, all inside the one C call, so the post, the error
+-- callback's attribution, and the error read share an OS thread whichever
+-- Haskell thread made the call. The monitor enumeration, name, and video mode getters
 -- are reached through shim accessors that only restate GLFW's @const@ return
 -- types as the generated wrappers declare them, and video modes are copied
 -- field by field through @hetoimasia_glfw_video_mode_at@, so no structure
@@ -24,7 +30,8 @@
 -- Every GLFW function is a @safe@ import. Any of them may report an error
 -- through the callback, which re-enters Haskell and is only permitted from a
 -- safe call, and a safe call lets other Haskell threads run while it is in C.
--- The thread-identity shim calls nothing and is @unsafe@.
+-- The thread-identity and wake-mark shims call nothing and are @unsafe@; the
+-- error callback reads both from inside a safe call.
 --
 -- The process-wide 'Guard' lives here, beside the library whose state it
 -- guards. It holds only occupancy and poison.
@@ -42,6 +49,9 @@ module Hetoimasia.GLFW.Internal.Native
   , requestCloseForCheck
   , noteProgressForCheck
   , takeWaitNotedForCheck
+  , blockedWaitForCheck
+  , takeLastWaitForCheck
+  , wakeCountsForCheck
   , leakResizableHintForCheck
   , windowResizableForCheck
   , windowSizeForCheck
@@ -69,7 +79,7 @@ import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Foreign.C.String (CString)
-import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt), CUInt (CUInt))
+import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt), CUInt (CUInt), CULLong (CULLong), CULong (CULong))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
@@ -95,6 +105,7 @@ import Hetoimasia.GLFW.Internal.Session
   , backendWindowCapabilities
   , newGuard
   )
+import Numeric.Natural (Natural)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Info (os)
 
@@ -136,6 +147,8 @@ productionNative =
         (/= glfwFalse) <$> c_glfwGetWindowAttrib window (attributeCode attribute)
     , nativePollEvents = c_glfwPollEvents
     , nativeWaitEventsTimeout = c_waitEventsTimeout . CDouble
+    , nativePostEmptyEvent = fmap fromIntegral . c_postEmptyEvent . fromIntegral
+    , nativeCurrentWakeMark = fromIntegral <$> c_currentWakeMark
     , nativeSetWindowTitle = \window title →
         ByteString.useAsCString (encodeUtf8 title) (c_glfwSetWindowTitle window)
     , nativeSetWindowSize = \window width height → c_glfwSetWindowSize window (fromIntegral width) (fromIntegral height)
@@ -403,6 +416,32 @@ noteProgressForCheck = (/= 0) <$> c_noteProgressForCheck
 takeWaitNotedForCheck ∷ IO Bool
 takeWaitNotedForCheck = (/= 0) <$> c_takeWaitNotedForCheck
 
+-- | The odd sequence number of the production wait in progress, if its thread is
+-- blocked inside GLFW's wait, for the native examples only. It observes and
+-- posts nothing.
+blockedWaitForCheck ∷ IO (Maybe Natural)
+blockedWaitForCheck = do
+  sequenceNumber ← c_blockedWaitForCheck
+  pure (if sequenceNumber == 0 then Nothing else Just (fromIntegral sequenceNumber))
+
+-- | The sequence number of the most recent production wait to return, and
+-- whether a production wake was posted while it was in progress, cleared by
+-- reading it, for the native examples only.
+takeLastWaitForCheck ∷ IO (Natural, Bool)
+takeLastWaitForCheck =
+  alloca $ \woken → do
+    sequenceNumber ← c_takeLastWaitForCheck woken
+    wasWoken ← (/= 0) <$> peek woken
+    pure (fromIntegral sequenceNumber, wasWoken)
+
+-- | How many production wake calls have entered @glfwPostEmptyEvent@, and how
+-- many have returned from it, in this process, for the native examples only.
+wakeCountsForCheck ∷ IO (Natural, Natural)
+wakeCountsForCheck =
+  alloca $ \entered → alloca $ \returned → do
+    c_wakeCountsForCheck entered returned
+    (,) <$> (fromIntegral <$> peek entered) <*> (fromIntegral <$> peek returned)
+
 -- | Set a creation hint no window configuration sets, so the native examples can
 -- show that the next window's creation resets it.
 leakResizableHintForCheck ∷ IO ()
@@ -483,6 +522,24 @@ foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_request_close_for_ch
 -- native examples observe of it and then calls glfwWaitEventsTimeout.
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wait_events_timeout"
   c_waitEventsTimeout ∷ CDouble → IO ()
+
+-- The production wake goes through the shim, which posts with the call's wake
+-- mark and reads the calling thread's error state on the same OS thread.
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_post_empty_event"
+  c_postEmptyEvent ∷ CULLong → IO CInt
+
+-- Read from inside the error callback; it reads thread-local storage only.
+foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_current_wake_mark"
+  c_currentWakeMark ∷ IO CULLong
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_blocked_wait_for_check"
+  c_blockedWaitForCheck ∷ IO CULong
+
+foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_take_last_wait_for_check"
+  c_takeLastWaitForCheck ∷ Ptr CInt → IO CULong
+
+foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_wake_counts_for_check"
+  c_wakeCountsForCheck ∷ Ptr CULong → Ptr CULong → IO ()
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_progress_for_check"
   c_noteProgressForCheck ∷ IO CInt

@@ -39,6 +39,45 @@
 -- operations of "Hetoimasia.GLFW.Internal.Window" check, before any native call, that they
 -- run on the thread that entered the session ('NotSessionOwner') and that the session has not ended ('SessionEnded').
 --
+-- = Waking the owner
+--
+-- 'sessionWake' lends the session's 'SessionWake' capability, which any thread
+-- may use with 'wakeSession' to post GLFW's documented cross-thread empty event,
+-- so an owner blocked in a native event wait returns. It is the one native call
+-- this package makes off the owner thread; event pumping, waits, and every
+-- window and monitor operation stay owner-only. The capability holds no native
+-- handle and exposes no session representation.
+--
+-- A wake is a hint. It carries no message, may be coalesced with others, and
+-- proves nothing about work; whatever state made it worth waking is
+-- authoritative, and what to do after an expected platform failure is the
+-- caller's policy.
+--
+-- A wake makes at most one native call plus bounded, non-blocking bookkeeping:
+-- one STM transaction that never retries to be admitted, one to leave, and the
+-- error capture's own updates. It invokes no caller-supplied IO and takes no
+-- lock an owner operation or a callback could hold, so bound and unbound
+-- threads, and the owner itself, may call it at any time.
+--
+-- = Wake lifetime
+--
+-- Each session owns a wake gate: open, closing with a count of admitted calls,
+-- or closed. A wake is admitted by incrementing that count in the same
+-- transaction that finds the gate open, and leaves by decrementing it after its
+-- native call returns; admission and leaving run masked, so no asynchronous
+-- exception can separate either from the native call it accounts for. A gate
+-- that is not open answers 'WakeTerminal' without entering GLFW.
+--
+-- The session's first release closes the gate and then waits, uninterruptibly,
+-- until every admitted call has left, before any later release runs: the
+-- monitor callback's detach, termination, the error callback's detach, and every
+-- free of callback storage all follow it. The wait is bounded by one native
+-- empty-event post per admitted call. Closing never changes teardown safety,
+-- so a session whose teardown was otherwise safe is not poisoned by it. A
+-- capability retained after its session closed stays terminal forever, and
+-- cannot reach any later session, which has a gate of its own. A construction
+-- that rolls back never lends a capability at all.
+--
 -- = Native errors
 --
 -- Each native call an operation makes is bracketed by the capture described in
@@ -54,7 +93,8 @@
 --
 -- = Teardown and poisoning
 --
--- Release order is declared, not reversed: close the monitor inventory, detach
+-- Release order is declared, not reversed: close the wake gate and wait for
+-- admitted wake calls, close the monitor inventory, detach
 -- the monitor callback, terminate, detach the error callback and free its
 -- storage, free the monitor callback's storage, then settle the guard. A release reads native
 -- errors after its call returns, logs nothing, pumps no events, and waits for no
@@ -115,6 +155,16 @@
 -- | storage            |                   | detached before      |             | native call        | teardown; leaked when |
 -- |                    |                   | termination          |             |                    | poisoned              |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Wake gate and      | The session       | Wake calls enter and | Any; STM    | Construction until | Closed by the first   |
+-- | admitted count     |                   | leave; the first     |             | the first release; | release, and never    |
+-- |                    |                   | release closes and   |             | closed thereafter  | reopened              |
+-- |                    |                   | drains it            |             |                    |                       |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Wake reports       | The session's     | The callback writes  | Callback:   | One wake call's    | Removed when its call |
+-- |                    | capture           | on the wake call's   | the wake's; | native call        | returns               |
+-- |                    |                   | OS thread; the call  | take: the   |                    |                       |
+-- |                    |                   | takes them           | wake's      |                    |                       |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 --
 -- Nothing here is application state, and nothing is shared between sessions
 -- except the guard.
@@ -140,6 +190,12 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionAssembly
   , sessionBackend
   , takeAsynchronousReports
+
+    -- * Waking the owner
+  , SessionWake
+  , sessionWake
+  , wakeSession
+  , WakeOutcome (..)
 
     -- * The monitor inventory
   , monitorInventory
@@ -193,7 +249,8 @@ module Hetoimasia.GLFW.Internal.Session
   ) where
 
 import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId)
-import Control.Exception (Exception, ExceptionWithContext, SomeException, finally, onException, rethrowIO, tryWithContext)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Exception (Exception, ExceptionWithContext, SomeException, finally, mask_, onException, rethrowIO, tryWithContext, uninterruptibleMask_)
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import qualified Data.Map.Strict as Map
@@ -215,6 +272,8 @@ import Hetoimasia.GLFW.Internal.Capture
   , NativeOutcome (..)
   , ReportingThread (..)
   , Reports (..)
+  , WakeMark
+  , beginWakeReports
   , captureCallback
   , errorDescriptionLimit
   , errorEvidenceCapacity
@@ -225,6 +284,7 @@ import Hetoimasia.GLFW.Internal.Capture
   , settleStrayOwnerReports
   , takeOtherReports
   , takeOwnerReports
+  , takeWakeReports
   )
 import Hetoimasia.GLFW.Internal.Control
   ( WindowCapabilities
@@ -392,6 +452,14 @@ data Native = Native
   , nativeWaitEventsTimeout ∷ Double → IO ()
     -- ^ Wait at most this many seconds for an event, then process every
     -- pending event.
+  , nativePostEmptyEvent ∷ WakeMark → IO Int
+    -- ^ Post an empty event, from any thread, so a wait in progress returns.
+    -- For the duration of the call the calling OS thread's wake mark is the one
+    -- given, so the error callback attributes what the call reports to it; the
+    -- answer is the error code the call left in that same OS thread's native
+    -- error state, zero for none.
+  , nativeCurrentWakeMark ∷ IO WakeMark
+    -- ^ The wake mark of the call running on the calling OS thread, or zero.
   , nativeSetWindowTitle ∷ Ptr NativeWindow → Text → IO ()
   , nativeSetWindowSize ∷ Ptr NativeWindow → Int32 → Int32 → IO ()
     -- ^ The content area's logical width and height.
@@ -458,7 +526,43 @@ data Session = Session
     -- ^ What windows cannot do or report on the selected backend.
   , sessionClaims ∷ !(IORef MonitorClaims)
     -- ^ The fullscreen claims on the current monitors, by window.
+  , sessionWakes ∷ !SessionWake
+    -- ^ The capability that wakes this session's owner.
   }
+
+-- | The capability to wake one session's owner from any thread. It holds no
+-- native handle and no way back to the session; once its session has closed it
+-- is terminal forever.
+data SessionWake = SessionWake
+  { wakeNative ∷ !Native
+  , wakeCapture ∷ !Capture
+  , wakeGate ∷ !(TVar WakeGate)
+  }
+
+-- | Whether wake calls may enter GLFW, and how many have been admitted and not
+-- yet left.
+data WakeGate
+  = WakeOpen !Int
+  | WakeClosing !Int
+  | WakeClosed
+
+-- | What one wake call did.
+data WakeOutcome
+  = WakePosted
+    -- ^ The empty event was posted, and nothing was reported during the call.
+  | WakeTerminal
+    -- ^ The session has begun closing, or has closed: GLFW was not entered.
+  | WakeFailed !Reports
+    -- ^ The platform reported a failure during the call, attributed to this
+    -- call alone. The reports include every error the callback recorded for
+    -- it, those lost to the bound, and callback faults; a native error the call
+    -- left behind that no report recorded is counted as a callback fault, so
+    -- lost evidence is never a successful wake.
+  deriving (Eq, Show)
+
+-- | The session's wake capability.
+sessionWake ∷ Session → SessionWake
+sessionWake = sessionWakes
 
 -- | The backend the session initialized.
 sessionBackend ∷ Session → Backend
@@ -567,28 +671,31 @@ backendIdentifiers backend = [("backend", backendText backend)]
 -- | Resolve backend, check      | none                         |               |
 -- | thread                      |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Claim the guard             | Vacate, or poison            | sixth         |
+-- | Claim the guard             | Vacate, or poison            | seventh       |
 -- +-----------------------------+------------------------------+---------------+
 -- | Query platform support      | none                         |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Install the error callback  | Detach, then free if safe    | fourth        |
+-- | Install the error callback  | Detach, then free if safe    | fifth         |
 -- +-----------------------------+------------------------------+---------------+
--- | Set hints and initialize    | Terminate                    | third         |
+-- | Set hints and initialize    | Terminate                    | fourth        |
 -- +-----------------------------+------------------------------+---------------+
 -- | Raise initialization        | none                         |               |
 -- | reports; verify the backend |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Allocate the monitor        | Free if safe                 | fifth         |
+-- | Allocate the monitor        | Free if safe                 | sixth         |
 -- | callback's storage          |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Attach the monitor callback | Take a latched fault; detach | second        |
+-- | Attach the monitor callback | Take a latched fault; detach | third         |
 -- +-----------------------------+------------------------------+---------------+
 -- | Sample the initial monitor  | none                         |               |
 -- | inventory                   |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Publish the inventory       | End every identity; close    | first         |
+-- | Publish the inventory       | End every identity; close    | second        |
 -- |                             | the snapshot holding the     |               |
 -- |                             | last descriptions            |               |
+-- +-----------------------------+------------------------------+---------------+
+-- | Open the wake gate          | Close it; wait for admitted  | first         |
+-- |                             | wake calls to leave          |               |
 -- +-----------------------------+------------------------------+---------------+
 sessionAssembly ∷ Native → SessionConfig → Assembly Session
 sessionAssembly native config = do
@@ -599,23 +706,23 @@ sessionAssembly native config = do
   identity ← restoredStep newUnique
   windows ← restoredStep (newIORef 1)
   claims ← restoredStep (newIORef Map.empty)
-  capture ← restoredStep (newCapture (nativeIsProcessMainThread native))
+  capture ← restoredStep (newCapture (nativeIsProcessMainThread native) (nativeCurrentWakeMark native))
   acquirePart
     "glfw session occupancy"
-    (releaseRank 5)
+    (releaseRank 6)
     (claimGuard (nativeGuard native) backend)
     (\() → settleGuard (nativeGuard native) teardown)
   restoredStep (requireSupported native backend)
   _ ←
     acquirePart
       "glfw error callback"
-      (releaseRank 3)
+      (releaseRank 4)
       (attachCallback native capture teardown)
       (detachCallback native capture owner teardown)
   initialized ←
     acquirePart
       "glfw terminate"
-      (releaseRank 2)
+      (releaseRank 3)
       (initialize native capture teardown backend)
       (\_ → terminate native capture owner teardown live backend)
   restoredStep $ do
@@ -626,7 +733,7 @@ sessionAssembly native config = do
   storage ←
     acquirePart
       "glfw monitor callback storage"
-      (releaseRank 4)
+      (releaseRank 5)
       (nativeNewMonitorCallback (nativeMonitor native) (monitorCallback source))
       (freeMonitorCallback native teardown)
   -- The detach is registered before the callback is attached, so an attachment
@@ -634,7 +741,7 @@ sessionAssembly native config = do
   -- termination.
   acquirePart
     "glfw monitor callback"
-    (releaseRank 1)
+    (releaseRank 2)
     (pure ())
     (\() → detachMonitorCallback native capture owner teardown source)
   restoredStep (attachMonitorCallback native capture teardown storage)
@@ -643,9 +750,15 @@ sessionAssembly native config = do
   publisher ←
     acquirePart
       "glfw monitor inventory"
-      (releaseRank 0)
+      (releaseRank 1)
       (publishInitialInventory initial)
       (closeInventory cell)
+  gate ←
+    acquirePart
+      "glfw wake gate"
+      (releaseRank 0)
+      (newTVarIO (WakeOpen 0))
+      closeWakeGate
   pure
     Session
       { sessionNative = native
@@ -659,6 +772,7 @@ sessionAssembly native config = do
       , sessionMonitors = assembleMonitors source cell publisher
       , sessionCapabilities = nativeWindowCapabilities native backend
       , sessionClaims = claims
+      , sessionWakes = SessionWake native capture gate
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -804,6 +918,67 @@ freeMonitorCallback ∷ Native → IORef Bool → MonitorCallbackStorage → IO 
 freeMonitorCallback native teardown storage = do
   safe ← readIORef teardown
   when safe (nativeFreeMonitorCallback (nativeMonitor native) storage)
+
+-- | Close the wake gate to new calls, then wait until every admitted call has
+-- left. The wait is uninterruptible, because every release after this one
+-- depends on no wake call being inside GLFW; it is bounded by one empty-event
+-- post per admitted call, and nothing else can hold a call inside.
+closeWakeGate ∷ TVar WakeGate → IO ()
+closeWakeGate gate = uninterruptibleMask_ $ do
+  atomically $
+    readTVar gate >>= \case
+      WakeOpen admitted → writeTVar gate (WakeClosing admitted)
+      _ → pure ()
+  atomically $
+    readTVar gate >>= \case
+      WakeClosing 0 → writeTVar gate WakeClosed
+      WakeClosing _ → retry
+      _ → pure ()
+
+-- | Wake the owner of the capability's session: post one empty event so a
+-- native wait in progress, or the next one, returns.
+--
+-- Any thread may call it, bound or unbound, including the owner. It answers
+-- 'WakeTerminal' without entering GLFW once the session has begun closing. An
+-- error reported during the call is attributed to this call alone and answered
+-- as 'WakeFailed'; it is neither left among the session's asynchronous reports
+-- nor taken from them or from a concurrent owner operation. A native table that
+-- raises propagates its exception once the call's accounting has settled. The
+-- wake does not retry, and does not decide what an expected failure means.
+wakeSession ∷ SessionWake → IO WakeOutcome
+wakeSession wake = mask_ $ do
+  admitted ← atomically (enterWake (wakeGate wake))
+  if not admitted
+    then pure WakeTerminal
+    else
+      flip finally (uninterruptibleMask_ (atomically (leaveWake (wakeGate wake)))) $ do
+        mark ← beginWakeReports capture
+        code ← nativePostEmptyEvent (wakeNative wake) mark `onException` takeWakeReports capture mark
+        reports ← takeWakeReports capture mark
+        pure $
+          if hasReports reports
+            then WakeFailed reports
+            else
+              if code /= 0
+                then WakeFailed reports {callbackFaults = callbackFaults reports + 1}
+                else WakePosted
+  where
+    capture = wakeCapture wake
+
+-- | Admit one wake call if the gate is open. Never retries.
+enterWake ∷ TVar WakeGate → STM Bool
+enterWake gate =
+  readTVar gate >>= \case
+    WakeOpen admitted → True <$ writeTVar gate (WakeOpen (admitted + 1))
+    _ → pure False
+
+-- | Account for an admitted call that has left. Never retries.
+leaveWake ∷ TVar WakeGate → STM ()
+leaveWake gate =
+  readTVar gate >>= \case
+    WakeOpen admitted → writeTVar gate (WakeOpen (admitted - 1))
+    WakeClosing admitted → writeTVar gate (WakeClosing (admitted - 1))
+    WakeClosed → pure ()
 
 -- | Run a release only on the owner thread. From any other thread it makes no
 -- native call, marks the teardown unsafe, and fails.

@@ -350,11 +350,18 @@ void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fie
  *
  * wait_sequence is odd while an owner is inside this call and even otherwise,
  * so each wait has its own odd number. A progress note names the wait it landed
- * in, and the wait reports, as it returns, whether a note named it. Nothing here
- * changes what GLFW does, and the production path never reads the note. */
+ * in, and the wait reports, as it returns, whether a note named it. A production
+ * wake records the wait in progress as it posts, and the wait reports, as it
+ * returns, whether a wake named it. Nothing here changes what GLFW does, and the
+ * production path never reads what is recorded. */
 static atomic_ulong wait_sequence = 0;
 static atomic_ulong noted_wait = 0;
 static atomic_int last_wait_noted = 0;
+static atomic_ulong woken_wait = 0;
+static atomic_ulong last_wait = 0;
+static atomic_int last_wait_woken = 0;
+static atomic_ulong wakes_entered = 0;
+static atomic_ulong wakes_returned = 0;
 
 void hetoimasia_glfw_wait_events_timeout(double timeout)
 {
@@ -363,17 +370,28 @@ void hetoimasia_glfw_wait_events_timeout(double timeout)
     glfwWaitEventsTimeout(timeout);
     atomic_fetch_add(&wait_sequence, 1);
     atomic_store(&last_wait_noted, atomic_exchange(&noted_wait, 0) == entered);
+    atomic_store(&last_wait_woken, atomic_exchange(&woken_wait, 0) == entered);
+    atomic_store(&last_wait, entered);
 }
 
-/* A note lands only when the same wait's odd sequence number is read on both
- * sides of observing the waiting thread blocked in the kernel. The shim does no
+/* The wait in progress, only while its thread is blocked in the kernel: the same
+ * odd sequence number is read on both sides of observing it. The shim does no
  * blocking work before calling glfwWaitEventsTimeout, so that thread is blocked
- * inside GLFW's own wait, not in the call's entry. A stale note left by a wait
- * that has already returned is overwritten. */
-int hetoimasia_glfw_note_progress_for_check(void)
+ * inside GLFW's own wait, not in the call's entry. */
+static unsigned long blocked_wait(void)
 {
     unsigned long sequence = atomic_load(&wait_sequence);
     if ((sequence & 1) == 0 || !waiting_thread_blocked() || atomic_load(&wait_sequence) != sequence)
+        return 0;
+    return sequence;
+}
+
+/* A note lands only in a blocked wait. A stale note left by a wait that has
+ * already returned is overwritten. */
+int hetoimasia_glfw_note_progress_for_check(void)
+{
+    unsigned long sequence = blocked_wait();
+    if (sequence == 0)
         return 0;
     unsigned long seen = atomic_load(&noted_wait);
     while (seen != sequence)
@@ -387,4 +405,43 @@ int hetoimasia_glfw_note_progress_for_check(void)
 int hetoimasia_glfw_take_wait_noted_for_check(void)
 {
     return atomic_exchange(&last_wait_noted, 0);
+}
+
+unsigned long hetoimasia_glfw_blocked_wait_for_check(void)
+{
+    return blocked_wait();
+}
+
+unsigned long hetoimasia_glfw_take_last_wait_for_check(int* woken)
+{
+    *woken = atomic_exchange(&last_wait_woken, 0);
+    return atomic_load(&last_wait);
+}
+
+void hetoimasia_glfw_wake_counts_for_check(unsigned long* entered, unsigned long* returned)
+{
+    *entered = atomic_load(&wakes_entered);
+    *returned = atomic_load(&wakes_returned);
+}
+
+/* The production wake. The mark, the post, and the error state it reads all
+ * belong to the calling thread, so what the error callback attributes to the
+ * mark and the code returned describe this call alone. */
+static _Thread_local unsigned long long current_wake_mark = 0;
+
+unsigned long long hetoimasia_glfw_current_wake_mark(void)
+{
+    return current_wake_mark;
+}
+
+int hetoimasia_glfw_post_empty_event(unsigned long long mark)
+{
+    glfwGetError(NULL);
+    atomic_fetch_add(&wakes_entered, 1);
+    atomic_store(&woken_wait, atomic_load(&wait_sequence));
+    current_wake_mark = mark;
+    glfwPostEmptyEvent();
+    current_wake_mark = 0;
+    atomic_fetch_add(&wakes_returned, 1);
+    return glfwGetError(NULL);
 }
