@@ -70,7 +70,7 @@
     },
     {
       "id": "test.foundation",
-      "description": "Focused Hspec examples for the foundation package's Logging, Resources, Failures, Recovery, Workers, and Messaging contracts.",
+      "description": "Focused Hspec examples for the foundation package's Logging, Resources, Failures, Recovery, Workers, Messaging, and Time contracts.",
       "command": [
         "cabal",
         "test",

@@ -121,8 +121,8 @@ identifier lists are sorted.
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
 
 `test.foundation` runs the foundation package's own suite: the `Logging`,
-`Resources`, `Failures`, `Recovery`, `Workers`, and `Messaging` examples. It
-entered the floor when those examples left `test.engine`, because their coverage
+`Resources`, `Failures`, `Recovery`, `Workers`, `Messaging`, and `Time`
+examples. It entered the floor when the first six left `test.engine`, because their coverage
 was already mandatory there. `test.runtime` runs the runtime package's own
 suite: the `Runtime` group's runner, application lifecycle, logging lifetime,
 reporting, supervision, inbox, opacity, resource smoke, and supervised channel
