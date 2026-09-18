@@ -587,6 +587,10 @@ data HostHooks = HostHooks
     -- ^ Runs at the end of a window's registration, masked and with nothing
     -- interruptible before it: after the collection and the host have both
     -- registered the window, before its creation's result is published.
+  , beforePublication ∷ IO ()
+    -- ^ Runs inside 'attachWindowGraphics', after the attachment's construction
+    -- has settled and before its service is published, so an example can reach
+    -- exactly that handoff from another thread.
   , beforeConsumer ∷ WindowHost → IO ()
     -- ^ Runs on the protected lifetime's own consumer path: after its exit
     -- handler is installed and before the consumer it was given is entered, so
@@ -596,7 +600,7 @@ data HostHooks = HostHooks
   }
 
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ()) (\_ → pure ())
+noHostHooks = HostHooks (pure ()) (pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol
@@ -668,9 +672,12 @@ allocHostOver protection hooks sessionScope config = do
   retirement ← liftIO $ case protection of
     Unprotected → pure Nothing
     Protected → Just <$> newHostRetirement (sessionIdentity session) (hostWindowLimit config)
+  -- Made before the release below, which brings every retained service up to
+  -- date in the same transaction that ends new graphics use.
+  cells ← liftIO (newTVarIO Map.empty)
   -- Released first: every port's admission, every demand slot, and attachment
   -- admission close before any window is released.
-  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement))
+  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement cells))
   host ←
     liftIO $
       WindowHost session collection commands config entries
@@ -683,7 +690,7 @@ allocHostOver protection hooks sessionScope config = do
         <*> pure retirement
         <*> newIORef Nothing
         <*> newTVarIO noRetirementDemand
-        <*> newTVarIO Map.empty
+        <*> pure cells
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
   pure host
 
@@ -717,11 +724,21 @@ hostActivity = readTVar . hostActivityState
 -- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
 quiesceWindowHost ∷ WindowHost → STM ()
 quiesceWindowHost host =
-  closeAdmission (hostCommands host) (hostEntries host) (hostDemandSlot host) (hostRetirementState host)
+  closeAdmission
+    (hostCommands host)
+    (hostEntries host)
+    (hostDemandSlot host)
+    (hostRetirementState host)
+    (hostGraphicsCells host)
 
 closeAdmission
-  ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → DemandSlot → Maybe HostRetirement → STM ()
-closeAdmission commands entries demand retirement = do
+  ∷ WindowCommandHost
+  → TVar (Map WindowId HostEntry)
+  → DemandSlot
+  → Maybe HostRetirement
+  → TVar (Map WindowId GraphicsCell)
+  → STM ()
+closeAdmission commands entries demand retirement cells = do
   void (closeWindowCommands commands)
   closeDemandSlot demand
   readTVar entries >>= mapM_ closeEntryAdmission
@@ -729,6 +746,10 @@ closeAdmission commands entries demand retirement = do
   -- attachment still registering or active begins retiring, and no later one is
   -- admitted. It makes no GPU call and waits for nothing.
   mapM_ closeAttachmentAdmission retirement
+  -- And every retained service learns it here, rather than on whichever owner
+  -- turn happens to come next: a reader that saw the host quiesce must not still
+  -- be told its owner is admitting use.
+  refreshCells retirement cells
 
 -- | Close one window's admission: its port, its input feed, and its demand
 -- slot. Finite, never retries, and idempotent.
@@ -1009,8 +1030,12 @@ commitClosing host target =
       closeEntryAdmission entry
       -- On a protected host the same step ends the window's new graphics use:
       -- its attachment, if it has one, begins retiring before the close is
-      -- answered, and its veto then holds destruction back.
+      -- answered, and its veto then holds destruction back. Its retained
+      -- service is brought up to date here too, so no reader can see the
+      -- closing phase published while the service still reports an attached
+      -- owner.
       mapM_ (`recordClosingWindow` target) (hostRetirementState host)
+      refreshGraphicsCells host
       pure True
     _ → pure False
 
@@ -1999,8 +2024,9 @@ data GraphicsAttachment
     -- ^ Construction and registration completed and the opaque service was
     -- published.
   | GraphicsSuperseded !AttachmentId
-    -- ^ Construction completed after retirement had already begun — the window
-    -- started closing, or the host quiesced, while it ran. The dependents stay
+    -- ^ Retirement had already begun by the time the service would have been
+    -- published — the window started closing, or the host quiesced, while the
+    -- construction ran or in the handoff after it settled. The dependents stay
     -- registered for retirement and nothing usable was published.
   | GraphicsRolledBack !RolledBack
     -- ^ Construction failed and its owned rollback settled. A rollback that
@@ -2069,8 +2095,15 @@ refusalOf = \case
 -- effect.
 attachWindowGraphics
   ∷ HasCallStack ⇒ WindowHost → WindowId → AttachmentProtocol → IO GraphicsAttachment
-attachWindowGraphics host target protocol =
-  attachHostWindow host target protocol >>= \case
+attachWindowGraphics host target protocol = do
+  outcome ← attachHostWindow host target protocol
+  -- Any reservation at all — established, superseded, or rolled back — is a
+  -- later incarnation of this window's slot, so the host stops holding the
+  -- earlier one's cell here. It keeps whatever disposal its own lifetime ended
+  -- with, and the destruction that follows a later owner is not its to report.
+  forM_ (reservedAttachment outcome) (atomically . releaseEarlierCell host)
+  beforePublication (hostHooks host)
+  case outcome of
     AttachmentEstablished active _ → publishService host (activeAttachment active)
     AttachmentSuperseded identity _ → pure (GraphicsSuperseded identity)
     AttachmentRolledBack settled → pure (GraphicsRolledBack settled)
@@ -2078,15 +2111,63 @@ attachWindowGraphics host target protocol =
     AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
     AttachmentHostUnprotected → pure GraphicsHostUnprotected
 
--- | Make the established attachment's observation cell and its service, in one
--- transaction, so the cell a caller is handed already reflects whatever the
--- attachment's phase had become by the time it was published.
+-- | The attachment a request reserved, whatever became of it. A refusal
+-- reserved nothing and names none.
+reservedAttachment ∷ AttachmentOutcome → Maybe AttachmentId
+reservedAttachment = \case
+  AttachmentEstablished active _ → Just (activeAttachment active)
+  AttachmentSuperseded identity _ → Just identity
+  AttachmentRolledBack settled → Just (rolledBackAttachment settled)
+  AttachmentRefused _ → Nothing
+  AttachmentAdmissionClosed → Nothing
+  AttachmentHostUnprotected → Nothing
+
+-- | Stop holding the cell of an incarnation this window's slot has moved past.
+--
+-- It is finalized as free and then dropped, so the window's own disposal, which
+-- belongs to whichever incarnation is its last, can never be written into it.
+releaseEarlierCell ∷ WindowHost → AttachmentId → STM ()
+releaseEarlierCell host identity = do
+  cells ← readTVar (hostGraphicsCells host)
+  forM_ (Map.lookup window cells) $ \cell → do
+    observed ← readGraphicsCell cell
+    when (observedIncarnation observed < attachmentIncarnation identity) $ do
+      writeGraphicsSlot cell SlotFree []
+      writeTVar (hostGraphicsCells host) (Map.delete window cells)
+  where
+    window = attachmentWindow identity
+
+-- | Make the established attachment's observation cell and its service in one
+-- transaction, and only while that attachment is still the window's active
+-- owner.
+--
+-- Publication and the check that it is still warranted commit together: a
+-- quiescence, a close, or a detach that reached the attachment after its
+-- construction settled has already begun its retirement, and this answers
+-- 'GraphicsSuperseded' rather than handing an application a service for an
+-- owner that may admit no use. The dependents stay registered for retirement
+-- exactly as they do when the model supersedes the publication itself.
 publishService ∷ WindowHost → AttachmentId → IO GraphicsAttachment
 publishService host identity = atomically $ do
-  cell ← newGraphicsCell (attachmentIncarnation identity) allRetirementFacts
-  modifyTVar' (hostGraphicsCells host) (Map.insert (attachmentWindow identity) cell)
-  refreshGraphicsCells host
-  pure (GraphicsAttached (serviceFor identity cell))
+  owning ← attachmentStillActive host identity
+  if not owning
+    then pure (GraphicsSuperseded identity)
+    else do
+      cell ← newGraphicsCell (attachmentIncarnation identity) allRetirementFacts
+      modifyTVar' (hostGraphicsCells host) (Map.insert (attachmentWindow identity) cell)
+      refreshGraphicsCells host
+      pure (GraphicsAttached (serviceFor identity cell))
+
+-- | Whether this exact attachment still holds its window's slot and still
+-- admits new use.
+attachmentStillActive ∷ WindowHost → AttachmentId → STM Bool
+attachmentStillActive host identity = case hostRetirementState host of
+  Nothing → pure False
+  Just retirement → do
+    occupant ← windowAttachmentState retirement (attachmentWindow identity)
+    pure $ case occupant of
+      Just (held, phase, _) → held == identity && phase == AttachmentActive
+      Nothing → False
 
 -- | Detach a window's current graphics owner while the window stays open, on
 -- the owner thread.
@@ -2222,10 +2303,15 @@ demandOf round' =
 -- nothing more. The disposal a cell already carries is never overwritten here;
 -- only the window's own retirement writes one.
 refreshGraphicsCells ∷ WindowHost → STM ()
-refreshGraphicsCells host = case hostRetirementState host of
+refreshGraphicsCells host = refreshCells (hostRetirementState host) (hostGraphicsCells host)
+
+-- | 'refreshGraphicsCells' over the two pieces alone, for the admission-closing
+-- release, which is installed before the host value it belongs to exists.
+refreshCells ∷ Maybe HostRetirement → TVar (Map WindowId GraphicsCell) → STM ()
+refreshCells held slots = case held of
   Nothing → pure ()
   Just retirement → do
-    cells ← readTVar (hostGraphicsCells host)
+    cells ← readTVar slots
     forM_ (Map.toList cells) $ \(window, cell) → do
       observed ← readGraphicsCell cell
       occupant ← windowAttachmentState retirement window

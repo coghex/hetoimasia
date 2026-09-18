@@ -40,7 +40,11 @@
 -- A service observes the native disposal of its window when its own
 -- incarnation was that window's last: an incarnation the slot moved on from
 -- keeps 'SlotFree' with the disposal its own lifetime ended with, because the
--- destruction that followed belonged to a later owner.
+-- destruction that followed belonged to a later owner. The host stops holding a
+-- cell as soon as a later reservation of the same window succeeds — whatever
+-- becomes of that reservation, including one that rolls back or is superseded
+-- without ever publishing a service — so a disposal can never be credited to an
+-- incarnation the slot has moved past.
 --
 -- = State
 --

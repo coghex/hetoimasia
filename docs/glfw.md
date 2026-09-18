@@ -2984,10 +2984,12 @@ or was cancelled — **retains** the attachment: the controller keeps the window
 the exclusive slot, and every dependency the construction left, with the
 original failure and the rollback's own as evidence, until each retirement fact
 is certified separately. Nothing usable is published either way, and no
-retirement is fabricated. A construction that finishes after retirement has
-already begun — a close, a detach, or quiescence overtook it — answers
+retirement is fabricated. A reservation that retirement has already begun on by the time its service would
+be published — a close, a detach, or quiescence overtook it, while the
+construction ran or in the handoff after it settled — answers
 `GraphicsSuperseded`: its dependents stay registered for retirement and nothing
-usable is published.
+usable is published. The check and the publication commit together, so no
+service is ever handed back for an owner that may admit no use.
 
 #### Observing the slot
 
@@ -3008,13 +3010,21 @@ failed native release is never reported as a successful destruction; it is
 latched by the collection, never attempted again, and reported here as
 `DisposalFailed`.
 
+Every transition an owner's admission ends in is written to its retained service
+in the very transaction that ends it: a close, and a quiescence that ends
+attachment admission without closing any window, are both readable from the
+service the moment they commit, without waiting for an owner turn.
+
 A retained service keeps answering after the host has forgotten its window, and
 after the whole application has ended: the cell lives with the value that holds
-it. The host itself keeps at most one cell per window it still holds, so
-repeated detaching and reattaching grows no incarnation history the host owns. A
-service observes its window's native disposal when its own incarnation was that
-window's last; an incarnation the slot moved on from keeps `SlotFree` with the
-disposal its own lifetime ended with.
+it. The host itself keeps at most one cell per window it still holds, and stops
+holding one as soon as a later reservation of that window succeeds — whatever
+becomes of that reservation, including one that rolls back or is superseded
+without ever publishing a service — so repeated detaching and reattaching grows
+no incarnation history the host owns, and a disposal is never credited to an
+incarnation the slot has moved past. A service observes its window's native
+disposal when its own incarnation was that window's last; an earlier one keeps
+`SlotFree` with the disposal its own lifetime ended with.
 
 `hostPendingAttachments` lists the attachments the host still holds, in
 registration order, bounded by the live-window limit.
@@ -3116,11 +3126,17 @@ new attachment:
 
 The examples in `glfw-tests` (`--match "attachments"`) run whole applications
 over the seam and assert an order of flags or an observed state, never a time.
-They cover every refusal above with no owner constructed; the service published
-only after registration, with the slot already reserved during construction;
-a construction superseded by another thread's quiescence; safe and unsafe
-rollback, and a cancellation delivered before publication; a close and a
-destruction separately observable, with the destruction after the last fact; a
+They cover every refusal above with no owner constructed — an ended window, a
+window of another host, a window of another session, an occupied slot, a closing
+window whose retirement a borrow defers, and closed admission; the service
+published only after registration, with the slot already reserved during
+construction; a construction superseded by another thread's quiescence, and one
+superseded in the handoff between its construction settling and its publication;
+safe and unsafe rollback, and a cancellation delivered before publication; a
+close and a destruction separately observable, with the destruction after the
+last fact; a close and a quiescence readable from a retained service in the
+transaction that ends its admission; a disposal never credited to an incarnation
+a later reservation moved past, even when that reservation published nothing; a
 retained service answering after the host forgot its window; a failed native
 release kept distinct from the retirement that succeeded; detach then reattach
 with a fresh incarnation and the stale acknowledgement refused on the owner
@@ -3130,7 +3146,10 @@ window, one port, and no history; two windows where one keeps executing commands
 and completing its own close, retirement, and destruction while the other's
 retirement is pending; a stalled owner's neighbour destroyed first and the
 stalled one finished on independent evidence; a budget of one rotating across
-three pending retirements; a blocking owner refused without its step running;
+three pending retirements, and a budget of one counting the attachment it never
+reached as deferred work even when the one it served withdrew; a blocking owner
+refused without its step running; a completion published from another thread
+ending the owner's idle wait and folding into the next round;
 the scheduled loop's wait shortened to a retirement's own instant and polling
 once a round advanced; the whole application exit with owners attached; and an
 ordinary window-only application seeing no slot, no demand, and unchanged turns.

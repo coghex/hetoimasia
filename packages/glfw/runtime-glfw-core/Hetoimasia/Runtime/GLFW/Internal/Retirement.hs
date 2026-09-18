@@ -817,11 +817,18 @@ advanceRetirements retirement cursor budget = do
   round' ← foldStep noProgressRound offered
   writeIORef cursor (registrationTarget <$> lastOf offered)
   settled ← atomically (retiringPending retirement)
+  -- Deferred work is what the budget did not reach, counted by name rather than
+  -- by arithmetic on the round's own size: an offered attachment that stalled or
+  -- was refused leaves the progressing count short by one, and subtracting the
+  -- offered count from it would then report an unserved neighbour as no work at
+  -- all, letting the next turn wait before ever offering it.
+  let attempted = map registrationTarget offered
+      unserved = filter ((`notElem` attempted) . registrationTarget) (filter registrationProgressing settled)
   pure
     round'
       { roundPending = length settled
       , roundStalled = length (filter (not . registrationProgressing) settled)
-      , roundDeferred = max 0 (length (filter registrationProgressing settled) - roundOffered round')
+      , roundDeferred = length unserved
       }
   where
     foldStep accumulated [] = pure accumulated

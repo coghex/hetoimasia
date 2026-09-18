@@ -66,6 +66,7 @@ import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window (WindowConfig, WindowId, WindowResult (..))
 import Hetoimasia.Runtime.GLFW
+import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Numeric.Natural (Natural)
@@ -81,6 +82,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testPublishedAfterRegistration)
     it "publishes nothing usable when the host's admission closes while the construction runs"
       (boundedExample testSupersededByQuiescence)
+    it "publishes nothing usable when admission closes in the handoff between construction and publication"
+      (boundedExample testSupersededAtHandoff)
     it "retires a construction whose rollback established safety, and frees the slot for a fresh incarnation"
       (boundedExample testRollbackSafeFreesSlot)
     it "retains one whose rollback could not, keeping the window, the slot, and every owed fact"
@@ -95,6 +98,10 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testTerminalObservationRetained)
     it "keeps a failed native release distinct from a failed retirement step"
       (boundedExample testDisposalFailureDistinct)
+    it "reports a closed and a quiesced owner to a retained service in the transaction that ends its admission"
+      (boundedExample testAdmissionVisibleAtOnce)
+    it "never credits a window's disposal to an incarnation the slot moved past"
+      (boundedExample testDisposalNeverCreditedToEarlier)
 
   describe "detaching" $ do
     it "frees the slot only after safe disposal, and a later attachment gets a fresh incarnation"
@@ -115,6 +122,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testStalledNeighbour)
     it "offers opportunities under a rotating bounded budget"
       (boundedExample testRotatingBudget)
+    it "counts an unserved attachment as deferred even when the one it served withdrew"
+      (boundedExample testUnservedCountedAsDeferred)
     it "refuses an owner that declares a blocking step, without running it, and reports the refusal"
       (boundedExample testBlockingOwnerRefused)
     it "ends the owner's idle wait with a completion published from another thread, and folds it in the next round"
@@ -388,6 +397,12 @@ onlyWindow host =
     [identity] → pure identity
     windows → unexpected ("expected one window, found " <> show (length windows))
 
+threeWindows ∷ WindowHost → IO (WindowId, WindowId, WindowId)
+threeWindows host =
+  atomically (hostWindowIdentities host) >>= \case
+    [alpha, beta, gamma] → pure (alpha, beta, gamma)
+    windows → unexpected ("expected three windows, found " <> show (length windows))
+
 twoWindows ∷ WindowHost → IO (WindowId, WindowId)
 twoWindows host =
   atomically (hostWindowIdentities host) >>= \case
@@ -422,6 +437,14 @@ testRefusals = do
   seam ← pollingSeam journal
   unprotected ← newIORef Nothing
   answers ← newIORef []
+  -- A window of a session that is not this host's, taken from a host of its
+  -- own over a second scripted platform and outliving it as a bare identity.
+  elsewhere ← newSeam defaultScript
+  foreignWindow ←
+    asProcessMainThread elsewhere $
+      withScoped
+        (allocWindowHostIn (seamSession elsewhere defaultSessionConfig) (settings [windowNamed "elsewhere"]))
+        onlyWindow
   -- A host built as an ordinary scoped dependency owns no retirement state, so
   -- it was issued no identity an attachment could name.
   asProcessMainThread seam $
@@ -441,32 +464,47 @@ testRefusals = do
     other → unexpected ("the unprotected host did not refuse: " <> show other)
 
   -- Two protected hosts over one session, so a window of one can be offered to
-  -- the other: a host refuses a window that is not its own exactly as it
-  -- refuses one that has ended.
+  -- the other beside one that really has ended.
   asProcessMainThread seam . withScoped (seamSession seam defaultSessionConfig) $ \session →
-    withProtectedWindowHostIn quietLogger (pure session) (settings [windowNamed "outer", windowNamed "spare"]) $
-      \outer →
+    withProtectedWindowHostIn
+      quietLogger
+      (pure session)
+      (settings [windowNamed "outer", windowNamed "spare", windowNamed "doomed"])
+      $ \outer →
         withProtectedWindowHostIn quietLogger (pure session) (settings [windowNamed "inner"]) $ \inner → do
-          (outerWindow, spare) ← twoWindows outer
+          (outerWindow, spare, doomed) ← threeWindows outer
           innerWindow ← onlyWindow inner
-          -- Another host's window, which this host's model does not hold.
-          (_, foreign') ← attachScripted journal inner outerWindow (ownerNamed "foreign")
+          -- Another session's window.
+          (_, foreign') ← attachScripted journal inner foreignWindow (ownerNamed "foreign")
+          -- Another host's window, of this very session.
+          (_, otherHost) ← attachScripted journal inner outerWindow (ownerNamed "borrowed")
           -- Occupied: the slot is exclusive from the reservation on.
           void (attachedOwner journal inner innerWindow (ownerNamed "inner"))
           (_, occupied) ← attachScripted journal inner innerWindow (ownerNamed "intruder")
-          -- Closing: the close protocol has begun, so no new use may start. The
-          -- spare window is borrowed, which defers the closing window's
-          -- retirement without changing what the close itself did.
+          -- Ended: nothing borrows and nothing attaches, so this window is
+          -- destroyed and forgotten by its own close.
+          void (closeHostWindow outer doomed)
+          identities ← atomically (hostWindowIdentities outer)
+          when (doomed `elem` identities) (unexpected "the doomed window was not retired by its close")
+          (_, ended) ← attachScripted journal outer doomed (ownerNamed "gone")
+          -- Closing: the close protocol has begun and a borrow of the spare
+          -- window defers the retirement, so the window is still held.
           closing ←
             withHostWindow outer spare $ \_ → do
               void (closeHostWindow outer outerWindow)
               snd <$> attachScripted journal outer outerWindow (ownerNamed "late")
           -- Quiesced: attachment admission has closed for good.
           atomically (quiesceWindowHost outer)
-          (_, ended) ← attachScripted journal outer spare (ownerNamed "gone")
-          writeIORef answers [foreign', occupied, refusalAnswer closing, ended]
+          (_, admission) ← attachScripted journal outer spare (ownerNamed "too late")
+          writeIORef answers [foreign', otherHost, occupied, ended, refusalAnswer closing, admission]
   map refusalOfAnswer <$> readIORef answers
-    `shouldReturn` [Just "unavailable", Just "occupied", Just "closing", Just "admission ended"]
+    `shouldReturn` [ Just "foreign session"
+                   , Just "unavailable"
+                   , Just "occupied"
+                   , Just "unavailable"
+                   , Just "closing"
+                   , Just "admission ended"
+                   ]
   -- Only the one owner that was established was ever constructed.
   entries ← readTVarIO journal
   [name | Constructed name ← entries] `shouldBe` ["inner"]
@@ -562,6 +600,71 @@ testSupersededByQuiescence = do
   readIORef answered >>= \case
     Just (GraphicsSuperseded _) → pure ()
     other → unexpected ("the superseded construction was not answered: " <> show other)
+  entries ← readTVarIO journal
+  entries `shouldSatisfy` (WindowGone 1 `elem`)
+
+-- | The window between a construction settling and its service being published
+-- is not a window in which a service can appear for an owner that may admit no
+-- use.
+--
+-- The private publication hook puts another thread's quiescence exactly there:
+-- the model has already recorded the attachment active, and the publication
+-- must nonetheless answer superseded rather than hand back a service.
+testSupersededAtHandoff ∷ Expectation
+testSupersededAtHandoff = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  answered ← newIORef Nothing
+  observedThen ← newIORef Nothing
+  atHandoff ← newEmptyMVar
+  quiesced ← newEmptyMVar
+  owned ← newTVarIO Nothing
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "attachment-example"
+      ( \_ use →
+          Private.withProtectedWindowHostWith
+            Private.noHostHooks
+              { Private.beforePublication = do
+                  pending ← readTVarIO owned
+                  forM_ pending $ \_ → putMVar atHandoff () >> takeMVar quiesced
+              }
+            quietLogger
+            (seamSession seam defaultSessionConfig)
+            (settings [windowNamed "alpha"])
+            $ \host → do
+              window ← onlyWindow host
+              owner ← newOwner (ownerNamed "alpha")
+              atomically (writeTVar owned (Just owner))
+              -- Another thread closes the host's admission once the attachment
+              -- has been constructed and registered, and before it is published.
+              _ ←
+                forkIO
+                  ( takeMVar atHandoff
+                      >> atomically (quiesceWindowHost host)
+                      >> putMVar quiesced ()
+                  )
+              outcome ←
+                attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha"))
+              writeIORef answered (Just outcome)
+              seen ← atomically (windowGraphicsStatus host window)
+              writeIORef observedThen (Just seen)
+              -- The facts are certified from another thread, so the exit drain
+              -- can end.
+              _ ← forkIO (publishFacts journal host owner allRetirementFacts)
+              use host
+      )
+      id
+      (\host _ → pure host)
+      (\_ _ → pure ())
+  readIORef answered >>= \case
+    Just (GraphicsSuperseded _) → pure ()
+    other → unexpected ("the handoff published a service: " <> show other)
+  -- The dependents the construction made are still registered for retirement.
+  readIORef observedThen >>= \case
+    Just (GraphicsPresent observed) → observedSlot observed `shouldBe` SlotRetiring
+    other → unexpected ("the superseded attachment was not retiring: " <> show other)
   entries ← readTVarIO journal
   entries `shouldSatisfy` (WindowGone 1 `elem`)
 
@@ -765,6 +868,82 @@ testDisposalFailureDistinct = do
   observedSlot observed `shouldBe` SlotFree
   observedMissing observed `shouldBe` []
   observedDisposal observed `shouldBe` DisposalFailed
+
+-- | A retained service must never report an attached owner after the
+-- transaction that ended that owner's admission has committed.
+--
+-- Both transactions are checked with no owner turn in between: the close, whose
+-- own commit publishes the window's closing phase, and quiescence, which ends
+-- attachment admission for every window at once.
+testAdmissionVisibleAtOnce ∷ Expectation
+testAdmissionVisibleAtOnce = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  afterClose ← newIORef Nothing
+  afterQuiescence ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    (alphaOwner, alphaService) ← attachedOwner journal host alpha (ownerNamed "alpha")
+    (betaOwner, betaService) ← attachedOwner journal host beta (ownerNamed "beta")
+    -- No turn runs between the close and this read.
+    closeHostWindow host alpha `shouldReturn` CloseStarted
+    observation alphaService >>= writeIORef afterClose . Just
+    -- Beta is untouched by alpha's close.
+    betaBefore ← observation betaService
+    observedSlot betaBefore `shouldBe` SlotAttached
+    -- Quiescence ends beta's admission without closing its window, so the
+    -- retained service must report it retiring though nothing has closed.
+    atomically (quiesceWindowHost host)
+    observation betaService >>= writeIORef afterQuiescence . Just
+    forM_ [alphaOwner, betaOwner] $ \owner →
+      atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    -- Only a close destroys a window, so beta's is asked for here.
+    void (closeHostWindow host beta)
+    turnsUntil host control "both destructions" ((== 2) . length <$> destroyCalls seam)
+  readIORef afterClose >>= \case
+    Just observed → do
+      observedSlot observed `shouldBe` SlotRetiring
+      observedMissing observed `shouldBe` allRetirementFacts
+    Nothing → unexpected "nothing was observed after the close"
+  readIORef afterQuiescence >>= \case
+    Just observed → observedSlot observed `shouldBe` SlotRetiring
+    Nothing → unexpected "nothing was observed after quiescence"
+
+-- | A window's disposal belongs to whichever incarnation is its last, and to no
+-- earlier one — including when the later incarnation never published a service
+-- at all.
+testDisposalNeverCreditedToEarlier ∷ Expectation
+testDisposalNeverCreditedToEarlier = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  kept ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (_, first') ← attachedOwner journal host window (ownerNamed "first")
+    writeIORef kept (Just first')
+    void (detachWindowGraphics host first')
+    turnsUntil host control "the first owner's retirement" (not <$> slotOccupied host window)
+    -- A later incarnation reserves the slot and then rolls back safely, so it
+    -- publishes no service of its own. The earlier one is still not the
+    -- window's last.
+    (_, rolled) ←
+      attachScripted
+        journal
+        host
+        window
+        (ownerNamed "second") {scriptConstruct = throwIO (Scripted "construction"), scriptRollback = pure RollbackSafe}
+    case rolled of
+      GraphicsRolledBack settled → rolledBackOutcome settled `shouldBe` RollbackSafe
+      other → unexpected ("the second reservation was not rolled back: " <> show other)
+    void (closeHostWindow host window)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  service ← readIORef kept >>= maybe (unexpected "no service was retained") pure
+  observed ← observation service
+  observedIncarnation observed `shouldBe` 1
+  observedSlot observed `shouldBe` SlotFree
+  -- The destruction that followed a later reservation is not this one's to
+  -- report.
+  observedDisposal observed `shouldBe` DisposalPending
 
 -- ---------------------------------------------------------------------------
 -- Detaching
@@ -1057,6 +1236,45 @@ testCompletionWakesTurn = do
     atomically (readTVar (ownerSteps owner)) >>= \offered → offered `shouldSatisfy` (>= 1)
   entries ← readTVarIO journal
   filter (/= Constructed "alpha") entries `shouldBe` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | An attachment the budget never reached is deferred work, however the one it
+-- did reach answered.
+--
+-- With a budget of one and a first owner that withdraws its path, the round
+-- serves nobody: counting deferred work by subtracting the round's own size
+-- from what is left would report none, and the next turn could wait before ever
+-- offering the second owner or learning its deadline.
+testUnservedCountedAsDeferred ∷ Expectation
+testUnservedCountedAsDeferred = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  reported ← newIORef Nothing
+  offered ← newIORef []
+  let config = (settings [windowNamed "alpha", windowNamed "beta"]) {hostRetirementBudget = 1}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+    (betaOwner, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+    void (closeHostWindow host alpha)
+    void (closeHostWindow host beta)
+    -- One turn, one opportunity, and it went to the owner that then withdrew.
+    turnsExactly host control 1
+    demand ← atomically (hostRetirementDemand host)
+    writeIORef reported (Just demand)
+    counts ← traverse (atomically . readTVar . ownerSteps) [alphaOwner, betaOwner]
+    writeIORef offered counts
+    forM_ [alphaOwner, betaOwner] $ \owner →
+      atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    _ ← forkIO (publishFacts journal host alphaOwner allRetirementFacts)
+    turnsUntil host control "both destructions" ((== 2) . length <$> destroyCalls seam)
+  readIORef offered `shouldReturn` [1, 0]
+  readIORef reported >>= \case
+    Just demand → do
+      retirementPending demand `shouldBe` 2
+      retirementStalled demand `shouldBe` 1
+      -- The unserved owner is why the next turn must not wait.
+      retirementImmediate demand `shouldBe` True
+    Nothing → unexpected "the turn reported no retirement demand"
 
 -- ---------------------------------------------------------------------------
 -- The schedule
