@@ -49,9 +49,9 @@
 --
 -- A step that answers 'RetirementStalled', and one that fails, both withdraw
 -- the attachment's progress path: the drain never replays a failed step, and it
--- resumes stepping only when independent evidence — a retirement fact that
--- attachment did not already owe, certified on the owner thread or folded from
--- a notice — arrives. A declaration of the protocol that raises when the
+-- resumes stepping only when independent evidence — a retirement fact the model
+-- did not already hold, certified on the owner thread or folded from a notice —
+-- arrives. A declaration of the protocol that raises when the
 -- round demands it does the same: it is contained, recorded as that
 -- attachment's evidence, and withdraws its path, so the exit this drain answers
 -- to keeps the attachment, its window, the session, and every parent. As soon as any pending attachment has no path
