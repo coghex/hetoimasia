@@ -41,10 +41,22 @@ ENV HETOIMASIA_QUALIFICATION_REVISION=${SOURCE_REVISION} \
 # loader and headers the binding's `pkgconfig-depends: vulkan` needs on Linux.
 # The loader package is what makes this a Vulkan container rather than the CI
 # image, and is exactly what must not be added there.
+# `snapshot.ubuntu.com` redirects to HTTPS and this base image ships no CA
+# bundle, so `ca-certificates` has to come from the image's own archive before
+# the pinned snapshot is reachable at all. That single package is the only thing
+# not taken from the snapshot, it cannot change the loader or the toolchain
+# support set, and `/opt/packages.txt` records the exact version that was
+# installed — so what this container qualified against is still recorded
+# exactly.
 RUN set -eux; \
-    printf 'deb http://snapshot.ubuntu.com/ubuntu/%s noble main universe\n\
-deb http://snapshot.ubuntu.com/ubuntu/%s noble-updates main universe\n\
-deb http://snapshot.ubuntu.com/ubuntu/%s noble-security main universe\n' \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    printf 'deb https://snapshot.ubuntu.com/ubuntu/%s noble main universe\n\
+deb https://snapshot.ubuntu.com/ubuntu/%s noble-updates main universe\n\
+deb https://snapshot.ubuntu.com/ubuntu/%s noble-security main universe\n' \
       "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" \
       > /etc/apt/sources.list.d/ubuntu.sources.list; \
     rm -f /etc/apt/sources.list.d/ubuntu.sources; \
