@@ -43,7 +43,18 @@ application, lent as `hostDemandPublisher`, and one per live window, lent on its
 `WindowClient` as `clientDemandPublisher`. Concurrent requests combine immediate
 demand and the earliest requested deadline, publication records before it wakes,
 and the owner captures a pending request with its revision and clears exactly
-what it captured. An admission and a publication each register the notification they owe in the
+what it captured. `renderTurn` is the CPU-only helper that composes those
+captures with the application's own simulation demand: it keeps per-window
+scheduling state keyed by `WindowId`, suspends a window known to be hidden,
+minimized, or of zero framebuffer extent while keeping its demand out of the
+wait, defers one whose extent is unknown, owes exactly one rebased frame on
+resume, offers a bounded and rotating number of opportunities per turn so no
+always-dirty window starves another, drops a window's state at its first closing
+observation because its slot closed with it, and answers the schedule the
+scheduled loop continues with, leaving out the work its own offers already
+cover. It calls no graphics API and infers no device readiness; a
+rendering backend must add presentation backpressure on top of it. An admission
+and a publication each register the notification they owe in the
 transaction that commits them, and discharge it exactly once. An expected
 platform wake failure degrades that session's wake path once, warns once under
 `glfw.wake`, and leaves the owner's finite idle wait as the bounded fallback,

@@ -22,24 +22,8 @@ import Control.Exception (Exception, throwIO)
 import Control.Monad (forM, forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log
-  ( Component
-  , Logger
-  , callbackSink
-  , defaultLogFilter
-  , mkLoggerWith
-  , systemMetadata
-  , unsafeComponent
-  )
-import Hetoimasia.Foundation.Time
-  ( Duration
-  , DurationRequirement (AllowZero)
-  , Instant
-  , MonotonicSource
-  , durationFromNanoseconds
-  , scriptedInstant
-  , scriptedSource
-  )
+import Hetoimasia.Foundation.Log (Component, unsafeComponent)
+import Hetoimasia.Foundation.Time (Duration)
 import Hetoimasia.Foundation.Worker (WorkerDefinition, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Command
@@ -60,24 +44,18 @@ import Hetoimasia.GLFW.Internal.Seam
   , defaultScript
   , newSeam
   , seamCalls
-  , seamSession
   )
-import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
   ( Window
-  , WindowConfig
   , WindowId
   , WindowResult (..)
-  , hiddenTestWindowConfig
   , windowIdentity
   , withWindow
   )
 import Hetoimasia.Runtime.GLFW
-import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
   , Role (..)
-  , RuntimeControl
   , SupervisedStart (..)
   , SupervisedWorker
   , WorkerPolicy (..)
@@ -86,7 +64,21 @@ import Hetoimasia.Runtime.Supervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
-import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
+import Test.GLFW.Support
+  ( at
+  , boundedExample
+  , caughtAs
+  , durationOf
+  , entered
+  , hosted
+  , millis
+  , pumps
+  , quietLogger
+  , scriptedClock
+  , settings
+  , unexpected
+  , windowNamed
+  )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn)
 
 spec ∷ Spec
@@ -545,31 +537,6 @@ boundedWaitOf wait = do
     (pacings, _) → unexpected ("expected one turn waiting its bound, found " <> show pacings)
 
 -- ---------------------------------------------------------------------------
--- Scripted clocks
-
--- | A clock whose readings are the scripted nanosecond offsets from the
--- script's own origin, in order, with the count still unread beside it. A
--- reading past the end fails the example rather than inventing an instant.
-scriptedClock ∷ [Integer] → IO (MonotonicSource, IO Int)
-scriptedClock offsets = do
-  remaining ← newIORef (map at offsets)
-  let next =
-        atomicModifyIORef' remaining (\case instant : rest → (rest, Just instant); [] → ([], Nothing))
-          >>= maybe (unexpected "the loop read the scripted clock more often than the example scripted") pure
-  pure (scriptedSource next, length <$> readIORef remaining)
-
-at ∷ Integer → Instant
-at = scriptedInstant . durationOf
-
-durationOf ∷ Integer → Duration
-durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
-  Right duration → duration
-  Left rejected → error ("the scripted duration was rejected: " <> show rejected)
-
-millis ∷ Integer → Integer
-millis count = count * 1000000
-
--- ---------------------------------------------------------------------------
 -- Running scheduled applications
 
 -- | Run a scheduled loop over a seam host and answer the turns its update saw.
@@ -594,34 +561,6 @@ turning start decide = do
 
 recording ∷ IORef [ScheduledTurn] → (ScheduledTurn → IO (ScheduledStep a)) → ScheduledTurn → IO (ScheduledStep a)
 recording seen decide turn = modifyIORef' seen (<> [turn]) >> decide turn
-
--- | Run an application over a host in the seam's session, on a bound thread
--- designated as the process main thread.
-hosted ∷ Seam → HostConfig → (WindowHost → RuntimeControl → IO s) → (s → RuntimeControl → IO a) → IO a
-hosted seam config startup action =
-  asProcessMainThread
-    seam
-    ( runWindowApplication
-        (withLoggingLifetime quietLogger)
-        "scheduled-example"
-        (allocWindowHostIn (seamSession seam defaultSessionConfig) config)
-        id
-        startup
-        action
-    )
-
-settings ∷ [WindowConfig] → MonotonicSource → HostConfig
-settings windows clock =
-  (defaultHostConfig windows)
-    { hostCommandCapacity = 8
-    , hostCommandBudget = 3
-    , hostEventBudget = 2
-    , hostIdleWait = 0.25
-    , hostClock = clock
-    }
-
-windowNamed ∷ Text → WindowConfig
-windowNamed name = hiddenTestWindowConfig name 64 48
 
 -- ---------------------------------------------------------------------------
 -- The scripted platform
@@ -673,18 +612,6 @@ duringTheWait platform action =
 
 -- ---------------------------------------------------------------------------
 -- Shared scaffolding
-
-quietLogger ∷ Logger
-quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
-
--- | The native event processing calls, in order.
-pumps ∷ Seam → IO [NativeCall]
-pumps seam = filter pumped <$> seamCalls seam
-  where
-    pumped = \case
-      PollEvents → True
-      WaitEvents _ → True
-      _ → False
 
 -- | How many empty-event posts the seam recorded.
 posts ∷ Seam → IO Int

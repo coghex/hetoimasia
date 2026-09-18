@@ -42,7 +42,7 @@ import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
-import Test.GLFW.Window (boundedExample, caughtAs, current, entered, originOf, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, current, entered, originOf, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldSatisfy)
 
 spec ∷ Spec

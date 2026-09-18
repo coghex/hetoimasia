@@ -16,32 +16,15 @@
 -- The scripted library answers every query with values deliberately different
 -- from every request, so an observation that copied its request would be seen.
 -- Threads are coordinated with 'MVar's, never with a sleep.
-module Test.GLFW.Window
-  ( spec
+module Test.GLFW.Window (spec) where
 
-    -- * Support shared with the command examples
-  , entered
-  , current
-  , stashed
-  , onThread
-  , caughtAs
-  , unexpected
-  , originOf
-  , operationOf
-  , contextsOf
-  , boundedExample
-  ) where
-
-import Control.Concurrent (ThreadId, forkOS)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (forkOS)
 import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ErrorCall (ErrorCall)
-  , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , IOException
-  , SomeException
   , displayException
   , fromException
   , throwIO
@@ -49,20 +32,11 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (sort)
 import Data.Maybe (listToMaybe)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Failure
-  ( FailureCause (..)
-  , FailureEvidence (..)
-  , FailureOrigin (..)
-  , OperationContext (..)
-  , failureEvidence
-  , operationText
-  )
-import Hetoimasia.Foundation.Log (componentText)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot
   ( Update (..)
@@ -72,12 +46,23 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , observedValue
   , readSnapshot
   )
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures, withScoped)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures)
 import qualified Hetoimasia.GLFW.Internal.Window as Internal
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
-import System.Timeout (timeout)
+import Test.GLFW.Support
+  ( boundedExample
+  , caughtAs
+  , current
+  , entered
+  , contextsOf
+  , onThread
+  , operationOf
+  , originOf
+  , stashed
+  , unexpected
+  )
 import Test.Hspec
   ( Expectation
   , Spec
@@ -864,15 +849,6 @@ testCreationFailures = do
 -- ---------------------------------------------------------------------------
 -- Support
 
-entered ∷ Seam → (Session → IO r) → IO r
-entered seam = withScoped (seamSession seam defaultSessionConfig)
-
-current ∷ Window → IO WindowObservation
-current window = preparedValue . observedValue <$> atomically (readSnapshot (windowObservations window))
-
-stashed ∷ IORef (Maybe Window) → IO Window
-stashed stash = readIORef stash >>= maybe (unexpected "no window was stashed") pure
-
 sameAttributes ∷ WindowObservation → WindowObservation → Bool
 sameAttributes left right =
   and
@@ -941,49 +917,3 @@ firstTimeOnly = do
   flag ← newIORef True
   pure (atomicModifyIORef' flag (\first → (False, first)))
 
--- | Run an action on a new thread and wait for its outcome.
-onThread ∷ (IO () → IO ThreadId) → IO a → IO a
-onThread fork action = do
-  finished ← newEmptyMVar
-  _ ← fork (try action >>= putMVar finished)
-  outcome ← takeMVar finished
-  either (throwIO ∷ SomeException → IO a) pure outcome
-
--- | The typed failure an action raised, beside the exception as caught.
-caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)
-caughtAs action = do
-  outcome ← try action
-  case outcome of
-    Right _ → unexpected "the action returned instead of failing"
-    Left caught → case fromException caught of
-      Just typed → pure (typed, caught)
-      Nothing → unexpected ("the action failed with " <> displayException caught)
-
-unexpected ∷ String → IO a
-unexpected message = expectationFailure message >> ioError (userError message)
-
-originOf ∷ SomeException → Maybe (Text, Text, [(Text, Text)])
-originOf caught = case failureCause (failureEvidence caught) of
-  EngineOrigin origin →
-    Just
-      ( componentText (originComponent origin)
-      , operationText (originOperation origin)
-      , originIdentifiers origin
-      )
-  NativeCause → Nothing
-
-operationOf ∷ SomeException → Maybe (Text, Text)
-operationOf caught = (\(component, operationName, _) → (component, operationName)) <$> originOf caught
-
-contextsOf ∷ SomeException → [(Text, Text, [(Text, Text)])]
-contextsOf caught =
-  [ (componentText (contextComponent context), operationText (contextOperation context), contextIdentifiers context)
-  | context ← failureContexts (failureEvidence caught)
-  ]
-
-boundedExample ∷ Expectation → Expectation
-boundedExample action = do
-  finished ← timeout (30 * 1000 * 1000) action
-  case finished of
-    Just () → pure ()
-    Nothing → expectationFailure "the example did not finish within its bound"

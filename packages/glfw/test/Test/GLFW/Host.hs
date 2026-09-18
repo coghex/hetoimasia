@@ -101,7 +101,7 @@ import Hetoimasia.Runtime.Supervision
   , workerStatus
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Test.GLFW.Window (boundedExample, caughtAs, current, entered, onThread, operationOf, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, current, entered, onThread, operationOf, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec

@@ -59,11 +59,11 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw` | public | `Hetoimasia.GLFW.Session`, `Hetoimasia.GLFW.Monitor`, `Hetoimasia.GLFW.Window`, `Hetoimasia.GLFW.Command`, `Hetoimasia.GLFW.Demand`, and `Hetoimasia.GLFW.Input`, the supported interface |
 | `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the notification policy over the session's wake capability and the bounded demand slots, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
-| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
-| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration |
+| `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, the CPU-only render demand helper that composes the runtime's simulation demand with each window's, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
+| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration, and `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the window attachment model examples, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -512,6 +512,35 @@ data TurnPacing = PolledForWork | PolledForDeadline | WaitedForDeadline Duration
 data UpdateSchedule = NoUpdateDemand | UpdateImmediately | UpdateBy Instant
 data ScheduledStep a = ContinueWith UpdateSchedule | FinishWith a
 
+data RenderDemand                                 -- per-window scheduling state, keyed by WindowId
+noRenderDemand         ∷ RenderDemand
+renderDemandWindows    ∷ RenderDemand → [WindowId]
+windowRenderState      ∷ WindowId → RenderDemand → Maybe WindowRenderState
+forgetRenderWindow     ∷ WindowId → RenderDemand → RenderDemand
+data WindowRenderState = WindowRenderState { windowRedrawPending ∷ Bool
+                                           , windowDeadlinePending, windowFrameDue, windowFrameRequested ∷ Maybe Instant
+                                           , windowResumeDue ∷ Maybe Instant
+                                           , windowRevisionPending, windowRevisionServed ∷ Natural
+                                           , windowSuspended ∷ Bool }
+
+data RenderBudget                                 -- a validated, strictly positive opportunity budget
+renderBudget           ∷ Int → Either RenderBudgetRejected RenderBudget
+renderBudgetSize       ∷ RenderBudget → Int
+data RenderBudgetRejected = OpportunityBudgetNotPositive
+
+data RenderEligibility = RenderEligible | RenderSuspended | RenderDeferred | RenderExcluded
+windowRenderEligibility ∷ WindowObservation → RenderEligibility
+
+data WindowRender = WindowRender { renderedObservation ∷ WindowObservation
+                                 , renderedCapture ∷ Maybe CapturedDemand, renderedFrame ∷ Maybe Instant }
+data RenderTurn = RenderTurn { renderNow ∷ Instant, renderSimulation ∷ Demand, renderLive ∷ [WindowRender] }
+renderTurn             ∷ RenderBudget → RenderTurn → RenderDemand → (RenderResult, RenderDemand)
+data RenderResult = RenderResult { renderOffers ∷ [RenderOffer], renderSchedule ∷ UpdateSchedule }
+renderDeadline         ∷ RenderResult → Maybe Instant
+data RenderOffer = RenderOffer { offeredWindow ∷ WindowId, offeredRevision ∷ Natural
+                               , offeredFrame, offeredResume ∷ Maybe Instant }
+acknowledgeRender      ∷ RenderOffer → RenderDemand → RenderDemand
+
 runWindowApplication
   ∷ HasCallStack
   ⇒ (∀ r. (LoggingLifetime → IO r) → IO r) → Text → Scoped dependencies
@@ -524,7 +553,7 @@ runWindowApplication
 `Session`, `MonitorInventory`, `MonitorDescription`, `MonitorId`, `Window`,
 `WindowObservation`, `WindowId`, `CloseRequest`, `WindowHost`, `WindowCommandHost`, `WindowCommandPort`, `CompletionTicket`,
 `CommandOrigin`, `RequestId`, `WindowCommand`, `SizeConstraints`, `WindowCapabilities`, `WindowClient`, `InputReader`,
-`InputControl`, `InputEvent`, `InputEpoch`, `DemandRequest`, `DemandPublisher`, and `ResetToken` are exported
+`InputControl`, `InputEvent`, `InputEpoch`, `DemandRequest`, `DemandPublisher`, `RenderDemand`, `RenderBudget`, and `ResetToken` are exported
 without their constructors, and their readers are functions rather than record
 fields, so no client can build or rewrite one. No public
 type holds a native window or monitor pointer, and no snapshot publisher is
@@ -2449,6 +2478,132 @@ lives here, in the GLFW layer, and is the only one; a wait is only ever entered
 for a positive duration, so the value it passes is finite, above zero, and never
 above the bound it came from.
 
+### Render demand
+
+`renderTurn` composes the application's simulation demand with each window's own
+demand and decides two things: which windows are offered a render opportunity
+this turn, and what the loop should continue with. It is the only place where
+[a demand slot's](#demand-slots) captured request and [the scheduled owner
+turn's](#the-scheduled-owner-turn) `UpdateSchedule` meet.
+
+It is a pure function of an explicit `RenderDemand` value the caller threads
+from one turn to the next, holding one `WindowRenderState` per window it has
+been shown, keyed by the opaque `WindowId`, and the rotation cursor that makes
+the opportunities fair — no window, no handle, no observation history. Nothing
+in it reads a clock, sleeps, starts a thread, or makes a native call: the caller
+samples `hostClock` itself and passes the instant in. Every operation's type
+says so; none of them is in `IO`.
+
+**It knows nothing about a GPU.** It offers opportunities and performs no
+drawing, calls no graphics API, and infers no device readiness whatever. A
+rendering backend built on it must additionally account for presentation
+backpressure and frame completion; nothing here does. Retirement is not
+represented in it at all and is never gated by it: hiding or closing a window
+suppresses its rendering and nothing else, and [the owner turn](#the-owner-turn)
+retires closing windows exactly as it did before.
+
+**Eligibility is the observation, exactly.** `windowRenderEligibility` reads one
+`WindowObservation` and nothing else, in this precedence:
+
+1. a window whose [phase](#lifecycle-phases) is `WindowClosing` or terminal is
+   `RenderExcluded`, with no normal render demand at all, and the turn shown
+   that observation removes its scheduling state;
+2. otherwise a *known* suspending condition — `Observed False` for visible,
+   `Observed True` for iconified, or an `Observed` framebuffer extent with a zero
+   dimension — makes it `RenderSuspended`, even when another field is
+   `Unavailable`;
+3. otherwise an `Unavailable` framebuffer extent makes it `RenderDeferred`:
+   rendering waits until a usable extent is known, and the window is neither
+   offered an opportunity nor counted as suspended;
+4. otherwise it is `RenderEligible`.
+
+An `Unavailable` visible or iconified field asserts nothing and leaves the
+decision to the other fields, so no observation the platform could not answer is
+invented. A zero framebuffer extent is an ordinary nondrawable observation, as
+[Observations](#observations) says, not a missing one.
+
+**A capture is transferred, not deferred.** Each `WindowRender` carries a
+window's latest observation, what that turn captured from its slot, and the
+absolute frame deadline the application currently wants for it. A capture's
+immediate demand coalesces into one pending redraw and its deadline is kept as
+the earliest pending published deadline, both bounded, both separate from the
+frame schedule the caller may replace on any turn. An absolute frame deadline is
+never enough to infer a period: a deadline already served is not recreated while
+the caller keeps supplying the same instant, a different instant is a new
+obligation, and supplying none removes the demand. Future cadence comes from the
+caller's own next deadline.
+
+**Suspension keeps demand and costs no wait.** A suspended window keeps its
+latest need to redraw, its pending published deadline, and its most recent frame
+request, and contributes nothing to the reported deadline — neither its expired
+deadlines, which would otherwise shorten every wait to nothing, nor its pending
+ones. A deferred window is the same, and keeps its demand until a usable extent
+arrives. Leaving suspension is a resume: it rebases the window's frame schedule
+at the resume instant and owes exactly one current frame, nothing missed is
+replayed, and no state grows with the missed frames. That obligation is held
+apart from the caller's own frame schedule, in `windowResumeDue` rather than
+`windowFrameDue`, precisely because the caller may replace its frame deadline on
+any turn — including while the window is still deferred — and doing so must not
+erase a resume frame nothing has served. A resume into a deferred observation
+therefore still owes its frame however often that schedule changes, and it is
+offered once the window is drawable. An offer names the two obligations
+separately, as `offeredFrame` and `offeredResume`, so an acknowledgement clears
+exactly what that opportunity covered.
+
+**Simulation is carried independently.** The turn's `Demand` is the
+application's own, from [`Hetoimasia.Runtime.UpdatePolicy`](scheduling.md). With
+every window suspended the reported deadline is still the simulation's; with no
+simulation demand and no eligible window work the helper reports
+`NoUpdateDemand`, so the loop waits its fallback bound. Simulation continues
+unless the application explicitly pauses it, a focus or visibility change is
+never a pause, finishing an opportunity never implies simulation demand, and
+simulation demand never marks a window dirty.
+
+**Fairness is a rotation.** At most `renderBudgetSize` opportunities are offered
+per turn, each window at most once, in identity order starting after the window
+served last. The rotation advances on the offers themselves rather than on
+whatever the caller did with them, so for a stable set of `n` continuously
+eligible pending windows and a budget of `b` every one of them is offered within
+`ceiling (n / b)` turns, and a window dirty on every turn cannot starve another.
+Rendering is the caller's; the helper only offers. Eligible due work left beyond
+the budget keeps the next schedule `UpdateImmediately`; work that was offered
+does not by itself, and neither does a deadline that offer already covers, so a
+caller that serves its offers returns to waiting rather than to a wake for work
+it has done. An offer covers the window's whole pending request, its deadline
+included; a frame deadline the offer did not serve, because it was not yet due,
+is still owed and is still reported.
+
+**Acknowledgement is by revision.** `acknowledgeRender` records the revision an
+opportunity served. A publication that arrived after it has been folded in under
+a newer revision and stays pending, so an acknowledgement can never erase a
+newer request, and it is offered again; repeated dirtiness between two
+opportunities coalesces into one, so no backlog of obsolete frames accumulates.
+A frame obligation is cleared only when it is still the one the offer carried.
+
+**Removal is the caller's list, and the window's own phase.** A window left out
+of a turn's `renderLive`, because the host no longer holds it, is removed, as is
+one whose observation reports any phase but `WindowOpen`. A window's
+[demand slot](#demand-slots) closes in the same transaction that publishes
+`WindowClosing`, so the first closing observation is the last thing the helper
+can learn about that window and its state goes then, rather than lingering until
+release. `forgetRenderWindow` removes one outright. The state therefore never
+holds an entry for a window whose slot has closed or that the host no longer
+holds, and a window's entry costs the same however many publications it
+coalesced.
+
+**The reference composition.** `Test.GLFW.Render`'s composition example is the
+worked one to copy: it runs `runScheduledOwnerLoop`, a fixed-step
+`FixedStepPolicy`, and two windows with independent frame cadences and their own
+dirtiness. Each turn's update reads no clock of its own — it takes
+`scheduledNow`, advances the simulation from it, captures each window's slot
+with `captureWindowDemand`, reads each window's observation, and hands
+`renderTurn` those three things plus the frame deadline it owns for each window.
+It then renders what it was offered, acknowledges those offers, rebases the next
+frame deadline of every window whose frame it consumed, and answers
+`ContinueWith (renderSchedule result)`. A future rendering backend replaces the
+rendering and adds its own presentation accounting; the scheduling above is
+already decided here.
+
 ### Demand slots
 
 A worker that wants a turn — now, or by a deadline — says so through a
@@ -2880,6 +3035,39 @@ the fallback bound floored to a whole nanosecond rather than rounded up —
 `1e-12`, `0.5e-9`, `0.75e-9`, and `0.9e-9` each refused before anything is
 acquired.
 
+The render demand examples (`--match "render demand"`) apply
+[the helper](#render-demand) to observations real windows published, over a seam
+whose scripted platform reports exactly the framebuffer extent, visibility, and
+minimize state each example wants, including the unavailable errors that make a
+field `Unavailable`; none of them builds an observation by hand. They prove: all
+thirty-six combinations of the three fields the eligibility rules read,
+classified exactly; a closing window and each of the three terminal phases
+excluded; an opportunity budget of none refused; a suspended window keeping its
+dirtiness and its published deadline while its expired deadline reaches no wait;
+a resume offering exactly one frame rebased at the resume instant after nine of
+the window's periods elapsed, replaying none of them, and the wait after
+acknowledging it being the simulation's alone; an owed resume frame surviving an
+intervening deferred observation; a deferred window's captured demand retained
+and offered once a usable extent arrives; the simulation's deadline reported with
+every window suspended, and no deadline at all with nothing demanded anywhere; a
+frame deadline served once, an unchanged request recreating nothing, a new one
+taken and a withdrawn one removed; an occasionally dirty window offered beside an
+always dirty one against a budget of one; three eligible windows against a budget
+of two each offered within the two turns `ceiling (3 / 2)` allows, with the work
+beyond the budget keeping the schedule immediate; an acknowledgement of an older
+revision leaving the newer request pending and offering it again; four
+publications coalescing into one opportunity per turn with the window's state
+unchanged in size; every way an entry leaves the state — dropped from the
+caller's list, reported closing, reported terminal, and forgotten outright —
+each asserted as the deletion of an entry that state held, from windows of one
+session observed open first and beside an open window that keeps its own; an
+owed resume frame surviving three deferred turns whose frame schedule the caller
+replaces each time; and a deadline this turn's own offer covers left out of the
+schedule while an unserved frame deadline beside it is reported. Two of them run the production scheduled loop: the worked composition
+above, asserting its exact simulation steps, per-window opportunities, schedules,
+and waits, and a suspended window whose captured demand still leaves the next
+turn its whole fallback bound.
+
 The host's CPU examples run whole applications over the test seam in
 `glfw-tests`. The seam's native table scripts the poll and the finite
 wait — recorded as `PollEvents` and `WaitEvents`, with `scriptPollEvents` and
@@ -3196,6 +3384,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Latest cursor sample | The input feed | The producer records it; button production copies it | Owner | The feed | Replaced by the next sample |
 | Window attachment records | The owning host boundary; no production component yet | Owner transitions write; any holder observes | Owner | The host | A record is removed when its window is forgotten, an attachment when it retires; counters never reissued |
 | Attachment completion inbox | The owning host boundary; no production component yet | Any thread offers; the owner takes and folds | Any; STM | While referenced | Emptied by each take |
+| Render demand: per-window scheduling state and the rotation cursor | Whichever caller threads the `RenderDemand` value | Each `renderTurn` folds the turn's captures and frame requests into it; `acknowledgeRender` clears what an offer served | Whatever thread the caller's turn runs on; no shared cell | The caller's own value | An entry is removed when a turn stops listing its window, when its phase is terminal, and by `forgetRenderWindow`; nothing here holds a window, a handle, or any state a driver could name |
 
 The guard holds only occupancy and poison. None of this is application state.
 

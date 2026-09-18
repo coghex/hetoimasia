@@ -52,7 +52,7 @@ import Hetoimasia.GLFW.Internal.Session (sessionWakePath)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
-import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, entered, unexpected)
 import Numeric.Natural (Natural)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 

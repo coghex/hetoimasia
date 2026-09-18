@@ -29,7 +29,7 @@ import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (reconcileMonitorEvents, withResolvedMonitor)
 import Hetoimasia.GLFW.Monitor
 import Hetoimasia.GLFW.Session
-import Test.GLFW.Window (boundedExample, caughtAs, contextsOf, entered, onThread, originOf, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, contextsOf, entered, onThread, originOf, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec

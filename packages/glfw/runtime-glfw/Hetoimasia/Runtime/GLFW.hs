@@ -29,6 +29,17 @@
 -- same idle-or-active choice, same fixed 'hostIdleWait' — and an application
 -- using them never reads a clock. See \"The scheduled owner turn\" below.
 --
+-- 'renderTurn' is the CPU-only helper beside that path, and the one place where
+-- an application's simulation demand, a window's captured demand, and the
+-- schedule the loop waits on meet. It is pure, keyed by 'WindowId', and reads
+-- one 'Hetoimasia.GLFW.Window.WindowObservation' per window to decide
+-- eligibility: a window known hidden, minimized, or of zero framebuffer extent
+-- is suspended and costs no wait, one whose extent is unknown is deferred, and
+-- a closing or ended window has no normal render demand. It calls no graphics
+-- API and infers no device readiness, so a rendering backend must add
+-- presentation backpressure on top of it, and it gates no retirement. See
+-- \"Render demand\" below.
+--
 -- = The owner turn
 --
 -- Every turn performs, in order:
@@ -210,6 +221,50 @@
 -- protocol and is inspected on the next turn; the loop adds no second
 -- notification mechanism, and a wake with nothing due is an ordinary turn that
 -- recomputes its wait.
+--
+-- = Render demand
+--
+-- 'renderTurn' composes what an application wants simulated with what each of
+-- its windows wants drawn, and is the only place the two meet. It takes the
+-- sampled 'Hetoimasia.Foundation.Time.Instant', the application's
+-- 'Hetoimasia.Runtime.UpdatePolicy.Demand', and one 'WindowRender' per live
+-- window — its latest observation, what this turn captured from its slot with
+-- that capture's revision, and the absolute frame deadline the application
+-- currently wants for it. It answers the ordered 'RenderOffer's and the
+-- 'UpdateSchedule' the loop should continue with, beside an updated
+-- 'RenderDemand'. Nothing in it is in 'IO': it reads no clock, sleeps never,
+-- starts no thread, and makes no native call.
+--
+-- 'windowRenderEligibility' reads one observation and nothing else. A closing
+-- or terminal window is 'RenderExcluded'; otherwise a /known/ hidden,
+-- minimized, or zero-dimension framebuffer observation is 'RenderSuspended',
+-- even beside an 'Hetoimasia.GLFW.Window.Unavailable' field; otherwise an
+-- unavailable framebuffer extent is 'RenderDeferred'; otherwise it is
+-- 'RenderEligible'. An unavailable visible or iconified field asserts nothing.
+--
+-- A suspended or deferred window keeps its dirtiness, its published deadline,
+-- and its frame request, and contributes neither its expired nor its pending
+-- deadlines to the schedule, so it can never shorten a wait to nothing.
+-- Leaving suspension rebases that window's frame schedule and owes exactly one
+-- current frame, held apart from the caller's own replaceable schedule so that
+-- replacing it cannot erase a resume frame nothing has served; nothing missed
+-- is replayed. At most 'renderBudgetSize'
+-- opportunities are offered per turn, each window once, rotating after the
+-- window served last, so an always-dirty window starves no other, and due work
+-- left beyond the budget is what keeps the next schedule 'UpdateImmediately'.
+-- A deadline this turn's own offer already covers is left out of the schedule,
+-- so the loop is not woken for work it has just been handed.
+-- 'acknowledgeRender' clears only what the offer served: a publication captured
+-- since stays pending and is offered again. A window a turn stops listing, or
+-- one whose observation reports any phase but
+-- 'Hetoimasia.GLFW.Window.WindowOpen', loses its entry — a window's demand slot
+-- closes with its closing transaction, so there is nothing left to capture for
+-- it — as does one passed to 'forgetRenderWindow'.
+--
+-- The simulation's demand is carried independently of every window: with every
+-- window suspended the schedule is still the simulation's, and with neither
+-- there is no demand at all. Retirement is not represented here and is never
+-- gated here — hiding or closing a window suppresses only its rendering.
 --
 -- = Close requests
 --
@@ -445,6 +500,27 @@ module Hetoimasia.Runtime.GLFW
   , UpdateSchedule (..)
   , ScheduledStep (..)
 
+    -- * Render demand
+  , RenderDemand
+  , noRenderDemand
+  , renderDemandWindows
+  , windowRenderState
+  , WindowRenderState (..)
+  , forgetRenderWindow
+  , RenderBudget
+  , renderBudget
+  , renderBudgetSize
+  , RenderBudgetRejected (..)
+  , RenderEligibility (..)
+  , windowRenderEligibility
+  , WindowRender (..)
+  , RenderTurn (..)
+  , renderTurn
+  , RenderResult (..)
+  , renderDeadline
+  , RenderOffer (..)
+  , acknowledgeRender
+
     -- * The protected host lifetime
   , withProtectedWindowHost
   , withProtectedWindowHostIn
@@ -455,3 +531,4 @@ module Hetoimasia.Runtime.GLFW
   ) where
 
 import Hetoimasia.Runtime.GLFW.Internal
+import Hetoimasia.Runtime.GLFW.Internal.RenderDemand
