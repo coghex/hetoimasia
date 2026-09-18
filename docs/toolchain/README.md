@@ -1,21 +1,17 @@
 # Qualification evidence
 
 What [`../toolchain.md`](../toolchain.md) asserts, as the files that assert it.
-Everything here was produced by the commands that record are named in that
-document; nothing here is transcribed by hand.
+Every file here was produced by the commands that document names; nothing in it
+is transcribed by hand.
 
 ## Local macOS
 
 | File | What it is |
 | --- | --- |
 | `receipts-darwin/*.json` | The validation receipts for every headless group, written by `tools/validation/run.py` against a committed candidate. |
-| `binding-darwin.txt` | `tools/toolchain/qualify-binding.sh` output. |
-| `binding-darwin.cabal.project` | The resolution input that run generated, so it can be replayed. |
-
-Every receipt here was executed at commit **`1b2c0c5`**, and each names that
-revision itself in `executed_commit`. The only later commit is the one adding
-this evidence, which changes documentation alone, so nothing here is a stale
-result relabelled as a newly executed one.
+| `binding-darwin.txt` | `tools/toolchain/qualify-binding.sh` output, naming the revision, platform, and loader it ran against. |
+| `binding-bundle-darwin/` | The complete consumer that run built: project, package description, source module, and a `REPLAY` note. `cabal build all` in a copy of it reproduces the qualification. |
+| `cpu-project-darwin.txt` | `cabal build all --project-file cabal.project.cpu`, captured by `tools/toolchain/capture-build.sh` with the command, toolchain, executed revision and tree, and result. |
 
 The receipts record their own `executed_commit`, `runner_os: Darwin`,
 `runner_arch: arm64`, and the toolchain map actually observed — GHC, Cabal, and
@@ -34,15 +30,22 @@ CI runs the group on its own isolated X11 display.
 
 | File | What it is |
 | --- | --- |
-| `binding-linux.txt` | The same `qualify-binding.sh`, run inside the container `tools/toolchain/Dockerfile.linux-binding` builds. |
-| `binding-linux.cabal.project` | That run's generated resolution input. |
+| `binding-linux.txt` | The same `qualify-binding.sh`, run inside the container `tools/toolchain/Dockerfile.linux-binding` builds, naming the revision the recipe was built from and the resolved package set it qualified against. |
+| `binding-bundle-linux/` | That run's complete consumer, plus `packages.txt`: the distribution packages actually installed, whose SHA-256 is the `packages=` term of the reported platform identity. |
 
-The two `cabal.project` files differ in exactly one way, and it is the platform
-difference [`../toolchain.md`](../toolchain.md#the-platform-difference-and-the-one-thing-it-costs)
+The two bundles' `cabal.project` files differ in exactly one way, and it is the
+platform difference
+[`../toolchain.md`](../toolchain.md#the-platform-difference-and-the-one-thing-it-costs)
 explains: the macOS one carries a `package vulkan` stanza naming the loader
 prefix and an rpath, because with `darwin-lib-dirs` disabled the binding supplies
 no search path of its own. The Linux one names nothing, because the binding
 declares `pkgconfig-depends: vulkan` there.
+
+There is no separate CPU-project artifact for Linux. `build.all` runs the
+ordinary project on every Linux CI run, and `cabal.project.cpu` exists for
+building without the GLFW SDK — a constraint the published image does not have,
+since it carries the pinned GLFW prefix. The local capture is where that
+configuration is actually exercised.
 
 The Linux CI receipts for this candidate are not copied here. They are produced
 by the validation workflow on this pull request, inside the published image

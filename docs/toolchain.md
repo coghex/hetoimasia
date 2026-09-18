@@ -188,8 +188,9 @@ compiler and build-tool versions from `tools/ci-image/toolchain.pin`, the index
 from `cabal.project.common`, and the binding and flags from
 `tools/toolchain/binding.pin`, so it cannot silently qualify something other
 than what this repository pins — it refuses outright if the `ghc` or `cabal` on
-`PATH` disagrees. It builds a throwaway consumer in a temporary directory,
-prints the resolved versions and effective flags, and exits zero.
+`PATH` disagrees. It builds a throwaway consumer in a temporary directory, and
+prints the resolved versions, the effective flags, the platform and loader it
+ran against, and the repository revision it exercised, then exits zero.
 
 On macOS, with the qualified toolchain on `PATH`:
 
@@ -202,9 +203,14 @@ On Linux, inside the pinned throwaway container
 and installs the toolchain from the same checksummed bindists the CI image uses:
 
 ```bash
-docker build -f tools/toolchain/Dockerfile.linux-binding -t hetoimasia-binding-qualification .
+docker build -f tools/toolchain/Dockerfile.linux-binding \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  -t hetoimasia-binding-qualification .
 docker run --rm hetoimasia-binding-qualification
 ```
+
+`SOURCE_REVISION` is how the container can report what it qualified: there is no
+checkout inside it to ask, only the handful of files the recipe copies.
 
 That container is not the CI image and nothing published depends on it. It
 carries `libvulkan-dev`, which is exactly the input the CI image must not gain
@@ -212,9 +218,33 @@ until VK-4 provisions it deliberately; keeping the two recipes separate is what
 lets this slice prove the binding without changing what every validation worker
 pulls.
 
-`HETOIMASIA_QUALIFICATION_OUT=<dir>` writes the generated project and package
-description to that directory, so a recorded qualification can be replayed
-rather than only read.
+Its inputs are pinned so a rebuild qualifies against the same thing: the base
+image by digest, the distribution packages by an Ubuntu archive snapshot, the
+toolchain by `toolchain.pin`'s checksummed bindists. A snapshot pins what the
+archive *offered*, though, not what was actually taken, so the resolved package
+set is recorded at `/opt/packages.txt`, travels with the qualification bundle,
+and its SHA-256 is part of the platform identity the run reports.
+
+Two deliberate exceptions, both because the alternative is not possible rather
+than not convenient:
+
+- `ca-certificates` comes from the base image's own archive, because
+  `snapshot.ubuntu.com` redirects to HTTPS and the pinned base image ships no CA
+  bundle — without it the snapshot cannot be reached at all. It cannot move the
+  loader or the toolchain support set, and `packages.txt` records the version
+  that was installed.
+- GHC's HTML documentation is dropped before installing. Nothing in the
+  container reads it, and on an emulated x86_64 host installing those files
+  dominates the build badly enough to make re-running this qualification
+  impractical. It changes no compiler, library, or link behaviour.
+
+`HETOIMASIA_QUALIFICATION_OUT=<dir>` exports the whole throwaway consumer to
+that directory — the project, the package description, the source module they
+name, the resolved package set on Linux, and a `REPLAY` note giving the exact
+`ghc` and `cabal` to use. That is a directory you can `cabal build all` in
+as-is, which is what makes a recorded qualification replayable rather than only
+readable. The exported bundles are retained in
+[`docs/toolchain/`](toolchain/).
 
 ## Evidence
 

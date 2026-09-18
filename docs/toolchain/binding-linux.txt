@@ -2,6 +2,8 @@ loader-prefix=/usr
 ghc=9.14.1
 cabal=3.18.1.0
 index-state=2026-09-18T00:00:00Z
+platform=linux/x86_64 loader=1.3.275 packages=707605cc2662cea45ebd807a9579fcf1e9c2733cde37dea39e5ebd2ef54e9dc4
+repository-revision=3cfee4edeb9f3b3238ab8a9d39fc6734ad04ecd1
 flags=vulkan +safe-foreign-calls -darwin-lib-dirs
 resolved vulkan-3.27
 resolved vulkan-utils-0.5.11.0
