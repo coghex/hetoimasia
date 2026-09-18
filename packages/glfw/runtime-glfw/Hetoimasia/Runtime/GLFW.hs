@@ -424,6 +424,7 @@ module Hetoimasia.Runtime.GLFW
   , defaultHostConfig
   , validateHostConfig
   , HostConfigRejected (..)
+  , maximumWindowLimit
   , hostComponent
 
     -- * The owner loop

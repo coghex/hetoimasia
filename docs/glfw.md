@@ -2119,8 +2119,11 @@ A `WindowHost` is an application dependency, built by `allocWindowHost` as a
 `Scoped` value before supervision is entered, on the process main thread. It
 validates its `HostConfig` first — both budgets at least one, an idle wait above
 zero and at most 60 seconds, so a NaN or infinite wait is refused, a
-live-window limit of at least one and at least the number of configured windows,
-and an input capacity between one and the channel's maximum —
+live-window limit of at least one, at least the number of configured windows,
+and at most `maximumWindowLimit`, which is far above what any platform hosts at
+once and low enough that every count a host derives from that limit is an exact
+`Int` rather than a wrapped one, and an input capacity between one and the
+channel's maximum —
 then enters the session, allocates a
 [scoped collection](resources.md#scoped-resource-collections) with that limit,
 creates the host's command port, and creates each configured window in order as
@@ -2602,9 +2605,11 @@ no application event or update hook and no supervisor checkpoint. One round is:
 2. every pending attachment that still has a progress path is given one bounded
    opportunity, in registration order, so a stalled attachment cannot starve one
    that could still retire;
-3. every window whose close protocol has begun is offered retirement again, so a
-   chain that has just become safe is destroyed while another chain's window,
-   the shared session, and every borrowed parent stay live;
+3. every window whose close protocol has begun is offered retirement again —
+   in every round, not only one that made progress, so a chain that became safe
+   before the drain and had its destruction deferred is not held by a chain that
+   only awaits or stalls. A window whose own retirement failed is forgotten
+   rather than attempted again, so the retry replays no failed disposal;
 4. native event processing runs — a poll when the round made progress, otherwise
    the host's configured finite bound — keeping both the events retirement needs
    and the session's internal wake, which ends that wait, live.
@@ -2673,6 +2678,17 @@ construction failure runs the integration's owned rollback and keeps its
 original failure with that rollback's outcome as the attachment's evidence; only
 a safe rollback retires it.
 
+The rollback is trusted but not infallible, and construction is settled whatever
+it does. A rollback that raises or is cancelled established no safety, so it is
+recorded as unsafe: the attachment is retained owing every fact rather than left
+with its construction pending, where no fact could ever be recorded and the
+drain could never finish. Its own failure is retained beside the construction
+failure the model keeps first, and a cancelled construction re-raises with it
+retained under `glfw attachment rollback`. Because a safe rollback retires the
+attachment and removes its evidence with it, the answer carries the original
+construction failure and the rollback's own back to the integration that
+attached; this boundary raises neither.
+
 #### Examples
 
 The examples in `glfw-tests` (`--match "protected host"`) run whole applications
@@ -2689,7 +2705,11 @@ with safe and with unsafe rollback, and no consumer entered when the host's own
 setup fails; cancellation queued during construction, during the drain, and
 repeatedly; a latched supervised failure before the drain; two attachments where
 only one can retire, with the other's window, the session, and a scripted parent
-retained while the first retires and its closed window is destroyed; a stalled
+retained while the first retires and its closed window is destroyed; a window
+that became safe before the drain being destroyed in a round that made no
+progress at all; one completion notice per fact per window admitted at once; a
+rollback that itself fails and one that is cancelled, each retained rather than
+stranded in construction; the window limit's bounds; a stalled
 attachment finishing on later independent evidence, with the stall reported
 once; a stall diagnostic that itself fails, unwinding nothing; required and
 recognized-optional retirement-step failures with their evidence retained and

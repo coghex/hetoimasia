@@ -49,6 +49,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , defaultHostConfig
   , validateHostConfig
   , HostConfigRejected (..)
+  , maximumWindowLimit
   , hostComponent
 
     -- * The owner loop
@@ -85,6 +86,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , AttachmentProtocol (..)
   , RetirementProgress (..)
   , AttachmentOutcome (..)
+  , RolledBack (..)
 
     -- * Applications
   , runWindowApplication
@@ -236,6 +238,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Retirement
   , AttachmentProtocol (..)
   , CompletionPublisher
   , DrainOutcome (..)
+  , RolledBack (..)
   , HostRetirement
   , RetirementEnvironment (..)
   , RetirementProgress (..)
@@ -297,7 +300,8 @@ data HostConfig = HostConfig
     -- ^ The windows created when the host is built, in order. It may be empty.
   , hostWindowLimit ∷ !Int
     -- ^ The most windows the host holds live at once, closing windows included.
-    -- At least one, and at least as many as 'hostWindowConfigs'.
+    -- At least one, at least as many as 'hostWindowConfigs', and at most
+    -- 'maximumWindowLimit'.
   , hostCommandCapacity ∷ !Integer
     -- ^ How many commands the host's port, and each window's own port, holds
     -- queued.
@@ -364,7 +368,8 @@ data HostConfigRejected
   | EventBudgetRejected !Int
   | IdleWaitRejected !Double
   | WindowLimitRejected !Int
-    -- ^ The limit is below one, or below the number of configured windows.
+    -- ^ The limit is below one, below the number of configured windows, or
+    -- above 'maximumWindowLimit'.
   | InputCapacityRejected !Integer
   deriving (Eq, Show)
 
@@ -373,6 +378,16 @@ instance Exception HostConfigRejected
 -- | The longest idle wait a configuration may ask for, in seconds.
 maximumIdleWait ∷ Double
 maximumIdleWait = 60
+
+-- | The most live windows a configuration may ask for.
+--
+-- Far above what any platform hosts at once, and low enough that every count a
+-- host derives from it — the protected host's completion inbox holds one notice
+-- per retirement fact per window — is an exact 'Int', never a wrapped one. A
+-- configuration above it is refused before anything is acquired, as one below
+-- one is.
+maximumWindowLimit ∷ Int
+maximumWindowLimit = 1024
 
 -- | Check the budgets, the idle wait, the window limit, and the input capacity.
 -- The session, window, and command capacity settings are checked by the
@@ -386,7 +401,8 @@ validateHostConfig config
   -- A wait of less than a whole nanosecond is no bound the scheduled path could
   -- wait for, so it is refused here rather than rounded up to one.
   | Left _ ← idleWaitDuration config = Left (IdleWaitRejected wait)
-  | limit < 1 || limit < length (hostWindowConfigs config) = Left (WindowLimitRejected limit)
+  | limit < 1 || limit < length (hostWindowConfigs config) || limit > maximumWindowLimit =
+      Left (WindowLimitRejected limit)
   | input < 1 || input > maximumCapacity = Left (InputCapacityRejected input)
   | otherwise = Right ()
   where

@@ -38,7 +38,7 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
-  , ExceptionWithContext
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
   , throwIO
@@ -138,6 +138,10 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testHostSetupFails)
     it "counts a cancellation delivered during construction and still retires what it left registered"
       (boundedExample testCancelledConstruction)
+    it "retains an attachment whose rollback itself failed, rather than stranding it in construction"
+      (boundedExample testRollbackFails)
+    it "retains one whose rollback was cancelled too, keeping both cancellations and finishing the drain"
+      (boundedExample testCancelledRollback)
 
   describe "the drain" $ do
     it "retains repeated cancellation as evidence, establishes no fact, and re-raises one only once retirement is safe"
@@ -148,12 +152,20 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testStalledThenEvidence)
     it "retains a stalled diagnostic's own failure without unwinding anything it is holding"
       (boundedExample testStallDiagnosticFails)
+    it "destroys a window that became safe before the drain, in a round that made no progress at all"
+      (boundedExample testDeferredWindowRetired)
+    it "admits one completion notice per fact per window the host may hold"
+      (boundedExample testInboxHoldsEveryFact)
 
   describe "failed retirement steps" $ do
     it "keeps a required step's failure and evidence, never marks the attachment safe, and never replays the step"
       (boundedExample (testFailedStep Required))
     it "leaves a recognized optional step unavailable with its evidence, which is still no permission to destroy"
       (boundedExample (testFailedStep Optional))
+
+  describe "configuration" $
+    it "refuses a window limit below one, below its configured windows, or above the bound its counts derive from"
+      (boundedExample testWindowLimitBounds)
 
   describe "closing an attached window during the run" $
     it "begins retirement without destroying it, and destroys it only once every fact is certified"
@@ -213,7 +225,7 @@ data Step
 data OwnerScript = OwnerScript
   { scriptName ∷ Text
   , scriptConstruct ∷ IO ()
-  , scriptRollback ∷ RollbackOutcome
+  , scriptRollback ∷ IO RollbackOutcome
   , scriptPlan ∷ [Step]
   , scriptDisposition ∷ Disposition
   , scriptRecognizes ∷ Bool
@@ -222,7 +234,7 @@ data OwnerScript = OwnerScript
 -- | An owner that constructs without effect and certifies every fact, one per
 -- opportunity.
 ownerNamed ∷ Text → OwnerScript
-ownerNamed name = OwnerScript name (pure ()) RollbackSafe (map Certify allRetirementFacts) Required False
+ownerNamed name = OwnerScript name (pure ()) (pure RollbackSafe) (map Certify allRetirementFacts) Required False
 
 -- | One attached scripted owner, as the example observes it.
 data Owner = Owner
@@ -270,7 +282,7 @@ protocolFor journal host owner script =
     { protocolConstruct = \_ acknowledgement → do
         atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
         scriptConstruct script
-    , protocolRollback = pure (scriptRollback script)
+    , protocolRollback = scriptRollback script
     , protocolStep = \target acknowledgement → do
         step ← atomically $ do
           plan ← readTVar (ownerPlan owner)
@@ -609,7 +621,10 @@ testConstructionFailure rollback = do
                 journal
                 host
                 window
-                (ownerNamed "alpha") {scriptConstruct = throwIO (Scripted "construction"), scriptRollback = rollback}
+                (ownerNamed "alpha")
+                  { scriptConstruct = throwIO (Scripted "construction")
+                  , scriptRollback = pure rollback
+                  }
             writeIORef answered (Just outcome)
             held ← atomically (hostPendingAttachments host)
             views ← traverse (atomically . hostAttachmentView host) held
@@ -620,7 +635,15 @@ testConstructionFailure rollback = do
       (\host _ → pure host)
       (\_ _ → pure ())
   readIORef answered >>= \case
-    Just (AttachmentRolledBack _ answeredRollback) → answeredRollback `shouldBe` rollback
+    Just (AttachmentRolledBack settled) → do
+      rolledBackOutcome settled `shouldBe` rollback
+      -- The original failure comes back whatever the model kept: a safe
+      -- rollback retired the attachment and removed its evidence with it.
+      (fromException (exceptionOf (rolledBackFailure settled)) ∷ Maybe Scripted)
+        `shouldBe` Just (Scripted "construction")
+      rolledBackRollback settled `shouldSatisfy` \case
+        Nothing → True
+        Just _ → False
     other → unexpected ("the construction failure was not answered: " <> show other)
   (count, views) ← readIORef observed >>= maybe (unexpected "nothing was observed") pure
   case rollback of
@@ -686,7 +709,7 @@ testCancelledConstruction = do
                 window
                 (ownerNamed "alpha")
                   { scriptConstruct = putMVar constructing () >> takeMVar never
-                  , scriptRollback = RollbackUnsafe
+                  , scriptRollback = pure RollbackUnsafe
                   }
         )
         (\_ _ → pure ())
@@ -696,6 +719,94 @@ testCancelledConstruction = do
   takeMVar finished >>= \case
     Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
     Right () → unexpected "the cancelled construction returned"
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A rollback is trusted but not infallible. One that raises establishes no
+-- safety, so the attachment is retained owing every fact — never left pending,
+-- where no fact could be recorded and the drain could never finish.
+testRollbackFails ∷ Expectation
+testRollbackFails = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  answered ← newIORef Nothing
+  owned ← newTVarIO Nothing
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+            window ← onlyWindow host
+            (owner, outcome) ←
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = throwIO (Scripted "construction")
+                  , scriptRollback = throwIO (Scripted "rollback")
+                  }
+            writeIORef answered (Just outcome)
+            atomically (writeTVar owned (Just owner))
+            use host
+      )
+      id
+      (\host _ → pure host)
+      (\_ _ → pure ())
+  readIORef answered >>= \case
+    Just (AttachmentRolledBack settled) → do
+      -- A rollback that did not complete established no safety.
+      rolledBackOutcome settled `shouldBe` RollbackUnsafe
+      (fromException (exceptionOf (rolledBackFailure settled)) ∷ Maybe Scripted)
+        `shouldBe` Just (Scripted "construction")
+      (fromException . exceptionOf <$> rolledBackRollback settled) `shouldBe` Just (Just (Scripted "rollback"))
+    other → unexpected ("the failed rollback was not answered: " <> show other)
+  owner ← awaitHeld owned
+  seen ← readTVarIO (ownerViews owner)
+  -- The construction failure stays first, with the rollback's own counted after
+  -- it, and every fact is still owed.
+  map (constructionEvidence . viewEvidence) (take 1 seen) `shouldBe` [Just RollbackUnsafe]
+  map (evidenceLaterFailures . viewEvidence) (take 1 seen) `shouldBe` [1]
+  map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A cancellation delivered inside the rollback is retained beside the one
+-- that cancelled the construction, and neither strands the attachment.
+testCancelledRollback ∷ Expectation
+testCancelledRollback = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  constructing ← newEmptyMVar
+  rollingBack ← newEmptyMVar
+  never ← newEmptyMVar
+  neverRolls ← newEmptyMVar
+  (runner, finished) ←
+    onMainThread seam $
+      protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = putMVar constructing () >> takeMVar never
+                  , scriptRollback = putMVar rollingBack () >> takeMVar neverRolls
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+  takeMVar constructing
+  killThread runner
+  takeMVar rollingBack
+  killThread runner
+  takeMVar finished >>= \case
+    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+    Right () → unexpected "the cancelled rollback returned"
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- ---------------------------------------------------------------------------
@@ -743,6 +854,9 @@ testRepeatedCancellation = do
     _ → False
   map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+exceptionOf ∷ Evidence → SomeException
+exceptionOf (ExceptionWithContext _ failure) = failure
 
 -- | Wait for a value another thread publishes, parked in a transaction rather
 -- than spinning: a busy loop here would keep a capability from ever reaching a
@@ -882,6 +996,115 @@ testStallDiagnosticFails = do
   void (pure helper)
   failure `shouldBe` Scripted "sink"
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A chain that became safe before the drain, and whose destruction was
+-- deferred while it was not, must not stay tied to a chain that stalls: the
+-- drain retries closing windows in every round, not only one that progressed.
+--
+-- Nothing here progresses in the round that destroys the window — the only
+-- other attachment stalls — so the retry is the whole reason it is destroyed
+-- before the stalled chain finishes rather than after it.
+testDeferredWindowRetired ∷ Expectation
+testDeferredWindowRetired = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  betaHeld ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  duringRun ← newIORef Nothing
+  helper ← forkIO (supplyEvidence journal hostHeld betaHeld afterStall allRetirementFacts)
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+            (alpha, beta) ← twoWindows host
+            alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
+            betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = [Stall]}
+            atomically (writeTVar betaHeld (Just betaOwner))
+            atomically (writeTVar hostHeld (Just host))
+            alphaAcknowledgement ←
+              atomically (readTVar (ownerAcknowledgement alphaOwner) >>= maybe retry pure)
+            -- Closing alpha's window begins its attachment's retirement and
+            -- destroys nothing: its own veto defers that.
+            closeHostWindow host alpha `shouldReturn` CloseStarted
+            -- Alpha then becomes safe on the owner thread, before anything
+            -- drains. Nothing retries its deferred destruction during the run,
+            -- because the application runs no owner turn.
+            forM_ allRetirementFacts $ \fact → do
+              atomically (note journal (flagOf "alpha" fact))
+              void (reportHostRetirementFact host alphaAcknowledgement fact)
+            atomically (hostPendingAttachments host) >>= \pending → length pending `shouldBe` 1
+            use host
+      )
+      id
+      (\host _ → pure host)
+      (\_ _ → destroyedWindows seam >>= writeIORef duringRun . Just)
+  void (pure helper)
+  readIORef duringRun `shouldReturn` Just []
+  readTVarIO journal
+    `shouldReturn` ( retiring "alpha"
+                       <> [WindowGone 1]
+                       <> retiring "beta"
+                       <> [WindowGone 2, SessionEnded]
+                   )
+
+-- | The completion inbox holds one notice per retirement fact per window the
+-- host may hold, so an integration can publish every obligation it has ended
+-- without being refused.
+testInboxHoldsEveryFact ∷ Expectation
+testInboxHoldsEveryFact = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+            (alpha, beta) ← twoWindows host
+            alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
+            betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = []}
+            use (host, alphaOwner, betaOwner)
+      )
+      (\(host, _, _) → host)
+      (\dependencies _ → pure dependencies)
+      ( \(host, alphaOwner, betaOwner) _ → do
+          -- Every fact of every window at once: none may be refused, and the
+          -- plans are empty, so only these notices can retire either chain.
+          published ← forkPublisher (publishFacts journal host alphaOwner allRetirementFacts)
+          publishFacts journal host betaOwner allRetirementFacts
+          takeMVar published
+      )
+  entries ← readTVarIO journal
+  -- Both chains retired from notices alone, whichever order the two publishers
+  -- interleaved in.
+  filter isWindowGone entries `shouldBe` [WindowGone 2, WindowGone 1]
+  length (filter (not . isWindowGone) entries) `shouldBe` 2 * length allRetirementFacts + 1
+  where
+    isWindowGone = \case
+      WindowGone _ → True
+      _ → False
+
+forkPublisher ∷ IO () → IO (MVar ())
+forkPublisher work = do
+  done ← newEmptyMVar
+  _ ← forkIO (work >> putMVar done ())
+  pure done
+
+-- | The window limit is refused below one, below the configured windows, and
+-- above the bound every count a host derives from it stays exact within.
+testWindowLimitBounds ∷ Expectation
+testWindowLimitBounds = do
+  let base = settings [windowNamed "alpha"]
+  validateHostConfig base {hostWindowLimit = 1} `shouldBe` Right ()
+  validateHostConfig base {hostWindowLimit = maximumWindowLimit} `shouldBe` Right ()
+  validateHostConfig base {hostWindowLimit = 0} `shouldBe` Left (WindowLimitRejected 0)
+  validateHostConfig base {hostWindowLimit = maximumWindowLimit + 1}
+    `shouldBe` Left (WindowLimitRejected (maximumWindowLimit + 1))
+  validateHostConfig base {hostWindowLimit = maxBound} `shouldBe` Left (WindowLimitRejected maxBound)
+  validateHostConfig (settings [windowNamed "alpha", windowNamed "beta"]) {hostWindowLimit = 1}
+    `shouldBe` Left (WindowLimitRejected 1)
 
 -- ---------------------------------------------------------------------------
 -- Failed retirement steps

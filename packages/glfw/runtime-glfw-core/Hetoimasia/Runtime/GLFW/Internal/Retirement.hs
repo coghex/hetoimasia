@@ -104,6 +104,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , AttachmentProtocol (..)
   , RetirementProgress (..)
   , AttachmentOutcome (..)
+  , RolledBack (..)
   , attachRetirement
   , pendingAttachments
   , attachmentViewOf
@@ -135,7 +136,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception
-  ( Exception
+  ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
@@ -147,11 +148,13 @@ import Control.Exception
 import Control.Monad (unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Maybe (fromMaybe, isJust)
+import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
+import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.Foundation.Recovery
   ( AttemptFailure (attemptException)
   , Disposition (..)
@@ -268,7 +271,10 @@ newHostRetirement session limit = do
   (authority, model) ← either rejected pure (newAttachmentModel identity session limit)
   -- One pending notice per fact per window the host may hold: enough that an
   -- integration can publish every obligation it has ended without being
-  -- refused, and still bounded by the configuration.
+  -- refused, and still bounded by the configuration. The product cannot
+  -- overflow, because 'Hetoimasia.Runtime.GLFW.validateHostConfig' refuses a
+  -- window limit above 'Hetoimasia.Runtime.GLFW.maximumWindowLimit', which is
+  -- chosen so that this many notices is far below 'maxBound'.
   inbox ← atomically (newCompletionInbox (limit * length allRetirementFacts)) >>= either rejected pure
   HostRetirement identity authority
     <$> newTVarIO model
@@ -415,9 +421,8 @@ data AttachmentOutcome
   | AttachmentSuperseded !AttachmentId !Acknowledgement
     -- ^ Construction completed after retirement had begun. The dependents stay
     -- registered for retirement; nothing usable was published.
-  | AttachmentRolledBack !AttachmentId !RollbackOutcome
-    -- ^ Construction failed. Its original failure is kept as the attachment's
-    -- evidence beside this rollback outcome.
+  | AttachmentRolledBack !RolledBack
+    -- ^ Construction failed and its owned rollback settled.
   | AttachmentRefused !AttachmentRefusal
     -- ^ The model refused the reservation, before any acquisition.
   | AttachmentAdmissionClosed
@@ -426,6 +431,36 @@ data AttachmentOutcome
     -- ^ The host owns no retirement state, so it was issued no identity an
     -- attachment could name. Answered before any effect.
   deriving (Show)
+
+-- | What a failed construction's owned rollback settled.
+--
+-- A safe rollback retires the attachment, which removes it and the evidence
+-- with it, so the original failure is handed back here rather than left only in
+-- a model entry that no longer exists. The integration that attached owns it
+-- from this point: this boundary raises it for nobody, exactly as it raises no
+-- construction failure.
+data RolledBack = RolledBack
+  { rolledBackAttachment ∷ !AttachmentId
+  , rolledBackOutcome ∷ !RollbackOutcome
+    -- ^ 'RollbackUnsafe' whenever the rollback itself failed or was cancelled:
+    -- a rollback that did not complete established no safety.
+  , rolledBackFailure ∷ !Evidence
+    -- ^ The construction's original failure, never replaced.
+  , rolledBackRollback ∷ !(Maybe Evidence)
+    -- ^ The rollback's own failure, retained beside it.
+  }
+
+instance Show RolledBack where
+  showsPrec precedence settled =
+    showParen (precedence > 10) $
+      showString "RolledBack "
+        . showsPrec 11 (rolledBackAttachment settled)
+        . showChar ' '
+        . showsPrec 11 (rolledBackOutcome settled)
+        . showString " (construction: "
+        . showString (displayException (rolledBackFailure settled))
+        . showString ")"
+        . maybe id (\failed → showString " (rollback: " . showString (displayException failed) . showString ")") (rolledBackRollback settled)
 
 -- | Reserve a window, register the protocol, construct, and publish — in that
 -- order and no other.
@@ -501,16 +536,40 @@ settleFailed
   → IO AttachmentOutcome
 settleFailed retirement restore protocol target acknowledgement caught@(ExceptionWithContext _ failure) = do
   when cancelled (atomically (countCancellation retirement target acknowledgement))
-  outcome ← restore (protocolRollback protocol)
+  -- The rollback is trusted but not infallible, and construction must leave
+  -- pending whatever it does: a rollback that raised or was cancelled
+  -- established no safety, so the attachment is retained owing every fact
+  -- rather than left pending, where no fact could ever be recorded and the
+  -- drain could never finish.
+  attempted ← tryWithContext (restore (protocolRollback protocol))
+  let outcome = either (const RollbackUnsafe) id attempted
+      rolledBack = either Just (const Nothing) attempted
   atomically $ do
     model ← readTVar (retirementState retirement)
     case constructionFailed (retirementOwner retirement) target acknowledgement caught outcome model of
       Left _ → pure ()
       Right (_, next) → writeTVar (retirementState retirement) next
+    -- Retained beside the construction failure the model already keeps first,
+    -- for a retained attachment. A safe rollback removed the entry, and the
+    -- answer below carries both failures instead.
+    mapM_ (recordFailure retirement target acknowledgement) rolledBack
     pruneRegistrations retirement
-  if cancelled then rethrowIO caught else pure (AttachmentRolledBack target outcome)
+  let settled = RolledBack target outcome caught rolledBack
+  if cancelled
+    then maybe (rethrowIO caught) (`raiseRetaining` caught) rolledBack
+    else pure (AttachmentRolledBack settled)
   where
     cancelled = isCancellation failure
+
+-- | Raise the primary failure with another retained beside it as this
+-- boundary's own cleanup evidence.
+raiseRetaining ∷ Evidence → Evidence → IO a
+raiseRetaining retained primary =
+  withResourceLabelled rollbackLabel (pure ()) (\() → rethrowIO retained) (\() → rethrowIO primary)
+
+-- | The cleanup label a failed rollback is retained under.
+rollbackLabel ∷ Text
+rollbackLabel = "glfw attachment rollback"
 
 -- | The attachments the model still holds, in registration order.
 pendingAttachments ∷ HostRetirement → STM [AttachmentId]
@@ -644,10 +703,14 @@ drainRetirement retirement environment restore = go True noDrainOutcome
         else do
           (advanced, stepped) ← opportunities retirement restore pending outcome
           let progressed = revived || advanced
+          -- Every round, not only one that made progress: a chain that became
+          -- safe before the drain began, and whose destruction a borrow then
+          -- deferred, must not stay tied to a chain that only awaits or stalls.
+          -- The retry itself replays no failed disposal: a window whose
+          -- retirement failed is forgotten rather than attempted again.
           settled ←
-            if progressed
-              then tryWithContext (restore (environmentRetireWindows environment)) >>= \attempted → absorb retirement attempted stepped
-              else pure stepped
+            tryWithContext (restore (environmentRetireWindows environment))
+              >>= \attempted → absorb retirement attempted stepped
           diagnosed ←
             if progressed
               then pure settled
