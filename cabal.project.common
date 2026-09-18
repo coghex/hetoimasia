@@ -24,3 +24,17 @@ package hetoimasia-test-support
 
 package hetoimasia-glfw
   ghc-options: -Werror -j
+
+package hetoimasia-scripting-lua
+  ghc-options: -Werror -j
+
+-- The Lua interpreter is the copy the `lua` package bundles, never one found
+-- on the machine: `system-lua` and `pkg-config` would link whatever the
+-- developer's PATH happens to offer, which is a different interpreter version
+-- per machine. `allow-unsafe-gc` is off because this bridge pushes Haskell
+-- functions into Lua, so any VM that has ever held one has a `__gc` metamethod
+-- that re-enters the RTS; with the flag on, every allocation that can trigger
+-- collection is an `unsafe` import, which is not a context that may re-enter.
+-- See packages/scripting-lua/README.md for the audit these settings come from.
+package lua
+  flags: -system-lua -pkg-config -allow-unsafe-gc

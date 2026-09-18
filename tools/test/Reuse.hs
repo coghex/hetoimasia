@@ -503,13 +503,20 @@ spec = describe "Validation evidence reuse" $ do
           workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
           change fixture "README.md" "a prose-only update\n"
           plan ← planRouted fixture workers "routed-plan.json"
-          engine ← workerGroups plan "haskell-engine"
-          engine `shouldContain` [packageGroup]
-          forM_ engine $ \group → do
+          owned ← workerGroups plan "haskell-engine"
+          owned `shouldContain` [packageGroup]
+          forM_ owned $ \group → do
             workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
             workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
           entryText plan packageGroup "reason" `shouldReturn` Just "floor"
           entryText plan "test.engine" "reason" `shouldReturn` Just "floor"
+          -- A worker owns every group it could ever be given; this prose-only
+          -- candidate selects only the floor. The groups that actually execute
+          -- are the intersection, so a mandatory engine group outside the floor
+          -- is routed and published like the rest without being run here.
+          selected ← selectedGroups plan
+          let engine = filter (`elem` selected) owned
+          engine `shouldContain` [packageGroup]
 
           -- Required: every other engine group passing does not stand in for it.
           writeFixtureFile (stubDirectory fixture) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
@@ -1170,6 +1177,13 @@ planRouted fixture workers name = do
   let target = root fixture </> name
   writeFile target output
   pure target
+
+-- | The groups a plan selected, in its own order.
+selectedGroups ∷ FilePath → IO [String]
+selectedGroups plan = do
+  document ← parseJson <$> readFile plan
+  maybe (fail ("no selected groups in " ++ plan)) pure $
+    document >>= field "selected" >>= asArray >>= traverse asString
 
 workerGroups ∷ FilePath → String → IO [String]
 workerGroups plan worker = do

@@ -46,9 +46,10 @@ owning subsystem's contract/design when continuing its work.
 - Logging, CPU scopes/collections, structured failures and bounded recovery,
   application composition, workers/supervision, bounded channels/snapshots,
   supervised inboxes, and GLFW dynamic windows/controls/monitors/input exist.
-- Five Cabal packages are active: root, foundation, runtime, GLFW, and the
-  test-only `hetoimasia-test-support`. Vulkan, Lua, fonts and renderers are
-  still plans/ownership notes, not implemented packages.
+- Six Cabal packages are active: root, foundation, runtime, GLFW, the Lua host
+  `hetoimasia-scripting-lua`, and the test-only `hetoimasia-test-support`.
+  Vulkan, fonts and renderers are still plans/ownership notes, not implemented
+  packages.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
@@ -73,6 +74,37 @@ owning subsystem's contract/design when continuing its work.
   on no GLFW package. Shared neutral helpers are test-only; no production
   dependency on test support. CPU-only foundation, runtime, and root builds use
   `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
+
+- LUA-1 (#146) is the Lua binding and foreign-call boundary. The selected pair
+  is `lua-2.3.4`, bundling Lua 5.4.8, on the #157 baseline merged as `3af4cb2`;
+  `hslua-core` was rejected because its `LuaE` hands out the raw state and its
+  `run` masks cancellation across the whole computation. The bridge is private:
+  the state, trampoline, and registry references live in the package's `bridge`
+  sublibrary, and the public module offers construct / load / call / close and
+  nothing else. `cabal.project.common` sets `lua` to
+  `-system-lua -pkg-config -allow-unsafe-gc`; the last is a correctness setting,
+  because every VM that has held a Haskell callback re-enters the RTS from its
+  collector. The suite is `lua-host-tests`, the group `test.scripting-lua`, and
+  the audit is in the package README. Open follow-ups it records, all for later
+  slices: cancelling a thread that is inside Lua cannot work with an
+  asynchronous exception, so a supervisor that must reclaim a running task needs
+  a Lua-consulted hook or a process boundary (LUA-4 onward); the `safe`-call
+  cost of disabling `allow-unsafe-gc` is unmeasured and belongs with the first
+  workload that has a budget to weigh it against. **Cancellation targets a VM's execution
+  owner**, decided by the owner on 2026-09-18: a callback thread is the
+  runtime's machinery, not an endpoint, and a trusted callback must not publish
+  its `ThreadId` or outlive its own return. Owner cancellation stays observable
+  after the native call and the bookkeeping; a callback's failure keeps its type
+  and context; nothing promises to interrupt arbitrary Lua, so callbacks stay
+  short and limits on untrusted code belong to LUA-14/LUA-15's processes. The
+  package performs state creation, publication, global reads, and library
+  opening through its own C — each one protected call — because the binding's
+  wrappers allocate their arguments before their own protection; it owns the
+  callback path and its error protocol for the same reason plus the export
+  window. A budget-walking allocator in the hazard runner proves every
+  allocation on the publication path reports rather than panics, that a failed
+  publication leaves the state usable, and that carriers are finalized exactly
+  once.
 
 ## Contracts to preserve
 

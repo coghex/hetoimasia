@@ -55,6 +55,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct`,
   `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
+  `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
@@ -86,10 +87,15 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
-- Without the GLFW SDK, build and run the foundation, runtime, and root suites
-  with `--project-file cabal.project.cpu`, which shares `cabal.project.common`
-  with `cabal.project` and leaves out `hetoimasia-glfw`, the package that needs
-  GLFW.
+- Without the GLFW SDK, build and run the foundation, runtime, Lua host, and
+  root suites with `--project-file cabal.project.cpu`, which shares
+  `cabal.project.common` with `cabal.project` and leaves out `hetoimasia-glfw`,
+  the package that needs GLFW.
+- The Lua host's binding settings live in `cabal.project.common`, not in
+  `packages/scripting-lua/`: the bundled interpreter, and whether Lua's
+  collection may run under unsafe calls. Read
+  [its contract](packages/scripting-lua/README.md) before changing them; a
+  second Lua on the machine must never reach the build.
 - Never import a helper from another component's spec module. Neutral
   utilities shared by more than one suite, currently the external-client
   compiler harness (`Test.Support.ExternalClient`) and the bounded test wait
