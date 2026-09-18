@@ -2798,12 +2798,16 @@ same transaction that first finds nothing pending, so a notice is either folded
 by the drain or refused outright: none can register an obligation after the one
 degradation report has passed.
 
-Only a notice that recorded evidence the model did not already hold counts as
-progress and revives a withdrawn path. A refusal, and a duplicate of a fact
-already recorded, establish nothing, so neither can make a failed disposal run
-again. An interrupted step withdraws its path exactly as a failed one does: it
-may have disposed part of what it owns, and nothing knows whether running it
-again would be safe.
+Only a fact that recorded evidence the model did not already hold counts as
+progress and revives a withdrawn path — and that holds however the fact reached
+the owner thread. A notice the drain folds and a fact the integration certifies
+directly through `certifyGraphicsFact` on the owner thread obey one rule, so an
+owner-thread integration needs no notice queued to itself to earn the
+opportunity its own certification established. A refusal, and a duplicate of a
+fact already recorded, establish nothing, so neither can make a failed disposal
+run again on either transport. An interrupted step withdraws its path exactly as
+a failed one does: it may have disposed part of what it owns, and nothing knows
+whether running it again would be safe.
 
 #### Outcome and cancellation
 
@@ -3145,7 +3149,21 @@ Each opportunity either advances finitely, keeps its path with
 `RetirementAwaiting`, keeps it and names the absolute instant at which progress
 may next be possible with `RetirementAwaitingUntil`, or withdraws it with
 `RetirementStalled`. A withdrawn path is never replayed; only independent
-evidence — a completion notice for that attachment — revives it.
+evidence revives it.
+
+That rule is the evidence's, not the transport's. A retirement fact the model
+did not already hold revives the attachment's withdrawn path whether it was
+certified directly on the owner thread through `certifyGraphicsFact` or
+published from another thread and folded from a notice; the next owner turn, or
+the next drain round, then offers that attachment one bounded opportunity, still
+under the rotating budget and still refused outright if its owner declares a
+blocking step. Evidence that establishes nothing revives nothing, on either
+transport: a duplicate of a fact already recorded, an attachment that has
+already retired, and a refused report — a stale acknowledgement, a foreign or
+replaced incarnation, a retirement not yet begun — all leave the path withdrawn,
+so no failed or interrupted step is ever run again without fresh evidence. A
+fact that completes the retirement frees the window rather than earning another
+opportunity: the registration is forgotten in the same transaction.
 
 `hostRetirementDemand` publishes what the last round left owed: how many
 attachments are pending, how many are stalled, how many opportunities were

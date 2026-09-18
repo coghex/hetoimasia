@@ -49,8 +49,9 @@
 --
 -- A step that answers 'RetirementStalled', and one that fails, both withdraw
 -- the attachment's progress path: the drain never replays a failed step, and it
--- resumes stepping only when independent evidence — a completion notice for
--- that attachment — arrives. A declaration of the protocol that raises when the
+-- resumes stepping only when independent evidence — a retirement fact that
+-- attachment did not already owe, certified on the owner thread or folded from
+-- a notice — arrives. A declaration of the protocol that raises when the
 -- round demands it does the same: it is contained, recorded as that
 -- attachment's evidence, and withdraws its path, so the exit this drain answers
 -- to keeps the attachment, its window, the session, and every parent. As soon as any pending attachment has no path
@@ -774,6 +775,15 @@ retiringIn model target = case attachmentStatus target model of
 --
 -- The last missing fact retires the attachment and frees its window; nothing
 -- else does.
+--
+-- Evidence the model did not already hold revives a withdrawn progress path,
+-- exactly as the same evidence folded from a notice does: the revival rule is
+-- the evidence's, never the transport's. A refusal, and a duplicate fact,
+-- establish nothing and leave the path withdrawn, so neither may make a failed
+-- or interrupted step run again. A fact that completes the retirement revives
+-- nothing in practice — the registration it restores is pruned in this same
+-- transaction, so no further opportunity is offered for an attachment that owes
+-- nothing.
 certifyRetirementFact
   ∷ HostRetirement
   → AttachmentId
@@ -786,6 +796,7 @@ certifyRetirementFact retirement target acknowledgement fact = do
     Left refusal → pure (Left refusal)
     Right (answer, next) → do
       writeTVar (retirementState retirement) next
+      when (established answer) (reviveRegistration retirement target)
       pruneRegistrations retirement
       pure (Right answer)
 
@@ -1186,6 +1197,9 @@ sealIfFinished retirement = do
 -- Only a notice that actually recorded new evidence counts as progress and
 -- revives a withdrawn path: a refusal, and a duplicate fact the model already
 -- holds, establish nothing, so neither may make a failed disposal run again.
+-- That is the same rule 'certifyRetirementFact' applies to a fact certified
+-- directly on the owner thread; which transport carried the evidence decides
+-- nothing.
 foldNotices ∷ HostRetirement → IO Bool
 foldNotices = atomically . fold
 
@@ -1203,8 +1217,8 @@ fold retirement = do
       pruneRegistrations retirement
       pure (not (null recorded))
 
--- | Whether one folded notice established evidence the model did not already
--- hold.
+-- | Whether one certified fact established evidence the model did not already
+-- hold, however it reached the owner thread.
 established ∷ FactAnswer → Bool
 established = \case
   FactRecorded _ → True

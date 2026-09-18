@@ -166,6 +166,16 @@ spec = describe "GLFW window attachments" $ do
     it "ends the owner's idle wait with a completion published from another thread, and folds it in the next round"
       (boundedExample testCompletionWakesTurn)
 
+  describe "reviving a withdrawn path" $ do
+    it "offers one further opportunity for a fact certified on the owner thread, and none for a duplicate of it"
+      (boundedExample testDirectCertificationRevives)
+    it "offers one further opportunity for the same fact folded from a notice, and none for a duplicate of it"
+      (boundedExample testNoticeRevives)
+    it "offers the restored registration the exit drain's opportunities too, not only a running turn's"
+      (boundedExample testDirectCertificationRevivesForTheDrain)
+    it "revives nothing for a report the model refuses, on the owner thread or through a notice"
+      (boundedExample testRefusedReportRevivesNothing)
+
   describe "the schedule" $
     it "polls the turn a detach begins, shortens the next wait to the instant the owner named, and polls once a round advanced"
       (boundedExample testRetirementSchedule)
@@ -1786,6 +1796,268 @@ testUnservedCountedAsDeferred = do
       -- The unserved owner is why the next turn must not wait.
       retirementImmediate demand `shouldBe` True
     Nothing → unexpected "the turn reported no retirement demand"
+
+-- ---------------------------------------------------------------------------
+-- Reviving a withdrawn path
+
+-- | What one revival example observed, recorded while the application ran and
+-- asserted once it has exited.
+--
+-- The assertions are deliberately not made inside the owner's own action. One
+-- that fails there leaves an attachment pending with no progress path, which the
+-- protected exit would then wait on for as long as the process lives: an example
+-- that is wrong about revival must fail, not hang.
+data Revival = Revival
+  { revivalWithdrawn ∷ !Int
+    -- ^ Opportunities offered before any evidence arrived: the one that stalled.
+  , revivalAnswers ∷ ![Maybe FactAnswer]
+    -- ^ What the transport answered for the new fact and then for a duplicate
+    -- of it. A notice is answered when it is folded rather than when it is
+    -- offered, so the queued transport records 'Nothing' for both.
+  , revivalOffered ∷ !Int
+    -- ^ Opportunities offered once the new evidence had arrived.
+  , revivalDestroyed ∷ ![Int]
+    -- ^ The windows destroyed by then, which must be none: disposal still waits
+    -- for every fact the attachment owes.
+  , revivalSlot ∷ !SlotState
+  , revivalMissing ∷ ![RetirementFact]
+  , revivalAfterDuplicate ∷ !Int
+    -- ^ Opportunities offered after a duplicate of that same fact, which
+    -- establishes nothing and must therefore change nothing.
+  }
+  deriving (Eq, Show)
+
+-- | How an example delivers one certified fact to the owner thread.
+--
+-- The two transports the contract names are the direct owner-thread operation
+-- and a notice another thread publishes. Answering with the model's own answer
+-- is what lets the direct transport assert what it established.
+type Deliver = WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
+
+-- | What revives a withdrawn path is the evidence, never the transport that
+-- carried it: a fact the model did not already hold earns exactly one further
+-- opportunity, and a duplicate of it earns none.
+--
+-- Both transports are asserted through this one shape, at the same points and
+-- against the same expectations, so they are compared rather than merely both
+-- exercised. Every assertion is made while the attachment still owes facts:
+-- completing the retirement prunes its registration, which would hide the
+-- difference between a revived path and a forgotten one.
+revivalThrough ∷ Deliver → [Maybe FactAnswer] → Expectation
+revivalThrough deliver answered = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  seen ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (owner, service) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+    acknowledgement ← heldAcknowledgement owner
+    void (closeHostWindow host window)
+    -- One opportunity, which stalled and withdrew the path. Every turn after it
+    -- offers nothing at all, so what the evidence below changes is unambiguous.
+    turnsExactly host control 4
+    withdrawn ← atomically (readTVar (ownerSteps owner))
+    recorded ← deliver host acknowledgement CpuUseRetired
+    -- Exactly one further opportunity, which stalls and withdraws again: new
+    -- evidence restores eligibility, it does not replay the step indefinitely.
+    turnsExactly host control 4
+    offered ← atomically (readTVar (ownerSteps owner))
+    destroyed ← destroyCalls seam
+    observed ← observation service
+    -- The same fact again establishes nothing, so it revives nothing. A
+    -- completed round is what proves that, rather than the absence of one.
+    duplicate ← deliver host acknowledgement CpuUseRetired
+    turnsExactly host control 4
+    afterDuplicate ← atomically (readTVar (ownerSteps owner))
+    writeIORef seen . Just $
+      Revival
+        { revivalWithdrawn = withdrawn
+        , revivalAnswers = [recorded, duplicate]
+        , revivalOffered = offered
+        , revivalDestroyed = destroyed
+        , revivalSlot = observedSlot observed
+        , revivalMissing = observedMissing observed
+        , revivalAfterDuplicate = afterDuplicate
+        }
+    -- The facts it still owes then retire it, and its window follows. This runs
+    -- whatever was observed above, so the application always exits.
+    forM_ (stillOwedAfter CpuUseRetired) (void . deliver host acknowledgement)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  readIORef seen
+    `shouldReturn` Just
+      Revival
+        { revivalWithdrawn = 1
+        , revivalAnswers = answered
+        , revivalOffered = 2
+        , revivalDestroyed = []
+        , revivalSlot = SlotRetiring
+        , revivalMissing = stillOwedAfter CpuUseRetired
+        , revivalAfterDuplicate = 2
+        }
+
+-- | The direct owner-thread transport. Before this, an owner-thread integration
+-- — the ordinary shape for GLFW rendering — had to queue a fact to itself
+-- through the cross-thread publisher to obtain progress its own certification
+-- had already established.
+testDirectCertificationRevives ∷ Expectation
+testDirectCertificationRevives =
+  revivalThrough
+    certifyOne
+    [Just (FactRecorded (stillOwedAfter CpuUseRetired)), Just FactAlreadyRecorded]
+
+-- | The queued transport, which behaved this way already, asserted identically.
+testNoticeRevives ∷ Expectation
+testNoticeRevives = revivalThrough publishOne [Nothing, Nothing]
+
+-- | A fact certified on the owner thread restores the registration for the
+-- protected exit's drain too, not only for another running owner turn.
+--
+-- The two paths filter withdrawn registrations independently, so one of them
+-- honouring the revival proves nothing about the other. Here the path is
+-- withdrawn while the application runs, the evidence is certified on the owner
+-- thread with three facts still outstanding, and the application then exits: the
+-- drain must offer the restored registration its opportunities before the
+-- window, the session, and every parent are released.
+testDirectCertificationRevivesForTheDrain ∷ Expectation
+testDirectCertificationRevivesForTheDrain = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  observed ← newIORef Nothing
+  owner ← protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (owner, _) ←
+      attachedOwner
+        journal
+        host
+        window
+        (ownerNamed "alpha") {scriptPlan = Stall : map Certify (stillOwedAfter CpuUseRetired)}
+    acknowledgement ← heldAcknowledgement owner
+    void (closeHostWindow host window)
+    -- The one running turn stalled and withdrew the path, and nothing has been
+    -- destroyed.
+    turnsExactly host control 4
+    withdrawn ← atomically (readTVar (ownerSteps owner))
+    recorded ← certifyGraphicsFact host acknowledgement CpuUseRetired
+    destroyed ← destroyCalls seam
+    writeIORef observed (Just (withdrawn, recorded, destroyed))
+    pure owner
+  readIORef observed
+    `shouldReturn` Just (1, Just (FactRecorded (stillOwedAfter CpuUseRetired)), [])
+  -- The drain offered the restored registration one opportunity per outstanding
+  -- fact, so the owner certified each of them and the window and the session
+  -- were released. Without the revival it would have offered none and waited on
+  -- an attachment whose evidence the model already held.
+  atomically (readTVar (ownerSteps owner)) `shouldReturn` 4
+  readTVarIO journal
+    `shouldReturn` ( [Constructed "alpha"]
+                       <> map (Certified "alpha") (stillOwedAfter CpuUseRetired)
+                       <> [WindowGone 1, SessionEnded]
+                   )
+
+-- | A report the model refuses establishes nothing and therefore revives
+-- nothing, on either transport.
+--
+-- The refusal names a replaced incarnation, and the incarnation that replaced it
+-- is the one holding a withdrawn path: a refusal that revived the replacement
+-- would make a withdrawn step run again on evidence about an attachment that is
+-- gone. Its own evidence then revives it, so the path was revivable throughout
+-- and the refusal is why nothing happened.
+testRefusedReportRevivesNothing ∷ Expectation
+testRefusedReportRevivesNothing = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  seen ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (first', firstService) ← attachedOwner journal host window (ownerNamed "first")
+    stale ← heldAcknowledgement first'
+    void (detachWindowGraphics host firstService)
+    turnsUntil host control "the first owner's retirement" (not <$> slotOccupied host window)
+    (second', secondService) ← attachedOwner journal host window (ownerNamed "second") {scriptPlan = [Stall]}
+    fresh ← heldAcknowledgement second'
+    void (closeHostWindow host window)
+    turnsExactly host control 4
+    withdrawn ← atomically (readTVar (ownerSteps second'))
+    -- The retired incarnation's acknowledgement, on the owner thread and then as
+    -- a notice. Both are refused, and a refusal establishes nothing.
+    refused ← certifyGraphicsFact host stale CpuUseRetired
+    void (publishOne host stale SubmittedWorkEnded)
+    turnsExactly host control 4
+    afterRefusal ← atomically (readTVar (ownerSteps second'))
+    destroyed ← destroyCalls seam
+    observed ← observation secondService
+    void (certifyGraphicsFact host fresh CpuUseRetired)
+    turnsExactly host control 4
+    afterEvidence ← atomically (readTVar (ownerSteps second'))
+    writeIORef seen . Just $
+      Unrevived
+        { unrevivedWithdrawn = withdrawn
+        , unrevivedAnswer = refused
+        , unrevivedOffered = afterRefusal
+        , unrevivedDestroyed = destroyed
+        , unrevivedSlot = observedSlot observed
+        , unrevivedMissing = observedMissing observed
+        , unrevivedAfterEvidence = afterEvidence
+        }
+    forM_ (stillOwedAfter CpuUseRetired) (void . certifyGraphicsFact host fresh)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  readIORef seen
+    `shouldReturn` Just
+      Unrevived
+        { unrevivedWithdrawn = 1
+        , unrevivedAnswer = Nothing
+        , unrevivedOffered = 1
+        , unrevivedDestroyed = []
+        , unrevivedSlot = SlotRetiring
+        , unrevivedMissing = allRetirementFacts
+        , unrevivedAfterEvidence = 2
+        }
+
+-- | What the refusal example observed, recorded while the application ran and
+-- asserted once it has exited, for the same reason 'Revival' is.
+data Unrevived = Unrevived
+  { unrevivedWithdrawn ∷ !Int
+    -- ^ Opportunities offered before the refused reports: the one that stalled.
+  , unrevivedAnswer ∷ !(Maybe FactAnswer)
+    -- ^ What the owner thread answered the refused report. A refusal records
+    -- nothing and answers nothing.
+  , unrevivedOffered ∷ !Int
+    -- ^ Opportunities offered after both refused reports, which must still be
+    -- only the one the stall withdrew.
+  , unrevivedDestroyed ∷ ![Int]
+  , unrevivedSlot ∷ !SlotState
+  , unrevivedMissing ∷ ![RetirementFact]
+    -- ^ Nothing may be credited to the replacement either.
+  , unrevivedAfterEvidence ∷ !Int
+    -- ^ Opportunities offered once the replacement's own new evidence arrived,
+    -- which is what proves the path was revivable throughout and the refusal is
+    -- why nothing happened.
+  }
+  deriving (Eq, Show)
+
+-- | Every fact an attachment still owes once this one has been recorded.
+stillOwedAfter ∷ RetirementFact → [RetirementFact]
+stillOwedAfter fact = filter (/= fact) allRetirementFacts
+
+-- | Deliver one fact by certifying it directly on the owner thread.
+certifyOne ∷ Deliver
+certifyOne = certifyGraphicsFact
+
+-- | Deliver one fact as a notice published from a thread that is not the owner,
+-- without journalling it.
+--
+-- 'publishFacts' notes each fact it publishes, which is what an example
+-- asserting the order of a whole retirement wants. An example offering evidence
+-- that establishes nothing wants the opposite: a duplicate and a refusal change
+-- no attachment, so noting them would claim a certification that never happened.
+publishOne ∷ Deliver
+publishOne host acknowledgement fact = do
+  publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+  let notice = completionNotice (acknowledgedAttachment acknowledgement) acknowledgement fact
+  publishCompletion publisher notice >>= \case
+    CompletionOffered NoticeRejectedFull → unexpected "the completion inbox refused a notice"
+    CompletionClosed → unexpected "the boundary had already closed publication"
+    _ → pure Nothing
 
 -- ---------------------------------------------------------------------------
 -- The schedule
