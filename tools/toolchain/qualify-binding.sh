@@ -65,6 +65,8 @@ darwin_lib_dirs="$(flag_argument darwin-lib-dirs "$VULKAN_FLAG_DARWIN_LIB_DIRS")
 # `darwin-lib-dirs` default this repository turns off, so the prefix is named
 # explicitly and checked before the solver is asked anything.
 loader_stanza=""
+platform_identity=""
+packages_manifest=""
 case "$(uname -s)" in
   Darwin)
     prefix="${HETOIMASIA_VULKAN_PREFIX:-$MACOS_VULKAN_PREFIX}"
@@ -92,6 +94,9 @@ package vulkan
 EOF
 )"
     echo "loader-prefix=$prefix"
+    # The loader is a system component here, so its own version is part of what
+    # was qualified.
+    platform_identity="darwin/$(uname -m) loader=$(pkg-config --modversion vulkan 2>/dev/null || echo unknown)"
     ;;
   Linux)
     # The binding declares pkgconfig-depends on vulkan here, so the loader's
@@ -101,6 +106,18 @@ EOF
       exit 2
     fi
     echo "loader-prefix=$(pkg-config --variable=prefix vulkan)"
+    # The distribution packages are the loader here, so the resolved package set
+    # is part of this platform's identity. The recipe records it while building
+    # the image; hashing it lets a later run say whether it qualified against
+    # the same set, and the bundle keeps the set itself.
+    platform_identity="linux/$(uname -m) loader=$(pkg-config --modversion vulkan 2>/dev/null || echo unknown)"
+    if [ -r /opt/packages.txt ]; then
+      packages_manifest=/opt/packages.txt
+      platform_identity="$platform_identity packages=$(sha256sum /opt/packages.txt | cut -d" " -f1)"
+    else
+      echo "qualify-binding: /opt/packages.txt is missing, so the resolved package set cannot be recorded" >&2
+      exit 2
+    fi
     ;;
   *)
     echo "qualify-binding: $(uname -s) is not a qualified platform" >&2
@@ -108,9 +125,28 @@ EOF
     ;;
 esac
 
+# What this run can be attributed to. A qualification that does not say which
+# revision it exercised cannot be told apart later from one taken against
+# different pins, so it is reported rather than left for prose to assert.
+#
+# Inside the container there is no checkout to ask — only the handful of files
+# the recipe copied — so the recipe bakes the revision it was built from into
+# HETOIMASIA_QUALIFICATION_REVISION and this reads it back.
+if [ -n "${HETOIMASIA_QUALIFICATION_REVISION:-}" ]; then
+  source_revision="$HETOIMASIA_QUALIFICATION_REVISION"
+elif source_revision="$(git -C "$root" rev-parse HEAD 2>/dev/null)"; then
+  if ! git -C "$root" diff --quiet HEAD -- "$root/tools/toolchain" "$root/tools/ci-image/toolchain.pin" "$root/cabal.project.common" 2>/dev/null; then
+    source_revision="$source_revision (dirty)"
+  fi
+else
+  source_revision="unknown"
+fi
+
 echo "ghc=$actual_ghc"
 echo "cabal=$actual_cabal"
 echo "index-state=$index_state"
+echo "platform=$platform_identity"
+echo "repository-revision=$source_revision"
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -169,14 +205,36 @@ EOF
 
 echo "flags=vulkan $safe_foreign_calls $darwin_lib_dirs"
 
-# The generated project is the replayable resolution input: it carries the
-# index, the flags, and the platform's loader configuration in one file. Keep it
-# when asked, so a qualification recorded in docs/toolchain.md can be replayed
-# rather than only read.
+# The exported bundle is the whole throwaway consumer, not just its project
+# file: the project names a package description, and that description names
+# `src/Qualification.hs`, which otherwise exists only in a temporary directory
+# this script deletes on exit. Copying two of the three files would promise a
+# replay that cannot run.
 if [ -n "${HETOIMASIA_QUALIFICATION_OUT:-}" ]; then
-  mkdir -p "$HETOIMASIA_QUALIFICATION_OUT"
+  mkdir -p "$HETOIMASIA_QUALIFICATION_OUT/src"
   cp "$scratch/cabal.project" "$HETOIMASIA_QUALIFICATION_OUT/cabal.project"
   cp "$scratch/binding-qualification.cabal" "$HETOIMASIA_QUALIFICATION_OUT/binding-qualification.cabal"
+  cp "$scratch/src/Qualification.hs" "$HETOIMASIA_QUALIFICATION_OUT/src/Qualification.hs"
+  if [ -n "$packages_manifest" ]; then
+    cp "$packages_manifest" "$HETOIMASIA_QUALIFICATION_OUT/packages.txt"
+  fi
+  # Replaying needs the toolchain too, so say how to get it rather than leaving
+  # the reader to infer it from prose elsewhere.
+  cat > "$HETOIMASIA_QUALIFICATION_OUT/REPLAY" <<EOF
+This directory is the complete consumer this qualification built.
+
+  ghc            $actual_ghc
+  cabal          $actual_cabal
+  platform       $platform_identity
+  repository     $source_revision
+
+Replay it with that exact ghc and cabal on PATH:
+
+  cabal build all
+
+Everything else — the Hackage index, the binding versions, the flags, and the
+platform's loader configuration — is already in cabal.project.
+EOF
 fi
 
 cd "$scratch"

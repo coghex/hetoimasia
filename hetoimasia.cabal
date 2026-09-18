@@ -36,6 +36,7 @@ extra-source-files:
     tools/docs_land.sh
     tools/display/x11.sh
     tools/toolchain/binding.pin
+    tools/toolchain/capture-build.sh
     tools/toolchain/qualify-binding.sh
     tools/toolchain/Dockerfile.linux-binding
     tools/docs_land_paths.py
