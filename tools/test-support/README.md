@@ -11,6 +11,13 @@ does.
   an example names, and exposes an `-inplace` unit id with `-package-id`.
   `rejectedBecause` requires a rejection to name its intended cause and never an
   environment failure such as a missing package or module.
+  `withStorePackageClient` exposes the dependency store `cabal` reports as well,
+  for a package whose own libraries depend on a Hackage package rather than on
+  the boot libraries alone: the compiler has to resolve the whole unit graph,
+  and without the store such a client is rejected for a reason about the
+  environment rather than about the boundary. It widens nothing a client may
+  say, because `-hide-all-packages` still applies and the example still lists
+  every package by name.
 - `Test.Support.Bounded` bounds a call that must return, so a stuck example
   fails instead of hanging the run.
 

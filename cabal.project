@@ -4,6 +4,7 @@ packages:
   .
   packages/foundation
   packages/runtime
+  packages/scripting-lua
   packages/glfw
   tools/test-support
 

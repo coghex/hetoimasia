@@ -15,13 +15,15 @@ module Test.Support.ExternalClient
   ( Client (..)
   , Mode (..)
   , withPackageClient
+  , withStorePackageClient
+  , storeDatabases
   , rejectedBecause
   ) where
 
 import Control.Monad (filterM)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Version (showVersion)
-import System.Directory (doesDirectoryExist, findExecutable)
+import System.Directory (doesDirectoryExist, findExecutable, listDirectory)
 import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath (takeDirectory, (</>))
@@ -83,7 +85,32 @@ rejectedBecause outcome reason = do
 -- ambient package environment file, and @-hide-all-packages@ leaves the client
 -- with exactly the packages named.
 withPackageClient ∷ [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withPackageClient packages name source use = do
+withPackageClient = clientWith False
+
+-- | 'withPackageClient', additionally exposing the dependency store this build
+-- resolved its Hackage packages from.
+--
+-- A package whose own libraries depend on a Hackage package -- rather than on
+-- the boot libraries alone -- cannot be loaded from the build's local database
+-- by itself: the compiler has to resolve the whole unit graph, and the units it
+-- depends on live in the store. Without them the client is rejected for an
+-- environment reason, which is exactly what an opacity example must never
+-- mistake for a boundary holding.
+--
+-- The store is the one @cabal@ itself reports, so this follows a project's
+-- configured store rather than assuming a personal one. Every compiler
+-- directory the store holds for this compiler version is exposed, because the
+-- store names them by version and an ABI hash this library has no way to
+-- recompute. Exposing the store cannot widen what a client may say: the client
+-- is still compiled with @-hide-all-packages@ and may name only the packages
+-- the example lists.
+withStorePackageClient
+  ∷ [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+withStorePackageClient = clientWith True
+
+clientWith
+  ∷ Bool → [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+clientWith wantStore packages name source use = do
   compiler ← findExecutable "ghc"
   database ← findPackageDatabase
   case (compiler, database) of
@@ -108,11 +135,17 @@ withPackageClient packages name source use = do
                       <> " but this suite was built with "
                       <> showVersion fullCompilerVersion
                   )
-          (ExitSuccess, _, _) →
+          (ExitSuccess, _, _) → do
+            -- Asked from the client's own directory, not the checkout's: the
+            -- question is about this machine's Cabal configuration, and asking
+            -- it where the sources live would make a source tree the run cannot
+            -- write to a reason to answer nothing.
+            stores ← if wantStore then storeDatabases directory else pure []
             use $ \mode → do
               (status, out, err) ←
                 readCreateProcessWithExitCode
-                  (proc ghc (arguments packages mode packageDatabase name)) { cwd = Just directory }
+                  (proc ghc (arguments packages mode (stores <> [packageDatabase]) name))
+                    { cwd = Just directory }
                   ""
               pure (Client status (out <> err) directory)
           (status, _, err) →
@@ -126,16 +159,15 @@ withPackageClient packages name source use = do
 -- one of them under the same package name, so @-package@ alone matches several
 -- units and GHC's choice among them is not stable; naming the main library's
 -- unit id exposes exactly that library.
-arguments ∷ [String] → Mode → FilePath → FilePath → [String]
-arguments packages mode packageDatabase name =
+arguments ∷ [String] → Mode → [FilePath] → FilePath → [String]
+arguments packages mode databases name =
   [ "-XGHC2024"
   , "-XUnicodeSyntax"
   , "-package-env"
   , "-"
-  , "-package-db"
-  , packageDatabase
-  , "-hide-all-packages"
   ]
+    <> concatMap (\database → ["-package-db", database]) databases
+    <> ["-hide-all-packages"]
     <> concatMap exposing packages
     <> ["-fdiagnostics-color=never"]
     <> case mode of
@@ -163,3 +195,46 @@ findPackageDatabase = do
         ]
   found ← filterM doesDirectoryExist candidates
   pure (case found of [] → Nothing; first : _ → Just first)
+
+-- | The package databases of the dependency store @cabal@ reports, for this
+-- compiler version.
+--
+-- An answer is best effort: without @cabal@ on @PATH@, or with no store
+-- directory for this compiler, the list is empty and a client that needed one
+-- of those units is rejected for an environment reason the example checks for.
+storeDatabases ∷ FilePath → IO [FilePath]
+storeDatabases directory = do
+  cabal ← findExecutable "cabal"
+  case cabal of
+    Nothing → pure []
+    Just executable → do
+      -- `--ignore-project`, and asked from a directory of this run's own: a
+      -- `cabal path` that reads a project resolves that project's build
+      -- directory, which it will try to create. A checkout the run may not
+      -- write to -- an extraction a reviewer reads, a build sent elsewhere with
+      -- `--builddir` -- would then fail, and the answer would silently become
+      -- "no store" and every client would be rejected for the wrong reason.
+      -- Nothing about the store depends on the project, so nothing here reads
+      -- one.
+      reported ←
+        readCreateProcessWithExitCode
+          (proc executable ["path", "--ignore-project", "--store-dir"]) { cwd = Just directory }
+          ""
+      case reported of
+        (ExitSuccess, out, _) → case reverse (filter (not . null) (lines out)) of
+          [] → pure []
+          latest : _ → compilerDatabases latest
+        _ → pure []
+  where
+    compilerDatabases root = do
+      present ← doesDirectoryExist root
+      if not present
+        then pure []
+        else do
+          entries ← listDirectory root
+          -- The store names a compiler directory by version and an ABI hash,
+          -- and more than one may exist for one version.
+          let prefix = "ghc-" <> showVersion fullCompilerVersion
+              candidates =
+                [root </> entry </> "package.db" | entry ← entries, prefix `isPrefixOf` entry]
+          filterM doesDirectoryExist candidates
