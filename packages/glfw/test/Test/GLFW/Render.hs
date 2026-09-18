@@ -544,48 +544,55 @@ testCoalescing = withScripted 1 $ \reports windows → do
 -- ---------------------------------------------------------------------------
 -- State removal
 
--- | A window the caller stops listing, one whose own phase has left
--- 'WindowOpen', and one forgotten outright all leave the state holding nothing
--- for them. The closing case is the window this state already holds an entry
--- for, so what is asserted is a deletion rather than an absent insertion.
+-- | Every way a window's entry leaves the state, each asserted as the deletion
+-- of an entry this state actually held rather than the absence of one it never
+-- inserted: the window the caller stops listing, the window whose own phase
+-- leaves 'WindowOpen' — closing, because its demand slot closed in that same
+-- transaction, and terminal, because it has been released — and the window
+-- forgotten outright. In each case an open window listed beside it keeps its
+-- entry and is still served, so what is proved is the phase's removal rather
+-- than a turn discarding everything.
 testRemoval ∷ Expectation
-testRemoval = withScripted 2 $ \reports windows → do
-  (closer, other) ← case windows of
-    [first, second] → pure (first, second)
-    _ → unexpected ("expected two windows, found " <> show (length windows))
-  observations ← mapM (observationAt reports drawable) windows
-  (kept, gone) ← case map windowIdentity windows of
-    [first, second] → pure (first, second)
-    other' → unexpected ("expected two windows, found " <> show (length other'))
-  -- The same window, observed while it is closing and again once its scope has
-  -- released it, so what is removed below is state this state actually held.
-  _ ← beginWindowClosing (pure ()) (pure True) closer
-  closing ← current closer
-  otherOpen ← current other
-  let dirty observation = WindowRender observation (captured 1 immediateDemand) Nothing
-      (_, both) = turn (at 0) NoDemand (map dirty observations) noRenderDemand
-      (dropped, afterDropped) =
-        turn (at (millis 10)) NoDemand [dirty observation | observation ← observations, observedWindow observation == kept] both
-      -- The very window the state holds an entry for is now closing, and its
-      -- entry goes with the slot that closed in the same transaction — even
-      -- though the caller still lists it, and with a capture beside it.
-      (ending, afterEnding) = turn (at (millis 20)) NoDemand [dirty closing, dirty otherOpen] afterDropped
-  observedWindow closing `shouldBe` kept
-  renderDemandWindows both `shouldBe` [kept, gone]
-  -- The window the host no longer holds took its slot and its state with it.
-  renderDemandWindows afterDropped `shouldBe` [kept]
-  map offeredWindow (renderOffers dropped) `shouldBe` [kept]
-  -- The closing window's entry is deleted and it is offered nothing; the open
-  -- window beside it keeps its entry and is served as usual, so the removal is
-  -- this window's phase rather than the turn dropping everything.
-  renderDemandWindows afterEnding `shouldBe` [gone]
-  map offeredWindow (renderOffers ending) `shouldBe` [gone]
-  -- A terminal phase removes it too, as does forgetting one outright.
-  released ← endedObservation (scriptOf (pure drawable))
-  let (_, seeded) = turn (at (millis 30)) NoDemand [dirty released] noRenderDemand
-  renderDemandWindows seeded `shouldBe` []
-  renderDemandWindows (forgetRenderWindow kept both) `shouldBe` [gone]
-  renderDemandWindows (forgetRenderWindow kept noRenderDemand) `shouldBe` []
+testRemoval = do
+  reports ← newIORef drawable
+  seam ← newSeam (scriptOf (readIORef reports))
+  asProcessMainThread seam $ entered seam $ \session →
+    withWindow session (windowNamed "kept") $ \kept →
+      withWindow session (windowNamed "closer") $ \closer → do
+        -- The released window's scope ends inside the other two, so its final
+        -- observation is a terminal one of a window this session held open.
+        stash ← newIORef Nothing
+        endingOpen ← withWindow session (windowNamed "ending") (\window → writeIORef stash (Just window) >> current window)
+        ending ← stashed stash >>= current
+        keptOpen ← current kept
+        closerOpen ← current closer
+        _ ← beginWindowClosing (pure ()) (pure True) closer
+        closing ← current closer
+        let identities@(keptId, closerId, endingId) =
+              (windowIdentity kept, windowIdentity closer, observedWindow ending)
+            dirty observation = WindowRender observation (captured 1 immediateDemand) Nothing
+            run instant live state = renderTurn (budgetOf 3) (RenderTurn (at instant) NoDemand (map dirty live)) state
+            (_, held) = run 0 [keptOpen, closerOpen, endingOpen] noRenderDemand
+            (retired, afterRetired) = run (millis 10) [keptOpen, closing, ending] held
+            (listed, afterListed) = run (millis 20) [keptOpen] held
+        -- The fixture really did produce the phases the removal turns on, for
+        -- the very windows the first turn gave entries to.
+        map observedPhase [keptOpen, closing, ending] `shouldBe` [WindowOpen, WindowClosing, WindowReleased]
+        map observedWindow [closing, ending] `shouldBe` [closerId, endingId]
+        renderDemandWindows held `shouldBe` [keptId, closerId, endingId]
+        -- Both retained entries are deleted by the observations that report
+        -- their phases, while the open window beside them keeps its own and is
+        -- the only one offered.
+        renderDemandWindows afterRetired `shouldBe` [keptId]
+        map offeredWindow (renderOffers retired) `shouldBe` [keptId]
+        -- A window the host no longer holds at all goes the same way.
+        renderDemandWindows afterListed `shouldBe` [keptId]
+        map offeredWindow (renderOffers listed) `shouldBe` [keptId]
+        -- And one forgotten outright, whether or not the state holds it.
+        renderDemandWindows (forgetRenderWindow keptId held) `shouldBe` [closerId, endingId]
+        renderDemandWindows (forgetRenderWindow keptId noRenderDemand) `shouldBe` []
+        case identities of
+          (first, second, third) → map windowLocalIdentity [first, second, third] `shouldBe` [1, 2, 3]
 
 -- ---------------------------------------------------------------------------
 -- The reported schedule

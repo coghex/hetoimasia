@@ -3057,10 +3057,11 @@ of two each offered within the two turns `ceiling (3 / 2)` allows, with the work
 beyond the budget keeping the schedule immediate; an acknowledgement of an older
 revision leaving the newer request pending and offering it again; four
 publications coalescing into one opportunity per turn with the window's state
-unchanged in size; removal on the caller's own list, at the first closing
-observation — asserted as the deletion of an entry the state held, beside an
-open window that keeps its own — on a terminal phase, and outright; an owed
-resume frame surviving three deferred turns whose frame schedule the caller
+unchanged in size; every way an entry leaves the state — dropped from the
+caller's list, reported closing, reported terminal, and forgotten outright —
+each asserted as the deletion of an entry that state held, from windows of one
+session observed open first and beside an open window that keeps its own; an
+owed resume frame surviving three deferred turns whose frame schedule the caller
 replaces each time; and a deadline this turn's own offer covers left out of the
 schedule while an unserved frame deadline beside it is reported. Two of them run the production scheduled loop: the worked composition
 above, asserting its exact simulation steps, per-window opportunities, schedules,
