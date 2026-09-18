@@ -21,8 +21,9 @@ kept here.
 | Vulkan binding | `vulkan-3.27` with `vulkan-utils-0.5.11.0` | `tools/toolchain/binding.pin` |
 | Binding flags | `+safe-foreign-calls`, `-darwin-lib-dirs` | `tools/toolchain/binding.pin` |
 
-Qualified by [#157](https://github.com/coghex/hetoimasia/issues/157). The
-qualification commit is named in [Evidence](#evidence) below.
+Qualified by [#157](https://github.com/coghex/hetoimasia/issues/157).
+[`toolchain/README.md`](toolchain/README.md) names the revision each piece of
+evidence was executed at, and every receipt names its own.
 
 These identities are synchronized by construction rather than by convention:
 `tools/ci-image/provision.sh` refuses to finish a toolchain layer whose

@@ -12,6 +12,11 @@ document; nothing here is transcribed by hand.
 | `binding-darwin.txt` | `tools/toolchain/qualify-binding.sh` output. |
 | `binding-darwin.cabal.project` | The resolution input that run generated, so it can be replayed. |
 
+Every receipt here was executed at commit **`1b2c0c5`**, and each names that
+revision itself in `executed_commit`. The only later commit is the one adding
+this evidence, which changes documentation alone, so nothing here is a stale
+result relabelled as a newly executed one.
+
 The receipts record their own `executed_commit`, `runner_os: Darwin`,
 `runner_arch: arm64`, and the toolchain map actually observed — GHC, Cabal, and
 the native GLFW manifest hash. They deliberately carry **no** `ci-image` entry:
