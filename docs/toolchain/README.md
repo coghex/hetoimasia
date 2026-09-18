@@ -66,23 +66,32 @@ active pins, bounds, fixtures, and current setup instructions must move, while
 accurately dated evidence and version-specific source citations must not,
 because rewriting those would misrepresent what was actually observed and when.
 
-Everything active moved. These tracked matches are retained deliberately:
-
-| Where | Why it stays |
-| --- | --- |
-| `docs/resource_ownership_design.md` | States the verification baseline the recorded probes ran on, and cites `base-4.21.0.0` API pages for behaviour observed there. |
-| `docs/resources.md`, `docs/runtime_foundation_design.md`, `docs/messaging_design.md` | Version-specific `base-4.21.0.0` and GHC 9.12.2 citations supporting behaviour claims probed on that compiler. |
-| `docs/glfw_integration_design.md`, `docs/lua_runtime_design.md` | Links into the GHC 9.12.2 and Cabal 3.16 documentation the design reasoned from. |
-| `docs/project_review_*.md` | Dated audit evidence naming the toolchain each review actually ran on. |
-| `docs/ci_validation_design.md` | The CI-2 row records the boundary settled at design time; it is a historical decision record, not current policy. `../toolchain.md` is the authority for the current baseline. |
-| `docs/vulkan_backend_design.md` | Records #146's former GHC 9.12.2 requirement, Synarchy's build plan (which genuinely still uses 9.12.2), and another project's 9.12.2 / `vulkan-3.26.6` precedent. |
-| `docs/history/` | History, by definition. |
-
-Re-run the audit with `git ls-files` rather than a filesystem walk, so build
-output and caches cannot appear as findings:
+Everything active moved. Run the audit with `git ls-files` rather than a
+filesystem walk, so build output and caches cannot appear as findings:
 
 ```bash
 git ls-files -z | xargs -0 grep -n '9\.12\.2\|3\.16\.1\.0\|base >=4\.21'
 ```
 
-Every match it reports should be in the table above.
+That command reports exactly these files, and every one is retained on purpose:
+
+| Where | Why it stays |
+| --- | --- |
+| `docs/toolchain.md` | The qualification record. It names the versions it replaced, and the ones Synarchy still uses, because that is what the record is for. |
+| `docs/toolchain/README.md` | This file, including the audit command and this table. |
+| `docs/resource_ownership_design.md` | States the verification baseline the recorded probes ran on. |
+| `docs/runtime_foundation_design.md`, `docs/messaging_design.md` | Behaviour claims probed on GHC 9.12.2, cited with the compiler they were observed on. |
+| `docs/glfw_integration_design.md`, `docs/lua_runtime_design.md` | Links into the GHC 9.12.2 and Cabal 3.16 documentation the design reasoned from. |
+| `docs/project_review_114-101.md`, `docs/project_review_122-119.md`, `docs/project_review_38-31.md`, `docs/project_review_46-43.md` | Dated audit evidence naming the toolchain each review actually ran on. |
+| `docs/ci_validation_design.md` | The CI-2 row records the boundary settled at design time; it is a historical decision record, not current policy. `../toolchain.md` is the authority for the current baseline. |
+| `docs/vulkan_backend_design.md` | Records #146's former GHC 9.12.2 requirement, Synarchy's build plan (which genuinely still uses 9.12.2), and another project's 9.12.2 / `vulkan-3.26.6` precedent. |
+| `docs/history/memory_before_2026-09-17.md` | History, by definition. |
+
+No tracked file outside `docs/` matches, which is the part that matters: every
+pin, bound, fixture, and current instruction moved.
+
+The patterns above are the ones the issue's acceptance named. Several design
+documents also cite `base-4.21.0.0` Hackage pages, which those patterns do not
+match; they are retained for the same reason as the rest — they cite the API as
+it was on the compiler the behaviour was observed on, and rewriting them would
+misdescribe the observation.
