@@ -3,18 +3,29 @@
 -- Every call into Lua is protected. Lua signals errors with @longjmp@, which
 -- cannot cross a Haskell frame, so an unprotected call that errors ends the
 -- process; @lua_pcall@ contains it and returns a status instead. The status is
--- classified, the error value is rendered under a bound without running further
--- Lua, and the result is an ordinary Haskell exception.
+-- classified, the error value is rendered under a bound, and the result is an
+-- ordinary Haskell exception.
+--
+-- The reporting path is held to the same rule as the call it reports on, which
+-- is the less obvious half. Once @lua_pcall@ has returned there is no protected
+-- frame left, so anything the diagnostic does that could raise a Lua error has
+-- nowhere for that error to go but Lua's panic function, which ends the
+-- process. That rules out more than it looks like: @luaL_ref@ can raise on a
+-- memory error, and @lua_tolstring@ allocates when it converts a number. So the
+-- bridge takes no registry reference at all, and reads a value only with
+-- accessors that cannot allocate.
 --
 -- Every operation restores the stack depth it entered at, on the faulting paths
--- as well as the successful one. The error value survives that restore in a
--- temporary registry reference, which is released before the operation returns.
+-- as well as the successful one.
 --
 -- A Haskell failure that reached a callback outranks whatever Lua reported.
 -- Lua may have caught the trampoline's error with @pcall@ and finished
 -- successfully; the boundary still re-raises the original Haskell exception,
 -- because the caller's code failed and no Lua construct is entitled to decide
--- otherwise.
+-- otherwise. Every path that can run Lua -- including the protected helpers
+-- that read a global through an @__index@ metamethod -- goes through that
+-- check, or a failure raised by one operation's callback would be raised by the
+-- next, unrelated one.
 module Hetoimasia.Scripting.Lua.Internal.Call
   ( -- * Chunk names
     ChunkName
@@ -25,6 +36,9 @@ module Hetoimasia.Scripting.Lua.Internal.Call
   , evalChunkWith
   , callGlobal
   , MessageHandler (..)
+    -- * Reporting
+  , reportFault
+  , classify
     -- * Globals
   , globalIsFunction
   ) where
@@ -63,7 +77,6 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
   , raiseEscape
   , withOpenVm
-  , withTemporaryReference
   )
 import Lua
   ( NumArgs (NumArgs)
@@ -74,20 +87,21 @@ import Lua
   , fromStackIndex
   , hslua_getglobal
   , lua_gettop
+  , lua_isinteger
   , lua_pcall
-  , lua_rawgeti
   , lua_settop
+  , lua_tointegerx
   , lua_tolstring
-  , lua_topointer
+  , lua_tonumberx
   , lua_type
   , lua_typename
   , luaL_loadbuffer
+  , data FALSE
   , data LUA_ERRERR
   , data LUA_ERRMEM
   , data LUA_ERRRUN
   , data LUA_ERRSYNTAX
   , data LUA_OK
-  , data LUA_REGISTRYINDEX
   , data LUA_TFUNCTION
   , data LUA_TNUMBER
   , data LUA_TSTRING
@@ -136,14 +150,14 @@ evalChunkWith vm handler name source =
   withOperationContext luaComponent evalOperation [("chunk", chunkNameText name)] $
     withOpenVm vm evalOperation $ \state → do
       entry ← lua_gettop state
-      handlerIndex ← pushHandler state entry handler
+      handlerIndex ← pushHandler vm state entry handler
       status ← loadChunk state name source
       if status /= LUA_OK
-        then fault vm state entry evalOperation (classify status) (chunkNameText name)
+        then reportFault vm state entry evalOperation (classify status) (chunkNameText name)
         else do
           called ← lua_pcall state (NumArgs 0) (NumResults 0) handlerIndex
           if called /= LUA_OK
-            then fault vm state entry evalOperation (classify called) (chunkNameText name)
+            then reportFault vm state entry evalOperation (classify called) (chunkNameText name)
             else do
               lua_settop state entry
               raiseEscape vm
@@ -155,15 +169,20 @@ callGlobal vm name =
   withOperationContext luaComponent callOperation [("global", name)] $
     withOpenVm vm callOperation $ \state → do
       entry ← lua_gettop state
-      isFunction ← pushGlobalFunction state name
-      if not isFunction
-        then do
+      found ← pushGlobalFunction state name
+      case found of
+        LookupFailed status →
+          reportFault vm state entry callOperation (classify status) name
+        LookupMissing → do
           lua_settop state entry
+          -- A metamethod may have run Haskell and failed without failing the
+          -- lookup itself; that failure is the caller's, not this one.
+          raiseEscape vm
           notAFunction callOperation CallFailed name
-        else do
+        LookupFunction → do
           called ← lua_pcall state (NumArgs 0) (NumResults 0) (StackIndex 0)
           if called /= LUA_OK
-            then fault vm state entry callOperation (classify called) name
+            then reportFault vm state entry callOperation (classify called) name
             else do
               lua_settop state entry
               raiseEscape vm
@@ -177,37 +196,60 @@ globalIsFunction vm name =
     entry ← lua_gettop state
     found ← pushGlobalFunction state name
     lua_settop state entry
-    pure found
+    raiseEscape vm
+    pure (found == LookupFunction)
 
 -- | Push the message handler, if there is one, and answer the stack index
 -- @lua_pcall@ should be given for it. Zero means no handler.
-pushHandler ∷ HasCallStack ⇒ State → StackIndex → MessageHandler → IO StackIndex
-pushHandler _ _ NoHandler = pure (StackIndex 0)
-pushHandler state entry (HandlerGlobal name) = do
-  isFunction ← pushGlobalFunction state name
-  if isFunction
-    then -- The handler sits directly above the entry depth, below the chunk.
-      pure (StackIndex (fromStackIndex entry + 1))
-    else do
+pushHandler
+  ∷ HasCallStack ⇒ Vm → State → StackIndex → MessageHandler → IO StackIndex
+pushHandler _ _ _ NoHandler = pure (StackIndex 0)
+pushHandler vm state entry (HandlerGlobal name) = do
+  found ← pushGlobalFunction state name
+  case found of
+    -- The handler sits directly above the entry depth, below the chunk.
+    LookupFunction → pure (StackIndex (fromStackIndex entry + 1))
+    LookupFailed status →
+      reportFault vm state entry evalOperation (classify status) name
+    LookupMissing → do
       lua_settop state entry
+      raiseEscape vm
       notAFunction evalOperation HandlerFailed name
 
--- | Push a global if it is a function, answering whether it was.
---
--- The global is read through the binding's protected getter, which cannot
--- raise a Lua error however the globals table is indexed. A global that is not
--- a function is left off the stack.
-pushGlobalFunction ∷ State → Text → IO Bool
+-- | What reading a global found.
+data GlobalLookup
+  = -- | The read itself failed, and left its error value on the stack.
+    --
+    -- The globals table can carry an @__index@ metamethod, so reading a global
+    -- can run arbitrary Lua, which can error or can call a Haskell function
+    -- that fails. Collapsing that into "not a function" would report the wrong
+    -- failure and leave the real one recorded for a later operation to raise.
+    LookupFailed !StatusCode
+  | -- | The read succeeded and the global is not a function. The stack is as
+    -- it was.
+    LookupMissing
+  | -- | The read succeeded and the function is on the stack.
+    LookupFunction
+  deriving (Eq, Show)
+
+-- | Read a global through the binding's protected getter, leaving it on the
+-- stack when it is a function and when the read failed.
+pushGlobalFunction ∷ State → Text → IO GlobalLookup
 pushGlobalFunction state name = do
   entry ← lua_gettop state
-  reached ←
+  (status, kind) ←
     ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
       alloca $ \reported → do
         poke reported LUA_OK
-        kind ← hslua_getglobal state bytes (fromIntegral len ∷ CSize) reported
+        found ← hslua_getglobal state bytes (fromIntegral len ∷ CSize) reported
         status ← peek reported
-        pure (status == LUA_OK && kind == LUA_TFUNCTION)
-  if reached then pure True else lua_settop state entry >> pure False
+        pure (status, found)
+  if status /= LUA_OK
+    then pure (LookupFailed status)
+    else
+      if kind == LUA_TFUNCTION
+        then pure LookupFunction
+        else lua_settop state entry >> pure LookupMissing
 
 -- | Report that a named global the caller relies on is not a callable
 -- function in this VM.
@@ -217,7 +259,7 @@ notAFunction name kind subject =
     luaComponent
     name
     [("global", subject)]
-    (LuaFault kind subject (ErrorOpaque "not-a-function" subject))
+    (LuaFault kind subject (ErrorOpaque "not-a-function"))
 
 -- | Load a chunk from memory. Nothing is read from disk.
 loadChunk ∷ State → ChunkName → ByteString → IO StatusCode
@@ -228,52 +270,60 @@ loadChunk state name source =
     withCString (Text.unpack ("=" <> chunkNameText name)) $ \label →
       luaL_loadbuffer state bytes (fromIntegral len ∷ CSize) label
 
--- | Report a failed Lua operation: restore the stack, render the error value
--- under a bound, and raise. An escaped Haskell failure is raised in its place.
-fault
+-- | Report a failed Lua operation: render what it left, restore the stack, and
+-- raise. An escaped Haskell failure is raised in its place.
+reportFault
   ∷ HasCallStack
   ⇒ Vm → State → StackIndex → Operation → FaultKind → Text → IO a
-fault vm state entry name kind subject = do
-  value ← withTemporaryReference vm $ \reference → do
-    -- The error value is in the registry now, so the stack can go back to the
-    -- depth this operation entered at before anything else happens.
-    lua_settop state entry
-    _ ← lua_rawgeti state LUA_REGISTRYINDEX (fromIntegral reference)
-    rendered ← renderErrorValue state
-    lua_settop state entry
-    pure rendered
+reportFault vm state entry name kind subject = do
+  value ← renderFailure state entry
+  lua_settop state entry
   raiseEscape vm
   throwFailure luaComponent name [("subject", subject)] (LuaFault kind subject value)
 
--- | Render the value on top of the stack without running any Lua.
+-- | Render what a failed call left above the depth it was given, running no Lua
+-- and using nothing that can raise one.
 --
--- @lua_tolstring@ converts a string or a number and answers @NULL@ for
--- everything else; it runs no @__tostring@ metamethod, which is the point.
--- Anything it declines is reported by type name and address.
-renderErrorValue ∷ State → IO ErrorValue
-renderErrorValue state = do
-  kind ← lua_type state index
-  if kind /= LUA_TSTRING && kind /= LUA_TNUMBER
-    then opaque kind
-    else alloca $ \reported → do
+-- Absence is read from the stack: an operation that left nothing above its
+-- entry depth left no error value, and no value's own contents are taken as
+-- evidence of that. @lua_tolstring@ is called only on something that is already
+-- a string, where it converts nothing and allocates nothing; a number is read
+-- with the non-allocating accessors and formatted here; anything else is named
+-- by its Lua type and nothing else.
+renderFailure ∷ State → StackIndex → IO ErrorValue
+renderFailure state entry = do
+  top ← lua_gettop state
+  if top <= entry
+    then pure ErrorAbsent
+    else do
+      kind ← lua_type state index
+      if kind == LUA_TSTRING
+        then readString
+        else
+          if kind == LUA_TNUMBER
+            then readNumber
+            else do
+              named ← lua_typename state kind >>= peekName
+              pure (ErrorOpaque named)
+  where
+    index = StackIndex (-1)
+    readString = alloca $ \reported → do
       bytes ← lua_tolstring state index reported
       if bytes == nullPtr
-        then opaque kind
+        then pure (ErrorOpaque "string")
         else do
           len ← peek reported
           let full = fromIntegral (len ∷ CSize) ∷ Int
               kept = min full diagnosticLimit
           taken ← ByteString.packCStringLen (bytes, kept)
           pure (ErrorMessage (Text.decodeUtf8Lenient taken) (full > diagnosticLimit))
-  where
-    index = StackIndex (-1)
-    opaque kind = do
-      named ← lua_typename state kind >>= peekName
-      address ← lua_topointer state index
-      pure $
-        if address == nullPtr
-          then ErrorAbsent
-          else ErrorOpaque named (Text.pack (show address))
+    readNumber = do
+      integral ← lua_isinteger state index
+      rendered ←
+        if integral /= FALSE
+          then Text.pack . show <$> lua_tointegerx state index nullPtr
+          else Text.pack . show <$> lua_tonumberx state index nullPtr
+      pure (ErrorMessage rendered False)
     peekName pointer
       | pointer == nullPtr = pure "unknown"
       | otherwise = Text.pack <$> peekCString pointer

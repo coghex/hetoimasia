@@ -123,6 +123,7 @@ spec = describe "opacity across the package boundary" $ do
                    , "defined global = called"
                    , "fault kind = CallFailed"
                    , "fault value = ErrorMessage \"raise:1: boom\" False"
+                   , "opaque value = ErrorOpaque \"boolean\""
                    , "closed = ()"
                    ]
 
@@ -228,6 +229,12 @@ publicClient =
     , "    Left fault → do"
     , "      putStrLn (\"fault kind = \" <> show (faultKind fault ∷ FaultKind))"
     , "      putStrLn (\"fault value = \" <> show (faultValue fault))"
+    , "  opaque ← try (evalChunk vm (chunkName \"opaque\") \"error(true)\")"
+    , "  case opaque ∷ Either LuaFault () of"
+    , "    Right () → putStrLn \"opaque value = none\""
+    , "    -- A native address would be reachable through this value if the"
+    , "    -- bridge put one in it. It names the Lua type and nothing else."
+    , "    Left fault → putStrLn (\"opaque value = \" <> show (faultValue fault))"
     , "  closeVm vm"
     , "  putStrLn \"closed = ()\""
     ]

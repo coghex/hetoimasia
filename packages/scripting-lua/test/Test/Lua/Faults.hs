@@ -35,6 +35,7 @@ import Hetoimasia.Scripting.Lua.Bridge
   , FaultKind (CallFailed, ChunkRejected, HandlerFailed)
   , Library (LibraryBase, LibraryString)
   , LuaFault (faultKind, faultValue)
+  , callGlobal
   , chunkName
   , evalChunk
   )
@@ -47,6 +48,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Fault (diagnosticLimit)
+import Hetoimasia.Scripting.Lua.Internal.Vm (stackDepth)
 import Test.Hspec
   ( Spec
   , describe
@@ -56,7 +58,13 @@ import Test.Hspec
   , shouldContain
   , shouldSatisfy
   )
-import Test.Lua.Support (newRecorder, recorded, recordingCallback, withVm)
+import Test.Lua.Support
+  ( newRecorder
+  , recorded
+  , recordingCallback
+  , referenceSlot
+  , withVm
+  )
 import Test.Support.Bounded (bounded)
 
 -- | The failure a callback raises when an example wants one.
@@ -184,7 +192,7 @@ spec = describe "faults" $ do
       case outcome of
         Right () → expectationFailure "the chunk succeeded"
         Left fault → case faultValue fault of
-          ErrorOpaque named _ → named `shouldBe` "table"
+          ErrorOpaque named → named `shouldBe` "table"
           other → expectationFailure ("the error value was " <> show other)
       -- The metamethod is arbitrary Lua on the error path. It did not run.
       recorded trace >>= (`shouldBe` [])
@@ -200,6 +208,108 @@ spec = describe "faults" $ do
             truncated `shouldBe` True
             Text.length message `shouldSatisfy` (<= diagnosticLimit)
           other → expectationFailure ("the error value was " <> show other)
+
+  it "names a non-string error value by its type and nothing else" $
+    withVm [LibraryBase] $ \vm → do
+      -- A boolean is a value, not an absence, and its rendering carries no
+      -- address: this type crosses the package boundary.
+      outcome ← try (evalChunk vm (chunkName "boolean") "error(true)")
+      case outcome of
+        Right () → expectationFailure "the chunk succeeded"
+        Left fault → faultValue fault `shouldBe` ErrorOpaque "boolean"
+      table ← try (evalChunk vm (chunkName "table") "error({})")
+      case table of
+        Right () → expectationFailure "the chunk succeeded"
+        Left fault → faultValue fault `shouldBe` ErrorOpaque "table"
+
+  it "reads a numeric error value without asking Lua to convert it" $
+    withVm [LibraryBase] $ \vm → do
+      slot ← referenceSlot vm
+      outcome ← try (evalChunk vm (chunkName "number") "error(0.1 + 0.2)")
+      case outcome of
+        Right () → expectationFailure "the chunk succeeded"
+        Left fault → case faultValue fault of
+          -- Lua's own number formatting would answer "0.3". This is Haskell's,
+          -- which is the observable difference between reading the number and
+          -- asking `lua_tolstring` to convert it -- and that conversion
+          -- allocates, so it can raise a memory error where there is no longer
+          -- a protected frame to catch it.
+          ErrorMessage rendered truncated → do
+            Text.unpack rendered `shouldBe` show (0.1 + 0.2 ∷ Double)
+            truncated `shouldBe` False
+          other → expectationFailure ("the error value was " <> show other)
+      -- And the report took no registry reference, which `luaL_ref` could have
+      -- raised on for the same reason.
+      referenceSlot vm >>= (`shouldBe` slot)
+
+  it "keeps a cancellation from stranding the stack of a call that faulted" $
+    withVm [LibraryBase] $ \vm → do
+      entered ← newEmptyMVar
+      released ← newEmptyMVar
+      raised ← newEmptyMVar
+      installCallback
+        vm
+        "wait"
+        (putMVar entered () >> takeMVar released >> pure NoResult)
+        (pure ())
+      before ← stackDepth vm
+      runner ←
+        forkIO $ do
+          outcome ← try @SomeException (evalChunk vm (chunkName "fault") "wait() error('boom')")
+          putMVar raised outcome
+      bounded (takeMVar entered)
+      _ ← forkIO (throwTo runner UserInterrupt)
+      putMVar released ()
+      outcome ← bounded (takeMVar raised)
+      case outcome of
+        Right () → expectationFailure "the chunk succeeded"
+        Left _ → pure ()
+      -- The cancellation arrives the instant the protected call returns. It
+      -- must not arrive between that and the stack being put back.
+      stackDepth vm >>= (`shouldBe` before)
+      evalChunk vm (chunkName "after") "local ignored = 1"
+      stackDepth vm >>= (`shouldBe` before)
+
+  it "keeps a cancellation from leaving a callback's failure for the next call" $
+    withVm [LibraryBase] $ \vm → do
+      entered ← newEmptyMVar
+      released ← newEmptyMVar
+      raised ← newEmptyMVar
+      installCallback vm "boom" (throwIO (CallbackBroke "stranded")) (pure ())
+      installCallback
+        vm
+        "wait"
+        (putMVar entered () >> takeMVar released >> pure NoResult)
+        (pure ())
+      runner ←
+        forkIO $ do
+          outcome ← try @SomeException (evalChunk vm (chunkName "strand") "pcall(boom) wait()")
+          putMVar raised outcome
+      bounded (takeMVar entered)
+      _ ← forkIO (throwTo runner UserInterrupt)
+      putMVar released ()
+      outcome ← bounded (takeMVar raised)
+      case outcome of
+        Right () → expectationFailure "the operation reported success"
+        Left _ → pure ()
+      -- Whichever of the two the cancelled operation raised, it took the
+      -- recorded failure with it. The next chunk is unrelated and succeeds.
+      evalChunk vm (chunkName "after") "local ignored = 1"
+
+  it "reports a callback that failed inside a globals metamethod as that failure" $
+    withVm [LibraryBase] $ \vm → do
+      installCallback vm "boom" (throwIO (CallbackBroke "through __index")) (pure ())
+      evalChunk
+        vm
+        (chunkName "trap")
+        "setmetatable(_G, {__index = function(table, key) return boom() end})"
+      outcome ← try @SomeException (callGlobal vm "anything")
+      case outcome of
+        Right () → expectationFailure "the call succeeded"
+        Left thrown →
+          fromException thrown `shouldBe` Just (CallbackBroke "through __index")
+      -- Not left behind for something unrelated to raise.
+      evalChunk vm (chunkName "after") "rawset(_G, 'ignored', 1)"
 
   it "classifies a message handler that fails as the handler's own failure" $
     withVm [LibraryBase] $ \vm → do

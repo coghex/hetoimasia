@@ -39,7 +39,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (Phase (Closed), vmPhase)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
 import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), runScoped)
 import Test.Support.Bounded (bounded)
 
@@ -147,6 +147,78 @@ spec = describe "close" $ do
     -- partial.
     closeVm vm
     readMVar releases >>= (`shouldBe` 1)
+
+  it "retains a callback's release even when publishing it was cancelled" $ do
+    vm ← newVm [LibraryBase]
+    releases ← newMVar (0 ∷ Int)
+    entered ← newEmptyMVar
+    released ← newEmptyMVar
+    raised ← newEmptyMVar
+    installCallback
+      vm
+      "hold"
+      (putMVar entered () >> takeMVar released >> pure NoResult)
+      (pure ())
+    -- Publishing a global now runs Haskell, and that Haskell can be paused.
+    evalChunk vm (chunkName "trap") "setmetatable(_G, {__newindex = function(t, k, v) hold() end})"
+    installer ←
+      forkIO $ do
+        outcome ←
+          try @SomeException
+            ( installCallback
+                vm
+                "later"
+                (pure NoResult)
+                (modifyMVar_ releases (pure . succ))
+            )
+        putMVar raised outcome
+    bounded (takeMVar entered)
+    _ ← forkIO (throwTo installer UserInterrupt)
+    putMVar released ()
+    _ ← bounded (takeMVar raised)
+    -- However that install ended, its borrowed dependency was retained before
+    -- anything was published, so the close still frees it exactly once.
+    closeVm vm
+    readMVar releases >>= (`shouldBe` 1)
+
+  it "reports a Haskell finalizer that failed while the interpreter closed" $ do
+    vm ← newVm [LibraryBase]
+    installCallback vm "boom" (throwIO (ReleaseBroke "the finalizer failed")) (pure ())
+    -- Lua marks a value for finalization when its metatable is set, so this
+    -- runs during lua_close.
+    evalChunk vm (chunkName "finalizer") "guard = setmetatable({}, {__gc = function() boom() end})"
+    outcome ← try @CloseFault (closeVm vm)
+    case outcome of
+      Right () → expectationFailure "the close reported success"
+      Left fault → case closeFailures fault of
+        [failed] → fromException failed `shouldBe` Just (ReleaseBroke "the finalizer failed")
+        other → expectationFailure ("the close reported " <> show (length other) <> " failures")
+
+  it "makes a second close wait for the teardown rather than report it done" $ do
+    vm ← newVm [LibraryBase]
+    order ← newMVar ([] ∷ [String])
+    let note entry = modifyMVar_ order (pure . (<> [entry]))
+    finalizing ← newEmptyMVar
+    release ← newEmptyMVar
+    firstDone ← newEmptyMVar
+    secondDone ← newEmptyMVar
+    installCallback
+      vm
+      "linger"
+      (putMVar finalizing () >> takeMVar release >> note "finalizer-left" >> pure NoResult)
+      (pure ())
+    evalChunk vm (chunkName "finalizer") "guard = setmetatable({}, {__gc = function() linger() end})"
+    _ ← forkIO (closeVm vm >> note "first-close" >> putMVar firstDone ())
+    bounded (takeMVar finalizing)
+    _ ← forkIO (closeVm vm >> note "second-close" >> putMVar secondDone ())
+    putMVar release ()
+    bounded (takeMVar firstDone)
+    bounded (takeMVar secondDone)
+    -- The second caller cannot report a finished close while the interpreter is
+    -- still running a finalizer that calls back into Haskell.
+    entries ← readMVar order
+    take 1 entries `shouldBe` ["finalizer-left"]
+    entries `shouldContain` ["second-close"]
 
   it "leaves a VM closed even when the chunk that ran last failed" $ do
     vm ← newVm [LibraryBase] ∷ IO Vm

@@ -43,13 +43,20 @@ luaComponent = unsafeComponent "scripting.lua"
 diagnosticLimit ∷ Int
 diagnosticLimit = 1024
 
--- | A Lua error value, rendered without running any Lua.
+-- | A Lua error value, rendered without running any Lua and without any
+-- operation that could raise one.
 data ErrorValue
   = -- | A string or number error value, and whether 'diagnosticLimit' cut it.
     ErrorMessage !Text !Bool
-  | -- | Any other value: its Lua type name and its address, nothing more.
-    ErrorOpaque !Text !Text
-  | -- | The call reported a failure but left no value behind.
+  | -- | Any other value, by its Lua type name alone.
+    --
+    -- Not its address. A pointer rendered into text is still the native
+    -- address of a Lua value, and this type crosses the package boundary.
+    ErrorOpaque !Text
+  | -- | The call reported a failure and left no value behind.
+    --
+    -- Read from the stack: the failing operation restored nothing above the
+    -- depth it entered at. It is never inferred from a value's contents.
     ErrorAbsent
   deriving (Eq, Show)
 

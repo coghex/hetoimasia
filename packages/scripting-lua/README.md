@@ -92,23 +92,57 @@ rediscover it.
 
 ### Which calls are safe, and which are not
 
-`lua_pcall`, `lua_load`, `lua_close`, `lua_gc`, and the binding's protected
-`hslua_*` ersatz functions are imported `safe`: they can run arbitrary Lua,
-which can call back into Haskell, and a `safe` call releases the capability for
-its duration. That is what lets other Haskell work and other VMs progress while
-one VM is running a chunk. The stack accessors — `lua_gettop`, `lua_settop`,
-`lua_type`, `lua_tolstring`, `lua_topointer` — are `unsafe` and O(1).
+Recorded per call, because grouping them gets it wrong. `lua-2.3.4` fixes some
+imports and leaves others to the `allow-unsafe-gc` flag, which this repository
+disables; under that setting the flagged ones are `safe`.
+
+| Import | Annotation | Used by |
+| --- | --- | --- |
+| `lua_pcall` | `safe`, fixed | every call into Lua |
+| `lua_close` | `safe`, fixed | the close |
+| `hslua_getglobal`, `hslua_setglobal` | `safe`, fixed | reading and publishing a global |
+| `luaL_loadbuffer` | `safe`, by the flag | loading a chunk |
+| `hslua_newhsfunction` (behind `hslua_pushhsfunction`), `hslua_extracthsfun` | `safe`, by the flag | installing and entering a callback |
+| `hslua_error` | `safe`, by the flag | the trampoline's stand-in error |
+| `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
+| `lua_tolstring` | `safe`, by the flag | reading a string error value |
+| `hsluaL_newstate`, `hsluaL_requiref` | `unsafe`, fixed | constructing a VM and opening a library |
+| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean` | `unsafe`, fixed | stack bookkeeping and rendering |
+
+The `safe` calls are what let other Haskell work and other VMs progress while
+one VM is running a chunk: a `safe` call releases the capability for its
+duration. That is the property the one-capability example in
+`Test.Lua.Hazard` exists to make falsifiable.
+
+Two of the `unsafe` ones are worth stating rather than listing.
+`hsluaL_requiref` runs Lua — it opens a standard library through an internal
+protected call — under an `unsafe` import. That is sound only because the
+`luaopen_*` functions are C and call no Haskell, so the call cannot re-enter the
+RTS; it would not be sound for a module opener written in Haskell, and LUA-3
+must not reuse this path for one. `hsluaL_newstate` allocates the interpreter
+and registers the Haskell-function metatable, and touches no Haskell either.
 
 `-allow-unsafe-gc` is **disabled**. With it on, every call that can trigger a
-collection is imported `unsafe`. This bridge pushes Haskell functions into Lua,
-and each one is a userdata whose `__gc` metamethod frees a stable pointer — so
-any VM that has ever held a callback re-enters the RTS from its collector. An
-`unsafe` import is not a context that may do that. Turning the flag off makes
-those calls `safe`. The cost is the `safe` foreign-call overhead on allocation
-paths, which this slice did not measure: it is a correctness setting, and a
-measurement belongs with the first workload that has a budget to weigh it
-against. The benefit is that Haskell finalizers remain available to LUA-2 and
-LUA-3 rather than being foreclosed here.
+collection — including `hslua_newhsfunction` and `lua_tolstring` above — is
+imported `unsafe`. This bridge pushes Haskell functions into Lua, and each one
+is a userdata whose `__gc` metamethod frees a stable pointer, so any VM that has
+ever held a callback re-enters the RTS from its collector. An `unsafe` import is
+not a context that may do that. Turning the flag off makes those calls `safe`.
+The cost is the `safe` foreign-call overhead on allocation paths, which this
+slice did not measure: it is a correctness setting, and a measurement belongs
+with the first workload that has a budget to weigh it against. The benefit is
+that Haskell finalizers remain available to LUA-2 and LUA-3 rather than being
+foreclosed here.
+
+Import safety is not the same question as whether a call can raise a Lua error,
+and the reporting path turns on the second. Once `lua_pcall` has returned there
+is no protected frame left, so a Lua error raised while building a diagnostic
+reaches Lua's panic function and ends the process. `luaL_ref` can raise on a
+memory error, and `lua_tolstring` allocates when it converts a number — so the
+bridge takes no registry reference at all, calls `lua_tolstring` only on a value
+that is already a string, and reads a number with the non-allocating accessors
+and formats it in Haskell. `Test.Lua.Faults` pins that: a numeric error value
+renders in Haskell's formatting, not Lua's, which is the observable difference.
 
 ### How callbacks re-enter
 
@@ -125,33 +159,48 @@ bearing:
 - The escape record has to live on the VM rather than on a thread, which is why
   `Vm` holds one.
 
+A globals table can carry `__index` and `__newindex` metamethods, so reading or
+publishing a global runs Lua too, and that Lua can call one of these callbacks.
+Every such path therefore reports the protected helper's own status and drains
+the escape record; collapsing a failed lookup into "not a function" would report
+the wrong failure and leave the real one for an unrelated later operation.
+
 ### Error and cancellation transport
 
 A Lua error inside a protected call is a status code, never an unwind: it is
 classified, its value is rendered under a bound, and it becomes a `LuaFault`.
-Rendering runs no Lua — `lua_tolstring` converts a string or a number and
-declines everything else, and a value it declines is reported by type name and
-address — so a failing chunk cannot keep executing through the report of its own
-failure, and a `__tostring` metamethod is never called.
+Rendering runs no Lua — a `__tostring` metamethod is never called — and reports
+a value that is neither a string nor a number by its Lua type alone. Not by its
+address: a pointer rendered into text is still a native address, and `LuaFault`
+crosses the package boundary. Absence is read from the stack depth, so a
+`false` error value is reported as a boolean rather than mistaken for nothing.
 
 A Haskell exception inside a callback never crosses the C frame. The trampoline
 catches it with the context it carried, records it on the VM, and raises an
 ordinary Lua error carrying a fixed message. Lua may catch that with `pcall` and
 finish the chunk successfully; the operation's boundary still re-raises the
 recorded exception, with its own type and context, and adds its operation to
-that context. The first escape of an operation is the one kept.
+that context. The first escape of an operation is the one kept, and an operation
+that leaves by any other exception takes the record with it.
 
 A cancellation aimed at the thread running a call is **not delivered while that
 thread is inside Lua**, because `lua_pcall` is a `safe` foreign call. It stays
 pending and is delivered once the call returns. It is never converted into an
 ordinary Lua error, and it is never swallowed.
 
+The instant it is delivered matters. Without care it lands between the protected
+call returning and the bookkeeping that follows — restoring the stack, taking
+the escape record — and leaves both for the next, unrelated operation. So an
+operation runs masked; the only interruptible point is waiting for a VM that is
+busy. Nothing is lost by that, because a thread inside Lua could not be
+cancelled anyway.
+
 ### Supported and rejected execution paths
 
 Supported:
 
 - One execution owner per VM, enforced by a gate rather than assumed. A second
-  thread's operation waits; an operation on a closed VM is refused.
+  thread's operation waits; an operation on a closing or closed VM is refused.
 - Several VMs in one process, each with its own globals, running concurrently.
 - Haskell work and a second VM progressing while one VM runs a long chunk.
 - Closing a VM whose last call failed; closing twice.
@@ -168,6 +217,9 @@ Rejected:
   `lua_pcall` or the binding's protected ersatz functions; an unprotected one
   that errors ends the process.
 - **Using a VM, or anything a callback borrowed, after the terminal close.**
+- **Taking a registry reference, or converting a number to a string, on a
+  reporting path.** Both can raise a Lua error where no protected frame is left
+  to catch it.
 
 ### Process-global state and thread affinity
 
@@ -185,20 +237,39 @@ Lua's default allocation function uses. The Lua interpreter holds no state
 shared between `lua_State`s, which is why two VMs share no globals.
 
 The suite runs with `-threaded -rtsopts -with-rtsopts=-N2`, and so does the
-`lua-hazard` executable. `-N2` rather than `-N`: the independent-progress
-example needs Haskell to run while a capability is inside a Lua computation, and
-the hazard needs one thread inside Lua and one observing it, on every machine
-that runs them.
+`lua-hazard` executable. `-N2` rather than `-N`, so every machine runs the same
+thing: the hazard needs one thread inside Lua and one observing it.
+
+The independent-progress proof runs `lua-hazard capability-release` with
+`+RTS -N1`, overriding that. One capability is what makes the claim falsifiable:
+a Haskell thread can run during a foreign call only if the call released the
+capability, so an `unsafe` import would leave the count taken at the end of the
+chunk's first pure-Lua block at zero. With two capabilities the same example
+passes either way. The in-process example in `Test.Lua.Independence` shows a
+second VM running to completion while the first VM's call is outstanding, which
+is deterministic but says nothing about capability release; it does not claim
+to.
 
 ## Lifetimes
 
-`closeVm` is terminal and runs once. The VM's phase becomes closed before
-`lua_close` is entered and the whole close is masked, so a cancellation arriving
-during it can neither release a callback's borrowed dependencies early nor leave
-a half-finished close for a later call to retry. Dependencies are released only
-after `lua_close` has returned, because until then Lua's finalizers are still
-running; every release is attempted and their failures are collected into one
-`CloseFault` rather than letting the first hide the rest.
+`closeVm` is terminal and runs once, and the VM's phase distinguishes *closing*
+from *closed*. The caller that finds it open runs the teardown holding the
+operation gate; the phase is `Closing` throughout, so an operation that arrives
+meanwhile is refused, and a second `closeVm` waits for that one teardown rather
+than being told the VM is closed while Lua is still running a finalizer. The
+teardown is masked, so a cancellation arriving during it can neither release a
+callback's borrowed dependencies early nor leave a half-finished close for a
+later call to retry.
+
+Dependencies are released only after `lua_close` has returned, because until then
+Lua's finalizers are still running. A callback's release is retained *before* the
+callback is published, so there is no ordering in which Lua can reach a callback
+whose release is not held; a publication that then fails leaves a release that
+runs at the close and frees something never used, which is the harmless
+direction of that pair. Every release is attempted, and their failures — together
+with any failure a Haskell finalizer raised while `lua_close` ran it, which
+belongs to no caller's operation and would otherwise be observed by nobody — are
+collected into one `CloseFault` rather than letting the first hide the rest.
 
 An unrestricted `lua_close` is deliberately **not** wired into
 `Hetoimasia.Foundation.Resource`'s `withResource`. The resource contract's

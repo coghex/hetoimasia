@@ -2,29 +2,43 @@
 -- every operation on it runs under.
 --
 -- One VM is one @lua_State@ with one execution owner. That ownership is
--- enforced by a gate rather than assumed: every operation takes the gate for
+-- enforced by a gate rather than assumed: every operation holds the gate for
 -- its duration, so two Haskell threads cannot be inside the same state at once,
--- and an operation asked of a closed VM is refused instead of reaching a freed
--- state.
+-- and an operation asked of a closing or closed VM is refused instead of
+-- reaching a state that is being or has been freed.
 --
--- Close is terminal and happens once. The gate is set to 'Closed' before
--- @lua_close@ runs and under a mask, so a cancellation delivered around the
--- close can neither retry a partially completed close nor reopen the VM, and a
--- second close is a no-op rather than a double free. Retained dependencies are
--- released only after @lua_close@ has returned, because the Lua finalizers it
--- runs -- including the @__gc@ that frees each pushed Haskell function's stable
+-- An operation runs masked. Not because anything in it blocks -- the only
+-- waiting it does is the @safe@ foreign call, which no asynchronous exception
+-- can interrupt anyway -- but because of the instant after that call returns. A
+-- cancellation that arrived while the thread was inside Lua is delivered at the
+-- first opportunity once it is out, and that opportunity falls between the call
+-- and the bookkeeping that follows it: restoring the stack, and taking the
+-- failure a callback recorded. Delivered there it would leave the stack deep
+-- and the failure behind for the next, unrelated operation to raise. Masking
+-- the operation moves the delivery to the boundary, after the bookkeeping. The
+-- gate is still taken interruptibly, so a caller waiting for a VM that is busy
+-- can be cancelled.
+--
+-- Close is terminal and happens once, and the phase says which of those two it
+-- is. It becomes 'Closing' before @lua_close@ is entered and 'Closed' only once
+-- the teardown has finished, and the one caller that runs the teardown holds
+-- the gate throughout; a second caller waits for it rather than being told the
+-- VM is closed while Lua is still running a finalizer. Retained dependencies
+-- are released after @lua_close@ has returned, because the finalizers it runs
+-- -- including the @__gc@ that frees each pushed Haskell function's stable
 -- pointer -- are still executing until it does.
 --
 -- A Haskell exception that reaches a callback is not thrown through the C
 -- frame. The trampoline records it here and signals an ordinary Lua error; the
--- outer boundary reads the record back and re-raises the original exception
--- with the context it was caught with, whatever Lua did with the error in
--- between. The first escape is the one kept: a later failure inside the same
--- operation never displaces the failure that started it.
+-- operation that was running reads the record back and re-raises the original
+-- exception with the context it was caught with, whatever Lua did with the
+-- error in between. The first escape is the one kept: a later failure inside
+-- the same operation never displaces the failure that started it. An escape
+-- from a finalizer during the close belongs to no operation, so the close
+-- drains it and reports it among the close's own failures.
 --
--- Nothing in this module is public. It holds the state, hands out stack
--- indices, and allocates registry references; the package's public library
--- exposes none of them.
+-- Nothing in this module is public. It holds the state and hands out stack
+-- indices; the package's public library exposes neither.
 module Hetoimasia.Scripting.Lua.Internal.Vm
   ( -- * The VM
     Vm
@@ -36,11 +50,9 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
+  , discardEscape
     -- * Retained dependencies
   , retainRelease
-    -- * Registry references
-  , withTemporaryReference
-  , outstandingReferences
     -- * Probes
   , vmState
   , vmPhase
@@ -48,9 +60,16 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , probeReferenceSlot
   ) where
 
-import Control.Concurrent.MVar (MVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.MVar
+  ( MVar
+  , newEmptyMVar
+  , newMVar
+  , putMVar
+  , readMVar
+  , takeMVar
+  )
 import Control.Exception
-  ( ExceptionWithContext
+  ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , mask
   , mask_
@@ -62,9 +81,8 @@ import Control.Exception
 import Control.Monad (unless)
 import Data.ByteString (useAsCString)
 import Data.Foldable (traverse_)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Foreign.C (CInt)
@@ -90,7 +108,8 @@ import Hetoimasia.Scripting.Lua.Internal.Library
   , libraryOpener
   )
 import Lua
-  ( State
+  ( StackIndex
+  , State
   , fromStackIndex
   , hsluaL_newstate
   , hsluaL_requiref
@@ -100,37 +119,45 @@ import Lua
   , lua_settop
   , luaL_ref
   , luaL_unref
+  , data FALSE
   , data LUA_OK
   , data LUA_REGISTRYINDEX
   , data TRUE
-  , data FALSE
   )
 
--- | Whether a VM still accepts operations.
-data Phase = Open | Closed
+-- | Whether a VM still accepts operations, and if not, why.
+data Phase
+  = Open
+  | -- | One caller is inside the teardown. Operations are refused and another
+    -- close waits; the VM is not yet closed.
+    Closing
+  | -- | The teardown has finished. Terminal.
+    Closed
   deriving (Eq, Show)
 
 -- | One Lua interpreter and everything the bridge owns beside it.
 data Vm = Vm
   { vmState ∷ !State
     -- ^ The interpreter. Reachable only from this package's bridge.
-  , vmGate ∷ !(MVar Phase)
-    -- ^ Held for the duration of every operation, and set to 'Closed' by the
-    -- one close that runs.
+  , vmGate ∷ !(MVar ())
+    -- ^ Held for the duration of every operation, and for the whole teardown.
+  , vmPhaseRef ∷ !(IORef Phase)
+    -- ^ Read under the gate. An 'IORef' rather than the gate's own contents so
+    -- that advancing it can never block or be interrupted.
   , vmEscape ∷ !(IORef (Maybe (ExceptionWithContext SomeException)))
-    -- ^ The first Haskell failure that reached a callback during the operation
-    -- in progress, waiting to be re-raised at the boundary.
+    -- ^ The first Haskell failure that reached a callback during whatever is
+    -- running, waiting to be re-raised by it.
   , vmReleases ∷ !(IORef [IO ()])
     -- ^ Dependencies the bridge retains for as long as Lua can call back into
     -- Haskell, released after @lua_close@ and never before.
-  , vmReferences ∷ !(IORef (Set CInt))
-    -- ^ The bridge's own outstanding temporary registry references. A
-    -- completed operation leaves this empty.
+  , vmFinished ∷ !(MVar ())
+    -- ^ Filled once, when the teardown has completed. What a second close
+    -- waits on.
   }
 
 -- | The interpreter's current phase.
 vmPhase ∷ Vm → IO Phase
-vmPhase = readMVar . vmGate
+vmPhase = readIORef . vmPhaseRef
 
 -- | The interpreter's current stack depth.
 --
@@ -138,6 +165,23 @@ vmPhase = readMVar . vmGate
 -- entered at, and this is how that is observed.
 stackDepth ∷ Vm → IO Int
 stackDepth vm = fromIntegral . fromStackIndex <$> lua_gettop (vmState vm)
+
+-- | Which registry slot a temporary reference would take right now.
+--
+-- A probe for this package's own fixtures. The registry keeps released slots on
+-- a free list and hands the most recently released one back first, so taking a
+-- reference before an operation and again after it answers the same slot only
+-- if the operation left the registry as it found it. The bridge itself takes no
+-- registry reference at all, so the answer should never move.
+probeReferenceSlot ∷ Vm → IO CInt
+probeReferenceSlot vm = do
+  let state = vmState vm
+  entry ← lua_gettop state
+  lua_pushboolean state FALSE
+  reference ← luaL_ref state LUA_REGISTRYINDEX
+  luaL_unref state LUA_REGISTRYINDEX reference
+  lua_settop state entry
+  pure reference
 
 -- | Create a VM and open exactly the named standard libraries, in order.
 --
@@ -150,11 +194,12 @@ stackDepth vm = fromIntegral . fromStackIndex <$> lua_gettop (vmState vm)
 newVm ∷ [Library] → IO Vm
 newVm libraries = mask_ $ do
   state ← hsluaL_newstate
-  gate ← newMVar Open
+  gate ← newMVar ()
+  phase ← newIORef Open
   escape ← newIORef Nothing
   releases ← newIORef []
-  references ← newIORef Set.empty
-  let vm = Vm state gate escape releases references
+  finished ← newEmptyMVar
+  let vm = Vm state gate phase escape releases finished
   opened ← try (traverse_ (openLibrary state) libraries)
   case opened of
     Right () → pure vm
@@ -185,43 +230,81 @@ openLibrary state library = do
 
 -- | Run one operation on an open VM, holding the gate for its duration.
 --
--- The gate is released on every exit path, including a cancellation, so a
--- failed or interrupted operation never strands the VM.
+-- Masked throughout, for the reason this module's header gives. The gate is
+-- released on every exit path, and an operation that leaves by an exception
+-- leaves the stack at the depth it entered at and no recorded callback failure
+-- behind for the next one.
 withOpenVm ∷ Vm → Operation → (State → IO a) → IO a
-withOpenVm vm name body = mask $ \restore → do
-  phase ← takeMVar (vmGate vm)
+withOpenVm vm name body = mask_ $ do
+  -- Interruptible, and deliberately the only interruptible point: a caller
+  -- waiting for a VM that is busy may still be cancelled.
+  takeMVar (vmGate vm)
+  phase ← readIORef (vmPhaseRef vm)
   case phase of
-    Closed → do
-      putMVar (vmGate vm) Closed
-      throwFailure luaComponent name [] (VmClosed (operationText name))
     Open → do
-      result ← restore (body (vmState vm)) `onException` putMVar (vmGate vm) Open
-      putMVar (vmGate vm) Open
+      let state = vmState vm
+      entry ← lua_gettop state
+      result ← body state `onException` abandon vm entry
+      putMVar (vmGate vm) ()
       pure result
+    _ → do
+      putMVar (vmGate vm) ()
+      throwFailure luaComponent name [] (VmClosed (operationText name))
+
+-- | Leave an operation that failed with the VM as the next one should find it.
+abandon ∷ Vm → StackIndex → IO ()
+abandon vm entry = do
+  lua_settop (vmState vm) entry
+  discardEscape vm
+  putMVar (vmGate vm) ()
 
 -- | Close the VM, once and for good.
 --
--- The phase becomes 'Closed' before @lua_close@ is entered and the whole close
--- runs masked, so repeated cancellation can neither release the retained
--- dependencies early nor cause a partially completed close to be retried. The
--- dependencies are released after @lua_close@ has returned, because until then
--- Lua's finalizers may still be running. Every release is attempted; their
--- failures are collected into one 'CloseFault' rather than letting the first
--- one hide the rest.
+-- The caller that finds it open runs the teardown holding the gate; any other
+-- caller waits for that one to finish rather than being told the VM is closed
+-- while Lua is still inside it. The phase is 'Closing' throughout, so an
+-- operation that arrives meanwhile is refused.
+--
+-- The teardown itself is masked. Repeated cancellation can therefore neither
+-- release the retained dependencies early nor leave a partially completed close
+-- for a later call to start again.
 closeVm ∷ Vm → IO ()
-closeVm vm = mask_ $ do
-  phase ← takeMVar (vmGate vm)
+closeVm vm = mask $ \restore → do
+  takeMVar (vmGate vm)
+  phase ← readIORef (vmPhaseRef vm)
   case phase of
-    Closed → putMVar (vmGate vm) Closed
     Open → do
-      -- Terminal before the close begins, so nothing that arrives during it
-      -- can observe an open VM or start the close again.
-      putMVar (vmGate vm) Closed
-      lua_close (vmState vm)
-      releases ← atomicModifyIORef' (vmReleases vm) (\retained → ([], retained))
-      outcomes ← traverse (try @SomeException) (reverse releases)
-      let failures = [failure | Left failure ← outcomes]
-      unless (null failures) (throwIO (CloseFault failures))
+      writeIORef (vmPhaseRef vm) Closing
+      outcome ← try (teardown vm)
+      writeIORef (vmPhaseRef vm) Closed
+      putMVar (vmFinished vm) ()
+      putMVar (vmGate vm) ()
+      either throwIO pure (outcome ∷ Either SomeException ())
+    _ → do
+      putMVar (vmGate vm) ()
+      -- Interruptible: waiting for someone else's teardown is a wait, and a
+      -- cancelled caller is entitled to stop waiting. The teardown itself is
+      -- unaffected.
+      restore (readMVar (vmFinished vm))
+
+-- | Close the interpreter, then release what its callbacks borrowed.
+--
+-- Every release is attempted; their failures, and any failure a Haskell
+-- finalizer raised while @lua_close@ ran it, are collected into one
+-- 'CloseFault' rather than letting the first one hide the rest. A finalizer's
+-- failure belongs to no caller's operation, so nothing else would ever observe
+-- it.
+teardown ∷ Vm → IO ()
+teardown vm = do
+  lua_close (vmState vm)
+  escaped ← takeEscape vm
+  releases ← atomicModifyIORef' (vmReleases vm) (\retained → ([], retained))
+  outcomes ← traverse (try @SomeException) (reverse releases)
+  let finalizerFailures =
+        [failure | ExceptionWithContext _ failure ← maybeToList escaped]
+      releaseFailures = [failure | Left failure ← outcomes]
+      failures = finalizerFailures <> releaseFailures
+  unless (null failures) (throwIO (CloseFault failures))
 
 -- | Retain a dependency's release until after the VM's terminal close.
 --
@@ -242,6 +325,17 @@ recordEscape vm captured =
     (vmEscape vm)
     (\held → (maybe (Just captured) Just held, ()))
 
+-- | Take the recorded failure, leaving none.
+takeEscape ∷ Vm → IO (Maybe (ExceptionWithContext SomeException))
+takeEscape vm = atomicModifyIORef' (vmEscape vm) (\held → (Nothing, held))
+
+-- | Drop the recorded failure without raising it.
+--
+-- For an operation that is already leaving by another exception: the failure it
+-- would have raised is owed to that operation and to no later one.
+discardEscape ∷ Vm → IO ()
+discardEscape vm = () <$ takeEscape vm
+
 -- | Re-raise the recorded Haskell failure, if a callback had one.
 --
 -- The exception keeps its own type and the context it was caught with; the
@@ -250,48 +344,10 @@ recordEscape vm captured =
 -- signalled is irrelevant here: a @pcall@ that swallowed it and a chunk that
 -- went on to succeed both still arrive at this.
 raiseEscape ∷ Vm → IO ()
-raiseEscape vm = do
-  held ← atomicModifyIORef' (vmEscape vm) (\held → (Nothing, held))
-  traverse_ rethrowIO held
-
--- | The bridge's outstanding temporary registry references.
---
--- Empty after every completed operation, including the ones that faulted.
-outstandingReferences ∷ Vm → IO (Set CInt)
-outstandingReferences = readIORef . vmReferences
-
--- | Move the value at the top of the stack into the registry for the duration
--- of an action, and release the reference on every exit path.
---
--- This is how the bridge reads a fault's error value after restoring the stack
--- to the depth the operation entered at: the value survives the restore, and
--- the slot it occupied goes back to the registry's free list whether the action
--- returns, fails, or is cancelled.
-withTemporaryReference ∷ Vm → (CInt → IO a) → IO a
-withTemporaryReference vm use = mask $ \restore → do
-  reference ← luaL_ref (vmState vm) LUA_REGISTRYINDEX
-  atomicModifyIORef' (vmReferences vm) (\held → (Set.insert reference held, ()))
-  let release = do
-        luaL_unref (vmState vm) LUA_REGISTRYINDEX reference
-        atomicModifyIORef' (vmReferences vm) (\held → (Set.delete reference held, ()))
-  result ← restore (use reference) `onException` release
-  release
-  pure result
+raiseEscape vm = takeEscape vm >>= traverse_ rethrowIO
 
 openOperation ∷ Operation
 openOperation = operation "open-library"
 
 showText ∷ Show a ⇒ a → Text
 showText = Text.pack . show
-
--- | Which registry slot a temporary reference would take right now.
---
--- A probe for this package's own fixtures. The registry keeps released slots on
--- a free list and hands the most recently released one back first, so taking a
--- reference before an operation and again after it answers the same slot only
--- if the operation released everything it took. It leaves the stack and the
--- registry exactly as it found them.
-probeReferenceSlot ∷ Vm → IO CInt
-probeReferenceSlot vm = do
-  lua_pushboolean (vmState vm) FALSE
-  withTemporaryReference vm pure

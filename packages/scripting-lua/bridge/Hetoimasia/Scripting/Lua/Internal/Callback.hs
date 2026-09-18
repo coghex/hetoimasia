@@ -23,7 +23,11 @@
 --
 -- A callback borrows whatever Haskell state it closes over. Its release is
 -- retained on the VM and run only after the terminal close, because until
--- @lua_close@ returns Lua can still call it.
+-- @lua_close@ returns Lua can still call it. It is retained /before/ the
+-- callback is published, so there is no ordering in which Lua can reach a
+-- callback whose release is not held: a publication that then fails leaves a
+-- release that runs at the close and frees something that was never used, which
+-- is the harmless direction of that pair.
 module Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (..)
   , Callback
@@ -40,15 +44,12 @@ import Foreign.C (CSize)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Storable (peek, poke)
 import GHC.Stack (HasCallStack)
-import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
-import Hetoimasia.Scripting.Lua.Internal.Fault
-  ( ErrorValue (ErrorOpaque)
-  , FaultKind (CallFailed)
-  , LuaFault (LuaFault)
-  , luaComponent
-  )
+import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
+import Hetoimasia.Scripting.Lua.Internal.Call (classify, reportFault)
+import Hetoimasia.Scripting.Lua.Internal.Fault (luaComponent)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
+  , raiseEscape
   , recordEscape
   , retainRelease
   , withOpenVm
@@ -95,24 +96,25 @@ escapeMessage = "hetoimasia: a Haskell callback failed; see the Haskell boundary
 -- after the VM's terminal close, never while Lua could still call back.
 installCallback ∷ HasCallStack ⇒ Vm → Text → Callback → IO () → IO ()
 installCallback vm name action release =
-  withOpenVm vm installOperation $ \state → do
-    entry ← lua_gettop state
-    hslua_pushhsfunction state (trampoline vm action)
-    status ←
-      ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
-        alloca $ \reported → do
-          poke reported LUA_OK
-          hslua_setglobal state bytes (fromIntegral len ∷ CSize) reported
-          peek reported
-    lua_settop state entry
-    if status == LUA_OK
-      then retainRelease vm release
-      else
-        throwFailure
-          luaComponent
-          installOperation
-          [("global", name)]
-          (LuaFault CallFailed name (ErrorOpaque "globals-rejected-the-name" name))
+  withOperationContext luaComponent installOperation [("global", name)] $
+    withOpenVm vm installOperation $ \state → do
+      entry ← lua_gettop state
+      retainRelease vm release
+      hslua_pushhsfunction state (trampoline vm action)
+      status ←
+        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
+          alloca $ \reported → do
+            poke reported LUA_OK
+            hslua_setglobal state bytes (fromIntegral len ∷ CSize) reported
+            peek reported
+      if status /= LUA_OK
+        then reportFault vm state entry installOperation (classify status) name
+        else do
+          lua_settop state entry
+          -- The globals table can carry a @__newindex@ metamethod, so
+          -- publishing a global can run Lua, which can call a Haskell function
+          -- that fails.
+          raiseEscape vm
 
 -- | The C-callable wrapper around one Haskell operation.
 --

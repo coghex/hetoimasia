@@ -24,12 +24,10 @@ module Test.Lua.Support
   , recorded
     -- * Bridge bookkeeping
   , referenceSlot
-  , noOutstandingReferences
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (SomeException, bracket, mask, try)
-import qualified Data.Set as Set
 import Data.Text (Text)
 import Foreign.C (CInt)
 import Hetoimasia.Scripting.Lua.Bridge (Library, Vm, closeVm, newVm)
@@ -37,11 +35,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (NoResult)
   , installCallback
   )
-import Hetoimasia.Scripting.Lua.Internal.Vm
-  ( outstandingReferences
-  , probeReferenceSlot
-  )
-import Test.Hspec (Expectation, shouldBe)
+import Hetoimasia.Scripting.Lua.Internal.Vm (probeReferenceSlot)
 
 -- | Run a body over a VM and close it afterwards.
 --
@@ -89,12 +83,12 @@ recordingCallback vm (Recorder slot) name =
     (pure ())
 
 -- | The registry slot a temporary reference would take right now.
+--
+-- The bridge takes no registry reference of its own, so this answers the same
+-- slot before and after every operation. A move would mean it had left one
+-- behind.
 referenceSlot ∷ Vm → IO CInt
 referenceSlot = probeReferenceSlot
-
--- | Assert that the bridge holds no temporary registry reference.
-noOutstandingReferences ∷ Vm → Expectation
-noOutstandingReferences vm = outstandingReferences vm >>= (`shouldBe` Set.empty)
 
 -- | Read a recorder.
 recorded ∷ Recorder → IO [Text]

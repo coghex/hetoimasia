@@ -25,11 +25,7 @@ import Hetoimasia.Scripting.Lua.Internal.Call (globalIsFunction)
 import Hetoimasia.Scripting.Lua.Internal.Callback (installCallback)
 import Hetoimasia.Scripting.Lua.Internal.Vm (stackDepth)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
-import Test.Lua.Support
-  ( noOutstandingReferences
-  , referenceSlot
-  , withVm
-  )
+import Test.Lua.Support (referenceSlot, withVm)
 
 newtype DisciplineBroke = DisciplineBroke String
   deriving (Eq, Show)
@@ -41,9 +37,10 @@ spec = describe "discipline" $ do
   it "restores the entry stack depth after a chunk that succeeded" $
     withVm [LibraryBase] $ \vm → do
       before ← stackDepth vm
+      slot ← referenceSlot vm
       evalChunk vm (chunkName "ok") "local value = 1 + 1"
       stackDepth vm >>= (`shouldBe` before)
-      noOutstandingReferences vm
+      referenceSlot vm >>= (`shouldBe` slot)
 
   it "restores the entry stack depth and the registry slot after a Lua fault" $
     withVm [LibraryBase] $ \vm → do
@@ -54,10 +51,10 @@ spec = describe "discipline" $ do
         Right () → expectationFailure "the chunk succeeded"
         Left _ → pure ()
       stackDepth vm >>= (`shouldBe` before)
-      -- The bridge took a temporary reference to read the error value after
-      -- restoring the stack, and gave the slot back.
+      -- The bridge reports a fault without taking a registry reference at all,
+      -- because `luaL_ref` can raise a memory error where no protected frame
+      -- is left to catch it. The registry is therefore exactly as it was.
       referenceSlot vm >>= (`shouldBe` slot)
-      noOutstandingReferences vm
 
   it "restores the entry stack depth after a callback's exception escaped" $
     withVm [LibraryBase] $ \vm → do
@@ -70,7 +67,6 @@ spec = describe "discipline" $ do
         Left _ → pure ()
       stackDepth vm >>= (`shouldBe` before)
       referenceSlot vm >>= (`shouldBe` slot)
-      noOutstandingReferences vm
 
   it "stays balanced across repeated loads and calls" $
     withVm [LibraryBase] $ \vm → do
@@ -86,7 +82,6 @@ spec = describe "discipline" $ do
         [1 .. 20]
       stackDepth vm >>= (`shouldBe` before)
       referenceSlot vm >>= (`shouldBe` slot)
-      noOutstandingReferences vm
 
   it "keeps the VM state a chunk intentionally left behind" $
     withVm [LibraryBase] $ \vm → do
@@ -96,4 +91,3 @@ spec = describe "discipline" $ do
       -- chunk defined is exactly what running it was for, and it is still here.
       globalIsFunction vm "retained" >>= (`shouldBe` True)
       stackDepth vm >>= (`shouldBe` before)
-      noOutstandingReferences vm
