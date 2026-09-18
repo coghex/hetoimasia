@@ -32,7 +32,8 @@
 -- this precedence:
 --
 -- 1. a window whose phase is 'WindowClosing' or terminal is 'RenderExcluded':
---    it has no normal render demand at all;
+--    it has no normal render demand at all, and a turn shown such an
+--    observation removes that window's scheduling state rather than keeping it;
 -- 2. otherwise a /known/ suspending condition — @'Observed' False@ for visible,
 --    @'Observed' True@ for iconified, or an @'Observed'@ framebuffer extent
 --    with a zero dimension — makes it 'RenderSuspended', even when another
@@ -89,8 +90,9 @@
 -- turns and a window that is dirty every turn cannot starve another.
 --
 -- Eligible due work left beyond the budget keeps the next schedule
--- 'UpdateImmediately'; work that was offered does not by itself, so a caller
--- that serves its offers returns to ordinary waiting.
+-- 'UpdateImmediately'; work that was offered does not by itself, and neither
+-- does a deadline that offer already covers, so a caller that serves its offers
+-- returns to ordinary waiting rather than to a wake for work it has done.
 --
 -- 'acknowledgeRender' records the revision an opportunity served. Demand
 -- published after that revision has already been folded in under a newer one
@@ -100,11 +102,14 @@
 --
 -- = Removal
 --
--- A window the caller stops listing — because its slot closed with it, or
--- because the host no longer holds it — is removed from the state by the next
--- turn, as is one whose observation reports a terminal phase.
--- 'forgetRenderWindow' removes one outright. The state therefore never holds an
--- entry for a window the host no longer holds.
+-- A window the caller stops listing — because the host no longer holds it — is
+-- removed from the state by the next turn, as is one whose observation reports
+-- any phase but 'WindowOpen'. A window's demand slot closes in the same
+-- transaction that publishes 'WindowClosing', so the first closing observation
+-- is the last thing the helper can learn about it and its state goes then,
+-- rather than lingering until the window is released. 'forgetRenderWindow'
+-- removes one outright. The state therefore never holds an entry for a window
+-- whose slot has closed or that the host no longer holds.
 --
 -- See @docs\/glfw.md@, \"Render demand\", for the same contract in prose, and
 -- @docs\/runtime_scheduling_design.md@ P-5 for the design it implements.
@@ -178,8 +183,9 @@ data RenderEligibility
     -- Rendering waits for a usable extent; this is not suspension, so becoming
     -- drawable owes no resume frame of its own.
   | RenderExcluded
-    -- ^ Closing or ended: no normal render demand. Retirement is the owner
-    -- loop's and is never gated here.
+    -- ^ Closing or ended: no normal render demand, and its scheduling state is
+    -- removed by the turn that sees it. Retirement is the owner loop's and is
+    -- never gated here.
   deriving (Eq, Show)
 
 -- | Classify one observation. This reads the observation and nothing else, so
@@ -201,12 +207,15 @@ windowRenderEligibility observation
       WindowDisposalFailed → True
       WindowReleaseUncertain → True
 
--- | Whether a phase removes the window's scheduling state outright, rather than
--- merely excluding it from rendering.
-terminalPhase ∷ WindowPhase → Bool
-terminalPhase = \case
+-- | Whether a phase removes the window's scheduling state. Every phase but
+-- 'WindowOpen' does: a window's demand slot closes in the same transaction that
+-- publishes 'WindowClosing', so from that observation onward there is nothing
+-- left to capture for it and nothing it could be offered. Its retirement is the
+-- owner loop's and needs nothing from here.
+retiringPhase ∷ WindowPhase → Bool
+retiringPhase = \case
   WindowOpen → False
-  WindowClosing → False
+  WindowClosing → True
   WindowReleased → True
   WindowDisposalFailed → True
   WindowReleaseUncertain → True
@@ -353,9 +362,9 @@ data RenderResult = RenderResult
   , renderSchedule ∷ !UpdateSchedule
     -- ^ What the loop should continue with: 'UpdateImmediately' when eligible
     -- due work is still owed beyond the budget or the simulation wants a turn
-    -- now, 'UpdateBy' the earliest deadline anything eligible still holds, and
-    -- 'NoUpdateDemand' when nothing is owed at all, so the loop waits its
-    -- fallback bound.
+    -- now, 'UpdateBy' the earliest deadline anything eligible still holds that
+    -- this turn's offers do not already serve, and 'NoUpdateDemand' when
+    -- nothing is owed at all, so the loop waits its fallback bound.
   }
   deriving (Eq, Show)
 
@@ -387,7 +396,7 @@ renderTurn (RenderBudget allowance) turn state = (result, RenderDemand kept curs
                   freshWindowRenderState
                   (observedWindow observation)
                   (demandWindows state)
-        , not (terminalPhase (observedPhase observation))
+        , not (retiringPhase (observedPhase observation))
         ]
 
     kept = Map.map snd inspected
@@ -418,12 +427,20 @@ renderTurn (RenderBudget allowance) turn state = (result, RenderDemand kept curs
       [] → demandCursor state
       _ → Just (last offering)
 
-    -- A deadline still in the future is reported whether or not its window was
-    -- offered: waking too early is an ordinary turn, and never waking is not.
+    -- Only deadlines still in the future, and only the ones this turn's offers
+    -- do not already serve. An offer covers the window's whole pending request,
+    -- including a deadline that had not been reached, so reporting that
+    -- deadline as well would wake the loop for work it had just handed out. A
+    -- frame deadline the offer did not serve, because it was not yet due, is
+    -- still owed and is still reported.
     upcoming =
       [ due
-      | (_, (RenderEligible, window)) ← Map.toAscList inspected
-      , due ← catMaybes [windowDeadlinePending window, windowFrameDue window]
+      | (target, (RenderEligible, window)) ← Map.toAscList inspected
+      , due ←
+          catMaybes
+            [ if target `elem` offering then Nothing else windowDeadlinePending window
+            , windowFrameDue window
+            ]
       , not (deadlineReached now due)
       ]
 

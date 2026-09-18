@@ -2504,7 +2504,8 @@ retires closing windows exactly as it did before.
 `WindowObservation` and nothing else, in this precedence:
 
 1. a window whose [phase](#lifecycle-phases) is `WindowClosing` or terminal is
-   `RenderExcluded`, with no normal render demand at all;
+   `RenderExcluded`, with no normal render demand at all, and the turn shown
+   that observation removes its scheduling state;
 2. otherwise a *known* suspending condition — `Observed False` for visible,
    `Observed True` for iconified, or an `Observed` framebuffer extent with a zero
    dimension — makes it `RenderSuspended`, even when another field is
@@ -2558,7 +2559,11 @@ eligible pending windows and a budget of `b` every one of them is offered within
 `ceiling (n / b)` turns, and a window dirty on every turn cannot starve another.
 Rendering is the caller's; the helper only offers. Eligible due work left beyond
 the budget keeps the next schedule `UpdateImmediately`; work that was offered
-does not by itself, so a caller that serves its offers returns to waiting.
+does not by itself, and neither does a deadline that offer already covers, so a
+caller that serves its offers returns to waiting rather than to a wake for work
+it has done. An offer covers the window's whole pending request, its deadline
+included; a frame deadline the offer did not serve, because it was not yet due,
+is still owed and is still reported.
 
 **Acknowledgement is by revision.** `acknowledgeRender` records the revision an
 opportunity served. A publication that arrived after it has been folded in under
@@ -2567,12 +2572,16 @@ newer request, and it is offered again; repeated dirtiness between two
 opportunities coalesces into one, so no backlog of obsolete frames accumulates.
 A frame obligation is cleared only when it is still the one the offer carried.
 
-**Removal is the caller's list.** A window left out of a turn's `renderLive` —
-because its slot closed with it, or because the host no longer holds it — is
-removed, as is one whose observation reports a terminal phase.
-`forgetRenderWindow` removes one outright. The state therefore never holds an
-entry for a window the host no longer holds, and a window's entry costs the same
-however many publications it coalesced.
+**Removal is the caller's list, and the window's own phase.** A window left out
+of a turn's `renderLive`, because the host no longer holds it, is removed, as is
+one whose observation reports any phase but `WindowOpen`. A window's
+[demand slot](#demand-slots) closes in the same transaction that publishes
+`WindowClosing`, so the first closing observation is the last thing the helper
+can learn about that window and its state goes then, rather than lingering until
+release. `forgetRenderWindow` removes one outright. The state therefore never
+holds an entry for a window whose slot has closed or that the host no longer
+holds, and a window's entry costs the same however many publications it
+coalesced.
 
 **The reference composition.** `Test.GLFW.Render`'s composition example is the
 worked one to copy: it runs `runScheduledOwnerLoop`, a fixed-step
@@ -3040,8 +3049,10 @@ of two each offered within the two turns `ceiling (3 / 2)` allows, with the work
 beyond the budget keeping the schedule immediate; an acknowledgement of an older
 revision leaving the newer request pending and offering it again; four
 publications coalescing into one opportunity per turn with the window's state
-unchanged in size; and removal on the caller's own list, on a terminal phase, and
-outright. Two of them run the production scheduled loop: the worked composition
+unchanged in size; removal on the caller's own list, at the first closing
+observation, on a terminal phase, and outright; and a deadline this turn's own
+offer covers left out of the schedule while an unserved frame deadline beside it
+is reported. Two of them run the production scheduled loop: the worked composition
 above, asserting its exact simulation steps, per-window opportunities, schedules,
 and waits, and a suspended window whose captured demand still leaves the next
 turn its whole fallback bound.

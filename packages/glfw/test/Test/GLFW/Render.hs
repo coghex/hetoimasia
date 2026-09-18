@@ -128,8 +128,12 @@ spec = describe "GLFW render demand" $ do
       testCoalescing
 
   describe "state removal" $
-    it "deletes a window's state when the host stops holding it and when its phase is terminal"
+    it "deletes a window's state when its slot closes with it, when its phase is terminal, and on request"
       testRemoval
+
+  describe "the reported schedule" $
+    it "reports no deadline for work this turn's own offer already covers, and keeps one it does not"
+      testOfferedDeadlineIsNotReported
 
   describe "the scheduled composition" $ do
     it "runs the scheduled loop, a fixed-step policy, and two windows with independent deadlines and dirtiness"
@@ -224,7 +228,9 @@ testSuspensionRetainsWithoutSpinning = withScripted 1 $ \reports windows → do
       (first, afterFirst) = turn (at 0) NoDemand [WindowRender visible request Nothing] noRenderDemand
       (second, afterSecond) = turn (at (millis 20)) NoDemand [plain hidden] afterFirst
   map offeredWindow (renderOffers first) `shouldBe` [windowIdentity window]
-  renderSchedule first `shouldBe` UpdateBy (at (millis 10))
+  -- The offer covers the whole captured request, deadline included, so the
+  -- schedule reports nothing the caller was just handed.
+  renderSchedule first `shouldBe` NoUpdateDemand
   -- Nothing was acknowledged, so the demand is still owed; suspended, it is
   -- owed silently.
   renderOffers second `shouldBe` []
@@ -509,20 +515,53 @@ testRemoval = do
         (_, both) = turn (at 0) NoDemand (map dirty observations) noRenderDemand
         (dropped, afterDropped) =
           turn (at (millis 10)) NoDemand [dirty observation | observation ← observations, observedWindow observation == kept] both
-        (ending, afterEnding) = turn (at (millis 20)) NoDemand [plain closing] afterDropped
+        -- The closing and released windows are a different session's, so they
+        -- start from no state of their own and are removed on sight.
+        (_, afterClosingSeen) = turn (at (millis 15)) NoDemand [dirty closing] afterDropped
+        (ending, afterEnding) = turn (at (millis 20)) NoDemand [plain closing] afterClosingSeen
         (_, afterTerminal) = turn (at (millis 30)) NoDemand [plain released] afterEnding
     renderDemandWindows both `shouldBe` [kept, gone]
     -- The window the host no longer holds took its slot and its state with it.
     renderDemandWindows afterDropped `shouldBe` [kept]
     map offeredWindow (renderOffers dropped) `shouldBe` [kept]
-    -- A closing window keeps an entry and is offered nothing.
-    renderDemandWindows afterEnding `shouldBe` [observedWindow closing]
+    -- A closing window's demand slot closed with it, so its state goes at the
+    -- first closing observation rather than lingering until release, and it is
+    -- never offered even with a capture beside it.
+    renderDemandWindows afterClosingSeen `shouldBe` []
+    renderDemandWindows afterEnding `shouldBe` []
     renderOffers ending `shouldBe` []
     renderSchedule ending `shouldBe` NoUpdateDemand
-    -- A terminal phase removes it, as does forgetting one outright.
+    -- A terminal phase removes it too, as does forgetting one outright.
     renderDemandWindows afterTerminal `shouldBe` []
     renderDemandWindows (forgetRenderWindow kept both) `shouldBe` [gone]
     renderDemandWindows (forgetRenderWindow kept noRenderDemand) `shouldBe` []
+
+-- ---------------------------------------------------------------------------
+-- The reported schedule
+
+-- | A capture carrying immediate demand and a deadline that is not yet due is
+-- offered now, and acknowledging that offer clears both. The schedule that turn
+-- reports must not name the deadline it just handed out, or the loop would wake
+-- for work already done; a frame deadline the offer did not serve is still
+-- owed, and is still reported.
+testOfferedDeadlineIsNotReported ∷ Expectation
+testOfferedDeadlineIsNotReported = withScripted 1 $ \reports windows → do
+  window ← only windows
+  visible ← observationAt reports drawable window
+  let target = windowIdentity window
+      request = captured 1 (immediateDemand <> deadlineDemand (at (millis 50)))
+      (served, afterServed) =
+        turn (at 0) NoDemand [WindowRender visible request (Just (at (millis 80)))] noRenderDemand
+      acknowledged = foldr acknowledgeRender afterServed (renderOffers served)
+      (after, _) = turn (at (millis 10)) NoDemand [WindowRender visible Nothing (Just (at (millis 80)))] acknowledged
+  renderOffers served `shouldBe` [RenderOffer target 1 Nothing]
+  -- The published deadline is the offer's; the frame deadline is not, so it is
+  -- the only one reported.
+  renderSchedule served `shouldBe` UpdateBy (at (millis 80))
+  -- Acknowledging left no trace of the deadline the offer covered.
+  fmap windowDeadlinePending (windowRenderState target acknowledged) `shouldBe` Just Nothing
+  renderOffers after `shouldBe` []
+  renderSchedule after `shouldBe` UpdateBy (at (millis 80))
 
 -- ---------------------------------------------------------------------------
 -- The scheduled composition

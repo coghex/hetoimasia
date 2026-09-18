@@ -49,8 +49,10 @@ scheduling state keyed by `WindowId`, suspends a window known to be hidden,
 minimized, or of zero framebuffer extent while keeping its demand out of the
 wait, defers one whose extent is unknown, owes exactly one rebased frame on
 resume, offers a bounded and rotating number of opportunities per turn so no
-always-dirty window starves another, and answers the schedule the scheduled loop
-continues with. It calls no graphics API and infers no device readiness; a
+always-dirty window starves another, drops a window's state at its first closing
+observation because its slot closed with it, and answers the schedule the
+scheduled loop continues with, leaving out the work its own offers already
+cover. It calls no graphics API and infers no device readiness; a
 rendering backend must add presentation backpressure on top of it. An admission
 and a publication each register the notification they owe in the
 transaction that commits them, and discharge it exactly once. An expected

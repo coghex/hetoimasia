@@ -250,10 +250,14 @@
 -- opportunities are offered per turn, each window once, rotating after the
 -- window served last, so an always-dirty window starves no other, and due work
 -- left beyond the budget is what keeps the next schedule 'UpdateImmediately'.
+-- A deadline this turn's own offer already covers is left out of the schedule,
+-- so the loop is not woken for work it has just been handed.
 -- 'acknowledgeRender' clears only what the offer served: a publication captured
 -- since stays pending and is offered again. A window a turn stops listing, or
--- one whose phase is terminal, loses its entry, as does one passed to
--- 'forgetRenderWindow'.
+-- one whose observation reports any phase but
+-- 'Hetoimasia.GLFW.Window.WindowOpen', loses its entry — a window's demand slot
+-- closes with its closing transaction, so there is nothing left to capture for
+-- it — as does one passed to 'forgetRenderWindow'.
 --
 -- The simulation's demand is carried independently of every window: with every
 -- window suspended the schedule is still the simulation's, and with neither
