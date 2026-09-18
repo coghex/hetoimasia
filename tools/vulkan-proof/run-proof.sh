@@ -127,6 +127,44 @@ else
   rm -f "$local_project"
 fi
 
+# The exact identity of the sources under proof, computed from their content.
+# A revision is a convenience and can be inexact — a working tree can be dirty,
+# and the Linux container has no checkout at all — so the record is pinned by
+# this instead, and a reader can recompute it with the same command.
+HETOIMASIA_PROOF_SOURCE_DIGEST="$(
+  python3 - "$root" <<'DIGEST'
+import hashlib, os, sys
+
+root = sys.argv[1]
+# Everything that decides what the proof is and how it is built. Documentation
+# beside the harness is included too: it is small, and excluding files by
+# judgement is how a digest stops describing what it claims to.
+roots = ["tools/vulkan-proof"]
+files = ["cabal.project.vulkan", "cabal.project.common",
+         "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin",
+         "tools/native/glfw.pin", "tools/display/x11.sh"]
+
+paths = set(files)
+for directory in roots:
+    for base, _, names in os.walk(os.path.join(root, directory)):
+        for name in names:
+            full = os.path.join(base, name)
+            paths.add(os.path.relpath(full, root))
+
+overall = hashlib.sha256()
+for path in sorted(paths):
+    full = os.path.join(root, path)
+    if not os.path.isfile(full):
+        continue
+    with open(full, "rb") as handle:
+        content = hashlib.sha256(handle.read()).hexdigest()
+    overall.update(path.encode("utf-8") + b"\0" + content.encode("ascii") + b"\n")
+print(overall.hexdigest())
+DIGEST
+)"
+export HETOIMASIA_PROOF_SOURCE_DIGEST
+[ -n "$HETOIMASIA_PROOF_SOURCE_DIGEST" ] || refuse "the source digest could not be computed, so a record could not identify the sources it came from"
+
 # What this run can be attributed to. A retained record that does not name the
 # revision it was produced from cannot be told apart later from one taken
 # against different code, so it is derived here rather than left to prose. The
@@ -155,6 +193,7 @@ fi
 
 echo "run-proof: ghc $actual_ghc, cabal $actual_cabal"
 echo "run-proof: repository revision $HETOIMASIA_PROOF_REVISION"
+echo "run-proof: source digest $HETOIMASIA_PROOF_SOURCE_DIGEST"
 echo "run-proof: VK_DRIVER_FILES=$VK_DRIVER_FILES"
 echo "run-proof: VK_LAYER_PATH=$VK_LAYER_PATH"
 echo "run-proof: GLFW prefix $glfw_prefix"

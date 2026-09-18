@@ -20,6 +20,7 @@ module Test.Vulkan.Proof.Findings
   , ReleaseRecord (..)
   , CaptureFacts (..)
   , CallbackFacts (..)
+  , TeardownFacts (..)
   , PhaseCount (..)
   , Diagnostic (..)
   , Outcome (..)
@@ -51,6 +52,20 @@ data Findings = Findings
   , findingsAbandonment ∷ AbandonmentFacts
   , findingsCapture ∷ CaptureFacts
   , findingsCallbacks ∷ CallbackFacts
+  , findingsTeardown ∷ TeardownFacts
+  }
+  deriving (Show)
+
+-- | What teardown did, filled in after the cleanup stack has run.
+--
+-- A release that fails is not a detail: @vkDeviceWaitIdle@ can return device
+-- loss, and a proof that let that pass while still reporting a verdict would be
+-- claiming a clean session it never had. Every release still runs — one failure
+-- must not hide the ones after it — and the failures are collected here so the
+-- verdict can refuse them.
+data TeardownFacts = TeardownFacts
+  { teardownReleases ∷ [Text]
+  , teardownFailures ∷ [Text]
   }
   deriving (Show)
 
@@ -59,9 +74,15 @@ data PlatformFacts = PlatformFacts
   { platformOs ∷ Text
   , platformArch ∷ Text
   , platformRevision ∷ Text
-    -- ^ The repository revision the harness was built and run from. Without it
-    -- a retained record cannot be told apart from one taken against different
-    -- code, which is the whole value of retaining it.
+    -- ^ The repository revision the harness was run from, for a reader who
+    -- wants to find it in history. It is a convenience and can be inexact: a
+    -- working tree can be dirty, and the Linux container has no checkout to
+    -- ask, only the revision baked into it.
+  , platformSourceDigest ∷ Text
+    -- ^ The identity that is exact. A SHA-256 over the content of every source
+    -- the proof is built from, so a retained record names the tree it was
+    -- produced by whether or not a revision was resolvable, and a reader can
+    -- recompute it. `tools/vulkan-proof/run-proof.sh` prints how.
   , platformConsent ∷ Text
   , platformDriverFiles ∷ Maybe Text
   , platformLayerPath ∷ Maybe Text
@@ -71,7 +92,13 @@ data PlatformFacts = PlatformFacts
     -- one in force.
   , platformInstanceVersion ∷ Text
   , platformAvailableLayers ∷ [(Text, Text)]
-  , platformEnabledLayers ∷ [Text]
+  , platformRequestedLayers ∷ [Text]
+  , platformValidationLayerLoaded ∷ Bool
+    -- ^ Whether the validation layer is in the chain the loader actually built,
+    -- observed by attributing a resolved device entry point to its image.
+    -- Requesting a layer is not the same as loading one: the loader's filter
+    -- variables can disable a requested layer, which would leave the run
+    -- claiming validation coverage it did not have.
   , platformGlfwRequired ∷ [Text]
   }
   deriving (Show)

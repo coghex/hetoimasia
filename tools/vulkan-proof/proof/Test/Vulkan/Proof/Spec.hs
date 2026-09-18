@@ -38,15 +38,28 @@ spec outcome = do
         -- that the record says which, not that there happened to be none.
         length findings.findingsPlatform.platformClearedOverrides `shouldSatisfy` (>= 0)
 
-    it "names the repository revision it proved" $
+    it "identifies the exact sources it proved, by their content" $
+      onFindings outcome $ \findings → do
+        -- The digest, not the revision, is the identity: a revision can be
+        -- dirty, and the Linux container has no checkout to resolve one from.
+        let digest = findings.findingsPlatform.platformSourceDigest
+        Text.length digest `shouldBe` 64
+        Text.unpack digest `shouldSatisfy` all (`elem` ("0123456789abcdef" ∷ String))
+
+    it "names a repository revision alongside it" $
       onFindings outcome $ \findings → do
         let recorded = findings.findingsPlatform.platformRevision
         recorded `shouldSatisfy` (not . Text.null)
         recorded `shouldSatisfy` (/= "unrecorded")
 
-    it "ran with validation enabled, so a clean run means something" $
-      onFindings outcome $ \findings →
-        findings.findingsPlatform.platformEnabledLayers `shouldContain` ["VK_LAYER_KHRONOS_validation"]
+    it "ran with validation actually loaded, so a clean run means something" $
+      onFindings outcome $ \findings → do
+        let facts = findings.findingsPlatform
+        facts.platformRequestedLayers `shouldContain` ["VK_LAYER_KHRONOS_validation"]
+        -- Requesting is not loading. The loader's filter variables can drop a
+        -- requested layer, and a run that validated nothing would otherwise
+        -- report zero validation errors just as loudly.
+        facts.platformValidationLayerLoaded `shouldBe` True
 
     it "recorded the layers the pinned path offers" $
       onFindings outcome $ \findings →
@@ -217,6 +230,25 @@ spec outcome = do
     it "recorded no validation error and no failed callback" $
       onFindings outcome $ \findings →
         findings.findingsCallbacks.callbackValidationErrors `shouldBe` []
+
+  describe "Teardown" $ do
+    it "released everything it acquired, with nothing failing" $
+      onFindings outcome $ \findings → do
+        let facts = findings.findingsTeardown
+        facts.teardownReleases `shouldSatisfy` (not . null)
+        facts.teardownFailures `shouldBe` []
+
+    it "destroyed the explicit messenger after every resource it should have watched" $
+      onFindings outcome $ \findings → do
+        let released = findings.findingsTeardown.teardownReleases
+            position name = length (takeWhile (/= name) released)
+        -- Reverse registration order, so a smaller position is released
+        -- earlier. The messenger must outlive the swapchain, device, surface
+        -- and window, and must not outlive the instance.
+        mapM_
+          (\earlier → position earlier `shouldSatisfy` (< position "the explicit debug messenger"))
+          ["the frame slots", "the swapchain", "the logical device", "the window surface", "the proof window"]
+        position "the explicit debug messenger" `shouldSatisfy` (< position "the Vulkan instance")
 
   describe "The operation and result matrix" $ do
     it "covers acquisition, submission, presentation, oldSwapchain creation, and destruction" $ do

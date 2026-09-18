@@ -71,6 +71,7 @@ body = \case
       <> abandonmentSection findings.findingsAbandonment
       <> captureSection findings.findingsCapture
       <> callbackSection findings.findingsCallbacks
+      <> teardownSection findings.findingsTeardown
 
 platformSection ∷ PlatformFacts → [Text]
 platformSection facts =
@@ -78,7 +79,8 @@ platformSection facts =
   , ""
   ]
     <> definitions
-      [ ("repository revision", facts.platformRevision)
+      [ ("source digest", facts.platformSourceDigest)
+      , ("repository revision", facts.platformRevision)
       , ("platform", facts.platformOs <> "/" <> facts.platformArch)
       , ("session authorization", facts.platformConsent)
       , ("VK_DRIVER_FILES", maybe "(unset)" id facts.platformDriverFiles)
@@ -86,7 +88,8 @@ platformSection facts =
       , ("cleared discovery overrides", listOrNone facts.platformClearedOverrides)
       , ("loader instance version", facts.platformInstanceVersion)
       , ("layers the pinned path offers", listOrNone [name <> " " <> version | (name, version) ← facts.platformAvailableLayers])
-      , ("layers enabled", listOrNone facts.platformEnabledLayers)
+      , ("layers requested", listOrNone facts.platformRequestedLayers)
+      , ("the validation layer is in the loaded chain", yesNo facts.platformValidationLayerLoaded)
       , ("surface extensions GLFW requires", listOrNone facts.platformGlfwRequired)
       ]
 
@@ -251,6 +254,22 @@ callbackSection facts =
       , ("callbacks during instance destruction", Text.pack (show facts.callbackDuringInstanceDestruction))
       , ("callback storage still valid while the instance was destroyed", yesNo facts.callbackStorageAliveAfterInstanceDestroyed)
       , ("validation errors", listOrNone facts.callbackValidationErrors)
+      ]
+
+teardownSection ∷ TeardownFacts → [Text]
+teardownSection facts =
+  [ ""
+  , "## Teardown"
+  , ""
+  , "Every release runs in the reverse of the order it was registered, whether"
+  , "the run finished or stopped, and one that fails never stops the rest. A"
+  , "failure here fails the verdict: a session torn down badly is not a session"
+  , "this proof can report a clean result for."
+  , ""
+  ]
+    <> definitions
+      [ ("released, in order", listOrNone facts.teardownReleases)
+      , ("releases that failed", listOrNone facts.teardownFailures)
       ]
 
 matrixTable ∷ [Text]

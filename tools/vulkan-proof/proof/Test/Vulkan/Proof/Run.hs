@@ -119,16 +119,22 @@ newCleanups = Cleanups <$> newIORef []
 onExit ∷ Cleanups → Text → IO () → IO ()
 onExit (Cleanups ref) label action = modifyIORef' ref ((label, action) :)
 
-runCleanups ∷ Journal → Cleanups → IO ()
+-- | Run every release, in reverse order, and report both what ran and what
+-- failed. A failure never stops the remaining releases and is never swallowed:
+-- the verdict refuses a run whose teardown failed.
+runCleanups ∷ Journal → Cleanups → IO ([Text], [Text])
 runCleanups journal (Cleanups ref) = do
   actions ← readIORef ref
   writeIORef ref []
-  for_ actions $ \(label, action) → do
+  outcomes ← forM actions $ \(label, action) → do
     outcome ← try @SomeException action
     case outcome of
-      Right () → pure ()
-      Left failure →
-        note journal ("teardown of " <> label <> " failed: " <> Text.pack (displayException failure))
+      Right () → pure (label, Nothing)
+      Left failure → do
+        let reason = label <> ": " <> Text.pack (displayException failure)
+        note journal ("teardown of " <> reason)
+        pure (label, Just reason)
+  pure (map fst outcomes, [reason | (_, Just reason) ← outcomes])
 
 -- --------------------------------------------------------------------------
 -- Callback capture
@@ -255,21 +261,46 @@ messengerCreateInfo callback =
 -- before anything native runs, and what was removed is recorded: a proof whose
 -- driver selection could have been overridden from outside is not a proof of
 -- the pinned selection.
+-- | The layer this proof requires, by the name it is requested under and by
+-- the substring its own shared library carries on both platforms
+-- (@libVkLayer_khronos_validation.dylib@, @libVkLayer_khronos_validation.so@).
+validationLayerName ∷ ByteString
+validationLayerName = "VK_LAYER_KHRONOS_validation"
+
+validationLayerImage ∷ Text
+validationLayerImage = "VkLayer_khronos_validation"
+
 -- | Where the revision under proof comes from. `run-proof.sh` derives it from
 -- the checkout, and the Linux container bakes it in because there is no
 -- checkout inside to ask.
 revisionVariable ∷ String
 revisionVariable = "HETOIMASIA_PROOF_REVISION"
 
+-- | The exact identity of the sources under proof, which the runner computes
+-- from their content. A revision can be dirty or absent; this cannot.
+digestVariable ∷ String
+digestVariable = "HETOIMASIA_PROOF_SOURCE_DIGEST"
+
 conflictingOverrides ∷ [String]
 conflictingOverrides =
-  [ "VK_ICD_FILENAMES"
+  [ -- Driver discovery and selection.
+    "VK_ICD_FILENAMES"
   , "VK_ADD_DRIVER_FILES"
-  , "VK_ADD_LAYER_PATH"
-  , "VK_INSTANCE_LAYERS"
-  , "VK_LOADER_LAYERS_ENABLE"
   , "VK_LOADER_DRIVERS_SELECT"
   , "VK_LOADER_DRIVERS_DISABLE"
+  , -- Explicit layer discovery, and the legacy list that force-enables layers.
+    "VK_ADD_LAYER_PATH"
+  , "VK_INSTANCE_LAYERS"
+  , -- Implicit layers, which need no request from the application at all and
+    -- would otherwise join the chain unrecorded.
+    "VK_IMPLICIT_LAYER_PATH"
+  , "VK_ADD_IMPLICIT_LAYER_PATH"
+  , -- The loader's own layer filters. `DISABLE` is the dangerous one: it can
+    -- switch off the validation layer this proof requested, leaving a run that
+    -- reported zero validation errors because nothing was validating.
+    "VK_LOADER_LAYERS_ENABLE"
+  , "VK_LOADER_LAYERS_DISABLE"
+  , "VK_LOADER_LAYERS_ALLOW"
   ]
 
 clearConflictingOverrides ∷ IO [Text]
@@ -295,20 +326,26 @@ runProof journal consent = do
   outcome ← catchAll (Proved <$> procedure journal consent cleanups sink) (pure . Stopped)
   -- Teardown, including the instance, happens here: after the procedure, and
   -- before the callback evidence is read. That ordering is the requirement.
-  runCleanups journal cleanups
+  (releases, teardownFailed) ← runCleanups journal cleanups
   diagnostics ← reverse <$> readIORef sink.sinkDiagnostics
   failures ← reverse <$> readIORef sink.sinkFailures
   for_ failures $ \failure → note journal ("a callback reported a failure: " <> failure)
-  pure (completeCallbacks diagnostics failures outcome)
+  pure (completeAfterTeardown releases teardownFailed diagnostics failures outcome)
 
--- | Fill in the callback facts that only exist once the instance is gone.
-completeCallbacks ∷ [Diagnostic] → [Text] → Outcome → Outcome
-completeCallbacks diagnostics failures = \case
+-- | Fill in the facts that only exist once the session is gone: the callback
+-- evidence, and what teardown itself did.
+completeAfterTeardown ∷ [Text] → [Text] → [Diagnostic] → [Text] → Outcome → Outcome
+completeAfterTeardown releases teardownFailed diagnostics failures = \case
   Stopped failure → Stopped failure
   Proved findings →
     Proved
       findings
-        { findingsCallbacks =
+        { findingsTeardown =
+            TeardownFacts
+              { teardownReleases = releases
+              , teardownFailures = teardownFailed
+              }
+        , findingsCallbacks =
             (findingsCallbacks findings)
               { callbackPhases = summarizePhases diagnostics
               , callbackDuringInstanceDestruction = countPhase diagnostics destructionPhase
@@ -357,7 +394,13 @@ procedure journal consent cleanups sink = do
   cleared ← clearConflictingOverrides
   for_ cleared $ \name → note journal ("cleared a conflicting discovery override: " <> name)
   revision ← Text.pack . maybe "unrecorded" id <$> lookupEnv revisionVariable
+  digest ← Text.pack . maybe "unrecorded" id <$> lookupEnv digestVariable
   note journal ("proving repository revision " <> revision)
+  note journal ("proving source digest " <> digest)
+  require
+    "source provenance"
+    "the runner supplied no source digest, so this record could not say which sources it was produced from"
+    (Text.length digest == 64 && Text.all (`elem` ("0123456789abcdef" ∷ String)) digest)
   driverFiles ← fmap Text.pack <$> lookupEnv "VK_DRIVER_FILES"
   layerPath ← fmap Text.pack <$> lookupEnv "VK_LAYER_PATH"
   note journal ("VK_DRIVER_FILES = " <> maybe "(unset)" id driverFiles)
@@ -409,7 +452,7 @@ procedure journal consent cleanups sink = do
           <> [KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME]
           <> [EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME]
           <> [KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME | portabilityEnumeration]
-      validationLayer = "VK_LAYER_KHRONOS_validation"
+      validationLayer = validationLayerName
       enabledLayers = [validationLayer | validationLayer `elem` layerNames]
   forM_ (KHR_SURFACE_EXTENSION_NAME : required) $ \name →
     require
@@ -549,6 +592,19 @@ procedure journal consent cleanups sink = do
     "neither vkReleaseSwapchainImagesEXT nor vkReleaseSwapchainImagesKHR resolved on the created device"
     (provenanceAddress bindingRelease /= nullPtr)
   deviceProcSample ← provenanceOf (castFunPtrToPtr (pVkQueueSubmit2 device.deviceCmds))
+  -- Whether validation is really in the chain, rather than whether it was asked
+  -- for. A requested layer the loader filtered out would leave every later
+  -- "zero validation errors" claim meaningless, and nothing in
+  -- vkEnumerateInstanceLayerProperties would say so: it lists what is
+  -- available. An entry point that resolves into the layer's own image does.
+  let validationLoaded =
+        maybe False (Text.isInfixOf validationLayerImage) (provenanceImage deviceProcSample)
+  note
+    journal
+    ( "the validation layer is "
+        <> (if validationLoaded then "in" else "NOT in")
+        <> " the loaded chain, by the image a device entry point resolves into"
+    )
 
   queue ← getDeviceQueue device selection.selectedQueueFamily 0
 
@@ -604,6 +660,7 @@ procedure journal consent cleanups sink = do
             { platformOs = Text.pack os
             , platformArch = Text.pack arch
             , platformRevision = revision
+            , platformSourceDigest = digest
             , platformConsent = describeConsent consent
             , platformDriverFiles = driverFiles
             , platformLayerPath = layerPath
@@ -613,7 +670,8 @@ procedure journal consent cleanups sink = do
                 [ (decodeName properties.layerName, describeVersion properties.specVersion)
                 | properties ← Vector.toList availableLayers
                 ]
-            , platformEnabledLayers = map decodeName enabledLayers
+            , platformRequestedLayers = map decodeName enabledLayers
+            , platformValidationLayerLoaded = validationLoaded
             , platformGlfwRequired = map decodeName required
             }
       , findingsLoader =
@@ -684,6 +742,9 @@ procedure journal consent cleanups sink = do
             , callbackValidationErrors = []
             , callbackDiagnostics = []
             }
+      , -- Both filled in by 'completeAfterTeardown', because neither exists
+        -- until the cleanup stack has run.
+        findingsTeardown = TeardownFacts {teardownReleases = [], teardownFailures = []}
       }
 
 -- --------------------------------------------------------------------------

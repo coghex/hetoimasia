@@ -122,8 +122,8 @@ operationMatrix =
   , MatrixRow
       { rowOperation = "vkReleaseSwapchainImagesEXT"
       , rowResult = "VK_SUCCESS"
-      , rowEffects = "The named images return to the presentation engine without being presented; their contents become undefined and their layout becomes VK_IMAGE_LAYOUT_UNDEFINED. No swapchain is retired or rebuilt."
-      , rowDisposition = "Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. This is the abandonment path; it is not a substitute for presentation."
+      , rowEffects = "The named images return to the presentation engine without being presented, and become acquirable again. The call does not present, does not modify the images, and does not retire or rebuild the swapchain."
+      , rowDisposition = "Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. Draw no conclusion about the released images\' contents from the release itself; the rule a consumer needs is the acquisition rule, which is that a newly acquired image\'s contents are undefined and its layout must be treated as such. This is the abandonment path; it is not a substitute for presentation."
       , rowEvidence = Observed
       }
   , MatrixRow
@@ -137,8 +137,8 @@ operationMatrix =
       { rowOperation = "vkCreateSwapchainKHR with a non-null oldSwapchain"
       , rowResult = "any error"
       , rowEffects = "No new swapchain was created, but oldSwapchain is retired regardless. This is the documented exception to the no-side-effects rule, and it is the failure case a naive retry loses."
-      , rowDisposition = "The retry cannot pass the now-retired swapchain as oldSwapchain, because that parameter must name a non-retired one; it passes VK_NULL_HANDLE and forgoes the handover. The retired swapchain is still the caller\'s to finish and destroy: present the images already acquired from it, acquire no more, and destroy it only once its work has completed."
-      , rowEvidence = Specified "vkCreateSwapchainKHR: oldSwapchain is retired even if creation of the new swapchain fails; VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933 then excludes it from a retry"
+      , rowDisposition = "A retry cannot pass the now-retired swapchain as oldSwapchain, because that parameter must name a non-retired one. Nor can it simply pass VK_NULL_HANDLE straight away: the retired swapchain still holds the native window, and creating against that surface while it lives can fail with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. The order is finish or abandon the images already acquired from it, destroy it once its work has completed, and only then create afresh with VK_NULL_HANDLE."
+      , rowEvidence = Specified "vkCreateSwapchainKHR: oldSwapchain is retired even if creation of the new swapchain fails; VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933 then excludes it from a retry, and vkCreateSwapchainKHR may return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR while the native window is still held"
       }
   , MatrixRow
       { rowOperation = "vkDestroySwapchainKHR"
