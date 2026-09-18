@@ -42,7 +42,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Language and build
 
-- GHC2024, GHC 9.12.2, Cabal 3.16.1.0. Use Unicode type syntax (`∷`, `→`, `⇒`).
+- GHC2024, GHC 9.14.1, Cabal 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`.
+  [toolchain.md](docs/toolchain.md) is the qualification record and the
+  authority for those versions; activate that toolchain on `PATH` before
+  building, because the external-client examples require the `ghc` on `PATH`
+  to be the one they were built with. Use Unicode type syntax (`∷`, `→`, `⇒`).
   The bootstrap uses standard Prelude; a custom operator vocabulary remains
   a design choice. Add extensions and dependencies only when used.
 - Routine build: `cabal build all`.

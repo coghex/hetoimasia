@@ -48,6 +48,13 @@ data Mode = Typecheck | Link
 -- The second half is what keeps this example honest: without it, a client that
 -- failed because a package could not be found would be reported as the
 -- representation holding.
+--
+-- Prefer GHC's own diagnostic code, such as @GHC-10237@ for an import naming a
+-- child the module does not export, over a phrase from the rendered message.
+-- The code identifies the same error across compiler releases; the prose does
+-- not. GHC 9.14 rewrote that message from "does not export any children" to
+-- "does not export any constructors called ...", which would have been read as
+-- a boundary failure rather than as the rewording it was.
 rejectedBecause ∷ Client → String → IO ()
 rejectedBecause outcome reason = do
   case clientStatus outcome of

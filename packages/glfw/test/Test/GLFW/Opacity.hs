@@ -93,7 +93,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that names the session constructor" $
     withClient "Client.hs" constructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Session"
 
   it "rejects a client that reaches for a native window handle or the production native table" $
@@ -115,7 +115,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that constructs a wake capability, or reaches through one for the native table" $ do
     withClient "Client.hs" wakeConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "SessionWake"
     withClient "Client.hs" wakeInternalsClient $ \compile → do
       outcome ← compile Typecheck
@@ -131,7 +131,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that forges a demand request or publisher, or reaches for a demand slot" $ do
     withClient "Client.hs" demandConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "DemandRequest"
     withClient "Client.hs" demandInternalsClient $ \compile → do
       outcome ← compile Typecheck
@@ -147,7 +147,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that names the window or observation constructor" $
     withClient "Client.hs" windowConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Window"
       clientOutput outcome `shouldContain` "WindowObservation"
 
@@ -174,7 +174,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that constructs a monitor identity, description, or inventory" $
     withClient "Client.hs" monitorConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "MonitorId"
       clientOutput outcome `shouldContain` "MonitorDescription"
       clientOutput outcome `shouldContain` "MonitorInventory"
@@ -203,7 +203,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that names a command host, port, or completion ticket constructor" $
     withClient "Client.hs" commandConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "WindowCommandHost"
       clientOutput outcome `shouldContain` "WindowCommandPort"
       clientOutput outcome `shouldContain` "CompletionTicket"
@@ -225,7 +225,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that constructs or alters a control command or its size constraints outside the smart constructors" $
     withClient "Client.hs" controlConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "WindowCommand"
       clientOutput outcome `shouldContain` "SizeConstraints"
 
@@ -246,7 +246,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that constructs a mode, a saved placement, or a mode record, or sets a saved placement through a field" $
     withClient "Client.hs" modeConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       mapM_ (clientOutput outcome `shouldContain`) ["WindowMode", "SavedPlacement", "ModeRecord"]
 
   it "rejects a client that reaches for the mode representation or the owner's record updates in the private mode module" $
@@ -280,7 +280,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that constructs an input reader, control, event, epoch, or reset token" $
     withClient "Client.hs" inputConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       mapM_ (clientOutput outcome `shouldContain`) ["InputReader", "InputControl", "InputEvent", "InputEpoch", "ResetToken"]
 
   it "rejects a client that coerces a number into an input epoch to retarget a reset" $
@@ -373,7 +373,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that names the window host's constructor" $
     withHostClient "Client.hs" hostConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "WindowHost"
 
   it "rejects a client that asks the window host for its session or command host" $
@@ -407,7 +407,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that forges a window's client capabilities or takes another window's port out of them" $
     withHostClient "Client.hs" windowClientForgeryClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "WindowClient"
 
   it "rejects a client holding a window host that reaches for the owner loop's executor or event processing" $
@@ -438,7 +438,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
   it "rejects a client that names the opaque graphics service's constructor" $
     withHostClient "Client.hs" graphicsServiceConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "GraphicsService"
 
   it "rejects a client that reaches for the graphics service's representation and its observation cell" $

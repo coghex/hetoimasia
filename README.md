@@ -41,7 +41,8 @@ native graphics and mod confinement require their separate platform proofs.
 
 ## Build and run
 
-Toolchain: GHC **9.12.2**, Cabal **3.16.1.0**. Console execution needs no
+Toolchain: GHC **9.14.1**, Cabal **3.18.1.0**, qualified and pinned in
+[docs/toolchain.md](docs/toolchain.md). Console execution needs no
 Vulkan, Lua, display, or Synarchy process. Building all components requires
 the pinned GLFW dependency: follow the
 [native prerequisites](docs/validation.md#developer-prerequisites-and-macos)

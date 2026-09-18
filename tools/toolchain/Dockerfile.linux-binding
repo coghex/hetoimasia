@@ -1,0 +1,68 @@
+# A throwaway Linux container for one job: proving the pinned Vulkan binding
+# builds on the pinned toolchain. It is NOT the CI image, nothing published
+# depends on it, and no validation worker ever runs it. The CI image
+# deliberately carries no Vulkan input, so this recipe is where the loader and
+# headers live until VK-4 provisions them properly.
+#
+# Every input is pinned: the base image by digest, the toolchain by the same
+# `tools/ci-image/toolchain.pin` the real image installs from, the Hackage view
+# by `cabal.project.common`'s index-state, and the binding by
+# `tools/toolchain/binding.pin`. Build and run it from the repository root:
+#
+#   docker build -f tools/toolchain/Dockerfile.linux-binding -t hetoimasia-binding-qualification .
+#   docker run --rm hetoimasia-binding-qualification
+#
+# See docs/toolchain.md.
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    CABAL_DIR=/opt/hetoimasia/cabal \
+    PATH=/opt/hetoimasia/ghc/bin:/opt/hetoimasia/cabal-install/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The C build prerequisites and GHC's bindist dependencies, plus the Vulkan
+# loader and headers the binding's `pkgconfig-depends: vulkan` needs on Linux.
+# The loader package is what makes this a Vulkan container rather than the CI
+# image, and is exactly what must not be added there.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends \
+      binutils build-essential ca-certificates curl git pkg-config python3 xz-utils \
+      libffi-dev libgmp-dev libncurses-dev libnuma-dev zlib1g-dev \
+      libvulkan-dev libvulkan1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && dpkg-query -W -f='${Package} ${Version}\n' | sort > /opt/packages.txt
+
+COPY tools/ci-image/toolchain.pin /opt/hetoimasia/recipe/tools/ci-image/toolchain.pin
+
+# The same checksummed upstream bindists the CI image installs, so a binding
+# proved here is proved on the toolchain Linux CI actually runs.
+RUN set -eux; \
+    . /opt/hetoimasia/recipe/tools/ci-image/toolchain.pin; \
+    scratch="$(mktemp -d)"; \
+    curl --fail --silent --show-error --location --retry 3 --output "$scratch/ghc.tar.xz" "$GHC_URL"; \
+    echo "$GHC_SHA256  $scratch/ghc.tar.xz" | sha256sum --check --strict -; \
+    mkdir "$scratch/ghc"; \
+    tar -xJf "$scratch/ghc.tar.xz" -C "$scratch/ghc"; \
+    bindist="$(find "$scratch/ghc" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; \
+    (cd "$bindist" && ./configure --prefix=/opt/hetoimasia/ghc && make install); \
+    curl --fail --silent --show-error --location --retry 3 --output "$scratch/cabal.tar.xz" "$CABAL_URL"; \
+    echo "$CABAL_SHA256  $scratch/cabal.tar.xz" | sha256sum --check --strict -; \
+    mkdir "$scratch/cabal"; \
+    tar -xJf "$scratch/cabal.tar.xz" -C "$scratch/cabal"; \
+    install -D -m 0755 "$(find "$scratch/cabal" -type f -name cabal | head -n 1)" /opt/hetoimasia/cabal-install/bin/cabal; \
+    rm -rf "$scratch"; \
+    test "$(ghc --numeric-version)" = "$GHC_VERSION"; \
+    test "$(cabal --numeric-version)" = "$CABAL_VERSION"
+
+RUN cabal update
+
+# Only what the qualification reads: the two pins and the file declaring the
+# index. The engine's own sources are deliberately absent, because nothing here
+# builds them.
+COPY tools/ci-image/toolchain.pin /work/tools/ci-image/toolchain.pin
+COPY tools/toolchain/binding.pin /work/tools/toolchain/binding.pin
+COPY tools/toolchain/qualify-binding.sh /work/tools/toolchain/qualify-binding.sh
+COPY cabal.project.common /work/cabal.project.common
+
+WORKDIR /work
+CMD ["bash", "tools/toolchain/qualify-binding.sh"]
