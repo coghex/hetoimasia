@@ -122,8 +122,8 @@ operationMatrix =
   , MatrixRow
       { rowOperation = "vkReleaseSwapchainImagesEXT"
       , rowResult = "VK_SUCCESS"
-      , rowEffects = "The named images return to the presentation engine without being presented, and become acquirable again. The call does not present, does not modify the images, and does not retire or rebuild the swapchain."
-      , rowDisposition = "Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. Draw no conclusion about the released images\' contents from the release itself; the rule a consumer needs is the acquisition rule, which is that a newly acquired image\'s contents are undefined and its layout must be treated as such. This is the abandonment path; it is not a substitute for presentation."
+      , rowEffects = "The named images return to the presentation engine without being presented, and become acquirable again. The call is read-only with respect to them: it does not present them, does not modify their contents, does not change their layout, and does not retire or rebuild the swapchain."
+      , rowDisposition = "Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. Contents and layout survive the release: acquiring a released image again returns it as it was, which is the one place an acquired image\'s contents are not simply undefined, and is why abandoning a frame this way costs nothing to redo. This is the abandonment path; it is not a substitute for presentation."
       , rowEvidence = Observed
       }
   , MatrixRow

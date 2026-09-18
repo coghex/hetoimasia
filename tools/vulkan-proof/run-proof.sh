@@ -136,20 +136,31 @@ HETOIMASIA_PROOF_SOURCE_DIGEST="$(
 import hashlib, os, sys
 
 root = sys.argv[1]
-# Everything that decides what the proof is and how it is built. Documentation
-# beside the harness is included too: it is small, and excluding files by
-# judgement is how a digest stops describing what it claims to.
-roots = ["tools/vulkan-proof"]
+# Everything that decides what the proof is and how it is built, by directory
+# rather than by file, because naming files individually is how an input gets
+# left out: `tools/native` holds both the GLFW pin and the recipe that builds
+# from it, and two different recipes must not be able to produce one digest.
+#
+# This set is exactly what the Linux container copies into /work, so the digest
+# computed there and the one computed from a checkout describe the same inputs
+# and can be compared. Generated Python and macOS metadata are excluded because
+# they are not inputs and do not exist identically in both places.
+roots = ["tools/vulkan-proof", "tools/native", "tools/display"]
 files = ["cabal.project.vulkan", "cabal.project.common",
-         "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin",
-         "tools/native/glfw.pin", "tools/display/x11.sh"]
+         "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
+
+def carried(path):
+    parts = path.split(os.sep)
+    return "__pycache__" not in parts and not path.endswith(".pyc") and ".DS_Store" not in parts
 
 paths = set(files)
 for directory in roots:
     for base, _, names in os.walk(os.path.join(root, directory)):
         for name in names:
             full = os.path.join(base, name)
-            paths.add(os.path.relpath(full, root))
+            relative = os.path.relpath(full, root)
+            if carried(relative):
+                paths.add(relative)
 
 overall = hashlib.sha256()
 for path in sorted(paths):

@@ -60,6 +60,10 @@ spec outcome = do
         -- requested layer, and a run that validated nothing would otherwise
         -- report zero validation errors just as loudly.
         facts.platformValidationLayerLoaded `shouldBe` True
+        -- And nothing else is in the chain: implicit layers need no request, so
+        -- clearing the ambient overrides only restores the loader's default
+        -- search for them. The policy switches that search off.
+        facts.platformImplicitLayerPolicy `shouldSatisfy` Text.isInfixOf "~implicit~"
 
     it "recorded the layers the pinned path offers" $
       onFindings outcome $ \findings →

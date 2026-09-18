@@ -88,6 +88,7 @@ platformSection facts =
       , ("cleared discovery overrides", listOrNone facts.platformClearedOverrides)
       , ("loader instance version", facts.platformInstanceVersion)
       , ("layers the pinned path offers", listOrNone [name <> " " <> version | (name, version) ← facts.platformAvailableLayers])
+      , ("implicit-layer policy", facts.platformImplicitLayerPolicy)
       , ("layers requested", listOrNone facts.platformRequestedLayers)
       , ("the validation layer is in the loaded chain", yesNo facts.platformValidationLayerLoaded)
       , ("surface extensions GLFW requires", listOrNone facts.platformGlfwRequired)

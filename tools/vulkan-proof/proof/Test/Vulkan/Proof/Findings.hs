@@ -93,6 +93,12 @@ data PlatformFacts = PlatformFacts
   , platformInstanceVersion ∷ Text
   , platformAvailableLayers ∷ [(Text, Text)]
   , platformRequestedLayers ∷ [Text]
+  , platformImplicitLayerPolicy ∷ Text
+    -- ^ What the run did about implicit layers, which need no request from the
+    -- application and would otherwise join the chain unrecorded. Clearing the
+    -- ambient overrides is not enough: that restores the loader's *default*
+    -- implicit search rather than disabling it, and @VK_LAYER_PATH@ governs
+    -- explicit layers only.
   , platformValidationLayerLoaded ∷ Bool
     -- ^ Whether the validation layer is in the chain the loader actually built,
     -- observed by attributing a resolved device entry point to its image.

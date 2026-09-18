@@ -43,7 +43,7 @@ import qualified Data.Vector as Vector
 import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (castFunPtrToPtr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peekByteOff)
-import System.Environment (lookupEnv, unsetEnv)
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Info (arch, os)
 
 import Vulkan.CStruct.Extends (SomeStruct (..), peekSomeCStruct, withSomeStruct)
@@ -303,6 +303,29 @@ conflictingOverrides =
   , "VK_LOADER_LAYERS_ALLOW"
   ]
 
+-- | The loader filter that disables every implicit layer, and the policy the
+-- record states. Scrubbing the ambient overrides only returns the loader to its
+-- default implicit-layer search; this switches that search off, so the chain is
+-- exactly the explicit layers this proof asked for and nothing a machine
+-- happened to have installed.
+implicitLayerFilter ∷ String
+implicitLayerFilter = "VK_LOADER_LAYERS_DISABLE"
+
+implicitLayerPolicy ∷ Text
+implicitLayerPolicy = "~implicit~"
+
+-- | Disable implicit layers, after the ambient overrides have been cleared.
+-- Returns the policy actually in force, for the record.
+applyImplicitLayerPolicy ∷ IO Text
+applyImplicitLayerPolicy = do
+  setEnv implicitLayerFilter (Text.unpack implicitLayerPolicy)
+  pure
+    ( Text.pack implicitLayerFilter
+        <> "="
+        <> implicitLayerPolicy
+        <> ", so no implicit layer joins the chain and the explicit layers below are all of it"
+    )
+
 clearConflictingOverrides ∷ IO [Text]
 clearConflictingOverrides =
   fmap concat . forM conflictingOverrides $ \name → do
@@ -393,6 +416,8 @@ procedure journal consent cleanups sink = do
   heading journal "The environment"
   cleared ← clearConflictingOverrides
   for_ cleared $ \name → note journal ("cleared a conflicting discovery override: " <> name)
+  implicitPolicy ← applyImplicitLayerPolicy
+  note journal ("implicit-layer policy: " <> implicitPolicy)
   revision ← Text.pack . maybe "unrecorded" id <$> lookupEnv revisionVariable
   digest ← Text.pack . maybe "unrecorded" id <$> lookupEnv digestVariable
   note journal ("proving repository revision " <> revision)
@@ -671,6 +696,7 @@ procedure journal consent cleanups sink = do
                 | properties ← Vector.toList availableLayers
                 ]
             , platformRequestedLayers = map decodeName enabledLayers
+            , platformImplicitLayerPolicy = implicitPolicy
             , platformValidationLayerLoaded = validationLoaded
             , platformGlfwRequired = map decodeName required
             }
