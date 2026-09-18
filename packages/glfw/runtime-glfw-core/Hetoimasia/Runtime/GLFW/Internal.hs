@@ -489,12 +489,12 @@ data HostHooks = HostHooks
     -- ^ Runs at the end of a window's registration, masked and with nothing
     -- interruptible before it: after the collection and the host have both
     -- registered the window, before its creation's result is published.
-  , afterHostBuilt ∷ WindowHost → IO ()
-    -- ^ Runs once the host is built and its configured windows registered,
-    -- still inside its construction and before its consumer is entered. For a
-    -- protected host this is inside the exit handler's mask, so an example may
-    -- attach here and prove that even a cancellation delivered in the handoff
-    -- is retired rather than skipped.
+  , beforeConsumer ∷ WindowHost → IO ()
+    -- ^ Runs on the protected lifetime's own consumer path: after its exit
+    -- handler is installed and before the consumer it was given is entered, so
+    -- whatever this attaches, and however it then fails, is drained exactly as
+    -- the consumer's own attachments are. It never runs for a host built as an
+    -- ordinary 'Scoped' value, which can hold no attachment.
   }
 
 noHostHooks ∷ HostHooks
@@ -584,7 +584,6 @@ allocHostOver protection hooks sessionScope config = do
         <*> pure hooks
         <*> pure retirement
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
-  liftIO (afterHostBuilt hooks host)
   pure host
 
 -- | The read endpoint of the host session's monitor inventory, which any thread
@@ -1618,13 +1617,15 @@ runWindowApplication enterLifetime name dependencies host startup action =
 -- dependency construction failure after host setup, an owner-loop failure, a
 -- latched supervised failure, and cancellation — the boundary:
 --
--- 1. closes attachment admission and ends new graphics use, idempotently and in
---    one finite transaction, even when the application never installed a
---    quiescence hook or omitted the host from one. This is the host's own
---    safeguard; when the application does install
---    'quiesceWindowHost' the runtime's ordering has already done it before the
---    worker drain, which is what keeps a worker from starting a use the drain
---    would then have to wait for;
+-- 1. runs the host's own 'quiesceWindowHost' — every port's admission, every
+--    input feed, every demand slot, and attachment admission with new graphics
+--    use — idempotently and in one finite transaction, even when the
+--    application never installed a quiescence hook or omitted the host from
+--    one. This is the host's own safeguard; when the application does install
+--    it the runtime's ordering has already done it before the worker drain,
+--    which is what keeps a worker from starting a use the drain would then have
+--    to wait for. Nothing can be admitted or published after it, so the report
+--    in step 3 cannot be outrun;
 -- 2. retires every remaining attachment on the owner thread, with the windows,
 --    the session, and every parent still live, through the narrow progress path
 --    "Hetoimasia.Runtime.GLFW.Internal.Retirement" describes: completion
@@ -1669,7 +1670,9 @@ withProtectedWindowHostWith hooks logger sessionScope config use =
   -- consumer is lent the restore.
   mask $ \restore →
     withScoped (allocHostOver Protected hooks sessionScope config) $ \host → do
-      outcome ← tryWithContext (restore (use host))
+      -- Inside the handler, so an attachment this makes is drained however it
+      -- then fails; the consumer follows it on the same protected path.
+      outcome ← tryWithContext (restore (beforeConsumer hooks host >> use host))
       settleProtectedExit restore logger host outcome
 
 -- | 'runWindowApplication' over a protected host lifetime.
@@ -1724,7 +1727,12 @@ settleProtectedExit
 settleProtectedExit restore logger host outcome = case hostRetirementState host of
   Nothing → either rethrowIO pure outcome
   Just retirement → do
-    atomically (closeAttachmentAdmission retirement)
+    -- The host's whole admission, not only its attachments': a command
+    -- admitted or a demand published after this point would register a
+    -- notification obligation the one degradation report below has already
+    -- waited past. Idempotent, so it changes nothing when the application's
+    -- own quiescence already ran before the worker drain.
+    atomically (quiesceWindowHost host)
     drained ← drainRetirement retirement (retirementEnvironmentOf logger host) restore
     reported ← tryWithContext (reportHostWakeDegradationAtExit restore logger host)
     settleProtectedOutcome outcome drained reported

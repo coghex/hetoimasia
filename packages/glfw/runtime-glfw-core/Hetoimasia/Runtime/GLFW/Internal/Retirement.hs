@@ -47,8 +47,8 @@
 -- A step that answers 'RetirementStalled', and one that fails, both withdraw
 -- the attachment's progress path: the drain never replays a failed step, and it
 -- resumes stepping only when independent evidence — a completion notice for
--- that attachment — arrives. When no pending attachment has a path left, the
--- drain makes one protected diagnostic attempt and keeps waiting; the
+-- that attachment — arrives. As soon as any pending attachment has no path
+-- left, the drain makes one protected diagnostic attempt and keeps waiting; the
 -- diagnostic's own failure is retained and unwinds nothing.
 --
 -- = Failures and cancellation
@@ -746,10 +746,11 @@ drainRetirement retirement environment restore = go True noDrainOutcome
           settled ←
             tryWithContext (restore (environmentRetireWindows environment))
               >>= \attempted → absorb retirement attempted stepped
-          diagnosed ←
-            if progressed
-              then pure settled
-              else declareStall retirement environment restore settled
+          -- Every round, whether or not another chain progressed: a chain with
+          -- no path left is retaining its window, the session, and its parents
+          -- now, and one beside it that is merely awaiting must not be able to
+          -- keep that from ever being said.
+          diagnosed ← declareStall retirement environment restore settled
           (pumping', waited) ← waitRound retirement environment restore pumping progressed diagnosed
           go pumping' waited
 
@@ -876,6 +877,12 @@ opportunity retirement restore registration outcome = do
 -- | The one protected diagnostic the stall policy owes, claimed once whatever
 -- it records.
 --
+-- It is owed as soon as any live attachment has no progress path left, not only
+-- when every one of them has: that chain is retaining its window, the session,
+-- and its parents from this round on, and a chain beside it that is merely
+-- awaiting must not be able to keep that from ever being reported. The entry
+-- names how many of the attachments still pending are stalled.
+--
 -- Its own failure is retained rather than raised: a failing diagnostic may not
 -- unwind the scopes the stall is retaining. No retirement timeout is configured
 -- in this slice; were one added it could only annotate this entry, never grant
@@ -889,8 +896,9 @@ declareStall
   → IO DrainOutcome
 declareStall retirement environment restore outcome = do
   pending ← atomically (livePending retirement)
+  let stalled = filter (not . registrationProgressing) pending
   claimed ←
-    if any registrationProgressing pending
+    if null stalled
       then pure False
       else atomicModifyIORef' (retirementDiagnosed retirement) (\made → (True, not made))
   if not claimed
@@ -901,8 +909,9 @@ declareStall retirement environment restore outcome = do
           logWarning
             (environmentLogger environment)
             retirementComponent
-            "No attachment can make safe progress; its window, the session, and every parent are retained"
-            [ ("attachments", Text.pack (show (length pending)))
+            "An attachment has no safe progress path; its window, the session, and every parent are retained"
+            [ ("stalled", Text.pack (show (length stalled)))
+            , ("attachments", Text.pack (show (length pending)))
             , ("wait", Text.pack (show (environmentBound environment)))
             ]
       absorb retirement attempted outcome

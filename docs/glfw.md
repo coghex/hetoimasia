@@ -2578,11 +2578,14 @@ On **every** exit — a normal return, an action failure, a startup failure, a
 dependency construction failure after host setup, an owner-loop failure, a
 latched supervised failure, and cancellation — the boundary:
 
-1. closes attachment admission and ends new graphics use itself, idempotently
-   and in one finite transaction. This is the host's own safeguard and runs even
-   when the application installed no quiescence hook or omitted the host from
-   one; it does not replace the runtime's ordering, which is what keeps a worker
-   from beginning a use the drain would then have to wait for;
+1. runs the host's own `quiesceWindowHost` — every port's admission, every input
+   feed, every demand slot, and attachment admission with new graphics use —
+   idempotently and in one finite transaction. This is the host's own safeguard
+   and runs even when the application installed no quiescence hook or omitted
+   the host from one; it does not replace the runtime's ordering, which is what
+   keeps a worker from beginning a use the drain would then have to wait for.
+   Nothing can be admitted or published after it, so the report in step 3 cannot
+   be outrun by a late command or demand;
 2. retires every remaining attachment on the owner thread, with every window,
    the session, and every parent still live;
 3. makes the wake path's one guarded degradation report, now that nothing
@@ -2665,10 +2668,13 @@ cancellation, and one that retained cleanup evidence stay fatal. No disposition
 authorizes destroying an unsafe dependent. A withdrawn path resumes only through
 an explicit safe progress path — independent evidence for that attachment.
 
-When no pending attachment has a path left, the boundary retains the affected
-chain, ceases unsafe work, writes one warning under `glfw.retirement` naming how
-many attachments are held and the finite bound it waits, and keeps waiting. That
-diagnostic is claimed once whatever it records, and its own failure is retained
+As soon as any pending attachment has no path left — not only when every one of
+them has, because a chain beside it that is merely awaiting must not be able to
+keep the stall from being reported — the boundary retains the affected chain,
+ceases unsafe work, writes one warning under `glfw.retirement` naming how many
+of the attachments still pending are stalled, how many are pending at all, and
+the finite bound it waits, and keeps waiting. That diagnostic is claimed once
+whatever it records, and its own failure is retained
 rather than raised: a failing diagnostic may not unwind what the stall is
 holding. No retirement timeout is configured; were one added it could only
 annotate that entry, never grant authority to destroy anything. Operator process
@@ -2680,7 +2686,10 @@ The public `runtime-glfw` sublibrary exports the protected lifetime and its
 runner and **no attachment operation or type**. Attaching, certifying a fact,
 publishing a notice, and observing an attachment live in the private
 `runtime-glfw-core` sublibrary for this package's own examples until LIFE-4
-exposes the contract. An attachment reserves its window, registers its protocol,
+exposes the contract. The seam is entered from the protected lifetime's own
+consumer path — the consumer it was given, or the private hook that runs just
+before it — never from the host's construction, which the exit handler does not
+yet cover. An attachment reserves its window, registers its protocol,
 constructs, and only then publishes — in that order and no other — so a
 cancellation at any handoff leaves the attachment registered and retiring rather
 than a constructed dependent outside registration, and nothing usable is
@@ -2724,8 +2733,14 @@ progress at all; one completion notice per fact per window admitted at once; a
 rollback that itself fails, one that is cancelled, and one cancelled after a
 construction that failed synchronously, each retained rather than stranded in
 construction and each re-raising what it received; the window limit's bounds; a
-cancellation queued in the handoff out of construction, which the exit still
-settles; a notice refused once retirement is complete; an interrupted step
+cancellation queued in the handoff out of construction, which reaches neither
+the consumer path nor startup and which the exit still settles; an attachment
+made on that consumer path which then fails or is cancelled, drained as the
+consumer's own are; a notice refused once retirement is complete; a command and
+a demand refused once the exit has closed the host; a stalled chain reported
+beside one that only ever awaits; a body failure kept as the exact primary
+exception with the drain's own retained beside it under `glfw protected
+retirement`; an interrupted step
 withdrawn rather than run again; a duplicate and a refused notice reviving
 nothing; a cancellation queued while the window's own destruction is in flight,
 which defers until the session and a parent have outlived it; a stalled
