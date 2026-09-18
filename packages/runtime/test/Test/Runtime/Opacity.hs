@@ -45,7 +45,7 @@ supervisedSpec = describe "Supervised worker opacity across the package boundary
   it "rejects a client that names the constructor" $
     withClient "Client.hs" constructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "SupervisedWorker"
 
   it "accepts and runs a client using the reader, completion, status, stop, and cancel" $
@@ -212,13 +212,13 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
   it "rejects a client that names the service handle's constructor" $
     withClient "Client.hs" (importingClient "InboxService (InboxService)") $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "InboxService"
 
   it "rejects a client that names the definition's constructor to build its own startup and handoff" $
     withClient "Client.hs" (importingClient "InboxDefinition (InboxDefinition)") $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "InboxDefinition"
 
   it "rejects a client that takes a send endpoint from an unavailable start" $
@@ -230,7 +230,7 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
   it "rejects a client that constructs an exit record" $
     withClient "Client.hs" (importingClient "InboxExit (InboxExit)") $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "InboxExit"
 
   it "rejects a client that updates an exit record's discard count" $
@@ -248,7 +248,7 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
   it "rejects a client that forges a drain acknowledgement with its constructor" $
     withClient "Client.hs" (importingClient "DrainAcknowledgement (DrainAcknowledgement)") $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "DrainAcknowledgement"
 
   it "rejects a client that rewrites a drain acknowledgement's handled count" $

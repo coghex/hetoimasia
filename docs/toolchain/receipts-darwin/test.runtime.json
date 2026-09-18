@@ -1,0 +1,33 @@
+{
+  "command": [
+    "cabal",
+    "test",
+    "hetoimasia-runtime:runtime-tests",
+    "--test-show-details=direct"
+  ],
+  "duration_seconds": 4.372,
+  "ended_at": "2026-09-18T15:47:37.532Z",
+  "executed_commit": "be927031a18dec744acc35a162c0fa6af74c4e75",
+  "executed_tree": "ef902cf659ffa3050edc6d971998fbda8ca7581f",
+  "exit_status": 0,
+  "group": "test.runtime",
+  "head_commit": "be927031a18dec744acc35a162c0fa6af74c4e75",
+  "input_identity": "8ddaeb94c6f559c39210104c91b8c8537872fdb314556b8fe9308261e6016f49",
+  "outcome": "passed",
+  "plan_identity": "ed05a32c18b56e2093fa2ac132bd788e1212bd80fb5f89309a1f6bafd3524c94",
+  "policy_version": "2362d7005e42d6657eb29ff4a6ee3362e6c1a9c1713c3757df000206cd787e2f",
+  "runner_arch": "arm64",
+  "runner_class": "cpu",
+  "runner_os": "Darwin",
+  "runner_python": "3.14.6",
+  "schema_version": 3,
+  "source_run_url": "",
+  "started_at": "2026-09-18T15:47:33.159Z",
+  "timeout_seconds": 1800,
+  "toolchain": {
+    "cabal": "3.18.1.0",
+    "ghc": "9.14.1",
+    "native-manifest": "f28f062c0b13c9ec8d4d3627a06e7abc545d5661c7572bce73e3453f25e6354a"
+  },
+  "worker": "local"
+}

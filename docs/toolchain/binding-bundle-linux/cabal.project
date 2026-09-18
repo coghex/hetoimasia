@@ -1,0 +1,8 @@
+packages: .
+
+index-state: 2026-09-18T00:00:00Z
+
+constraints:
+    vulkan +safe-foreign-calls,
+    vulkan -darwin-lib-dirs
+

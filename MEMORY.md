@@ -22,7 +22,10 @@ owning subsystem's contract/design when continuing its work.
   windowing, monotonic time, Vulkan ownership, Lua and rendering code before
   replacing concepts. Do not copy its central environment or game managers.
 - GitHub: `coghex/hetoimasia`, public, default `master`; license `GPL-3.0-only`.
-  GHC 9.12.2, Cabal 3.16.1.0, GHC2024, Unicode type syntax, standard Prelude.
+  GHC 9.14.1, Cabal 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, GHC2024,
+  Unicode type syntax, standard Prelude. `docs/toolchain.md` records that
+  qualification, the candidates rejected, and the pinned `vulkan-3.27` /
+  `vulkan-utils-0.5.11.0` pair VK-2 inherits.
   Preserve `semaphore: False` for the multi-worktree build.
 - Use Kanban skills and `~/work/kanban` for issue/PR workflow. This repository
   is the target. Code and its required documentation/evidence ship in the same

@@ -22,7 +22,7 @@ author: Vincent Coghlan
 maintainer: Vincent Coghlan
 category: Game
 build-type: Simple
-tested-with: GHC ==9.12.2
+tested-with: GHC ==9.14.1
 extra-doc-files: README.md
 extra-source-files:
     native/cbits/hetoimasia_glfw.h
@@ -62,9 +62,9 @@ library model
         Hetoimasia.GLFW.Internal.Window
         Hetoimasia.GLFW.Internal.Command
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
-        containers >=0.7 && <0.8,
+        containers >=0.8 && <0.9,
         deepseq >=1.5.1 && <1.6,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
@@ -89,7 +89,7 @@ library native
     if os(linux)
         extra-libraries: rt m dl
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         text >=2.1 && <2.2,
         hetoimasia-glfw:model
@@ -106,7 +106,7 @@ library
         Hetoimasia.GLFW.Session
         Hetoimasia.GLFW.Window
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw:model,
         hetoimasia-glfw:native
@@ -125,7 +125,7 @@ library runtime-glfw
     exposed-modules:
         Hetoimasia.Runtime.GLFW
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         hetoimasia-glfw:runtime-glfw-core
 
 -- The runtime integration's implementation, including the test-only host hooks
@@ -146,8 +146,8 @@ library runtime-glfw-core
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
     build-depends:
-        base >=4.21 && <4.22,
-        containers >=0.7 && <0.8,
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
@@ -166,7 +166,7 @@ library seam
     exposed-modules:
         Hetoimasia.GLFW.Seam
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         hetoimasia-glfw:seam-core
 
 -- The seam's implementation, including the window drivers that deliver
@@ -180,7 +180,7 @@ library seam-core
     exposed-modules:
         Hetoimasia.GLFW.Internal.Seam
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
@@ -230,9 +230,9 @@ test-suite glfw-tests
         Test.GLFW.Window
     ghc-options: -threaded -rtsopts
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
-        containers >=0.7 && <0.8,
+        containers >=0.8 && <0.9,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
@@ -281,7 +281,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Window
     ghc-options: -threaded
     build-depends:
-        base >=4.21 && <4.22,
+        base >=4.22 && <4.23,
         hspec >=2.11 && <3,
         hspec-core >=2.11 && <2.12,
         process >=1.6 && <1.7,

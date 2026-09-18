@@ -453,7 +453,7 @@ spec = describe "Validation evidence reuse" $ do
         identityOf rebuilt >>= (`shouldNotBe` pinnedIdentity)
         recorded ←
           patched fixture earlier "native-pinned.json" "toolchain"
-            ("{\"ghc\": \"9.12.2\", \"native-manifest\": \"" ++ replicate 64 'a' ++ "\"}")
+            ("{\"ghc\": \"9.14.1\", \"native-manifest\": \"" ++ replicate 64 'a' ++ "\"}")
         install fixture rebuilt "test.native" [passing recorded]
         refusal fixture rebuilt "test.native" "a different toolchain"
 
@@ -559,7 +559,7 @@ planCandidateWith fixture extra base head' candidate name = do
         , "--base", base
         , "--head", head'
         , "--candidate", candidate
-        , "--toolchain", "ghc=9.12.2"
+        , "--toolchain", "ghc=9.14.1"
         , "--runner-os", "Linux"
         , "--json"
         ]
@@ -601,7 +601,7 @@ runGroup fixture plan group extra =
       , group
       , "--plan", plan
       , "--receipts", receiptsDirectory fixture
-      , "--toolchain", "ghc=9.12.2"
+      , "--toolchain", "ghc=9.14.1"
       , "--source-run-url", runUrl 41 1
       ]
         ++ (if "--worker" `elem` extra then extra else routeOf group ++ extra)
@@ -1160,7 +1160,7 @@ planRouted fixture workers name = do
         , "--base", seeded fixture
         , "--head", "HEAD"
         , "--candidate", "HEAD"
-        , "--toolchain", "ghc=9.12.2"
+        , "--toolchain", "ghc=9.14.1"
         , "--runner-os", "Linux"
         , "--json"
         ]

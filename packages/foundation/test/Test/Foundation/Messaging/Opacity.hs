@@ -51,7 +51,7 @@ payloadSpec = describe "Prepared payload opacity across the package boundary" $ 
   it "rejects a client that names the constructor" $
     withClient constructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Prepared"
 
   it "rejects a client that replaces the payload with record update" $
@@ -143,7 +143,7 @@ channelSpec = describe "Channel endpoint authority across the package boundary" 
   it "rejects a client that constructs an endpoint from its internals" $
     withChannelClient endpointConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Sender"
 
   it "rejects a client that replaces an endpoint with record update" $
@@ -331,13 +331,13 @@ snapshotSpec = describe "Snapshot endpoint authority across the package boundary
   it "rejects a client that forges a cursor from its constructor" $
     withChannelClient cursorConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "SnapshotCursor"
 
   it "rejects a client that forges an observation from its constructor" $
     withChannelClient observationConstructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Observation"
 
   it "rejects a client that replaces an observation's payload with record update" $

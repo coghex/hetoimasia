@@ -1036,7 +1036,7 @@ prevented a verdict at all.
 Linux workers install nothing. They run inside one published image,
 `ghcr.io/coghex/hetoimasia-ci`, which carries:
 
-- GHC 9.12.2 at `/opt/hetoimasia/ghc` and Cabal 3.16.1.0 at
+- GHC 9.14.1 at `/opt/hetoimasia/ghc` and Cabal 3.18.1.0 at
   `/opt/hetoimasia/cabal-install`, both on `PATH`, installed from the upstream
   binary distributions `tools/ci-image/toolchain.pin` pins by URL and SHA-256;
 - `CABAL_DIR=/opt/hetoimasia/cabal` with an explicit `store-dir` of
@@ -1163,7 +1163,7 @@ not declare `ci-image` at all:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --runner-os Linux --toolchain ghc=9.12.2 --toolchain cabal=3.16.1.0
+  --runner-os Linux --toolchain ghc=9.14.1 --toolchain cabal=3.18.1.0
 ```
 
 Every Linux worker runs in a `container:` bound to that exact digest, which is

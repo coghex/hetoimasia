@@ -41,8 +41,8 @@ permissions:
 # verifies them inside the image. Evidence can never be reused across a
 # toolchain the candidate was not planned for.
 env:
-  GHC_VERSION: '9.12.2'
-  CABAL_VERSION: '3.16.1.0'
+  GHC_VERSION: '9.14.1'
+  CABAL_VERSION: '3.18.1.0'
   WORKER_OS: Linux
 
 defaults:

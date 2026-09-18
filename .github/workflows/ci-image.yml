@@ -25,8 +25,8 @@ permissions:
 
 # The image must install exactly the toolchain the validation workflow pins.
 env:
-  GHC_VERSION: '9.12.2'
-  CABAL_VERSION: '3.16.1.0'
+  GHC_VERSION: '9.14.1'
+  CABAL_VERSION: '3.18.1.0'
 
 defaults:
   run:

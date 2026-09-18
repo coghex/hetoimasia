@@ -95,7 +95,7 @@ spec = describe "CI image" $ do
             [ checkout fixture </> "tools/ci-image/builder.py", "descriptor"
             , "--image", "ghcr.io/owner/project-ci", "--digest", digestOf 'a'
             , "--fingerprint", first, "--native-manifest", replicate 64 'b'
-            , "--ghc", "9.12.2", "--cabal", "3.16.1.0"
+            , "--ghc", "9.14.1", "--cabal", "3.18.1.0"
             , "--output", scratch fixture </> "descriptor.json"
             ]
         (built, errors) `shouldBe` (ExitSuccess, "")
@@ -120,8 +120,8 @@ spec = describe "CI image" $ do
         plan ← planLinux fixture []
         toolchainEntry plan "ci-image" `shouldBe` Just (digest described)
         toolchainEntry plan "native-manifest" `shouldBe` Just (manifest described)
-        toolchainEntry plan "ghc" `shouldBe` Just "9.12.2"
-        toolchainEntry plan "cabal" `shouldBe` Just "3.16.1.0"
+        toolchainEntry plan "ghc" `shouldBe` Just "9.14.1"
+        toolchainEntry plan "cabal" `shouldBe` Just "3.18.1.0"
         (parseJson plan >>= field "ci_image" >>= field "reference" >>= asString)
           `shouldBe` Just "ghcr.io/owner/project-ci"
         -- A candidate that touches no image input is still selected exactly
@@ -168,7 +168,7 @@ spec = describe "CI image" $ do
         void $ gitIn fixture ["commit", "-q", "-m", "Retire the image recipe"]
         plan ← planLinux fixture []
         toolchainEntry plan "ci-image" `shouldBe` Nothing
-        toolchainEntry plan "ghc" `shouldBe` Just "9.12.2"
+        toolchainEntry plan "ghc" `shouldBe` Just "9.14.1"
 
     it "never lets a local plan claim the Linux image digest" $
       withFixture $ \fixture → do
@@ -207,9 +207,9 @@ spec = describe "CI image" $ do
         declared ← strictRead (scratch fixture </> "toolchain.txt")
         sort (lines declared)
           `shouldBe` sort
-            [ "cabal=3.16.1.0"
+            [ "cabal=3.18.1.0"
             , "ci-image=" ++ digestOf 'a'
-            , "ghc=9.12.2"
+            , "ghc=9.14.1"
             , "native-manifest=" ++ workerManifest worker
             ]
         planned ← environmentOfPlan fixture (workerPlan worker)
@@ -547,7 +547,7 @@ commitDescriptor fixture = change fixture "tools/ci-image/descriptor.json" . des
 describedImage ∷ Fixture → IO Descriptor
 describedImage fixture = do
   current ← fingerprintNow fixture
-  let described = Descriptor (digestOf 'a') (replicate 64 'b') current "9.12.2" "3.16.1.0"
+  let described = Descriptor (digestOf 'a') (replicate 64 'b') current "9.14.1" "3.18.1.0"
   commitDescriptor fixture described
   pure described
 
@@ -558,7 +558,7 @@ descriptorNow fixture = do
   pure (Descriptor (value "digest") (value "native_manifest") (value "recipe_fingerprint") (value "ghc") (value "cabal"))
 
 linuxPins ∷ [String]
-linuxPins = ["--runner-os", "Linux", "--toolchain", "ghc=9.12.2", "--toolchain", "cabal=3.16.1.0"]
+linuxPins = ["--runner-os", "Linux", "--toolchain", "ghc=9.14.1", "--toolchain", "cabal=3.18.1.0"]
 
 planRaw ∷ Fixture → String → Maybe String → [String] → IO (ExitCode, String, String)
 planRaw fixture head' candidate extra =
@@ -653,13 +653,13 @@ withWorker action = withFixture $ \fixture → do
     pythonIn fixture [checkout fixture </> "tools/native/native.py", "record", "--prefix", prefix]
   (recorded, recordErrors) `shouldBe` (ExitSuccess, "")
   hash ← sha256Of fixture (prefix </> "hetoimasia-native-manifest.json")
-  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.12.2" "3.16.1.0")
+  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.14.1" "3.18.1.0")
   plan ← planLinux fixture []
   let planPath = scratch fixture </> "plan.json"
   writeFile planPath plan
   createDirectoryIfMissing True stubs
-  writeFile (stubs </> "ghc-version") "9.12.2\n"
-  writeFile (stubs </> "cabal-version") "3.16.1.0\n"
+  writeFile (stubs </> "ghc-version") "9.14.1\n"
+  writeFile (stubs </> "cabal-version") "3.18.1.0\n"
   writeFile (stubs </> "store") (image </> "cabal/store\n")
   executableFile (stubs </> "ghc") ("#!/bin/sh\ncat '" ++ stubs </> "ghc-version" ++ "'\n")
   executableFile
@@ -788,7 +788,7 @@ labelledAnswer recipeLabel manifestLabel =
     ++ recipeLabel
     ++ "\", \"org.hetoimasia.ci-image.native-manifest\": \""
     ++ manifestLabel
-    ++ "\", \"org.hetoimasia.ci-image.ghc\": \"9.12.2\", \"org.hetoimasia.ci-image.cabal\": \"3.16.1.0\"}}"
+    ++ "\", \"org.hetoimasia.ci-image.ghc\": \"9.14.1\", \"org.hetoimasia.ci-image.cabal\": \"3.18.1.0\"}}"
 
 builder ∷ Registry → String → [String] → IO (ExitCode, String, String)
 builder registry command extra =
@@ -799,8 +799,8 @@ builder registry command extra =
     ( [ registryCheckout registry </> "tools/ci-image/builder.py", command
       , "--image", "ghcr.io/owner/project-ci"
       , "--fingerprint", fingerprintX
-      , "--ghc", "9.12.2"
-      , "--cabal", "3.16.1.0"
+      , "--ghc", "9.14.1"
+      , "--cabal", "3.18.1.0"
       , "--registry", registryTool registry
       ]
         ++ extra

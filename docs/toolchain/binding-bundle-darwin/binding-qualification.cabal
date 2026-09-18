@@ -1,0 +1,14 @@
+cabal-version: 3.16
+name: binding-qualification
+version: 0
+build-type: Simple
+
+library
+    exposed-modules: Qualification
+    hs-source-dirs: src
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    build-depends:
+        base,
+        vulkan ==3.27,
+        vulkan-utils ==0.5.11.0

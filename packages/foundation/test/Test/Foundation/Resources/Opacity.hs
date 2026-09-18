@@ -68,7 +68,7 @@ scopedSpec = describe "Scoped opacity across the package boundary" $ do
   it "rejects a client that names the constructor" $
     withClient "Client.hs" constructorClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "does not export any children"
+      rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "Scoped"
 
   it "accepts and runs a client using only the runner and the allocators" $
@@ -126,7 +126,7 @@ cleanupEvidenceSpec =
     it "rejects a client that names the entry constructor" $
       withClient "Client.hs" evidenceConstructorClient $ \compile → do
         outcome ← compile Typecheck
-        rejectedBecause outcome "does not export any children"
+        rejectedBecause outcome "GHC-10237"
         clientOutput outcome `shouldContain` "CleanupFailure"
 
     it "accepts and runs a client using only the readers and reattachment" $
@@ -163,13 +163,13 @@ collectionSpec =
     it "rejects a client that names the collection constructor" $
       withClient "Client.hs" (collectionConstructorClient "Collection (Collection)" "Collection") $ \compile → do
         outcome ← compile Typecheck
-        rejectedBecause outcome "does not export any children"
+        rejectedBecause outcome "GHC-10237"
         clientOutput outcome `shouldContain` "Collection"
 
     it "rejects a client that names the member token constructor" $
       withClient "Client.hs" (collectionConstructorClient "Member (Member)" "Member") $ \compile → do
         outcome ← compile Typecheck
-        rejectedBecause outcome "does not export any children"
+        rejectedBecause outcome "GHC-10237"
         clientOutput outcome `shouldContain` "Member"
 
     it "rejects a client that rewrites a collection with record update" $

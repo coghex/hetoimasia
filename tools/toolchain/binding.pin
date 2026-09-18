@@ -1,0 +1,28 @@
+# The Vulkan binding this repository has qualified against the pinned Haskell
+# toolchain, and the flags it is qualified with. Nothing builds against these
+# values yet: there is no `packages/gpu-vulkan` Cabal package, and the Linux CI
+# image carries no Vulkan input. They exist so the later Vulkan slices inherit a
+# proven pair rather than re-deciding it, and so `qualify-binding.sh` can prove
+# the pair still resolves and builds on demand. See docs/toolchain.md.
+VULKAN_VERSION=3.27
+VULKAN_UTILS_VERSION=0.5.11.0
+
+# The two flags the engine's use of the binding requires, both opposite to the
+# package's own defaults.
+#
+# `safe-foreign-calls` marks the foreign imports `safe` instead of `unsafe`, so
+# a Vulkan call may re-enter Haskell. Debug-utils messenger callbacks and
+# allocation callbacks are exactly that re-entry, and with the default `unsafe`
+# imports they corrupt the RTS rather than fail.
+#
+# `darwin-lib-dirs` appends the LunarG SDK's `/usr/local/lib` to
+# `extra-lib-dirs` on macOS whether or not the loader is there. It is disabled
+# so the loader is named by this repository rather than assumed by the
+# dependency; `qualify-binding.sh` passes the prefix explicitly.
+VULKAN_FLAG_SAFE_FOREIGN_CALLS=on
+VULKAN_FLAG_DARWIN_LIB_DIRS=off
+
+# The macOS loader prefix the qualification links against when
+# HETOIMASIA_VULKAN_PREFIX does not name another. `<prefix>/lib` must hold the
+# loader and `<prefix>/lib/pkgconfig/vulkan.pc` must describe it.
+MACOS_VULKAN_PREFIX=/usr/local
