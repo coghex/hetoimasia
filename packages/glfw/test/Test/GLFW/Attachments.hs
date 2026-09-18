@@ -56,6 +56,11 @@ import Hetoimasia.GLFW.Command
   , pollCompletion
   , submitWindowCommand
   )
+import Hetoimasia.GLFW.Internal.Attachment
+  ( AttachmentEvidence (evidenceFirstFailure)
+  , AttachmentFailure (DisposalFailure)
+  , AttachmentView (viewEvidence)
+  )
 import Hetoimasia.GLFW.Internal.Seam
   ( NativeCall (CreateWindow, DestroyWindow)
   , Seam
@@ -834,6 +839,14 @@ testMetadataRejectedBeforeConstruction = do
   -- Incarnations are issued by the reservation, and neither rejection made one.
   readIORef incarnation `shouldReturn` Just 1
 
+-- | The typed failure the model recorded as one attachment's own evidence.
+recordedFailureOf ∷ WindowHost → AttachmentId → IO (Maybe Scripted)
+recordedFailureOf host target = do
+  seen ← atomically (Private.hostAttachmentView host target)
+  pure $ case evidenceFirstFailure . viewEvidence =<< seen of
+    Just (DisposalFailure (ExceptionWithContext _ failure)) → fromException failure
+    _ → Nothing
+
 -- | The typed failure a rejected declaration was answered with.
 declarationFailureOf ∷ GraphicsAttachment → Maybe Scripted
 declarationFailureOf = \case
@@ -873,6 +886,9 @@ testMetadataFailsOnTurn = do
     atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
     destroyCalls seam `shouldReturn` []
     slotOccupied host window `shouldReturn` True
+    -- The failure the turn contained is the attachment's own evidence, kept
+    -- exactly as a failed step's is.
+    recordedFailureOf host (graphicsAttachment service) `shouldReturn` Just (Scripted "declaration")
     _ ← forkIO (publishFacts journal host owner allRetirementFacts)
     turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
   entries ← readTVarIO journal
