@@ -78,10 +78,6 @@ static void *budgeted(void *ud, void *block, size_t was, size_t wanted)
   return realloc(block, wanted);
 }
 
-/* The binding's registration of the metatable a Haskell function's userdata
-** carries. Its header is not installed; the symbol is. */
-extern void hslua_registerhsfunmetatable(lua_State *L);
-
 int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acquired)
 {
   int status;
@@ -96,7 +92,6 @@ int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acqu
   if (L == NULL) {
     return LUA_ERRMEM;
   }
-  hslua_registerhsfunmetatable(L);
   lua_settop(L, 0);
 
   remaining = budget;

@@ -1,17 +1,30 @@
 /*
-** Publishing a Haskell function as a Lua global, with every allocation inside
-** a protected Lua call.
+** Publishing a Haskell function as a Lua global, and the C side of calling one
+** back.
 **
-** Publication allocates twice: the userdata that carries the Haskell function,
-** and the string that names it. Either can fail, and a Lua allocation failure
-** is a Lua error. Raised from a call Haskell made directly, that error finds no
-** protected frame, reaches Lua's panic function, and ends the process; the
-** binding's own `hslua_setglobal` pushes its key before entering its internal
-** protected call, so it has the same exposure.
+** This package owns the callback path rather than using the binding's, for two
+** reasons it could not work around from outside.
 **
-** So the whole of it runs inside one `lua_pcall` here, and the caller is
-** answered with a status. Nothing crosses into this file that could allocate on
-** the way: the arguments are a light userdata, a pointer, and an integer.
+** The first is allocation. Publication allocates twice -- the userdata that
+** carries the Haskell function, and the string that names it -- and an
+** allocation failure in Lua is a Lua error. Raised from a call Haskell made
+** directly it finds no protected frame, reaches Lua's panic function, and ends
+** the process; the binding's own `hslua_setglobal` pushes its key before
+** entering its internal protected call, so it has that exposure. Here the whole
+** publication is one `lua_pcall`, and nothing that could allocate crosses into
+** it: the arguments go in as light userdata and an integer.
+**
+** The second is cancellation. The binding reaches Haskell through its own
+** foreign export and runs more of its own Haskell after the called function
+** returns; an asynchronous exception delivered in that stretch unwinds through
+** a C frame and ends the process, and it is not code this package can mask.
+** `hetoimasia_lua_enter` is this package's export, so the only Haskell between
+** Lua calling in and the callback thread ending is its own, and all of it is
+** masked but the callback's action.
+**
+** The error protocol is correspondingly this package's: a negative result count
+** means the value on top is the failure marker, and `lua_error` is raised from
+** C once every Haskell frame has returned.
 */
 #ifndef HETOIMASIA_LUA_PUBLISH_H
 #define HETOIMASIA_LUA_PUBLISH_H

@@ -107,13 +107,15 @@ disables; under that setting the flagged ones are `safe`.
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
 | `hetoimasia_lua_publish` (this package's C) | `safe` | publishing a callback, under protection |
+| `lua_touserdata`, `lua_remove` | `unsafe`, fixed | the callback entry, reading its carrier |
 | `hsluaL_newstate`, `hsluaL_requiref` | `unsafe`, fixed | constructing a VM and opening a library |
 | `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata` | `unsafe`, fixed | stack bookkeeping, rendering, and the escape marker |
 
-`lua_pushlstring` and `lua_newuserdatauv` appear only inside
-`hetoimasia_lua_publish`, where they run under a protected call; the binding's
-own `hslua_pushhsfunction` and `hslua_setglobal`, which would reach them
-unprotected, are not used. See *Allocation* below.
+`lua_pushlstring`, `lua_newuserdatauv`, and `luaL_newmetatable` appear only
+inside `hetoimasia_lua_publish`, where they run under a protected call; the
+binding's own `hslua_pushhsfunction`, `hslua_setglobal`, and `hslua_error`,
+which would reach them unprotected or bring their own export with them, are not
+used. See *Allocation* and *How callbacks re-enter* below.
 
 The `safe` calls are what let other Haskell work and other VMs progress while
 one VM is running a chunk: a `safe` call releases the capability for its
@@ -194,19 +196,32 @@ shim sets a flag at the exact instruction the userdata stores the pointer, and
 the bridge frees the pointer only when that flag says Lua never did. That is why
 the shim builds the userdata itself instead of calling the binding's
 `hslua_newhsfunction` — the instruction is inside that function, and nothing
-outside it can observe it. Everything else about the callback is still the
-binding's: the same metatable, the same `__gc`, the same C closure and foreign
-export.
+outside it can observe it.
 
 ### How callbacks re-enter
 
-`hslua_pushhsfunction` stores a `StablePtr` to the Haskell operation in a
-userdata with a `__call` metamethod, wrapped in a C closure. Calling it from Lua
-reaches Haskell through the binding's `foreign export ccall hslua_callhsfun`.
+This package owns the callback path. `bridge/cbits/hetoimasia_lua_publish.c`
+builds a userdata that carries a stable pointer to the Haskell operation, gives
+it a metatable whose `__gc` frees that pointer and whose `__metatable` keeps a
+script away from it, and wraps it in a C closure. Lua calls that closure, which
+calls this package's own `foreign export`, `hetoimasia_lua_enter`.
+
+Using the binding's equivalent is what the two previous sections rule out. It
+allocates outside protection, and it runs more of its own Haskell after the
+function it called returns — an asynchronous exception delivered there unwinds
+through a C frame and ends the process, and it is not code this package can
+mask. With its own export, the only Haskell between Lua calling in and the
+callback thread ending is this package's, and all of it is masked but the
+action.
+
+The error protocol is correspondingly this package's. A negative result count
+means the value on top is the failure marker; `lua_error` is raised by the C
+closure, after every Haskell frame has returned, because a `longjmp` through one
+is undefined.
 
 That export runs the callback **in a Haskell thread of its own**, not in the
-thread that called `evalChunk`. Two consequences follow, and both are load
-bearing:
+thread that called `evalChunk` — that is how GHC's foreign exports work, and two
+consequences follow:
 
 - A callback cannot be cancelled by cancelling the calling thread, and the
   calling thread cannot observe the callback's own thread.
@@ -229,13 +244,26 @@ address: a pointer rendered into text is still a native address, and `LuaFault`
 crosses the package boundary. Absence is read from the stack depth, so a
 `false` error value is reported as a boolean rather than mistaken for nothing.
 
-A Haskell exception inside a callback never crosses the C frame. The trampoline
-runs the callback's own action unmasked, so a cancellation aimed at it is
-delivered there and caught with the context it carried; everything after the
-action — recording the failure, building the result, returning through the C
-frame — is masked, because an exception delivered in that stretch would unwind
-through a frame that is not Haskell's. The recorded failure becomes an ordinary
-Lua error carrying the escape marker. Lua may catch that with `pcall` and
+A Haskell exception inside a callback never crosses the C frame. The entry runs
+the callback's own action unmasked, so a cancellation aimed at it is delivered
+there and caught with the context it carried; everything after the action —
+recording the failure, building the result, returning — is masked, because an
+exception delivered in that stretch would unwind through a frame that is not
+Haskell's. The recorded failure becomes an ordinary Lua error carrying the
+escape marker.
+
+Masking stops a cancellation from unwinding; it does not stop one from being
+pending. A `throwTo` blocked against the mask is delivered the moment the mask
+lifts, and a callback thread that ends killed is reported by the export's
+epilogue as an uncaught exception the process does not survive. So before
+returning, the entry lets each pending cancellation in through a window of its
+own and drops it. Dropping is right rather than expedient: the thread is the
+runtime's, made for one call and ending with it, and a cancellation arriving
+after the action has finished cannot stop work that is already done — while a
+failure the action itself suffered was recorded on the VM first and is still
+owed to the caller. `lua-hazard callback-cancellation` fires three cancellations
+at each of fifty callbacks and requires every one to be delivered, contained,
+and survived. Lua may catch that with `pcall` and
 finish the chunk successfully; the operation's boundary still re-raises the
 recorded exception, with its own type and context, and adds its operation to
 that context. The first escape of an operation is the one kept, and an operation
@@ -280,14 +308,9 @@ Rejected:
   to catch it.
 - **Any allocating Lua operation from inside a callback.** A raise there unwinds
   out of a Haskell frame to the protected call outside it.
-- **Cancelling a callback's own thread from outside it.** A cancellation
-  delivered inside the callback's action is caught and contained, and
-  `lua-hazard callback-cancellation` proves that fifty times over. One
-  delivered after the action, while the binding's own export stub is finishing,
-  is not: that code is not this bridge's and cannot be masked by it, and an
-  uncaught exception there ends the process. Nothing here hands out a callback
-  thread's identity, which is what makes it unreachable; LUA-3's registration
-  surface must not start.
+- **Reaching Lua from a callback with anything that allocates.** A raise there
+  unwinds out of a Haskell frame to the protected call outside it. The entry
+  pushes only a boolean or a light userdata for that reason.
 
 ### Process-global state and thread affinity
 

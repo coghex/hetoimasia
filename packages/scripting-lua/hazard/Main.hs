@@ -234,8 +234,10 @@ capabilityRelease = do
 -- rather than its own.
 --
 -- The cancellation is coordinated, not hoped for: the callback publishes its
--- thread and parks interruptibly, so the exception is delivered inside the
--- action and the count of deliveries is checked, not assumed.
+-- thread and parks interruptibly, so the first exception is delivered inside
+-- the action and the count of deliveries is checked, not assumed. The two that
+-- follow it overlap the masked epilogue, which is the half a fixture cannot
+-- coordinate and can only repeat.
 callbackCancellation ∷ IO ()
 callbackCancellation = do
   vm ← newVm [LibraryBase]
@@ -251,16 +253,13 @@ callbackCancellation = do
         -- The callback has published its thread and is parked in its own
         -- action: a cancellation aimed here is delivered, not merely sent.
         target ← takeMVar live
-        -- One, and deliberately one. It reaches the action, where the
-        -- trampoline can catch it, and the trampoline's own epilogue runs
-        -- masked from there. What a second one would reach is the binding's
-        -- export stub, after this bridge's code has returned and before the
-        -- callback thread ends -- a stretch the bridge does not own and cannot
-        -- mask, where an uncaught exception ends the process. That is a
-        -- rejected path, recorded in the package contract, and it is reachable
-        -- only by something holding a callback thread's identity, which
-        -- nothing here hands out.
-        _ ← forkIO (throwTo target ThreadKilled)
+        -- Three of them. The first reaches the action, where the entry can
+        -- catch it; the rest arrive while the entry is finishing under its
+        -- mask, which is the stretch that would otherwise unwind through a C
+        -- frame. Every Haskell instruction between Lua calling in and this
+        -- thread ending belongs to this package, which is why the later ones
+        -- have nowhere to land.
+        mapM_ (\_ → forkIO (throwTo target ThreadKilled)) [1 .. 3 ∷ Int]
         result ← timeout boundMicroseconds (takeMVar outcome)
         case result of
           Just (Left thrown)

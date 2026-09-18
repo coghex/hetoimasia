@@ -35,15 +35,22 @@ module Hetoimasia.Scripting.Lua.Internal.Callback
   , escapeMarker
   ) where
 
-import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithContext)
+import Control.Exception
+  ( ExceptionWithContext
+  , SomeException
+  , allowInterrupt
+  , mask
+  , try
+  , tryWithContext
+  )
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Control.Monad (when)
 import Foreign.C (CChar, CInt (CInt), CSize (CSize))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr, nullPtr)
-import Foreign.StablePtr (StablePtr, freeStablePtr, newStablePtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.StablePtr (StablePtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
@@ -59,13 +66,15 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
 import Lua
   ( NumResults (NumResults)
   , PreCFunction
+  , StackIndex (StackIndex)
   , State (State)
   , StatusCode (StatusCode)
-  , hslua_error
   , lua_gettop
   , lua_pushboolean
   , lua_pushlightuserdata
+  , lua_remove
   , lua_settop
+  , lua_touserdata
   , data FALSE
   , data LUA_OK
   , data TRUE
@@ -78,7 +87,7 @@ import Lua
 -- call back into Haskell.
 foreign import ccall safe "hetoimasia_lua_publish.h hetoimasia_lua_publish"
   hetoimasia_lua_publish
-    ∷ State → StablePtr PreCFunction → Ptr CChar → CSize → Ptr CInt → IO StatusCode
+    ∷ State → StablePtr Installed → Ptr CChar → CSize → Ptr CInt → IO StatusCode
 
 -- | What a bridge callback answers Lua with.
 --
@@ -122,7 +131,7 @@ installCallback vm name action release =
       status ←
         ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
           alloca $ \acquired → do
-            carried ← newStablePtr (trampoline vm action)
+            carried ← newStablePtr (Installed vm action)
             reported ←
               hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize) acquired
             -- Freed here only when Lua never took it. Once the userdata holds
@@ -140,31 +149,87 @@ installCallback vm name action release =
           -- that fails.
           raiseEscape vm
 
--- | The C-callable wrapper around one Haskell operation.
+-- | What a carrier's stable pointer holds: the VM the callback belongs to, and
+-- the callback itself.
+data Installed = Installed !Vm !Callback
+
+-- | This package's entry from Lua into Haskell.
 --
--- Nothing escapes it. A failure is recorded on the VM and answered to Lua as an
--- ordinary error through the binding's own error protocol, which the C shim
--- turns into @lua_error@ once this function has returned -- so the @longjmp@
--- happens in C, after the Haskell frame is gone, rather than through it.
-trampoline ∷ Vm → Callback → PreCFunction
-trampoline vm action state = mask $ \restore → do
-  -- Only the callback's own action runs unmasked, so a cancellation aimed at it
-  -- is delivered there and caught here. Everything after it -- recording the
-  -- failure, building the result, returning through the C frame -- is masked:
-  -- a cancellation delivered in that stretch, or a second one after the first
-  -- was caught, would unwind through a frame that is not a Haskell frame.
-  outcome ← tryWithContext (restore action)
-  case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
-    Right NoResult → pure (NumResults 0)
-    Right (BooleanResult value) → do
-      -- Allocates nothing, so it cannot raise a Lua error from inside this
-      -- Haskell frame.
-      lua_pushboolean state (if value then TRUE else FALSE)
-      pure (NumResults 1)
-    Left captured → do
-      recordEscape vm captured
+-- Masked from its first instruction, and it is the /only/ Haskell that runs
+-- between Lua calling in and the callback thread ending -- which is why this
+-- package registers its own export rather than using the binding's. The
+-- binding's runs more of its own Haskell after the function it called returns,
+-- and an asynchronous exception delivered there unwinds through a C frame and
+-- ends the process; that code cannot be masked from outside it.
+--
+-- Only the callback's own action is unmasked, so a cancellation aimed at it is
+-- delivered there and caught with the context it carried. Nothing escapes: a
+-- failure is recorded on the VM and answered with a negative result count,
+-- which the C closure turns into a Lua error once this has returned.
+hetoimasiaEnter ∷ PreCFunction
+hetoimasiaEnter state = mask $ \restore → do
+  -- The C closure put the carrier below the call's own arguments.
+  carrier ← lua_touserdata state (StackIndex 1)
+  lua_remove state (StackIndex 1)
+  if carrier == nullPtr
+    then do
       lua_pushlightuserdata state escapeMarker
-      hslua_error state
+      pure failedResults
+    else do
+      stored ← peek (castPtr carrier)
+      Installed vm action ← deRefStablePtr stored
+      outcome ← tryWithContext (restore action)
+      results ← case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
+        Right NoResult → pure (NumResults 0)
+        Right (BooleanResult value) → do
+          -- Allocates nothing, so it cannot raise a Lua error from inside this
+          -- Haskell frame.
+          lua_pushboolean state (if value then TRUE else FALSE)
+          pure (NumResults 1)
+        Left captured → do
+          recordEscape vm captured
+          lua_pushlightuserdata state escapeMarker
+          pure failedResults
+      drainCancellations drainBudget
+      pure results
+
+foreign export ccall "hetoimasia_lua_enter" hetoimasiaEnter ∷ PreCFunction
+
+-- | Absorb any cancellation still aimed at this thread, before returning.
+--
+-- Masking this entry stops a cancellation from unwinding through the C frame
+-- while it runs. It does not stop one from being /pending/: a @throwTo@ blocked
+-- against the mask is delivered the moment the mask lifts, which is as this
+-- returns, and a callback thread that ends killed is reported by the export's
+-- own epilogue as an uncaught exception that the process does not survive.
+--
+-- So each one is let in through a window of this function's own choosing and
+-- dropped. Dropping is the right answer and not a shortcut: this thread is the
+-- runtime's, made for one call and ending with it, and a cancellation that
+-- arrives after the action has finished cannot stop work that is already done.
+-- A failure the action itself suffered was recorded on the VM before this runs,
+-- and is still owed to the caller.
+--
+-- The budget bounds a caller that simply keeps throwing; each blocked @throwTo@
+-- is delivered once, so an ordinary burst drains long before it.
+drainCancellations ∷ Int → IO ()
+drainCancellations budget
+  | budget <= 0 = pure ()
+  | otherwise = do
+      landed ← try @SomeException allowInterrupt
+      case landed of
+        Left _ → drainCancellations (budget - 1)
+        Right () → pure ()
+
+-- | How many pending cancellations one callback will absorb.
+drainBudget ∷ Int
+drainBudget = 64
+
+-- | The result count that means "the value on top is the failure marker".
+--
+-- Negative, because no real call returns a negative number of results.
+failedResults ∷ NumResults
+failedResults = NumResults (-1)
 
 installOperation ∷ Operation
 installOperation = operation "install-callback"
