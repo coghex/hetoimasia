@@ -2,6 +2,7 @@
 #include "hetoimasia_lua_bridge.h"
 
 #include <lauxlib.h>
+#include <lualib.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 
@@ -114,4 +115,79 @@ int hetoimasia_lua_publish_sweep(
   lua_close(L);
   *finalized = hetoimasia_lua_carriers_finalized() - before;
   return status;
+}
+
+/*
+** The same question of the global-lookup path.
+**
+** Reading a global allocates its key, and the binding's wrapper allocated it
+** before entering its own protected call. This starves the allocator at every
+** point along the replacement and reports what came back, how much the shim
+** left on the stack, and whether the state still works afterwards.
+*/
+int hetoimasia_lua_getglobal_sweep(
+  size_t budget, int *status, int *left, int *usable)
+{
+  int type;
+  int before;
+  lua_State *L;
+
+  *status = LUA_OK;
+  *left = -1;
+  *usable = 0;
+
+  remaining = (size_t) -1;
+  L = lua_newstate(budgeted, NULL);
+  if (L == NULL) {
+    return LUA_ERRMEM;
+  }
+  before = lua_gettop(L);
+
+  remaining = budget;
+  *status = hetoimasia_lua_getglobal(L, "a_global_that_is_absent", 23, &type);
+  /* One value either way: the result, or the error it failed with. */
+  *left = lua_gettop(L) - before;
+  lua_settop(L, before);
+
+  remaining = (size_t) -1;
+  *usable =
+    hetoimasia_lua_getglobal(L, "a_global_that_is_absent", 23, &type) == LUA_OK;
+  lua_settop(L, before);
+
+  lua_close(L);
+  return *status;
+}
+
+/*
+** And of the library-opening path, whose wrapper allocated the module's name
+** before its own protected call.
+*/
+int hetoimasia_lua_requiref_sweep(
+  size_t budget, int *status, int *left, int *usable)
+{
+  int before;
+  lua_State *L;
+
+  *status = LUA_OK;
+  *left = -1;
+  *usable = 0;
+
+  remaining = (size_t) -1;
+  L = lua_newstate(budgeted, NULL);
+  if (L == NULL) {
+    return LUA_ERRMEM;
+  }
+  before = lua_gettop(L);
+
+  remaining = budget;
+  *status = hetoimasia_lua_requiref(L, "string", luaopen_string, 1);
+  *left = lua_gettop(L) - before;
+  lua_settop(L, before);
+
+  remaining = (size_t) -1;
+  *usable = hetoimasia_lua_requiref(L, "table", luaopen_table, 1) == LUA_OK;
+  lua_settop(L, before);
+
+  lua_close(L);
+  return *status;
 }

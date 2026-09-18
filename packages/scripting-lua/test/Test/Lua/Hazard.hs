@@ -85,18 +85,44 @@ spec = describe "hazard" $ do
       status `shouldBe` ExitSuccess
       grew reported
 
-  it "reports memory exhaustion anywhere along publication instead of dying of it" $
+  it "reports memory exhaustion on every protected path instead of dying of it" $
     withHazard ["allocation-failure"] EndsItself $ \reported status → do
-      -- Every allocation on the path is the one that fails in some run, the
-      -- same state is published to again afterwards and must accept it, and the
-      -- carriers a state finalizes must be exactly those a publication took
-      -- ownership of -- no fewer, which is a stable pointer nothing releases,
-      -- and no more, which is a second release of one.
-      reported
-        `shouldContain` "HAZARD allocation-swept"
+      -- Publishing a callback, reading a global, and opening a standard library
+      -- each replaced a binding wrapper that allocated its arguments before
+      -- entering its own protected call. Each is starved at every point along
+      -- it, and each has to answer rather than end the process.
+      reported `shouldContain` "HAZARD allocation-swept"
+      refusedAndMade reported "publish"
+      refusedAndMade reported "lookup"
+      refusedAndMade reported "library"
+      -- A refusal is Lua's own memory status and not something else; the shim
+      -- leaves exactly one value either way; the state still works afterwards.
+      reported `shouldContain` "statuses=all-memory"
+      reported `shouldContain` "stack=balanced"
+      reported `shouldContain` "state=usable"
+      -- And for publication alone: a failed attempt leaves the state fit to
+      -- publish to again, and carriers are finalized exactly as often as they
+      -- were acquired.
       reported `shouldContain` "retries=all-accepted"
       reported `shouldContain` "finalization=exact"
       status `shouldBe` ExitSuccess
+
+-- | Assert that a swept path was both refused and completed at some budget.
+--
+-- Neither alone would mean anything: a path that is never refused was never
+-- starved, and one that never completes was starved past the point the sweep is
+-- about.
+refusedAndMade ∷ String → String → Expectation
+refusedAndMade reported path = do
+  positive (path <> "-refused")
+  positive (path <> "-made")
+  where
+    fields = map (fmap (drop 1) . break (== '=')) (words reported)
+    positive key = case lookup key fields of
+      Just value | [(count ∷ Int, "")] ← reads value, count > 0 → pure ()
+      _ →
+        expectationFailure
+          ("the sweep reported no " <> key <> " in: " <> reported)
 
 -- | Assert that the counter grew between the hook's two samples.
 --

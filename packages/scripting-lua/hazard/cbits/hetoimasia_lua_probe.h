@@ -51,3 +51,10 @@ int hetoimasia_lua_publish_sweep(
   int *first_acquired, int *second_status, int *second_acquired, long *finalized);
 
 #endif
+
+/* Starve the global-lookup path at `budget`, and report the status it answered,
+** how many values it left on the stack, and whether the state still works. */
+int hetoimasia_lua_getglobal_sweep(size_t budget, int *status, int *left, int *usable);
+
+/* The same for the library-opening path. */
+int hetoimasia_lua_requiref_sweep(size_t budget, int *status, int *left, int *usable);

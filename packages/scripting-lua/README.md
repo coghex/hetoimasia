@@ -167,17 +167,28 @@ package does from that position is therefore either non-allocating or wrapped:
   Haskell. `Test.Lua.Faults` pins that — a numeric error value renders in
   Haskell's formatting, not Lua's, which is the observable difference.
 
-`lua-hazard allocation-failure` is the evidence. The binding exports no
-`lua_newstate`, so an allocator that fails on demand cannot be installed from
-Haskell; the hazard runner builds one in C and walks its budget from nothing
-upwards, so every allocation on the publication path is the one that fails in
-some run. At each budget it then publishes to the *same* state with room to
-spare and requires that to succeed, and requires the carriers the state
-finalizes to equal exactly those a publication took ownership of. That pair is
-what a half-built state breaks: this package's carrier metatable is registered
-only once complete, because a metatable registered before its `__gc` is
-installed would be found by the next publication, believed finished, and leave a
-carrier nothing ever finalizes.
+`lua-hazard allocation-failure` is the evidence, for all three replaced paths.
+The binding exports no `lua_newstate`, so an allocator that fails on demand
+cannot be installed from Haskell; the hazard runner builds one in C and walks
+its budget from nothing upwards, so every allocation on each path is the one
+that fails in some run. Each path must be refused at some budget and complete at
+another — a path never refused was never starved — and every refusal must be
+Lua's own memory status rather than something else, the shim must leave exactly
+one value on the stack whether it succeeded or failed, and the state must still
+work afterwards.
+
+Publication is asked two things more. At each budget it publishes to the *same*
+state again with room to spare and requires that to succeed, and requires the
+carriers the state finalizes to equal exactly those a publication took ownership
+of. That pair is what a half-built state breaks: this package's carrier
+metatable is registered only once complete, because a metatable registered
+before its `__gc` is installed would be found by the next publication, believed
+finished, and leave a carrier nothing ever finalizes.
+
+What the child cannot show is what the bridge does with the status it gets back,
+because it has no `Vm`; `Test.Lua.Faults` holds that half, and requires
+`LUA_ERRMEM` to become `MemoryExhausted` rather than the rejected chunk it was
+read as before these paths were protected.
 
 Ownership of the Haskell function's stable pointer is reported rather than
 inferred. Several allocations can fail on that path and only some leave an owner

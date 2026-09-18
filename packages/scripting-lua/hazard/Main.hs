@@ -294,8 +294,8 @@ callbackCancellation = do
   where
     attempts = 50 ∷ Int
 
--- | Ask the publication path what it does when Lua cannot allocate -- at every
--- point along it, not only the first.
+-- | Ask each of this package's protected Lua operations what it does when Lua
+-- cannot allocate -- at every point along it, not only the first.
 --
 -- Publishing allocates several times over, and an allocation failure in Lua is
 -- a Lua error. Raised from a call Haskell made directly it would find no
@@ -303,7 +303,10 @@ callbackCancellation = do
 -- publication inside one. The binding exports no @lua_newstate@, so an
 -- allocator that fails on demand cannot be installed from Haskell; this builds
 -- one in C and walks its budget from nothing upwards, so every allocation on
--- the path is the one that fails in some run.
+-- each path is the one that fails in some run. Publication, reading a global,
+-- and opening a standard library are all swept: each replaced a binding wrapper
+-- that allocated its arguments before entering its own protected call, and each
+-- must now answer a status instead of ending this process.
 --
 -- Two things are checked at each budget, and they are the ones a partially
 -- built state would break. The same state is published to again with room to
@@ -312,43 +315,92 @@ callbackCancellation = do
 -- must equal the number of publications that took ownership -- no more, which
 -- would be a double free, and no fewer, which would be a stable pointer nothing
 -- will ever release.
+--
+-- The lookup and library paths are checked for the three things a caller of
+-- theirs relies on: that a refusal is Lua's own memory status and not something
+-- else, that the shim leaves exactly one value on the stack whether it
+-- succeeded or failed, and that the state still works afterwards.
 allocationFailure ∷ IO ()
 allocationFailure = do
-  swept ← traverse sweepAt [0 .. budgets]
-  let failed = length [() | (_, status, _, _, _, _) ← swept, status /= luaOk]
-      succeeded = length [() | (_, status, _, _, _, _) ← swept, status == luaOk]
-      retriesRefused =
-        [budget | (budget, _, _, retry, _, _) ← swept, retry /= luaOk]
+  swept ← traverse sweepPublication [0 .. budgets]
+  lookups ← traverse (sweepOne hetoimasia_lua_getglobal_sweep) [0 .. budgets]
+  libraries ← traverse (sweepOne hetoimasia_lua_requiref_sweep) [0 .. budgets]
+  let refusedPublications = [() | (_, status, _, _, _, _) ← swept, status /= luaOk]
+      madePublications = [() | (_, status, _, _, _, _) ← swept, status == luaOk]
+      retriesRefused = [budget | (budget, _, _, retry, _, _) ← swept, retry /= luaOk]
       miscounted =
         [ budget
         | (budget, _, first, _, second, finalized) ← swept
         , finalized /= fromIntegral (first + second)
         ]
-  case (retriesRefused, miscounted) of
-    ([], []) | failed > 0 && succeeded > 0 →
-      putStrLn
-        ( "HAZARD allocation-swept budgets="
-            <> show (length swept)
-            <> " refused="
-            <> show failed
-            <> " published="
-            <> show succeeded
-            <> " retries=all-accepted finalization=exact"
-        )
-    (refused, miscount)
-      | failed == 0 → report "no budget was small enough to refuse a publication"
-      | succeeded == 0 → report "no budget was large enough to publish"
+      -- Every refusal on either replacement path must be Lua's own memory
+      -- status; anything else would mean the failure came from somewhere other
+      -- than the allocator being starved.
+      misclassified =
+        [ budget
+        | (budget, status, _, _) ← lookups <> libraries
+        , status /= luaOk && status /= luaErrMem
+        ]
+      unbalanced = [budget | (budget, _, left, _) ← lookups <> libraries, left /= 1]
+      unusable = [budget | (budget, _, _, usable) ← lookups <> libraries, usable /= 1]
+      refusals outcomes = length [() | (_, status, _, _) ← outcomes, status /= luaOk]
+      successes outcomes = length [() | (_, status, _, _) ← outcomes, status == luaOk]
+  case (retriesRefused, miscounted, misclassified, unbalanced <> unusable) of
+    ([], [], [], [])
+      | not (null refusedPublications)
+      , not (null madePublications)
+      , refusals lookups > 0
+      , successes lookups > 0
+      , refusals libraries > 0
+      , successes libraries > 0 →
+          putStrLn
+            ( "HAZARD allocation-swept budgets="
+                <> show (length swept)
+                <> " publish-refused="
+                <> show (length refusedPublications)
+                <> " publish-made="
+                <> show (length madePublications)
+                <> " lookup-refused="
+                <> show (refusals lookups)
+                <> " lookup-made="
+                <> show (successes lookups)
+                <> " library-refused="
+                <> show (refusals libraries)
+                <> " library-made="
+                <> show (successes libraries)
+                <> " retries=all-accepted finalization=exact"
+                <> " statuses=all-memory stack=balanced state=usable"
+            )
+    (refused, miscount, misclass, misbehaved)
+      | null refusedPublications → report "no budget refused a publication"
+      | null madePublications → report "no budget published"
+      | refusals lookups == 0 → report "no budget refused a lookup"
+      | successes lookups == 0 → report "no budget completed a lookup"
+      | refusals libraries == 0 → report "no budget refused a library"
+      | successes libraries == 0 → report "no budget opened a library"
       | not (null refused) →
           report ("a retry on the same state was refused at budgets " <> show refused)
-      | otherwise →
+      | not (null miscount) →
           report ("carriers finalized did not match those acquired at budgets " <> show miscount)
+      | not (null misclass) →
+          report ("a refusal was not Lua's memory status at budgets " <> show misclass)
+      | otherwise →
+          report ("a shim left the state wrong at budgets " <> show misbehaved)
   where
     budgets = 39 ∷ Int
     luaOk = 0 ∷ CInt
+    -- Lua 5.4's LUA_ERRMEM.
+    luaErrMem = 4 ∷ CInt
     report reason = do
       putStrLn ("HAZARD allocation-unswept reason=" <> reason)
       exitWith (ExitFailure 4)
-    sweepAt budget = do
+    sweepOne sweep budget =
+      alloca $ \status →
+        alloca $ \left →
+          alloca $ \usable → do
+            _ ← sweep (fromIntegral budget) status left usable
+            (,,,) budget <$> peek status <*> peek left <*> peek usable
+    sweepPublication budget = do
       first ← newStablePtr trivialCallback
       second ← newStablePtr trivialCallback
       (status, firstTook, retry, secondTook, finalized) ←
@@ -413,3 +465,13 @@ foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_publish_sweep"
 -- | The hook's first two samples, and how many it took.
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_samples"
   hetoimasia_lua_probe_samples ∷ Ptr CLong → Ptr CLong → IO CInt
+
+-- | Starve the global-lookup path at one budget.
+foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_getglobal_sweep"
+  hetoimasia_lua_getglobal_sweep
+    ∷ CSize → Ptr CInt → Ptr CInt → Ptr CInt → IO CInt
+
+-- | Starve the library-opening path at one budget.
+foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_requiref_sweep"
+  hetoimasia_lua_requiref_sweep
+    ∷ CSize → Ptr CInt → Ptr CInt → Ptr CInt → IO CInt

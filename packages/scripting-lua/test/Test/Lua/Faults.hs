@@ -39,7 +39,7 @@ import Hetoimasia.Foundation.Failure
   )
 import Hetoimasia.Scripting.Lua.Bridge
   ( ErrorValue (ErrorMessage, ErrorOpaque)
-  , FaultKind (CallFailed, ChunkRejected, HandlerFailed)
+  , FaultKind (CallFailed, ChunkRejected, HandlerFailed, MemoryExhausted)
   , Library (LibraryBase, LibraryString)
   , LuaFault (faultKind, faultValue)
   , callGlobal
@@ -56,8 +56,9 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (NoResult)
   , installCallback
   )
-import Hetoimasia.Scripting.Lua.Internal.Fault (diagnosticLimit)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, diagnosticLimit)
 import Hetoimasia.Scripting.Lua.Internal.Vm (stackDepth)
+import Lua (data LUA_ERRERR, data LUA_ERRMEM, data LUA_ERRRUN, data LUA_ERRSYNTAX)
 import Test.Hspec
   ( Spec
   , describe
@@ -350,6 +351,17 @@ spec = describe "faults" $ do
           fromException thrown `shouldBe` Just (CallbackBroke "through __index")
       -- Not left behind for something unrelated to raise.
       evalChunk vm (chunkName "after") "rawset(_G, 'ignored', 1)"
+
+  it "classifies Lua's own status codes, memory exhaustion included" $ do
+    -- The other half of this is in "Test.Lua.Hazard": a starved allocator makes
+    -- the library-opening and lookup paths answer LUA_ERRMEM rather than end
+    -- the process, and this is what the bridge does with that answer. Reading
+    -- it as a rejected chunk, which is what it did before those paths were
+    -- protected, would report a script's syntax for the machine's memory.
+    classify LUA_ERRMEM `shouldBe` MemoryExhausted
+    classify LUA_ERRSYNTAX `shouldBe` ChunkRejected
+    classify LUA_ERRRUN `shouldBe` CallFailed
+    classify LUA_ERRERR `shouldBe` HandlerFailed
 
   it "classifies a message handler that fails as the handler's own failure" $
     withVm [LibraryBase] $ \vm → do
