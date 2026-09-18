@@ -23,9 +23,16 @@
 module VulkanProof (spec) where
 
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd, isInfixOf, isPrefixOf)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
+
+-- | The retained per-platform records, and the summary that quotes them.
+retainedRecords ∷ [(String, FilePath)]
+retainedRecords = [("macOS", "docs/vulkan/macos.md"), ("Linux", "docs/vulkan/linux.md")]
+
+compatibilityRecord ∷ FilePath
+compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
 -- | The package directory the proof lives in, as a project file would name it.
 proofPackage ∷ String
@@ -47,8 +54,8 @@ spec = describe "The Vulkan proof boundary" $ do
     -- The pin is the record; the constraint is what actually reaches the
     -- dependency. A flag flipped in one and not the other is the drift this
     -- example exists to catch.
-    settingOf pin "VULKAN_FLAG_SAFE_FOREIGN_CALLS" `shouldBe` Just "on"
-    settingOf pin "VULKAN_FLAG_DARWIN_LIB_DIRS" `shouldBe` Just "off"
+    settingOf pin "VULKAN_FLAG_SAFE_FOREIGN_CALLS=" `shouldBe` Just "on"
+    settingOf pin "VULKAN_FLAG_DARWIN_LIB_DIRS=" `shouldBe` Just "off"
     map trim (lines project) `shouldContain` ["vulkan +safe-foreign-calls,"]
     map trim (lines project) `shouldContain` ["vulkan -darwin-lib-dirs"]
 
@@ -79,11 +86,46 @@ spec = describe "The Vulkan proof boundary" $ do
     pin ← readFile "tools/vulkan-proof/environment.pin"
     let manifests =
           [ value
-          | name ← ["MACOS_VULKAN_DRIVER_MANIFEST", "LINUX_VULKAN_DRIVER_MANIFEST"]
+          | name ← ["MACOS_VULKAN_DRIVER_MANIFEST=", "LINUX_VULKAN_DRIVER_MANIFEST="]
           , Just value ← [settingOf pin name]
           ]
     length manifests `shouldBe` 2
     manifests `shouldSatisfy` all ("/" `isPrefixOf`)
+
+  it "keeps the summary's callback totals equal to the records they came from" $ do
+    -- The summary is declared authoritative for later Vulkan slices, and it
+    -- restates figures the raw records own. Regenerating a record and not the
+    -- summary is the drift this catches; it already happened once.
+    summary ← readFile compatibilityRecord
+    totals ← mapM (\(platform, path) → (,) platform . recordTotal <$> readFile path) retainedRecords
+    missing ←
+      pure
+        [ platform <> " reports " <> show total <> " callbacks, which the summary does not quote"
+        | (platform, Just total) ← totals
+        , not ((show total <> " deliveries") `isInfixOf` summary)
+        ]
+    missing `shouldBe` []
+    map snd totals `shouldSatisfy` all (/= Nothing)
+
+  it "retains a record for each platform, each naming the sources it proved" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          let digest = settingOf record "- source digest:"
+          case digest of
+            Nothing → expectationFailure (platform <> "'s record names no source digest")
+            Just value → do
+              let hex = trim value
+              length hex `shouldBe` 64
+              hex `shouldSatisfy` all (`elem` ("0123456789abcdef" ∷ String))
+      )
+      retainedRecords
+
+  it "proved both platforms from one tree, by the digest each computed" $ do
+    digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") retainedRecords
+    -- Computed independently: from a Git checkout on one, from the files the
+    -- container recipe copied on the other, with no checkout to consult.
+    length (nub (map (fmap trim) digests)) `shouldBe` 1
 
   it "never supplies the native-session consent itself" $ do
     -- AGENTS.md: the human's approval is given on one approved command, never
@@ -119,14 +161,22 @@ projectPackages path = collect . lines <$> readFile path
         then Just (drop (length name) (trim line))
         else Nothing
 
--- | One @NAME=value@ setting from a shell-style pin file, ignoring comments.
+-- | The first line beginning with a prefix, with that prefix removed. Serves
+-- both a shell-style @NAME=@ pin and a record's @- label:@ bullet, so the two
+-- readers here are one.
 settingOf ∷ String → String → Maybe String
-settingOf text name =
-  case [drop (length prefix) line | line ← map trim (lines text), prefix `isPrefixOf` line] of
+settingOf text prefix =
+  case [rest | line ← map trim (lines text), Just rest ← [stripPrefix prefix line]] of
     (value : _) → Just value
     [] → Nothing
-  where
-    prefix = name <> "="
+
+-- | The total a record reports, read from its own summary line.
+recordTotal ∷ String → Maybe Int
+recordTotal record = do
+  value ← settingOf record "- callbacks in total:"
+  case reads (trim value) of
+    [(total, "")] → Just total
+    _ → Nothing
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace

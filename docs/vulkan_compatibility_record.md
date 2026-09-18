@@ -60,7 +60,7 @@ together settle, and what they do not.
 | Surface extension | `VK_EXT_metal_surface` | `VK_KHR_xcb_surface` |
 | Presentation | `PRESENT_MODE_FIFO_KHR`, `FORMAT_B8G8R8A8_UNORM`, three images at 640×480 | `PRESENT_MODE_FIFO_KHR`, `FORMAT_B8G8R8A8_UNORM`, four images at 320×240 |
 | Capture | `TRANSFER_SRC` read back and matched | the same |
-| Callbacks | 77 deliveries, 1 during teardown, 3 during instance destruction | 105 deliveries, none during teardown, 2 during instance destruction |
+| Callbacks | 77 deliveries, 1 during teardown, 3 during instance destruction | 84 deliveries, none during teardown, 1 during instance destruction |
 | Teardown | ten releases, none failed | the same ten, none failed |
 
 Downstream slices may require Vulkan 1.3 with dynamic rendering and
@@ -151,8 +151,14 @@ on Lavapipe would have no reason to notice the gap.
 
 Creation and destruction produce plenty of naturally emitted diagnostics. On
 macOS: 54 callbacks during `vkCreateInstance`, 16 during `vkCreateDevice`, 1
-during teardown, 3 during `vkDestroyInstance`. On Linux: 62, 15, none, and 2,
-plus 24 during messenger creation that macOS did not produce. All of them re-enter Haskell from inside a
+during teardown, 3 during `vkDestroyInstance`. On Linux: 55, 14, none, and 1,
+plus 12 during messenger creation that macOS did not produce at all.
+
+Those counts are not stable across runs or across driver versions, and nothing
+asserts them; they are here to show the shape of the reentry, and the retained
+records are what they are taken from. `tools/test/VulkanProof.hs` checks that
+this summary still quotes the same totals the records carry, because a summary
+that quietly drifts from its own evidence is worse than one that quotes none. All of them re-enter Haskell from inside a
 Vulkan call on the binding's `+safe-foreign-calls` imports.
 
 Submission produced none of its own. Rather than claim reentry that did not

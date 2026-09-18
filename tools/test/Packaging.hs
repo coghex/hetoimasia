@@ -53,6 +53,9 @@ consumed =
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
   , ("tools/vulkan-proof/environment.pin", "VulkanProof.hs reads the driver manifests it pins")
   , ("tools/vulkan-proof/run-proof.sh", "VulkanProof.hs reads it to check it supplies no native-session consent")
+  , ("docs/vulkan/macos.md", "VulkanProof.hs reads the retained record it must agree with")
+  , ("docs/vulkan/linux.md", "VulkanProof.hs reads the retained record it must agree with")
+  , ("docs/vulkan_compatibility_record.md", "VulkanProof.hs checks it still quotes the records' own totals")
   ]
 
 -- | The packaging declaration the inventory is derived from.
