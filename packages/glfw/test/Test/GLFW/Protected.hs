@@ -173,6 +173,8 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testIndependentChains)
     it "keeps a stalled attachment and its window until independent evidence arrives, reporting the stall once"
       (boundedExample testStalledThenEvidence)
+    it "contains a declaration that fails after acquisition, retiring on independent evidence before it settles"
+      (boundedExample testMetadataFailsInDrain)
     it "retains a stalled diagnostic's own failure without unwinding anything it is holding"
       (boundedExample testStallDiagnosticFails)
     it "destroys a window that became safe before the drain, in a round that made no progress at all"
@@ -1024,6 +1026,79 @@ testStalledThenEvidence = do
   void (pure helper)
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
   stallReports entries `shouldReturn` 1
+
+-- | A declaration of the protocol that raises while the drain demands it is
+-- contained, exactly as a failed step is.
+--
+-- Declarations are demanded when the attachment is made, so this state is
+-- reached through the package's own after-acquisition seam. 'drainRetirement'
+-- raises nothing for it either: the failure becomes that attachment's own
+-- evidence, withdraws its progress path, and is settled against the body's
+-- outcome only once retirement is safe. The window and the session are retained
+-- until independent certified evidence retires the attachment — which is the
+-- whole difference from an exception escaping the drain, where the window and
+-- the session are released with every fact still owed.
+testMetadataFailsInDrain ∷ Expectation
+testMetadataFailsInDrain = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  helper ← forkIO (supplyEvidenceAfterFault journal hostHeld owned)
+  (failure, _) ←
+    caughtAs . asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha")
+              acknowledgement ← awaitAcknowledgement owner
+              atomically
+                ( faultHostAttachmentMetadata
+                    host
+                    (acknowledgedAttachment acknowledgement)
+                    (throw (Scripted "declaration"))
+                )
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  void (pure helper)
+  owner ← awaitHeld owned
+  -- The step was never entered: the declaration is demanded before it.
+  readTVarIO (ownerSteps owner) `shouldReturn` 0
+  -- Every fact was certified independently, and the window and the session were
+  -- released only afterwards.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  -- It is the drain's own retained evidence, settled after retirement was safe.
+  failure `shouldBe` Scripted "declaration"
+
+-- | The owner's completion authority, once its construction has stored it.
+awaitAcknowledgement ∷ Owner → IO Acknowledgement
+awaitAcknowledgement owner =
+  atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
+
+-- | Publish independent evidence once the drain has recorded the faulted
+-- declaration against the attachment and withdrawn its progress path.
+supplyEvidenceAfterFault ∷ TVar [Flag] → TVar (Maybe WindowHost) → TVar (Maybe Owner) → IO ()
+supplyEvidenceAfterFault journal hostHeld owned = do
+  owner ← awaitHeld owned
+  host ← awaitHeld hostHeld
+  atomically (afterDeclarationFailed host owner)
+  publishFacts journal host owner allRetirementFacts
+
+afterDeclarationFailed ∷ WindowHost → Owner → STM ()
+afterDeclarationFailed host owner = do
+  held ← readTVar (ownerAcknowledgement owner) >>= maybe retry pure
+  seen ← hostAttachmentView host (acknowledgedAttachment held)
+  case seen of
+    Just view | disposalEvidence (viewEvidence view) → pure ()
+    _ → retry
 
 -- | The stall diagnostic is claimed once, and its own failure may not unwind
 -- what the stall is retaining: the window is destroyed only after the evidence

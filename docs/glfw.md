@@ -2869,6 +2869,32 @@ construction failure runs the integration's owned rollback and keeps its
 original failure with that rollback's outcome as the attachment's evidence; only
 a safe rollback retires it.
 
+Before any of that, the attach call demands the protocol's own declarations —
+`protocolCompletion` and `protocolDisposition` — inside its own exception
+boundary. They are values the boundary reads rather than callbacks it enters, so
+a lazy one that raises when it is demanded would otherwise raise wherever a
+later boundary happened to read it: on an ordinary owner turn, or inside
+`drainRetirement`, which owes the protected exit that it raises nothing.
+Demanded here, such a failure answers `AttachmentMetadataRejected` and has
+reserved no slot, registered no protocol, entered no construction, run no
+rollback, and acquired nothing; it names no attachment, because none was issued.
+A cancellation delivered while they are demanded is this thread's own and is
+re-raised, exactly as one delivered an instant earlier would be. The callbacks
+are not demanded there: each is entered inside a handler that already answers
+its own failure.
+
+Every later boundary that reads a declaration demands it the same way, inside a
+handler of its own, so containment does not rest on the preflight having run.
+A declaration that fails after acquisition — which an immutable, already
+evaluated value cannot do on its own, and which the package's own examples
+therefore reach through an after-acquisition test seam — is recorded as that
+attachment's evidence and withdraws its progress path. It is evidence and never
+a fact: it retires nothing and authorizes destroying nothing, so the attachment,
+its window, the session, and every parent stay until independent certified
+evidence retires it. In the drain it settles into the same `DrainOutcome` a
+failed step does, behind an existing body failure and with a cancellation still
+deferred until retirement is safe.
+
 The rollback is trusted but not infallible, and construction is settled whatever
 it does. A rollback that raises or is cancelled established no safety, so it is
 recorded as unsafe: the attachment is retained owing every fact rather than left
@@ -2918,7 +2944,10 @@ withdrawn rather than run again; a duplicate and a refused notice reviving
 nothing; a cancellation queued while the window's own destruction is in flight,
 which defers until the session and a parent have outlived it; a stalled
 attachment finishing on later independent evidence, with the stall reported
-once; a stall diagnostic that itself fails, unwinding nothing; required and
+once; a stall diagnostic that itself fails, unwinding nothing; a declaration
+that raises while the drain demands it, contained as that attachment's evidence
+with its step never entered, its window and the session retained until
+independent evidence retires it, and the failure settled only afterwards; required and
 recognized-optional retirement-step failures with their evidence retained and
 their dispositions applied; closing a privately attached window during the run,
 which destroys nothing until every fact is certified; and a host built by
@@ -2967,7 +2996,19 @@ attachment has constructed nothing:
 | `GraphicsRefused (GraphicsWindowOccupied a)` | Another owner holds the slot, and holds it until it has safely retired |
 | `GraphicsRefused GraphicsForeignSession` | The window belongs to another session |
 | `GraphicsRefused GraphicsAdmissionEnded` | Attachment admission has closed; no new graphics use may begin |
+| `GraphicsMetadataRejected r` | A declaration the protocol carries raised when it was demanded |
 | `GraphicsHostUnprotected` | The host owns no retirement state at all |
+
+`CompletionPolicy` and `Disposition` are declarations rather than calls, and the
+boundary reads them itself on every round it offers the owner. Both are
+therefore **demanded inside the attach call, before anything is reserved**. One
+that raises when it is demanded answers `GraphicsMetadataRejected`, carrying the
+failure with the context it propagated with and naming no attachment, because
+none was issued: no slot was reserved, no protocol registered, no construction
+entered, and no rollback run, so there is nothing to retire and the window's
+slot is left exactly as it was found. The other four fields are callbacks, each
+entered inside a handler that already answers its own failure, so none is
+demanded early.
 
 A window of another host of the same session and one of this host's own that has
 ended are deliberately one answer. Telling them apart would need a record of
@@ -3131,6 +3172,22 @@ its step runs**, its path is withdrawn, and the refusal is counted in the demand
 the turn publishes. A backend that blocks inside a native call limits the
 latency this contract can claim, and must document that.
 
+Reading that declaration is itself protected. Every boundary that reads one —
+the running owner turn and the protected exit's own drain alike — demands
+`protocolCompletion` and `protocolDisposition` inside a handler of its own, so
+neither ever raises a declaration's failure out of ordinary progress or out of
+the drain, whose contract is that it raises nothing. Because both are demanded
+when the attachment is made, an evaluated, immutable declaration cannot begin
+failing afterwards; the containment is what the boundary owes a trusted input it
+re-reads, and the package's own examples reach that state through an
+after-acquisition test seam. When it does fire, the failure is recorded as that
+attachment's own evidence and its progress path is withdrawn, exactly as a
+failed step's is. It certifies nothing and **authorizes destroying nothing**:
+the attachment, its window, the session, and every parent are retained until
+independent certified evidence retires it, and in the drain the failure settles
+into the same outcome a failed step's does — behind an existing body failure,
+with a cancellation still deferred until retirement is safe.
+
 Progress runs on the main thread, outside every foundation finalizer, as a
 trusted narrow component operation. It runs no input, event, or game handler and
 no supervisor checkpoint.
@@ -3201,7 +3258,12 @@ and is advanced by none of it; a stalled owner's neighbour destroyed first and t
 stalled one finished on independent evidence; a budget of one rotating across
 three pending retirements, and a budget of one counting the attachment it never
 reached as deferred work even when the one it served withdrew; a blocking owner
-refused without its step running; a completion published from another thread
+refused without its step running; a declaration that raises when it is demanded,
+answered with nothing reserved, constructed, or rolled back and the slot left
+free for the next owner at the very first incarnation, for both declarations the
+boundary reads; one that raises after acquisition, contained on the owner turn
+with its step never entered and its window kept until independent evidence
+retires it; a completion published from another thread
 ending the owner's idle wait and folding into the next round;
 the scheduled loop polling the turn a detach begins,
 shortening the next wait to the instant that owner named, and polling again once

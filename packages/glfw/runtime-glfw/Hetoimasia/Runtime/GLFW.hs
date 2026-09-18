@@ -444,6 +444,17 @@
 -- refusal — a closing or ended window, an occupied one, another host or session,
 -- closed admission — is answered before any acquisition effect too.
 --
+-- The protocol's declarations are values this boundary reads rather than calls
+-- it makes, so they are demanded inside the attach call, before anything is
+-- reserved: one that raises when it is demanded answers
+-- 'GraphicsMetadataRejected' having reserved nothing, registered nothing, and
+-- constructed nothing, and never reaches a running owner turn or the protected
+-- exit's drain as an unprotected failure. A declaration that fails after the
+-- attachment was acquired is contained where it is read, recorded as that
+-- attachment's own evidence, and withdraws its progress path; it retires
+-- nothing, and the attachment, its window, and the session stay until
+-- independent certified evidence retires it.
+--
 -- A successful attachment hands back an opaque 'GraphicsService' and nothing
 -- else: an identity, an incarnation, and its own observation, with no native
 -- pointer, no window, no session, and no authority to destroy, release, or
@@ -580,6 +591,7 @@ module Hetoimasia.Runtime.GLFW
   , RetirementProgress (..)
   , RollbackOutcome (..)
   , RolledBack (..)
+  , MetadataRejection (..)
   , GraphicsRefusal (..)
   , AttachmentId
   , attachmentWindow

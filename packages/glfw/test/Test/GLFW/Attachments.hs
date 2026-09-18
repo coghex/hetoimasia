@@ -33,13 +33,15 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , throw
   , throwIO
   , try
   )
 import Control.Monad (forM, forM_, void, when)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
@@ -53,6 +55,11 @@ import Hetoimasia.GLFW.Command
   , observeWindowCommand
   , pollCompletion
   , submitWindowCommand
+  )
+import Hetoimasia.GLFW.Internal.Attachment
+  ( AttachmentEvidence (evidenceFirstFailure)
+  , AttachmentFailure (DisposalFailure)
+  , AttachmentView (viewEvidence)
   )
 import Hetoimasia.GLFW.Internal.Seam
   ( NativeCall (CreateWindow, DestroyWindow)
@@ -108,6 +115,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testClosedDuringConstruction)
     it "asks for a turn at once after a cancelled construction its rollback could not make safe"
       (boundedExample testCancelledRollbackWantsATurn)
+    it "answers a declaration that raises when it is demanded, having reserved and constructed nothing"
+      (boundedExample testMetadataRejectedBeforeConstruction)
 
   describe "observing the slot" $ do
     it "separates the close from the destruction, which follows the last retirement fact"
@@ -152,6 +161,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testUnservedCountedAsDeferred)
     it "refuses an owner that declares a blocking step, without running it, and reports the refusal"
       (boundedExample testBlockingOwnerRefused)
+    it "contains a declaration that fails after acquisition, retaining the window until independent evidence"
+      (boundedExample testMetadataFailsOnTurn)
     it "ends the owner's idle wait with a completion published from another thread, and folds it in the next round"
       (boundedExample testCompletionWakesTurn)
 
@@ -211,13 +222,14 @@ data OwnerScript = OwnerScript
   , scriptRollback ∷ IO RollbackOutcome
   , scriptPlan ∷ [Step]
   , scriptCompletion ∷ CompletionPolicy
+  , scriptDisposition ∷ Disposition
   }
 
 -- | An owner that constructs without effect and certifies every fact, one per
 -- opportunity.
 ownerNamed ∷ Text → OwnerScript
 ownerNamed name =
-  OwnerScript name (pure ()) (pure RollbackSafe) (map Certify allRetirementFacts) FiniteCompletion
+  OwnerScript name (pure ()) (pure RollbackSafe) (map Certify allRetirementFacts) FiniteCompletion Required
 
 -- | One attached scripted owner, as the example observes it.
 data Owner = Owner
@@ -267,7 +279,7 @@ protocolFor journal host owner script =
             next : rest → next <$ writeTVar (ownerPlan owner) rest
         perform acknowledgement step
     , protocolCompletion = scriptCompletion script
-    , protocolDisposition = Required
+    , protocolDisposition = scriptDisposition script
     , protocolRecognizes = \_ → pure False
     }
   where
@@ -783,6 +795,110 @@ testRollbackUnsafeRetains = do
     other → unexpected ("the unsafe rollback did not retain its slot: " <> show other)
   readIORef refusedLater >>= \answer →
     refusalOfAnswer <$> answer `shouldBe` Just (Just "occupied")
+
+-- | A declaration the protocol carries that raises when it is demanded is
+-- answered before anything is reserved.
+--
+-- Both declarations this boundary reads are covered: nothing is constructed,
+-- no rollback runs, no attachment is registered, and the window's exclusive
+-- slot is left exactly as it was found — so the next valid owner takes it with
+-- the very first incarnation, which no rejected attempt consumed.
+testMetadataRejectedBeforeConstruction ∷ Expectation
+testMetadataRejectedBeforeConstruction = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  rolledBack ← newIORef (0 ∷ Int)
+  answers ← newIORef []
+  incarnation ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    let counting =
+          (ownerNamed "faulty") {scriptRollback = modifyIORef' rolledBack (+ 1) >> pure RollbackSafe}
+        faulty =
+          [ counting {scriptCompletion = throw (Scripted "completion")}
+          , counting {scriptDisposition = throw (Scripted "disposition")}
+          ]
+    forM_ faulty $ \script → do
+      (_, answer) ← attachScripted journal host window script
+      modifyIORef' answers (<> [answer])
+      slotOccupied host window `shouldReturn` False
+      atomically (hostPendingAttachments host) `shouldReturn` []
+    -- No construction ran, so no rollback could have been owed one.
+    readTVarIO journal `shouldReturn` []
+    readIORef rolledBack `shouldReturn` 0
+    (owner, service) ← attachedOwner journal host window (ownerNamed "alpha")
+    writeIORef incarnation (Just (graphicsIncarnation service))
+    void (closeHostWindow host window)
+    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  readIORef answers >>= \case
+    [completion, disposition] → do
+      declarationFailureOf completion `shouldBe` Just (Scripted "completion")
+      declarationFailureOf disposition `shouldBe` Just (Scripted "disposition")
+    other → unexpected ("expected two answers, found " <> show (length other))
+  -- Incarnations are issued by the reservation, and neither rejection made one.
+  readIORef incarnation `shouldReturn` Just 1
+
+-- | The typed failure the model recorded as one attachment's own evidence.
+recordedFailureOf ∷ WindowHost → AttachmentId → IO (Maybe Scripted)
+recordedFailureOf host target = do
+  seen ← atomically (Private.hostAttachmentView host target)
+  pure $ case evidenceFirstFailure . viewEvidence =<< seen of
+    Just (DisposalFailure (ExceptionWithContext _ failure)) → fromException failure
+    _ → Nothing
+
+-- | The typed failure a rejected declaration was answered with.
+declarationFailureOf ∷ GraphicsAttachment → Maybe Scripted
+declarationFailureOf = \case
+  GraphicsMetadataRejected rejected →
+    case rejectedDeclaration rejected of
+      ExceptionWithContext _ failure → fromException failure
+  _ → Nothing
+
+-- | A declaration that fails once the attachment has been acquired is contained
+-- on the ordinary owner turn rather than raised out of it.
+--
+-- Metadata is demanded when the attachment is made, so this state is reached
+-- through the package's own after-acquisition seam. The turn records the
+-- failure as that attachment's evidence and withdraws its progress path: its
+-- step is never entered, its window is not destroyed, and only independent
+-- certified evidence retires it.
+testMetadataFailsOnTurn ∷ Expectation
+testMetadataFailsOnTurn = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  reported ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (owner, service) ← attachedOwner journal host window (ownerNamed "alpha")
+    void (closeHostWindow host window)
+    atomically
+      ( Private.faultHostAttachmentMetadata
+          host
+          (graphicsAttachment service)
+          (throw (Scripted "declaration"))
+      )
+    turnsExactly host control 3
+    demand ← atomically (hostRetirementDemand host)
+    writeIORef reported (Just demand)
+    -- The step was never entered, and nothing the declaration failed at
+    -- authorized destroying the window.
+    atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
+    destroyCalls seam `shouldReturn` []
+    slotOccupied host window `shouldReturn` True
+    -- The failure the turn contained is the attachment's own evidence, kept
+    -- exactly as a failed step's is.
+    recordedFailureOf host (graphicsAttachment service) `shouldReturn` Just (Scripted "declaration")
+    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  entries ← readTVarIO journal
+  -- Every fact was certified independently, and all of them precede the
+  -- destruction.
+  takeWhile (/= WindowGone 1) entries `shouldSatisfy` \before →
+    length [() | Certified{} ← before] == length allRetirementFacts
+  readIORef reported >>= \case
+    Just demand → retirementStalled demand `shouldBe` 1
+    Nothing → unexpected "the turn reported no retirement demand"
 
 -- | A cancellation delivered inside the construction is counted as evidence,
 -- establishes no fact, and publishes nothing; the run's own cancellation is
