@@ -2078,6 +2078,13 @@ hostAttachmentView host target = maybe (pure Nothing) (`attachmentViewOf` target
 --
 -- An unprotected host, and a target this host's model refuses, answer
 -- 'Nothing'; the refusal changes nothing.
+--
+-- A fact the model did not already hold revives that attachment's withdrawn
+-- progress path, so the next owner turn or drain round offers it one bounded
+-- opportunity. That is the same rule a notice published through
+-- 'hostCompletionPublisher' obeys once it is folded: the evidence decides, not
+-- the transport. A duplicate fact and a refusal establish nothing and revive
+-- nothing.
 reportHostRetirementFact
   ∷ HasCallStack ⇒ WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
 reportHostRetirementFact host acknowledgement fact =
