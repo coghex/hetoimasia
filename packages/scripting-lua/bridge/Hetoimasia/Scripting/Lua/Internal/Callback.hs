@@ -32,16 +32,16 @@ module Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (..)
   , Callback
   , installCallback
-  , escapeMessage
+  , escapeMarker
   ) where
 
-import Control.Exception (ExceptionWithContext, SomeException, tryWithContext)
-import Data.ByteString (ByteString)
+import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithContext)
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Foreign.C (CSize)
 import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (peek, poke)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
@@ -57,13 +57,12 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
 import Lua
   ( NumResults (NumResults)
   , PreCFunction
-  , State
   , hslua_error
   , hslua_pushhsfunction
   , hslua_setglobal
   , lua_gettop
   , lua_pushboolean
-  , lua_pushlstring
+  , lua_pushlightuserdata
   , lua_settop
   , data FALSE
   , data LUA_OK
@@ -82,13 +81,19 @@ data CallbackResult
 -- | A Haskell operation Lua may call. It takes no arguments.
 type Callback = IO CallbackResult
 
--- | The Lua error a failed callback raises in place of the Haskell exception.
+-- | The value a failed callback raises in Lua's terms.
 --
--- Fixed, ASCII, and short: it is a marker that something failed on the Haskell
--- side, never a rendering of the failure. The failure itself is reported to
--- Haskell, where its type and context survive.
-escapeMessage ∷ ByteString
-escapeMessage = "hetoimasia: a Haskell callback failed; see the Haskell boundary"
+-- A light userdata, and deliberately not a string. Pushing a string allocates,
+-- and an allocation failure raises a Lua error; raised here it would longjmp
+-- out of a Haskell frame to the protected call outside it, which is undefined
+-- rather than an error report. Pushing a light userdata allocates nothing.
+--
+-- It carries no information, which is the point: it marks that something failed
+-- on the Haskell side and is not a rendering of the failure. The failure itself
+-- is reported to Haskell, where its type and context survive. A script cannot
+-- mistake it for one of its own error values either.
+escapeMarker ∷ Ptr ()
+escapeMarker = nullPtr
 
 -- | Install a Haskell operation as a global of this VM.
 --
@@ -123,23 +128,24 @@ installCallback vm name action release =
 -- turns into @lua_error@ once this function has returned -- so the @longjmp@
 -- happens in C, after the Haskell frame is gone, rather than through it.
 trampoline ∷ Vm → Callback → PreCFunction
-trampoline vm action state = do
-  outcome ← tryWithContext action
+trampoline vm action state = mask $ \restore → do
+  -- Only the callback's own action runs unmasked, so a cancellation aimed at it
+  -- is delivered there and caught here. Everything after it -- recording the
+  -- failure, building the result, returning through the C frame -- is masked:
+  -- a cancellation delivered in that stretch, or a second one after the first
+  -- was caught, would unwind through a frame that is not a Haskell frame.
+  outcome ← tryWithContext (restore action)
   case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
     Right NoResult → pure (NumResults 0)
     Right (BooleanResult value) → do
+      -- Allocates nothing, so it cannot raise a Lua error from inside this
+      -- Haskell frame.
       lua_pushboolean state (if value then TRUE else FALSE)
       pure (NumResults 1)
     Left captured → do
       recordEscape vm captured
-      pushEscapeMessage state
+      lua_pushlightuserdata state escapeMarker
       hslua_error state
-
--- | Push the fixed escape message.
-pushEscapeMessage ∷ State → IO ()
-pushEscapeMessage state =
-  ByteString.unsafeUseAsCStringLen escapeMessage $ \(bytes, len) →
-    lua_pushlstring state bytes (fromIntegral len ∷ CSize)
 
 installOperation ∷ Operation
 installOperation = operation "install-callback"

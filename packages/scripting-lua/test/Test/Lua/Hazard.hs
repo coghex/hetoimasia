@@ -68,30 +68,39 @@ spec = describe "hazard" $ do
     -- instead, and the example would prove nothing about the foreign call.
     withHazard ["capability-release", "+RTS", "-N1", "-RTS"] EndsItself $ \reported status → do
       reported `shouldContain` "HAZARD progressed"
-      reported `shouldContain` "baseline=0"
+      reported `shouldContain` "samples=2"
       status `shouldBe` ExitSuccess
-      counted reported
+      grew reported
 
--- | Assert that the child counted substantial Haskell progress inside the
--- chunk's first block of pure Lua.
+  it "survives callback threads cancelled repeatedly while Lua is calling them" $
+    withHazard ["callback-cancellation"] EndsItself $ \reported status → do
+      reported `shouldContain` "HAZARD callbacks-survived"
+      -- The failure this guards against is a process that is no longer there
+      -- to report anything, so the exit status carries as much as the line.
+      status `shouldBe` ExitSuccess
+
+-- | Assert that the counter grew between the hook's two samples.
 --
--- Zero would mean the capability was never released. The threshold is not a
--- latency claim: it separates a thread that ran for the length of a
--- four-million-iteration Lua loop from the handful of instructions between the
--- handshake callback reading the counter and returning into C, which is the
--- only other window in which the count could move.
-counted ∷ String → Expectation
-counted reported = case lookup "during-first-block" (fields reported) of
-  Nothing → expectationFailure ("the report named no count: " <> reported)
-  Just value → case reads value of
-    [(progress ∷ Int, "")]
-      | progress >= 1000 → pure ()
-      | otherwise →
-          expectationFailure
-            ("Haskell made no real progress inside the Lua block: " <> reported)
-    _ → expectationFailure ("the count was not a number: " <> reported)
+-- Both are taken from inside Lua's instruction loop with nothing but Lua
+-- instructions between them, so growth there happened while Lua was executing
+-- and not inside a callback. The criterion is that they differ, not that they
+-- differ by some amount: how much they differ is throughput, and this is not a
+-- claim about throughput. Equal samples would mean no Haskell thread ran
+-- between two points inside the foreign call, which is what an `unsafe` import
+-- would produce.
+grew ∷ String → Expectation
+grew reported = case (number "first", number "second") of
+  (Just first, Just second)
+    | second > first → pure ()
+    | otherwise →
+        expectationFailure
+          ("no Haskell progress between two samples taken inside Lua: " <> reported)
+  _ → expectationFailure ("the report named no pair of samples: " <> reported)
   where
-    fields = map (fmap (drop 1) . break (== '=')) . words
+    fields = map (fmap (drop 1) . break (== '=')) (words reported)
+    number key = case lookup key fields of
+      Just value | [(parsed ∷ Int, "")] ← reads value → Just parsed
+      _ → Nothing
 
 -- | Whether a mode can end its own process.
 data Ending

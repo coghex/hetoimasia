@@ -18,11 +18,27 @@
 -- process when the mode cannot end itself, and keeps the exit status.
 module Main (main) where
 
-import Control.Concurrent (forkIO, threadDelay, throwTo)
+import Control.Concurrent
+  ( forkIO
+  , myThreadId
+  , threadDelay
+  , throwTo
+  , yield
+  )
+import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (Exception, SomeException, try)
+import Control.Exception
+  ( AsyncException (ThreadKilled)
+  , Exception
+  , SomeException
+  , try
+  )
 import Control.Monad (forever, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Foreign.C (CInt (CInt), CLong)
+import Foreign.Marshal.Alloc (alloca, free, malloc)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
 import Hetoimasia.Scripting.Lua.Bridge
   ( Library (LibraryBase)
   , chunkName
@@ -34,6 +50,8 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (BooleanResult, NoResult)
   , installCallback
   )
+import Hetoimasia.Scripting.Lua.Internal.Vm (vmState)
+import Lua (State (State))
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitWith)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -63,8 +81,11 @@ main = do
   case arguments of
     ["uninterruptible-lua"] → uninterruptibleLua 1
     ["capability-release"] → capabilityRelease
+    ["callback-cancellation"] → callbackCancellation
     _ → do
-      hPutStrLn stderr "usage: lua-hazard uninterruptible-lua|capability-release"
+      hPutStrLn
+        stderr
+        "usage: lua-hazard uninterruptible-lua|capability-release|callback-cancellation"
       exitWith (ExitFailure 2)
 
 -- | Run a chunk that never returns, cancel the thread running it, and report
@@ -105,52 +126,47 @@ uninterruptibleLua attempt
           -- example lives here. The suite ends it.
           forever (threadDelay maxBound)
 
--- | Show that Haskell runs during a substantial pure-Lua computation, on a
--- runtime with one capability.
+-- | Show that Haskell runs while Lua is executing instructions, on a runtime
+-- with one capability.
 --
--- The chunk's exit condition is Haskell work: it loops until @keep_going@
--- answers false, and only the Haskell thread below can make it do that. So the
--- chunk terminating at all means that thread ran. What makes the result mean
--- something is where it ran: the counter is read at the end of the chunk's
--- first block of pure Lua, before any Lua has called back a second time, so
--- what it counts happened while the interpreter was inside @lua_pcall@ and
--- nowhere else.
+-- The difficulty is not showing that Haskell ran. It is showing /when/. Every
+-- signal Haskell can observe from a running chunk arrives through a callback,
+-- and a callback is Haskell: work seen around one proves only that a Haskell
+-- thread ran while another Haskell thread was running, which is not the claim.
 --
--- With one capability, that is possible only because @lua_pcall@ is imported
--- @safe@ and releases it. An @unsafe@ import would hold the capability for the
--- whole call, and the count taken at the end of the first block would be zero.
+-- So the observation is made from inside Lua. A count hook samples the counter
+-- twice, both times from within Lua's instruction loop, with nothing but Lua
+-- instructions in between. Growth between those two samples happened while Lua
+-- was executing and could not have happened in a callback, because no callback
+-- runs between them.
+--
+-- With one capability that growth is possible only because @lua_pcall@ is
+-- imported @safe@ and releases the capability for its duration. An @unsafe@
+-- import would hold it for the whole call, no Haskell thread could run between
+-- two hook firings, and the two samples would be equal. The test is that they
+-- differ -- not that they differ by some amount, which would be a claim about
+-- throughput rather than about the foreign call.
+--
+-- What the hook costs is worth stating: it interrupts the interpreter every
+-- @probeInstructions@ instructions, which slows the chunk and creates yield
+-- points. That affects how much growth is seen. It does not create the growth,
+-- and nothing here reads a latency bound out of it.
 capabilityRelease ∷ IO ()
 capabilityRelease = do
   vm ← newVm [LibraryBase]
   started ← newEmptyMVar
   finished ← newEmptyMVar
-  counter ← newIORef (0 ∷ Int)
-  baseline ← newIORef (0 ∷ Int)
-  duringFirstBlock ← newIORef (Nothing ∷ Maybe Int)
   stop ← newIORef False
-  installCallback
-    vm
-    "started"
-    ( do
-        -- The count before the chunk's first block, so what the block is
-        -- credited with is growth and not a total.
-        readIORef counter >>= writeIORef baseline
-        putMVar started ()
-        pure NoResult
-    )
-    (pure ())
+  -- Plain memory, not an IORef: the sampling hook is C and reads it directly.
+  counter ← malloc
+  poke counter (0 ∷ CLong)
+  installCallback vm "started" (putMVar started () >> pure NoResult) (pure ())
   installCallback
     vm
     "keep_going"
-    ( do
-        recorded ← readIORef duringFirstBlock
-        case recorded of
-          Just _ → pure ()
-          Nothing → readIORef counter >>= writeIORef duringFirstBlock . Just
-        halt ← readIORef stop
-        pure (BooleanResult (not halt))
-    )
+    (BooleanResult . not <$> readIORef stop)
     (pure ())
+  hetoimasia_lua_arm_probe (vmState vm) counter probeInstructions
   _ ← forkIO $ do
     outcome ←
       try @SomeException
@@ -166,32 +182,101 @@ capabilityRelease = do
         )
     putMVar finished outcome
   takeMVar started
-  -- Count until the chunk's first block ends. Every increment here happens
-  -- while the interpreter is inside the foreign call.
+  -- Increment until the hook has both samples. Nothing here reads the clock.
   let count = do
-        recorded ← readIORef duringFirstBlock
-        case recorded of
-          Just _ → pure ()
-          Nothing → atomicModifyIORef' counter (\value → (value + 1, ())) >> count
-  ran ← timeout boundMicroseconds count
+        (taken, _, _) ← readSamples
+        if taken >= 2
+          then pure ()
+          else do
+            value ← peek counter
+            poke counter (value + 1)
+            yield
+            count
+  counted ← timeout boundMicroseconds count
   writeIORef stop True
   outcome ← timeout boundMicroseconds (takeMVar finished)
-  before ← readIORef baseline
-  reached ← readIORef duringFirstBlock
+  (taken, first, second) ← readSamples
   closeVm vm
-  case (ran, outcome, reached) of
-    (Just (), Just (Right ()), Just during) →
-      putStrLn
-        ( "HAZARD progressed baseline="
-            <> show before
-            <> " during-first-block="
-            <> show (during - before)
-        )
-    (Nothing, _, _) → report "the counting thread never saw the first block end"
-    (_, Nothing, _) → report "the chunk never returned"
-    (_, Just (Left failure), _) → report ("the chunk failed: " <> show failure)
-    (_, _, Nothing) → report "the chunk never reached its exit condition"
+  free counter
+  case (counted, outcome) of
+    (Just (), Just (Right ()))
+      | taken >= 2 →
+          putStrLn
+            ( "HAZARD progressed samples="
+                <> show taken
+                <> " first="
+                <> show first
+                <> " second="
+                <> show second
+            )
+      | otherwise → report "the hook never sampled twice inside the chunk"
+    (Nothing, _) → report "the counting thread never saw two samples"
+    (_, Nothing) → report "the chunk never returned"
+    (_, Just (Left failure)) → report ("the chunk failed: " <> show failure)
   where
     report reason = do
       putStrLn ("HAZARD no-progress reason=" <> reason)
       exitWith (ExitFailure 4)
+    readSamples =
+      alloca $ \first → alloca $ \second → do
+        taken ← hetoimasia_lua_probe_samples first second
+        (,,) (fromIntegral taken ∷ Int) <$> peek first <*> peek second
+
+-- | Cancel callback threads repeatedly while Lua is calling them.
+--
+-- The trampoline runs the callback's own action unmasked, so a cancellation
+-- aimed there is delivered and caught. Everything after it is masked, because
+-- the frame this returns through is C: an exception unwinding out of it is
+-- undefined, not an error report, and the failure it would produce is a crashed
+-- process rather than a failed example. So it is provoked here, where a crash
+-- is the suite's evidence rather than its own death.
+--
+-- Each call publishes its thread and is then cancelled several times over, so
+-- both windows are covered: inside the action, and after it while the
+-- trampoline is finishing.
+callbackCancellation ∷ IO ()
+callbackCancellation = do
+  vm ← newVm [LibraryBase]
+  targets ← newChan
+  calls ← newIORef (0 ∷ Int)
+  installCallback
+    vm
+    "emit"
+    ( do
+        target ← myThreadId
+        atomicModifyIORef' calls (\value → (value + 1, ()))
+        writeChan targets target
+        pure NoResult
+    )
+    (pure ())
+  _ ← forkIO . forever $ do
+    target ← readChan targets
+    -- Each throw on a thread of its own: throwTo waits for delivery, and the
+    -- masked stretch is exactly what it may have to wait for.
+    mapM_ (\_ → forkIO (throwTo target ThreadKilled)) [1 .. 3 ∷ Int]
+  outcome ←
+    try @SomeException
+      (evalChunk vm (chunkName "callbacks") "for index = 1, 500 do emit() end")
+  made ← readIORef calls
+  closeVm vm
+  putStrLn
+    ( "HAZARD callbacks-survived calls="
+        <> show made
+        <> " outcome="
+        <> either (const "cancelled") (const "completed") outcome
+    )
+
+-- | How many Lua instructions separate the hook's samples.
+--
+-- Large enough that the interpreter is unmistakably executing between them,
+-- small enough that both fall inside the chunk's first block.
+probeInstructions ∷ CInt
+probeInstructions = 200000
+
+-- | Arm Lua's count hook to sample a counter from inside the instruction loop.
+foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_arm_probe"
+  hetoimasia_lua_arm_probe ∷ State → Ptr CLong → CInt → IO ()
+
+-- | The hook's first two samples, and how many it took.
+foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_samples"
+  hetoimasia_lua_probe_samples ∷ Ptr CLong → Ptr CLong → IO CInt

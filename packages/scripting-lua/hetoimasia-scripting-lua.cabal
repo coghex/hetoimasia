@@ -24,6 +24,8 @@ category: Game
 build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
+extra-source-files:
+    hazard/cbits/hetoimasia_lua_probe.h
 
 source-repository head
     type: git
@@ -82,6 +84,11 @@ executable lua-hazard
     import: language
     hs-source-dirs: hazard
     main-is: Main.hs
+    -- Lua's own count hook, which is the only vantage point inside a pure-Lua
+    -- interval; see the header for why the question needs one.
+    c-sources: hazard/cbits/hetoimasia_lua_probe.c
+    include-dirs: hazard/cbits
+    includes: hetoimasia_lua_probe.h
     -- -N2 rather than -N: the hazard needs one capability for the thread that
     -- is inside Lua and one for the thread that observes it, on every machine
     -- that runs it.
@@ -90,6 +97,7 @@ executable lua-hazard
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         text >=2.1 && <2.2,
+        lua >=2.3.4 && <2.4,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge
 
@@ -124,6 +132,7 @@ test-suite lua-host-tests
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
+        temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0,

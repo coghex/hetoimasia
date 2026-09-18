@@ -107,7 +107,11 @@ disables; under that setting the flagged ones are `safe`.
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
 | `hsluaL_newstate`, `hsluaL_requiref` | `unsafe`, fixed | constructing a VM and opening a library |
-| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean` | `unsafe`, fixed | stack bookkeeping and rendering |
+| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata` | `unsafe`, fixed | stack bookkeeping, rendering, and the escape marker |
+
+`lua_pushlstring` appears nowhere in the bridge, for the reason in *Allocation*
+below; `lua_newuserdatauv` appears only inside `hslua_pushhsfunction`, which is
+the binding's, and is accounted for there.
 
 The `safe` calls are what let other Haskell work and other VMs progress while
 one VM is running a chunk: a `safe` call releases the capability for its
@@ -134,15 +138,52 @@ with the first workload that has a budget to weigh it against. The benefit is
 that Haskell finalizers remain available to LUA-2 and LUA-3 rather than being
 foreclosed here.
 
-Import safety is not the same question as whether a call can raise a Lua error,
-and the reporting path turns on the second. Once `lua_pcall` has returned there
-is no protected frame left, so a Lua error raised while building a diagnostic
-reaches Lua's panic function and ends the process. `luaL_ref` can raise on a
-memory error, and `lua_tolstring` allocates when it converts a number — so the
-bridge takes no registry reference at all, calls `lua_tolstring` only on a value
-that is already a string, and reads a number with the non-allocating accessors
-and formats it in Haskell. `Test.Lua.Faults` pins that: a numeric error value
+### Allocation, and where a Lua error can be raised
+
+Import safety is not the same question as whether a call can raise a Lua error.
+Almost every Lua operation that allocates can raise `LUA_ERRMEM`, and where that
+raise lands depends entirely on where the call was made from. There are two
+places, and they are not equally bad.
+
+**From inside a callback.** A protected frame exists — the caller's
+`lua_pcall`, further out — so a raise here `longjmp`s *out of a Haskell frame*
+to reach it. That is undefined behaviour, not an error report. So the
+trampoline uses only operations that allocate nothing: `lua_pushboolean` for a
+boolean result, and a light userdata for the escape marker rather than a string,
+because pushing a string allocates. `hslua_error` reads the binding's error
+sentinel out of the registry with a key that `hsluaL_newstate` already interned,
+so its lookup finds an existing short string and allocates nothing either.
+
+**From Haskell, outside any protected frame.** The reporting path after
+`lua_pcall` has returned is in this position, and so is `installCallback`, which
+is not reachable from inside Lua because the VM's gate is held. Here a raise
+finds no frame at all and runs Lua's panic function, which ends the process. No
+Haskell frame is unwound and nothing is corrupted, but the failure is a dead
+process rather than a `MemoryExhausted` fault.
+
+The reporting path is clean: it takes no registry reference (`luaL_ref` can
+raise) and calls `lua_tolstring` only on a value that is already a string, where
+it converts nothing; a number is read with the non-allocating accessors and
+formatted in Haskell. `Test.Lua.Faults` pins that — a numeric error value
 renders in Haskell's formatting, not Lua's, which is the observable difference.
+
+**`installCallback` is not clean, and this slice cannot make it so.** It reaches
+`lua_newuserdatauv` through `hslua_pushhsfunction`, and `hslua_setglobal` pushes
+its key with `lua_pushlstring` before its own internal `lua_pcall`. Both
+allocate outside protection, so a VM built under memory exhaustion aborts the
+process instead of reporting. Putting them behind a C-side protected call is not
+available from here: the binding installs only Lua's own four headers, so a shim
+of ours cannot call `hslua_newhsfunction` or name the `hslua_call_hs` closure,
+and building our own equivalents means owning the callback protocol and its
+metatable — a private binding, which this slice's scope excludes. The binding
+also exports no `lua_newstate`, so an allocator that fails on demand cannot be
+installed and the path cannot be tested from here either.
+
+**This is an owner decision, recorded rather than worked around.** The choices
+are to accept it — a process that dies on memory exhaustion during VM setup,
+which is where most embedders leave it — or to take over the callback
+publication path in this package's own C, which is a design change to the
+boundary and belongs to the owner, not to this slice.
 
 ### How callbacks re-enter
 
@@ -176,8 +217,12 @@ crosses the package boundary. Absence is read from the stack depth, so a
 `false` error value is reported as a boolean rather than mistaken for nothing.
 
 A Haskell exception inside a callback never crosses the C frame. The trampoline
-catches it with the context it carried, records it on the VM, and raises an
-ordinary Lua error carrying a fixed message. Lua may catch that with `pcall` and
+runs the callback's own action unmasked, so a cancellation aimed at it is
+delivered there and caught with the context it carried; everything after the
+action — recording the failure, building the result, returning through the C
+frame — is masked, because an exception delivered in that stretch would unwind
+through a frame that is not Haskell's. The recorded failure becomes an ordinary
+Lua error carrying the escape marker. Lua may catch that with `pcall` and
 finish the chunk successfully; the operation's boundary still re-raises the
 recorded exception, with its own type and context, and adds its operation to
 that context. The first escape of an operation is the one kept, and an operation
@@ -220,6 +265,10 @@ Rejected:
 - **Taking a registry reference, or converting a number to a string, on a
   reporting path.** Both can raise a Lua error where no protected frame is left
   to catch it.
+- **Any allocating Lua operation from inside a callback.** A raise there unwinds
+  out of a Haskell frame to the protected call outside it.
+- **Reporting memory exhaustion during VM setup.** See *Allocation* above; it is
+  a process abort, and an open decision.
 
 ### Process-global state and thread affinity
 
@@ -241,14 +290,28 @@ The suite runs with `-threaded -rtsopts -with-rtsopts=-N2`, and so does the
 thing: the hazard needs one thread inside Lua and one observing it.
 
 The independent-progress proof runs `lua-hazard capability-release` with
-`+RTS -N1`, overriding that. One capability is what makes the claim falsifiable:
-a Haskell thread can run during a foreign call only if the call released the
-capability, so an `unsafe` import would leave the count taken at the end of the
-chunk's first pure-Lua block at zero. With two capabilities the same example
-passes either way. The in-process example in `Test.Lua.Independence` shows a
-second VM running to completion while the first VM's call is outstanding, which
-is deterministic but says nothing about capability release; it does not claim
-to.
+`+RTS -N1`, overriding that. Two things make it mean something.
+
+One capability is what makes it falsifiable: a Haskell thread can run during a
+foreign call only if the call released the capability, so an `unsafe` import
+would let no Haskell run at all inside the call. With two capabilities the same
+example passes either way.
+
+And the observation is made from inside Lua, by a count hook in the hazard
+runner's own C. Every signal Haskell can see from a running chunk arrives
+through a callback, and a callback is Haskell — so work observed around one
+proves only that one Haskell thread ran while another did. The hook samples a
+counter twice from within Lua's instruction loop, with nothing but Lua
+instructions in between; growth between those samples happened while Lua was
+executing. The test is that they differ, not that they differ by some amount,
+which would be a claim about throughput. What the hook costs is that it
+interrupts the interpreter every 200,000 instructions, which slows the chunk and
+creates yield points: that changes how much growth is seen, not whether any is
+possible, and no latency bound is read out of it.
+
+The in-process example in `Test.Lua.Independence` shows a second VM running to
+completion while the first VM's call is outstanding. That is deterministic, and
+it says nothing about capability release; it does not claim to.
 
 ## Lifetimes
 

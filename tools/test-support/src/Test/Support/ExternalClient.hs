@@ -16,6 +16,7 @@ module Test.Support.ExternalClient
   , Mode (..)
   , withPackageClient
   , withStorePackageClient
+  , storeDatabases
   , rejectedBecause
   ) where
 
@@ -84,7 +85,7 @@ rejectedBecause outcome reason = do
 -- ambient package environment file, and @-hide-all-packages@ leaves the client
 -- with exactly the packages named.
 withPackageClient ∷ [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withPackageClient = clientWith []
+withPackageClient = clientWith False
 
 -- | 'withPackageClient', additionally exposing the dependency store this build
 -- resolved its Hackage packages from.
@@ -105,13 +106,11 @@ withPackageClient = clientWith []
 -- the example lists.
 withStorePackageClient
   ∷ [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withStorePackageClient packages name source use = do
-  stores ← storeDatabases
-  clientWith stores packages name source use
+withStorePackageClient = clientWith True
 
 clientWith
-  ∷ [FilePath] → [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-clientWith stores packages name source use = do
+  ∷ Bool → [String] → FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
+clientWith wantStore packages name source use = do
   compiler ← findExecutable "ghc"
   database ← findPackageDatabase
   case (compiler, database) of
@@ -136,7 +135,12 @@ clientWith stores packages name source use = do
                       <> " but this suite was built with "
                       <> showVersion fullCompilerVersion
                   )
-          (ExitSuccess, _, _) →
+          (ExitSuccess, _, _) → do
+            -- Asked from the client's own directory, not the checkout's: the
+            -- question is about this machine's Cabal configuration, and asking
+            -- it where the sources live would make a source tree the run cannot
+            -- write to a reason to answer nothing.
+            stores ← if wantStore then storeDatabases directory else pure []
             use $ \mode → do
               (status, out, err) ←
                 readCreateProcessWithExitCode
@@ -198,13 +202,24 @@ findPackageDatabase = do
 -- An answer is best effort: without @cabal@ on @PATH@, or with no store
 -- directory for this compiler, the list is empty and a client that needed one
 -- of those units is rejected for an environment reason the example checks for.
-storeDatabases ∷ IO [FilePath]
-storeDatabases = do
+storeDatabases ∷ FilePath → IO [FilePath]
+storeDatabases directory = do
   cabal ← findExecutable "cabal"
   case cabal of
     Nothing → pure []
     Just executable → do
-      reported ← readCreateProcessWithExitCode (proc executable ["path", "--store-dir"]) ""
+      -- `--ignore-project`, and asked from a directory of this run's own: a
+      -- `cabal path` that reads a project resolves that project's build
+      -- directory, which it will try to create. A checkout the run may not
+      -- write to -- an extraction a reviewer reads, a build sent elsewhere with
+      -- `--builddir` -- would then fail, and the answer would silently become
+      -- "no store" and every client would be rejected for the wrong reason.
+      -- Nothing about the store depends on the project, so nothing here reads
+      -- one.
+      reported ←
+        readCreateProcessWithExitCode
+          (proc executable ["path", "--ignore-project", "--store-dir"]) { cwd = Just directory }
+          ""
       case reported of
         (ExitSuccess, out, _) → case reverse (filter (not . null) (lines out)) of
           [] → pure []

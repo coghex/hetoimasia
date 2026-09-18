@@ -21,8 +21,11 @@
 -- evidence that the public surface is sufficient as well as narrow.
 module Test.Lua.Opacity (spec) where
 
+import Control.Exception (finally)
+import System.Directory (getPermissions, setPermissions, writable)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
 import Test.Hspec
   ( Spec
@@ -31,12 +34,14 @@ import Test.Hspec
   , it
   , shouldBe
   , shouldContain
+  , shouldNotBe
   , shouldNotContain
   )
 import Test.Support.ExternalClient
   ( Client (clientDirectory, clientOutput, clientStatus)
   , Mode (Link, Typecheck)
   , rejectedBecause
+  , storeDatabases
   , withStorePackageClient
   )
 
@@ -99,6 +104,22 @@ spec = describe "opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-scripting-lua"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "finds the dependency store without reading a project it cannot write to" $
+    withSystemTempDirectory "hetoimasia-readonly" $ \directory → do
+      -- A checkout shaped like this one that the run may not write to: an
+      -- extraction a reviewer reads, or a build sent elsewhere with
+      -- `--builddir`. Asking Cabal a question that makes it resolve this
+      -- project would make it try to create a build directory here and fail,
+      -- and the answer would silently become "no store" -- which rejects every
+      -- client above for a reason about the environment rather than about the
+      -- boundary.
+      writeFile (directory </> "cabal.project") "packages: .\n"
+      permissions ← getPermissions directory
+      found ←
+        (setPermissions directory permissions {writable = False} >> storeDatabases directory)
+          `finally` setPermissions directory permissions
+      found `shouldNotBe` []
 
   it "accepts, links, and runs a client using the whole public contract" $
     withClient "Main.hs" publicClient $ \compile → do

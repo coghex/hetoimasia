@@ -88,9 +88,16 @@ owning subsystem's contract/design when continuing its work.
   the audit is in the package README. Open follow-ups it records, all for later
   slices: cancelling a thread that is inside Lua cannot work with an
   asynchronous exception, so a supervisor that must reclaim a running task needs
-  a Lua-consulted hook or a process boundary (LUA-4 onward); and the `safe`-call
+  a Lua-consulted hook or a process boundary (LUA-4 onward); the `safe`-call
   cost of disabling `allow-unsafe-gc` is unmeasured and belongs with the first
-  workload that has a budget to weigh it against.
+  workload that has a budget to weigh it against; and **an open owner decision**:
+  publishing a callback allocates outside any protected Lua frame
+  (`hslua_pushhsfunction` and `hslua_setglobal`'s key push), so memory
+  exhaustion during VM setup aborts the process instead of reporting
+  `MemoryExhausted`. The binding installs only Lua's own headers, so a protected
+  shim cannot reach its callback machinery, and it exports no `lua_newstate`, so
+  the path cannot be tested either. Accept it, or take over callback publication
+  in this package's own C — a boundary design change.
 
 ## Contracts to preserve
 
