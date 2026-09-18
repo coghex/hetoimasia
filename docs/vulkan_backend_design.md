@@ -20,9 +20,9 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Establish the first windowed Vulkan backend — [#155]
-- [ ] VK-1. Qualify and pin the shared Haskell toolchain
-- [ ] VK-2. Prove the native compatibility and completion profile
-- [ ] VK-3. Model GPU retention and frame ownership
+- [x] VK-1. Qualify and pin the shared Haskell toolchain — [#157]
+- [x] VK-2. Prove the native compatibility and completion profile — [#158]
+- [x] VK-3. Model GPU retention and frame ownership — [#160]
 - [ ] VK-4. Provision the pinned native Vulkan environment — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
 - [ ] VK-5. Add the loader-aware GLFW surface bridge — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
 - [ ] VK-6. Capture validation diagnostics with an independent worker — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
