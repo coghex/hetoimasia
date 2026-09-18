@@ -37,7 +37,9 @@ long hetoimasia_lua_probe_advance(void);
 int hetoimasia_lua_probe_samples(long *first, long *second);
 
 /* Publish a Haskell function into a state whose allocator fails after `budget`
-** allocations, and answer the Lua status that came back. */
-int hetoimasia_lua_publish_under_budget(void *function, size_t budget);
+** allocations, and answer the Lua status that came back. `acquired` reports
+** whether Lua took ownership of the stable pointer, so the caller frees only
+** what it still owns. */
+int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acquired);
 
 #endif

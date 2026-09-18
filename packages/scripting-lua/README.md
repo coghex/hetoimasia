@@ -187,11 +187,16 @@ that came back. A starved publication answers `LUA_ERRMEM`; a generous one
 answers `LUA_OK`. Without the protection there would be no line to read, because
 the process would be gone.
 
-One allocation is left, on a path that has already failed: if the publication
-fails after the userdata exists, its stable pointer is leaked rather than freed,
-because the userdata's `__gc` owns it from that moment and freeing it here would
-be a double free. A leaked stable pointer when memory has run out is the right
-way round.
+Ownership of the Haskell function's stable pointer is reported rather than
+inferred. Two allocations can fail on that path and only the second of them
+leaves an owner behind, so the status alone cannot say whether Lua took it: the
+shim sets a flag at the exact instruction the userdata stores the pointer, and
+the bridge frees the pointer only when that flag says Lua never did. That is why
+the shim builds the userdata itself instead of calling the binding's
+`hslua_newhsfunction` — the instruction is inside that function, and nothing
+outside it can observe it. Everything else about the callback is still the
+binding's: the same metatable, the same `__gc`, the same C closure and foreign
+export.
 
 ### How callbacks re-enter
 
@@ -347,6 +352,10 @@ direction of that pair. Every release is attempted, and their failures — toget
 with any failure a Haskell finalizer raised while `lua_close` ran it, which
 belongs to no caller's operation and would otherwise be observed by nobody — are
 collected into one `CloseFault` rather than letting the first hide the rest.
+Every failing finalizer is kept, not just the first: an operation's first
+callback failure is the one its caller is owed, but a close is not one
+operation — `lua_close` runs each pending finalizer, and each can fail on its
+own account.
 
 An unrestricted `lua_close` is deliberately **not** wired into
 `Hetoimasia.Foundation.Resource`'s `withResource`. The resource contract's

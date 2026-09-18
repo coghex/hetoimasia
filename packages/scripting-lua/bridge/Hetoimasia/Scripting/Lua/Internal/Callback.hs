@@ -39,9 +39,12 @@ import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithCont
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
+import Control.Monad (when)
 import Foreign.C (CChar, CInt (CInt), CSize (CSize))
+import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr)
-import Foreign.StablePtr (StablePtr, newStablePtr)
+import Foreign.StablePtr (StablePtr, freeStablePtr, newStablePtr)
+import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Call (classify, reportFault)
@@ -75,7 +78,7 @@ import Lua
 -- call back into Haskell.
 foreign import ccall safe "hetoimasia_lua_publish.h hetoimasia_lua_publish"
   hetoimasia_lua_publish
-    ∷ State → StablePtr PreCFunction → Ptr CChar → CSize → IO StatusCode
+    ∷ State → StablePtr PreCFunction → Ptr CChar → CSize → Ptr CInt → IO StatusCode
 
 -- | What a bridge callback answers Lua with.
 --
@@ -117,9 +120,17 @@ installCallback vm name action release =
       -- function and the string that names it -- happen inside one protected
       -- call, so memory exhaustion here is a status rather than a panic.
       status ←
-        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) → do
-          carried ← newStablePtr (trampoline vm action)
-          hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize)
+        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
+          alloca $ \acquired → do
+            carried ← newStablePtr (trampoline vm action)
+            reported ←
+              hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize) acquired
+            -- Freed here only when Lua never took it. Once the userdata holds
+            -- it, its @__gc@ is the owner and freeing it here would be a second
+            -- free of the same pointer.
+            owned ← peek acquired
+            when (owned == (0 ∷ CInt)) (freeStablePtr carried)
+            pure reported
       if status /= LUA_OK
         then reportFault vm state entry installOperation (classify status) name
         else do

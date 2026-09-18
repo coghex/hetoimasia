@@ -194,6 +194,28 @@ spec = describe "close" $ do
         [failed] → fromException failed `shouldBe` Just (ReleaseBroke "the finalizer failed")
         other → expectationFailure ("the close reported " <> show (length other) <> " failures")
 
+  it "reports every finalizer that failed, not only the first" $ do
+    vm ← newVm [LibraryBase]
+    installCallback vm "first_boom" (throwIO (ReleaseBroke "first")) (pure ())
+    installCallback vm "second_boom" (throwIO (ReleaseBroke "second")) (pure ())
+    -- Two values marked for finalization, so lua_close runs two callbacks that
+    -- fail. The close is not one operation, and keeping the first would be
+    -- dropping the other.
+    evalChunk
+      vm
+      (chunkName "finalizers")
+      ( "first_guard = setmetatable({}, {__gc = function() first_boom() end})\n"
+          <> "second_guard = setmetatable({}, {__gc = function() second_boom() end})\n"
+      )
+    outcome ← try @CloseFault (closeVm vm)
+    case outcome of
+      Right () → expectationFailure "the close reported success"
+      Left fault → do
+        length (closeFailures fault) `shouldBe` 2
+        let reported = [failed | Just failed ← map fromException (closeFailures fault)]
+        reported `shouldContain` [ReleaseBroke "first"]
+        reported `shouldContain` [ReleaseBroke "second"]
+
   it "makes a second close wait for the teardown rather than report it done" $ do
     vm ← newVm [LibraryBase]
     order ← newMVar ([] ∷ [String])

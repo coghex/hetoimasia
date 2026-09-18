@@ -147,6 +147,11 @@ data Vm = Vm
   , vmEscape ∷ !(IORef (Maybe (ExceptionWithContext SomeException)))
     -- ^ The first Haskell failure that reached a callback during whatever is
     -- running, waiting to be re-raised by it.
+  , vmClosingEscapes ∷ !(IORef [ExceptionWithContext SomeException])
+    -- ^ Every Haskell failure that reached a callback during the close, newest
+    -- first. The close is not one operation: @lua_close@ runs every pending
+    -- finalizer, and each is a separate thing that can fail, so keeping the
+    -- first would be dropping the rest.
   , vmReleases ∷ !(IORef [IO ()])
     -- ^ Dependencies the bridge retains for as long as Lua can call back into
     -- Haskell, released after @lua_close@ and never before.
@@ -197,9 +202,10 @@ newVm libraries = mask_ $ do
   gate ← newMVar ()
   phase ← newIORef Open
   escape ← newIORef Nothing
+  closing ← newIORef []
   releases ← newIORef []
   finished ← newEmptyMVar
-  let vm = Vm state gate phase escape releases finished
+  let vm = Vm state gate phase escape closing releases finished
   opened ← try (traverse_ (openLibrary state) libraries)
   case opened of
     Right () → pure vm
@@ -297,11 +303,14 @@ closeVm vm = mask $ \restore → do
 teardown ∷ Vm → IO ()
 teardown vm = do
   lua_close (vmState vm)
-  escaped ← takeEscape vm
+  -- Every finalizer that failed, in the order they ran, and anything an
+  -- operation left behind.
+  escaped ← atomicModifyIORef' (vmClosingEscapes vm) (\held → ([], reverse held))
+  stranded ← takeEscape vm
   releases ← atomicModifyIORef' (vmReleases vm) (\retained → ([], retained))
   outcomes ← traverse (try @SomeException) (reverse releases)
   let finalizerFailures =
-        [failure | ExceptionWithContext _ failure ← maybeToList escaped]
+        [failure | ExceptionWithContext _ failure ← escaped <> maybeToList stranded]
       releaseFailures = [failure | Left failure ← outcomes]
       failures = finalizerFailures <> releaseFailures
   unless (null failures) (throwIO (CloseFault failures))
@@ -317,13 +326,21 @@ retainRelease vm release =
 
 -- | Record the Haskell failure that reached a callback.
 --
--- The first one is kept. Lua may go on to call the same callback again, and
--- that later failure must not displace the one the caller is owed.
+-- During an operation the first one is kept: Lua may go on to call the same
+-- callback again, and that later failure must not displace the one the caller
+-- is owed. During the close every one is kept, because the close is not one
+-- operation -- @lua_close@ runs each pending finalizer, and each is separately
+-- able to fail.
 recordEscape ∷ Vm → ExceptionWithContext SomeException → IO ()
-recordEscape vm captured =
-  atomicModifyIORef'
-    (vmEscape vm)
-    (\held → (maybe (Just captured) Just held, ()))
+recordEscape vm captured = do
+  phase ← readIORef (vmPhaseRef vm)
+  case phase of
+    Closing →
+      atomicModifyIORef' (vmClosingEscapes vm) (\held → (captured : held, ()))
+    _ →
+      atomicModifyIORef'
+        (vmEscape vm)
+        (\held → (maybe (Just captured) Just held, ()))
 
 -- | Take the recorded failure, leaving none.
 takeEscape ∷ Vm → IO (Maybe (ExceptionWithContext SomeException))

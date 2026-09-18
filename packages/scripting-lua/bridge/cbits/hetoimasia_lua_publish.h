@@ -25,7 +25,14 @@
 **
 ** Answers a Lua status code. On failure the error value is left on the stack,
 ** for the caller to render and clear as it does for any other failed call.
+**
+** `acquired` is set to 1 the moment the stable pointer becomes the userdata's
+** to free, and left at 0 if it never did. Ownership is not something the caller
+** can infer from the status: the allocation that creates the userdata and the
+** one that wraps it in a closure can each fail, and only the second of them
+** leaves an owner behind. Free the pointer when, and only when, this reports 0.
 */
-int hetoimasia_lua_publish(lua_State *L, HsStablePtr function, const char *name, size_t length);
+int hetoimasia_lua_publish(
+  lua_State *L, HsStablePtr function, const char *name, size_t length, int *acquired);
 
 #endif

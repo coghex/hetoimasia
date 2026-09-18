@@ -82,10 +82,12 @@ static void *budgeted(void *ud, void *block, size_t was, size_t wanted)
 ** carries. Its header is not installed; the symbol is. */
 extern void hslua_registerhsfunmetatable(lua_State *L);
 
-int hetoimasia_lua_publish_under_budget(void *function, size_t budget)
+int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acquired)
 {
   int status;
   lua_State *L;
+
+  *acquired = 0;
 
   /* Generous while the state is built, so the failure lands where it is being
   ** asked about rather than before. */
@@ -98,7 +100,7 @@ int hetoimasia_lua_publish_under_budget(void *function, size_t budget)
   lua_settop(L, 0);
 
   remaining = budget;
-  status = hetoimasia_lua_publish(L, function, "starved", 7);
+  status = hetoimasia_lua_publish(L, function, "starved", 7, acquired);
 
   remaining = (size_t) -1;
   lua_close(L);

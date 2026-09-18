@@ -90,7 +90,11 @@ spec = describe "hazard" $ do
       -- because the whole publication runs inside a protected call; without
       -- that, the raise would find no frame and end this process, and there
       -- would be no line to read at all.
-      reported `shouldContain` "HAZARD allocation-reported starved=4 generous=0"
+      -- 4 is LUA_ERRMEM and 0 is LUA_OK, and the acquisition flags say which
+      -- publication handed its stable pointer to Lua: the starved one never
+      -- got that far, the generous one did and the state's close freed it.
+      reported
+        `shouldContain` "HAZARD allocation-reported starved=4 starved-acquired=0 generous=0 generous-acquired=1"
       status `shouldBe` ExitSuccess
 
 -- | Assert that the counter grew between the hook's two samples.

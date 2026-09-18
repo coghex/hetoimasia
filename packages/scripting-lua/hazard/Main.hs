@@ -33,7 +33,7 @@ import Control.Exception
   , fromException
   , try
   )
-import Control.Monad (forever, void)
+import Control.Monad (forever, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.C (CInt (CInt), CLong (CLong), CSize (CSize))
 import Foreign.Marshal.Alloc (alloca)
@@ -303,16 +303,33 @@ callbackCancellation = do
 -- a status at all, rather than this process's death, is the evidence.
 allocationFailure ∷ IO ()
 allocationFailure = do
-  carried ← newStablePtr (\_ → pure (NumResults 0))
-  starved ← hetoimasia_lua_publish_under_budget carried 0
-  generous ← hetoimasia_lua_publish_under_budget carried 4096
-  freeStablePtr carried
+  -- One pointer per publication, and each freed by whoever ended up owning it:
+  -- the starved publication never handed its pointer to Lua, so this frees it;
+  -- the generous one did, and closing that state freed it already.
+  starving ← newStablePtr (\_ → pure (NumResults 0))
+  (starved, starvedTook) ← publishUnderBudget starving 0
+  when (starvedTook == 0) (freeStablePtr starving)
+  generous' ← newStablePtr (\_ → pure (NumResults 0))
+  (generous, generousTook) ← publishUnderBudget generous' 4096
+  when (generousTook == 0) (freeStablePtr generous')
   putStrLn
     ( "HAZARD allocation-reported starved="
         <> show (fromIntegral starved ∷ Int)
+        <> " starved-acquired="
+        <> show (fromIntegral starvedTook ∷ Int)
         <> " generous="
         <> show (fromIntegral generous ∷ Int)
+        <> " generous-acquired="
+        <> show (fromIntegral generousTook ∷ Int)
     )
+
+-- | Publish under a budget, answering the status and whether Lua took the
+-- stable pointer.
+publishUnderBudget ∷ StablePtr PreCFunction → CSize → IO (CInt, CInt)
+publishUnderBudget carried budget =
+  alloca $ \acquired → do
+    status ← hetoimasia_lua_publish_under_budget carried budget acquired
+    (,) status <$> peek acquired
 
 -- | How many Lua instructions separate the hook's samples.
 --
@@ -334,7 +351,8 @@ foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_advance
 --
 -- @safe@ for the same reason publication itself is: it can run Lua.
 foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_publish_under_budget"
-  hetoimasia_lua_publish_under_budget ∷ StablePtr PreCFunction → CSize → IO CInt
+  hetoimasia_lua_publish_under_budget
+    ∷ StablePtr PreCFunction → CSize → Ptr CInt → IO CInt
 
 -- | The hook's first two samples, and how many it took.
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_samples"
