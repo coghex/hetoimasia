@@ -3161,9 +3161,11 @@ release kept distinct from the retirement that succeeded; detach then reattach
 with a fresh incarnation and the stale acknowledgement refused on the owner
 thread and through a published notice; a second owner refused while the first
 retires; the typed detach no-ops; three detach-and-reattach cycles leaving one
-window, one port, and no history; two windows where one keeps executing commands
-and completing its own close, retirement, and destruction while the other's
-retirement is pending; a stalled owner's neighbour destroyed first and the
+window, one port, and no history; two windows where one keeps executing
+commands and admitting scripted render use, turn after turn, and completes its
+own close, retirement, and destruction while the other's retirement is pending —
+and admits no use once it has closed, while the pending one admits none at all
+and is advanced by none of it; a stalled owner's neighbour destroyed first and the
 stalled one finished on independent evidence; a budget of one rotating across
 three pending retirements, and a budget of one counting the attachment it never
 reached as deferred work even when the one it served withdrew; a blocking owner
@@ -3178,9 +3180,11 @@ both refused, beside an accepted client that uses the public contract.
 
 One `glfw-native-tests` scenario (`--match "public attachments"`) repeats two of
 these in a child process of its own over a real session: a real window destroyed
-only after its owner completes while a second real window stays live,
-responsive, and pending, and a detach-and-reattach cycle on a real window that
-creates and destroys no native window. It claims nothing about GPU
+only after its owner completes while a second real window, whose own owner is
+still retiring, stays live and answers a real resize through its own port with
+the size the platform then reports back through its callbacks; and a
+detach-and-reattach cycle on a real window that creates and destroys no native
+window. It claims nothing about GPU
 synchronization: the owners are scripts and their facts are CPU facts.
 
 ### What the owner and workers may wait on

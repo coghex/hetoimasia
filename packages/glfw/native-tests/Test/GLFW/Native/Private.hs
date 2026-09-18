@@ -70,6 +70,7 @@ import Hetoimasia.GLFW.Internal.Native
   , waitEventsForCheck
   , wakeCountsForCheck
   )
+import qualified Hetoimasia.GLFW.Command as Command
 import Hetoimasia.GLFW.Internal.Monitor (MonitorCallbackStorage (..), MonitorNative (..))
 import Hetoimasia.GLFW.Internal.Session (Native (..), WindowCallbacks (..), sessionAssembly)
 import Hetoimasia.GLFW.Internal.Window (windowStep)
@@ -105,7 +106,7 @@ spec gate = describe "private sessions in a child process" $ do
   it "destroys a real window only after a scripted owner retires through the protected host, and terminates after that" $
     privateScenarioReporting gate "protected-retirement"
 
-  it "keeps a second real window live and responsive while the first's owner retires, and creates or destroys no native window across a detach and reattach" $
+  it "keeps a second real window live, resizable, and observing while the first's owner retires, and creates or destroys no native window across a detach and reattach" $
     privateScenarioReporting gate "public-attachments"
 
 privateScenario ∷ Gate → String → IO ()
@@ -192,7 +193,7 @@ scenarios =
       ]
     )
   , ( "public-attachments"
-    , [ ( "destroys the completing owner's window while the other window stays live, responsive, and pending"
+    , [ ( "destroys the completing owner's window while the other window resizes, observes, and stays pending"
         , attachmentNeighbour
         )
       , ( "creates and destroys no native window across a detach and a reattach of a real window"
@@ -511,14 +512,18 @@ scriptedOwner journal remaining host =
 --
 -- One owner completes and the other does not. The completing one's window must
 -- be destroyed while the other's is still held by its pending retirement, and
--- that other window must stay live and responsive throughout: the host keeps
--- serving it, and its own slot reports retiring rather than gone. It claims
--- nothing about GPU synchronisation; what the real session adds is that the
--- destruction is the platform's own.
+-- that other window must stay live and /responsive/ throughout — which this
+-- proves by a real native round trip on it after the first destruction: a
+-- resize command executed through its own port, and the size the platform then
+-- reports back through its own callbacks. It claims nothing about GPU
+-- synchronisation; what the real session adds is that the destruction, the
+-- resize, and the observation are the platform's own.
 attachmentNeighbour ∷ IO String
 attachmentNeighbour = do
   journal ← newIORef []
   destroys ← newIORef (0 ∷ Int)
+  settlement ← newIORef Nothing
+  resized ← newIORef Nothing
   let traced =
         productionNative
           { nativeDestroyWindow = \handle → do
@@ -529,7 +534,7 @@ attachmentNeighbour = do
           }
       config =
         ( Runtime.defaultHostConfig
-            [ hiddenTestWindowConfig (Text.pack "pending") 64 48
+            [ hiddenTestWindowConfig (Text.pack "pending") 200 150
             , hiddenTestWindowConfig (Text.pack "completing") 64 48
             ]
         )
@@ -537,7 +542,6 @@ attachmentNeighbour = do
       logger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
   pendingFacts ← newIORef []
   completingFacts ← newIORef allRetirementFacts
-  held ← newIORef Nothing
   Runtime.runProtectedWindowApplication
     (withLoggingLifetime logger)
     (Text.pack "public-attachments")
@@ -548,9 +552,11 @@ attachmentNeighbour = do
           config
           ( \host → do
               (pending, completing) ← twoHostWindows host
-              attachThrough host pending "pending" journal pendingFacts
-              acknowledged ← attachThrough host completing "completing" journal completingFacts
-              writeIORef held (Just acknowledged)
+              pendingService ← attachServiceThrough host pending "pending" journal pendingFacts
+              void (attachServiceThrough host completing "completing" journal completingFacts)
+              -- The pending owner retires while its own window stays open, so
+              -- that window is still the application's to use throughout.
+              _ ← Runtime.detachWindowGraphics host pendingService
               use host
           )
     )
@@ -558,22 +564,55 @@ attachmentNeighbour = do
     (\host _ → pure host)
     ( \host control → do
         (pending, completing) ← twoHostWindows host
-        -- Both windows close. Only the completing owner can retire, so only its
-        -- window may be destroyed.
-        _ ← Runtime.closeHostWindow host pending
         _ ← Runtime.closeHostWindow host completing
         turnsUntilNative host control "the completing window's destruction" ((>= 1) <$> readIORef destroys)
-        -- The other window is still the host's, still pending, and its slot
-        -- still reports a retiring owner rather than a gone one.
+        -- The other window is still the host's, still open, and its slot still
+        -- reports a retiring owner rather than a gone one.
         identities ← atomically (Runtime.hostWindowIdentities host)
         unless (identities == [pending]) $
           failCheck ("the pending window was not the one still held: " <> show (length identities))
         atomically (Runtime.windowGraphicsStatus host pending) >>= \case
           Runtime.GraphicsPresent observed
-            | Runtime.observedSlot observed == Runtime.SlotRetiring → pure ()
+            | Runtime.observedSlot observed == Runtime.SlotRetiring
+            , not (null (Runtime.observedMissing observed)) → pure ()
           other → failCheck ("the pending window's slot was " <> show other)
-          -- Independent evidence finishes it, and its window follows.
+        -- Responsive, not merely registered: a real resize goes through its own
+        -- port and the platform reports the new size back through its callbacks.
+        client ←
+          atomically (Runtime.hostWindowClient host pending)
+            >>= maybe (failCheck "the pending window has no client") pure
+        let reader = Command.clientObservations client
+            extentNow =
+              observedLogicalExtent . preparedValue . observedValue <$> atomically (readSnapshot reader)
+        before ← extentNow
+        ticket ←
+          Command.submitWindowCommand
+            (Command.clientCommandPort client)
+            []
+            (Command.setWindowSizeCommand pending (Extent 260 190))
+            >>= \case
+              Command.SubmitAccepted accepted → pure accepted
+              other → failCheck ("the pending window's port refused a resize: " <> show other)
+        turnsUntilNative
+          host
+          control
+          "the resize settling"
+          (isJustDisposition <$> atomically (Command.pollCompletion ticket))
+        disposition ←
+          atomically (Command.pollCompletion ticket) >>= maybe (failCheck "the resize did not settle") pure
+        case disposition of
+          Command.Attempted _ → pure ()
+          Command.Performed _ → pure ()
+          other → failCheck ("the pending window refused the resize: " <> show other)
+        writeIORef settlement (Just (show disposition))
+        turnsUntilNative host control "the resized extent being observed" ((/= before) <$> extentNow)
+        after ← extentNow
+        writeIORef resized (Just (before, after))
+        -- Only now does the pending owner get what it needs, and its window
+        -- follows.
         writeIORef pendingFacts allRetirementFacts
+        turnsUntilNative host control "the pending owner's retirement" (slotFree host pending)
+        _ ← Runtime.closeHostWindow host pending
         turnsUntilNative host control "the pending window's destruction" ((>= 2) <$> readIORef destroys)
     )
   entries ← readIORef journal
@@ -584,7 +623,23 @@ attachmentNeighbour = do
           <> ["window 2 destroyed"]
   unless (entries == expected) $
     failCheck ("the order was " <> show entries <> ", not " <> show expected)
-  pure ("the order was " <> show entries)
+  settled ← readIORef settlement >>= maybe (failCheck "the resize recorded no settlement") pure
+  extents ← readIORef resized >>= maybe (failCheck "the resize recorded no extents") pure
+  pure
+    ( "the order was "
+        <> show entries
+        <> "; while the pending owner was retiring its window answered "
+        <> settled
+        <> " and its observed extent went from "
+        <> show (fst extents)
+        <> " to "
+        <> show (snd extents)
+    )
+
+isJustDisposition ∷ Maybe Command.Disposition → Bool
+isJustDisposition = \case
+  Just _ → True
+  Nothing → False
 
 -- | One real window, attached and detached and attached again through the
 -- public contract.
@@ -655,13 +710,6 @@ attachmentDetachCycle = do
         <> show numbered
         <> ", and the host destroyed the window once on the way out"
     )
-
--- | Attach one scripted owner through the public contract and keep its
--- acknowledgement, which the checks above never need themselves.
-attachThrough
-  ∷ Runtime.WindowHost → WindowId → String → IORef [String] → IORef [RetirementFact] → IO ()
-attachThrough host window name journal remaining =
-  void (attachServiceThrough host window name journal remaining)
 
 attachServiceThrough
   ∷ Runtime.WindowHost

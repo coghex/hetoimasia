@@ -155,6 +155,8 @@ spec = describe "GLFW window attachments" $ do
 data Note
   = Certified !Text !RetirementFact
   | Constructed !Text
+  | Rendered !Text
+    -- ^ One scripted render an owner's service admitted.
   | WindowGone !Int
     -- ^ The seam's own destroy call, named by the window's creation order.
   | SessionEnded
@@ -262,6 +264,24 @@ protocolFor journal host owner script =
 -- | The owner's own completion authority, once its construction has stored it.
 heldAcknowledgement ∷ Owner → IO Acknowledgement
 heldAcknowledgement owner = atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
+
+-- | One scripted graphics use through an attached service.
+--
+-- There is no surface and no submission at this boundary, so what "new use"
+-- means here is exactly what the contract says it means: a use may begin only
+-- while the owner's own slot still admits one. The service's retained
+-- observation and the host's own reading of the slot must agree, and the use is
+-- noted only when it was really admitted.
+renderThrough ∷ TVar [Note] → WindowHost → Text → GraphicsService → IO Bool
+renderThrough journal host name service = atomically $ do
+  observed ← readGraphicsService service
+  held ← windowGraphicsStatus host (graphicsWindow service)
+  let admits = case held of
+        GraphicsPresent seen → observedSlot seen == SlotAttached
+        _ → False
+      usable = observedSlot observed == SlotAttached && admits
+  when usable (note journal (Rendered name))
+  pure usable
 
 -- | Publish an owner's certified facts from a thread that is not the owner.
 publishFacts ∷ TVar [Note] → WindowHost → Owner → [RetirementFact] → IO ()
@@ -1160,8 +1180,8 @@ testIndependentWindows = do
   seam ← pollingSeam journal
   protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
     (alpha, beta) ← twoWindows host
-    (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha")
-    (betaOwner, _) ← attachedOwner journal host beta (ownerNamed "beta")
+    (alphaOwner, alphaService) ← attachedOwner journal host alpha (ownerNamed "alpha")
+    (betaOwner, betaService) ← attachedOwner journal host beta (ownerNamed "beta")
     -- Alpha's owner never makes progress of its own.
     atomically (writeTVar (ownerPlan alphaOwner) [])
     void (closeHostWindow host alpha)
@@ -1172,9 +1192,23 @@ testIndependentWindows = do
         SubmitAccepted ticket → pure ticket
         other → unexpected ("beta's port refused an observation: " <> show other)
     turnsUntil host control "beta's observation" (hasSettled <$> atomically (pollCompletion ticket))
-    -- And beta's own close, retirement, and destruction run to the end while
-    -- alpha is still pending.
+    -- And beta keeps rendering: its owner's slot still admits new use, turn
+    -- after turn, while alpha's owner is pending and its window is retained.
+    renders ← forM [1 .. 3 ∷ Int] $ \_ → do
+      admitted ← renderThrough journal host "beta" betaService
+      turnsExactly host control 1
+      pure admitted
+    renders `shouldBe` [True, True, True]
+    -- Alpha admits none of it, and none of beta's work advanced alpha by a
+    -- single fact.
+    renderThrough journal host "alpha" alphaService `shouldReturn` False
+    alphaSeen ← observation alphaService
+    observedSlot alphaSeen `shouldBe` SlotRetiring
+    observedMissing alphaSeen `shouldBe` allRetirementFacts
+    -- Beta's own close, retirement, and destruction then run to the end while
+    -- alpha is still pending, and beta admits no use once it has closed.
     void (closeHostWindow host beta)
+    renderThrough journal host "beta" betaService `shouldReturn` False
     turnsUntil host control "beta's destruction" (elem 2 <$> destroyCalls seam)
     destroyCalls seam `shouldReturn` [2]
     atomically (windowGraphicsStatus host alpha) >>= \case
@@ -1185,7 +1219,9 @@ testIndependentWindows = do
     turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
     void (atomically (readTVar (ownerSteps betaOwner)))
   entries ← readTVarIO journal
-  -- Beta's whole retirement and destruction happened before alpha's.
+  -- Beta rendered exactly while it was attached, and its whole retirement and
+  -- destruction happened before alpha's.
+  [name | Rendered name ← entries] `shouldBe` ["beta", "beta", "beta"]
   takeWhile (/= WindowGone 1) entries `shouldSatisfy` (WindowGone 2 `elem`)
 
 -- | Whether a ticket has settled at all; which way it settled is the command
