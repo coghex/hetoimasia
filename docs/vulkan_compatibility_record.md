@@ -53,7 +53,7 @@ together settle, and what they do not.
 | Conformance version | 1.4.2.0 | 1.3.1.1 |
 | Validation layer | `VK_LAYER_KHRONOS_validation` 1.3.296, verified present in the loaded chain, zero error records | `VK_LAYER_KHRONOS_validation` 1.3.275, verified the same way, zero error records |
 | 1.3 core features | `dynamicRendering` and `synchronization2` supported, requested, accepted | the same |
-| Portability | advertised: `VK_KHR_portability_enumeration` on the instance and `VK_KHR_portability_subset` on the device | not advertised, so not enabled |
+| Portability | `VK_KHR_portability_enumeration` advertised and enabled on the instance; `VK_KHR_portability_subset` advertised and enabled on the device | `VK_KHR_portability_enumeration` advertised and enabled on the instance too; `VK_KHR_portability_subset` not advertised, so not enabled |
 | Maintenance variant | `VK_EXT_swapchain_maintenance1`, `swapchainMaintenance1` accepted | the same |
 | Its dependencies | `VK_KHR_swapchain`, `VK_EXT_surface_maintenance1`, `VK_KHR_get_surface_capabilities2`, all present and enabled | the same |
 | Release entry point | `vkReleaseSwapchainImagesEXT` resolved; `…KHR` did not | the same |
@@ -62,6 +62,15 @@ together settle, and what they do not.
 | Capture | `TRANSFER_SRC` read back and matched | the same |
 | Callbacks | 77 deliveries, 1 during teardown, 3 during instance destruction | 84 deliveries, none during teardown, 1 during instance destruction |
 | Teardown | ten releases, none failed | the same ten, none failed |
+
+The two halves of portability are separate and only one of them is about
+MoltenVK. `VK_KHR_portability_enumeration` is an *instance* extension that lets
+the loader enumerate portability drivers at all; the proof enables it wherever
+the loader advertises it, which includes Linux, where it then finds no such
+driver. `VK_KHR_portability_subset` is the *device* extension a portability
+driver advertises to say which parts of Vulkan it does not fully implement, and
+that one appears on MoltenVK and not on Lavapipe. A slice that conflates them
+will enable the wrong one on the wrong platform.
 
 Downstream slices may require Vulkan 1.3 with dynamic rendering and
 synchronization2, the EXT maintenance variant with present fences and image
