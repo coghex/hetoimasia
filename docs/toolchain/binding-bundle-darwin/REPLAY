@@ -3,7 +3,7 @@ This directory is the complete consumer this qualification built.
   ghc            9.14.1
   cabal          3.18.1.0
   platform       darwin/arm64 loader=1.3.296.0
-  repository     3cfee4edeb9f3b3238ab8a9d39fc6734ad04ecd1
+  repository     be927031a18dec744acc35a162c0fa6af74c4e75
 
 Replay it with that exact ghc and cabal on PATH:
 

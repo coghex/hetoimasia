@@ -20,6 +20,12 @@ each receipt in `executed_commit`, the CPU-project capture in
 which changes documentation alone, so nothing here is a stale result relabelled
 as a newly executed one.
 
+Every artifact here was executed at commit **`be92703`**, and each says so
+itself rather than relying on this sentence: the receipts in `executed_commit`,
+the CPU-project capture in `executed-revision` with its tree beside it, and both
+binding runs and their bundles in `repository-revision`. The only later commit
+is the one adding this evidence, which changes documentation alone.
+
 The receipts record their own `executed_commit`, `runner_os: Darwin`,
 `runner_arch: arm64`, and the toolchain map actually observed — GHC, Cabal, and
 the native GLFW manifest hash. They deliberately carry **no** `ci-image` entry:
