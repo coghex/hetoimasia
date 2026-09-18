@@ -47,18 +47,24 @@
 -- This suite declares the sublibrary as a dependency so it is built and
 -- registered for these clients, rather than relying on another component
 -- registering it incidentally.
--- Six clients must be rejected: one names the host's constructor, one asks
+-- Eight clients must be rejected: one names the host's constructor, one asks
 -- the host for its session, windows' command host, and settings, one reaches
 -- for the owner loop's executor and event processing in the private modules
 -- the sublibrary uses, one asks the host for the collection that owns its
 -- windows and the registry of their members and ports, one reaches for that
 -- collection and the host's test hooks in the private @runtime-glfw-core@
--- implementation, and one forges a
+-- implementation, one forges a
 -- window's client capabilities, or reads another window's port out of them,
--- through the capability's constructor and fields. One client must be accepted,
+-- through the capability's constructor and fields, one asks the public
+-- @runtime-glfw@ sublibrary for the private attachment seam it does not export,
+-- and one reaches for the retirement boundary that owns it in the private
+-- implementation. Those last two are the export-boundary evidence for the
+-- protected host: what may attach to it is private, while the lifetime itself
+-- is not. One client must be accepted,
 -- linked, and run: it uses the host's supported configuration, construction,
 -- turn, window, and client capabilities, including a window's input reader and
--- admission control, and every path it runs is refused
+-- admission control, and the protected host lifetime and its runner, and every
+-- path it runs is refused
 -- before GLFW is initialized.
 --
 -- The test seam is a public component, and this suite declares it for the same
@@ -418,6 +424,30 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client asking the public host sublibrary for the private attachment seam" $
+    withHostClient "Client.hs" publicAttachmentClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a public module exports an attachment:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that reaches for the retirement boundary in the host's private implementation" $
+    withHostClient "Client.hs" retirementInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the retirement boundary is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW.Internal.Retirement"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "accepts and runs a client using the window host's supported capabilities, without initializing GLFW" $
     withHostClient "Main.hs" hostClient $ \compile → do
       outcome ← compile Link
@@ -440,6 +470,8 @@ spec = describe "GLFW session opacity across the package boundary" $ do
         `shouldBe` [ "default = Right ()"
                    , "zero budget = CommandBudgetRejected 0"
                    , "without the threaded runtime = NotProcessMainThread"
+                   , "protected zero budget = CommandBudgetRejected 0"
+                   , "protected without the threaded runtime = NotProcessMainThread"
                    ]
 
   it "accepts and runs a client using only the public session, window, and command interfaces, without initializing GLFW" $
@@ -577,7 +609,7 @@ hostClient =
     , "import Control.Concurrent.STM (atomically)"
     , "import Control.Exception (SomeException, fromException, try)"
     , "import qualified Data.Text as Text"
-    , "import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)"
+    , "import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)"
     , "import Hetoimasia.Foundation.Messaging.Snapshot (readSnapshot)"
     , "import Hetoimasia.Foundation.Resource (withScoped)"
     , "import Hetoimasia.GLFW.Command"
@@ -596,6 +628,11 @@ hostClient =
     , "  putStrLn (\"zero budget = \" <> describe rejected)"
     , "  unthreaded ← try (withScoped (allocWindowHost config) (atomically . hostCommandStatistics))"
     , "  putStrLn (\"without the threaded runtime = \" <> describe unthreaded)"
+    , "  let logger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\\_ → pure ()))"
+    , "  refused ← try (withProtectedWindowHost logger config {hostCommandBudget = 0} (atomically . hostCommandStatistics))"
+    , "  putStrLn (\"protected zero budget = \" <> describe refused)"
+    , "  protected ← try (withProtectedWindowHost logger config (atomically . hostCommandStatistics))"
+    , "  putStrLn (\"protected without the threaded runtime = \" <> describe protected)"
     , ""
     , "describe ∷ Either SomeException CommandStatistics → String"
     , "describe outcome = case outcome of"
@@ -608,6 +645,16 @@ hostClient =
     , "application ∷ (∀ r. (LoggingLifetime → IO r) → IO r) → IO Int"
     , "application enter ="
     , "  runWindowApplication enter (Text.pack \"tool\") (allocWindowHost (defaultHostConfig [])) id (\\host _ → pure host) serve"
+    , ""
+    , "protectedApplication ∷ (∀ r. (LoggingLifetime → IO r) → IO r) → Logger → IO Int"
+    , "protectedApplication enter logger ="
+    , "  runProtectedWindowApplication"
+    , "    enter"
+    , "    (Text.pack \"tool\")"
+    , "    (\\_ use → withProtectedWindowHost logger (defaultHostConfig []) use)"
+    , "    id"
+    , "    (\\host _ → pure host)"
+    , "    serve"
     , ""
     , "serve ∷ WindowHost → RuntimeControl → IO Int"
     , "serve host control ="
@@ -831,6 +878,40 @@ attachmentModelClient =
     , "retire ∷ OwnerAuthority → Registered → AttachmentModel () → Bool"
     , "retire owner registered model ="
     , "  either (const False) (const True) (recordRetirementFact owner (registeredAttachment registered) (registeredAcknowledgement registered) DependentsDisposed model)"
+    ]
+
+-- | A client asking the public host sublibrary for the private attachment seam:
+-- the protected lifetime is exported, what may attach to it is not.
+publicAttachmentClient ∷ String
+publicAttachmentClient =
+  unlines
+    [ "module Client (attached) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW"
+    , "  ( AttachmentProtocol"
+    , "  , RetirementProgress"
+    , "  , WindowHost"
+    , "  , attachHostWindow"
+    , "  , hostAttachmentIdentity"
+    , "  , reportHostRetirementFact"
+    , "  )"
+    , ""
+    , "attached ∷ Maybe (WindowHost → AttachmentProtocol → RetirementProgress)"
+    , "attached = Nothing"
+    ]
+
+-- | A client reaching for the retirement boundary that owns the attachment
+-- model, in the private @runtime-glfw-core@ implementation.
+retirementInternalsClient ∷ String
+retirementInternalsClient =
+  unlines
+    [ "module Client (retire) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW.Internal.Retirement (HostRetirement, closeAttachmentAdmission)"
+    , "import Control.Concurrent.STM (STM)"
+    , ""
+    , "retire ∷ HostRetirement → STM ()"
+    , "retire = closeAttachmentAdmission"
     ]
 
 -- | A client naming the input capabilities' and values' data constructors.

@@ -2119,8 +2119,11 @@ A `WindowHost` is an application dependency, built by `allocWindowHost` as a
 `Scoped` value before supervision is entered, on the process main thread. It
 validates its `HostConfig` first — both budgets at least one, an idle wait above
 zero and at most 60 seconds, so a NaN or infinite wait is refused, a
-live-window limit of at least one and at least the number of configured windows,
-and an input capacity between one and the channel's maximum —
+live-window limit of at least one, at least the number of configured windows,
+and at most `maximumWindowLimit`, which is far above what any platform hosts at
+once and low enough that every count a host derives from that limit is an exact
+`Int` rather than a wrapped one, and an input capacity between one and the
+channel's maximum —
 then enters the session, allocates a
 [scoped collection](resources.md#scoped-resource-collections) with that limit,
 creates the host's command port, and creates each configured window in order as
@@ -2135,6 +2138,18 @@ native ownership. At registration the host attaches the window's input feed so
 owner-boundary callbacks publish into it. `allocWindowHostIn` builds
 the same host over a session scope the caller supplies, such as a test seam's or
 a borrowed session; the host then owns the session only if that scope does.
+
+`withProtectedWindowHost` and `withProtectedWindowHostIn` build exactly that
+host — same validated configuration, session, collection, port, configured
+windows, and admission-closing release — inside a dedicated IO continuation
+boundary, and additionally give it the retirement state of
+[window attachments](#window-attachments) under a host identity only they issue.
+They are the only constructors that do. A host built by `allocWindowHost`,
+`allocWindowHostIn`, or the private `allocWindowHostWith` is issued no identity,
+so it can never be the target of an attachment: `hostAttachmentIdentity` answers
+`Nothing` and a registration against it is refused before any effect. Its
+signatures, its behaviour, and every example over it are unchanged. See
+[the protected host lifetime](#the-protected-host-lifetime).
 
 `WindowHost` is exported without its constructor or fields. No session,
 collection, member, command host, native handle, executor, or release authority
@@ -2504,8 +2519,10 @@ non-retrying transaction it closes the admission of the host's port and of every
 window's port, settles every command queued in any of them as `NotExecuted`,
 closes every window's input feed, ending its reads even while a reset waits for
 an acknowledgement, and closes the application's demand slot and every window's.
-It destroys nothing, pumps nothing, waits on nothing, and repeating it changes
-nothing. A window's close protocol closes that window's feed and its demand slot
+On a protected host the same step also ends new graphics use: no later
+attachment is admitted, and every attachment still registering or active begins
+retiring. It destroys nothing, pumps nothing, makes no GPU call, waits on
+nothing, and repeating it changes nothing. A window's close protocol closes that window's feed and its demand slot
 in its closing transaction the same way.
 
 Quiescence does not disable wake support: the session's capability stays usable
@@ -2542,6 +2559,212 @@ The runtime's two earlier orderings are unchanged: a fatal latch may request
 worker stops before quiescence, and a worker whose managed startup is abandoned
 or cancelled is drained before it. Quiescence neither precedes nor unblocks
 either.
+
+### The protected host lifetime
+
+`withProtectedWindowHost` is the shape
+[`runManagedApplication`](resources.md#managed-dependency-lifetimes) accepts, and
+`runProtectedWindowApplication` is `runWindowApplication` over one of them. It
+invokes its consumer exactly once, synchronously on the calling thread, with
+every dependency it built live, and not at all when its own construction failed.
+Its exit handler is installed under masking before the scope is entered at all,
+so it covers the handoff out of construction and into the consumer — itself a
+point the scope restores at — as well as everything the consumer then does.
+It is the LIFE-3 slice of
+[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+(P-3, D-1 to D-4).
+
+On **every** exit — a normal return, an action failure, a startup failure, a
+dependency construction failure after host setup, an owner-loop failure, a
+latched supervised failure, and cancellation — the boundary:
+
+1. runs the host's own `quiesceWindowHost` — every port's admission, every input
+   feed, every demand slot, and attachment admission with new graphics use —
+   idempotently and in one finite transaction. This is the host's own safeguard
+   and runs even when the application installed no quiescence hook or omitted
+   the host from one; it does not replace the runtime's ordering, which is what
+   keeps a worker from beginning a use the drain would then have to wait for.
+   Nothing can be admitted or published after it, so the report in step 3 cannot
+   be outrun by a late command or demand;
+2. retires every remaining attachment on the owner thread, with every window,
+   the session, and every parent still live;
+3. makes the wake path's one guarded degradation report, now that nothing
+   further can be admitted or published;
+4. returns — and only then do the windows, the session, and the parents unwind
+   in dependency order, followed by the terminal report and the final flush.
+
+Which regions were entered still decides what runs: a dependency construction
+that failed after host setup enters no supervision and installs no application
+quiescence, so steps 2 to 4 happen with no worker drain before them. The fatal
+latch's stop requests, the startup-local drain, and the whole cancellation,
+reporting, and flushing matrix are unchanged.
+
+#### The retirement progress path
+
+Retirement runs on the owner thread through a narrow path of its own. It calls
+no application event or update hook and no supervisor checkpoint. One round is:
+
+1. every completion notice another thread published is taken and folded,
+   revalidated exactly as an owner-thread report is;
+2. every pending attachment that still has a progress path is given one bounded
+   opportunity, in registration order, so a stalled attachment cannot starve one
+   that could still retire;
+3. every window whose close protocol has begun is offered retirement again —
+   in every round, not only one that made progress, so a chain that became safe
+   before the drain and had its destruction deferred is not held by a chain that
+   only awaits or stalls. A window whose own retirement failed is forgotten
+   rather than attempted again, so the retry replays no failed disposal;
+4. native event processing runs — a poll when the round made progress, otherwise
+   the host's configured finite bound — keeping both the events retirement needs
+   and the session's internal wake, which ends that wait, live.
+
+The round repeats until no registered attachment is pending. An attachment is
+pending until the model records every one of its retirement facts: no elapsed
+time, cancellation, failure, or disposition substitutes for one. A suspended or
+closing window still has retirement demand, because the path iterates
+attachments and never render eligibility.
+
+Another thread publishes a certified fact as a bounded completion notice, which
+registers its notification obligation in the transaction that admitted it and
+discharges it with exactly one wake — the same accounting an admission uses — so
+a notice published during retirement really ends the owner's wait, and a wake
+that finds the session terminal enters GLFW not at all. Publication closes in the
+same transaction that first finds nothing pending, so a notice is either folded
+by the drain or refused outright: none can register an obligation after the one
+degradation report has passed.
+
+Only a notice that recorded evidence the model did not already hold counts as
+progress and revives a withdrawn path. A refusal, and a duplicate of a fact
+already recorded, establish nothing, so neither can make a failed disposal run
+again. An interrupted step withdraws its path exactly as a failed one does: it
+may have disposed part of what it owns, and nothing knows whether running it
+again would be safe.
+
+#### Outcome and cancellation
+
+The initiating outcome is recorded before any interruptible drain work. A body
+failure stays primary, and every drain, report, and deferred failure is retained
+beside it under the `glfw protected retirement` cleanup label, in the order the
+boundary found them. Every callback result the boundary depends on — a
+construction's, a rollback's, the stall diagnostic's, and a retirement step's —
+is forced inside the attempt that catches it, so a value that raises only when
+it is demanded is that attempt's failure rather than one escaping it. After a
+successful body the first drain failure becomes primary and later ones are
+retained; beyond a bounded number they are counted rather than kept, so a
+boundary waiting indefinitely cannot grow without bound.
+
+A cancellation delivered during the drain is deferred. It is counted against
+every pending attachment as that attachment's own evidence, establishes no fact,
+never replaces a recorded outcome, and is re-raised only once retirement is
+safe — never before a window, the session, or a parent is released. Repeated
+cancellation is retained the same way. The drain uses interruptible finite waits
+rather than one uninterruptible mask.
+
+#### Failed steps and the stall policy
+
+A failed retirement opportunity keeps its failure and evidence on the
+attachment, withdraws that attachment's progress path rather than replaying the
+step, and never marks it safe. The existing
+[required and optional policy](recovery.md) decides the application's
+disposition alone: a recognized failure under an optional disposition leaves
+that component unavailable, while a required failure, an unrecognized one, a
+cancellation, and one that retained cleanup evidence stay fatal. No disposition
+authorizes destroying an unsafe dependent. A withdrawn path resumes only through
+an explicit safe progress path — independent evidence for that attachment.
+
+As soon as any pending attachment has no path left — not only when every one of
+them has, because a chain beside it that is merely awaiting must not be able to
+keep the stall from being reported — the boundary retains the affected chain,
+ceases unsafe work, writes one warning under `glfw.retirement` naming how many
+of the attachments still pending are stalled, how many are pending at all, and
+the finite bound it waits, and keeps waiting. That diagnostic is claimed once
+whatever it records, and its own failure is retained
+rather than raised: a failing diagnostic may not unwind what the stall is
+holding. No retirement timeout is configured; were one added it could only
+annotate that entry, never grant authority to destroy anything. Operator process
+termination is the escape.
+
+#### The private attachment seam
+
+The public `runtime-glfw` sublibrary exports the protected lifetime and its
+runner and **no attachment operation or type**. Attaching, certifying a fact,
+publishing a notice, and observing an attachment live in the private
+`runtime-glfw-core` sublibrary for this package's own examples until LIFE-4
+exposes the contract. The seam is entered from the protected lifetime's own
+consumer path — the consumer it was given, or the private hook that runs just
+before it — never from the host's construction, which the exit handler does not
+yet cover. An attachment reserves its window, registers its protocol,
+constructs, and only then publishes — in that order and no other — so a
+cancellation at any handoff leaves the attachment registered and retiring rather
+than a constructed dependent outside registration, and nothing usable is
+published before construction and registration have both completed. A
+construction failure runs the integration's owned rollback and keeps its
+original failure with that rollback's outcome as the attachment's evidence; only
+a safe rollback retires it.
+
+The rollback is trusted but not infallible, and construction is settled whatever
+it does. A rollback that raises or is cancelled established no safety, so it is
+recorded as unsafe: the attachment is retained owing every fact rather than left
+with its construction pending, where no fact could ever be recorded and the
+drain could never finish. Its own failure is retained beside the construction
+failure the model keeps first, and a cancelled construction re-raises with it
+retained under `glfw attachment rollback`. A cancellation the rollback itself
+received is equally this thread's to answer: it is re-raised with the
+synchronous construction failure retained beside it, never traded for it. Because a safe rollback retires the
+attachment and removes its evidence with it, the answer carries the original
+construction failure and the rollback's own back to the integration that
+attached; this boundary raises neither.
+
+#### Examples
+
+The examples in `glfw-tests` (`--match "protected host"`) run whole applications
+over the seam and assert an order of flags, never a time: scripted graphics
+owners note each obligation they end, the seam's own destroy and terminate hooks
+note the native calls, and a scripted parent notes its release, so one list shows
+admission closing, each chain retiring, each window being destroyed, the session
+ending, and the parent being released in the order they happened. The seam's
+finite wait blocks until an empty event has been posted, so a round with nothing
+to do really waits and a completion published from another thread really ends
+it. They cover each exit path above with that order verified; an omitted
+quiescence hook with the host's own close still running; construction failure
+with safe and with unsafe rollback, and no consumer entered when the host's own
+setup fails; cancellation queued during construction, during the drain, and
+repeatedly; a latched supervised failure before the drain; two attachments where
+only one can retire, with the other's window, the session, and a scripted parent
+retained while the first retires and its closed window is destroyed; a window
+that became safe before the drain being destroyed in a round that made no
+progress at all; one completion notice per fact per window admitted at once; a
+rollback that itself fails, one that is cancelled, and one cancelled after a
+construction that failed synchronously, each retained rather than stranded in
+construction and each re-raising what it received; the window limit's bounds; a
+cancellation queued in the handoff out of construction, which reaches neither
+the consumer path nor startup and which the exit still settles; an attachment
+made on that consumer path which then fails or is cancelled, drained as the
+consumer's own are; a notice refused once retirement is complete; a command and
+a demand refused once the exit has closed the host; a stalled chain reported
+beside one that only ever awaits; a body failure kept as the exact primary
+exception with the drain's own retained beside it under `glfw protected
+retirement`, and two of them retained in the order they happened; a
+construction, a rollback, and a diagnostic sink whose results raise only when
+demanded, each caught inside its own attempt; an interrupted step
+withdrawn rather than run again; a duplicate and a refused notice reviving
+nothing; a cancellation queued while the window's own destruction is in flight,
+which defers until the session and a parent have outlived it; a stalled
+attachment finishing on later independent evidence, with the stall reported
+once; a stall diagnostic that itself fails, unwinding nothing; required and
+recognized-optional retirement-step failures with their evidence retained and
+their dispositions applied; closing a privately attached window during the run,
+which destroys nothing until every fact is certified; and a host built by
+`allocWindowHost` refusing registration. The opacity examples compile external
+clients that ask the public sublibrary for the attachment seam and reach for the
+retirement boundary in the private implementation, and both are refused, while
+the accepted client builds and runs a protected host through the public
+interface. One `glfw-native-tests` scenario
+(`--match "protected host"`) repeats the lifetime in a child process of its own
+over a real session, proving the window's native destruction follows the
+scripted owner's completion and the termination follows that destruction, with
+no event, wake, or window call entering GLFW afterwards. It claims nothing about
+GPU synchronization: the owner is a script and its facts are CPU facts.
 
 ### What the owner and workers may wait on
 
@@ -2754,11 +2977,15 @@ vetoes the window's destruction. It is the LIFE-1 slice of
 [the window and graphics lifetime design](window_graphics_lifetime_design.md)
 (P-1, P-5, D-1, D-2, D-4).
 
-**No public attachment exists yet.** No module under `packages/glfw/src/`
-exports the model, an external client cannot import it, and no production
-component uses it: the window host, its close protocol, retirement by borrow
-count, and every public module behave exactly as before. The protected host
-lifetime (LIFE-3) and the public attachment contract (LIFE-4) follow. The model
+**No public attachment exists yet.** No module under `packages/glfw/src/` or
+`packages/glfw/runtime-glfw/` exports the model or an operation over it, and an
+external client can import neither it nor the retirement boundary that owns it.
+The one boundary that owns an instance is
+[the protected host lifetime](#the-protected-host-lifetime) (LIFE-3), which
+reaches it through the private `runtime-glfw-core` sublibrary; a host built by
+`allocWindowHost` is issued no identity, so its close protocol, its retirement
+by borrow count, and every public module behave exactly as before. The public
+attachment contract (LIFE-4) follows. The model
 names no Vulkan, native, or GPU type, performs no native call, and owns no
 thread; it is a pure state machine with bounded bookkeeping and one bounded
 notice inbox.
@@ -2950,6 +3177,12 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Request counter | The command port | Submissions issue from it | Any; atomic | The host | Never reissued |
 | Demand slots: the application's and one per window | The window host | Publishers combine into them; the owner captures and clears; the close protocol and quiescence close | Publish: any; capture and close: owner | The host, and a window's until it is forgotten | Cleared by each capture; closed and never reopened |
 | Release failure | The window | A failing release part sets it; the observation release reads it | Owner | The window | Read at release |
+| Attachment model and its owner authority | The protected host lifetime | The owner thread writes; any thread may read the phases, facts, and evidence | Owner; STM | The host | Ends with the host, every attachment retired first |
+| Attachment admission | The protected host lifetime | Quiescence closes it, and the host's own exit closes it again | Any; STM | The host | Closed on every exit, idempotently; never reopened |
+| Completion publication | The protected host lifetime | Every offer reads it; the drain closes it | Any; STM | The host | Closed in the transaction that first finds nothing pending; never reopened |
+| Completion inbox | The protected host lifetime | Any thread offers a notice; the owner takes and folds them | Any; STM | The host | Emptied by each take; bounded by the window limit times the retirement facts |
+| Registered retirement protocols | The protected host lifetime | The owner registers, withdraws, revives, and prunes them | Owner; STM | Until the attachment retires | At most one per window the host may hold; removed as attachments retire |
+| The stall diagnostic | The protected host lifetime | The owner claims it | Owner | The host | Claimed once, whatever it records; never retried |
 | Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |
 | Window registry | The window host | Registration inserts; the close protocol marks closing; a retirement that succeeded or failed removes; ports, clients, and dispatch read | Write: owner; read: any | Registration until retirement | Emptied as windows retire; the collection's exit releases what remains |
 | Per-window command hosts | The window host, for each window | The window's port admits; the loop executes; the close protocol and quiescence close | Admit: any; execute and close: owner | Registration until the window is forgotten | Closed at the close protocol or quiescence; never reopened |

@@ -49,6 +49,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , defaultHostConfig
   , validateHostConfig
   , HostConfigRejected (..)
+  , maximumWindowLimit
   , hostComponent
 
     -- * The owner loop
@@ -69,6 +70,24 @@ module Hetoimasia.Runtime.GLFW.Internal
   , UpdateSchedule (..)
   , ScheduledStep (..)
 
+    -- * The protected host lifetime
+  , withProtectedWindowHost
+  , withProtectedWindowHostIn
+  , withProtectedWindowHostWith
+  , runProtectedWindowApplication
+
+    -- * The private attachment seam
+  , hostAttachmentIdentity
+  , attachHostWindow
+  , hostCompletionPublisher
+  , hostPendingAttachments
+  , hostAttachmentView
+  , reportHostRetirementFact
+  , AttachmentProtocol (..)
+  , RetirementProgress (..)
+  , AttachmentOutcome (..)
+  , RolledBack (..)
+
     -- * Applications
   , runWindowApplication
   ) where
@@ -83,9 +102,11 @@ import Control.Exception
   , fromException
   , mask
   , rethrowIO
+  , toException
   , tryWithContext
   , uninterruptibleMask_
   )
+import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -198,8 +219,42 @@ import Hetoimasia.GLFW.Internal.Session
   ( WakePath
   , ownerOperation
   , reconcileMonitorEvents
+  , sessionIdentity
   , sessionWakePath
   , sessionWindowCapabilities
+  )
+import Hetoimasia.GLFW.Internal.Attachment
+  ( Acknowledgement
+  , AttachmentId
+  , AttachmentView
+  , FactAnswer
+  , HostIdentity
+  , RetirementFact
+  , acknowledgedAttachment
+  , attachmentWindow
+  )
+import Hetoimasia.Runtime.GLFW.Internal.Retirement
+  ( AttachmentOutcome (..)
+  , AttachmentProtocol (..)
+  , CompletionPublisher
+  , DrainOutcome (..)
+  , RolledBack (..)
+  , HostRetirement
+  , RetirementEnvironment (..)
+  , RetirementProgress (..)
+  , attachRetirement
+  , attachmentViewOf
+  , certifyRetirementFact
+  , closeAttachmentAdmission
+  , completionPublisher
+  , drainRetirement
+  , forgetRetiredWindow
+  , newHostRetirement
+  , pendingAttachments
+  , recordClosingWindow
+  , recordRegisteredWindow
+  , retirementIdentity
+  , windowRetirementVeto
   )
 import Hetoimasia.GLFW.Internal.Window
   ( EventProcessing (..)
@@ -245,7 +300,8 @@ data HostConfig = HostConfig
     -- ^ The windows created when the host is built, in order. It may be empty.
   , hostWindowLimit ∷ !Int
     -- ^ The most windows the host holds live at once, closing windows included.
-    -- At least one, and at least as many as 'hostWindowConfigs'.
+    -- At least one, at least as many as 'hostWindowConfigs', and at most
+    -- 'maximumWindowLimit'.
   , hostCommandCapacity ∷ !Integer
     -- ^ How many commands the host's port, and each window's own port, holds
     -- queued.
@@ -312,7 +368,8 @@ data HostConfigRejected
   | EventBudgetRejected !Int
   | IdleWaitRejected !Double
   | WindowLimitRejected !Int
-    -- ^ The limit is below one, or below the number of configured windows.
+    -- ^ The limit is below one, below the number of configured windows, or
+    -- above 'maximumWindowLimit'.
   | InputCapacityRejected !Integer
   deriving (Eq, Show)
 
@@ -321,6 +378,16 @@ instance Exception HostConfigRejected
 -- | The longest idle wait a configuration may ask for, in seconds.
 maximumIdleWait ∷ Double
 maximumIdleWait = 60
+
+-- | The most live windows a configuration may ask for.
+--
+-- Far above what any platform hosts at once, and low enough that every count a
+-- host derives from it — the protected host's completion inbox holds one notice
+-- per retirement fact per window — is an exact 'Int', never a wrapped one. A
+-- configuration above it is refused before anything is acquired, as one below
+-- one is.
+maximumWindowLimit ∷ Int
+maximumWindowLimit = 1024
 
 -- | Check the budgets, the idle wait, the window limit, and the input capacity.
 -- The session, window, and command capacity settings are checked by the
@@ -334,7 +401,8 @@ validateHostConfig config
   -- A wait of less than a whole nanosecond is no bound the scheduled path could
   -- wait for, so it is refused here rather than rounded up to one.
   | Left _ ← idleWaitDuration config = Left (IdleWaitRejected wait)
-  | limit < 1 || limit < length (hostWindowConfigs config) = Left (WindowLimitRejected limit)
+  | limit < 1 || limit < length (hostWindowConfigs config) || limit > maximumWindowLimit =
+      Left (WindowLimitRejected limit)
   | input < 1 || input > maximumCapacity = Left (InputCapacityRejected input)
   | otherwise = Right ()
   where
@@ -372,7 +440,7 @@ waitSeconds duration = fromIntegral (durationNanoseconds duration) / 1e9
 hostComponent ∷ Component
 hostComponent = unsafeComponent "glfw.runtime"
 
-constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation ∷ Operation
+constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation, attachOperation, certifyOperation ∷ Operation
 constructOperation = operation "construct window host"
 loopOperation = operation "run owner loop"
 rejectOperation = operation "reject close request"
@@ -382,6 +450,8 @@ honourOperation = operation "honour close request"
 bookkeepingOperation = operation "read host bookkeeping"
 captureOperation = operation "capture demand"
 reportOperation = operation "report wake degradation"
+attachOperation = operation "attach host window"
+certifyOperation = operation "certify retirement fact"
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -406,6 +476,10 @@ data WindowHost = WindowHost
     -- ^ The application's one demand slot, lent to workers as a publisher.
   , hostActivityState ∷ !(TVar HostActivity)
   , hostHooks ∷ !HostHooks
+  , hostRetirementState ∷ !(Maybe HostRetirement)
+    -- ^ The attachment model and its owner authority, issued only by the
+    -- protected lifetime. A host built by 'allocWindowHost' has none, so it can
+    -- never be the target of an attachment.
   }
 
 -- | Where the private examples interrupt a host. Production passes
@@ -415,10 +489,16 @@ data HostHooks = HostHooks
     -- ^ Runs at the end of a window's registration, masked and with nothing
     -- interruptible before it: after the collection and the host have both
     -- registered the window, before its creation's result is published.
+  , beforeConsumer ∷ WindowHost → IO ()
+    -- ^ Runs on the protected lifetime's own consumer path: after its exit
+    -- handler is installed and before the consumer it was given is entered, so
+    -- whatever this attaches, and however it then fails, is drained exactly as
+    -- the consumer's own attachments are. It never runs for a host built as an
+    -- ordinary 'Scoped' value, which can hold no attachment.
   }
 
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ())
+noHostHooks = HostHooks (pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol
@@ -468,7 +548,17 @@ allocWindowHostIn = allocWindowHostWith noHostHooks
 
 -- | 'allocWindowHostIn' with the private examples' hooks.
 allocWindowHostWith ∷ HasCallStack ⇒ HostHooks → Scoped Session → HostConfig → Scoped WindowHost
-allocWindowHostWith hooks sessionScope config = do
+allocWindowHostWith = allocHostOver Unprotected
+
+-- | Whether a host owns retirement state, and so whether an attachment may
+-- name it. Only 'withProtectedWindowHostWith' builds a 'Protected' one.
+data HostProtection = Unprotected | Protected
+  deriving (Eq, Show)
+
+-- | The one host construction both lifetimes use. The protected one differs in
+-- exactly one thing: it owns the retirement state its exit boundary drains.
+allocHostOver ∷ HasCallStack ⇒ HostProtection → HostHooks → Scoped Session → HostConfig → Scoped WindowHost
+allocHostOver protection hooks sessionScope config = do
   liftIO (either (throwFailure hostComponent constructOperation []) pure (validateHostConfig config))
   session ← sessionScope
   -- Released after every later part: the collection's exit releases the
@@ -477,9 +567,12 @@ allocWindowHostWith hooks sessionScope config = do
   commands ← liftIO (newWindowCommandHost session (hostCommandCapacity config))
   entries ← liftIO (newTVarIO Map.empty)
   demand ← liftIO newDemandSlot
-  -- Released first: every port's admission and every demand slot close before
-  -- any window is released.
-  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand))
+  retirement ← liftIO $ case protection of
+    Unprotected → pure Nothing
+    Protected → Just <$> newHostRetirement (sessionIdentity session) (hostWindowLimit config)
+  -- Released first: every port's admission, every demand slot, and attachment
+  -- admission close before any window is released.
+  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement))
   host ←
     liftIO $
       WindowHost session collection commands config entries
@@ -489,6 +582,7 @@ allocWindowHostWith hooks sessionScope config = do
         <*> pure demand
         <*> newTVarIO (HostActivity 0 False)
         <*> pure hooks
+        <*> pure retirement
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
   pure host
 
@@ -521,13 +615,19 @@ hostActivity = readTVar . hostActivityState
 -- the calling transaction. Finite, non-retrying, and idempotent; it destroys
 -- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
 quiesceWindowHost ∷ WindowHost → STM ()
-quiesceWindowHost host = closeAdmission (hostCommands host) (hostEntries host) (hostDemandSlot host)
+quiesceWindowHost host =
+  closeAdmission (hostCommands host) (hostEntries host) (hostDemandSlot host) (hostRetirementState host)
 
-closeAdmission ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → DemandSlot → STM ()
-closeAdmission commands entries demand = do
+closeAdmission
+  ∷ WindowCommandHost → TVar (Map WindowId HostEntry) → DemandSlot → Maybe HostRetirement → STM ()
+closeAdmission commands entries demand retirement = do
   void (closeWindowCommands commands)
   closeDemandSlot demand
   readTVar entries >>= mapM_ closeEntryAdmission
+  -- A protected host ends new graphics use in the same finite step: every
+  -- attachment still registering or active begins retiring, and no later one is
+  -- admitted. It makes no GPU call and waits for nothing.
+  mapM_ closeAttachmentAdmission retirement
 
 -- | Close one window's admission: its port, its input feed, and its demand
 -- slot. Finite, never retries, and idempotent.
@@ -806,6 +906,10 @@ commitClosing host target =
     Just entry | not (entryClosing entry) → do
       modifyTVar' (hostEntries host) (Map.insert target entry {entryClosing = True})
       closeEntryAdmission entry
+      -- On a protected host the same step ends the window's new graphics use:
+      -- its attachment, if it has one, begins retiring before the close is
+      -- answered, and its veto then holds destruction back.
+      mapM_ (`recordClosingWindow` target) (hostRetirementState host)
       pure True
     _ → pure False
 
@@ -817,7 +921,8 @@ commitClosing host target =
 retireClosing ∷ WindowHost → WindowId → HostEntry → IO ()
 retireClosing host target entry = do
   borrowed ← readIORef (hostBorrowed host)
-  if any (/= target) (Map.keys borrowed)
+  vetoed ← attachmentVetoes host target
+  if vetoed || any (/= target) (Map.keys borrowed)
     then pure ()
     else
       tryWithContext (retireMember (hostCollection host) (entryMember entry)) >>= \case
@@ -829,8 +934,18 @@ retireClosing host target entry = do
             _ → rethrowIO caught
   where
     forget = do
-      atomically (modifyTVar' (hostEntries host) (Map.delete target))
+      atomically $ do
+        modifyTVar' (hostEntries host) (Map.delete target)
+        mapM_ (`forgetRetiredWindow` target) (hostRetirementState host)
       modifyIORef' (hostSurfaced host) (Map.delete target)
+
+-- | Whether a protected host's attachment still vetoes this window's native
+-- destruction. An ordinary host has no attachment and vetoes nothing, so its
+-- close protocol is exactly what it was.
+attachmentVetoes ∷ WindowHost → WindowId → IO Bool
+attachmentVetoes host target = case hostRetirementState host of
+  Nothing → pure False
+  Just retirement → atomically (windowRetirementVeto retirement target)
 
 -- | Retry the retirement of every closing window, in registration order.
 retirePending ∷ WindowHost → IO ()
@@ -874,6 +989,9 @@ registerWindow host config =
       quiesced ← commandsAdmissionClosed (hostCommands host)
       when quiesced (closeEntryAdmission entry)
       modifyTVar' (hostEntries host) (Map.insert identity entry)
+      -- The model learns of the window in the same step, so an attachment can
+      -- never name a window the host does not hold, or miss one it does.
+      mapM_ (`recordRegisteredWindow` identity) (hostRetirementState host)
     afterRegistration (hostHooks host)
     pure client
 
@@ -1472,3 +1590,268 @@ runWindowApplication enterLifetime name dependencies host startup action =
       (quiesceWindowHost . host)
       startup
       action
+
+-- ---------------------------------------------------------------------------
+-- The protected host lifetime
+
+-- | Enter a session and build an attachment-capable host in it, for one
+-- consumer on the calling thread, on the process main thread.
+--
+-- It builds exactly the host 'allocWindowHost' builds — the same validated
+-- configuration, session, scoped collection, host port, configured windows, and
+-- admission-closing release — and additionally owns the retirement state of
+-- "Hetoimasia.GLFW.Internal.Attachment" under a host identity only this
+-- lifetime issues. A host built by 'allocWindowHost' is issued none, so no
+-- attachment can ever name it.
+--
+-- It is the shape
+-- 'Hetoimasia.Runtime.Application.runManagedApplication' accepts, and it
+-- follows that contract in full: once construction succeeds it invokes the
+-- consumer exactly once, synchronously on the calling thread, with every
+-- dependency it built live; when construction fails it invokes the consumer not
+-- at all. Its exit handler is installed under masking before the host is handed
+-- over and before interruptibility is restored for any dependent the consumer
+-- constructs, so no exit can escape it.
+--
+-- __On every exit__ — a normal return, an action failure, a startup failure, a
+-- dependency construction failure after host setup, an owner-loop failure, a
+-- latched supervised failure, and cancellation — the boundary:
+--
+-- 1. runs the host's own 'quiesceWindowHost' — every port's admission, every
+--    input feed, every demand slot, and attachment admission with new graphics
+--    use — idempotently and in one finite transaction, even when the
+--    application never installed a quiescence hook or omitted the host from
+--    one. This is the host's own safeguard; when the application does install
+--    it the runtime's ordering has already done it before the worker drain,
+--    which is what keeps a worker from starting a use the drain would then have
+--    to wait for. Nothing can be admitted or published after it, so the report
+--    in step 3 cannot be outrun;
+-- 2. retires every remaining attachment on the owner thread, with the windows,
+--    the session, and every parent still live, through the narrow progress path
+--    "Hetoimasia.Runtime.GLFW.Internal.Retirement" describes: completion
+--    notices folded, one bounded opportunity per pending attachment per round,
+--    native event processing and the session's internal wake kept live, finite
+--    interruptible waits, and no application hook or supervisor checkpoint;
+-- 3. makes the wake path's one guarded degradation report, as
+--    'runWindowApplication' does, now that nothing further can be admitted or
+--    published;
+-- 4. settles the outcome and returns, at which point — and only once every
+--    attachment is safe — the windows, the session, and the parents unwind in
+--    dependency order.
+--
+-- __The outcome__ is recorded before any interruptible drain work. A body
+-- failure stays primary and every drain, report, and deferred failure is
+-- retained beside it under the @glfw protected retirement@ label. After a
+-- successful body the first drain failure becomes primary and later ones are
+-- retained. A cancellation delivered during the drain is deferred: it is
+-- counted against every pending attachment as the model's evidence, never
+-- establishes a fact, never replaces a recorded outcome, and is re-raised only
+-- once retirement is safe — never before a window, the session, or a parent is
+-- released.
+withProtectedWindowHost ∷ HasCallStack ⇒ Logger → HostConfig → (WindowHost → IO r) → IO r
+withProtectedWindowHost logger config =
+  withProtectedWindowHostIn logger (allocSession (hostSessionConfig config)) config
+
+-- | 'withProtectedWindowHost' over a session scope the caller supplies, such as
+-- a test seam's session. The host owns the session only if that scope does.
+withProtectedWindowHostIn
+  ∷ HasCallStack ⇒ Logger → Scoped Session → HostConfig → (WindowHost → IO r) → IO r
+withProtectedWindowHostIn = withProtectedWindowHostWith noHostHooks
+
+-- | 'withProtectedWindowHostIn' with the private examples' hooks.
+withProtectedWindowHostWith
+  ∷ HasCallStack ⇒ HostHooks → Logger → Scoped Session → HostConfig → (WindowHost → IO r) → IO r
+withProtectedWindowHostWith hooks logger sessionScope config use =
+  -- The scope is entered under this mask, so the handler below is installed
+  -- before anything at all can be delivered — including in the handoff out of
+  -- the scope's own construction and into the consumer, which is a point the
+  -- scope restores at. Each part still acquires exactly as it does for
+  -- 'allocWindowHost', which already acquires under a mask of its own, and the
+  -- consumer is lent the restore.
+  mask $ \restore →
+    withScoped (allocHostOver Protected hooks sessionScope config) $ \host → do
+      -- Inside the handler, so an attachment this makes is drained however it
+      -- then fails; the consumer follows it on the same protected path.
+      outcome ← tryWithContext (restore (beforeConsumer hooks host >> use host))
+      settleProtectedExit restore logger host outcome
+
+-- | 'runWindowApplication' over a protected host lifetime.
+--
+-- The third argument builds the application's dependencies inside the logging
+-- lifetime, so the protected host can be given the logger its stall diagnostic
+-- and its wake report are written through; the fourth finds the host among
+-- them. Every other step keeps the runner's order, thread, and labels: the
+-- host's quiescence transaction runs before the worker drain, supervision
+-- drains, and the protected host's own exit then retires attachments before its
+-- windows, session, and parents unwind.
+--
+-- Parents the host borrows belong outside the protected lifetime, so they
+-- outlive retirement; dependents the consumer builds belong inside it.
+runProtectedWindowApplication
+  ∷ HasCallStack
+  ⇒ (∀ r. (LoggingLifetime → IO r) → IO r)
+  → Text
+  → (LoggingLifetime → (∀ r. (dependencies → IO r) → IO r))
+  → (dependencies → WindowHost)
+  → (dependencies → RuntimeControl → IO services)
+  → (services → RuntimeControl → IO a)
+  → IO a
+runProtectedWindowApplication enterLifetime name manage host startup action =
+  enterLifetime $ \lifetime →
+    runManagedApplication (\use → use lifetime) name (manage lifetime) (quiesceWindowHost . host) startup action
+
+-- | What the drain is lent: the owner's own native event processing and the
+-- host's configured finite bound. No application hook, no dispatch, and no
+-- supervisor checkpoint is among them.
+retirementEnvironmentOf ∷ Logger → WindowHost → RetirementEnvironment
+retirementEnvironmentOf logger host =
+  RetirementEnvironment
+    { environmentLogger = logger
+    , environmentPoll = processWindowEvents (hostSession host) ProcessPending
+    , environmentAwait = processWindowEvents (hostSession host) (AwaitEventsFor bound)
+    , environmentRetireWindows = retirePending host
+    , environmentBound = bound
+    }
+  where
+    bound = hostIdleWait (hostSettings host)
+
+-- | The protected boundary's exit: the host's own close, the drain, the wake
+-- report, and the settled outcome.
+settleProtectedExit
+  ∷ HasCallStack
+  ⇒ (∀ a. IO a → IO a)
+  → Logger
+  → WindowHost
+  → Either (ExceptionWithContext SomeException) r
+  → IO r
+settleProtectedExit restore logger host outcome = case hostRetirementState host of
+  Nothing → either rethrowIO pure outcome
+  Just retirement → do
+    -- The host's whole admission, not only its attachments': a command
+    -- admitted or a demand published after this point would register a
+    -- notification obligation the one degradation report below has already
+    -- waited past. Idempotent, so it changes nothing when the application's
+    -- own quiescence already ran before the worker drain.
+    atomically (quiesceWindowHost host)
+    drained ← drainRetirement retirement (retirementEnvironmentOf logger host) restore
+    reported ← tryWithContext (reportHostWakeDegradationAtExit restore logger host)
+    settleProtectedOutcome outcome drained reported
+
+-- | Combine the body's outcome with what the drain and the report found.
+--
+-- A body failure stays primary. After a successful body the first drain
+-- failure becomes primary, then the report's, then the deferred cancellation;
+-- everything not chosen is retained beside the primary as labelled cleanup
+-- evidence.
+settleProtectedOutcome
+  ∷ Either (ExceptionWithContext SomeException) r
+  → DrainOutcome
+  → Either (ExceptionWithContext SomeException) ()
+  → IO r
+settleProtectedOutcome body drained reported = case body of
+  Left primary → raiseRetaining primary afterwards
+  Right result → case afterwards of
+    [] → pure result
+    primary : retained → raiseRetaining primary retained
+  where
+    afterwards =
+      maybe [] pure (drainPrimary drained)
+        <> drainRetained drained
+        <> elided
+        <> either pure (const []) reported
+        <> maybe [] pure (drainDeferred drained)
+    elided
+      | drainElided drained == 0 = []
+      | otherwise =
+          [ ExceptionWithContext
+              emptyExceptionContext
+              (toException (RetirementFailuresElided (drainElided drained)))
+          ]
+
+-- | Raise one failure with the others retained beside it, each under the
+-- protected boundary's own cleanup label, in the order they happened.
+--
+-- Releases run inside out, so the failure to be recorded first is the innermost
+-- scope: the list is reversed before it is folded, and inspection then reports
+-- the evidence in the order the boundary found it.
+raiseRetaining ∷ ExceptionWithContext SomeException → [ExceptionWithContext SomeException] → IO a
+raiseRetaining primary = foldr retainOne (rethrowIO primary) . reverse
+  where
+    retainOne failure rest =
+      withResourceLabelled retirementLabel (pure ()) (\() → rethrowIO failure) (\() → rest)
+
+-- | The cleanup label the protected boundary's retained failures carry.
+retirementLabel ∷ Text
+retirementLabel = "glfw protected retirement"
+
+-- | How many retirement failures the boundary counted rather than kept, when
+-- more arrived than the drain's retained-failure bound keeps.
+newtype RetirementFailuresElided = RetirementFailuresElided Natural
+  deriving (Eq, Show)
+
+instance Exception RetirementFailuresElided
+
+-- ---------------------------------------------------------------------------
+-- The private attachment seam
+
+-- | The host identity a protected host issued, or 'Nothing' for a host built by
+-- 'allocWindowHost', 'allocWindowHostIn', or 'allocWindowHostWith'.
+--
+-- That absence is the whole of why an ordinary host accepts no attachment:
+-- without an identity there is nothing an attachment could name, and
+-- 'attachHostWindow' answers 'AttachmentHostUnprotected' before any effect.
+hostAttachmentIdentity ∷ WindowHost → Maybe HostIdentity
+hostAttachmentIdentity = fmap retirementIdentity . hostRetirementState
+
+-- | Reserve a window of a protected host, construct its dependents, and publish
+-- the capability, on the owner thread.
+--
+-- It is available only here, in the private @runtime-glfw-core@ sublibrary, for
+-- this package's own examples: no public module exports it. The public
+-- attachment contract is LIFE-4's.
+--
+-- Refuses other threads with 'Hetoimasia.GLFW.Session.NotSessionOwner', and a
+-- host with no retirement state with 'AttachmentHostUnprotected', each before
+-- any effect.
+attachHostWindow ∷ HasCallStack ⇒ WindowHost → WindowId → AttachmentProtocol → IO AttachmentOutcome
+attachHostWindow host target protocol =
+  ownerOperation (hostSession host) attachOperation (windowIdentifiers target) $
+    case hostRetirementState host of
+      Nothing → pure AttachmentHostUnprotected
+      Just retirement → mask (\restore → attachRetirement retirement restore target protocol)
+
+-- | The capability another thread publishes a certified fact through, or
+-- 'Nothing' for an unprotected host. Publishing wakes the owner exactly as a
+-- command admission does.
+hostCompletionPublisher ∷ WindowHost → Maybe CompletionPublisher
+hostCompletionPublisher host =
+  (\retirement → completionPublisher retirement (hostNotifier host)) <$> hostRetirementState host
+
+-- | The attachments the host still holds, in registration order. Any thread may
+-- read it; it is bounded by the live-window limit.
+hostPendingAttachments ∷ WindowHost → STM [AttachmentId]
+hostPendingAttachments = maybe (pure []) pendingAttachments . hostRetirementState
+
+-- | One attachment's phase, construction state, recorded and missing facts, and
+-- evidence. 'Nothing' once it has retired. Any thread may read it.
+hostAttachmentView
+  ∷ WindowHost → AttachmentId → STM (Maybe (AttachmentView (ExceptionWithContext SomeException)))
+hostAttachmentView host target = maybe (pure Nothing) (`attachmentViewOf` target) (hostRetirementState host)
+
+-- | Certify one retirement fact on the owner thread, for an attachment's own
+-- protocol. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+--
+-- An unprotected host, and a target this host's model refuses, answer
+-- 'Nothing'; the refusal changes nothing.
+reportHostRetirementFact
+  ∷ HasCallStack ⇒ WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
+reportHostRetirementFact host acknowledgement fact =
+  ownerOperation (hostSession host) certifyOperation (windowIdentifiers (attachmentWindow target)) $
+    case hostRetirementState host of
+      Nothing → pure Nothing
+      Just retirement →
+        either (const Nothing) Just
+          <$> atomically (certifyRetirementFact retirement target acknowledgement fact)
+  where
+    target = acknowledgedAttachment acknowledgement

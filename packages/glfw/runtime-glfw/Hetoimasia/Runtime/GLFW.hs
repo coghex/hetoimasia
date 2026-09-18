@@ -347,6 +347,41 @@
 -- operations, and supervised failures as the runtime delivers them. The
 -- application runner makes the one terminal report.
 --
+-- = The protected host lifetime
+--
+-- 'allocWindowHost' builds a host as an ordinary 'Scoped' dependency and keeps
+-- every behaviour described above. Its finalizers run uninterruptibly, after the
+-- runner has already unwound what a dependent might still need, so such a host
+-- accepts no graphics attachment and never will: it is issued no attachment
+-- identity, and the private seam refuses it before any effect.
+--
+-- 'withProtectedWindowHost' and 'withProtectedWindowHostIn' build the same
+-- host — same validated configuration, session, collection, port, windows, and
+-- admission-closing release — inside a dedicated IO continuation boundary that
+-- additionally owns the host's retirement state, and they are the only
+-- constructors that do. They have the shape
+-- 'Hetoimasia.Runtime.Application.runManagedApplication' accepts, and
+-- 'runProtectedWindowApplication' is 'runWindowApplication' over one of them.
+--
+-- On every exit — a normal return, an action failure, a startup failure, a
+-- dependency construction failure after host setup, an owner-loop failure, a
+-- latched supervised failure, and cancellation — the boundary closes attachment
+-- admission and ends new graphics use in one finite transaction, retires every
+-- remaining attachment on the owner thread with the windows, the session, and
+-- every parent still live, makes the wake path's one degradation report, and
+-- only then lets those windows, that session, and those parents unwind. A body
+-- failure stays primary with every later failure retained beside it under the
+-- @glfw protected retirement@ label; after a successful body the first drain
+-- failure becomes primary. A cancellation delivered during retirement is
+-- deferred until retirement is safe and never releases anything early. When no
+-- attachment can make safe progress the boundary retains everything, writes one
+-- diagnostic under @glfw.retirement@, and waits.
+--
+-- Attachments themselves are not public. This library exports no attachment
+-- operation or type: the protected lifetime is usable, and what may attach to it
+-- is the private seam this package's own examples use until LIFE-4 exposes the
+-- contract.
+--
 -- See @docs/glfw.md@, \"The window host and owner loop\", for the same contract
 -- in prose.
 module Hetoimasia.Runtime.GLFW
@@ -389,6 +424,7 @@ module Hetoimasia.Runtime.GLFW
   , defaultHostConfig
   , validateHostConfig
   , HostConfigRejected (..)
+  , maximumWindowLimit
   , hostComponent
 
     -- * The owner loop
@@ -408,6 +444,11 @@ module Hetoimasia.Runtime.GLFW
   , TurnPacing (..)
   , UpdateSchedule (..)
   , ScheduledStep (..)
+
+    -- * The protected host lifetime
+  , withProtectedWindowHost
+  , withProtectedWindowHostIn
+  , runProtectedWindowApplication
 
     -- * Applications
   , runWindowApplication

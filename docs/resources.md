@@ -1171,6 +1171,16 @@ report and flush still to come. Every other step keeps its order, thread, and
 labels, including `application quiescence` and the single report. The runner
 adds no shutdown callback list, no second supervisor, and no resource registry.
 
+The first managed lifetime in this repository is the GLFW package's protected
+window host, `withProtectedWindowHost`: it encloses supervision, quiescence,
+startup, and the action, and uses its release to retire a window's graphics
+dependents on the main thread — after the worker drain, before its windows, its
+session, and its parents unwind. See
+[the protected host lifetime](glfw.md#the-protected-host-lifetime) for what it
+does there and what it retains when it cannot finish. `runWindowApplication`
+already uses one for the host's wake-degradation report; `allocWindowHost`
+remains an ordinary `Scoped` dependency and accepts no attachment.
+
 The lifetime is trusted code, under the same contract as the continuation of
 [`allocComponent`](#the-protected-handoff-and-the-once-only-consumer); the
 runner does not police arbitrary `IO` for violations, and `withScoped` honours
