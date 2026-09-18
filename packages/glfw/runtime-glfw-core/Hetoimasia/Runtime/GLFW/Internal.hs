@@ -88,6 +88,8 @@ module Hetoimasia.Runtime.GLFW.Internal
   , RetirementProgress (..)
   , AttachmentOutcome (..)
   , RolledBack (..)
+  , MetadataRejection (..)
+  , faultHostAttachmentMetadata
 
     -- * The public attachment contract
   , AttachmentId
@@ -307,6 +309,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Retirement
   , CompletionPublisher
   , DetachAnswer (..)
   , DrainOutcome (..)
+  , MetadataRejection (..)
   , ProgressRound (..)
   , RolledBack (..)
   , HostRetirement
@@ -322,6 +325,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Retirement
   , completionPublisher
   , detachAttachment
   , drainRetirement
+  , faultProtocolMetadata
   , forgetRetiredWindow
   , newHostRetirement
   , pendingAttachments
@@ -2033,6 +2037,23 @@ attachHostWindow host target protocol =
         -- cancellation can leave the host holding it.
         mask (\restore → attachRetirement retirement restore target protocol (releaseEarlierCell host))
 
+-- | Install an after-acquisition metadata fault on one of a protected host's
+-- registrations, for this package's own examples.
+--
+-- 'attachHostWindow' demands a protocol's declarations before it reserves
+-- anything, so a protocol that survived attaching holds evaluated, immutable
+-- values that cannot begin raising later. The containment a running owner turn
+-- and the protected drain owe a registration they read every round is real all
+-- the same, and this is how the examples that assert it reach that state
+-- without weakening the preflight they also assert. An unprotected host holds
+-- no registration and changes nothing.
+--
+-- It is available only here, in the private @runtime-glfw-core@ sublibrary: no
+-- public module exports it, and nothing in production calls it.
+faultHostAttachmentMetadata ∷ WindowHost → AttachmentId → CompletionPolicy → STM ()
+faultHostAttachmentMetadata host target completion =
+  mapM_ (\retirement → faultProtocolMetadata retirement target completion) (hostRetirementState host)
+
 -- | The capability another thread publishes a certified fact through, or
 -- 'Nothing' for an unprotected host. Publishing wakes the owner exactly as a
 -- command admission does.
@@ -2093,6 +2114,12 @@ data GraphicsAttachment
     -- Nothing usable was published either way.
   | GraphicsRefused !GraphicsRefusal
     -- ^ The reservation was refused before any acquisition effect.
+  | GraphicsMetadataRejected !MetadataRejection
+    -- ^ A declaration the supplied 'AttachmentProtocol' carries raised when the
+    -- boundary demanded it, which it does before it reserves anything. No slot
+    -- was reserved, no protocol registered, no construction entered, and no
+    -- rollback run — there is no attachment to name — and the failure is handed
+    -- back with the context it propagated with.
   | GraphicsHostUnprotected
     -- ^ The host was built with the @Scoped@ constructor, so it owns no
     -- retirement state and was issued no identity an attachment could name.
@@ -2149,6 +2176,13 @@ refusalOf = \case
 -- the opaque 'GraphicsService': no native pointer, no window, no session, and
 -- no destruction, release, or completion authority.
 --
+-- The protocol's own declarations — its 'protocolCompletion' and its
+-- 'protocolDisposition' — are demanded before anything is reserved, because this
+-- boundary reads them itself on every later round. One that raises when it is
+-- demanded answers 'GraphicsMetadataRejected' having constructed nothing, and
+-- never becomes a failure raised out of a running turn or out of the protected
+-- exit's own drain.
+--
 -- Refuses other threads with 'Hetoimasia.GLFW.Session.NotSessionOwner', and a
 -- host with no retirement state with 'GraphicsHostUnprotected', each before any
 -- effect.
@@ -2187,6 +2221,7 @@ settleAttachment host retirement = \case
   AttachmentSuperseded identity _ → begunRetiring (GraphicsSuperseded identity)
   AttachmentRolledBack settled → begunRetiring (GraphicsRolledBack settled)
   AttachmentRefused refusal → pure (GraphicsRefused (refusalOf refusal))
+  AttachmentMetadataRejected rejected → pure (GraphicsMetadataRejected rejected)
   AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
   AttachmentHostUnprotected → pure GraphicsHostUnprotected
   where
