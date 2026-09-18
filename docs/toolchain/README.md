@@ -16,8 +16,20 @@ is transcribed by hand.
 Every artifact here was executed at commit **`be92703`**, and each says so
 itself rather than relying on this sentence: the receipts in `executed_commit`,
 the CPU-project capture in `executed-revision` with its tree beside it, and both
-binding runs and their bundles in `repository-revision`. The only later commit
-is the one adding this evidence, which changes documentation alone.
+binding runs and their bundles in `repository-revision`.
+
+Commits after that revision add or correct this evidence and the documentation
+around it; none of them changes a qualified input — no pin, bound, project
+setting, recipe, or tool that these artifacts exercised. That is what keeps them
+current rather than stale, and it is a claim you can check rather than take:
+
+```bash
+git diff be92703..HEAD --name-only | grep -v '^docs/'
+```
+
+It should print nothing. If it prints a path, something these results depend on
+moved after they were produced, and they need re-executing rather than
+re-describing.
 
 The receipts record their own `executed_commit`, `runner_os: Darwin`,
 `runner_arch: arm64`, and the toolchain map actually observed — GHC, Cabal, and

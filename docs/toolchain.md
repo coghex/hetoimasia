@@ -109,9 +109,9 @@ boot libraries within their existing bounds.
 
 The third-party packages the index resolves, as observed on local macOS. No
 package here is selected conditionally — the only `if os(…)` stanzas in this
-repository choose frameworks and `extra-libraries` for `hetoimasia-glfw`, never
-a `build-depends` entry — so the same index and bounds select the same set
-wherever the solver runs. Linux CI resolves and builds it under the published
+repository's package descriptions are two in `hetoimasia-glfw`, choosing
+frameworks and `extra-libraries`, never a `build-depends` entry — so the same
+index and bounds select the same set wherever the solver runs. Linux CI resolves and builds it under the published
 image on every run:
 
 ```
