@@ -44,7 +44,9 @@
         "all"
       ],
       "component": "all",
-      "inputs": [],
+      "inputs": [
+        "cabal.project.common"
+      ],
       "framework": "none",
       "runner": "cpu",
       "timeout_seconds": 3600,
@@ -61,7 +63,9 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia:test:hetoimasia-tests",
-      "inputs": [],
+      "inputs": [
+        "cabal.project.common"
+      ],
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,
@@ -78,7 +82,9 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia-foundation:test:foundation-tests",
-      "inputs": [],
+      "inputs": [
+        "cabal.project.common"
+      ],
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,
@@ -95,7 +101,9 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia-runtime:test:runtime-tests",
-      "inputs": [],
+      "inputs": [
+        "cabal.project.common"
+      ],
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,
@@ -113,6 +121,7 @@
       ],
       "component": "hetoimasia-glfw:test:glfw-tests",
       "inputs": [
+        "cabal.project.common",
         "tools/ci-image/",
         "tools/native/"
       ],
@@ -133,7 +142,9 @@
         "--smoke"
       ],
       "component": "hetoimasia:exe:hetoimasia",
-      "inputs": [],
+      "inputs": [
+        "cabal.project.common"
+      ],
       "framework": "none",
       "runner": "cpu",
       "timeout_seconds": 900,
@@ -170,6 +181,7 @@
       ],
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
+        "cabal.project.common",
         "tools/ci-image/",
         "tools/display/",
         "tools/docs_land.sh",
@@ -194,6 +206,7 @@
       ],
       "component": "hetoimasia-glfw:test:glfw-native-tests",
       "inputs": [
+        "cabal.project.common",
         "tools/ci-image/",
         "tools/display/",
         "tools/native/"

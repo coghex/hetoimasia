@@ -192,6 +192,16 @@ A group's inputs are the union of:
   `build-tool-depends`. `"all"` starts from every component of every local
   package.
 
+`cabal.project.common` is declared by **every** group. The planner derives
+`cabal.project` for every component, but not the file that one imports, and that
+file carries the index pin, the warning policy, and the Lua binding's own build
+settings -- which interpreter the build links, and whether Lua's garbage
+collection may run under unsafe calls. Declaring it on one group alone would
+have narrowed selection rather than widened it: before any group declared it a
+change there was an unknown input, which selects every non-optional group, and a
+single consumer would have left the others unselected. Declaring it everywhere
+states what is true and keeps that selection.
+
 The closure is derived from **both** revisions and unioned, so a source that was
 removed or relocated — or an input a group has since stopped declaring — still
 counts for the group that used to own it. A change to the
