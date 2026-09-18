@@ -22,12 +22,15 @@ module Test.Lua.Support
   , newRecorder
   , recordingCallback
   , recorded
+    -- * Cancelling an owner
+  , cancelling
     -- * Bridge bookkeeping
   , referenceSlot
   ) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (SomeException, bracket, mask, try)
+import Control.Concurrent (ThreadId, forkIO, throwTo)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Exception (Exception, SomeException, bracket, mask, try)
 import Data.Text (Text)
 import Foreign.C (CInt)
 import Hetoimasia.Scripting.Lua.Bridge (Library, Vm, closeVm, newVm)
@@ -36,6 +39,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (probeReferenceSlot)
+import Test.Support.Bounded (bounded)
 
 -- | Run a body over a VM and close it afterwards.
 --
@@ -81,6 +85,25 @@ recordingCallback vm (Recorder slot) name =
     name
     (modifyMVar_ slot (pure . (<> [name])) >> pure NoResult)
     (pure ())
+
+-- | Cancel a VM's execution owner, and do not go on until the cancellation has
+-- actually been delivered.
+--
+-- @throwTo@ returns when its exception is delivered, so a sender that has
+-- returned is a cancellation that has landed. Waiting for that sender is what
+-- makes an example about cancellation an example rather than a race: nothing
+-- after it is reasoning about a throw that might still be in flight.
+--
+-- The owner is the thread that called into the VM. While it is inside the
+-- native call the cancellation cannot be delivered, so the sender runs on a
+-- thread of its own and @release@ is what lets the call return -- after which
+-- delivery, and this, complete.
+cancelling ∷ Exception e ⇒ ThreadId → e → IO () → IO ()
+cancelling owner exception release = do
+  sent ← newEmptyMVar
+  _ ← forkIO (throwTo owner exception >> putMVar sent ())
+  release
+  bounded (takeMVar sent)
 
 -- | The registry slot a temporary reference would take right now.
 --

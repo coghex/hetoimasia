@@ -25,7 +25,7 @@ build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
 extra-source-files:
-    bridge/cbits/hetoimasia_lua_publish.h
+    bridge/cbits/hetoimasia_lua_bridge.h
     hazard/cbits/hetoimasia_lua_probe.h
 
 source-repository head
@@ -48,9 +48,9 @@ library bridge
     visibility: private
     hs-source-dirs: bridge
     -- Publication has to happen inside a protected Lua call; see the header.
-    c-sources: bridge/cbits/hetoimasia_lua_publish.c
+    c-sources: bridge/cbits/hetoimasia_lua_bridge.c
     include-dirs: bridge/cbits
-    install-includes: hetoimasia_lua_publish.h
+    install-includes: hetoimasia_lua_bridge.h
     exposed-modules:
         Hetoimasia.Scripting.Lua.Internal.Call
         Hetoimasia.Scripting.Lua.Internal.Callback

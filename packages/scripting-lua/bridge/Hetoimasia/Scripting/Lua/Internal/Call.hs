@@ -38,20 +38,18 @@ module Hetoimasia.Scripting.Lua.Internal.Call
   , MessageHandler (..)
     -- * Reporting
   , reportFault
-  , classify
     -- * Globals
   , globalIsFunction
   ) where
 
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Foreign.C (CSize, peekCString, withCString)
+import Foreign.C (CChar, CInt (CInt), CSize (CSize), withCString)
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (nullPtr)
+import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek, poke)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure
@@ -61,17 +59,12 @@ import Hetoimasia.Foundation.Failure
   , withOperationContext
   )
 import Hetoimasia.Scripting.Lua.Internal.Fault
-  ( ErrorValue (ErrorAbsent, ErrorMessage, ErrorOpaque)
-  , FaultKind
-      ( CallFailed
-      , ChunkRejected
-      , HandlerFailed
-      , MemoryExhausted
-      , UnclassifiedStatus
-      )
+  ( ErrorValue (ErrorOpaque)
+  , FaultKind (CallFailed, HandlerFailed)
   , LuaFault (LuaFault)
-  , diagnosticLimit
+  , classify
   , luaComponent
+  , renderFailure
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
@@ -82,29 +75,18 @@ import Lua
   ( NumArgs (NumArgs)
   , NumResults (NumResults)
   , StackIndex (StackIndex)
-  , State
-  , StatusCode
+  , State (State)
+  , StatusCode (StatusCode)
+  , TypeCode (TypeCode)
   , fromStackIndex
-  , hslua_getglobal
+  , fromTypeCode
   , lua_gettop
-  , lua_isinteger
   , lua_pcall
   , lua_settop
-  , lua_tointegerx
-  , lua_tolstring
-  , lua_tonumberx
-  , lua_type
-  , lua_typename
   , luaL_loadbuffer
-  , data FALSE
-  , data LUA_ERRERR
-  , data LUA_ERRMEM
-  , data LUA_ERRRUN
-  , data LUA_ERRSYNTAX
   , data LUA_OK
   , data LUA_TFUNCTION
-  , data LUA_TNUMBER
-  , data LUA_TSTRING
+  , data LUA_TNONE
   )
 
 -- | What a chunk is called in a diagnostic.
@@ -232,24 +214,36 @@ data GlobalLookup
     LookupFunction
   deriving (Eq, Show)
 
--- | Read a global through the binding's protected getter, leaving it on the
+-- | Read a global through this package's protected getter, leaving it on the
 -- stack when it is a function and when the read failed.
+--
+-- The binding's own getter allocates the key before entering its protected
+-- call, so a first lookup under memory exhaustion would panic rather than
+-- report; this one puts the whole lookup inside the call.
 pushGlobalFunction ∷ State → Text → IO GlobalLookup
 pushGlobalFunction state name = do
   entry ← lua_gettop state
   (status, kind) ←
     ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
       alloca $ \reported → do
-        poke reported LUA_OK
-        found ← hslua_getglobal state bytes (fromIntegral len ∷ CSize) reported
-        status ← peek reported
-        pure (status, found)
+        poke reported (fromTypeCode LUA_TNONE)
+        status ← hetoimasia_lua_getglobal state bytes (fromIntegral len ∷ CSize) reported
+        found ← peek reported
+        pure (status, TypeCode found)
   if status /= LUA_OK
     then pure (LookupFailed status)
     else
       if kind == LUA_TFUNCTION
         then pure LookupFunction
         else lua_settop state entry >> pure LookupMissing
+
+-- | Read a global, with the whole lookup inside one protected Lua call.
+--
+-- @safe@: the globals table can carry an @__index@ metamethod, which can run
+-- Lua, which can call back into Haskell.
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_getglobal"
+  hetoimasia_lua_getglobal
+    ∷ State → Ptr CChar → CSize → Ptr CInt → IO StatusCode
 
 -- | Report that a named global the caller relies on is not a callable
 -- function in this VM.
@@ -280,62 +274,6 @@ reportFault vm state entry name kind subject = do
   lua_settop state entry
   raiseEscape vm
   throwFailure luaComponent name [("subject", subject)] (LuaFault kind subject value)
-
--- | Render what a failed call left above the depth it was given, running no Lua
--- and using nothing that can raise one.
---
--- Absence is read from the stack: an operation that left nothing above its
--- entry depth left no error value, and no value's own contents are taken as
--- evidence of that. @lua_tolstring@ is called only on something that is already
--- a string, where it converts nothing and allocates nothing; a number is read
--- with the non-allocating accessors and formatted here; anything else is named
--- by its Lua type and nothing else.
-renderFailure ∷ State → StackIndex → IO ErrorValue
-renderFailure state entry = do
-  top ← lua_gettop state
-  if top <= entry
-    then pure ErrorAbsent
-    else do
-      kind ← lua_type state index
-      if kind == LUA_TSTRING
-        then readString
-        else
-          if kind == LUA_TNUMBER
-            then readNumber
-            else do
-              named ← lua_typename state kind >>= peekName
-              pure (ErrorOpaque named)
-  where
-    index = StackIndex (-1)
-    readString = alloca $ \reported → do
-      bytes ← lua_tolstring state index reported
-      if bytes == nullPtr
-        then pure (ErrorOpaque "string")
-        else do
-          len ← peek reported
-          let full = fromIntegral (len ∷ CSize) ∷ Int
-              kept = min full diagnosticLimit
-          taken ← ByteString.packCStringLen (bytes, kept)
-          pure (ErrorMessage (Text.decodeUtf8Lenient taken) (full > diagnosticLimit))
-    readNumber = do
-      integral ← lua_isinteger state index
-      rendered ←
-        if integral /= FALSE
-          then Text.pack . show <$> lua_tointegerx state index nullPtr
-          else Text.pack . show <$> lua_tonumberx state index nullPtr
-      pure (ErrorMessage rendered False)
-    peekName pointer
-      | pointer == nullPtr = pure "unknown"
-      | otherwise = Text.pack <$> peekCString pointer
-
--- | Classify one of Lua's own status codes.
-classify ∷ StatusCode → FaultKind
-classify status
-  | status == LUA_ERRSYNTAX = ChunkRejected
-  | status == LUA_ERRRUN = CallFailed
-  | status == LUA_ERRMEM = MemoryExhausted
-  | status == LUA_ERRERR = HandlerFailed
-  | otherwise = UnclassifiedStatus (Text.pack (show status))
 
 evalOperation ∷ Operation
 evalOperation = operation "eval-chunk"

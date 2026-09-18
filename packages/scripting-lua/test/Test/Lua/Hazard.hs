@@ -17,7 +17,20 @@
 -- process boundary. Both are later slices' work; that they will be needed is
 -- this example's finding.
 --
--- The second is requirement 8's independent-progress proof, and it is here
+-- A fourth mode, @callback-cancellation@, is a diagnostic rather than an
+-- example. It cancels callback threads, which the contract does not support --
+-- a callback thread is the runtime's machinery, not an endpoint an owner
+-- addresses -- and it ends this process some of the time, which is the evidence
+-- for saying so. It is kept runnable by hand and is not asserted on here,
+-- because an example that accepts either outcome asserts nothing. The supported
+-- cancellation, of a VM's execution owner, is exercised in
+-- "Test.Lua.Faults".
+--
+-- The second is the publication path's behaviour under memory exhaustion, which
+-- needs an allocator that fails on demand -- something the binding exports no
+-- way to install from Haskell.
+--
+-- The third is requirement 8's independent-progress proof, and it is here
 -- because it needs an RTS option this suite cannot have: exactly one
 -- capability. That is what makes the claim falsifiable. Under one capability a
 -- Haskell thread can run during a foreign call only if the call released the
@@ -72,29 +85,17 @@ spec = describe "hazard" $ do
       status `shouldBe` ExitSuccess
       grew reported
 
-  it "contains a cancellation delivered inside a callback, fifty times over" $
-    withHazard ["callback-cancellation"] EndsItself $ \reported status → do
-      reported `shouldContain` "HAZARD callbacks-survived"
-      -- Delivered, not merely sent: the callback parks interruptibly, and the
-      -- count is of cancellations that reached the boundary as themselves.
-      reported `shouldContain` "attempts=50"
-      reported `shouldContain` "delivered=50"
-      reported `shouldContain` "usable=yes"
-      -- The failure this guards against is a process that is no longer there
-      -- to report anything, so the exit status carries as much as the line.
-      status `shouldBe` ExitSuccess
-
-  it "reports memory exhaustion while publishing a callback instead of dying of it" $
+  it "reports memory exhaustion anywhere along publication instead of dying of it" $
     withHazard ["allocation-failure"] EndsItself $ \reported status → do
-      -- 4 is LUA_ERRMEM and 0 is LUA_OK. A starved allocator answers the first
-      -- because the whole publication runs inside a protected call; without
-      -- that, the raise would find no frame and end this process, and there
-      -- would be no line to read at all.
-      -- 4 is LUA_ERRMEM and 0 is LUA_OK, and the acquisition flags say which
-      -- publication handed its stable pointer to Lua: the starved one never
-      -- got that far, the generous one did and the state's close freed it.
+      -- Every allocation on the path is the one that fails in some run, the
+      -- same state is published to again afterwards and must accept it, and the
+      -- carriers a state finalizes must be exactly those a publication took
+      -- ownership of -- no fewer, which is a stable pointer nothing releases,
+      -- and no more, which is a second release of one.
       reported
-        `shouldContain` "HAZARD allocation-reported starved=4 starved-acquired=0 generous=0 generous-acquired=1"
+        `shouldContain` "HAZARD allocation-swept"
+      reported `shouldContain` "retries=all-accepted"
+      reported `shouldContain` "finalization=exact"
       status `shouldBe` ExitSuccess
 
 -- | Assert that the counter grew between the hook's two samples.

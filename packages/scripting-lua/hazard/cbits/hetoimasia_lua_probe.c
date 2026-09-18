@@ -1,5 +1,5 @@
 #include "hetoimasia_lua_probe.h"
-#include "hetoimasia_lua_publish.h"
+#include "hetoimasia_lua_bridge.h"
 
 #include <lauxlib.h>
 #include <stdatomic.h>
@@ -59,7 +59,8 @@ int hetoimasia_lua_probe_samples(long *first, long *second)
 
 /*
 ** An allocator with a budget, so the publication path can be asked what it does
-** when Lua cannot allocate.
+** when Lua cannot allocate -- and asked at every point along it, not only the
+** first.
 */
 static size_t remaining;
 
@@ -78,12 +79,18 @@ static void *budgeted(void *ud, void *block, size_t was, size_t wanted)
   return realloc(block, wanted);
 }
 
-int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acquired)
+int hetoimasia_lua_publish_sweep(
+  void *first, void *second, size_t budget,
+  int *first_acquired, int *second_status, int *second_acquired, long *finalized)
 {
   int status;
+  long before;
   lua_State *L;
 
-  *acquired = 0;
+  *first_acquired = 0;
+  *second_acquired = 0;
+  *second_status = LUA_OK;
+  *finalized = 0;
 
   /* Generous while the state is built, so the failure lands where it is being
   ** asked about rather than before. */
@@ -92,12 +99,19 @@ int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acqu
   if (L == NULL) {
     return LUA_ERRMEM;
   }
-  lua_settop(L, 0);
+  before = hetoimasia_lua_carriers_finalized();
 
   remaining = budget;
-  status = hetoimasia_lua_publish(L, function, "starved", 7, acquired);
+  status = hetoimasia_lua_publish(L, first, "starved", 7, first_acquired);
 
+  /* The same state again, with room this time. A publication that failed
+  ** part-way must not have left anything behind that makes the next one wrong:
+  ** the metatable a carrier needs is either absent or complete, never half
+  ** built and reusable. */
   remaining = (size_t) -1;
+  *second_status = hetoimasia_lua_publish(L, second, "retried", 7, second_acquired);
+
   lua_close(L);
+  *finalized = hetoimasia_lua_carriers_finalized() - before;
   return status;
 }

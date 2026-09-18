@@ -31,18 +31,12 @@
 module Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (..)
   , Callback
+  , Installed
   , installCallback
   , escapeMarker
   ) where
 
-import Control.Exception
-  ( ExceptionWithContext
-  , SomeException
-  , allowInterrupt
-  , mask
-  , try
-  , tryWithContext
-  )
+import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithContext)
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
@@ -54,8 +48,8 @@ import Foreign.StablePtr (StablePtr, deRefStablePtr, freeStablePtr, newStablePtr
 import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
-import Hetoimasia.Scripting.Lua.Internal.Call (classify, reportFault)
-import Hetoimasia.Scripting.Lua.Internal.Fault (luaComponent)
+import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, luaComponent)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
   , raiseEscape
@@ -85,7 +79,7 @@ import Lua
 --
 -- @safe@: setting a global honours @__newindex@, which can run Lua, which can
 -- call back into Haskell.
-foreign import ccall safe "hetoimasia_lua_publish.h hetoimasia_lua_publish"
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_publish"
   hetoimasia_lua_publish
     ∷ State → StablePtr Installed → Ptr CChar → CSize → Ptr CInt → IO StatusCode
 
@@ -155,17 +149,28 @@ data Installed = Installed !Vm !Callback
 
 -- | This package's entry from Lua into Haskell.
 --
--- Masked from its first instruction, and it is the /only/ Haskell that runs
--- between Lua calling in and the callback thread ending -- which is why this
--- package registers its own export rather than using the binding's. The
--- binding's runs more of its own Haskell after the function it called returns,
--- and an asynchronous exception delivered there unwinds through a C frame and
--- ends the process; that code cannot be masked from outside it.
+-- It runs on a thread of the runtime's own making, created for this call and
+-- ending with it. That thread is not a cancellation endpoint: cancellation
+-- targets a VM's execution owner, and a callback thread is machinery the owner
+-- does not address. A trusted callback must not publish its own 'ThreadId' for
+-- something else to cancel, and must not leave work running past its own
+-- return.
 --
--- Only the callback's own action is unmasked, so a cancellation aimed at it is
--- delivered there and caught with the context it carried. Nothing escapes: a
--- failure is recorded on the VM and answered with a negative result count,
--- which the C closure turns into a Lua error once this has returned.
+-- What this does contain is a failure the callback's own action raises. The
+-- action runs unmasked, so it is interruptible for its own purposes and its
+-- failure -- of any type, with the context it carried -- is caught here rather
+-- than unwinding through the C frame that called in. It is recorded on the VM
+-- and answered with a negative result count, which the C closure turns into a
+-- Lua error once every Haskell frame has returned. The owner's boundary
+-- re-raises it with its own type and context, whatever Lua did with the
+-- placeholder.
+--
+-- Everything after the action is masked, which narrows the window in which an
+-- exception could unwind through C to the runtime's own prologue and epilogue
+-- around this function. It does not close it, and the contract does not claim
+-- it does: a cancellation aimed at this thread from outside can still end the
+-- process, which is why nothing in this package hands out its identity and why
+-- no registration surface may start.
 hetoimasiaEnter ∷ PreCFunction
 hetoimasiaEnter state = mask $ \restore → do
   -- The C closure put the carrier below the call's own arguments.
@@ -190,40 +195,9 @@ hetoimasiaEnter state = mask $ \restore → do
           recordEscape vm captured
           lua_pushlightuserdata state escapeMarker
           pure failedResults
-      drainCancellations drainBudget
       pure results
 
 foreign export ccall "hetoimasia_lua_enter" hetoimasiaEnter ∷ PreCFunction
-
--- | Absorb any cancellation still aimed at this thread, before returning.
---
--- Masking this entry stops a cancellation from unwinding through the C frame
--- while it runs. It does not stop one from being /pending/: a @throwTo@ blocked
--- against the mask is delivered the moment the mask lifts, which is as this
--- returns, and a callback thread that ends killed is reported by the export's
--- own epilogue as an uncaught exception that the process does not survive.
---
--- So each one is let in through a window of this function's own choosing and
--- dropped. Dropping is the right answer and not a shortcut: this thread is the
--- runtime's, made for one call and ending with it, and a cancellation that
--- arrives after the action has finished cannot stop work that is already done.
--- A failure the action itself suffered was recorded on the VM before this runs,
--- and is still owed to the caller.
---
--- The budget bounds a caller that simply keeps throwing; each blocked @throwTo@
--- is delivered once, so an ordinary burst drains long before it.
-drainCancellations ∷ Int → IO ()
-drainCancellations budget
-  | budget <= 0 = pure ()
-  | otherwise = do
-      landed ← try @SomeException allowInterrupt
-      case landed of
-        Left _ → drainCancellations (budget - 1)
-        Right () → pure ()
-
--- | How many pending cancellations one callback will absorb.
-drainBudget ∷ Int
-drainBudget = 64
 
 -- | The result count that means "the value on top is the failure marker".
 --

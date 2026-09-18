@@ -13,8 +13,15 @@
 -- caught with.
 module Test.Lua.Faults (spec) where
 
-import Control.Concurrent (forkIO, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar
+  ( modifyMVar_
+  , newEmptyMVar
+  , newMVar
+  , putMVar
+  , readMVar
+  , takeMVar
+  )
 import Control.Exception
   ( AsyncException (UserInterrupt)
   , Exception
@@ -37,7 +44,9 @@ import Hetoimasia.Scripting.Lua.Bridge
   , LuaFault (faultKind, faultValue)
   , callGlobal
   , chunkName
+  , closeVm
   , evalChunk
+  , newVm
   )
 import Hetoimasia.Scripting.Lua.Internal.Call
   ( MessageHandler (HandlerGlobal)
@@ -59,7 +68,8 @@ import Test.Hspec
   , shouldSatisfy
   )
 import Test.Lua.Support
-  ( newRecorder
+  ( cancelling
+  , newRecorder
   , recorded
   , recordingCallback
   , referenceSlot
@@ -151,10 +161,10 @@ spec = describe "faults" $ do
               )
           putMVar raised outcome
       bounded (takeMVar entered)
-      -- throwTo blocks while the target is inside the native call, so it runs
-      -- on a thread of its own.
-      _ ← forkIO (throwTo runner UserInterrupt)
-      putMVar released ()
+      -- Delivered and waited for: the owner is inside the native call when the
+      -- sender starts, so the sender returns only once that call has returned
+      -- and the cancellation has landed.
+      cancelling runner UserInterrupt (putMVar released ())
       outcome ← bounded (takeMVar raised)
       case outcome of
         Right () → expectationFailure "the thread was never cancelled"
@@ -258,12 +268,18 @@ spec = describe "faults" $ do
           outcome ← try @SomeException (evalChunk vm (chunkName "fault") "wait() error('boom')")
           putMVar raised outcome
       bounded (takeMVar entered)
-      _ ← forkIO (throwTo runner UserInterrupt)
-      putMVar released ()
+      cancelling runner UserInterrupt (putMVar released ())
       outcome ← bounded (takeMVar raised)
       case outcome of
         Right () → expectationFailure "the chunk succeeded"
-        Left _ → pure ()
+        -- Two failures are owed to this thread at once: the chunk's, and the
+        -- cancellation. Which of them it ends up carrying is the runtime's to
+        -- decide, and this example is not about that -- it is about what the VM
+        -- looks like afterwards, which is the same either way.
+        Left thrown → case (fromException thrown, fromException thrown) of
+          (Just UserInterrupt, _) → pure ()
+          (_, Just (_ ∷ LuaFault)) → pure ()
+          _ → expectationFailure ("the operation failed with " <> show thrown)
       -- The cancellation arrives the instant the protected call returns. It
       -- must not arrive between that and the stack being put back.
       stackDepth vm >>= (`shouldBe` before)
@@ -286,8 +302,7 @@ spec = describe "faults" $ do
           outcome ← try @SomeException (evalChunk vm (chunkName "strand") "pcall(boom) wait()")
           putMVar raised outcome
       bounded (takeMVar entered)
-      _ ← forkIO (throwTo runner UserInterrupt)
-      putMVar released ()
+      cancelling runner UserInterrupt (putMVar released ())
       outcome ← bounded (takeMVar raised)
       case outcome of
         Right () → expectationFailure "the operation reported success"
@@ -295,6 +310,31 @@ spec = describe "faults" $ do
       -- Whichever of the two the cancelled operation raised, it took the
       -- recorded failure with it. The next chunk is unrelated and succeeds.
       evalChunk vm (chunkName "after") "local ignored = 1"
+
+  it "retains a cancelled operation's borrowed dependencies until the close" $ do
+    vm ← newVm [LibraryBase]
+    releases ← newMVar (0 ∷ Int)
+    entered ← newEmptyMVar
+    released ← newEmptyMVar
+    raised ← newEmptyMVar
+    installCallback
+      vm
+      "wait"
+      (putMVar entered () >> takeMVar released >> pure NoResult)
+      (modifyMVar_ releases (pure . succ))
+    runner ←
+      forkIO $ do
+        outcome ← try @SomeException (evalChunk vm (chunkName "cancel") "wait()")
+        putMVar raised outcome
+    bounded (takeMVar entered)
+    cancelling runner UserInterrupt (putMVar released ())
+    _ ← bounded (takeMVar raised)
+    -- Cancelling the owner does not retire what its callbacks borrowed. Lua can
+    -- still call them, right up to the close.
+    readMVar releases >>= (`shouldBe` 0)
+    evalChunk vm (chunkName "again") "local ignored = 1"
+    closeVm vm
+    readMVar releases >>= (`shouldBe` 1)
 
   it "reports a callback that failed inside a globals metamethod as that failure" $
     withVm [LibraryBase] $ \vm → do

@@ -49,10 +49,11 @@ import Hetoimasia.Scripting.Lua.Bridge
   )
 import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (BooleanResult, NoResult)
+  , Installed
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmState)
-import Lua (NumResults (NumResults), PreCFunction, State (State))
+import Lua (State (State))
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitWith)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -293,42 +294,91 @@ callbackCancellation = do
   where
     attempts = 50 ∷ Int
 
--- | Ask the publication path what it does when Lua cannot allocate.
+-- | Ask the publication path what it does when Lua cannot allocate -- at every
+-- point along it, not only the first.
 --
--- Publishing allocates twice, and an allocation failure in Lua is a Lua error.
--- Raised from a call Haskell made directly it would find no protected frame and
--- end the process, which is why the bridge puts the whole publication inside
--- one. This starves a state's allocator and reports the status that came back:
--- a status at all, rather than this process's death, is the evidence.
+-- Publishing allocates several times over, and an allocation failure in Lua is
+-- a Lua error. Raised from a call Haskell made directly it would find no
+-- protected frame and end the process, which is why the bridge puts the whole
+-- publication inside one. The binding exports no @lua_newstate@, so an
+-- allocator that fails on demand cannot be installed from Haskell; this builds
+-- one in C and walks its budget from nothing upwards, so every allocation on
+-- the path is the one that fails in some run.
+--
+-- Two things are checked at each budget, and they are the ones a partially
+-- built state would break. The same state is published to again with room to
+-- spare, and must succeed: a failure part-way must leave nothing behind that
+-- makes the next attempt wrong. And the number of carriers the state finalizes
+-- must equal the number of publications that took ownership -- no more, which
+-- would be a double free, and no fewer, which would be a stable pointer nothing
+-- will ever release.
 allocationFailure ∷ IO ()
 allocationFailure = do
-  -- One pointer per publication, and each freed by whoever ended up owning it:
-  -- the starved publication never handed its pointer to Lua, so this frees it;
-  -- the generous one did, and closing that state freed it already.
-  starving ← newStablePtr (\_ → pure (NumResults 0))
-  (starved, starvedTook) ← publishUnderBudget starving 0
-  when (starvedTook == 0) (freeStablePtr starving)
-  generous' ← newStablePtr (\_ → pure (NumResults 0))
-  (generous, generousTook) ← publishUnderBudget generous' 4096
-  when (generousTook == 0) (freeStablePtr generous')
-  putStrLn
-    ( "HAZARD allocation-reported starved="
-        <> show (fromIntegral starved ∷ Int)
-        <> " starved-acquired="
-        <> show (fromIntegral starvedTook ∷ Int)
-        <> " generous="
-        <> show (fromIntegral generous ∷ Int)
-        <> " generous-acquired="
-        <> show (fromIntegral generousTook ∷ Int)
-    )
+  swept ← traverse sweepAt [0 .. budgets]
+  let failed = length [() | (_, status, _, _, _, _) ← swept, status /= luaOk]
+      succeeded = length [() | (_, status, _, _, _, _) ← swept, status == luaOk]
+      retriesRefused =
+        [budget | (budget, _, _, retry, _, _) ← swept, retry /= luaOk]
+      miscounted =
+        [ budget
+        | (budget, _, first, _, second, finalized) ← swept
+        , finalized /= fromIntegral (first + second)
+        ]
+  case (retriesRefused, miscounted) of
+    ([], []) | failed > 0 && succeeded > 0 →
+      putStrLn
+        ( "HAZARD allocation-swept budgets="
+            <> show (length swept)
+            <> " refused="
+            <> show failed
+            <> " published="
+            <> show succeeded
+            <> " retries=all-accepted finalization=exact"
+        )
+    (refused, miscount)
+      | failed == 0 → report "no budget was small enough to refuse a publication"
+      | succeeded == 0 → report "no budget was large enough to publish"
+      | not (null refused) →
+          report ("a retry on the same state was refused at budgets " <> show refused)
+      | otherwise →
+          report ("carriers finalized did not match those acquired at budgets " <> show miscount)
+  where
+    budgets = 39 ∷ Int
+    luaOk = 0 ∷ CInt
+    report reason = do
+      putStrLn ("HAZARD allocation-unswept reason=" <> reason)
+      exitWith (ExitFailure 4)
+    sweepAt budget = do
+      first ← newStablePtr trivialCallback
+      second ← newStablePtr trivialCallback
+      (status, firstTook, retry, secondTook, finalized) ←
+        alloca $ \firstAcquired →
+          alloca $ \retryStatus →
+            alloca $ \secondAcquired →
+              alloca $ \finalizedCount → do
+                reported ←
+                  hetoimasia_lua_publish_sweep
+                    first
+                    second
+                    (fromIntegral budget)
+                    firstAcquired
+                    retryStatus
+                    secondAcquired
+                    finalizedCount
+                (,,,,) reported
+                  <$> peek firstAcquired
+                  <*> peek retryStatus
+                  <*> peek secondAcquired
+                  <*> peek finalizedCount
+      -- Freed here only by whoever still owns it; a carrier that took one has
+      -- already released it at the state's close.
+      when (firstTook == 0) (freeStablePtr first)
+      when (secondTook == 0) (freeStablePtr second)
+      pure (budget, status, firstTook, retry, secondTook, finalized)
 
--- | Publish under a budget, answering the status and whether Lua took the
--- stable pointer.
-publishUnderBudget ∷ StablePtr PreCFunction → CSize → IO (CInt, CInt)
-publishUnderBudget carried budget =
-  alloca $ \acquired → do
-    status ← hetoimasia_lua_publish_under_budget carried budget acquired
-    (,) status <$> peek acquired
+-- | A callback that does nothing, for the publications the sweep makes.
+trivialCallback ∷ Installed
+trivialCallback = error "the sweep never calls what it publishes"
 
 -- | How many Lua instructions separate the hook's samples.
 --
@@ -346,12 +396,19 @@ foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_arm_probe"
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_advance"
   hetoimasia_lua_probe_advance ∷ IO CLong
 
--- | Publish a callback into a state whose allocator fails after a budget.
+-- | Walk the publication path's allocations, and report what each budget did.
 --
 -- @safe@ for the same reason publication itself is: it can run Lua.
-foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_publish_under_budget"
-  hetoimasia_lua_publish_under_budget
-    ∷ StablePtr PreCFunction → CSize → Ptr CInt → IO CInt
+foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_publish_sweep"
+  hetoimasia_lua_publish_sweep
+    ∷ StablePtr Installed
+    → StablePtr Installed
+    → CSize
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CLong
+    → IO CInt
 
 -- | The hook's first two samples, and how many it took.
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_samples"

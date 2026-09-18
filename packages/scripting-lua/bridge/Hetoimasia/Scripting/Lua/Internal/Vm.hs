@@ -85,9 +85,8 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Foreign.C (CInt)
-import Foreign.Marshal.Alloc (alloca)
-import Foreign.Storable (peek, poke)
+import Foreign.C (CChar, CInt (CInt))
+import Foreign.Ptr (Ptr, nullPtr)
 import Hetoimasia.Foundation.Failure
   ( Operation
   , operation
@@ -97,10 +96,12 @@ import Hetoimasia.Foundation.Failure
 import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseFault (CloseFault)
   , ErrorValue (ErrorAbsent)
-  , FaultKind (ChunkRejected)
+  , FaultKind (MemoryExhausted)
   , LuaFault (LuaFault)
   , VmClosed (VmClosed)
+  , classify
   , luaComponent
+  , renderFailure
   )
 import Hetoimasia.Scripting.Lua.Internal.Library
   ( Library
@@ -108,11 +109,11 @@ import Hetoimasia.Scripting.Lua.Internal.Library
   , libraryOpener
   )
 import Lua
-  ( StackIndex
-  , State
+  ( CFunction
+  , StackIndex
+  , State (State)
+  , StatusCode (StatusCode)
   , fromStackIndex
-  , hsluaL_newstate
-  , hsluaL_requiref
   , lua_close
   , lua_gettop
   , lua_pushboolean
@@ -122,7 +123,6 @@ import Lua
   , data FALSE
   , data LUA_OK
   , data LUA_REGISTRYINDEX
-  , data TRUE
   )
 
 -- | Whether a VM still accepts operations, and if not, why.
@@ -198,7 +198,16 @@ probeReferenceSlot vm = do
 -- closed before the failure is raised.
 newVm ∷ [Library] → IO Vm
 newVm libraries = mask_ $ do
-  state ← hsluaL_newstate
+  -- The one Lua operation that cannot be protected, because there is no state
+  -- yet to protect it with. It reports an allocation failure by answering a
+  -- null state rather than by raising, which is why it is the entry used.
+  state ← hetoimasia_lua_newstate
+  unless (stateReachable state) $
+    throwFailure
+      luaComponent
+      newOperation
+      []
+      (LuaFault MemoryExhausted "new-state" ErrorAbsent)
   gate ← newMVar ()
   phase ← newIORef Open
   escape ← newIORef Nothing
@@ -213,26 +222,31 @@ newVm libraries = mask_ $ do
       lua_close state
       throwIO (failure ∷ SomeException)
 
--- | Open one standard library through the binding's protected @requiref@,
--- restoring the stack it borrowed.
+-- | Open one standard library, with the whole @requiref@ inside one protected
+-- Lua call, restoring the stack it borrowed.
+--
+-- The binding's own wrapper allocates the module's name before entering its
+-- protected call, so opening a library under memory exhaustion would panic
+-- rather than report. What it left behind is read and classified like any other
+-- failed call: a library that could not be allocated is 'MemoryExhausted', not
+-- a rejected chunk.
 openLibrary ∷ State → Library → IO ()
 openLibrary state library = do
   entry ← lua_gettop state
   status ←
     useAsCString (libraryModuleName library) $ \name →
-      alloca $ \reported → do
-        poke reported LUA_OK
-        hsluaL_requiref state name (libraryOpener library) TRUE reported
-        peek reported
-  -- Successful or not, the protected call left exactly one value: the module,
-  -- or the error it failed with.
-  lua_settop state entry
-  unless (status == LUA_OK) $
+      hetoimasia_lua_requiref state name (libraryOpener library) 1
+  unless (status == LUA_OK) $ do
+    value ← renderFailure state entry
+    lua_settop state entry
     throwFailure
       luaComponent
       openOperation
       [("library", showText library)]
-      (LuaFault ChunkRejected (showText library) ErrorAbsent)
+      (LuaFault (classify status) (showText library) value)
+  -- Successful or not, the protected call left exactly one value: the module,
+  -- or the error it failed with.
+  lua_settop state entry
 
 -- | Run one operation on an open VM, holding the gate for its duration.
 --
@@ -365,6 +379,25 @@ raiseEscape vm = takeEscape vm >>= traverse_ rethrowIO
 
 openOperation ∷ Operation
 openOperation = operation "open-library"
+
+newOperation ∷ Operation
+newOperation = operation "new-vm"
+
+-- | Whether the interpreter was allocated at all.
+stateReachable ∷ State → Bool
+stateReachable (State pointer) = pointer /= nullPtr
+
+-- | A new interpreter, or a null state when one could not be allocated.
+foreign import ccall unsafe "hetoimasia_lua_bridge.h hetoimasia_lua_newstate"
+  hetoimasia_lua_newstate ∷ IO State
+
+-- | Open one standard library, with the whole operation inside one protected
+-- Lua call.
+--
+-- @safe@: an opener runs Lua, and a module already in @package.loaded@ can be
+-- anything, including something that calls back into Haskell.
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_requiref"
+  hetoimasia_lua_requiref ∷ State → Ptr CChar → CFunction → CInt → IO StatusCode
 
 showText ∷ Show a ⇒ a → Text
 showText = Text.pack . show

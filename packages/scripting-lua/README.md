@@ -24,8 +24,8 @@ boundary they will be built on, and the evidence that it holds.
 `Vm` and `ChunkName` are abstract. No exported module hands a caller a Lua
 state, a stack index, a registry reference, a coroutine, a closure, or a native
 address, and none of them has a reachable representation that becomes one: the
-state, the callback trampoline, the temporary registry references, and the stack
-probes live in the package's private `bridge` sublibrary, which no client
+state, the callback entry, and the stack probes live in the package's private
+`bridge` sublibrary, which no client
 outside the package can depend on. `Test.Lua.Opacity` compiles clients that try
 each of those reaches and requires the compiler to refuse them, and one client
 that uses the whole public contract and requires it to link and run.
@@ -53,9 +53,10 @@ reasons that are this slice's requirements rather than preferences:
   bridge has to decide for itself what a cancellation delivered around a native
   call does, and inheriting a blanket mask forecloses that.
 
-Nothing in `hslua-core` is needed for what this slice does: the raw layer
-already exposes the individual `luaopen_*` functions, protected `pcall`, the
-registry reference helpers, and the Haskell-function trampoline.
+Nothing in `hslua-core` is needed for what this slice does. What is used from
+`lua` is narrower still: the Lua C API, the bundled interpreter, and the
+individual `luaopen_*` functions. Its Haskell-facing conveniences are not used,
+for the reasons under *The foreign-call audit*.
 
 ### Provisioning and build identity
 
@@ -90,134 +91,111 @@ the binding before this package, and nothing else changes.
 What the boundary actually does, recorded here so later slices do not have to
 rediscover it.
 
-### Which calls are safe, and which are not
+### What is used, and what is not
 
-Recorded per call, because grouping them gets it wrong. `lua-2.3.4` fixes some
-imports and leaves others to the `allow-unsafe-gc` flag, which this repository
-disables; under that setting the flagged ones are `safe`.
+This package performs several Lua operations through its own C rather than the
+binding's wrappers, in `bridge/cbits/hetoimasia_lua_bridge.c`. The reason is the
+same each time and is set out under *Allocation* below: the binding's wrappers
+put their protected call after the allocation that builds their arguments, so
+the first allocation of the operation is unprotected.
 
 | Import | Annotation | Used by |
 | --- | --- | --- |
 | `lua_pcall` | `safe`, fixed | every call into Lua |
 | `lua_close` | `safe`, fixed | the close |
-| `hslua_getglobal`, `hslua_setglobal` | `safe`, fixed | reading and publishing a global |
 | `luaL_loadbuffer` | `safe`, by the flag | loading a chunk |
-| `hslua_newhsfunction` (behind `hslua_pushhsfunction`), `hslua_extracthsfun` | `safe`, by the flag | installing and entering a callback |
-| `hslua_error` | `safe`, by the flag | the trampoline's stand-in error |
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
-| `hetoimasia_lua_publish` (this package's C) | `safe` | publishing a callback, under protection |
-| `lua_touserdata`, `lua_remove` | `unsafe`, fixed | the callback entry, reading its carrier |
-| `hsluaL_newstate`, `hsluaL_requiref` | `unsafe`, fixed | constructing a VM and opening a library |
-| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata` | `unsafe`, fixed | stack bookkeeping, rendering, and the escape marker |
+| `hetoimasia_lua_publish`, `hetoimasia_lua_getglobal`, `hetoimasia_lua_requiref` | `safe` | publishing a callback, reading a global, opening a library — each one protected call |
+| `hetoimasia_lua_newstate` | `unsafe` | creating the interpreter |
+| `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata`, `lua_touserdata`, `lua_remove` | `unsafe`, fixed | stack bookkeeping, rendering, and the callback entry |
 
-`lua_pushlstring`, `lua_newuserdatauv`, and `luaL_newmetatable` appear only
-inside `hetoimasia_lua_publish`, where they run under a protected call; the
-binding's own `hslua_pushhsfunction`, `hslua_setglobal`, and `hslua_error`,
-which would reach them unprotected or bring their own export with them, are not
-used. See *Allocation* and *How callbacks re-enter* below.
+`lua-2.3.4` fixes some of its imports and leaves others to the
+`allow-unsafe-gc` flag, which this repository disables; under that setting the
+flagged ones are `safe`.
+
+Deliberately **not** used: `hsluaL_newstate`, `hsluaL_requiref`,
+`hslua_getglobal`, `hslua_setglobal`, `hslua_pushhsfunction`,
+`hslua_newhsfunction`, `hslua_extracthsfun`, and `hslua_error`. Each either
+allocates before its own protection or brings the binding's foreign export with
+it. Nothing this package does reaches them, so the binding is used for the Lua C
+API, the bundled interpreter, and the standard-library openers — not for its
+Haskell-facing conveniences.
 
 The `safe` calls are what let other Haskell work and other VMs progress while
 one VM is running a chunk: a `safe` call releases the capability for its
-duration. That is the property the one-capability example in
-`Test.Lua.Hazard` exists to make falsifiable.
-
-Two of the `unsafe` ones are worth stating rather than listing.
-`hsluaL_requiref` runs Lua — it opens a standard library through an internal
-protected call — under an `unsafe` import. That is sound only because the
-`luaopen_*` functions are C and call no Haskell, so the call cannot re-enter the
-RTS; it would not be sound for a module opener written in Haskell, and LUA-3
-must not reuse this path for one. `hsluaL_newstate` allocates the interpreter
-and registers the Haskell-function metatable, and touches no Haskell either.
+duration. That is the property the one-capability example in `Test.Lua.Hazard`
+exists to make falsifiable.
 
 `-allow-unsafe-gc` is **disabled**. With it on, every call that can trigger a
-collection — including `hslua_newhsfunction` and `lua_tolstring` above — is
-imported `unsafe`. This bridge pushes Haskell functions into Lua, and each one
-is a userdata whose `__gc` metamethod frees a stable pointer, so any VM that has
-ever held a callback re-enters the RTS from its collector. An `unsafe` import is
-not a context that may do that. Turning the flag off makes those calls `safe`.
-The cost is the `safe` foreign-call overhead on allocation paths, which this
-slice did not measure: it is a correctness setting, and a measurement belongs
-with the first workload that has a budget to weigh it against. The benefit is
-that Haskell finalizers remain available to LUA-2 and LUA-3 rather than being
-foreclosed here.
+collection is imported `unsafe`. This bridge puts Haskell functions into Lua,
+and each one is a userdata whose `__gc` frees a stable pointer, so any VM that
+has ever held a callback re-enters the RTS from its collector. An `unsafe`
+import is not a context that may do that. Turning the flag off makes those calls
+`safe`. The cost is the `safe` foreign-call overhead on allocation paths, which
+this slice did not measure: it is a correctness setting, and a measurement
+belongs with the first workload that has a budget to weigh it against.
 
 ### Allocation, and where a Lua error can be raised
 
-Import safety is not the same question as whether a call can raise a Lua error.
 Almost every Lua operation that allocates can raise `LUA_ERRMEM`, and where that
-raise lands depends entirely on where the call was made from. There are two
-places, and they are not equally bad.
+raise lands depends on where the call was made from. There are two places, and
+they are not equally bad.
 
-**From inside a callback.** A protected frame exists — the caller's
-`lua_pcall`, further out — so a raise here `longjmp`s *out of a Haskell frame*
-to reach it. That is undefined behaviour, not an error report. So the
-trampoline uses only operations that allocate nothing: `lua_pushboolean` for a
-boolean result, and a light userdata for the escape marker rather than a string,
-because pushing a string allocates. `hslua_error` reads the binding's error
-sentinel out of the registry with a key that `hsluaL_newstate` already interned,
-so its lookup finds an existing short string and allocates nothing either.
+**From inside a callback.** A protected frame exists — the caller's `lua_pcall`,
+further out — so a raise here `longjmp`s *out of a Haskell frame* to reach it.
+That is undefined behaviour, not an error report. So the callback entry uses
+only operations that allocate nothing: `lua_pushboolean` for a boolean result,
+and a light userdata for the failure marker rather than a string.
 
-**From Haskell, outside any protected frame.** The reporting path after
-`lua_pcall` has returned is in this position, and so is `installCallback`, which
-is not reachable from inside Lua because the VM's gate is held. Here a raise
-finds no frame at all and runs Lua's panic function, which ends the process. No
-Haskell frame is unwound and nothing is corrupted, but the failure is a dead
-process rather than a `MemoryExhausted` fault.
+**From Haskell, outside any protected frame.** A raise here finds no frame at
+all and runs Lua's panic function, which ends the process. Everything this
+package does from that position is therefore either non-allocating or wrapped:
 
-The reporting path is clean: it takes no registry reference (`luaL_ref` can
-raise) and calls `lua_tolstring` only on a value that is already a string, where
-it converts nothing; a number is read with the non-allocating accessors and
-formatted in Haskell. `Test.Lua.Faults` pins that — a numeric error value
-renders in Haskell's formatting, not Lua's, which is the observable difference.
+- Constructing the interpreter cannot be protected, because there is no state
+  yet to protect it with. `hetoimasia_lua_newstate` is `luaL_newstate`, which
+  reports an allocation failure by answering a null state rather than by
+  raising, and `newVm` turns that into `MemoryExhausted`. The binding's
+  `hsluaL_newstate` also builds a registry entry and a metatable afterwards,
+  unprotected; this package needs neither.
+- Publishing a callback, reading a global, and opening a standard library each
+  run entirely inside one `lua_pcall`, including the `lua_pushlstring` that
+  builds their names. The binding's wrappers push those names first.
+- Reporting a fault takes no registry reference (`luaL_ref` can raise) and calls
+  `lua_tolstring` only on a value that is already a string, where it converts
+  nothing; a number is read with the non-allocating accessors and formatted in
+  Haskell. `Test.Lua.Faults` pins that — a numeric error value renders in
+  Haskell's formatting, not Lua's, which is the observable difference.
 
-**Publishing a callback allocates twice**, and used to do it in this second
-position: `hslua_pushhsfunction` reaches `lua_newuserdatauv`, and the binding's
-`hslua_setglobal` pushes its key with `lua_pushlstring` *before* entering its
-own protected call. Both now happen inside one `lua_pcall`, in this package's
-own `bridge/cbits/hetoimasia_lua_publish.c`, which calls the binding's
-`hslua_newhsfunction` from there. Nothing that could allocate crosses into that
-call: the stable pointer and the name go in as light userdata and an integer,
-and `lua_checkstack` reports its own failure rather than raising it. Memory
-exhaustion while publishing is therefore a status, and the bridge reports it as
-a fault.
-
-`lua-hazard allocation-failure` proves it, because the binding exports no
-`lua_newstate` and an allocator that fails on demand cannot be installed from
-Haskell: the hazard runner builds one in C, starves it, and reports the status
-that came back. A starved publication answers `LUA_ERRMEM`; a generous one
-answers `LUA_OK`. Without the protection there would be no line to read, because
-the process would be gone.
+`lua-hazard allocation-failure` is the evidence. The binding exports no
+`lua_newstate`, so an allocator that fails on demand cannot be installed from
+Haskell; the hazard runner builds one in C and walks its budget from nothing
+upwards, so every allocation on the publication path is the one that fails in
+some run. At each budget it then publishes to the *same* state with room to
+spare and requires that to succeed, and requires the carriers the state
+finalizes to equal exactly those a publication took ownership of. That pair is
+what a half-built state breaks: this package's carrier metatable is registered
+only once complete, because a metatable registered before its `__gc` is
+installed would be found by the next publication, believed finished, and leave a
+carrier nothing ever finalizes.
 
 Ownership of the Haskell function's stable pointer is reported rather than
-inferred. Two allocations can fail on that path and only the second of them
-leaves an owner behind, so the status alone cannot say whether Lua took it: the
-shim sets a flag at the exact instruction the userdata stores the pointer, and
-the bridge frees the pointer only when that flag says Lua never did. That is why
-the shim builds the userdata itself instead of calling the binding's
-`hslua_newhsfunction` — the instruction is inside that function, and nothing
-outside it can observe it.
+inferred. Several allocations can fail on that path and only some leave an owner
+behind, so the status alone cannot say whether Lua took it: the shim sets a flag
+at the instruction the carrier's metatable is attached — the first point from
+which its `__gc` is certain to run — and the bridge frees the pointer only when
+that flag says Lua never took it.
 
 ### How callbacks re-enter
 
-This package owns the callback path. `bridge/cbits/hetoimasia_lua_publish.c`
-builds a userdata that carries a stable pointer to the Haskell operation, gives
-it a metatable whose `__gc` frees that pointer and whose `__metatable` keeps a
-script away from it, and wraps it in a C closure. Lua calls that closure, which
-calls this package's own `foreign export`, `hetoimasia_lua_enter`.
-
-Using the binding's equivalent is what the two previous sections rule out. It
-allocates outside protection, and it runs more of its own Haskell after the
-function it called returns — an asynchronous exception delivered there unwinds
-through a C frame and ends the process, and it is not code this package can
-mask. With its own export, the only Haskell between Lua calling in and the
-callback thread ending is this package's, and all of it is masked but the
-action.
-
-The error protocol is correspondingly this package's. A negative result count
-means the value on top is the failure marker; `lua_error` is raised by the C
-closure, after every Haskell frame has returned, because a `longjmp` through one
-is undefined.
+This package owns the callback path. `hetoimasia_lua_bridge.c` builds a userdata
+that carries a stable pointer to the Haskell operation, gives it a metatable
+whose `__gc` frees that pointer and whose `__metatable` keeps a script away from
+it, and wraps it in a C closure. Lua calls that closure, which calls this
+package's own `foreign export`, `hetoimasia_lua_enter`. The error protocol is
+correspondingly this package's: a negative result count means the value on top
+is the failure marker, and `lua_error` is raised by the C closure after every
+Haskell frame has returned, because a `longjmp` through one is undefined.
 
 That export runs the callback **in a Haskell thread of its own**, not in the
 thread that called `evalChunk` — that is how GHC's foreign exports work, and two
@@ -230,56 +208,55 @@ consequences follow:
 
 A globals table can carry `__index` and `__newindex` metamethods, so reading or
 publishing a global runs Lua too, and that Lua can call one of these callbacks.
-Every such path therefore reports the protected helper's own status and drains
-the escape record; collapsing a failed lookup into "not a function" would report
-the wrong failure and leave the real one for an unrelated later operation.
+Every such path therefore reports its own protected call's status and drains the
+escape record; collapsing a failed lookup into "not a function" would report the
+wrong failure and leave the real one for an unrelated later operation.
 
 ### Error and cancellation transport
 
+**Cancellation targets a VM's execution owner.** A callback thread is the
+runtime's machinery, created for one call and ending with it, and is not an
+endpoint an owner addresses. A trusted callback must not publish its own
+`ThreadId` for something else to cancel, and must not leave work running past
+its own return. This is a contract, not a wish: the runtime's own prologue and
+epilogue around a foreign export are not code this package can mask, and a
+cancellation delivered there ends the process. `lua-hazard
+callback-cancellation` reproduces that on demand and is kept as diagnostic
+evidence rather than as an example, because an example that accepts either
+outcome asserts nothing.
+
+What the contract does promise:
+
+- **Owner cancellation stays observable.** It is not delivered while the owner
+  is inside Lua, because `lua_pcall` is a `safe` foreign call; it stays pending
+  and arrives once the call has returned *and* the operation's bookkeeping is
+  done. Operations run masked for that reason — delivered between the call
+  returning and the stack being restored, it would leave the stack deep and one
+  call's callback failure for the next to raise. Nothing is lost by masking,
+  because a thread inside Lua could not be cancelled anyway. What a cancelled
+  operation does not do is retire anything its callbacks borrowed; that waits
+  for the close.
+- **A callback's failure keeps its type and context.** The action runs unmasked,
+  so it is interruptible for its own purposes and a failure of any type is
+  caught with the context it carried, recorded on the VM, and answered to Lua
+  with the failure marker. Lua may catch that with `pcall` and finish the chunk
+  successfully; the operation's boundary still re-raises the recorded exception,
+  with its own type and context, and adds its operation to that context. The
+  first escape of an operation is the one kept, and an operation that leaves by
+  any other exception takes the record with it.
+- **Nothing promises to interrupt arbitrary Lua.** Callbacks are short and do
+  not block; work that would block belongs in an asynchronous request or is cut
+  into segments. Enforcing limits on untrusted code is the business of the
+  isolated processes that will run it, not of this boundary.
+
 A Lua error inside a protected call is a status code, never an unwind: it is
-classified, its value is rendered under a bound, and it becomes a `LuaFault`.
-Rendering runs no Lua — a `__tostring` metamethod is never called — and reports
-a value that is neither a string nor a number by its Lua type alone. Not by its
-address: a pointer rendered into text is still a native address, and `LuaFault`
-crosses the package boundary. Absence is read from the stack depth, so a
-`false` error value is reported as a boolean rather than mistaken for nothing.
-
-A Haskell exception inside a callback never crosses the C frame. The entry runs
-the callback's own action unmasked, so a cancellation aimed at it is delivered
-there and caught with the context it carried; everything after the action —
-recording the failure, building the result, returning — is masked, because an
-exception delivered in that stretch would unwind through a frame that is not
-Haskell's. The recorded failure becomes an ordinary Lua error carrying the
-escape marker.
-
-Masking stops a cancellation from unwinding; it does not stop one from being
-pending. A `throwTo` blocked against the mask is delivered the moment the mask
-lifts, and a callback thread that ends killed is reported by the export's
-epilogue as an uncaught exception the process does not survive. So before
-returning, the entry lets each pending cancellation in through a window of its
-own and drops it. Dropping is right rather than expedient: the thread is the
-runtime's, made for one call and ending with it, and a cancellation arriving
-after the action has finished cannot stop work that is already done — while a
-failure the action itself suffered was recorded on the VM first and is still
-owed to the caller. `lua-hazard callback-cancellation` fires three cancellations
-at each of fifty callbacks and requires every one to be delivered, contained,
-and survived. Lua may catch that with `pcall` and
-finish the chunk successfully; the operation's boundary still re-raises the
-recorded exception, with its own type and context, and adds its operation to
-that context. The first escape of an operation is the one kept, and an operation
-that leaves by any other exception takes the record with it.
-
-A cancellation aimed at the thread running a call is **not delivered while that
-thread is inside Lua**, because `lua_pcall` is a `safe` foreign call. It stays
-pending and is delivered once the call returns. It is never converted into an
-ordinary Lua error, and it is never swallowed.
-
-The instant it is delivered matters. Without care it lands between the protected
-call returning and the bookkeeping that follows — restoring the stack, taking
-the escape record — and leaves both for the next, unrelated operation. So an
-operation runs masked; the only interruptible point is waiting for a VM that is
-busy. Nothing is lost by that, because a thread inside Lua could not be
-cancelled anyway.
+classified — including `LUA_ERRMEM` as `MemoryExhausted`, wherever it comes from
+— its value is rendered under a bound, and it becomes a `LuaFault`. Rendering
+runs no Lua, so a `__tostring` metamethod is never called, and reports a value
+that is neither a string nor a number by its Lua type alone. Not by its address:
+a pointer rendered into text is still a native address, and `LuaFault` crosses
+the package boundary. Absence is read from the stack depth, so a `false` error
+value is reported as a boolean rather than mistaken for nothing.
 
 ### Supported and rejected execution paths
 
@@ -309,7 +286,9 @@ Rejected:
 - **Any allocating Lua operation from inside a callback.** A raise there unwinds
   out of a Haskell frame to the protected call outside it.
 - **Reaching Lua from a callback with anything that allocates.** A raise there
-  unwinds out of a Haskell frame to the protected call outside it. The entry
+  unwinds out of a Haskell frame to the protected call outside it.
+- **Cancelling a callback thread.** Not an endpoint; see *Error and cancellation
+  transport*. Cancel the VM's execution owner instead. The entry
   pushes only a boolean or a light userdata for that reason.
 
 ### Process-global state and thread affinity
@@ -330,6 +309,12 @@ shared between `lua_State`s, which is why two VMs share no globals.
 The suite runs with `-threaded -rtsopts -with-rtsopts=-N2`, and so does the
 `lua-hazard` executable. `-N2` rather than `-N`, so every machine runs the same
 thing: the hazard needs one thread inside Lua and one observing it.
+
+The hazard runner carries four modes. Three are examples: the uninterruptible
+chunk, the allocation sweep, and the progress proof. The fourth,
+`callback-cancellation`, is a diagnostic — it cancels callback threads, which
+the contract does not support, and ends the process some of the time, which is
+the evidence for saying so. Run it by hand; the suite does not assert on it.
 
 The independent-progress proof runs `lua-hazard capability-release` with
 `+RTS -N1`, overriding that. Two things make it mean something.

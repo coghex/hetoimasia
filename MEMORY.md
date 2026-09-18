@@ -90,15 +90,21 @@ owning subsystem's contract/design when continuing its work.
   asynchronous exception, so a supervisor that must reclaim a running task needs
   a Lua-consulted hook or a process boundary (LUA-4 onward); the `safe`-call
   cost of disabling `allow-unsafe-gc` is unmeasured and belongs with the first
-  workload that has a budget to weigh it against. The package owns the callback path in
-  its own C — carrier userdata, metatable, C closure, and `foreign export` — on
-  the owner's decision of 2026-09-18, because the binding's allocates outside a
-  protected Lua call and runs its own Haskell after the callback returns, which
-  no amount of masking from outside can contain. Publication is one `lua_pcall`
-  and reports who owns the stable pointer; the entry is masked but for the
-  action and drains pending cancellations before returning. A starved allocator
-  and three cancellations per callback, both in the hazard runner, are the
-  evidence.
+  workload that has a budget to weigh it against. **Cancellation targets a VM's execution
+  owner**, decided by the owner on 2026-09-18: a callback thread is the
+  runtime's machinery, not an endpoint, and a trusted callback must not publish
+  its `ThreadId` or outlive its own return. Owner cancellation stays observable
+  after the native call and the bookkeeping; a callback's failure keeps its type
+  and context; nothing promises to interrupt arbitrary Lua, so callbacks stay
+  short and limits on untrusted code belong to LUA-14/LUA-15's processes. The
+  package performs state creation, publication, global reads, and library
+  opening through its own C — each one protected call — because the binding's
+  wrappers allocate their arguments before their own protection; it owns the
+  callback path and its error protocol for the same reason plus the export
+  window. A budget-walking allocator in the hazard runner proves every
+  allocation on the publication path reports rather than panics, that a failed
+  publication leaves the state usable, and that carriers are finalized exactly
+  once.
 
 ## Contracts to preserve
 

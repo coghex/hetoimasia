@@ -36,10 +36,18 @@ long hetoimasia_lua_probe_advance(void);
 /* The two samples, and how many were actually taken. */
 int hetoimasia_lua_probe_samples(long *first, long *second);
 
-/* Publish a Haskell function into a state whose allocator fails after `budget`
-** allocations, and answer the Lua status that came back. `acquired` reports
-** whether Lua took ownership of the stable pointer, so the caller frees only
-** what it still owns. */
-int hetoimasia_lua_publish_under_budget(void *function, size_t budget, int *acquired);
+/* Publish into a state whose allocator fails after `budget` allocations, then
+** publish again on that same state with room to spare, close it, and report
+** everything observed: the first status (returned), whether each publication
+** took ownership of its stable pointer, the second status, and how many
+** carriers the state finalized.
+**
+** Ownership and finalization together are the question. A caller frees only a
+** pointer that was never acquired; a state finalizes exactly the carriers that
+** were. The two counts agreeing at every budget is what says no intermediate
+** failure left a carrier nothing would ever finalize. */
+int hetoimasia_lua_publish_sweep(
+  void *first, void *second, size_t budget,
+  int *first_acquired, int *second_status, int *second_acquired, long *finalized);
 
 #endif
