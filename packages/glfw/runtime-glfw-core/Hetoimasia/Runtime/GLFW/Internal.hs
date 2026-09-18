@@ -665,19 +665,20 @@ allocHostOver protection hooks sessionScope config = do
   session ← sessionScope
   entries ← liftIO (newTVarIO Map.empty)
   cells ← liftIO (newTVarIO Map.empty)
+  retirement ← liftIO $ case protection of
+    Unprotected → pure Nothing
+    Protected → Just <$> newHostRetirement (sessionIdentity session) (hostWindowLimit config)
   -- Released after the collection's own exit, which is the last thing that can
   -- destroy a window: a window nobody closed is released there and nowhere
   -- else, so this is where a service retained across it learns what that
-  -- release settled its window as. It only ever fills a disposal still pending.
-  allocResource (pure ()) (\() → settleRetainedDisposals entries cells)
+  -- release settled its window as, and the last place its slot can be brought
+  -- up to date. It only ever fills a disposal still pending.
+  allocResource (pure ()) (\() → settleRetainedDisposals retirement entries cells)
   -- Released after every later part: the collection's exit releases the
   -- windows still registered once admission has closed.
   collection ← allocCollection (hostWindowLimit config)
   commands ← liftIO (newWindowCommandHost session (hostCommandCapacity config))
   demand ← liftIO newDemandSlot
-  retirement ← liftIO $ case protection of
-    Unprotected → pure Nothing
-    Protected → Just <$> newHostRetirement (sessionIdentity session) (hostWindowLimit config)
   -- Released first: every port's admission, every demand slot, and attachment
   -- admission close before any window is released.
   allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement cells))
@@ -758,12 +759,19 @@ closeAdmission commands entries demand retirement cells = do
 --
 -- 'retireClosing' writes the disposal of a window the close protocol retired;
 -- a window nobody closed is released by the collection's exit instead, and this
--- runs after that exit for exactly those. It reads each member's settled status
+-- runs after that exit for exactly those. It brings every cell's slot up to
+-- date first, so a retirement the drain's last fold completed is never left
+-- unreported beside a disposal that is. It reads each member's settled status
 -- rather than assuming one, so a release that failed is reported as failed and
 -- never as a destruction that happened, and it overwrites nothing: a disposal
 -- already recorded stays as it was.
-settleRetainedDisposals ∷ TVar (Map WindowId HostEntry) → TVar (Map WindowId GraphicsCell) → IO ()
-settleRetainedDisposals entries cells = do
+settleRetainedDisposals
+  ∷ Maybe HostRetirement → TVar (Map WindowId HostEntry) → TVar (Map WindowId GraphicsCell) → IO ()
+settleRetainedDisposals retirement entries cells = do
+  -- Whatever the model settled last — a fact folded from a notice on the very
+  -- round that ended the drain, for instance — is what every retained cell says
+  -- before its disposal is written beside it.
+  atomically (refreshCells retirement cells)
   held ← readTVarIO cells
   registered ← readTVarIO entries
   settled ← forM (Map.toList held) $ \(window, cell) →

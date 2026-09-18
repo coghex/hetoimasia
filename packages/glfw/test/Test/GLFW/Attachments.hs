@@ -41,10 +41,11 @@ import Control.Exception
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log (Logger)
+import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
+import Hetoimasia.Foundation.Resource (allocResource, withScoped)
+import Hetoimasia.Foundation.Worker (WorkerDefinition, awaitStopRequest, workerDefinition)
 import Hetoimasia.Foundation.Time (Instant)
-import Hetoimasia.Foundation.Resource (withScoped)
 import Hetoimasia.GLFW.Command
   ( SubmitResult (..)
   , clientCommandPort
@@ -69,7 +70,15 @@ import Hetoimasia.GLFW.Window (WindowConfig, WindowId, WindowResult (..))
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision
+  ( Recognition (Unrecognized)
+  , Role (Job)
+  , RuntimeControl
+  , SupervisedStart (..)
+  , SupervisedWorker
+  , WorkerPolicy (..)
+  , startSupervised
+  )
 import Numeric.Natural (Natural)
 import Test.GLFW.Support (at, boundedExample, millis, quietLogger, scriptedClock, unexpected, windowNamed)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -109,6 +118,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample (testDisposalAtHostExit DisposalCompleted))
     it "tells it when that release failed instead"
       (boundedExample (testDisposalAtHostExit DisposalFailed))
+    it "finalizes a service whose last facts a draining worker published between quiescence and the exit"
+      (boundedExample testRetiredByNoticesAtExit)
 
   describe "detaching" $ do
     it "frees the slot only after safe disposal, and a later attachment gets a fresh incarnation"
@@ -1033,6 +1044,67 @@ testDisposalAtHostExit expected = do
   observedSlot observed `shouldBe` SlotFree
   observedMissing observed `shouldBe` []
   observedDisposal observed `shouldBe` expected
+
+-- | The ordinary shutdown shape: quiescence begins every retirement, a worker
+-- publishes what it has ended as it drains, and the exit's own drain folds
+-- those notices and finds nothing left pending on that very round.
+--
+-- The retirement is then complete before the drain has offered a single
+-- opportunity, and a service retained across the exit must say so — free, owing
+-- nothing, and with the disposal its window really ended with.
+testRetiredByNoticesAtExit ∷ Expectation
+testRetiredByNoticesAtExit = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  kept ← newIORef Nothing
+  owned ← newTVarIO Nothing
+  protectedRun
+    seam
+    (settings [windowNamed "alpha"])
+    ( \host → do
+        window ← onlyWindow host
+        -- Its own opportunities establish nothing, so only the published
+        -- notices can retire it.
+        (owner, service) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+        atomically (writeTVar owned (Just owner))
+        writeIORef kept (Just service)
+    )
+    ( \host control → do
+        owner ← readTVarIO owned >>= maybe (unexpected "no owner was attached") pure
+        void (startSupervised control workerPolicy (publishingWorker journal host owner) >>= started)
+    )
+  service ← readIORef kept >>= maybe (unexpected "no service was retained") pure
+  observed ← observation service
+  observedSlot observed `shouldBe` SlotFree
+  observedMissing observed `shouldBe` []
+  observedDisposal observed `shouldBe` DisposalCompleted
+  entries ← readTVarIO journal
+  filter (/= Constructed "alpha") entries `shouldBe` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A worker whose own release publishes its owner's certified facts.
+--
+-- Supervision runs that release while draining, which the runtime orders after
+-- the host's quiescence and before the protected host's own exit: the facts are
+-- therefore admitted — quiescence has already begun the retirement — and they
+-- are all pending before the drain folds anything.
+publishingWorker ∷ TVar [Note] → WindowHost → Owner → WorkerDefinition ()
+publishingWorker journal host owner =
+  workerDefinition
+    "renderer"
+    (\_ → allocResource (pure ()) (\() → publishFacts journal host owner allRetirementFacts))
+    (\token () → atomically (awaitStopRequest token))
+
+workerPolicy ∷ WorkerPolicy
+workerPolicy = WorkerPolicy Job Required testComponent (\_ → pure Unrecognized)
+
+testComponent ∷ Component
+testComponent = unsafeComponent "test.attachments"
+
+started ∷ SupervisedStart r → IO (SupervisedWorker r)
+started = \case
+  WorkerStarted worker → pure worker
+  WorkerStartUnavailable _ _ → unexpected "the worker was unavailable"
+  WorkerStartRejected → unexpected "the worker's start was rejected"
 
 -- ---------------------------------------------------------------------------
 -- Detaching

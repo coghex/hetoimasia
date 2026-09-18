@@ -1008,7 +1008,15 @@ drainRetirement retirement environment restore = go True noDrainOutcome
       sealed ← atomically (sealIfFinished retirement)
       pending ← atomically (livePending retirement)
       if sealed
-        then pure outcome
+        then
+          -- The notices folded just above may have retired the last attachment
+          -- themselves, which is the ordinary shutdown shape: quiescence begins
+          -- every retirement and a draining worker then publishes what it has
+          -- ended. A round that seals must still offer that retirement, or a
+          -- window those notices made safe would be left to the collection's
+          -- exit with its retained observation never brought up to date.
+          tryWithContext (restore (environmentRetireWindows environment >>= evaluate))
+            >>= \attempted → absorb retirement attempted outcome
         else do
           (advanced, stepped) ← opportunities retirement restore pending outcome
           let progressed = revived || advanced

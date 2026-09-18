@@ -3155,7 +3155,9 @@ transaction that ends its admission; a disposal never credited to an incarnation
 a later reservation moved past, even when that reservation published nothing and
 even when it was cancelled without returning at all; a service retained across a
 normal exit learning how the window it never closed was released, and learning
-when that release failed instead; a retained service answering after the host
+when that release failed instead; one whose last facts a draining worker
+published between quiescence and the exit, so the drain's very first fold ends
+the retirement, reported free and owing nothing beside that disposal; a retained service answering after the host
 forgot its window; a failed native
 release kept distinct from the retirement that succeeded; detach then reattach
 with a fresh incarnation and the stale acknowledgement refused on the owner
