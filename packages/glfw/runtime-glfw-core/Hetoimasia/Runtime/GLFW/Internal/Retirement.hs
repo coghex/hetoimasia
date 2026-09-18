@@ -529,16 +529,23 @@ instance Show RolledBack where
 -- owned rollback, keeps the original failure with the rollback's outcome as the
 -- attachment's evidence, and answers 'AttachmentRolledBack'; a cancellation is
 -- counted against the attachment and then re-raised.
+--
+-- @reserved@ runs in the reserving transaction itself, for the incarnation it
+-- just issued, so whatever the owning boundary keys on an incarnation is settled
+-- with the reservation rather than after it. Nothing that follows — a failing
+-- construction, a rollback, a cancellation at any handoff — can leave it undone,
+-- because a reservation that does not commit issues no incarnation at all.
 attachRetirement
   ∷ HasCallStack
   ⇒ HostRetirement
   → (∀ a. IO a → IO a)
   → WindowId
   → AttachmentProtocol
+  → (AttachmentId → STM ())
   → IO AttachmentOutcome
-attachRetirement retirement restore window protocol = do
-  reserved ← atomically reserve
-  case reserved of
+attachRetirement retirement restore window protocol onReserved = do
+  answered ← atomically reserve
+  case answered of
     Left refusal → pure refusal
     Right registered → do
       let target = registeredAttachment registered
@@ -570,6 +577,7 @@ attachRetirement retirement restore window protocol = do
                     protocol
                     True
                 )
+              onReserved (registeredAttachment registered)
               pure (Right registered)
 
 settleConstructed ∷ HostRetirement → AttachmentId → Acknowledgement → IO AttachmentOutcome

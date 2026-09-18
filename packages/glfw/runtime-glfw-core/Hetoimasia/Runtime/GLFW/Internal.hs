@@ -663,18 +663,21 @@ allocHostOver ∷ HasCallStack ⇒ HostProtection → HostHooks → Scoped Sessi
 allocHostOver protection hooks sessionScope config = do
   liftIO (either (throwFailure hostComponent constructOperation []) pure (validateHostConfig config))
   session ← sessionScope
+  entries ← liftIO (newTVarIO Map.empty)
+  cells ← liftIO (newTVarIO Map.empty)
+  -- Released after the collection's own exit, which is the last thing that can
+  -- destroy a window: a window nobody closed is released there and nowhere
+  -- else, so this is where a service retained across it learns what that
+  -- release settled its window as. It only ever fills a disposal still pending.
+  allocResource (pure ()) (\() → settleRetainedDisposals entries cells)
   -- Released after every later part: the collection's exit releases the
   -- windows still registered once admission has closed.
   collection ← allocCollection (hostWindowLimit config)
   commands ← liftIO (newWindowCommandHost session (hostCommandCapacity config))
-  entries ← liftIO (newTVarIO Map.empty)
   demand ← liftIO newDemandSlot
   retirement ← liftIO $ case protection of
     Unprotected → pure Nothing
     Protected → Just <$> newHostRetirement (sessionIdentity session) (hostWindowLimit config)
-  -- Made before the release below, which brings every retained service up to
-  -- date in the same transaction that ends new graphics use.
-  cells ← liftIO (newTVarIO Map.empty)
   -- Released first: every port's admission, every demand slot, and attachment
   -- admission close before any window is released.
   allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement cells))
@@ -750,6 +753,32 @@ closeAdmission commands entries demand retirement cells = do
   -- turn happens to come next: a reader that saw the host quiesce must not still
   -- be told its owner is admitting use.
   refreshCells retirement cells
+
+-- | Tell every cell the host still holds how its window's own release ended.
+--
+-- 'retireClosing' writes the disposal of a window the close protocol retired;
+-- a window nobody closed is released by the collection's exit instead, and this
+-- runs after that exit for exactly those. It reads each member's settled status
+-- rather than assuming one, so a release that failed is reported as failed and
+-- never as a destruction that happened, and it overwrites nothing: a disposal
+-- already recorded stays as it was.
+settleRetainedDisposals ∷ TVar (Map WindowId HostEntry) → TVar (Map WindowId GraphicsCell) → IO ()
+settleRetainedDisposals entries cells = do
+  held ← readTVarIO cells
+  registered ← readTVarIO entries
+  settled ← forM (Map.toList held) $ \(window, cell) →
+    forM (Map.lookup window registered) (fmap ((,) cell . disposalOf) . memberStatus . entryMember)
+  atomically . forM_ (catMaybes settled) $ \(cell, disposal) → do
+    observed ← readGraphicsCell cell
+    when (observedDisposal observed == DisposalPending) (writeGraphicsDisposal cell disposal)
+
+-- | What a member's settled status says about its window's native destruction.
+-- A member still live settled nothing, so its disposal stays pending.
+disposalOf ∷ MemberStatus → NativeDisposal
+disposalOf = \case
+  MemberRetired → DisposalCompleted
+  MemberRetirementFailed _ → DisposalFailed
+  MemberLive → DisposalPending
 
 -- | Close one window's admission: its port, its input feed, and its demand
 -- slot. Finite, never retries, and idempotent.
@@ -1974,7 +2003,11 @@ attachHostWindow host target protocol =
   ownerOperation (hostSession host) attachOperation (windowIdentifiers target) $
     case hostRetirementState host of
       Nothing → pure AttachmentHostUnprotected
-      Just retirement → mask (\restore → attachRetirement retirement restore target protocol)
+      Just retirement →
+        -- The reservation itself releases the cell of any incarnation this
+        -- window's slot has moved past, so no later failure, rollback, or
+        -- cancellation can leave the host holding it.
+        mask (\restore → attachRetirement retirement restore target protocol (releaseEarlierCell host))
 
 -- | The capability another thread publishes a certified fact through, or
 -- 'Nothing' for an unprotected host. Publishing wakes the owner exactly as a
@@ -2053,15 +2086,18 @@ data GraphicsRefusal
     -- ^ The window's close protocol has begun, so no new graphics use may
     -- start on it.
   | GraphicsWindowUnavailable !WindowId
-    -- ^ This host holds no such open window: it was never this host's, or it
-    -- has already ended.
+    -- ^ This host holds no such open window, so there is no slot of its to
+    -- reserve. It may be a window of another host of the same session, or one
+    -- of this host's own that has ended; the two are one answer deliberately,
+    -- because telling them apart would need a record of every window this host
+    -- ever held, and this boundary keeps nothing that grows with how many
+    -- windows were ever made. A window of another /session/ is named as such,
+    -- because a session identity is carried by the window itself.
   | GraphicsWindowOccupied !AttachmentId
     -- ^ Another owner holds the window's one exclusive slot, and holds it until
     -- it has safely retired.
   | GraphicsForeignSession
     -- ^ The window belongs to another session.
-  | GraphicsForeignHost
-    -- ^ The window belongs to another host.
   | GraphicsAdmissionEnded
     -- ^ Attachment admission has closed — the host has quiesced or is exiting —
     -- so no new graphics use may begin at all.
@@ -2077,7 +2113,6 @@ refusalOf = \case
   Model.WindowHasEnded window → GraphicsWindowUnavailable window
   Model.WindowOccupied occupant → GraphicsWindowOccupied occupant
   Model.AttachmentMisuse Model.ForeignSession → GraphicsForeignSession
-  Model.AttachmentMisuse Model.ForeignHost → GraphicsForeignHost
   _ → GraphicsSlotUnavailable
 
 -- | Attach a graphics owner to one open window of a protected host, on the
@@ -2097,11 +2132,6 @@ attachWindowGraphics
   ∷ HasCallStack ⇒ WindowHost → WindowId → AttachmentProtocol → IO GraphicsAttachment
 attachWindowGraphics host target protocol = do
   outcome ← attachHostWindow host target protocol
-  -- Any reservation at all — established, superseded, or rolled back — is a
-  -- later incarnation of this window's slot, so the host stops holding the
-  -- earlier one's cell here. It keeps whatever disposal its own lifetime ended
-  -- with, and the destruction that follows a later owner is not its to report.
-  forM_ (reservedAttachment outcome) (atomically . releaseEarlierCell host)
   beforePublication (hostHooks host)
   case outcome of
     AttachmentEstablished active _ → publishService host (activeAttachment active)
@@ -2111,21 +2141,13 @@ attachWindowGraphics host target protocol = do
     AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
     AttachmentHostUnprotected → pure GraphicsHostUnprotected
 
--- | The attachment a request reserved, whatever became of it. A refusal
--- reserved nothing and names none.
-reservedAttachment ∷ AttachmentOutcome → Maybe AttachmentId
-reservedAttachment = \case
-  AttachmentEstablished active _ → Just (activeAttachment active)
-  AttachmentSuperseded identity _ → Just identity
-  AttachmentRolledBack settled → Just (rolledBackAttachment settled)
-  AttachmentRefused _ → Nothing
-  AttachmentAdmissionClosed → Nothing
-  AttachmentHostUnprotected → Nothing
-
 -- | Stop holding the cell of an incarnation this window's slot has moved past.
 --
 -- It is finalized as free and then dropped, so the window's own disposal, which
 -- belongs to whichever incarnation is its last, can never be written into it.
+-- It runs in the transaction that reserves the later incarnation, so every
+-- reservation settles it — including one that then fails, rolls back, or is
+-- cancelled without ever publishing a service.
 releaseEarlierCell ∷ WindowHost → AttachmentId → STM ()
 releaseEarlierCell host identity = do
   cells ← readTVar (hostGraphicsCells host)

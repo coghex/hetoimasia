@@ -22,6 +22,7 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , check
   , modifyTVar'
   , newTVarIO
   , readTVar
@@ -102,6 +103,12 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testAdmissionVisibleAtOnce)
     it "never credits a window's disposal to an incarnation the slot moved past"
       (boundedExample testDisposalNeverCreditedToEarlier)
+    it "never credits it to one whose successor was cancelled before it could publish"
+      (boundedExample testDisposalNeverCreditedAfterCancellation)
+    it "tells a service retained across a normal exit how the window it never closed was released"
+      (boundedExample (testDisposalAtHostExit DisposalCompleted))
+    it "tells it when that release failed instead"
+      (boundedExample (testDisposalAtHostExit DisposalFailed))
 
   describe "detaching" $ do
     it "frees the slot only after safe disposal, and a later attachment gets a fresh incarnation"
@@ -476,7 +483,9 @@ testRefusals = do
           innerWindow ← onlyWindow inner
           -- Another session's window.
           (_, foreign') ← attachScripted journal inner foreignWindow (ownerNamed "foreign")
-          -- Another host's window, of this very session.
+          -- Another host's window, of this very session: this host holds no
+          -- such window, which is the one answer it can give without keeping a
+          -- record of every window it ever held.
           (_, otherHost) ← attachScripted journal inner outerWindow (ownerNamed "borrowed")
           -- Occupied: the slot is exclusive from the reservation on.
           void (attachedOwner journal inner innerWindow (ownerNamed "inner"))
@@ -524,7 +533,6 @@ refusalOfAnswer = \case
   GraphicsRefused (GraphicsWindowClosing _) → Just "closing"
   GraphicsRefused (GraphicsWindowUnavailable _) → Just "unavailable"
   GraphicsRefused GraphicsForeignSession → Just "foreign session"
-  GraphicsRefused GraphicsForeignHost → Just "foreign host"
   GraphicsRefused GraphicsAdmissionEnded → Just "admission ended"
   _ → Nothing
 
@@ -945,6 +953,67 @@ testDisposalNeverCreditedToEarlier = do
   -- report.
   observedDisposal observed `shouldBe` DisposalPending
 
+-- | The reservation itself is what stops the host holding an earlier
+-- incarnation's cell, so a later reservation that never returns at all — a
+-- cancellation in its construction, which the boundary re-raises — cannot leave
+-- the earlier one to collect the window's disposal.
+testDisposalNeverCreditedAfterCancellation ∷ Expectation
+testDisposalNeverCreditedAfterCancellation = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  kept ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (_, first') ← attachedOwner journal host window (ownerNamed "first")
+    writeIORef kept (Just first')
+    void (detachWindowGraphics host first')
+    turnsUntil host control "the first owner's retirement" (not <$> slotOccupied host window)
+    -- The second reservation commits and its construction is then cancelled, so
+    -- the attach raises rather than answering at all.
+    cancelled ←
+      try . attachScripted journal host window $
+        (ownerNamed "second") {scriptConstruct = throwIO ThreadKilled, scriptRollback = pure RollbackSafe}
+    case (cancelled ∷ Either SomeException (Owner, GraphicsAttachment)) of
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right _ → unexpected "the cancelled construction answered instead of raising"
+    void (closeHostWindow host window)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  service ← readIORef kept >>= maybe (unexpected "no service was retained") pure
+  observed ← observation service
+  observedIncarnation observed `shouldBe` 1
+  observedSlot observed `shouldBe` SlotFree
+  observedDisposal observed `shouldBe` DisposalPending
+
+-- | A window nobody ever closed is released by the host's own exit, and the
+-- service retained across that exit must learn what the release settled as —
+-- a destruction that happened, or one that failed.
+testDisposalAtHostExit ∷ NativeDisposal → Expectation
+testDisposalAtHostExit expected = do
+  journal ← newTVarIO []
+  seam ← case expected of
+    DisposalFailed → failingDestroySeam 1 journal
+    _ → pollingSeam journal
+  kept ← newIORef Nothing
+  outcome ←
+    try . protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+      window ← onlyWindow host
+      (_, service) ← attachedOwner journal host window (ownerNamed "alpha")
+      writeIORef kept (Just service)
+      -- Nothing closes the window: the owner retires on the exit drain and the
+      -- collection's own exit is what releases it.
+      pure ()
+  case (outcome ∷ Either SomeException (), expected) of
+    (Right (), DisposalCompleted) → pure ()
+    (Left _, DisposalFailed) → pure ()
+    (Right (), DisposalFailed) → unexpected "the failed release did not reach the caller"
+    (Left caught, _) → unexpected ("the run failed: " <> show caught)
+    (_, other) → unexpected ("unexpected disposal expectation: " <> show other)
+  service ← readIORef kept >>= maybe (unexpected "no service was retained") pure
+  observed ← observation service
+  observedSlot observed `shouldBe` SlotFree
+  observedMissing observed `shouldBe` []
+  observedDisposal observed `shouldBe` expected
+
 -- ---------------------------------------------------------------------------
 -- Detaching
 
@@ -1224,16 +1293,20 @@ testCompletionWakesTurn = do
     (owner, service) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
     void (closeHostWindow host window)
     -- The owner withdrew its own path on its one opportunity, so no turn can
-    -- advance it and the loop goes idle.
-    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
+    -- advance it and the loop goes idle. The facts are published only once the
+    -- owner has really entered that wait, so the wake is what ends it rather
+    -- than a fold that happened to come first.
+    _ ←
+      forkIO $ do
+        atomically (hostActivity host >>= check . activityWaiting)
+        publishFacts journal host owner allRetirementFacts
     turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
     observed ← observation service
     observedSlot observed `shouldBe` SlotFree
     observedMissing observed `shouldBe` []
-    -- The owner stalled on every opportunity it was given; each folded notice
-    -- revived its path, so a later round may offer it again, and none of those
-    -- steps established anything.
-    atomically (readTVar (ownerSteps owner)) >>= \offered → offered `shouldSatisfy` (>= 1)
+    -- One opportunity, which stalled and established nothing; the retirement is
+    -- entirely the published evidence's.
+    atomically (readTVar (ownerSteps owner)) `shouldReturn` 1
   entries ← readTVarIO journal
   filter (/= Constructed "alpha") entries `shouldBe` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 

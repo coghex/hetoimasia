@@ -2963,11 +2963,19 @@ attachment has constructed nothing:
 | Answer | Meaning |
 |---|---|
 | `GraphicsRefused (GraphicsWindowClosing w)` | The window's close protocol has begun |
-| `GraphicsRefused (GraphicsWindowUnavailable w)` | This host holds no such open window: it was never its, or it has ended |
+| `GraphicsRefused (GraphicsWindowUnavailable w)` | This host holds no such open window: a window of another host of the same session, or one of its own that has ended |
 | `GraphicsRefused (GraphicsWindowOccupied a)` | Another owner holds the slot, and holds it until it has safely retired |
-| `GraphicsRefused GraphicsForeignSession` / `GraphicsForeignHost` | The window belongs to another session or host |
+| `GraphicsRefused GraphicsForeignSession` | The window belongs to another session |
 | `GraphicsRefused GraphicsAdmissionEnded` | Attachment admission has closed; no new graphics use may begin |
 | `GraphicsHostUnprotected` | The host owns no retirement state at all |
+
+A window of another host of the same session and one of this host's own that has
+ended are deliberately one answer. Telling them apart would need a record of
+every window this host ever held, and nothing in this boundary grows with how
+many windows were ever made; a window of another *session* is named as such
+because the session identity is carried by the window itself. Either way the
+refusal comes before any acquisition effect, which is what the contract
+requires.
 
 On success the application is handed a `GraphicsService` and **nothing else**.
 Its representation is private: it exposes the attachment's identity, its
@@ -3018,13 +3026,20 @@ service the moment they commit, without waiting for an owner turn.
 A retained service keeps answering after the host has forgotten its window, and
 after the whole application has ended: the cell lives with the value that holds
 it. The host itself keeps at most one cell per window it still holds, and stops
-holding one as soon as a later reservation of that window succeeds — whatever
-becomes of that reservation, including one that rolls back or is superseded
-without ever publishing a service — so repeated detaching and reattaching grows
-no incarnation history the host owns, and a disposal is never credited to an
-incarnation the slot has moved past. A service observes its window's native
-disposal when its own incarnation was that window's last; an earlier one keeps
-`SlotFree` with the disposal its own lifetime ended with.
+holding one in the very transaction that reserves a later incarnation of that
+window — so whatever becomes of that reservation, including one that rolls back,
+is superseded, or is cancelled without ever returning, repeated detaching and
+reattaching grows no incarnation history the host owns, and a disposal is never
+credited to an incarnation the slot has moved past. A service observes its
+window's native disposal when its own incarnation was that window's last; an
+earlier one keeps `SlotFree` with the disposal its own lifetime ended with.
+
+A disposal is recorded wherever the window is really released. A window the
+close protocol retired is recorded there; a window nobody ever closed is
+released by the collection's own exit instead, and the host's last release step
+runs after that exit and tells each cell it still holds what its member's
+settled status says — a destruction that happened, or a release that failed. It
+fills only a disposal still pending, so nothing already recorded is rewritten.
 
 `hostPendingAttachments` lists the attachments the host still holds, in
 registration order, bounded by the live-window limit.
@@ -3127,8 +3142,9 @@ new attachment:
 The examples in `glfw-tests` (`--match "attachments"`) run whole applications
 over the seam and assert an order of flags or an observed state, never a time.
 They cover every refusal above with no owner constructed — an ended window, a
-window of another host, a window of another session, an occupied slot, a closing
-window whose retirement a borrow defers, and closed admission; the service
+window of another host of the same session, a window of another session, an
+occupied slot, a closing window whose retirement a borrow defers, and closed
+admission; the service
 published only after registration, with the slot already reserved during
 construction; a construction superseded by another thread's quiescence, and one
 superseded in the handoff between its construction settling and its publication;
@@ -3136,8 +3152,11 @@ safe and unsafe rollback, and a cancellation delivered before publication; a
 close and a destruction separately observable, with the destruction after the
 last fact; a close and a quiescence readable from a retained service in the
 transaction that ends its admission; a disposal never credited to an incarnation
-a later reservation moved past, even when that reservation published nothing; a
-retained service answering after the host forgot its window; a failed native
+a later reservation moved past, even when that reservation published nothing and
+even when it was cancelled without returning at all; a service retained across a
+normal exit learning how the window it never closed was released, and learning
+when that release failed instead; a retained service answering after the host
+forgot its window; a failed native
 release kept distinct from the retirement that succeeded; detach then reattach
 with a fresh incarnation and the stale acknowledgement refused on the owner
 thread and through a published notice; a second owner refused while the first
@@ -3616,7 +3635,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Completion inbox | The protected host lifetime | Any thread offers a notice; the owner takes and folds them | Any; STM | The host | Emptied by each take; bounded by the window limit times the retirement facts |
 | Registered retirement protocols | The protected host lifetime | The owner registers, withdraws, revives, and prunes them | Owner; STM | Until the attachment retires | At most one per window the host may hold; removed as attachments retire |
 | The stall diagnostic | The protected host lifetime | The owner claims it | Owner | The host | Claimed once, whatever it records; never retried |
-| Attachment observation cells | The protected host lifetime, and each `GraphicsService` that retains one | The owner thread writes; any holder of the service reads | Write: owner; read: any | The service value that retains it | At most one per window the host holds; finalized when its incarnation leaves the slot and when its window is disposed, then dropped by the host; never reopened |
+| Attachment observation cells | The protected host lifetime, and each `GraphicsService` that retains one | The owner thread writes; any holder of the service reads | Write: owner; read: any | The service value that retains it | At most one per window the host holds; dropped in the transaction reserving a later incarnation, and finalized with its window's disposal by the close protocol or by the host's last release step after the collection's exit; never reopened |
 | Retirement rotation cursor | The window host | Each turn's round records the attachment it served last | Owner | The host | Never reset; an identity the pending list no longer holds leaves the order as it is |
 | Published retirement demand | The window host | Each turn's round writes it; the loops and any thread read it | Write: owner; read: any | The host | Replaced by each round; an ordinary host leaves it empty |
 | Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |

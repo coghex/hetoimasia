@@ -475,7 +475,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       lines out
         `shouldBe` [ "zero retirement budget = Left (RetirementBudgetRejected 0)"
                    , "no demand = RetirementDemand {retirementPending = 0, retirementStalled = 0, retirementRefused = 0, retirementImmediate = False, retirementNextPossible = Nothing}"
-                   , "refusals = [GraphicsAdmissionEnded,GraphicsForeignHost,GraphicsSlotUnavailable]"
+                   , "refusals = [GraphicsAdmissionEnded,GraphicsForeignSession,GraphicsSlotUnavailable]"
                    , "facts = [CpuUseRetired,SubmittedWorkEnded,PresentationEnded,DependentsDisposed]"
                    , "absent = (GraphicsAbsent,DisposalPending,SlotFree)"
                    ]
@@ -990,7 +990,7 @@ attachmentClient =
     , "  let config = defaultHostConfig [hiddenTestWindowConfig (Text.pack \"tool\") 64 48]"
     , "  putStrLn (\"zero retirement budget = \" <> show (validateHostConfig config {hostRetirementBudget = 0}))"
     , "  putStrLn (\"no demand = \" <> show noRetirementDemand)"
-    , "  putStrLn (\"refusals = \" <> show [GraphicsAdmissionEnded, GraphicsForeignHost, GraphicsSlotUnavailable])"
+    , "  putStrLn (\"refusals = \" <> show [GraphicsAdmissionEnded, GraphicsForeignSession, GraphicsSlotUnavailable])"
     , "  putStrLn (\"facts = \" <> show allRetirementFacts)"
     , "  putStrLn (\"absent = \" <> show (GraphicsAbsent, DisposalPending, SlotFree))"
     , ""

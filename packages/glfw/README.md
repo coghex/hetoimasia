@@ -86,8 +86,9 @@ effect.
 the only way in. It attaches one exclusive graphics owner to one open window of
 a protected host, on the owner thread, taking the caller's own construction,
 bounded retirement step, and completion policy, and answering a typed refusal —
-a closing or ended window, an occupied one, another host or session, closed
-admission, an unprotected host — before any acquisition effect. On success it
+a closing window, one this host does not hold, an occupied one, a window of
+another session, closed admission, an unprotected host — before any acquisition
+effect. On success it
 hands back an opaque `GraphicsService`: an identity, an incarnation, and its own
 observation, with no native pointer, no window, no session, and no authority to
 destroy, release, or certify anything. `windowGraphicsStatus` and
