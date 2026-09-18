@@ -19,7 +19,7 @@ be committed — and inside the Linux container there is no checkout to resolve
 one from at all. The digest is what pins the record either way.
 
 It also does something the revision cannot: the two retained records carry the
-*same* digest, `65fbfaa6…`, computed independently — on macOS from a Git
+*same* digest, `54a027aa…`, computed independently — on macOS from a Git
 checkout, and inside the Linux container from the files the recipe copied into
 it, with no checkout to consult. That is direct evidence the two platforms
 proved one tree rather than two that were believed to match.
@@ -172,6 +172,15 @@ fail quietly, so the proof checks each:
   entry point and checks the image it lands in, which is the layer's own on both
   platforms. It clears that filter and the implicit-layer paths out of its
   environment first, and records what it cleared.
+- **Nothing else was in the chain.** Implicit layers need no request from the
+  application at all, so clearing `VK_IMPLICIT_LAYER_PATH` is not enough: that
+  restores the loader's *default* implicit search rather than disabling it, and
+  `VK_LAYER_PATH` governs explicit layers only. After scrubbing, the proof sets
+  `VK_LOADER_LAYERS_DISABLE=~implicit~` and records the policy, so the chain is
+  the explicit layers it asked for and nothing a machine happened to have
+  installed. The effect is visible in the Linux record: Mesa's implicit
+  `VK_LAYER_MESA_device_select` is present on the machine and absent from the
+  enumeration the run reports.
 - **Something was listening for the whole session.** A messenger destroyed
   before the device would miss every diagnostic the device's own destruction
   emits. See the section above.
