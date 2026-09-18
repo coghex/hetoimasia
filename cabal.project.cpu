@@ -8,4 +8,5 @@ packages:
   .
   packages/foundation
   packages/runtime
+  packages/scripting-lua
   tools/test-support

@@ -116,6 +116,7 @@ identifier lists are sorted.
 | `test.foundation` | `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct` | no | yes |
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes |
+| `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
@@ -142,6 +143,20 @@ the root suite: only the `Console` group's startup and exit integration. An
 explicit request for `test.engine` therefore selects none of the foundation,
 runtime, or GLFW examples; request `test.foundation`, `test.runtime`, and
 `test.glfw` beside it for that coverage.
+
+`test.scripting-lua` runs the Lua host package's own suite: the fault and
+cancellation transport across the foreign-call boundary, stack and registry
+discipline, the terminal close, independent execution under the threaded RTS,
+the selectable standard libraries, and the package's export boundary. It is
+mandatory but outside the floor: it is new coverage that no floor group ever
+held, so it is selected when affected rather than added to the evidence every
+candidate must carry. Beside its Cabal closure it declares
+`cabal.project.common`, where the binding's own build settings live -- which Lua
+the build links, and whether Lua's garbage collection may run under unsafe calls
+-- because changing either changes what the group proves. Its uninterruptible-Lua
+example runs the package's `lua-hazard` executable as a child process; the Cabal
+closure reaches that executable through `build-tool-depends`, so its sources
+select the group like any other input.
 
 `test.workflow` runs only when affected or requested.
 
@@ -373,7 +388,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native
 ```
@@ -487,7 +502,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native` |
 
@@ -1282,7 +1297,7 @@ native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \

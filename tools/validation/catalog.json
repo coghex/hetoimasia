@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 10,
+  "policy_version": 11,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -138,6 +138,25 @@
       "runner": "cpu",
       "timeout_seconds": 900,
       "category": "smoke",
+      "optional": false
+    },
+    {
+      "id": "test.scripting-lua",
+      "description": "Focused Hspec examples for the Lua host package's fault and cancellation transport across the foreign-call boundary, stack and registry discipline, terminal close, independent execution under the threaded RTS, selectable standard libraries, and its export boundary. Runs the uninterruptible-Lua example in a child process.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-scripting-lua:lua-host-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-scripting-lua:test:lua-host-tests",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
       "optional": false
     },
     {

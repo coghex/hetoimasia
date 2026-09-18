@@ -1,0 +1,131 @@
+cabal-version: 3.16
+name: hetoimasia-scripting-lua
+version: 0.1.0.0
+synopsis: The private Lua binding and foreign-call boundary for Hetoimasia
+description:
+    One embedded Lua interpreter reached through a private bridge: a VM
+    constructed with an explicitly chosen set of standard libraries, chunks
+    loaded and run through protected calls, and a terminal close. No exported
+    module hands a caller a Lua state, a stack index, a registry reference, a
+    coroutine, a closure, or a native address; the raw binding, the callback
+    trampoline, and the registry bookkeeping stay in this package's private
+    bridge sublibrary. A Lua error is reported as a bounded diagnostic without
+    unwinding Haskell, and a Haskell exception or a cancellation that reaches
+    a callback is re-raised at the Haskell boundary with its type and context
+    rather than becoming an ordinary Lua error that @pcall@ can swallow.
+    This library has no runtime, GLFW, Vulkan, console, or game dependency.
+    The public module and capability registration surface, the protected VM
+    owner, and the task model are later slices.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/scripting-lua
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The bridge itself: the VM record and its gate, the selectable standard
+-- libraries, the protected call and its bounded error rendering, the temporary
+-- registry references, and the Haskell callback trampoline. It is private
+-- because every one of those exposes the Lua state, a stack index, or a
+-- registry reference; the public library above it exposes none of them.
+library bridge
+    import: language
+    visibility: private
+    hs-source-dirs: bridge
+    exposed-modules:
+        Hetoimasia.Scripting.Lua.Internal.Call
+        Hetoimasia.Scripting.Lua.Internal.Callback
+        Hetoimasia.Scripting.Lua.Internal.Fault
+        Hetoimasia.Scripting.Lua.Internal.Library
+        Hetoimasia.Scripting.Lua.Internal.Vm
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        lua >=2.3.4 && <2.4,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0
+
+-- What a client outside this package may say: construct a VM over a chosen set
+-- of libraries, load and run a chunk, call a global the VM already defines, and
+-- close it. Nothing here mentions the binding's types.
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Scripting.Lua.Bridge
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-scripting-lua:bridge
+
+-- The hazard runner. An example that cannot be bounded inside the suite's own
+-- process -- cancelling a thread that is inside Lua does not interrupt Lua, so
+-- the thread never dies -- runs here instead, reports what it observed on
+-- stdout, and is terminated by the suite, which keeps the exit status as the
+-- example's evidence. It is a test fixture, not a shipped tool.
+executable lua-hazard
+    import: language
+    hs-source-dirs: hazard
+    main-is: Main.hs
+    -- -N2 rather than -N: the hazard needs one capability for the thread that
+    -- is inside Lua and one for the thread that observes it, on every machine
+    -- that runs it.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:bridge
+
+-- The bridge's own contracts: the fault and cancellation transport, stack and
+-- registry discipline, the terminal close, independent execution, and the
+-- selectable libraries, plus the export boundary the package promises.
+test-suite lua-host-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Lua.Close
+        Test.Lua.Discipline
+        Test.Lua.Faults
+        Test.Lua.Hazard
+        Test.Lua.Independence
+        Test.Lua.Libraries
+        Test.Lua.Opacity
+        Test.Lua.Spec
+        Test.Lua.Support
+    -- -N2 rather than -N: the independent-progress example needs Haskell to
+    -- run while a capability is inside a substantial Lua computation, on every
+    -- machine that runs it.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-tool-depends: hetoimasia-scripting-lua:lua-hazard
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:bridge
