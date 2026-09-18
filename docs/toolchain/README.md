@@ -13,13 +13,6 @@ is transcribed by hand.
 | `binding-bundle-darwin/` | The complete consumer that run built: project, package description, source module, and a `REPLAY` note. `cabal build all` in a copy of it reproduces the qualification. |
 | `cpu-project-darwin.txt` | `cabal build all --project-file cabal.project.cpu`, captured by `tools/toolchain/capture-build.sh` with the command, toolchain, executed revision and tree, and result. |
 
-Every artifact here was executed at commit **`4bfce6f`** and says so itself:
-each receipt in `executed_commit`, the CPU-project capture in
-`executed-revision` with the tree beside it, and both binding runs in
-`repository-revision`. The only later commit is the one adding this evidence,
-which changes documentation alone, so nothing here is a stale result relabelled
-as a newly executed one.
-
 Every artifact here was executed at commit **`be92703`**, and each says so
 itself rather than relying on this sentence: the receipts in `executed_commit`,
 the CPU-project capture in `executed-revision` with its tree beside it, and both
