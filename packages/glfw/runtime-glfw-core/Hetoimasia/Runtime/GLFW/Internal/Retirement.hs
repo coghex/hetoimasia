@@ -50,7 +50,10 @@
 -- A step that answers 'RetirementStalled', and one that fails, both withdraw
 -- the attachment's progress path: the drain never replays a failed step, and it
 -- resumes stepping only when independent evidence — a completion notice for
--- that attachment — arrives. As soon as any pending attachment has no path
+-- that attachment — arrives. A declaration of the protocol that raises when the
+-- round demands it does the same: it is contained, recorded as that
+-- attachment's evidence, and withdraws its path, so the exit this drain answers
+-- to keeps the attachment, its window, the session, and every parent. As soon as any pending attachment has no path
 -- left, the drain makes one protected diagnostic attempt and keeps waiting; the
 -- diagnostic's own failure is retained and unwinds nothing.
 --
@@ -109,7 +112,9 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , RetirementProgress (..)
   , AttachmentOutcome (..)
   , RolledBack (..)
+  , MetadataRejection (..)
   , attachRetirement
+  , faultProtocolMetadata
   , pendingAttachments
   , attachmentViewOf
   , certifyRetirementFact
@@ -446,6 +451,26 @@ data CompletionPolicy
 -- callback, and release. None may wait on a worker, pump native events, or make
 -- a GPU call: 'protocolStep' is one bounded opportunity that must return
 -- finitely.
+--
+-- = When its declarations are demanded
+--
+-- 'protocolCompletion' and 'protocolDisposition' are values rather than calls,
+-- and the boundary reads them itself. Both are therefore demanded by
+-- 'demandProtocolMetadata' inside 'attachRetirement'\'s own exception boundary,
+-- before anything is reserved: a declaration that raises when it is demanded
+-- answers 'AttachmentMetadataRejected' with its context preserved, having
+-- reserved no slot, registered no protocol, entered no 'protocolConstruct', and
+-- acquired nothing. Every later boundary that reads them — the running owner
+-- turn's 'offerOne' and the drain's 'opportunity' — demands them the same way,
+-- inside a handler of its own, so a declaration that fails after acquisition is
+-- recorded as that attachment's own evidence and withdraws its progress path
+-- instead of escaping. It is evidence and never a fact: it retires nothing, and
+-- it is never permission to destroy the attachment, its window, the session, or
+-- any parent, which stay until independent certified evidence retires it.
+--
+-- The callbacks are not demanded here. Each is entered inside a handler that
+-- already answers its own failure, so demanding it early would only move a
+-- failure the attach call already contains.
 data AttachmentProtocol = AttachmentProtocol
   { protocolConstruct ∷ AttachmentId → Acknowledgement → IO ()
     -- ^ Build the dependents. It runs after the reservation and after this
@@ -459,10 +484,12 @@ data AttachmentProtocol = AttachmentProtocol
     -- ^ One bounded retirement opportunity.
   , protocolCompletion ∷ CompletionPolicy
     -- ^ What the integration declares about those steps. A 'BlockingCompletion'
-    -- owner is refused every opportunity without its step being run.
+    -- owner is refused every opportunity without its step being run. Demanded
+    -- when the attachment is made, before anything is reserved.
   , protocolDisposition ∷ Disposition
     -- ^ Whether a recognized failed step leaves this component unavailable or
     -- fails the application. Neither authorizes destroying an unsafe dependent.
+    -- Demanded when the attachment is made, before anything is reserved.
   , protocolRecognizes ∷ AttemptFailure → IO Bool
     -- ^ Whether a failed step is one this integration recognizes. An
     -- unrecognized failure is fatal whatever the disposition says, as are a
@@ -481,6 +508,10 @@ data AttachmentOutcome
     -- ^ Construction failed and its owned rollback settled.
   | AttachmentRefused !AttachmentRefusal
     -- ^ The model refused the reservation, before any acquisition.
+  | AttachmentMetadataRejected !MetadataRejection
+    -- ^ A declaration the protocol carries raised when it was demanded, before
+    -- the reservation. Nothing was reserved, registered, constructed, or
+    -- acquired.
   | AttachmentAdmissionClosed
     -- ^ Attachment admission has closed; nothing was reserved.
   | AttachmentHostUnprotected
@@ -518,6 +549,41 @@ instance Show RolledBack where
         . showString ")"
         . maybe id (\failed → showString " (rollback: " . showString (displayException failed) . showString ")") (rolledBackRollback settled)
 
+-- | A declaration of a protocol that raised when the attach call demanded it.
+--
+-- It names no attachment, because none was ever issued: the demand precedes the
+-- reservation, so there is no identity to report, no construction to have run,
+-- and no rollback to have settled. It carries the failure with the context it
+-- propagated with, which the integration that attached owns from here; this
+-- boundary raises it for nobody.
+newtype MetadataRejection = MetadataRejection
+  { rejectedDeclaration ∷ Evidence
+  }
+
+instance Show MetadataRejection where
+  showsPrec precedence rejected =
+    showParen (precedence > 10) $
+      showString "MetadataRejection ("
+        . showString (displayException (rejectedDeclaration rejected))
+        . showChar ')'
+
+-- | Demand every declaration an 'AttachmentProtocol' carries, and answer the
+-- completion policy it declared.
+--
+-- Every boundary that reads one reads them all through this, inside its own
+-- exception handler, so a lazy declaration that raises when it is demanded can
+-- never raise as a bare guard outside one. 'protocolDisposition' is demanded
+-- here for the same reason 'protocolCompletion' is, although 'recover' would
+-- also demand it: a boundary that reads a declaration owns containing it,
+-- rather than depending on where a later caller happens to force it.
+--
+-- It runs no callback: nothing here constructs, rolls back, steps, or
+-- classifies.
+demandProtocolMetadata ∷ AttachmentProtocol → IO CompletionPolicy
+demandProtocolMetadata protocol = do
+  _ ← evaluate (protocolDisposition protocol)
+  evaluate (protocolCompletion protocol)
+
 -- | Reserve a window, register the protocol, construct, and publish — in that
 -- order and no other.
 --
@@ -526,6 +592,15 @@ instance Show RolledBack where
 -- leaves the attachment registered and retiring rather than a constructed
 -- dependent outside registration. Nothing usable is published until
 -- construction and registration have both completed.
+--
+-- The protocol's own declarations are demanded first, inside this call's
+-- exception boundary and before the reserving transaction runs. They are values
+-- the boundary reads rather than calls it makes, so one that raises when it is
+-- demanded would otherwise raise wherever a later boundary happened to read it
+-- — on a running owner turn, or in the protected drain, which owes the
+-- protected exit that it raises nothing. Demanded here, that failure answers
+-- 'AttachmentMetadataRejected' instead, with no reservation, no registration,
+-- no 'protocolConstruct' call, and no acquisition of any kind behind it.
 --
 -- A refusal answers before any acquisition. A construction failure runs the
 -- owned rollback, keeps the original failure with the rollback's outcome as the
@@ -545,20 +620,30 @@ attachRetirement
   → AttachmentProtocol
   → (AttachmentId → STM ())
   → IO AttachmentOutcome
-attachRetirement retirement restore window protocol onReserved = do
-  answered ← atomically reserve
-  case answered of
-    Left refusal → pure refusal
-    Right registered → do
-      let target = registeredAttachment registered
-          acknowledgement = registeredAcknowledgement registered
-      -- Forced inside the boundary that catches it: a callback may return a
-      -- value that raises when it is demanded, and demanding it afterwards
-      -- would leave the reservation pending with nothing able to settle it.
-      tryWithContext (restore (protocolConstruct protocol target acknowledgement >>= evaluate)) >>= \case
-        Right () → settleConstructed retirement target acknowledgement
-        Left caught → settleFailed retirement restore protocol target acknowledgement caught
+attachRetirement retirement restore window protocol onReserved =
+  tryWithContext (demandProtocolMetadata protocol) >>= \case
+    Left caught
+      -- A cancellation delivered while the declarations were demanded is this
+      -- thread's own and not the protocol's. Nothing has been reserved for it
+      -- to be counted against, so it is re-raised exactly as one delivered an
+      -- instant earlier would have been.
+      | isCancellation (exceptionOf caught) → rethrowIO caught
+      | otherwise → pure (AttachmentMetadataRejected (MetadataRejection caught))
+    Right _ → reserveAndConstruct
   where
+    reserveAndConstruct = do
+      answered ← atomically reserve
+      case answered of
+        Left refusal → pure refusal
+        Right registered → do
+          let target = registeredAttachment registered
+              acknowledgement = registeredAcknowledgement registered
+          -- Forced inside the boundary that catches it: a callback may return a
+          -- value that raises when it is demanded, and demanding it afterwards
+          -- would leave the reservation pending with nothing able to settle it.
+          tryWithContext (restore (protocolConstruct protocol target acknowledgement >>= evaluate)) >>= \case
+            Right () → settleConstructed retirement target acknowledgement
+            Left caught → settleFailed retirement restore protocol target acknowledgement caught
     reserve = do
       open ← readTVar (retirementAdmitting retirement)
       if not open
@@ -880,12 +965,28 @@ rotateAfter (Just served) pending = case break ((== served) . registrationTarget
   (_, []) → pending
   (before, at' : after) → after <> before <> [at']
 
+-- | One opportunity on a running owner turn.
+--
+-- The registration's declarations are demanded inside this turn's own handler
+-- rather than read as a bare guard: one that raises is the attachment's own
+-- evidence and withdraws its path, exactly as a stalled step does, because a
+-- declaration is never a fact and never permission to destroy anything. It is
+-- the one failure here that is contained — a recognized step failure is still
+-- settled under the integration's disposition, and any other step failure, like
+-- a cancellation, is still re-raised after the path has been withdrawn.
 offerOne ∷ HostRetirement → ProgressRound → Registration → IO ProgressRound
-offerOne retirement accumulated registration
-  | protocolCompletion protocol == BlockingCompletion = do
+offerOne retirement accumulated registration =
+  tryWithContext (demandProtocolMetadata protocol) >>= \case
+    Left caught → do
+      atomically (recordFailure retirement target acknowledgement caught)
+      withdraw
+      -- A cancellation reached this turn rather than the declaration, and is
+      -- answered exactly as one delivered inside a step is.
+      if isCancellation (exceptionOf caught) then rethrowIO caught else pure counted
+    Right BlockingCompletion → do
       withdraw
       pure counted {roundRefused = roundRefused counted + 1}
-  | otherwise = do
+    Right FiniteCompletion → do
       attempted ←
         tryWithContext . recover retirementOperation (stepPolicy protocol) $
           protocolStep protocol target acknowledgement >>= evaluate
@@ -1133,13 +1234,20 @@ opportunity
   → Registration
   → DrainOutcome
   → IO (Bool, DrainOutcome)
-opportunity retirement restore registration outcome
-  -- Refused before the step runs, exactly as a running turn refuses it: an
-  -- owner that declares its step would block is never given the opportunity,
-  -- and the stall policy then retains its window, the session, and every parent
-  -- until independent evidence arrives.
-  | protocolCompletion protocol == BlockingCompletion = withdraw >> pure (False, outcome)
-  | otherwise =
+opportunity retirement restore registration outcome =
+  -- Demanded inside a handler, like every other part of the protocol this round
+  -- reads: 'drainRetirement' owes the protected exit that it raises nothing,
+  -- and a declaration that raises here must therefore settle into the round's
+  -- own outcome rather than escape through the exit that is still holding this
+  -- window, the session, and every parent.
+  tryWithContext (demandProtocolMetadata protocol) >>= \case
+    Left caught → settleFailure caught
+    -- Refused before the step runs, exactly as a running turn refuses it: an
+    -- owner that declares its step would block is never given the opportunity,
+    -- and the stall policy then retains its window, the session, and every
+    -- parent until independent evidence arrives.
+    Right BlockingCompletion → withdraw >> pure (False, outcome)
+    Right FiniteCompletion →
       tryWithContext (restore (recover retirementOperation (stepPolicy protocol) step)) >>= settleAttempt
   where
     step = protocolStep protocol target (registrationAcknowledgement registration)
@@ -1158,17 +1266,18 @@ opportunity retirement restore registration outcome
           )
         withdraw
         pure (False, outcome)
-      Left caught@(ExceptionWithContext _ failure)
-        -- Withdrawn as a failed step is: an interrupted step may have disposed
-        -- part of what it owns, and nothing here knows whether running it again
-        -- would be safe. Independent evidence revives it.
-        | isCancellation failure → withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
-        | otherwise → do
-            -- Evidence, never a fact: the step is withdrawn rather than
-            -- replayed, and the attachment is not safe.
-            atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
-            withdraw
-            pure (False, retainFailure caught outcome)
+      Left caught → settleFailure caught
+    settleFailure caught@(ExceptionWithContext _ failure)
+      -- Withdrawn as a failed step is: an interrupted step may have disposed
+      -- part of what it owns, and nothing here knows whether running it again
+      -- would be safe. Independent evidence revives it.
+      | isCancellation failure = withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
+      | otherwise = do
+          -- Evidence, never a fact: the step is withdrawn rather than
+          -- replayed, and the attachment is not safe.
+          atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
+          withdraw
+          pure (False, retainFailure caught outcome)
     target = registrationTarget registration
     protocol = registrationProtocol registration
     withdraw = atomically (writeProgressing retirement target False)
@@ -1309,6 +1418,30 @@ writeProgressing retirement target progressing =
   where
     adjust registration
       | registrationTarget registration == target = registration {registrationProgressing = progressing}
+      | otherwise = registration
+
+-- | Replace a live registration's declared completion policy, for this
+-- package's own examples.
+--
+-- The declarations are demanded when an attachment is made, so a protocol that
+-- survived attaching cannot raise from one later of its own accord: the value
+-- has been evaluated and is immutable. The containment the running owner turn
+-- and the drain owe it is a real obligation all the same — a registration is a
+-- trusted input the boundary reads on every round — so the examples that assert
+-- it install the fault here, after acquisition, rather than by weakening the
+-- preflight they also assert.
+--
+-- It is exported by this private sublibrary only; no public module names it,
+-- and nothing in production calls it.
+faultProtocolMetadata ∷ HostRetirement → AttachmentId → CompletionPolicy → STM ()
+faultProtocolMetadata retirement target completion =
+  readTVar (retirementRegistrations retirement)
+    >>= writeTVar (retirementRegistrations retirement) . map adjust
+  where
+    adjust registration
+      | registrationTarget registration == target =
+          registration
+            {registrationProtocol = (registrationProtocol registration) {protocolCompletion = completion}}
       | otherwise = registration
 
 -- | Independent evidence revives a withdrawn progress path.
