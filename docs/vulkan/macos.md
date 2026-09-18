@@ -15,7 +15,8 @@ HETOIMASIA_NATIVE_SESSION=desktop \
 
 ## The environment
 
-- repository revision: b29a49641609d995a832bd5a6e7fe6ff4fe6b9c7
+- source digest: 65fbfaa68ec24eca66ffe9a4776c0c779a20c2c878559b85298fe5f4b54feab8
+- repository revision: ee8074c82d6b70746a2bb5bbdcb24cf066caebed
 - platform: darwin/aarch64
 - session authorization: the human user's explicit approval for this one run on the local desktop
 - VK_DRIVER_FILES: /opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
@@ -23,7 +24,8 @@ HETOIMASIA_NATIVE_SESSION=desktop \
 - cleared discovery overrides: none
 - loader instance version: 1.3.296
 - layers the pinned path offers: VK_LAYER_LUNARG_api_dump 1.3.296, VK_LAYER_KHRONOS_profiles 1.3.296, VK_LAYER_KHRONOS_validation 1.3.296, VK_LAYER_LUNARG_screenshot 1.3.296, VK_LAYER_KHRONOS_synchronization2 1.3.296, VK_LAYER_KHRONOS_shader_object 1.3.296
-- layers enabled: VK_LAYER_KHRONOS_validation
+- layers requested: VK_LAYER_KHRONOS_validation
+- the validation layer is in the loaded chain: yes
 - surface extensions GLFW requires: VK_KHR_surface, VK_EXT_metal_surface
 
 ## One loader, by address and image
@@ -32,11 +34,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x00000001092038f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x00000001092038f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x000000010920503c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-- GLFW's vkCreateDevice: 0x000000010920503c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-- a device-level entry point: 0x000000011fae4d78 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis12QueueSubmit2EP9VkQueue_TjPK13VkSubmitInfo2P9VkFence_T
+- the binding's vkGetInstanceProcAddr: 0x000000010748b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x000000010748b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x000000010748d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+- GLFW's vkCreateDevice: 0x000000010748d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+- a device-level entry point: 0x000000011dd4cd78 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis12QueueSubmit2EP9VkQueue_TjPK13VkSubmitInfo2P9VkFence_T
 - device: Apple M3 Max
 - device API version: 1.3.323
 - driver: MoltenVK (DRIVER_ID_MOLTENVK)
@@ -142,6 +144,16 @@ driver. What the driver supplied for those is the fence evidence beside them.
 - callback storage still valid while the instance was destroyed: yes
 - validation errors: none
 
+## Teardown
+
+Every release runs in the reverse of the order it was registered, whether
+the run finished or stopped, and one that fails never stops the rest. A
+failure here fails the verdict: a session torn down badly is not a session
+this proof can report a clean result for.
+
+- released, in order: the teardown boundary, the frame slots, the swapchain, the logical device, the window surface, the proof window, the explicit debug messenger, the Vulkan instance, the callback trampoline, GLFW
+- releases that failed: none
+
 ## Operation and result matrix
 
 Rows marked *observed in this run* were produced by this run. The rest are
@@ -160,9 +172,9 @@ such; no device loss was induced.
 | `vkQueuePresentKHR` | VK_SUBOPTIMAL_KHR | Presentation was enqueued exactly as for VK_SUCCESS; the swapchain no longer matches the surface exactly. | Preserve the enqueued operations and the per-swapchain results. Request recovery without resetting this frame's synchronization early. | specification: vkQueuePresentKHR return codes; VK_SUBOPTIMAL_KHR is a success code and presentation still occurred |
 | `vkQueuePresentKHR` | VK_ERROR_OUT_OF_DATE_KHR or VK_ERROR_SURFACE_LOST_KHR | With several swapchains, some may have been presented and some not; pResults is the only per-swapchain truth. The semaphore waits that did happen still happened. | Classify per swapchain through pResults before deciding anything. Recover the affected target; do not treat one swapchain's failure as evidence about another's. | specification: vkQueuePresentKHR: pResults gives the per-swapchain result; the overall result is the worst of them |
 | `vkQueuePresentKHR` | VK_ERROR_OUT_OF_HOST_MEMORY or VK_ERROR_OUT_OF_DEVICE_MEMORY | No presentation was enqueued: the specified no-effect case. No present fence was enqueued either. | Do not wait on a present fence this call did not enqueue. The image and its synchronization are still owned, and the prior rendering is still pending or complete on its own fence. | specification: Vulkan: a command that returns a run time error has no side effects unless otherwise specified |
-| `vkReleaseSwapchainImagesEXT` | VK_SUCCESS | The named images return to the presentation engine without being presented; their contents become undefined and their layout becomes VK_IMAGE_LAYOUT_UNDEFINED. No swapchain is retired or rebuilt. | Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. This is the abandonment path; it is not a substitute for presentation. | observed in this run |
+| `vkReleaseSwapchainImagesEXT` | VK_SUCCESS | The named images return to the presentation engine without being presented, and become acquirable again. The call does not present, does not modify the images, and does not retire or rebuild the swapchain. | Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. Draw no conclusion about the released images' contents from the release itself; the rule a consumer needs is the acquisition rule, which is that a newly acquired image's contents are undefined and its layout must be treated as such. This is the abandonment path; it is not a substitute for presentation. | observed in this run |
 | `vkCreateSwapchainKHR with a non-null oldSwapchain` | VK_SUCCESS | A new swapchain exists and oldSwapchain is retired. Retired is not dead: it is not destroyed, its outstanding work is untouched, and images already acquired from it may still be presented. What it may no longer do is supply a new acquisition. | Finish the frames already in flight on the retired swapchain by presenting them; acquire nothing further from it. It also cannot be named as oldSwapchain again, because that parameter must be a non-retired swapchain. Every image, view, and synchronization object depending on it stays owned until its work completes; destroying it early is the error the retirement model exists to prevent. | specification: VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933 requires a non-retired oldSwapchain; VUID-vkAcquireNextImageKHR-swapchain-01285 forbids acquiring from a retired swapchain, and no such rule forbids presenting an image already acquired from one |
-| `vkCreateSwapchainKHR with a non-null oldSwapchain` | any error | No new swapchain was created, but oldSwapchain is retired regardless. This is the documented exception to the no-side-effects rule, and it is the failure case a naive retry loses. | The retry cannot pass the now-retired swapchain as oldSwapchain, because that parameter must name a non-retired one; it passes VK_NULL_HANDLE and forgoes the handover. The retired swapchain is still the caller's to finish and destroy: present the images already acquired from it, acquire no more, and destroy it only once its work has completed. | specification: vkCreateSwapchainKHR: oldSwapchain is retired even if creation of the new swapchain fails; VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933 then excludes it from a retry |
+| `vkCreateSwapchainKHR with a non-null oldSwapchain` | any error | No new swapchain was created, but oldSwapchain is retired regardless. This is the documented exception to the no-side-effects rule, and it is the failure case a naive retry loses. | A retry cannot pass the now-retired swapchain as oldSwapchain, because that parameter must name a non-retired one. Nor can it simply pass VK_NULL_HANDLE straight away: the retired swapchain still holds the native window, and creating against that surface while it lives can fail with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. The order is finish or abandon the images already acquired from it, destroy it once its work has completed, and only then create afresh with VK_NULL_HANDLE. | specification: vkCreateSwapchainKHR: oldSwapchain is retired even if creation of the new swapchain fails; VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933 then excludes it from a retry, and vkCreateSwapchainKHR may return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR while the native window is still held |
 | `vkDestroySwapchainKHR` | n/a | Destroys the swapchain and its images. Images acquired from it must not be in use, and the surface's other swapchains are unaffected. | Every outstanding acquisition, submission, and presentation that names this swapchain or its images must have completed. A present fence is the completion evidence for the presentation side; the rendering fence is not. | specification: vkDestroySwapchainKHR valid usage: all uses of presentable images acquired from the swapchain must have completed |
 | `any queue or device command` | VK_ERROR_DEVICE_LOST | The device is permanently unusable. Pending work may never complete, and fences and semaphores may never be signalled. | Terminal for the whole graphics session. Waiting for completion is not an option, because the completion may never arrive. | specification: Vulkan, Lost Device: the device is lost and further commands on it fail |
 | `destruction after VK_ERROR_DEVICE_LOST` | n/a | The specification permits destroying objects of a lost device without waiting for their pending work: completion is not required, because it may never happen. | This is the only rule that authorizes destroying an object whose work has not completed. It authorizes destruction, not a claim that the work finished, and it must never be used to mark an unfinished fence as signalled. | specification: Vulkan, Lost Device: objects of a lost device may be destroyed, and vkDeviceWaitIdle and fence waits may return VK_ERROR_DEVICE_LOST |
@@ -171,22 +183,24 @@ such; no device loss was induced.
 
 ```
 ## The environment
-proving repository revision b29a49641609d995a832bd5a6e7fe6ff4fe6b9c7
+proving repository revision ee8074c82d6b70746a2bb5bbdcb24cf066caebed
+proving source digest 65fbfaa68ec24eca66ffe9a4776c0c779a20c2c878559b85298fe5f4b54feab8
 VK_DRIVER_FILES = /opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
 VK_LAYER_PATH = /usr/local/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x00000001092038f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-GLFW resolves the same name to 0x00000001092038f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+the binding dispatches through 0x000000010748b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x000000010748b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_EXT_metal_surface
 ## The instance
 the loader reports instance version 1.3.296
-the binding resolves vkCreateDevice to 0x000000010920503c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x000000010920503c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+the binding resolves vkCreateDevice to 0x000000010748d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x000000010748d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
 ## The window and its surface
 ## The device profile
 Apple M3 Max advertises Vulkan 1.3.323
 selected Apple M3 Max, advertising Vulkan 1.3.323
-the binding dispatches image release through 0x000000011fb19b64 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis25ReleaseSwapchainImagesEXTEP10VkDevice_TPK31VkReleaseSwapchainImagesInfoEXT
+the binding dispatches image release through 0x000000011dd81b64 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis25ReleaseSwapchainImagesEXTEP10VkDevice_TPK31VkReleaseSwapchainImagesInfoEXT
+the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 3 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 640, height = 480}
 ## Presentation completion

@@ -8,10 +8,21 @@ record [#158](https://github.com/coghex/hetoimasia/issues/158) asks for, and it
 is what VK-4 through VK-17 may assume.
 
 It is not a changelog. When the profile moves, this file is rewritten to
-describe the new one, and the proof that established it is named by commit. Each
-retained record names the repository revision its run was built from, which is
-the commit that introduced the harness rather than the one that retains the
-record — evidence is produced before it can be committed.
+describe the new one, and the proof that established it is named by commit.
+
+Each retained record identifies the sources it was produced from twice over: by
+a SHA-256 over the content of every file the harness is built from, which is
+exact and which a reader can recompute, and by the repository revision, which is
+the convenient one. The revision is the commit that introduced the harness
+rather than the one that retains the record — evidence is produced before it can
+be committed — and inside the Linux container there is no checkout to resolve
+one from at all. The digest is what pins the record either way.
+
+It also does something the revision cannot: the two retained records carry the
+*same* digest, `65fbfaa6…`, computed independently — on macOS from a Git
+checkout, and inside the Linux container from the files the recipe copied into
+it, with no checkout to consult. That is direct evidence the two platforms
+proved one tree rather than two that were believed to match.
 
 **Verdict: pass on both platforms.** The design's 1.3 minimum, its present-fence
 retirement, and its `VK_EXT_swapchain_maintenance1` image release all hold. No
@@ -40,7 +51,7 @@ together settle, and what they do not.
 | Driver | MoltenVK 1.4.0 on an Apple M3 Max, named by absolute `VK_DRIVER_FILES` | Mesa 25.2.8 Lavapipe (`llvmpipe`, LLVM 20.1.2), named by absolute `VK_DRIVER_FILES` |
 | Device API version | 1.3.323 | 1.4.318 |
 | Conformance version | 1.4.2.0 | 1.3.1.1 |
-| Validation layer | `VK_LAYER_KHRONOS_validation` 1.3.296, zero error records | `VK_LAYER_KHRONOS_validation` 1.3.275, zero error records |
+| Validation layer | `VK_LAYER_KHRONOS_validation` 1.3.296, verified present in the loaded chain, zero error records | `VK_LAYER_KHRONOS_validation` 1.3.275, verified the same way, zero error records |
 | 1.3 core features | `dynamicRendering` and `synchronization2` supported, requested, accepted | the same |
 | Portability | advertised: `VK_KHR_portability_enumeration` on the instance and `VK_KHR_portability_subset` on the device | not advertised, so not enabled |
 | Maintenance variant | `VK_EXT_swapchain_maintenance1`, `swapchainMaintenance1` accepted | the same |
@@ -50,6 +61,7 @@ together settle, and what they do not.
 | Presentation | `PRESENT_MODE_FIFO_KHR`, `FORMAT_B8G8R8A8_UNORM`, three images at 640×480 | `PRESENT_MODE_FIFO_KHR`, `FORMAT_B8G8R8A8_UNORM`, four images at 320×240 |
 | Capture | `TRANSFER_SRC` read back and matched | the same |
 | Callbacks | 77 deliveries, 1 during teardown, 3 during instance destruction | 105 deliveries, none during teardown, 2 during instance destruction |
+| Teardown | ten releases, none failed | the same ten, none failed |
 
 Downstream slices may require Vulkan 1.3 with dynamic rendering and
 synchronization2, the EXT maintenance variant with present fences and image
@@ -147,6 +159,26 @@ Submission produced none of its own. Rather than claim reentry that did not
 happen, the proof elicits it with `vkSubmitDebugUtilsMessageEXT` at chosen points
 and labels those deliveries as injected in a separate column. Every phase table
 in the records distinguishes the two.
+
+### "Zero validation errors" is a claim about coverage, not just about count
+
+The sentence is worth nothing unless three things are true, and each of them can
+fail quietly, so the proof checks each:
+
+- **The layer was actually loaded.** Requesting `VK_LAYER_KHRONOS_validation`
+  does not load it — the loader's own `VK_LOADER_LAYERS_DISABLE` can drop a
+  requested layer, and `vkEnumerateInstanceLayerProperties` would still list it,
+  because that reports what is *available*. The proof instead resolves a device
+  entry point and checks the image it lands in, which is the layer's own on both
+  platforms. It clears that filter and the implicit-layer paths out of its
+  environment first, and records what it cleared.
+- **Something was listening for the whole session.** A messenger destroyed
+  before the device would miss every diagnostic the device's own destruction
+  emits. See the section above.
+- **Teardown itself succeeded.** Every release runs in reverse registration
+  order and a failure never stops the ones after it — but the failures are
+  collected and fail the verdict, because a `vkDeviceWaitIdle` that returned
+  device loss is not a clean session however few validation messages arrived.
 
 ### A fence is not a host-visibility barrier
 
