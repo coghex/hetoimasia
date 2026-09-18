@@ -21,9 +21,6 @@ extra-doc-files:
     CLAUDE.md
     docs/*.md
     docs/toolchain/*.md
-    docs/toolchain/*.txt
-    docs/toolchain/*.cabal.project
-    docs/toolchain/receipts-darwin/*.json
     tools/README.md
     tools/KANBAN-LICENSE
 extra-source-files:

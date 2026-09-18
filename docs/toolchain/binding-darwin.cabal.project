@@ -1,0 +1,12 @@
+packages: .
+
+index-state: 2026-09-18T00:00:00Z
+
+constraints:
+    vulkan +safe-foreign-calls,
+    vulkan -darwin-lib-dirs
+
+package vulkan
+  extra-lib-dirs: /usr/local/lib
+  extra-include-dirs: /usr/local/include
+  ghc-options: -optl-Wl,-rpath,/usr/local/lib

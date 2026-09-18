@@ -106,8 +106,12 @@ No other bound moved: `bytestring`, `deepseq`, `directory`, `filepath`,
 `process`, `stm`, and `text` are all still satisfied by this compiler's own
 boot libraries within their existing bounds.
 
-The third-party packages the index resolves, identical on both platforms
-because nothing in this set is platform-conditional:
+The third-party packages the index resolves, as observed on local macOS. No
+package here is selected conditionally — the only `if os(…)` stanzas in this
+repository choose frameworks and `extra-libraries` for `hetoimasia-glfw`, never
+a `build-depends` entry — so the same index and bounds select the same set
+wherever the solver runs. Linux CI resolves and builds it under the published
+image on every run:
 
 ```
 HUnit-1.6.2.0              hspec-2.11.17              quickcheck-io-0.2.0
@@ -213,15 +217,43 @@ rather than only read.
 
 ## Evidence
 
-Retained with this record in [`docs/toolchain/`](toolchain/).
+Retained with this record in [`docs/toolchain/`](toolchain/), whose README says
+what each file is, which revision produced it, and which matches of the old
+versions are kept on purpose.
+
+In summary, all on the qualified toolchain:
+
+- `cabal build all` and `cabal build all --project-file cabal.project.cpu` are
+  warning-clean under the existing `-Werror` policy.
+- `foundation-tests` (336), `runtime-tests` (184), `glfw-tests` (423),
+  `hetoimasia-tests` (11) and `workflow-tests` (335) pass with no failures, and
+  `cabal run exe:hetoimasia -- --smoke` exits zero.
+- Every headless validation group has a passing local receipt, produced by the
+  planner and runner against a committed candidate.
+- `test.glfw-native` has no local receipt on purpose. It takes over the desktop
+  it runs on, and [AGENTS.md](../AGENTS.md) requires explicit per-run human
+  approval before an agent starts such a session; qualifying a toolchain is not
+  that approval. Linux CI runs the group on its own isolated X11 display.
+- `tools/toolchain/qualify-binding.sh` exits zero on local macOS and inside the
+  pinned Linux container, reporting the pinned pair and the required flags on
+  both.
 
 ## Keeping Synarchy out of it
 
 `~/work/synarchy` keeps its own compiler, pins, and installation. GHC 9.12.2
 remains installed, Synarchy's `cabal.project` continues to select its own
-`index-state: 2026-08-14T00:00:00Z` and its own bounds, and nothing in this
-qualification edits a file there. Verified by resolving Synarchy against its own
-project files after this refresh; the resolution is unchanged and complete.
+`index-state: 2026-08-14T00:00:00Z`, its own bounds, and its own
+`vulkan-utils-0.5.10.6`, and nothing in this qualification edits a file there.
+Verified by resolving Synarchy against its own project files after this refresh:
+the resolution is complete and its working tree is clean.
+
+One piece of shared workstation state does move, and it is worth naming rather
+than discovering later. Installing cabal-install 3.18.1.0 makes it `ghcup`'s
+active `cabal`, so Synarchy is now resolved by 3.18.1.0 rather than 3.16.1.0.
+That is a build tool, not a pin: Synarchy declares no `with-compiler` and no
+Cabal version, and the verification above was run in exactly that state. The
+*compiler* `ghcup` selects is unchanged, so Synarchy still builds on GHC 9.12.2
+unless someone changes it deliberately.
 
 The qualified compiler is selected by `PATH`, not by a `with-compiler` line
 here, because `Test.Support.ExternalClient` requires the `ghc` on `PATH` to be

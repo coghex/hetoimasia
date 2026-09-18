@@ -1,0 +1,9 @@
+loader-prefix=/usr
+ghc=9.14.1
+cabal=3.18.1.0
+index-state=2026-09-18T00:00:00Z
+flags=vulkan +safe-foreign-calls -darwin-lib-dirs
+resolved vulkan-3.27
+resolved vulkan-utils-0.5.11.0
+effective-flags -darwin-lib-dirs -generic-instances +safe-foreign-calls -trace-calls
+qualify-binding: the pinned binding builds on the pinned toolchain
