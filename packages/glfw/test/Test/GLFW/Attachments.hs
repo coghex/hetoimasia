@@ -16,7 +16,7 @@
 -- opens a window, needs a display, or sleeps for a concurrency outcome.
 module Test.GLFW.Attachments (spec) where
 
-import Control.Concurrent (forkIO, forkOS, killThread)
+import Control.Concurrent (forkIO, forkOS, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
@@ -100,6 +100,8 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testRollbackUnsafeRetains)
     it "counts a cancellation delivered before publication and still publishes nothing"
       (boundedExample testCancelledConstruction)
+    it "retires an attachment its caller was interrupted out of, so a turn frees the slot"
+      (boundedExample testCancelledAtPublication)
 
   describe "observing the slot" $ do
     it "separates the close from the destruction, which follows the last retirement fact"
@@ -148,7 +150,7 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testCompletionWakesTurn)
 
   describe "the schedule" $
-    it "shortens the wait to a retirement's own instant and polls once a round advanced"
+    it "polls the turn a detach begins, shortens the next wait to the instant the owner named, and polls once a round advanced"
       (boundedExample testRetirementSchedule)
 
   describe "the application exit" $
@@ -815,6 +817,80 @@ testCancelledConstruction = do
   [name | Certified name _ ← entries] `shouldBe` []
   entries `shouldSatisfy` (WindowGone 1 `elem`)
 
+-- | An interruption delivered in the handoff between an attachment becoming
+-- active and its caller receiving the service must not strand the exclusive
+-- slot.
+--
+-- The caller catches it and keeps running, so nothing else will clean up after
+-- it: no service exists to detach with, and a running turn offers no
+-- opportunity to an attachment that has not begun retiring. The attachment must
+-- therefore already be retiring when the failure arrives, and ordinary turns
+-- must then retire it and free the slot.
+testCancelledAtPublication ∷ Expectation
+testCancelledAtPublication = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  atHandoff ← newEmptyMVar
+  never ← newEmptyMVar
+  armed ← newTVarIO False
+  caught ← newIORef Nothing
+  afterwards ← newIORef Nothing
+  reattached ← newIORef Nothing
+  owned ← newTVarIO Nothing
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "attachment-example"
+      ( \_ use →
+          Private.withProtectedWindowHostWith
+            Private.noHostHooks
+              { Private.beforePublication = do
+                  armedNow ← readTVarIO armed
+                  when armedNow (putMVar atHandoff () >> takeMVar never)
+              }
+            quietLogger
+            (seamSession seam defaultSessionConfig)
+            (settings [windowNamed "alpha"])
+            use
+      )
+      id
+      (\host _ → pure host)
+      ( \host control → do
+          window ← onlyWindow host
+          owner ← newOwner (ownerNamed "alpha")
+          atomically (writeTVar owned (Just owner))
+          -- The owner thread is interrupted while it is inside the handoff, and
+          -- catches that interruption itself.
+          me ← myThreadId
+          _ ← forkIO (takeMVar atHandoff >> killThread me)
+          atomically (writeTVar armed True)
+          interrupted ←
+            try (attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha")))
+          atomically (writeTVar armed False)
+          case (interrupted ∷ Either SomeException GraphicsAttachment) of
+            Left failure → writeIORef caught (fromException failure ∷ Maybe AsyncException)
+            Right answered → unexpected ("the interrupted handoff answered: " <> show answered)
+          -- Already retiring, though nothing ever held a service for it.
+          seen ← atomically (windowGraphicsStatus host window)
+          writeIORef afterwards (Just seen)
+          -- Ordinary turns retire it and free the slot, and the window is then
+          -- open for a later owner with a fresh incarnation.
+          turnsUntil host control "the stranded attachment's retirement" (not <$> slotOccupied host window)
+          (later, service) ← attachedOwner journal host window (ownerNamed "later")
+          writeIORef reattached (Just (graphicsIncarnation service))
+          void (closeHostWindow host window)
+          atomically (writeTVar (ownerPlan later) (map Certify allRetirementFacts))
+          turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+      )
+  readIORef caught `shouldReturn` Just ThreadKilled
+  readIORef afterwards >>= \case
+    Just (GraphicsPresent observed) → do
+      observedSlot observed `shouldBe` SlotRetiring
+      observedMissing observed `shouldBe` allRetirementFacts
+    other → unexpected ("the stranded attachment was not retiring: " <> show other)
+  -- Incarnations are never reissued, so the later owner is the second.
+  readIORef reattached `shouldReturn` Just 2
+
 -- ---------------------------------------------------------------------------
 -- Observing the slot
 
@@ -1460,9 +1536,12 @@ testUnservedCountedAsDeferred = do
 -- ---------------------------------------------------------------------------
 -- The schedule
 
--- | A retirement that named an instant shortens the scheduled wait to it, and
--- a round that advanced makes the next turn poll: a due retirement step is
--- never delayed by the idle bound.
+-- | A retirement is never delayed by the idle bound, from its very first
+-- opportunity onwards.
+--
+-- The turn after a detach polls, because that retirement has never been offered
+-- one; the turn after an owner named an instant waits only until that instant;
+-- and the turn after a round advanced polls again.
 testRetirementSchedule ∷ Expectation
 testRetirementSchedule = do
   journal ← newTVarIO []
@@ -1493,17 +1572,15 @@ testRetirementSchedule = do
   observed ← readTVarIO pacings
   case observed of
     first' : second' : rest → do
-      -- Nothing was owed before the first round ran, so the turn waited the
-      -- configured fallback bound.
-      first' `shouldSatisfy` \case
-        WaitedForFallback _ → True
-        _ → False
-      -- The instant the owner named is nearer than the fallback, so the wait
-      -- is the time remaining to it, not the bound.
+      -- The detach began a retirement no turn had offered an opportunity to, so
+      -- the first turn polls rather than waiting its configured bound.
+      first' `shouldBe` PolledForWork
+      -- That turn's own opportunity named an instant nearer than the bound, so
+      -- the next wait is the time remaining to it.
       second' `shouldSatisfy` \case
         WaitedForDeadline _ → True
         _ → False
-      -- Once a round advanced, the turn after it polls rather than waiting.
+      -- Once a round advanced, the turn after it polls again.
       rest `shouldSatisfy` all (== PolledForWork)
     _ → unexpected ("the scheduled loop ran too few turns: " <> show observed)
 

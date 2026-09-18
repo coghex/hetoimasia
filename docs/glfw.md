@@ -2999,6 +2999,15 @@ construction ran or in the handoff after it settled — answers
 usable is published. The check and the publication commit together, so no
 service is ever handed back for an owner that may admit no use.
 
+One protected region covers the reservation, the construction, and the
+publication together. An interruption anywhere in it leaves nothing admitting
+use that nobody can end: the reservation itself is what frees an earlier
+incarnation's bookkeeping, and an interruption after the attachment became
+active is counted as the model's own evidence and begins exactly the retirement
+a detach begins, so an owner turn retires it and frees the slot even though no
+service was ever handed over. The failure is re-raised unchanged and establishes
+no fact.
+
 #### Observing the slot
 
 `windowGraphicsStatus host window` reads a window's slot in one transaction,
@@ -3084,7 +3093,12 @@ evidence — a completion notice for that attachment — revives it.
 `hostRetirementDemand` publishes what the last round left owed: how many
 attachments are pending, how many are stalled, how many opportunities were
 refused, whether another opportunity is wanted at once, and the earliest instant
-an awaiting owner named.
+an awaiting owner named. A transaction that *begins* a retirement — a close, a
+detach, quiescence, a superseded publication, a retained rollback, an
+interrupted handoff — says so there too, because that retirement has never been
+offered an opportunity and the turn after it must not wait its idle bound before
+giving it one. A host with nothing retiring, and every ordinary host, leave the
+demand empty.
 [The scheduled owner loop](#the-scheduled-owner-turn) reads it in the same
 inspection that captures demand, so a retirement instant shortens that turn's
 wait exactly as an application deadline does — never lengthens it — and a round
@@ -3173,8 +3187,11 @@ three pending retirements, and a budget of one counting the attachment it never
 reached as deferred work even when the one it served withdrew; a blocking owner
 refused without its step running; a completion published from another thread
 ending the owner's idle wait and folding into the next round;
-the scheduled loop's wait shortened to a retirement's own instant and polling
-once a round advanced; the whole application exit with owners attached; and an
+the scheduled loop polling the turn a detach begins,
+shortening the next wait to the instant that owner named, and polling again once
+a round advanced; an attachment whose caller was interrupted in the handoff
+before its service arrived, left retiring and retired by ordinary turns with the
+slot freed for a fresh incarnation; the whole application exit with owners attached; and an
 ordinary window-only application seeing no slot, no demand, and unchanged turns.
 The opacity examples compile external clients that name the service's data
 constructor and reach for its observation cell in the private implementation,

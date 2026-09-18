@@ -118,9 +118,11 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
     -- * Detaching and in-run progress
   , DetachAnswer (..)
   , detachAttachment
+  , cancelAttachment
   , ProgressRound (..)
   , noProgressRound
   , advanceRetirements
+  , anyRetiring
 
     -- * Completion notices from other threads
   , CompletionPublisher
@@ -673,6 +675,10 @@ retiringPending retirement = do
   registrations ← readTVar (retirementRegistrations retirement)
   pure (filter (retiringIn model . registrationTarget) registrations)
 
+-- | Whether any attachment has begun retiring and not yet finished.
+anyRetiring ∷ HostRetirement → STM Bool
+anyRetiring = fmap (not . null) . retiringPending
+
 retiringIn ∷ AttachmentModel Evidence → AttachmentId → Bool
 retiringIn model target = case attachmentStatus target model of
   Right (AttachmentLive view) → viewPhase view == AttachmentRetiring
@@ -765,6 +771,25 @@ detachAttachment retirement target = do
             RetirementBegun → DetachBegun
             RetirementAlreadyBegun → DetachAlreadyRetiring
             RetirementAlreadyComplete → DetachAbsent
+
+-- | Count an interruption against an attachment and begin its retirement, on
+-- the owner thread.
+--
+-- It is what an owning boundary does when it is interrupted after a reservation
+-- has committed: the attachment is registered and whatever its construction
+-- built is already its to retire, but nothing will ever hold a capability for
+-- it. Counting the interruption is the model's own evidence — it establishes no
+-- fact — and the retirement it begins is the one a detach begins, so an owner
+-- turn can retire it and free the slot.
+--
+-- An attachment this model does not hold, and one already retiring, change
+-- nothing.
+cancelAttachment ∷ HostRetirement → AttachmentId → STM ()
+cancelAttachment retirement target = do
+  registrations ← readTVar (retirementRegistrations retirement)
+  mapM_
+    (countCancellation retirement target . registrationAcknowledgement)
+    (find ((== target) . registrationTarget) registrations)
 
 -- ---------------------------------------------------------------------------
 -- In-run progress

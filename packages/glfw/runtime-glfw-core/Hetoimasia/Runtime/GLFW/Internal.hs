@@ -312,7 +312,9 @@ import Hetoimasia.Runtime.GLFW.Internal.Retirement
   , RetirementEnvironment (..)
   , RetirementProgress (..)
   , advanceRetirements
+  , anyRetiring
   , attachRetirement
+  , cancelAttachment
   , attachmentViewOf
   , certifyRetirementFact
   , closeAttachmentAdmission
@@ -681,7 +683,10 @@ allocHostOver protection hooks sessionScope config = do
   demand ← liftIO newDemandSlot
   -- Released first: every port's admission, every demand slot, and attachment
   -- admission close before any window is released.
-  allocResource (pure ()) (\() → atomically (closeAdmission commands entries demand retirement cells))
+  owed ← liftIO (newTVarIO noRetirementDemand)
+  allocResource
+    (pure ())
+    (\() → atomically (closeAdmission commands entries demand retirement cells owed))
   host ←
     liftIO $
       WindowHost session collection commands config entries
@@ -693,7 +698,7 @@ allocHostOver protection hooks sessionScope config = do
         <*> pure hooks
         <*> pure retirement
         <*> newIORef Nothing
-        <*> newTVarIO noRetirementDemand
+        <*> pure owed
         <*> pure cells
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
   pure host
@@ -734,6 +739,7 @@ quiesceWindowHost host =
     (hostDemandSlot host)
     (hostRetirementState host)
     (hostGraphicsCells host)
+    (hostRetirementDemandState host)
 
 closeAdmission
   ∷ WindowCommandHost
@@ -741,8 +747,9 @@ closeAdmission
   → DemandSlot
   → Maybe HostRetirement
   → TVar (Map WindowId GraphicsCell)
+  → TVar RetirementDemand
   → STM ()
-closeAdmission commands entries demand retirement cells = do
+closeAdmission commands entries demand retirement cells owed = do
   void (closeWindowCommands commands)
   closeDemandSlot demand
   readTVar entries >>= mapM_ closeEntryAdmission
@@ -754,6 +761,9 @@ closeAdmission commands entries demand retirement cells = do
   -- turn happens to come next: a reader that saw the host quiesce must not still
   -- be told its owner is admitting use.
   refreshCells retirement cells
+  -- Retirements that have just begun have never been offered an opportunity, so
+  -- a turn that still runs must not wait before offering them one.
+  demandRetirementNow retirement owed
 
 -- | Tell every cell the host still holds how its window's own release ended.
 --
@@ -1073,6 +1083,11 @@ commitClosing host target =
       -- owner.
       mapM_ (`recordClosingWindow` target) (hostRetirementState host)
       refreshGraphicsCells host
+      -- A retirement this close just began has never been offered an
+      -- opportunity, so the next turn polls rather than waiting its idle bound
+      -- before giving it one. A window with no attachment, and every window of
+      -- an ordinary host, leave the demand exactly as they found it.
+      markRetirementImmediate host
       pure True
     _ → pure False
 
@@ -2138,16 +2153,70 @@ refusalOf = \case
 -- effect.
 attachWindowGraphics
   ∷ HasCallStack ⇒ WindowHost → WindowId → AttachmentProtocol → IO GraphicsAttachment
-attachWindowGraphics host target protocol = do
-  outcome ← attachHostWindow host target protocol
-  beforePublication (hostHooks host)
-  case outcome of
-    AttachmentEstablished active _ → publishService host (activeAttachment active)
-    AttachmentSuperseded identity _ → pure (GraphicsSuperseded identity)
-    AttachmentRolledBack settled → pure (GraphicsRolledBack settled)
-    AttachmentRefused refusal → pure (GraphicsRefused (refusalOf refusal))
-    AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
-    AttachmentHostUnprotected → pure GraphicsHostUnprotected
+attachWindowGraphics host target protocol =
+  ownerOperation (hostSession host) attachOperation (windowIdentifiers target) $
+    case hostRetirementState host of
+      Nothing → pure GraphicsHostUnprotected
+      Just retirement →
+        -- One protected region covers the reservation, the construction, and
+        -- the publication together. The seam's own mask ends when it answers,
+        -- and an interruption delivered between there and this answer would
+        -- otherwise leave an attachment admitting use that nobody holds a
+        -- service to end.
+        mask $ \restore → do
+          outcome ← attachRetirement retirement restore target protocol (releaseEarlierCell host)
+          settleAttachment host retirement restore outcome
+
+-- | Turn a settled reservation into the public answer, inside the same
+-- protected region that made it.
+settleAttachment
+  ∷ HasCallStack
+  ⇒ WindowHost
+  → HostRetirement
+  → (∀ a. IO a → IO a)
+  → AttachmentOutcome
+  → IO GraphicsAttachment
+settleAttachment host retirement restore = \case
+  AttachmentEstablished active _ → publishOrRetire host retirement restore (activeAttachment active)
+  AttachmentSuperseded identity _ → begunRetiring (GraphicsSuperseded identity)
+  AttachmentRolledBack settled → begunRetiring (GraphicsRolledBack settled)
+  AttachmentRefused refusal → pure (GraphicsRefused (refusalOf refusal))
+  AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
+  AttachmentHostUnprotected → pure GraphicsHostUnprotected
+  where
+    -- A superseded publication and a retained rollback both leave something
+    -- retiring that no turn has offered an opportunity to yet.
+    begunRetiring answer = atomically (markRetirementImmediate host) >> pure answer
+
+-- | Publish the established attachment's service, or — if anything interrupts
+-- the handoff — begin its retirement before re-raising.
+--
+-- The window between an attachment becoming active and its caller holding the
+-- service is the one place an interruption could strand the exclusive slot: the
+-- attachment is registered, its dependents are built, and no service exists to
+-- detach it with, while a running turn deliberately offers no opportunity to an
+-- attachment that has not begun retiring. So an interruption here is counted as
+-- the model's own evidence and begins exactly the retirement a detach begins,
+-- and an owner turn then retires it and frees the slot. It establishes no fact,
+-- and the failure is re-raised unchanged.
+publishOrRetire
+  ∷ HasCallStack
+  ⇒ WindowHost
+  → HostRetirement
+  → (∀ a. IO a → IO a)
+  → AttachmentId
+  → IO GraphicsAttachment
+publishOrRetire host retirement restore identity = do
+  attempted ←
+    tryWithContext (restore (beforePublication (hostHooks host)) >> publishService host identity)
+  case attempted of
+    Right answered → pure answered
+    Left (caught ∷ ExceptionWithContext SomeException) → do
+      atomically $ do
+        cancelAttachment retirement identity
+        refreshGraphicsCells host
+        markRetirementImmediate host
+      rethrowIO caught
 
 -- | Stop holding the cell of an incarnation this window's slot has moved past.
 --
@@ -2220,6 +2289,9 @@ detachWindowGraphics host service =
       Just retirement → atomically $ do
         answered ← detachAttachment retirement target
         refreshGraphicsCells host
+        -- A retirement that has just begun has never been offered an
+        -- opportunity, so the next turn polls rather than waiting for one.
+        when (answered == DetachBegun) (markRetirementImmediate host)
         pure answered
   where
     target = graphicsAttachment service
@@ -2301,6 +2373,25 @@ noRetirementDemand = RetirementDemand 0 0 0 False Nothing
 
 hostRetirementDemand ∷ WindowHost → STM RetirementDemand
 hostRetirementDemand = readTVar . hostRetirementDemandState
+
+-- | Record that a retirement wants an opportunity now.
+--
+-- Every round republishes the demand from its own accounting, so this is only
+-- ever read by the turn that follows the transaction which began a retirement —
+-- which is exactly the turn that would otherwise wait its idle bound before
+-- offering that retirement its first opportunity. It says so only when
+-- something really is retiring, so an ordinary host, and a protected host with
+-- nothing pending, report no demand at all.
+markRetirementImmediate ∷ WindowHost → STM ()
+markRetirementImmediate host =
+  demandRetirementNow (hostRetirementState host) (hostRetirementDemandState host)
+
+demandRetirementNow ∷ Maybe HostRetirement → TVar RetirementDemand → STM ()
+demandRetirementNow held owed = case held of
+  Nothing → pure ()
+  Just retirement → do
+    retiring ← anyRetiring retirement
+    when retiring (modifyTVar' owed (\demand → demand {retirementImmediate = True}))
 
 -- | Offer one bounded, rotating round of retirement opportunities, and publish
 -- what it left owed. An ordinary host has no attachment state and does nothing
