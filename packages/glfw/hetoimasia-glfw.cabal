@@ -188,7 +188,9 @@ library seam-core
 -- window, monitor inventory, input feed, and window mode examples that use the
 -- private window and monitor drivers, the private command executor, and the
 -- host's private test hooks, the scheduled owner turn and render demand
--- examples over a scripted clock, the pure window attachment model examples, the
+-- examples over a scripted clock, all of them over the fixtures its component
+-- specs share through the suite's own non-spec Test.GLFW.Support module,
+-- the pure window attachment model examples, the
 -- link-declaration check against the native
 -- manifest, and the external-client opacity examples. It initializes no GLFW,
 -- opens no window, and needs no display; it links the pinned native SDK only
@@ -217,6 +219,7 @@ test-suite glfw-tests
         Test.GLFW.Scheduled
         Test.GLFW.Session
         Test.GLFW.Spec
+        Test.GLFW.Support
         Test.GLFW.Wake
         Test.GLFW.Window
     ghc-options: -threaded -rtsopts

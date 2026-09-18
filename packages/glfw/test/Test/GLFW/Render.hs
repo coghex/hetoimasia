@@ -67,18 +67,21 @@ import Hetoimasia.Runtime.UpdatePolicy
   , fixedStepPolicy
   )
 import Numeric.Natural (Natural)
-import Test.GLFW.Scheduled
+import Test.GLFW.Support
   ( at
+  , current
   , durationOf
+  , entered
   , hosted
   , millis
   , pumps
   , quietLogger
   , scriptedClock
   , settings
+  , stashed
+  , unexpected
   , windowNamed
   )
-import Test.GLFW.Window (current, entered, stashed, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn)
 
 spec ∷ Spec
@@ -102,6 +105,8 @@ spec = describe "GLFW render demand" $ do
       testResumeThroughDeferred
     it "retains a deferred window's captured demand, excludes its deadlines, and offers it once a usable extent arrives"
       testDeferredRetainsDemand
+    it "keeps the owed resume frame across deferred turns whose frame schedule the caller keeps replacing"
+      testResumeSurvivesFrameSchedule
 
   describe "simulation demand" $ do
     it "reports the simulation's own deadline with every window suspended"
@@ -261,14 +266,18 @@ testResumeRequestsOneFrame = withScripted 1 $ \reports windows → do
       (settled, _) =
         turn (at (millis 110)) (DeadlineDemand (at (millis 200))) [WindowRender visible Nothing frame] acknowledged
   renderOffers asleep `shouldBe` []
-  -- Exactly one opportunity, carrying a frame obligation rebased at the resume
-  -- instant rather than the nine periods that elapsed.
-  renderOffers resumed `shouldBe` [RenderOffer target 0 (Just (at (millis 100)))]
-  fmap windowFrameDue (windowRenderState target acknowledged) `shouldBe` Just Nothing
+  -- Exactly one opportunity, carrying the resume frame rebased at the resume
+  -- instant rather than the nine periods that elapsed, beside the one frame
+  -- deadline the caller had asked for and nothing had served. Two obligations,
+  -- coalesced into the single opportunity that discharges both.
+  renderOffers resumed `shouldBe` [RenderOffer target 0 (Just (at (millis 10))) (Just (at (millis 100)))]
+  fmap owed (windowRenderState target acknowledged) `shouldBe` Just (Nothing, Nothing)
   -- The unchanged frame request recreates nothing, so the next wait is the
   -- simulation's own.
   renderOffers settled `shouldBe` []
   renderSchedule settled `shouldBe` UpdateBy (at (millis 200))
+  where
+    owed state = (windowFrameDue state, windowResumeDue state)
 
 -- | A window that becomes drawable only after an observation whose framebuffer
 -- extent is unknown still owes the frame its resume created.
@@ -287,9 +296,44 @@ testResumeThroughDeferred = withScripted 1 $ \reports windows → do
   -- and reports no deadline of its own.
   renderOffers deferred `shouldBe` []
   renderSchedule deferred `shouldBe` NoUpdateDemand
-  fmap windowFrameDue (windowRenderState target waiting) `shouldBe` Just (Just (at (millis 20)))
+  fmap windowResumeDue (windowRenderState target waiting) `shouldBe` Just (Just (at (millis 20)))
   -- Becoming drawable offers exactly that owed frame.
-  renderOffers drawn `shouldBe` [RenderOffer target 0 (Just (at (millis 20)))]
+  renderOffers drawn `shouldBe` [RenderOffer target 0 Nothing (Just (at (millis 20)))]
+
+-- | The frame schedule a caller replaces is its own, and the one current frame
+-- a resume owes is not. A window resumed into a deferred observation still owes
+-- that frame after several deferred turns, each carrying a different frame
+-- deadline, and is offered it as soon as it is drawable.
+testResumeSurvivesFrameSchedule ∷ Expectation
+testResumeSurvivesFrameSchedule = withScripted 1 $ \reports windows → do
+  window ← only windows
+  visible ← observationAt reports drawable window
+  hidden ← observationAt reports drawable {scriptedVisible = Observed False} window
+  unknown ← observationAt reports drawable {scriptedFramebuffer = Unavailable} window
+  let target = windowIdentity window
+      framed observation instant = WindowRender observation Nothing (Just (at (millis instant)))
+      (_, opened) = turn (at 0) NoDemand [framed visible 200] noRenderDemand
+      (_, slept) = turn (at (millis 10)) NoDemand [framed hidden 200] opened
+      -- The resume happens here, into an observation that cannot be drawn yet.
+      (_, resumed) = turn (at (millis 20)) NoDemand [framed unknown 300] slept
+      -- Two more deferred turns, each replacing the frame schedule outright.
+      (_, replaced) = turn (at (millis 30)) NoDemand [framed unknown 400] resumed
+      (deferred, stillDeferred) = turn (at (millis 40)) NoDemand [framed unknown 500] replaced
+      (drawn, acknowledged') = turn (at (millis 50)) NoDemand [framed visible 500] stillDeferred
+      acknowledged = foldr acknowledgeRender acknowledged' (renderOffers drawn)
+      (after, _) = turn (at (millis 60)) NoDemand [framed visible 500] acknowledged
+  -- A deferred window is offered nothing and reports no deadline of its own,
+  -- however often its schedule changes.
+  renderOffers deferred `shouldBe` []
+  renderSchedule deferred `shouldBe` NoUpdateDemand
+  fmap windowResumeDue (windowRenderState target stillDeferred) `shouldBe` Just (Just (at (millis 20)))
+  -- Drawable at last: the resume frame rebased at the resume instant, beside
+  -- the caller's current schedule, which is not yet due and is not replayed.
+  renderOffers drawn `shouldBe` [RenderOffer target 0 Nothing (Just (at (millis 20)))]
+  renderSchedule drawn `shouldBe` UpdateBy (at (millis 500))
+  -- One frame, not one per deferred turn.
+  renderOffers after `shouldBe` []
+  renderSchedule after `shouldBe` UpdateBy (at (millis 500))
 
 -- | A deferred window keeps what was captured for it, contributes nothing to
 -- the wait, and is offered as soon as a usable extent is known.
@@ -309,7 +353,7 @@ testDeferredRetainsDemand = withScripted 1 $ \reports windows → do
   -- nothing missed is replayed: one opportunity, not one per deferred turn. Its
   -- published deadline is what made it due; it owed no frame of its own, and
   -- deferral is not suspension, so no resume frame was created either.
-  renderOffers drawn `shouldBe` [RenderOffer target 1 Nothing]
+  renderOffers drawn `shouldBe` [RenderOffer target 1 Nothing Nothing]
 
 -- ---------------------------------------------------------------------------
 -- Simulation demand
@@ -377,7 +421,7 @@ testFrameConsumption = withScripted 1 $ \reports windows → do
       (withdrawn, _) = turn (at (millis 35)) NoDemand [WindowRender visible Nothing Nothing] afterReplaced
   renderOffers pending `shouldBe` []
   renderSchedule pending `shouldBe` UpdateBy (at (millis 10))
-  renderOffers due `shouldBe` [RenderOffer target 0 (Just (at (millis 10)))]
+  renderOffers due `shouldBe` [RenderOffer target 0 (Just (at (millis 10))) Nothing]
   -- The same request repeated is the same obligation, already served.
   renderOffers unchanged `shouldBe` []
   renderSchedule unchanged `shouldBe` NoUpdateDemand
@@ -451,12 +495,12 @@ testOlderRevisionLeavesNewerPending = withScripted 1 $ \reports windows → do
       (third, afterThird) = turn (at (millis 20)) NoDemand [plain visible] stale
       settled = foldr acknowledgeRender afterThird (renderOffers second)
       (fourth, _) = turn (at (millis 30)) NoDemand [plain visible] settled
-  renderOffers first `shouldBe` [RenderOffer target 1 Nothing]
-  renderOffers second `shouldBe` [RenderOffer target 2 Nothing]
+  renderOffers first `shouldBe` [RenderOffer target 1 Nothing Nothing]
+  renderOffers second `shouldBe` [RenderOffer target 2 Nothing Nothing]
   -- The stale acknowledgement recorded its revision and erased nothing.
   fmap windowRedrawPending (windowRenderState target stale) `shouldBe` Just True
   fmap windowRevisionServed (windowRenderState target stale) `shouldBe` Just 1
-  renderOffers third `shouldBe` [RenderOffer target 2 Nothing]
+  renderOffers third `shouldBe` [RenderOffer target 2 Nothing Nothing]
   -- Acknowledging the revision actually captured clears it.
   renderOffers fourth `shouldBe` []
   fmap windowRevisionServed (windowRenderState target settled) `shouldBe` Just 2
@@ -478,10 +522,10 @@ testCoalescing = withScripted 1 $ \reports windows → do
   -- Four publications, one opportunity each turn: no backlog of obsolete
   -- frames, and the last offer carries the newest revision.
   offers
-    `shouldBe` [ [RenderOffer target 1 Nothing]
-               , [RenderOffer target 2 Nothing]
-               , [RenderOffer target 3 Nothing]
-               , [RenderOffer target 4 Nothing]
+    `shouldBe` [ [RenderOffer target 1 Nothing Nothing]
+               , [RenderOffer target 2 Nothing Nothing]
+               , [RenderOffer target 3 Nothing Nothing]
+               , [RenderOffer target 4 Nothing Nothing]
                ]
   windowRenderState target saturated
     `shouldBe` Just
@@ -492,6 +536,7 @@ testCoalescing = withScripted 1 $ \reports windows → do
         , windowRevisionServed = 0
         , windowFrameDue = Nothing
         , windowFrameRequested = Nothing
+        , windowResumeDue = Nothing
         , windowSuspended = False
         }
   renderOffers quiet `shouldBe` []
@@ -499,42 +544,48 @@ testCoalescing = withScripted 1 $ \reports windows → do
 -- ---------------------------------------------------------------------------
 -- State removal
 
--- | A window the caller stops listing, one whose phase is terminal, and one
--- forgotten outright all leave the state holding nothing for them. A closing
--- window keeps its entry and is offered nothing.
+-- | A window the caller stops listing, one whose own phase has left
+-- 'WindowOpen', and one forgotten outright all leave the state holding nothing
+-- for them. The closing case is the window this state already holds an entry
+-- for, so what is asserted is a deletion rather than an absent insertion.
 testRemoval ∷ Expectation
-testRemoval = do
-  closing ← closingObservation
+testRemoval = withScripted 2 $ \reports windows → do
+  (closer, other) ← case windows of
+    [first, second] → pure (first, second)
+    _ → unexpected ("expected two windows, found " <> show (length windows))
+  observations ← mapM (observationAt reports drawable) windows
+  (kept, gone) ← case map windowIdentity windows of
+    [first, second] → pure (first, second)
+    other' → unexpected ("expected two windows, found " <> show (length other'))
+  -- The same window, observed while it is closing and again once its scope has
+  -- released it, so what is removed below is state this state actually held.
+  _ ← beginWindowClosing (pure ()) (pure True) closer
+  closing ← current closer
+  otherOpen ← current other
+  let dirty observation = WindowRender observation (captured 1 immediateDemand) Nothing
+      (_, both) = turn (at 0) NoDemand (map dirty observations) noRenderDemand
+      (dropped, afterDropped) =
+        turn (at (millis 10)) NoDemand [dirty observation | observation ← observations, observedWindow observation == kept] both
+      -- The very window the state holds an entry for is now closing, and its
+      -- entry goes with the slot that closed in the same transaction — even
+      -- though the caller still lists it, and with a capture beside it.
+      (ending, afterEnding) = turn (at (millis 20)) NoDemand [dirty closing, dirty otherOpen] afterDropped
+  observedWindow closing `shouldBe` kept
+  renderDemandWindows both `shouldBe` [kept, gone]
+  -- The window the host no longer holds took its slot and its state with it.
+  renderDemandWindows afterDropped `shouldBe` [kept]
+  map offeredWindow (renderOffers dropped) `shouldBe` [kept]
+  -- The closing window's entry is deleted and it is offered nothing; the open
+  -- window beside it keeps its entry and is served as usual, so the removal is
+  -- this window's phase rather than the turn dropping everything.
+  renderDemandWindows afterEnding `shouldBe` [gone]
+  map offeredWindow (renderOffers ending) `shouldBe` [gone]
+  -- A terminal phase removes it too, as does forgetting one outright.
   released ← endedObservation (scriptOf (pure drawable))
-  withScripted 2 $ \reports windows → do
-    observations ← mapM (observationAt reports drawable) windows
-    (kept, gone) ← case map windowIdentity windows of
-      [first, second] → pure (first, second)
-      other → unexpected ("expected two windows, found " <> show (length other))
-    let dirty observation = WindowRender observation (captured 1 immediateDemand) Nothing
-        (_, both) = turn (at 0) NoDemand (map dirty observations) noRenderDemand
-        (dropped, afterDropped) =
-          turn (at (millis 10)) NoDemand [dirty observation | observation ← observations, observedWindow observation == kept] both
-        -- The closing and released windows are a different session's, so they
-        -- start from no state of their own and are removed on sight.
-        (_, afterClosingSeen) = turn (at (millis 15)) NoDemand [dirty closing] afterDropped
-        (ending, afterEnding) = turn (at (millis 20)) NoDemand [plain closing] afterClosingSeen
-        (_, afterTerminal) = turn (at (millis 30)) NoDemand [plain released] afterEnding
-    renderDemandWindows both `shouldBe` [kept, gone]
-    -- The window the host no longer holds took its slot and its state with it.
-    renderDemandWindows afterDropped `shouldBe` [kept]
-    map offeredWindow (renderOffers dropped) `shouldBe` [kept]
-    -- A closing window's demand slot closed with it, so its state goes at the
-    -- first closing observation rather than lingering until release, and it is
-    -- never offered even with a capture beside it.
-    renderDemandWindows afterClosingSeen `shouldBe` []
-    renderDemandWindows afterEnding `shouldBe` []
-    renderOffers ending `shouldBe` []
-    renderSchedule ending `shouldBe` NoUpdateDemand
-    -- A terminal phase removes it too, as does forgetting one outright.
-    renderDemandWindows afterTerminal `shouldBe` []
-    renderDemandWindows (forgetRenderWindow kept both) `shouldBe` [gone]
-    renderDemandWindows (forgetRenderWindow kept noRenderDemand) `shouldBe` []
+  let (_, seeded) = turn (at (millis 30)) NoDemand [dirty released] noRenderDemand
+  renderDemandWindows seeded `shouldBe` []
+  renderDemandWindows (forgetRenderWindow kept both) `shouldBe` [gone]
+  renderDemandWindows (forgetRenderWindow kept noRenderDemand) `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- The reported schedule
@@ -554,7 +605,7 @@ testOfferedDeadlineIsNotReported = withScripted 1 $ \reports windows → do
         turn (at 0) NoDemand [WindowRender visible request (Just (at (millis 80)))] noRenderDemand
       acknowledged = foldr acknowledgeRender afterServed (renderOffers served)
       (after, _) = turn (at (millis 10)) NoDemand [WindowRender visible Nothing (Just (at (millis 80)))] acknowledged
-  renderOffers served `shouldBe` [RenderOffer target 1 Nothing]
+  renderOffers served `shouldBe` [RenderOffer target 1 Nothing Nothing]
   -- The published deadline is the offer's; the frame deadline is not, so it is
   -- the only one reported.
   renderSchedule served `shouldBe` UpdateBy (at (millis 80))

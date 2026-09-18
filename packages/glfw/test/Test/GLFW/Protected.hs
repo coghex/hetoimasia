@@ -126,7 +126,7 @@ import Hetoimasia.Runtime.Supervision
   , startSupervised
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Test.GLFW.Window (boundedExample, caughtAs, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec

@@ -63,7 +63,7 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration, and `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the link-declaration check, and the external-client opacity examples. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -519,6 +519,7 @@ windowRenderState      ∷ WindowId → RenderDemand → Maybe WindowRenderState
 forgetRenderWindow     ∷ WindowId → RenderDemand → RenderDemand
 data WindowRenderState = WindowRenderState { windowRedrawPending ∷ Bool
                                            , windowDeadlinePending, windowFrameDue, windowFrameRequested ∷ Maybe Instant
+                                           , windowResumeDue ∷ Maybe Instant
                                            , windowRevisionPending, windowRevisionServed ∷ Natural
                                            , windowSuspended ∷ Bool }
 
@@ -536,7 +537,8 @@ data RenderTurn = RenderTurn { renderNow ∷ Instant, renderSimulation ∷ Deman
 renderTurn             ∷ RenderBudget → RenderTurn → RenderDemand → (RenderResult, RenderDemand)
 data RenderResult = RenderResult { renderOffers ∷ [RenderOffer], renderSchedule ∷ UpdateSchedule }
 renderDeadline         ∷ RenderResult → Maybe Instant
-data RenderOffer = RenderOffer { offeredWindow ∷ WindowId, offeredRevision ∷ Natural, offeredFrame ∷ Maybe Instant }
+data RenderOffer = RenderOffer { offeredWindow ∷ WindowId, offeredRevision ∷ Natural
+                               , offeredFrame, offeredResume ∷ Maybe Instant }
 acknowledgeRender      ∷ RenderOffer → RenderDemand → RenderDemand
 
 runWindowApplication
@@ -2538,9 +2540,15 @@ deadlines, which would otherwise shorten every wait to nothing, nor its pending
 ones. A deferred window is the same, and keeps its demand until a usable extent
 arrives. Leaving suspension is a resume: it rebases the window's frame schedule
 at the resume instant and owes exactly one current frame, nothing missed is
-replayed, and no state grows with the missed frames. A resume into a deferred
-observation still owes that frame, and it is offered once the window is
-drawable.
+replayed, and no state grows with the missed frames. That obligation is held
+apart from the caller's own frame schedule, in `windowResumeDue` rather than
+`windowFrameDue`, precisely because the caller may replace its frame deadline on
+any turn — including while the window is still deferred — and doing so must not
+erase a resume frame nothing has served. A resume into a deferred observation
+therefore still owes its frame however often that schedule changes, and it is
+offered once the window is drawable. An offer names the two obligations
+separately, as `offeredFrame` and `offeredResume`, so an acknowledgement clears
+exactly what that opportunity covered.
 
 **Simulation is carried independently.** The turn's `Demand` is the
 application's own, from [`Hetoimasia.Runtime.UpdatePolicy`](scheduling.md). With
@@ -3050,9 +3058,11 @@ beyond the budget keeping the schedule immediate; an acknowledgement of an older
 revision leaving the newer request pending and offering it again; four
 publications coalescing into one opportunity per turn with the window's state
 unchanged in size; removal on the caller's own list, at the first closing
-observation, on a terminal phase, and outright; and a deadline this turn's own
-offer covers left out of the schedule while an unserved frame deadline beside it
-is reported. Two of them run the production scheduled loop: the worked composition
+observation — asserted as the deletion of an entry the state held, beside an
+open window that keeps its own — on a terminal phase, and outright; an owed
+resume frame surviving three deferred turns whose frame schedule the caller
+replaces each time; and a deadline this turn's own offer covers left out of the
+schedule while an unserved frame deadline beside it is reported. Two of them run the production scheduled loop: the worked composition
 above, asserting its exact simulation steps, per-window opportunities, schedules,
 and waits, and a suspended window whose captured demand still leaves the next
 turn its whole fallback bound.

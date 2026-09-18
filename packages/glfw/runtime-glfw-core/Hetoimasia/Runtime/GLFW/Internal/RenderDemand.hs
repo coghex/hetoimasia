@@ -76,9 +76,11 @@
 --
 -- Leaving suspension is a resume. It rebases the window's frame schedule at the
 -- resume instant and owes exactly one current frame; nothing missed while
--- suspended is replayed, and no state grows with the missed frames. A resume
--- into a deferred observation still owes that frame, which is offered once the
--- window becomes drawable.
+-- suspended is replayed, and no state grows with the missed frames. That
+-- obligation is held apart from the caller's own frame schedule, so a resume
+-- into a deferred observation still owes its frame — and still owes it however
+-- many times the caller replaces that window's frame deadline while it is
+-- deferred — and it is offered once the window becomes drawable.
 --
 -- = Fairness and acknowledgement
 --
@@ -146,7 +148,7 @@ module Hetoimasia.Runtime.GLFW.Internal.RenderDemand
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Hetoimasia.Foundation.Time (Instant, deadlineReached)
 import Hetoimasia.GLFW.Demand (CapturedDemand (..), demandDeadline, demandIsImmediate)
 import Hetoimasia.GLFW.Window
@@ -235,11 +237,16 @@ data WindowRenderState = WindowRenderState
   , windowRevisionServed ∷ !Natural
     -- ^ The newest revision an acknowledged opportunity recorded.
   , windowFrameDue ∷ !(Maybe Instant)
-    -- ^ The frame obligation this window owes: the caller's own frame deadline,
-    -- or the one current frame a resume rebased at its instant.
+    -- ^ The obligation the caller's own frame deadline created, and nothing
+    -- else. A changed frame request replaces it.
   , windowFrameRequested ∷ !(Maybe Instant)
     -- ^ The frame deadline the caller last supplied, so an unchanged one
     -- recreates no obsolete work and a withdrawn one removes its demand.
+  , windowResumeDue ∷ !(Maybe Instant)
+    -- ^ The one current frame a resume rebased at its instant. It is held apart
+    -- from 'windowFrameDue' precisely so that replacing the caller's ongoing
+    -- frame schedule — which a window may do on any turn, including while it is
+    -- still deferred — cannot erase a resume frame that has not been served.
   , windowSuspended ∷ !Bool
     -- ^ Whether the last observation suspended it, which is what makes the next
     -- eligible or deferred observation a resume.
@@ -256,6 +263,7 @@ freshWindowRenderState =
     , windowRevisionServed = 0
     , windowFrameDue = Nothing
     , windowFrameRequested = Nothing
+    , windowResumeDue = Nothing
     , windowSuspended = False
     }
 
@@ -351,7 +359,11 @@ data RenderOffer = RenderOffer
     -- ^ The newest capture revision the offer covers; zero when the window owed
     -- only a frame.
   , offeredFrame ∷ !(Maybe Instant)
-    -- ^ The frame obligation the offer serves, when one was due.
+    -- ^ The caller's own frame obligation the offer serves, when one was due.
+  , offeredResume ∷ !(Maybe Instant)
+    -- ^ The resume frame the offer serves, when one was owed and due. It is
+    -- named separately from 'offeredFrame' so an acknowledgement clears exactly
+    -- the obligations that opportunity covered.
   }
   deriving (Eq, Show)
 
@@ -417,7 +429,8 @@ renderTurn (RenderBudget allowance) turn state = (result, RenderDemand kept curs
       [ RenderOffer
           { offeredWindow = target
           , offeredRevision = windowRevisionPending window
-          , offeredFrame = dueFrame now window
+          , offeredFrame = reachedBy now (windowFrameDue window)
+          , offeredResume = reachedBy now (windowResumeDue window)
           }
       | target ← offering
       , Just (_, window) ← [Map.lookup target inspected]
@@ -440,6 +453,7 @@ renderTurn (RenderBudget allowance) turn state = (result, RenderDemand kept curs
           catMaybes
             [ if target `elem` offering then Nothing else windowDeadlinePending window
             , windowFrameDue window
+            , windowResumeDue window
             ]
       , not (deadlineReached now due)
       ]
@@ -470,9 +484,10 @@ advanceWindow now input previous = (eligibility, settled)
       RenderExcluded → requested
       _
         -- Leaving suspension rebases the frame schedule here and owes exactly
-        -- one current frame. A resume into a deferred observation keeps that
-        -- obligation until the window is drawable.
-        | windowSuspended requested → requested {windowSuspended = False, windowFrameDue = Just now}
+        -- one current frame, in its own field. A resume into a deferred
+        -- observation keeps that obligation until the window is drawable,
+        -- however often the caller replaces its frame deadline meanwhile.
+        | windowSuspended requested → requested {windowSuspended = False, windowResumeDue = Just now}
         | otherwise → requested
 
 -- | Transfer a captured publication into bounded scheduling state: its
@@ -501,14 +516,11 @@ applyFrame requested window
 dueNow ∷ Instant → WindowRenderState → Bool
 dueNow now window =
   windowRedrawPending window
-    || reached (windowDeadlinePending window)
-    || reached (windowFrameDue window)
-  where
-    reached = maybe False (deadlineReached now)
+    || any (isJust . reachedBy now) [windowDeadlinePending window, windowFrameDue window, windowResumeDue window]
 
--- | The frame obligation an offer made at this instant serves, if one is due.
-dueFrame ∷ Instant → WindowRenderState → Maybe Instant
-dueFrame now window = case windowFrameDue window of
+-- | An obligation an offer made at this instant serves, if it is due.
+reachedBy ∷ Instant → Maybe Instant → Maybe Instant
+reachedBy now held = case held of
   Just due | deadlineReached now due → Just due
   _ → Nothing
 
@@ -537,6 +549,9 @@ acknowledgeRender offer state =
             , windowRevisionServed = max (windowRevisionServed window) (offeredRevision offer)
             }
       | otherwise = window {windowRevisionServed = max (windowRevisionServed window) (offeredRevision offer)}
-    frame window = case offeredFrame offer of
+    frame window = resumed (case offeredFrame offer of
       Just due | windowFrameDue window == Just due → window {windowFrameDue = Nothing}
+      _ → window)
+    resumed window = case offeredResume offer of
+      Just due | windowResumeDue window == Just due → window {windowResumeDue = Nothing}
       _ → window

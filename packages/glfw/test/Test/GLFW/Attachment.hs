@@ -17,7 +17,7 @@ import Hetoimasia.GLFW.Internal.Attachment
 import Hetoimasia.GLFW.Internal.Seam (asProcessMainThread, defaultScript, newSeam)
 import Hetoimasia.GLFW.Internal.Window (windowSessionIdentity)
 import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig, windowIdentity, withWindow)
-import Test.GLFW.Window (boundedExample, entered, unexpected)
+import Test.GLFW.Support (boundedExample, entered, unexpected)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe)
 
 type Model = AttachmentModel String

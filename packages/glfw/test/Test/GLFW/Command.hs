@@ -27,7 +27,7 @@ import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
-import Test.GLFW.Window
+import Test.GLFW.Support
   ( boundedExample
   , caughtAs
   , contextsOf

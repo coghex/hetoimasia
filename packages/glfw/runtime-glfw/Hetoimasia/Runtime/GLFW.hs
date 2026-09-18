@@ -246,7 +246,9 @@
 -- and its frame request, and contributes neither its expired nor its pending
 -- deadlines to the schedule, so it can never shorten a wait to nothing.
 -- Leaving suspension rebases that window's frame schedule and owes exactly one
--- current frame; nothing missed is replayed. At most 'renderBudgetSize'
+-- current frame, held apart from the caller's own replaceable schedule so that
+-- replacing it cannot erase a resume frame nothing has served; nothing missed
+-- is replayed. At most 'renderBudgetSize'
 -- opportunities are offered per turn, each window once, rotating after the
 -- window served last, so an always-dirty window starves no other, and due work
 -- left beyond the budget is what keeps the next schedule 'UpdateImmediately'.

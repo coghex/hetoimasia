@@ -26,7 +26,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Numeric.Natural (Natural)
-import Test.GLFW.Window (boundedExample, current, entered, stashed, unexpected)
+import Test.GLFW.Support (boundedExample, current, entered, stashed, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldSatisfy)
 
 spec ∷ Spec

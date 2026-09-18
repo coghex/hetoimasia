@@ -54,7 +54,7 @@ import Hetoimasia.GLFW.Window
   )
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
-import Test.GLFW.Window (boundedExample, caughtAs, entered, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, entered, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec

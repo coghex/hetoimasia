@@ -49,7 +49,7 @@ import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (Recognition (..), Role (..), RuntimeControl, SupervisedStart (..), WorkerPolicy (..), startSupervised)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
-import Test.GLFW.Window (boundedExample, caughtAs, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
