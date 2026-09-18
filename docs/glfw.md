@@ -2644,7 +2644,11 @@ again would be safe.
 
 The initiating outcome is recorded before any interruptible drain work. A body
 failure stays primary, and every drain, report, and deferred failure is retained
-beside it under the `glfw protected retirement` cleanup label. After a
+beside it under the `glfw protected retirement` cleanup label, in the order the
+boundary found them. Every callback result the boundary depends on — a
+construction's, a rollback's, the stall diagnostic's, and a retirement step's —
+is forced inside the attempt that catches it, so a value that raises only when
+it is demanded is that attempt's failure rather than one escaping it. After a
 successful body the first drain failure becomes primary and later ones are
 retained; beyond a bounded number they are counted rather than kept, so a
 boundary waiting indefinitely cannot grow without bound.
@@ -2740,7 +2744,9 @@ consumer's own are; a notice refused once retirement is complete; a command and
 a demand refused once the exit has closed the host; a stalled chain reported
 beside one that only ever awaits; a body failure kept as the exact primary
 exception with the drain's own retained beside it under `glfw protected
-retirement`; an interrupted step
+retirement`, and two of them retained in the order they happened; a
+construction, a rollback, and a diagnostic sink whose results raise only when
+demanded, each caught inside its own attempt; an interrupted step
 withdrawn rather than run again; a duplicate and a refused notice reviving
 nothing; a cancellation queued while the window's own destruction is in flight,
 which defers until the session and a parent have outlived it; a stalled

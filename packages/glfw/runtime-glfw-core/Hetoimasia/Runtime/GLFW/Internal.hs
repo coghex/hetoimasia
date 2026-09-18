@@ -1769,9 +1769,13 @@ settleProtectedOutcome body drained reported = case body of
           ]
 
 -- | Raise one failure with the others retained beside it, each under the
--- protected boundary's own cleanup label.
+-- protected boundary's own cleanup label, in the order they happened.
+--
+-- Releases run inside out, so the failure to be recorded first is the innermost
+-- scope: the list is reversed before it is folded, and inspection then reports
+-- the evidence in the order the boundary found it.
 raiseRetaining ∷ ExceptionWithContext SomeException → [ExceptionWithContext SomeException] → IO a
-raiseRetaining primary = foldr retainOne (rethrowIO primary)
+raiseRetaining primary = foldr retainOne (rethrowIO primary) . reverse
   where
     retainOne failure rest =
       withResourceLabelled retirementLabel (pure ()) (\() → rethrowIO failure) (\() → rest)

@@ -138,6 +138,7 @@ import Control.Concurrent.STM
   )
 import Control.Exception
   ( Exception (displayException)
+  , evaluate
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
@@ -496,7 +497,10 @@ attachRetirement retirement restore window protocol = do
     Right registered → do
       let target = registeredAttachment registered
           acknowledgement = registeredAcknowledgement registered
-      tryWithContext (restore (protocolConstruct protocol target acknowledgement)) >>= \case
+      -- Forced inside the boundary that catches it: a callback may return a
+      -- value that raises when it is demanded, and demanding it afterwards
+      -- would leave the reservation pending with nothing able to settle it.
+      tryWithContext (restore (protocolConstruct protocol target acknowledgement >>= evaluate)) >>= \case
         Right () → settleConstructed retirement target acknowledgement
         Left caught → settleFailed retirement restore protocol target acknowledgement caught
   where
@@ -548,7 +552,7 @@ settleFailed retirement restore protocol target acknowledgement caught@(Exceptio
   -- established no safety, so the attachment is retained owing every fact
   -- rather than left pending, where no fact could ever be recorded and the
   -- drain could never finish.
-  attempted ← tryWithContext (restore (protocolRollback protocol))
+  attempted ← tryWithContext (restore (protocolRollback protocol >>= evaluate))
   let outcome = either (const RollbackUnsafe) id attempted
       rolledBack = either Just (const Nothing) attempted
   atomically $ do
@@ -744,7 +748,7 @@ drainRetirement retirement environment restore = go True noDrainOutcome
           -- The retry itself replays no failed disposal: a window whose
           -- retirement failed is forgotten rather than attempted again.
           settled ←
-            tryWithContext (restore (environmentRetireWindows environment))
+            tryWithContext (restore (environmentRetireWindows environment >>= evaluate))
               >>= \attempted → absorb retirement attempted stepped
           -- Every round, whether or not another chain progressed: a chain with
           -- no path left is retaining its window, the session, and its parents
@@ -914,6 +918,9 @@ declareStall retirement environment restore outcome = do
             , ("attachments", Text.pack (show (length pending)))
             , ("wait", Text.pack (show (environmentBound environment)))
             ]
+            -- Forced here, inside the attempt: a sink whose result raises when
+            -- demanded may not escape and unwind what the stall is retaining.
+            >>= evaluate
       absorb retirement attempted outcome
 
 -- | The round's native step, and the finite wait that ends it.
@@ -937,7 +944,7 @@ waitRound retirement environment restore pumping progressed outcome
   | otherwise = do
       attempted ←
         tryWithContext . restore $
-          if progressed then environmentPoll environment else environmentAwait environment
+          (if progressed then environmentPoll environment else environmentAwait environment) >>= evaluate
       (,) (keepsPumping attempted) <$> absorb retirement attempted outcome
   where
     -- A synchronous native failure withdraws the pump; a cancellation does not.

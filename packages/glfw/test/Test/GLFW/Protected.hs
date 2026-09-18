@@ -41,6 +41,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , throw
   , throwIO
   , try
   , uninterruptibleMask_
@@ -171,6 +172,8 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testCancelledRollback)
     it "re-raises a cancellation the rollback received after a construction that failed synchronously"
       (boundedExample testRollbackCancelledAfterFailure)
+    it "catches a construction and a rollback whose results raise only when demanded"
+      (boundedExample testLazyCallbackResults)
 
   describe "the drain" $ do
     it "retains repeated cancellation as evidence, establishes no fact, and re-raises one only once retirement is safe"
@@ -201,6 +204,10 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testStallReportedBesideAwaiting)
     it "keeps the body's failure primary with the drain's retained beside it"
       (boundedExample testBodyFailureStaysPrimary)
+    it "retains two drain failures in the order it found them"
+      (boundedExample testRetainedEvidenceOrder)
+    it "catches a stall diagnostic whose sink's result raises only when demanded"
+      (boundedExample testLazyStallDiagnosticFails)
 
   describe "failed retirement steps" $ do
     it "keeps a required step's failure and evidence, never marks the attachment safe, and never replays the step"
@@ -1750,6 +1757,143 @@ retainedUnder label caught =
   | failure ← cleanupFailures caught
   , cleanupFailureLabel failure == label
   ]
+
+
+-- | A callback may return a value that raises only when it is demanded. Both
+-- construction and its rollback are forced inside the boundary that catches
+-- them, so neither leaves the reservation pending with nothing able to settle
+-- it and the drain unable ever to finish.
+testLazyCallbackResults ∷ Expectation
+testLazyCallbackResults = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  answered ← newIORef Nothing
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+            window ← onlyWindow host
+            (_, outcome) ←
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = pure (throw (Scripted "lazy construction"))
+                  , scriptRollback = pure (throw (Scripted "lazy rollback"))
+                  }
+            writeIORef answered (Just outcome)
+            use host
+      )
+      id
+      (\host _ → pure host)
+      (\_ _ → pure ())
+  readIORef answered >>= \case
+    Just (AttachmentRolledBack settled) → do
+      -- A rollback whose own result raised established no safety.
+      rolledBackOutcome settled `shouldBe` RollbackUnsafe
+      (fromException (exceptionOf (rolledBackFailure settled)) ∷ Maybe Scripted)
+        `shouldBe` Just (Scripted "lazy construction")
+      (fromException . exceptionOf <$> rolledBackRollback settled)
+        `shouldBe` Just (Just (Scripted "lazy rollback"))
+    other → unexpected ("the lazy construction was not answered: " <> show other)
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A sink whose result raises only when demanded is caught inside the stall
+-- attempt, so it is retained like any other diagnostic failure and unwinds
+-- nothing the stall is holding.
+testLazyStallDiagnosticFails ∷ Expectation
+testLazyStallDiagnosticFails = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
+  let logger = lazilyFailingLogger "glfw.retirement"
+  (failure, _) ←
+    asProcessMainThread seam . caughtAs $
+      runProtectedWindowApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  void (pure helper)
+  failure `shouldBe` Scripted "lazy sink"
+  -- Retained, not raised through the scope: the window outlived the stall.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A logger whose sink returns, for one component, a unit that raises when it
+-- is demanded rather than raising as it is run.
+lazilyFailingLogger ∷ Text → Logger
+lazilyFailingLogger component =
+  mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \entry →
+    pure (if componentText (entryComponent entry) == component then throw (Scripted "lazy sink") else ())
+
+-- | Two chains whose steps both fail, so the boundary retains two failures
+-- beside the body's own: inspection reports them in the order the drain found
+-- them, not reversed by the scopes that carry them.
+testRetainedEvidenceOrder ∷ Expectation
+testRetainedEvidenceOrder = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  firstHeld ← newTVarIO Nothing
+  secondHeld ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  helper ← forkIO $ do
+    alpha ← awaitHeld firstHeld
+    beta ← awaitHeld secondHeld
+    host ← awaitHeld hostHeld
+    atomically (afterFailedStep alpha >> afterFailedStep beta)
+    publishFacts journal host alpha [CpuUseRetired]
+    publishFacts journal host beta [CpuUseRetired]
+  (primary, caught) ←
+    asProcessMainThread seam . caughtAs $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+              (alpha, beta) ← twoWindows host
+              -- Stepped in registration order, so the failures happen in this
+              -- order too.
+              first ← establishedOwner journal host alpha (failingOwner "alpha" "first")
+              second ← establishedOwner journal host beta (failingOwner "beta" "second")
+              atomically (writeTVar firstHeld (Just first))
+              atomically (writeTVar secondHeld (Just second))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → throwIO (Scripted "action"))
+  void (pure helper)
+  primary `shouldBe` Scripted "action"
+  retainedUnder "glfw protected retirement" caught
+    `shouldBe` [Just (Scripted "first"), Just (Scripted "second")]
+  destructions journal `shouldReturn` [WindowGone 2, WindowGone 1]
+
+-- | An owner whose first opportunity fails and whose later ones certify.
+failingOwner ∷ Text → Text → OwnerScript
+failingOwner name message =
+  (ownerNamed name) {scriptPlan = FailWith message : map Certify allRetirementFacts}
+
+destructions ∷ TVar [Flag] → IO [Flag]
+destructions journal = filter isWindowGone <$> readTVarIO journal
+  where
+    isWindowGone = \case
+      WindowGone _ → True
+      _ → False
 
 -- ---------------------------------------------------------------------------
 -- Closing an attached window during the run
