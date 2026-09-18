@@ -4,20 +4,24 @@ A modular Haskell/Vulkan game engine with a planned Lua scripting host and
 separate 2D and 3D rendering modules. Synarchy is a potential future client.
 
 **Current implementation:** logging, scoped CPU resources, failures and bounded
-recovery, monotonic time values, application composition, supervised workers, bounded messaging, and
-GLFW with dynamic windows, controls, monitor-aware modes, and input feeds.
+recovery, monotonic scheduling, application composition, supervised workers,
+bounded messaging, and GLFW with dynamic windows, controls, monitor-aware modes,
+input feeds, native wake, and protected graphics-owner attachment lifetimes.
 Vulkan, Lua, fonts, and rendering remain planned; their directories contain
 ownership notes and are not in the Cabal package list.
 
 The original GLFW arc and its completion repairs (#115–#118 and #123) are
 merged and reviewed; epic #86 is complete. Native desktop tests now require
-explicit per-session consent (#124). The active pre-Vulkan work is
+explicit per-session consent (#124). The children of the
 [package-owned tests](docs/test_architecture_design.md) (#49),
 [scheduling and native wake](docs/runtime_scheduling_design.md) (#131), and
-[window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140).
-Their issues are filed; remaining implementation is tracked in those epics.
-The [Lua design](docs/lua_runtime_design.md) is ready for staged processing,
-with platform isolation proofs before production sandbox work.
+[window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140)
+arcs have merged. The [latest review](docs/project_review_165-150.md) identifies
+four retirement/reporting follow-ups before real GPU attachments.
+The [Vulkan](docs/vulkan_backend_design.md) (#155) and
+[Lua](docs/lua_runtime_design.md) (#145) designs are ready for staged processing.
+Shared toolchain qualification (#157) precedes their initial implementation;
+native graphics and mod confinement require their separate platform proofs.
 
 ## Start here
 
@@ -32,7 +36,7 @@ with platform isolation proofs before production sandbox work.
 - [Scheduling update policy](docs/scheduling.md)
 - [GLFW contract and native tests](docs/glfw.md)
 - [Validation and evidence reuse](docs/validation.md)
-- [Vulkan backend design — exploring](docs/vulkan_backend_design.md)
+- [Vulkan backend design — staged qualification](docs/vulkan_backend_design.md)
 - [Kanban development workflow](docs/workflow.md)
 
 ## Build and run

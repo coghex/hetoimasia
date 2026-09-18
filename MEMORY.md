@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated 2026-09-17 against code `master@9300962`. This is the active handoff,
+Updated 2026-09-18 against code `master@8e4eb6e`. This is the active handoff,
 not an exhaustive changelog. Recheck Git and the tracker before relying on status.
 Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
 [the memory archive](docs/history/memory_before_2026-09-17.md). Read only the
@@ -50,13 +50,17 @@ owning subsystem's contract/design when continuing its work.
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
 - Test-support extraction #125/#132, foundation migration #127/#137, and
-  runtime migration #129/#150 are complete; GLFW headless migration #130 lands
-  with its own PR, the last child of epic #49.
-- Audit at `9300962`: PRs #137, #132, #128 and #126 had no new confirmed repair.
-  Local build/smoke, foundation 308 examples (GLFW discovery disabled), root
-  209, workflow 333, consent 14 and scripted fixture 13 passed. No native
-  session was started by that audit. Linux native CI passed on those PRs.
-  Counts are dated evidence, not permanent expectations.
+  runtime migration #129/#150, and GLFW headless migration #130/#151 are
+  complete. All children of epic #49 are merged; its checklist still needs
+  reconciliation.
+- Audit at `8e4eb6e`: the latest twelve merged PRs (#150–#165, exact list in
+  [the report](docs/project_review_165-150.md)) cover every merge since the
+  previous review through #137. Build and 1,289 existing Hspec examples passed;
+  five added headless examples reproduced four follow-ups: completion-policy
+  evaluation escaping protected retirement (P1), direct-versus-queued evidence
+  revival, retirement budget busy polling, and diagnostic-failure propagation.
+  These are not filed yet. Repair the lifetime escape before attaching native
+  GPU dependents. No desktop session ran. Counts are dated evidence.
 - Foundation owns `packages/foundation/test/` (`test.foundation`) and runtime
   owns `packages/runtime/test/` (`test.runtime`, 143 examples at #129, with the
   per-example map in docs/runtime_tests_mapping.md). GLFW owns
@@ -106,16 +110,16 @@ owning subsystem's contract/design when continuing its work.
 - All three pre-Vulkan documents are fully processed into tracker artifacts;
   processing completion does not mean implementation completion. Their canonical
   approval comments amend the issue bodies and must be included by solvers.
-- [Test ownership](docs/test_architecture_design.md), epic #49: #130
-  remains. Their migrations are not hard prerequisites of TIME/LIFE, but finishing
-  them early reduces test/Cabal/catalog edit conflicts.
+- [Test ownership](docs/test_architecture_design.md), epic #49: all children
+  have merged. Package suites and the root/tools separation are implemented.
 - [Scheduling](docs/runtime_scheduling_design.md), epic #131: #133, #134, #135,
-  #136, #138, #139. Accepted: event/deadline/fixed-step updates with bounded
-  catch-up; render suspension per window while simulation remains application-
+  #136, #138, #139 are all merged. Accepted: event/deadline/fixed-step updates
+  with bounded catch-up; render suspension per window while simulation remains application-
   owned; committed demand retained across cancellation; expected wake failure
   keeps accepted work, reports once under logging policy and degrades to polling.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
-  #141, #142, #143, and #144 are merged, so the arc is complete. One exclusive
+  #141, #142, #143, and #144 are merged. The current review report records
+  follow-up repairs, so merged children do not establish a clean arc. One exclusive
   graphics owner per window, attached through `attachWindowGraphics` and held as
   an opaque `GraphicsService`. Protected main-thread retirement follows worker
   drain and precedes dependency release on every exit; in-run retirement
@@ -126,26 +130,36 @@ owning subsystem's contract/design when continuing its work.
   `runtime-glfw-core` beneath that contract. Still open: no surface, GPU
   submission, or device wait exists anywhere here — evidence that GPU work has
   completed is the backend's, and which mechanism proves it is the Vulkan
-  design's Q-3.
+  compatibility proof #158.
 - [Lua](docs/lua_runtime_design.md) is ready for staged processing. Independent
   UI/gameplay execution domains; stop unsafe authoritative gameplay while keeping
   UI available. Untrusted mods require separate processes per mod/domain,
   explicit capabilities, and enforced whole-process resource/execution limits.
-  LUA-1 establishes the binding baseline. LUA-14/LUA-15 must prove viable Linux
-  and macOS confinement before dependent process/integration slices are drafted.
+  Epic #145 has approved children #146–#149. #146 (LUA-1) consumes the shared
+  toolchain qualification from #157; it must wait for that merge. #147/#148
+  (platform proofs) and #149 (pure protocol model) follow #146 and can then run
+  in parallel. The backlog review identified one amendment for #147: it needs
+  the same bounded Cabal OS/buildable parser support already specified in #148,
+  or must reuse that support if #148 lands first. No tracker edit has been made.
+  LUA-14/LUA-15 must prove viable Linux and macOS confinement before dependent
+  process/integration slices are drafted.
   Signed bundled macOS helpers may be evaluated while preserving headless CLI
   operation; no assumed privileged install or paid signing account. A failed or
   inconclusive proof returns the design to exploring; never weaken isolation.
-- [Vulkan](docs/vulkan_backend_design.md) remains exploring. It owns the actual
-  loader/surface bridge, platform/toolchain proof, GPU and presentation completion,
-  backend retirement, diagnostic capture and graphics verification. TIME/LIFE
-  are prerequisites, not replacements for these GPU contracts. No Vulkan issue
-  or compatibility profile has been approved yet.
+- [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
+  tracked by epic #155. Approved #157 qualifies the shared toolchain first;
+  after #157 merges, native proof #158, pure ownership model #160, and Lua
+  #146 can run in parallel. Vulkan 1.3 minimum, a shared loader,
+  managed retention, present-fence retirement, and default two frame slots are
+  accepted design choices; native compatibility remains unproven until #158.
+  Later native slices remain gated on that proof. Host-retirement repairs must
+  precede real GPU attachment integration; the current three Vulkan issues do
+  not depend on the defective host paths.
 - CI-5 (`test`/`autotest` adapter integration) remains explicitly deferred.
   The old foundation umbrella is architectural context, not another queue for
   duplicating completed resources/runtime/GLFW or the newer TIME/LIFE arcs.
-- No game save schema, full Synarchy port, Vulkan API baseline, permanent RTS
-  tuning, or general engine-wide rendering abstraction is committed yet.
+- No game save schema, full Synarchy port, permanent RTS tuning, or general
+  engine-wide rendering abstraction is committed yet.
 
 ## Where to look
 

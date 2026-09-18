@@ -46,6 +46,13 @@ concrete precondition
 The ledger records processing, not implementation. Keep it synchronized with
 the delivery plan; do not infer issue numbers from these local slice IDs.
 
+Dependency reconciliation, 2026-09-18: the owner selected the shared-toolchain
+qualification VK-1/#157 before LUA-1/#146. The amended and reapproved #146 and
+its tracker comment linking #157 are authoritative. Consume its merged exact
+GHC/Cabal/index baseline; do not perform a competing upgrade. This is a shared
+build prerequisite, not a dependency on Vulkan rendering or native proof. The
+source observations below remain historical.
+
 ## Epic contract
 
 - **Goal:** a reusable Lua host and runtime adapter run UI and gameplay on
@@ -998,8 +1005,10 @@ and verified policy, with adversarial regression coverage.
   Hspec target; safe call/error trampolines; reproducible native inputs and its
   initial affected CI group. Record supported/rejected paths and resolve Q-3.
 - **Phase:** binding foundation.
-- **Depends on:** none.
-- **Ordering:** critical path; independent of Vulkan and TIME-1.
+- **Depends on:** external VK-1/#157 merged with the shared-toolchain
+  qualification required by #146.
+- **Ordering:** critical path after that qualification; independent of Vulkan
+  rendering/native proof and TIME-1.
 - **Relevant decisions:** D-1, D-2, D-4, D-6, D-9.
 - **Acceptance signals:** pinned Linux/macOS builds; callback/error evidence;
   independent interpreter execution; verified cancellation/close assumptions.
@@ -1297,8 +1306,8 @@ and verified policy, with adversarial regression coverage.
 
 ## Deferred extensions and next-session handoff
 
-After processing, the implementation order is LUA-1, then LUA-14/LUA-15 and
-LUA-2/LUA-4 independently; LUA-3 after LUA-2; LUA-9 after LUA-3/LUA-4 and both
+After processing, the implementation order is external VK-1/#157, then LUA-1,
+then LUA-14/LUA-15 and LUA-2/LUA-4 independently; LUA-3 after LUA-2; LUA-9 after LUA-3/LUA-4 and both
 successful platform proofs; LUA-10,
 LUA-11, and LUA-13 in parallel; LUA-12 after both platform slices and TIME-1;
 LUA-5 after LUA-12/LUA-13; LUA-6 and LUA-7 in parallel; then LUA-8. Stable IDs
