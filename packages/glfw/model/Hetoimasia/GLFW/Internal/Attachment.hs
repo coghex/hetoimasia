@@ -10,9 +10,10 @@
 -- attachment still vetoes the window's destruction. It is a pure state machine
 -- plus bounded bookkeeping and one bounded notice inbox: it performs no native
 -- call, owns no thread, names no graphics type, and exposes no usable
--- attachment. Nothing in the public library exports it, and no production
--- component uses it yet; the protected host (LIFE-3) and the public attachment
--- contract (LIFE-4) of "docs/window_graphics_lifetime_design.md" follow.
+-- attachment. Nothing in the public library exports it: the protected host
+-- (LIFE-3) owns the one instance, and the public attachment contract (LIFE-4)
+-- of "docs/window_graphics_lifetime_design.md" is that instance's narrow face.
+-- What that contract answers is what this model decided.
 --
 -- = Identities
 --
