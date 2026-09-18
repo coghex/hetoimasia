@@ -34,3 +34,5 @@ config/*.local.yaml
 /request.txt
 /reuse.out
 /receipts/
+/cabal.project.vulkan.local
+/dist-vulkan-proof/

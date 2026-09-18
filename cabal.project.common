@@ -24,3 +24,6 @@ package hetoimasia-test-support
 
 package hetoimasia-glfw
   ghc-options: -Werror -j
+
+package hetoimasia-vulkan-proof
+  ghc-options: -Werror -j

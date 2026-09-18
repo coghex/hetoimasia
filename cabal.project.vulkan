@@ -1,0 +1,26 @@
+-- The VK-2 proof harness's own project, and the only one that names it.
+--
+-- `cabal.project` and `cabal.project.cpu` deliberately do not list
+-- `tools/vulkan-proof`, so neither resolves nor links the Vulkan binding and
+-- neither `cabal build all` nor `cabal build all --project-file
+-- cabal.project.cpu` needs a loader on the unchanged CI image. Every mandatory
+-- validation group runs through one of those two, so the floor never builds
+-- this. Selecting it is an explicit act:
+--
+--   bash tools/vulkan-proof/run-proof.sh
+--
+-- which is also what supplies the platform's loader prefix. See
+-- docs/vulkan_compatibility_record.md.
+import: cabal.project.common
+
+packages:
+  tools/vulkan-proof
+
+-- The flags docs/toolchain.md qualified, restated here because a constraint is
+-- what actually reaches the dependency: `safe-foreign-calls` so a Vulkan call
+-- may re-enter the Haskell debug-utils callback, and `darwin-lib-dirs` off so
+-- the loader is the one this repository names rather than whatever sits in
+-- /usr/local/lib. `run-proof.sh` checks these against tools/toolchain/binding.pin.
+constraints:
+    vulkan +safe-foreign-calls,
+    vulkan -darwin-lib-dirs

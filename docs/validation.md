@@ -1115,6 +1115,20 @@ cannot publish.
 | `descriptor` | Writes the descriptor for the hit or the published image, as the `ci-image-descriptor` artifact and in the job summary. |
 | `anonymous-pull` | Pulls the reference by digest with no credentials and no token grant, and records how long the pull took. |
 
+`ci-image.yml` also carries one job that has nothing to do with publishing an
+image. Dispatching it with `route: vulkan-proof` skips every job above and runs
+the VK-2 native Vulkan compatibility proof instead, inside the throwaway
+container `tools/vulkan-proof/Dockerfile.linux-proof` and on the isolated X11
+display `tools/display/x11.sh` starts. It holds no package grant, publishes
+nothing, and writes no descriptor; it uploads the record as the
+`vulkan-compatibility-linux` artifact and repeats it in the job summary. It is
+lodged here rather than in a workflow of its own because GitHub offers
+`workflow_dispatch` only for a workflow already on the default branch, so a new
+workflow cannot supply pre-merge evidence for the pull request introducing it;
+dispatch a candidate branch with `--ref`. Nothing about it is required, and the
+CI image gains no Vulkan input from it — that is VK-4's deliberate step. See
+[the compatibility record](vulkan_compatibility_record.md).
+
 A registry error is never a miss, and an existing tag whose metadata does not
 describe the fingerprint is refused rather than overwritten: both fail without
 publishing. The decisions live in `builder.py`; the GHCR and Docker transport

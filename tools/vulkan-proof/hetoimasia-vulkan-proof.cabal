@@ -1,0 +1,74 @@
+cabal-version: 3.16
+name: hetoimasia-vulkan-proof
+version: 0.1.0.0
+synopsis: The VK-2 native Vulkan compatibility and completion proof harness
+description:
+    A narrow, reproducible qualification harness for issue #158, and nothing
+    else. It queries and enables the runtime profile the Vulkan backend design
+    requires, demonstrates presentation completion through present fences and
+    safe abandonment through the selected swapchain-maintenance extension,
+    verifies that GLFW and the Haskell binding dispatch through one loader
+    image, and exercises Haskell debug-messenger reentry across creation,
+    submission, and destruction. It exports no library, adds no production
+    component, and is selected only by the root `cabal.project.vulkan` project
+    file, so neither `cabal.project` nor `cabal.project.cpu` resolves or links
+    the Vulkan binding.
+    .
+    VK-5 through VK-7 attach their own focused native cases here until VK-8
+    migrates them into the package-native fixture. Nothing here is a public
+    API, and the interop shim is deliberately throwaway.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+extra-source-files:
+    cbits/hetoimasia_vulkan_proof.h
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: tools/vulkan-proof
+
+-- The proof is a test suite, never a library: nothing in this repository may
+-- come to depend on it. `cabal.project.vulkan` is the only project file that
+-- names this package, and it enables tests for it alone.
+test-suite vulkan-proof
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: proof
+    default-language: GHC2024
+    -- PatternSynonyms is the binding's own idiom: its extension names, flag
+    -- bits, and version constants are all bidirectional pattern synonyms.
+    default-extensions: UnicodeSyntax OverloadedStrings PatternSynonyms
+    ghc-options:
+        -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+        -threaded -rtsopts
+    other-modules:
+        Test.Vulkan.Proof.Consent
+        Test.Vulkan.Proof.Findings
+        Test.Vulkan.Proof.Interop
+        Test.Vulkan.Proof.Journal
+        Test.Vulkan.Proof.Matrix
+        Test.Vulkan.Proof.Record
+        Test.Vulkan.Proof.Run
+        Test.Vulkan.Proof.Spec
+    c-sources: cbits/hetoimasia_vulkan_proof.c
+    include-dirs: cbits
+    -- The private GLFW prefix `tools/native/native.py` builds, exactly as the
+    -- engine's own native library finds it. The proof adds no second GLFW.
+    pkgconfig-depends: glfw3 >=3.4 && <3.5
+    if os(darwin)
+        frameworks: Cocoa IOKit CoreFoundation
+    if os(linux)
+        extra-libraries: rt m dl
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        hspec >=2.11 && <3,
+        text >=2.1 && <2.2,
+        vector >=0.13 && <0.14,
+        vulkan >=3.27 && <3.28
