@@ -225,18 +225,22 @@ archive *offered*, though, not what was actually taken, so the resolved package
 set is recorded at `/opt/packages.txt`, travels with the qualification bundle,
 and its SHA-256 is part of the platform identity the run reports.
 
-Two deliberate exceptions, both because the alternative is not possible rather
-than not convenient:
+Not even the trust material comes from a mutable archive. The snapshot host
+redirects to HTTPS and the pinned base image ships no CA bundle, so reaching it
+at all needs `ca-certificates` — and taking that from the default archive would
+pull whatever `openssl` is current that day, which is the drift the snapshot
+exists to prevent. Apt does not rely on TLS for integrity: it verifies each
+archive's `InRelease` GPG signature against the Ubuntu keyring the pinned base
+image already carries. So the recipe disables peer verification for the snapshot
+host alone, long enough to install that snapshot's own `ca-certificates`, then
+removes the exemption; every later fetch is both signature-verified and
+TLS-verified. A tampered archive is refused either way.
 
-- `ca-certificates` comes from the base image's own archive, because
-  `snapshot.ubuntu.com` redirects to HTTPS and the pinned base image ships no CA
-  bundle — without it the snapshot cannot be reached at all. It cannot move the
-  loader or the toolchain support set, and `packages.txt` records the version
-  that was installed.
-- GHC's HTML documentation is dropped before installing. Nothing in the
-  container reads it, and on an emulated x86_64 host installing those files
-  dominates the build badly enough to make re-running this qualification
-  impractical. It changes no compiler, library, or link behaviour.
+One deliberate difference from the CI image: GHC's HTML documentation is dropped
+before installing. Nothing in the container reads it, and on an emulated x86_64
+host installing those files dominates the build badly enough to make re-running
+this qualification impractical. It changes no compiler, library, or link
+behaviour.
 
 `HETOIMASIA_QUALIFICATION_OUT=<dir>` exports the whole throwaway consumer to
 that directory — the project, the package description, the source module they

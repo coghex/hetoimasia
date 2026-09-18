@@ -41,18 +41,20 @@ ENV HETOIMASIA_QUALIFICATION_REVISION=${SOURCE_REVISION} \
 # loader and headers the binding's `pkgconfig-depends: vulkan` needs on Linux.
 # The loader package is what makes this a Vulkan container rather than the CI
 # image, and is exactly what must not be added there.
+# Nothing here comes from a mutable archive, including the trust material.
+#
 # `snapshot.ubuntu.com` redirects to HTTPS and this base image ships no CA
-# bundle, so `ca-certificates` has to come from the image's own archive before
-# the pinned snapshot is reachable at all. That single package is the only thing
-# not taken from the snapshot, it cannot change the loader or the toolchain
-# support set, and `/opt/packages.txt` records the exact version that was
-# installed — so what this container qualified against is still recorded
-# exactly.
-RUN set -eux; \
-    apt-get update; \
-    apt-get install --yes --no-install-recommends ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
-
+# bundle, so the obvious move is to install `ca-certificates` from the default
+# archive first — but that archive is exactly what the snapshot exists to avoid,
+# and it would drag in whatever `openssl` happens to be current.
+#
+# Apt does not depend on TLS for integrity: it verifies each archive's
+# `InRelease` GPG signature against the Ubuntu keyring this pinned base image
+# already carries, and refuses the archive if that fails. So peer verification
+# is disabled for the snapshot host alone, just long enough to install that
+# snapshot's own `ca-certificates`, and then removed — every later fetch is both
+# signature-verified and TLS-verified. A tampered archive is rejected either
+# way; what the exemption costs is transport privacy, not authenticity.
 RUN set -eux; \
     printf 'deb https://snapshot.ubuntu.com/ubuntu/%s noble main universe\n\
 deb https://snapshot.ubuntu.com/ubuntu/%s noble-updates main universe\n\
@@ -60,9 +62,14 @@ deb https://snapshot.ubuntu.com/ubuntu/%s noble-security main universe\n' \
       "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" \
       > /etc/apt/sources.list.d/ubuntu.sources.list; \
     rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    printf 'Acquire::https::snapshot.ubuntu.com::Verify-Peer "false";\n' \
+      > /etc/apt/apt.conf.d/99snapshot-bootstrap; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends ca-certificates; \
+    rm -f /etc/apt/apt.conf.d/99snapshot-bootstrap; \
     apt-get update \
  && apt-get install --yes --no-install-recommends \
-      binutils build-essential ca-certificates curl git pkg-config python3 xz-utils \
+      binutils build-essential curl git pkg-config python3 xz-utils \
       libffi-dev libgmp-dev libncurses-dev libnuma-dev zlib1g-dev \
       libvulkan-dev libvulkan1 \
  && rm -rf /var/lib/apt/lists/* \
