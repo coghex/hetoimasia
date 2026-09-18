@@ -192,10 +192,17 @@ fi
 # What the solver actually chose, read back from the plan rather than from the
 # pin, so a resolution that quietly drifted from the pinned pair is reported as
 # the failure it is.
-python3 - "$scratch" "$VULKAN_VERSION" "$VULKAN_UTILS_VERSION" <<'PY'
+python3 - "$scratch" "$VULKAN_VERSION" "$VULKAN_UTILS_VERSION" \
+  "$VULKAN_FLAG_SAFE_FOREIGN_CALLS" "$VULKAN_FLAG_DARWIN_LIB_DIRS" <<'PY'
 import json, sys, pathlib
 
 scratch, expected_vulkan, expected_utils = sys.argv[1], sys.argv[2], sys.argv[3]
+# The pin is the single source of truth for the flags too, so flipping one there
+# moves both what is asked for and what is checked.
+expected_flags = {
+    "safe-foreign-calls": sys.argv[4] == "on",
+    "darwin-lib-dirs": sys.argv[5] == "on",
+}
 plan = json.loads(pathlib.Path(scratch, "dist-newstyle", "cache", "plan.json").read_text())
 
 chosen = {}
@@ -215,7 +222,7 @@ for name, expected in (("vulkan", expected_vulkan), ("vulkan-utils", expected_ut
         problems.append(f"{name} resolved to {chosen[name]}, but the pin names {expected}")
 
 effective = flags.get("vulkan", {})
-for flag, wanted in (("safe-foreign-calls", True), ("darwin-lib-dirs", False)):
+for flag, wanted in sorted(expected_flags.items()):
     if effective.get(flag) != wanted:
         problems.append(f"vulkan flag {flag} resolved to {effective.get(flag)}, not {wanted}")
 
