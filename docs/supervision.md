@@ -450,8 +450,9 @@ build's package database with the external-client harness from
 `Test.Support.ExternalClient` in `hetoimasia-test-support`, exposing only `base`, `text`, `stm`,
 `hetoimasia-foundation`, and `hetoimasia-runtime`. A client that replaces the
 raw worker through record update must be rejected with `Not in scope: record
-field`, and one that names the constructor with `does not export any children`;
-an environment failure such as a missing package never counts as either. A
+field`, and one that names the constructor with `GHC-10237`, the diagnostic code
+for an import naming a child its module does not export; an environment failure
+such as a missing package never counts as either. A
 third client must compile, link, and run, reading a job's result through
 `supervisedWorker` and raw completion, stopping one service and cancelling
 another, and reporting `completed`, `stopped`, and `stopped`. The inbox
