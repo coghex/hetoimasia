@@ -25,6 +25,7 @@ build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
 extra-source-files:
+    bridge/cbits/hetoimasia_lua_publish.h
     hazard/cbits/hetoimasia_lua_probe.h
 
 source-repository head
@@ -46,6 +47,10 @@ library bridge
     import: language
     visibility: private
     hs-source-dirs: bridge
+    -- Publication has to happen inside a protected Lua call; see the header.
+    c-sources: bridge/cbits/hetoimasia_lua_publish.c
+    include-dirs: bridge/cbits
+    install-includes: hetoimasia_lua_publish.h
     exposed-modules:
         Hetoimasia.Scripting.Lua.Internal.Call
         Hetoimasia.Scripting.Lua.Internal.Callback
@@ -87,7 +92,7 @@ executable lua-hazard
     -- Lua's own count hook, which is the only vantage point inside a pure-Lua
     -- interval; see the header for why the question needs one.
     c-sources: hazard/cbits/hetoimasia_lua_probe.c
-    include-dirs: hazard/cbits
+    include-dirs: hazard/cbits bridge/cbits
     includes: hetoimasia_lua_probe.h
     -- -N2 rather than -N: the hazard needs one capability for the thread that
     -- is inside Lua and one for the thread that observes it, on every machine

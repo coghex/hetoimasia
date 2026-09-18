@@ -106,12 +106,14 @@ disables; under that setting the flagged ones are `safe`.
 | `hslua_error` | `safe`, by the flag | the trampoline's stand-in error |
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
+| `hetoimasia_lua_publish` (this package's C) | `safe` | publishing a callback, under protection |
 | `hsluaL_newstate`, `hsluaL_requiref` | `unsafe`, fixed | constructing a VM and opening a library |
 | `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata` | `unsafe`, fixed | stack bookkeeping, rendering, and the escape marker |
 
-`lua_pushlstring` appears nowhere in the bridge, for the reason in *Allocation*
-below; `lua_newuserdatauv` appears only inside `hslua_pushhsfunction`, which is
-the binding's, and is accounted for there.
+`lua_pushlstring` and `lua_newuserdatauv` appear only inside
+`hetoimasia_lua_publish`, where they run under a protected call; the binding's
+own `hslua_pushhsfunction` and `hslua_setglobal`, which would reach them
+unprotected, are not used. See *Allocation* below.
 
 The `safe` calls are what let other Haskell work and other VMs progress while
 one VM is running a chunk: a `safe` call releases the capability for its
@@ -167,23 +169,29 @@ it converts nothing; a number is read with the non-allocating accessors and
 formatted in Haskell. `Test.Lua.Faults` pins that — a numeric error value
 renders in Haskell's formatting, not Lua's, which is the observable difference.
 
-**`installCallback` is not clean, and this slice cannot make it so.** It reaches
-`lua_newuserdatauv` through `hslua_pushhsfunction`, and `hslua_setglobal` pushes
-its key with `lua_pushlstring` before its own internal `lua_pcall`. Both
-allocate outside protection, so a VM built under memory exhaustion aborts the
-process instead of reporting. Putting them behind a C-side protected call is not
-available from here: the binding installs only Lua's own four headers, so a shim
-of ours cannot call `hslua_newhsfunction` or name the `hslua_call_hs` closure,
-and building our own equivalents means owning the callback protocol and its
-metatable — a private binding, which this slice's scope excludes. The binding
-also exports no `lua_newstate`, so an allocator that fails on demand cannot be
-installed and the path cannot be tested from here either.
+**Publishing a callback allocates twice**, and used to do it in this second
+position: `hslua_pushhsfunction` reaches `lua_newuserdatauv`, and the binding's
+`hslua_setglobal` pushes its key with `lua_pushlstring` *before* entering its
+own protected call. Both now happen inside one `lua_pcall`, in this package's
+own `bridge/cbits/hetoimasia_lua_publish.c`, which calls the binding's
+`hslua_newhsfunction` from there. Nothing that could allocate crosses into that
+call: the stable pointer and the name go in as light userdata and an integer,
+and `lua_checkstack` reports its own failure rather than raising it. Memory
+exhaustion while publishing is therefore a status, and the bridge reports it as
+a fault.
 
-**This is an owner decision, recorded rather than worked around.** The choices
-are to accept it — a process that dies on memory exhaustion during VM setup,
-which is where most embedders leave it — or to take over the callback
-publication path in this package's own C, which is a design change to the
-boundary and belongs to the owner, not to this slice.
+`lua-hazard allocation-failure` proves it, because the binding exports no
+`lua_newstate` and an allocator that fails on demand cannot be installed from
+Haskell: the hazard runner builds one in C, starves it, and reports the status
+that came back. A starved publication answers `LUA_ERRMEM`; a generous one
+answers `LUA_OK`. Without the protection there would be no line to read, because
+the process would be gone.
+
+One allocation is left, on a path that has already failed: if the publication
+fails after the userdata exists, its stable pointer is leaked rather than freed,
+because the userdata's `__gc` owns it from that moment and freeing it here would
+be a double free. A leaked stable pointer when memory has run out is the right
+way round.
 
 ### How callbacks re-enter
 
@@ -267,8 +275,14 @@ Rejected:
   to catch it.
 - **Any allocating Lua operation from inside a callback.** A raise there unwinds
   out of a Haskell frame to the protected call outside it.
-- **Reporting memory exhaustion during VM setup.** See *Allocation* above; it is
-  a process abort, and an open decision.
+- **Cancelling a callback's own thread from outside it.** A cancellation
+  delivered inside the callback's action is caught and contained, and
+  `lua-hazard callback-cancellation` proves that fifty times over. One
+  delivered after the action, while the binding's own export stub is finishing,
+  is not: that code is not this bridge's and cannot be masked by it, and an
+  uncaught exception there ends the process. Nothing here hands out a callback
+  thread's identity, which is what makes it unreachable; LUA-3's registration
+  surface must not start.
 
 ### Process-global state and thread affinity
 

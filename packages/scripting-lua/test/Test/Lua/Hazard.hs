@@ -72,11 +72,25 @@ spec = describe "hazard" $ do
       status `shouldBe` ExitSuccess
       grew reported
 
-  it "survives callback threads cancelled repeatedly while Lua is calling them" $
+  it "contains a cancellation delivered inside a callback, fifty times over" $
     withHazard ["callback-cancellation"] EndsItself $ \reported status → do
       reported `shouldContain` "HAZARD callbacks-survived"
+      -- Delivered, not merely sent: the callback parks interruptibly, and the
+      -- count is of cancellations that reached the boundary as themselves.
+      reported `shouldContain` "attempts=50"
+      reported `shouldContain` "delivered=50"
+      reported `shouldContain` "usable=yes"
       -- The failure this guards against is a process that is no longer there
       -- to report anything, so the exit status carries as much as the line.
+      status `shouldBe` ExitSuccess
+
+  it "reports memory exhaustion while publishing a callback instead of dying of it" $
+    withHazard ["allocation-failure"] EndsItself $ \reported status → do
+      -- 4 is LUA_ERRMEM and 0 is LUA_OK. A starved allocator answers the first
+      -- because the whole publication runs inside a protected call; without
+      -- that, the raise would find no frame and end this process, and there
+      -- would be no line to read at all.
+      reported `shouldContain` "HAZARD allocation-reported starved=4 generous=0"
       status `shouldBe` ExitSuccess
 
 -- | Assert that the counter grew between the hook's two samples.

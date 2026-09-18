@@ -25,20 +25,21 @@ import Control.Concurrent
   , throwTo
   , yield
   )
-import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
   , SomeException
+  , fromException
   , try
   )
 import Control.Monad (forever, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Foreign.C (CInt (CInt), CLong)
-import Foreign.Marshal.Alloc (alloca, free, malloc)
+import Foreign.C (CInt (CInt), CLong (CLong), CSize (CSize))
+import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
-import Foreign.Storable (peek, poke)
+import Foreign.StablePtr (StablePtr, freeStablePtr, newStablePtr)
+import Foreign.Storable (peek)
 import Hetoimasia.Scripting.Lua.Bridge
   ( Library (LibraryBase)
   , chunkName
@@ -51,7 +52,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmState)
-import Lua (State (State))
+import Lua (NumResults (NumResults), PreCFunction, State (State))
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitWith)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -82,10 +83,14 @@ main = do
     ["uninterruptible-lua"] → uninterruptibleLua 1
     ["capability-release"] → capabilityRelease
     ["callback-cancellation"] → callbackCancellation
+    ["allocation-failure"] → allocationFailure
     _ → do
       hPutStrLn
         stderr
-        "usage: lua-hazard uninterruptible-lua|capability-release|callback-cancellation"
+        ( "usage: lua-hazard "
+            <> "uninterruptible-lua|capability-release|callback-cancellation"
+            <> "|allocation-failure"
+        )
       exitWith (ExitFailure 2)
 
 -- | Run a chunk that never returns, cancel the thread running it, and report
@@ -157,16 +162,13 @@ capabilityRelease = do
   started ← newEmptyMVar
   finished ← newEmptyMVar
   stop ← newIORef False
-  -- Plain memory, not an IORef: the sampling hook is C and reads it directly.
-  counter ← malloc
-  poke counter (0 ∷ CLong)
   installCallback vm "started" (putMVar started () >> pure NoResult) (pure ())
   installCallback
     vm
     "keep_going"
     (BooleanResult . not <$> readIORef stop)
     (pure ())
-  hetoimasia_lua_arm_probe (vmState vm) counter probeInstructions
+  hetoimasia_lua_arm_probe (vmState vm) probeInstructions
   _ ← forkIO $ do
     outcome ←
       try @SomeException
@@ -188,8 +190,9 @@ capabilityRelease = do
         if taken >= 2
           then pure ()
           else do
-            value ← peek counter
-            poke counter (value + 1)
+            -- An atomic increment in the probe's own C, because the thread Lua
+            -- runs on reads it.
+            _ ← hetoimasia_lua_probe_advance
             yield
             count
   counted ← timeout boundMicroseconds count
@@ -197,7 +200,6 @@ capabilityRelease = do
   outcome ← timeout boundMicroseconds (takeMVar finished)
   (taken, first, second) ← readSamples
   closeVm vm
-  free counter
   case (counted, outcome) of
     (Just (), Just (Right ()))
       | taken >= 2 →
@@ -222,48 +224,94 @@ capabilityRelease = do
         taken ← hetoimasia_lua_probe_samples first second
         (,,) (fromIntegral taken ∷ Int) <$> peek first <*> peek second
 
--- | Cancel callback threads repeatedly while Lua is calling them.
+-- | Cancel callback threads while Lua is calling them, over and over.
 --
 -- The trampoline runs the callback's own action unmasked, so a cancellation
--- aimed there is delivered and caught. Everything after it is masked, because
--- the frame this returns through is C: an exception unwinding out of it is
--- undefined, not an error report, and the failure it would produce is a crashed
--- process rather than a failed example. So it is provoked here, where a crash
--- is the suite's evidence rather than its own death.
+-- aimed there is delivered and caught; everything after the action is masked,
+-- because the frame it returns through is C and an exception unwinding out of
+-- one is undefined rather than an error report. That containment is what this
+-- provokes, fifty times, in a process whose death would be the suite's evidence
+-- rather than its own.
 --
--- Each call publishes its thread and is then cancelled several times over, so
--- both windows are covered: inside the action, and after it while the
--- trampoline is finishing.
+-- The cancellation is coordinated, not hoped for: the callback publishes its
+-- thread and parks interruptibly, so the exception is delivered inside the
+-- action and the count of deliveries is checked, not assumed.
 callbackCancellation ∷ IO ()
 callbackCancellation = do
   vm ← newVm [LibraryBase]
-  targets ← newChan
-  calls ← newIORef (0 ∷ Int)
+  live ← newEmptyMVar
+  delivered ← newIORef (0 ∷ Int)
+  let attempt = do
+        outcome ← newEmptyMVar
+        _ ←
+          forkIO
+            ( try @SomeException (evalChunk vm (chunkName "emit") "emit()")
+                >>= putMVar outcome
+            )
+        -- The callback has published its thread and is parked in its own
+        -- action: a cancellation aimed here is delivered, not merely sent.
+        target ← takeMVar live
+        -- One, and deliberately one. It reaches the action, where the
+        -- trampoline can catch it, and the trampoline's own epilogue runs
+        -- masked from there. What a second one would reach is the binding's
+        -- export stub, after this bridge's code has returned and before the
+        -- callback thread ends -- a stretch the bridge does not own and cannot
+        -- mask, where an uncaught exception ends the process. That is a
+        -- rejected path, recorded in the package contract, and it is reachable
+        -- only by something holding a callback thread's identity, which
+        -- nothing here hands out.
+        _ ← forkIO (throwTo target ThreadKilled)
+        result ← timeout boundMicroseconds (takeMVar outcome)
+        case result of
+          Just (Left thrown)
+            | Just ThreadKilled ← fromException thrown →
+                atomicModifyIORef' delivered (\value → (value + 1, ()))
+          _ → pure ()
   installCallback
     vm
     "emit"
     ( do
         target ← myThreadId
-        atomicModifyIORef' calls (\value → (value + 1, ()))
-        writeChan targets target
+        putMVar live target
+        -- Parked interruptibly, so the cancellation lands inside the action.
+        threadDelay maxBound
         pure NoResult
     )
     (pure ())
-  _ ← forkIO . forever $ do
-    target ← readChan targets
-    -- Each throw on a thread of its own: throwTo waits for delivery, and the
-    -- masked stretch is exactly what it may have to wait for.
-    mapM_ (\_ → forkIO (throwTo target ThreadKilled)) [1 .. 3 ∷ Int]
-  outcome ←
-    try @SomeException
-      (evalChunk vm (chunkName "callbacks") "for index = 1, 500 do emit() end")
-  made ← readIORef calls
+  mapM_ (const attempt) [1 .. attempts]
+  landed ← readIORef delivered
+  -- Every one of those was contained, so the VM is still a VM.
+  usable ← try @SomeException (evalChunk vm (chunkName "after") "local ignored = 1")
   closeVm vm
   putStrLn
-    ( "HAZARD callbacks-survived calls="
-        <> show made
-        <> " outcome="
-        <> either (const "cancelled") (const "completed") outcome
+    ( "HAZARD callbacks-survived attempts="
+        <> show attempts
+        <> " delivered="
+        <> show landed
+        <> " usable="
+        <> either (const "no") (const "yes") usable
+    )
+  where
+    attempts = 50 ∷ Int
+
+-- | Ask the publication path what it does when Lua cannot allocate.
+--
+-- Publishing allocates twice, and an allocation failure in Lua is a Lua error.
+-- Raised from a call Haskell made directly it would find no protected frame and
+-- end the process, which is why the bridge puts the whole publication inside
+-- one. This starves a state's allocator and reports the status that came back:
+-- a status at all, rather than this process's death, is the evidence.
+allocationFailure ∷ IO ()
+allocationFailure = do
+  carried ← newStablePtr (\_ → pure (NumResults 0))
+  starved ← hetoimasia_lua_publish_under_budget carried 0
+  generous ← hetoimasia_lua_publish_under_budget carried 4096
+  freeStablePtr carried
+  putStrLn
+    ( "HAZARD allocation-reported starved="
+        <> show (fromIntegral starved ∷ Int)
+        <> " generous="
+        <> show (fromIntegral generous ∷ Int)
     )
 
 -- | How many Lua instructions separate the hook's samples.
@@ -273,9 +321,20 @@ callbackCancellation = do
 probeInstructions ∷ CInt
 probeInstructions = 200000
 
--- | Arm Lua's count hook to sample a counter from inside the instruction loop.
+-- | Arm Lua's count hook to sample the probe's counter from inside the
+-- instruction loop.
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_arm_probe"
-  hetoimasia_lua_arm_probe ∷ State → Ptr CLong → CInt → IO ()
+  hetoimasia_lua_arm_probe ∷ State → CInt → IO ()
+
+-- | Advance the probe's counter, atomically.
+foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_advance"
+  hetoimasia_lua_probe_advance ∷ IO CLong
+
+-- | Publish a callback into a state whose allocator fails after a budget.
+--
+-- @safe@ for the same reason publication itself is: it can run Lua.
+foreign import ccall safe "hetoimasia_lua_probe.h hetoimasia_lua_publish_under_budget"
+  hetoimasia_lua_publish_under_budget ∷ StablePtr PreCFunction → CSize → IO CInt
 
 -- | The hook's first two samples, and how many it took.
 foreign import ccall unsafe "hetoimasia_lua_probe.h hetoimasia_lua_probe_samples"

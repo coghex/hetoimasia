@@ -39,10 +39,9 @@ import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithCont
 import qualified Data.ByteString.Unsafe as ByteString
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
-import Foreign.C (CSize)
-import Foreign.Marshal.Alloc (alloca)
+import Foreign.C (CChar, CInt (CInt), CSize (CSize))
 import Foreign.Ptr (Ptr, nullPtr)
-import Foreign.Storable (peek, poke)
+import Foreign.StablePtr (StablePtr, newStablePtr)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Call (classify, reportFault)
@@ -57,9 +56,9 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
 import Lua
   ( NumResults (NumResults)
   , PreCFunction
+  , State (State)
+  , StatusCode (StatusCode)
   , hslua_error
-  , hslua_pushhsfunction
-  , hslua_setglobal
   , lua_gettop
   , lua_pushboolean
   , lua_pushlightuserdata
@@ -68,6 +67,15 @@ import Lua
   , data LUA_OK
   , data TRUE
   )
+
+-- | Publish a Haskell function as a global, with every allocation the two of
+-- them need inside one protected Lua call.
+--
+-- @safe@: setting a global honours @__newindex@, which can run Lua, which can
+-- call back into Haskell.
+foreign import ccall safe "hetoimasia_lua_publish.h hetoimasia_lua_publish"
+  hetoimasia_lua_publish
+    ∷ State → StablePtr PreCFunction → Ptr CChar → CSize → IO StatusCode
 
 -- | What a bridge callback answers Lua with.
 --
@@ -105,13 +113,13 @@ installCallback vm name action release =
     withOpenVm vm installOperation $ \state → do
       entry ← lua_gettop state
       retainRelease vm release
-      hslua_pushhsfunction state (trampoline vm action)
+      -- Both allocations publication needs -- the userdata that carries the
+      -- function and the string that names it -- happen inside one protected
+      -- call, so memory exhaustion here is a status rather than a panic.
       status ←
-        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
-          alloca $ \reported → do
-            poke reported LUA_OK
-            hslua_setglobal state bytes (fromIntegral len ∷ CSize) reported
-            peek reported
+        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) → do
+          carried ← newStablePtr (trampoline vm action)
+          hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize)
       if status /= LUA_OK
         then reportFault vm state entry installOperation (classify status) name
         else do
