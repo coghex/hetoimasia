@@ -84,9 +84,47 @@ module Hetoimasia.Runtime.GLFW.Internal
   , hostAttachmentView
   , reportHostRetirementFact
   , AttachmentProtocol (..)
+  , CompletionPolicy (..)
   , RetirementProgress (..)
   , AttachmentOutcome (..)
   , RolledBack (..)
+
+    -- * The public attachment contract
+  , AttachmentId
+  , attachmentWindow
+  , attachmentIncarnation
+  , Acknowledgement
+  , acknowledgedAttachment
+  , GraphicsRefusal (..)
+  , RetirementFact (..)
+  , allRetirementFacts
+  , RollbackOutcome (..)
+  , FactAnswer (..)
+  , CompletionNotice
+  , completionNotice
+  , NoticeAdmission (..)
+  , CompletionPublisher
+  , CompletionPublication (..)
+  , publishCompletion
+  , GraphicsService
+  , graphicsWindow
+  , graphicsAttachment
+  , graphicsIncarnation
+  , readGraphicsService
+  , GraphicsObservation (..)
+  , SlotState (..)
+  , NativeDisposal (..)
+  , WindowGraphics (..)
+  , GraphicsAttachment (..)
+  , attachWindowGraphics
+  , detachWindowGraphics
+  , DetachAnswer (..)
+  , windowGraphicsStatus
+  , hostGraphicsPublisher
+  , certifyGraphicsFact
+  , RetirementDemand (..)
+  , noRetirementDemand
+  , hostRetirementDemand
 
     -- * Applications
   , runWindowApplication
@@ -226,34 +264,69 @@ import Hetoimasia.GLFW.Internal.Session
 import Hetoimasia.GLFW.Internal.Attachment
   ( Acknowledgement
   , AttachmentId
+  , AttachmentPhase (..)
+  , AttachmentRefusal
   , AttachmentView
-  , FactAnswer
+  , CompletionNotice
+  , FactAnswer (..)
   , HostIdentity
-  , RetirementFact
+  , NoticeAdmission (..)
+  , RetirementFact (..)
+  , RollbackOutcome (..)
   , acknowledgedAttachment
+  , activeAttachment
+  , allRetirementFacts
+  , attachmentIncarnation
   , attachmentWindow
+  , completionNotice
+  )
+import qualified Hetoimasia.GLFW.Internal.Attachment as Model
+import Hetoimasia.Runtime.GLFW.Internal.Graphics
+  ( GraphicsCell
+  , GraphicsObservation (..)
+  , GraphicsService
+  , NativeDisposal (..)
+  , SlotState (..)
+  , WindowGraphics (..)
+  , graphicsAttachment
+  , graphicsIncarnation
+  , graphicsWindow
+  , newGraphicsCell
+  , readGraphicsCell
+  , readGraphicsService
+  , serviceFor
+  , writeGraphicsDisposal
+  , writeGraphicsSlot
   )
 import Hetoimasia.Runtime.GLFW.Internal.Retirement
   ( AttachmentOutcome (..)
   , AttachmentProtocol (..)
+  , CompletionPolicy (..)
+  , CompletionPublication (..)
   , CompletionPublisher
+  , DetachAnswer (..)
   , DrainOutcome (..)
+  , ProgressRound (..)
   , RolledBack (..)
   , HostRetirement
   , RetirementEnvironment (..)
   , RetirementProgress (..)
+  , advanceRetirements
   , attachRetirement
   , attachmentViewOf
   , certifyRetirementFact
   , closeAttachmentAdmission
   , completionPublisher
+  , detachAttachment
   , drainRetirement
   , forgetRetiredWindow
   , newHostRetirement
   , pendingAttachments
+  , publishCompletion
   , recordClosingWindow
   , recordRegisteredWindow
   , retirementIdentity
+  , windowAttachmentState
   , windowRetirementVeto
   )
 import Hetoimasia.GLFW.Internal.Window
@@ -312,6 +385,13 @@ data HostConfig = HostConfig
     -- ^ The most commands one turn attempts, across every port. At least one.
   , hostEventBudget ∷ !Int
     -- ^ The most application events one turn dispatches. At least one.
+  , hostRetirementBudget ∷ !Int
+    -- ^ The most attachment retirement opportunities one turn offers, across
+    -- every window with a pending retirement. At least one. Pending retirements
+    -- are served in rotating order, so one window's stalled or slow retirement
+    -- can never starve another's, and work the budget could not reach keeps the
+    -- next turn immediate rather than waiting. An ordinary host holds no
+    -- attachment, so nothing spends it.
   , hostIdleWait ∷ !Double
     -- ^ The most seconds an idle turn waits for a native event, and the
     -- scheduled path's fallback bound. Finite, above zero, at most
@@ -341,13 +421,16 @@ instance Show HostConfig where
       <> show (hostCommandBudget config)
       <> ", hostEventBudget = "
       <> show (hostEventBudget config)
+      <> ", hostRetirementBudget = "
+      <> show (hostRetirementBudget config)
       <> ", hostIdleWait = "
       <> show (hostIdleWait config)
       <> ", hostClock = <injected>}"
 
 -- | The platform's own session, the given windows, a limit of 16 live windows,
--- a command capacity of 64, an input capacity of 256, budgets of 16, a
--- 0.1-second idle wait, and the process's monotonic clock.
+-- a command capacity of 64, an input capacity of 256, command and event budgets
+-- of 16, a retirement budget of 4, a 0.1-second idle wait, and the process's
+-- monotonic clock.
 defaultHostConfig ∷ [WindowConfig] → HostConfig
 defaultHostConfig windows =
   HostConfig
@@ -358,6 +441,7 @@ defaultHostConfig windows =
     , hostInputCapacity = 256
     , hostCommandBudget = 16
     , hostEventBudget = 16
+    , hostRetirementBudget = 4
     , hostIdleWait = 0.1
     , hostClock = monotonicSource
     }
@@ -366,6 +450,7 @@ defaultHostConfig windows =
 data HostConfigRejected
   = CommandBudgetRejected !Int
   | EventBudgetRejected !Int
+  | RetirementBudgetRejected !Int
   | IdleWaitRejected !Double
   | WindowLimitRejected !Int
     -- ^ The limit is below one, below the number of configured windows, or
@@ -396,6 +481,7 @@ validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
 validateHostConfig config
   | hostCommandBudget config < 1 = Left (CommandBudgetRejected (hostCommandBudget config))
   | hostEventBudget config < 1 = Left (EventBudgetRejected (hostEventBudget config))
+  | hostRetirementBudget config < 1 = Left (RetirementBudgetRejected (hostRetirementBudget config))
   -- Written so a NaN, which fails every comparison, is refused too.
   | not (wait > 0 && wait <= maximumIdleWait) = Left (IdleWaitRejected wait)
   -- A wait of less than a whole nanosecond is no bound the scheduled path could
@@ -440,7 +526,7 @@ waitSeconds duration = fromIntegral (durationNanoseconds duration) / 1e9
 hostComponent ∷ Component
 hostComponent = unsafeComponent "glfw.runtime"
 
-constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation, attachOperation, certifyOperation ∷ Operation
+constructOperation, loopOperation, rejectOperation, borrowOperation, closeOperation, honourOperation, bookkeepingOperation, captureOperation, reportOperation, attachOperation, certifyOperation, detachOperation ∷ Operation
 constructOperation = operation "construct window host"
 loopOperation = operation "run owner loop"
 rejectOperation = operation "reject close request"
@@ -452,6 +538,7 @@ captureOperation = operation "capture demand"
 reportOperation = operation "report wake degradation"
 attachOperation = operation "attach host window"
 certifyOperation = operation "certify retirement fact"
+detachOperation = operation "detach window graphics"
 
 -- ---------------------------------------------------------------------------
 -- Hosts
@@ -480,6 +567,17 @@ data WindowHost = WindowHost
     -- ^ The attachment model and its owner authority, issued only by the
     -- protected lifetime. A host built by 'allocWindowHost' has none, so it can
     -- never be the target of an attachment.
+  , hostRetireCursor ∷ !(IORef (Maybe AttachmentId))
+    -- ^ The attachment the last turn's retirement round served last, which the
+    -- next round rotates after.
+  , hostRetirementDemandState ∷ !(TVar RetirementDemand)
+    -- ^ What the last round of opportunities left owed, which the scheduled
+    -- loop folds into the wait it chooses. Any thread may read it.
+  , hostGraphicsCells ∷ !(TVar (Map WindowId GraphicsCell))
+    -- ^ One observation cell per window that has an attachment the host has not
+    -- yet finished with: never more than one per live window, so repeated
+    -- detaching and reattaching grows nothing the host owns. A retained
+    -- 'GraphicsService' keeps its own cell after the host drops it.
   }
 
 -- | Where the private examples interrupt a host. Production passes
@@ -583,6 +681,9 @@ allocHostOver protection hooks sessionScope config = do
         <*> newTVarIO (HostActivity 0 False)
         <*> pure hooks
         <*> pure retirement
+        <*> newIORef Nothing
+        <*> newTVarIO noRetirementDemand
+        <*> newTVarIO Map.empty
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
   pure host
 
@@ -927,16 +1028,27 @@ retireClosing host target entry = do
     else
       tryWithContext (retireMember (hostCollection host) (entryMember entry)) >>= \case
         Right RetirementInUse → pure ()
-        Right _ → forget
+        Right _ → forget DisposalCompleted
         Left (caught ∷ ExceptionWithContext SomeException) →
           memberStatus (entryMember entry) >>= \case
-            MemberRetirementFailed _ → forget
+            -- The collection latched the failed release as evidence for its own
+            -- exit and will never attempt it again. The window is forgotten
+            -- either way, and the attachment observation says the disposal
+            -- failed rather than claiming a destruction that did not happen.
+            MemberRetirementFailed _ → forget DisposalFailed
             _ → rethrowIO caught
   where
-    forget = do
+    forget disposal = do
       atomically $ do
         modifyTVar' (hostEntries host) (Map.delete target)
         mapM_ (`forgetRetiredWindow` target) (hostRetirementState host)
+        -- The window's last attachment learns how its window ended before the
+        -- host drops the cell; whoever retains the service keeps that answer.
+        cells ← readTVar (hostGraphicsCells host)
+        forM_ (Map.lookup target cells) $ \cell → do
+          writeGraphicsSlot cell SlotFree []
+          writeGraphicsDisposal cell disposal
+        writeTVar (hostGraphicsCells host) (Map.delete target cells)
       modifyIORef' (hostSurfaced host) (Map.delete target)
 
 -- | Whether a protected host's attachment still vetoes this window's native
@@ -950,6 +1062,7 @@ attachmentVetoes host target = case hostRetirementState host of
 -- | Retry the retirement of every closing window, in registration order.
 retirePending ∷ WindowHost → IO ()
 retirePending host = do
+  atomically (refreshGraphicsCells host)
   entries ← readTVarIO (hostEntries host)
   forM_ (Map.toAscList entries) $ \(target, entry) →
     if entryClosing entry then retireClosing host target entry else pure ()
@@ -1166,8 +1279,12 @@ runOwnerLoop host control hooks =
     settings = hostSettings host
     turn number idle = do
       checkRuntime control
-      queued ← atomically (queuedCommands host)
-      let waited = idle && queued == 0
+      (queued, retiring) ← atomically ((,) <$> queuedCommands host <*> hostRetirementDemand host)
+      -- A retirement the last round advanced, or one the budget could not
+      -- reach, is work this turn already has, so the turn polls rather than
+      -- waiting: one window's pending retirement never waits on the idle bound
+      -- and never holds another window's service up.
+      let waited = idle && queued == 0 && not (retirementImmediate retiring)
       processEvents host number (if waited then AwaitEventsFor (hostIdleWait settings) else ProcessPending)
       work ← turnWork host control (loopLogger hooks) (loopEvent hooks)
       step ← loopUpdate hooks (turnSummary number waited work)
@@ -1205,6 +1322,9 @@ turnWork ∷ WindowHost → RuntimeControl → Logger → IO Bool → IO TurnWor
 turnWork host control logger event = do
   reconcileMonitorEvents (hostSession host)
   reconcileWindowModes host
+  -- Before the retirement retry below, so an attachment this turn's own bounded
+  -- round made safe releases its window in the same turn rather than the next.
+  advanceHostRetirements host
   retirePending host
   closes ← surfaceCloseRequests host
   recoverFeeds logger host
@@ -1469,10 +1589,13 @@ scheduleDeadline = \case
 -- | The earlier of the application's own deadline and the captured request's.
 earliestDeadline ∷ UpdateSchedule → Maybe CapturedDemand → Maybe Instant
 earliestDeadline schedule captured =
-  case (scheduleDeadline schedule, demandDeadline . capturedRequest =<< captured) of
-    (Nothing, requested) → requested
-    (own, Nothing) → own
-    (Just own, Just requested) → Just (min own requested)
+  earlierOf (scheduleDeadline schedule) (demandDeadline . capturedRequest =<< captured)
+
+-- | The earlier of two optional deadlines.
+earlierOf ∷ Maybe Instant → Maybe Instant → Maybe Instant
+earlierOf Nothing later = later
+earlierOf earlier Nothing = earlier
+earlierOf (Just earlier) (Just later) = Just (min earlier later)
 
 -- | Choose the turn's native step from the sampled instant, the earliest
 -- deadline, and whether work is ready.
@@ -1518,14 +1641,22 @@ runScheduledOwnerLoop host control hooks =
     turn bound number schedule = do
       checkRuntime control
       inspected ← readInstant (hostClock settings)
-      (captured, queued) ←
-        atomically ((,) <$> captureDemand (hostDemandSlot host) <*> queuedCommands host)
+      (captured, queued, retiring) ←
+        atomically
+          ( (,,)
+              <$> captureDemand (hostDemandSlot host)
+              <*> queuedCommands host
+              <*> hostRetirementDemand host
+          )
       ready ← scheduledReady hooks
       let immediate =
             schedule == UpdateImmediately
               || maybe False (demandIsImmediate . capturedRequest) captured
-          pacing =
-            choosePacing bound inspected (earliestDeadline schedule captured) (queued > 0 || ready || immediate)
+              || retirementImmediate retiring
+          -- A due retirement step shortens the wait exactly as an application
+          -- deadline does, and never lengthens it.
+          deadline = earlierOf (earliestDeadline schedule captured) (retirementNextPossible retiring)
+          pacing = choosePacing bound inspected deadline (queued > 0 || ready || immediate)
       processEvents host number (pacingProcessing pacing)
       -- The instant the update is given, so a deadline the wait itself reached
       -- is due now rather than on the turn after.
@@ -1855,3 +1986,258 @@ reportHostRetirementFact host acknowledgement fact =
           <$> atomically (certifyRetirementFact retirement target acknowledgement fact)
   where
     target = acknowledgedAttachment acknowledgement
+
+-- ---------------------------------------------------------------------------
+-- The public attachment contract
+
+-- | How a request to attach a graphics owner to a window was answered.
+--
+-- Every refusal is answered before any acquisition effect, and nothing usable
+-- is published before construction and registration have both completed.
+data GraphicsAttachment
+  = GraphicsAttached !GraphicsService
+    -- ^ Construction and registration completed and the opaque service was
+    -- published.
+  | GraphicsSuperseded !AttachmentId
+    -- ^ Construction completed after retirement had already begun — the window
+    -- started closing, or the host quiesced, while it ran. The dependents stay
+    -- registered for retirement and nothing usable was published.
+  | GraphicsRolledBack !RolledBack
+    -- ^ Construction failed and its owned rollback settled. A rollback that
+    -- established safety retired the attachment; one that could not keeps the
+    -- window, the exclusive slot, and every dependency it left, with its
+    -- original and cleanup evidence, for the protected boundary's own drain.
+    -- Nothing usable was published either way.
+  | GraphicsRefused !GraphicsRefusal
+    -- ^ The reservation was refused before any acquisition effect.
+  | GraphicsHostUnprotected
+    -- ^ The host was built with the @Scoped@ constructor, so it owns no
+    -- retirement state and was issued no identity an attachment could name.
+    -- Answered before any effect, and before the owner thread is even checked
+    -- against anything the host holds.
+  deriving (Show)
+
+-- | Why a window's exclusive graphics slot was not reserved.
+--
+-- Every one of these is answered before the owner's construction is entered, so
+-- a refusal has acquired nothing, published nothing, and left the window's slot
+-- exactly as it found it.
+data GraphicsRefusal
+  = GraphicsWindowClosing !WindowId
+    -- ^ The window's close protocol has begun, so no new graphics use may
+    -- start on it.
+  | GraphicsWindowUnavailable !WindowId
+    -- ^ This host holds no such open window: it was never this host's, or it
+    -- has already ended.
+  | GraphicsWindowOccupied !AttachmentId
+    -- ^ Another owner holds the window's one exclusive slot, and holds it until
+    -- it has safely retired.
+  | GraphicsForeignSession
+    -- ^ The window belongs to another session.
+  | GraphicsForeignHost
+    -- ^ The window belongs to another host.
+  | GraphicsAdmissionEnded
+    -- ^ Attachment admission has closed — the host has quiesced or is exiting —
+    -- so no new graphics use may begin at all.
+  | GraphicsSlotUnavailable
+    -- ^ The reservation was refused for a reason a reservation is not expected
+    -- to produce. Nothing was acquired and nothing changed.
+  deriving (Eq, Show)
+
+refusalOf ∷ AttachmentRefusal → GraphicsRefusal
+refusalOf = \case
+  Model.WindowIsClosing window → GraphicsWindowClosing window
+  Model.WindowNotRegistered window → GraphicsWindowUnavailable window
+  Model.WindowHasEnded window → GraphicsWindowUnavailable window
+  Model.WindowOccupied occupant → GraphicsWindowOccupied occupant
+  Model.AttachmentMisuse Model.ForeignSession → GraphicsForeignSession
+  Model.AttachmentMisuse Model.ForeignHost → GraphicsForeignHost
+  _ → GraphicsSlotUnavailable
+
+-- | Attach a graphics owner to one open window of a protected host, on the
+-- owner thread.
+--
+-- The owner is the caller's: it supplies the construction of the dependents,
+-- the bounded retirement step, the completion policy those steps are offered
+-- under, and how a failed step is classified. This boundary supplies the
+-- exclusivity, the ordering, and the retirement rule, and it hands back only
+-- the opaque 'GraphicsService': no native pointer, no window, no session, and
+-- no destruction, release, or completion authority.
+--
+-- Refuses other threads with 'Hetoimasia.GLFW.Session.NotSessionOwner', and a
+-- host with no retirement state with 'GraphicsHostUnprotected', each before any
+-- effect.
+attachWindowGraphics
+  ∷ HasCallStack ⇒ WindowHost → WindowId → AttachmentProtocol → IO GraphicsAttachment
+attachWindowGraphics host target protocol =
+  attachHostWindow host target protocol >>= \case
+    AttachmentEstablished active _ → publishService host (activeAttachment active)
+    AttachmentSuperseded identity _ → pure (GraphicsSuperseded identity)
+    AttachmentRolledBack settled → pure (GraphicsRolledBack settled)
+    AttachmentRefused refusal → pure (GraphicsRefused (refusalOf refusal))
+    AttachmentAdmissionClosed → pure (GraphicsRefused GraphicsAdmissionEnded)
+    AttachmentHostUnprotected → pure GraphicsHostUnprotected
+
+-- | Make the established attachment's observation cell and its service, in one
+-- transaction, so the cell a caller is handed already reflects whatever the
+-- attachment's phase had become by the time it was published.
+publishService ∷ WindowHost → AttachmentId → IO GraphicsAttachment
+publishService host identity = atomically $ do
+  cell ← newGraphicsCell (attachmentIncarnation identity) allRetirementFacts
+  modifyTVar' (hostGraphicsCells host) (Map.insert (attachmentWindow identity) cell)
+  refreshGraphicsCells host
+  pure (GraphicsAttached (serviceFor identity cell))
+
+-- | Detach a window's current graphics owner while the window stays open, on
+-- the owner thread.
+--
+-- It begins exactly the retirement a close begins, under the same protocol and
+-- the same owner turns, and the exclusive slot frees only once every retirement
+-- fact is recorded and the owner's dependents are safely disposed. A later
+-- attachment then gets a fresh incarnation, against which this one's
+-- acknowledgement is refused and releases nothing.
+--
+-- Detaching an absent or already retiring owner is a typed no-op answer, not a
+-- failure. Refuses other threads with
+-- 'Hetoimasia.GLFW.Session.NotSessionOwner', and a host with no retirement
+-- state answers 'DetachAbsent'.
+detachWindowGraphics ∷ HasCallStack ⇒ WindowHost → GraphicsService → IO DetachAnswer
+detachWindowGraphics host service =
+  ownerOperation (hostSession host) detachOperation (windowIdentifiers (attachmentWindow target)) $
+    case hostRetirementState host of
+      Nothing → pure DetachAbsent
+      Just retirement → atomically $ do
+        answered ← detachAttachment retirement target
+        refreshGraphicsCells host
+        pure answered
+  where
+    target = graphicsAttachment service
+
+-- | What a window's one exclusive graphics slot holds, read in one transaction
+-- from any thread.
+--
+-- It answers without inference: whether an owner is attached, retiring, or
+-- absent, which incarnation holds the slot, which retirement facts are still
+-- missing, and whether the window's own native destruction has completed. A
+-- close ticket's 'Hetoimasia.GLFW.Command.WindowCloseBegun' implies none of
+-- them.
+windowGraphicsStatus ∷ WindowHost → WindowId → STM WindowGraphics
+windowGraphicsStatus host target = case hostRetirementState host of
+  Nothing → pure GraphicsWindowUnknown
+  Just retirement → do
+    held ← Map.member target <$> readTVar (hostEntries host)
+    occupant ← windowAttachmentState retirement target
+    cells ← readTVar (hostGraphicsCells host)
+    case (held, occupant) of
+      (False, Nothing) → pure GraphicsWindowUnknown
+      (_, Nothing) → pure GraphicsAbsent
+      (_, Just (identity, phase, missing)) → do
+        disposal ← maybe (pure DisposalPending) (fmap observedDisposal . readGraphicsCell) (Map.lookup target cells)
+        pure . GraphicsPresent $
+          GraphicsObservation
+            { observedIncarnation = attachmentIncarnation identity
+            , observedSlot = slotOf phase
+            , observedMissing = missing
+            , observedDisposal = disposal
+            }
+
+-- | The capability a thread that is not the owner publishes one certified
+-- retirement fact through, or 'Nothing' for a host that owns no attachment
+-- state.
+--
+-- It carries no authority over the model: an admitted notice is revalidated on
+-- the owner thread exactly as an owner-thread report is, so one queued for a
+-- replaced incarnation is refused when it is folded and touches the replacement
+-- not at all. Publishing wakes the owner exactly as a command admission does.
+hostGraphicsPublisher ∷ WindowHost → Maybe CompletionPublisher
+hostGraphicsPublisher = hostCompletionPublisher
+
+-- | Certify one retirement fact on the owner thread, from inside the owner's
+-- own protocol. It is 'reportHostRetirementFact' under the name the public
+-- contract uses.
+certifyGraphicsFact
+  ∷ HasCallStack ⇒ WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
+certifyGraphicsFact = reportHostRetirementFact
+
+-- | What the last turn's bounded round of retirement opportunities left owed.
+--
+-- It is the retirement side of the scheduling arc: the scheduled owner loop
+-- reads it in the same inspection that captures demand, so a retirement that
+-- wants another opportunity now is not delayed by the idle wait, and one that
+-- named an instant is served at it. Any thread may read it; every count is
+-- bounded by the live windows.
+data RetirementDemand = RetirementDemand
+  { retirementPending ∷ !Int
+    -- ^ Attachments registered and not yet retired.
+  , retirementStalled ∷ !Int
+    -- ^ Of those, the ones with no progress path left, which only independent
+    -- evidence revives.
+  , retirementRefused ∷ !Int
+    -- ^ Opportunities the last round refused because their owner declared a
+    -- blocking step. The step itself was never run.
+  , retirementImmediate ∷ !Bool
+    -- ^ Whether another opportunity is wanted at once: the last round advanced
+    -- something, or the budget could not reach every pending attachment.
+  , retirementNextPossible ∷ !(Maybe Instant)
+    -- ^ The earliest instant an awaiting owner named, in 'hostClock'\'s domain.
+  }
+  deriving (Eq, Show)
+
+-- | No attachment pending and nothing owed, which is what an ordinary host
+-- always reports.
+noRetirementDemand ∷ RetirementDemand
+noRetirementDemand = RetirementDemand 0 0 0 False Nothing
+
+hostRetirementDemand ∷ WindowHost → STM RetirementDemand
+hostRetirementDemand = readTVar . hostRetirementDemandState
+
+-- | Offer one bounded, rotating round of retirement opportunities, and publish
+-- what it left owed. An ordinary host has no attachment state and does nothing
+-- at all here.
+advanceHostRetirements ∷ WindowHost → IO ()
+advanceHostRetirements host = case hostRetirementState host of
+  Nothing → pure ()
+  Just retirement → do
+    round' ←
+      advanceRetirements retirement (hostRetireCursor host) (hostRetirementBudget (hostSettings host))
+    atomically $ do
+      refreshGraphicsCells host
+      writeTVar (hostRetirementDemandState host) (demandOf round')
+
+demandOf ∷ ProgressRound → RetirementDemand
+demandOf round' =
+  RetirementDemand
+    { retirementPending = roundPending round'
+    , retirementStalled = roundStalled round'
+    , retirementRefused = roundRefused round'
+    , retirementImmediate = roundAdvanced round' > 0 || roundDeferred round' > 0
+    , retirementNextPossible = roundNextPossible round'
+    }
+
+-- | Bring every cell the host holds up to what the model now says about its
+-- window's slot.
+--
+-- A cell whose incarnation no longer holds the slot is finalized as free: it
+-- has retired, or a later incarnation replaced it, and either way this one owes
+-- nothing more. The disposal a cell already carries is never overwritten here;
+-- only the window's own retirement writes one.
+refreshGraphicsCells ∷ WindowHost → STM ()
+refreshGraphicsCells host = case hostRetirementState host of
+  Nothing → pure ()
+  Just retirement → do
+    cells ← readTVar (hostGraphicsCells host)
+    forM_ (Map.toList cells) $ \(window, cell) → do
+      observed ← readGraphicsCell cell
+      occupant ← windowAttachmentState retirement window
+      case occupant of
+        Just (identity, phase, missing)
+          | attachmentIncarnation identity == observedIncarnation observed →
+              writeGraphicsSlot cell (slotOf phase) missing
+        _ → writeGraphicsSlot cell SlotFree []
+
+slotOf ∷ AttachmentPhase → SlotState
+slotOf = \case
+  AttachmentRegistering → SlotAttached
+  AttachmentActive → SlotAttached
+  AttachmentRetiring → SlotRetiring
+  AttachmentRetired → SlotFree

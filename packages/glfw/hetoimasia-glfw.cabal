@@ -130,8 +130,10 @@ library runtime-glfw
 
 -- The runtime integration's implementation, including the test-only host hooks
 -- the dynamic window examples use to deliver a cancellation at a precise point,
--- and the pure render demand helper that composes the runtime's simulation
--- demand with each window's observed eligibility and published demand.
+-- the pure render demand helper that composes the runtime's simulation
+-- demand with each window's observed eligibility and published demand, the
+-- retirement boundary that owns the attachment model, and the opaque graphics
+-- service and observation the public attachment contract hands an application.
 -- Private, so no package outside this one can name them; the public
 -- runtime-glfw sublibrary re-exports everything else.
 library runtime-glfw-core
@@ -140,6 +142,7 @@ library runtime-glfw-core
     hs-source-dirs: runtime-glfw-core
     exposed-modules:
         Hetoimasia.Runtime.GLFW.Internal
+        Hetoimasia.Runtime.GLFW.Internal.Graphics
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
     build-depends:
@@ -190,7 +193,9 @@ library seam-core
 -- host's private test hooks, the scheduled owner turn and render demand
 -- examples over a scripted clock, all of them over the fixtures its component
 -- specs share through the suite's own non-spec Test.GLFW.Support module,
--- the pure window attachment model examples, the
+-- the pure window attachment model examples, the public attachment contract
+-- examples that attach, observe, detach, and retire graphics owners on running
+-- owner turns, the
 -- link-declaration check against the native
 -- manifest, and the external-client opacity examples. It initializes no GLFW,
 -- opens no window, and needs no display; it links the pinned native SDK only
@@ -204,6 +209,7 @@ test-suite glfw-tests
     hs-source-dirs: test
     other-modules:
         Test.GLFW.Attachment
+        Test.GLFW.Attachments
         Test.GLFW.Command
         Test.GLFW.Control
         Test.GLFW.Dynamic

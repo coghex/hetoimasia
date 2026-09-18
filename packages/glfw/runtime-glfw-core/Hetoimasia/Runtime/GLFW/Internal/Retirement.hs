@@ -9,8 +9,11 @@
 -- ones it needs to keep native event processing and the session's internal wake
 -- support live while it waits — and it names no graphics type.
 --
--- It belongs to the private @runtime-glfw-core@ sublibrary and is re-exported
--- by nothing: no public module names an attachment operation or type.
+-- It belongs to the private @runtime-glfw-core@ sublibrary. The public
+-- attachment contract of "Hetoimasia.Runtime.GLFW" is built over it and
+-- re-exports the caller-facing parts — the protocol, its completion policy, the
+-- progress answers, and the detach answer — while the state, the model, the
+-- drain, and the registrations stay here.
 --
 -- = What a protected host owns that an ordinary one does not
 --
@@ -102,6 +105,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
 
     -- * The private attachment seam
   , AttachmentProtocol (..)
+  , CompletionPolicy (..)
   , RetirementProgress (..)
   , AttachmentOutcome (..)
   , RolledBack (..)
@@ -109,6 +113,14 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , pendingAttachments
   , attachmentViewOf
   , certifyRetirementFact
+  , windowAttachmentState
+
+    -- * Detaching and in-run progress
+  , DetachAnswer (..)
+  , detachAttachment
+  , ProgressRound (..)
+  , noProgressRound
+  , advanceRetirements
 
     -- * Completion notices from other threads
   , CompletionPublisher
@@ -148,7 +160,8 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (unless, void, when)
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (find)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -157,6 +170,7 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
 import Hetoimasia.Foundation.Resource (withResourceLabelled)
+import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.Foundation.Recovery
   ( AttemptFailure (attemptException)
   , Disposition (..)
@@ -173,9 +187,11 @@ import Hetoimasia.GLFW.Internal.Attachment
   , allRetirementFacts
   , AttachmentId
   , AttachmentModel
+  , AttachmentPhase (..)
   , AttachmentRefusal (..)
   , AttachmentStatus (..)
   , AttachmentView (..)
+  , RetirementAnswer (..)
   , CompletionInbox
   , CompletionNotice
   , ConstructionAnswer (..)
@@ -388,11 +404,38 @@ data RetirementProgress
     -- alone decides whether the attachment is now retired.
   | RetirementAwaiting
     -- ^ No progress this round, and progress may still become possible: the
-    -- step keeps its path and is offered another opportunity.
+    -- step keeps its path and is offered another opportunity. It names no
+    -- instant, so a running loop learns nothing about when to come back and
+    -- offers the next opportunity on its own pace.
+  | RetirementAwaitingUntil !Instant
+    -- ^ 'RetirementAwaiting' with the absolute instant at which progress may
+    -- next be possible, in the host's own 'Hetoimasia.Runtime.GLFW.hostClock'
+    -- domain. A running scheduled loop folds it into the turn it waits for, so
+    -- a due retirement step is not delayed by the idle wait; the exit drain,
+    -- which has its own finite bound and its own wake, treats it exactly as
+    -- 'RetirementAwaiting'.
   | RetirementStalled
     -- ^ No safe progress path exists. The step withdraws its path; the
     -- attachment, its window, the session, and every parent are retained, and
     -- only independent evidence revives it.
+  deriving (Eq, Show)
+
+-- | What an integration declares about the steps it will be offered.
+--
+-- The boundary cannot inspect arbitrary backend @IO@ to prove it returns, so
+-- finite, nonblocking progress is the trusted backend's own contract. What this
+-- declaration adds is the one case the boundary /can/ refuse: an owner that says
+-- its step would block. Budgets bound how many opportunities a turn offers, and
+-- neither this nor a budget is a wall-clock guarantee about a native call.
+data CompletionPolicy
+  = FiniteCompletion
+    -- ^ Every step returns finitely without waiting on a GPU, a worker, or a
+    -- native event pump.
+  | BlockingCompletion
+    -- ^ The owner declares that its step would block. Every opportunity is
+    -- refused before the step runs, the path is withdrawn, and the refusal is
+    -- reported; the attachment keeps its window until independent evidence
+    -- retires it.
   deriving (Eq, Show)
 
 -- | The trusted, narrow protocol an integration supplies when it attaches.
@@ -412,6 +455,9 @@ data AttachmentProtocol = AttachmentProtocol
     -- certified separately.
   , protocolStep ∷ AttachmentId → Acknowledgement → IO RetirementProgress
     -- ^ One bounded retirement opportunity.
+  , protocolCompletion ∷ CompletionPolicy
+    -- ^ What the integration declares about those steps. A 'BlockingCompletion'
+    -- owner is refused every opportunity without its step being run.
   , protocolDisposition ∷ Disposition
     -- ^ Whether a recognized failed step leaves this component unavailable or
     -- fails the application. Neither authorizes destroying an unsafe dependent.
@@ -605,6 +651,25 @@ live model target = case attachmentStatus target model of
   Right (AttachmentLive _) → True
   _ → False
 
+-- | The registrations of attachments that have actually begun retiring.
+--
+-- A running host holds active attachments too, and an active one owes nothing
+-- yet: the model refuses every retirement fact before retirement has begun, so
+-- offering it an opportunity would spend a step that could establish nothing and
+-- could only end by withdrawing a path the window's own close still needs. The
+-- exit drain has no such distinction to make, because closing admission has
+-- already begun the retirement of every attachment it holds.
+retiringPending ∷ HostRetirement → STM [Registration]
+retiringPending retirement = do
+  model ← readTVar (retirementState retirement)
+  registrations ← readTVar (retirementRegistrations retirement)
+  pure (filter (retiringIn model . registrationTarget) registrations)
+
+retiringIn ∷ AttachmentModel Evidence → AttachmentId → Bool
+retiringIn model target = case attachmentStatus target model of
+  Right (AttachmentLive view) → viewPhase view == AttachmentRetiring
+  _ → False
+
 -- | Certify one retirement fact on the owner thread, revalidating the target
 -- and its acknowledgement exactly as a folded notice is.
 --
@@ -633,6 +698,196 @@ attachmentViewOf retirement target = do
   pure $ case attachmentStatus target model of
     Right (AttachmentLive view) → Just view
     _ → Nothing
+
+-- | What a window's one exclusive slot holds now: the attachment occupying it,
+-- its phase, and the retirement facts it still owes.
+--
+-- 'Nothing' means the slot is free — either the model holds no record for the
+-- window, or it holds one with no attachment. It needs no authority and any
+-- thread may read it.
+windowAttachmentState
+  ∷ HostRetirement → WindowId → STM (Maybe (AttachmentId, AttachmentPhase, [RetirementFact]))
+windowAttachmentState retirement window = do
+  model ← readTVar (retirementState retirement)
+  pure $ case windowVeto window model of
+    Right (VetoedByAttachment target phase missing) → Just (target, phase, missing)
+    _ → Nothing
+
+-- ---------------------------------------------------------------------------
+-- Detaching
+
+-- | How a request to detach a window's current owner was answered.
+data DetachAnswer
+  = DetachBegun
+    -- ^ Retirement began now. The slot frees only once every fact is recorded.
+  | DetachAlreadyRetiring
+    -- ^ The attachment was already retiring — through a close, an earlier
+    -- detach, or quiescence. Nothing changed.
+  | DetachAbsent
+    -- ^ No attachment of this incarnation holds the window: it has already
+    -- retired, or the slot was taken by a later one. Nothing changed and
+    -- nothing was released.
+  deriving (Eq, Show)
+
+-- | Ask one attachment to retire while its window stays open, on the owner
+-- thread.
+--
+-- It begins exactly the retirement a close begins — the same facts, the same
+-- protocol, the same owner turns — and it frees the exclusive slot only once
+-- the model records every fact. The acknowledgement comes from the registration
+-- the boundary already holds, so a caller needs no completion authority of its
+-- own to ask.
+detachAttachment ∷ HostRetirement → AttachmentId → STM DetachAnswer
+detachAttachment retirement target = do
+  registrations ← readTVar (retirementRegistrations retirement)
+  case find ((== target) . registrationTarget) registrations of
+    Nothing → pure DetachAbsent
+    Just registration → do
+      model ← readTVar (retirementState retirement)
+      case beginRetirement
+        (retirementOwner retirement)
+        target
+        (registrationAcknowledgement registration)
+        Detach
+        model of
+        Left _ → pure DetachAbsent
+        Right (answer, next) → do
+          writeTVar (retirementState retirement) next
+          pure $ case answer of
+            RetirementBegun → DetachBegun
+            RetirementAlreadyBegun → DetachAlreadyRetiring
+            RetirementAlreadyComplete → DetachAbsent
+
+-- ---------------------------------------------------------------------------
+-- In-run progress
+
+-- | What one running turn's bounded round of opportunities found.
+--
+-- It is the retirement side of the scheduling arc: 'roundAdvanced' says another
+-- opportunity is wanted now, and 'roundNextPossible' is the earliest instant any
+-- awaiting owner named, which a scheduled loop folds into the wait it chooses so
+-- a due step is not delayed by the idle bound.
+data ProgressRound = ProgressRound
+  { roundOffered ∷ !Int
+    -- ^ Opportunities offered, at most the budget.
+  , roundAdvanced ∷ !Int
+    -- ^ Of those, the ones that made finite progress.
+  , roundPending ∷ !Int
+    -- ^ Attachments still registered and not yet retired, after the round.
+  , roundDeferred ∷ !Int
+    -- ^ Pending attachments the budget could not reach this round, which is
+    -- itself a reason to come back at once.
+  , roundStalled ∷ !Int
+    -- ^ Pending attachments with no progress path left.
+  , roundRefused ∷ !Int
+    -- ^ Opportunities refused because their owner declared a blocking step.
+  , roundNextPossible ∷ !(Maybe Instant)
+    -- ^ The earliest instant an awaiting owner named, if any did.
+  }
+  deriving (Eq, Show)
+
+noProgressRound ∷ ProgressRound
+noProgressRound = ProgressRound 0 0 0 0 0 0 Nothing
+
+-- | Offer one bounded, rotating round of retirement opportunities on the owner
+-- thread, for a host that is still running.
+--
+-- It folds whatever other threads published, then gives at most @budget@ pending
+-- attachments one opportunity each, starting after the attachment the previous
+-- round served last, so one window's pending retirement can never starve
+-- another's and never blocks that window's commands, close, or attachment. Each
+-- opportunity either advances finitely, names when progress may next be
+-- possible, keeps its path without naming one, withdraws it, or is refused
+-- outright for declaring that it would block.
+--
+-- A recognized failure under an optional disposition leaves the component
+-- unavailable with its evidence, which is never permission to destroy a
+-- dependent. Any other failure, and a cancellation, is recorded as the
+-- attachment's evidence and re-raised after its path has been withdrawn: the
+-- step is never replayed, and ending the loop hands the rest to the protected
+-- boundary's own drain.
+advanceRetirements
+  ∷ HostRetirement → IORef (Maybe AttachmentId) → Int → IO ProgressRound
+advanceRetirements retirement cursor budget = do
+  void (foldNotices retirement)
+  pending ← atomically (retiringPending retirement)
+  served ← readIORef cursor
+  let ordered = rotateAfter served pending
+      offered = take (max 0 budget) (filter registrationProgressing ordered)
+  round' ← foldStep noProgressRound offered
+  writeIORef cursor (registrationTarget <$> lastOf offered)
+  settled ← atomically (retiringPending retirement)
+  pure
+    round'
+      { roundPending = length settled
+      , roundStalled = length (filter (not . registrationProgressing) settled)
+      , roundDeferred = max 0 (length (filter registrationProgressing settled) - roundOffered round')
+      }
+  where
+    foldStep accumulated [] = pure accumulated
+    foldStep accumulated (registration : rest) = do
+      next ← offerOne retirement accumulated registration
+      foldStep next rest
+    lastOf [] = Nothing
+    lastOf entries = Just (last entries)
+
+-- | The pending attachments, starting after the one served last. An identity
+-- the list no longer holds leaves the order as it is, so a retired attachment
+-- never skips the ones registered after it.
+rotateAfter ∷ Maybe AttachmentId → [Registration] → [Registration]
+rotateAfter Nothing pending = pending
+rotateAfter (Just served) pending = case break ((== served) . registrationTarget) pending of
+  (_, []) → pending
+  (before, at' : after) → after <> before <> [at']
+
+offerOne ∷ HostRetirement → ProgressRound → Registration → IO ProgressRound
+offerOne retirement accumulated registration
+  | protocolCompletion protocol == BlockingCompletion = do
+      withdraw
+      pure counted {roundRefused = roundRefused counted + 1}
+  | otherwise = do
+      attempted ←
+        tryWithContext . recover retirementOperation (stepPolicy protocol) $
+          protocolStep protocol target acknowledgement >>= evaluate
+      case attempted of
+        Right (Available recovered) → settle (recoveredValue recovered)
+        Right (Unavailable unavailability) → do
+          atomically
+            (recordFailure retirement target acknowledgement (attemptException (unavailableReason unavailability)))
+          withdraw
+          pure counted
+        Left caught → do
+          atomically (recordFailure retirement target acknowledgement caught)
+          withdraw
+          rethrowIO caught
+  where
+    counted = accumulated {roundOffered = roundOffered accumulated + 1}
+    target = registrationTarget registration
+    acknowledgement = registrationAcknowledgement registration
+    protocol = registrationProtocol registration
+    withdraw = atomically (writeProgressing retirement target False)
+    settle = \case
+      RetirementAdvanced → do
+        atomically (pruneRegistrations retirement)
+        pure counted {roundAdvanced = roundAdvanced counted + 1}
+      RetirementAwaiting → pure counted
+      RetirementAwaitingUntil due →
+        pure counted {roundNextPossible = Just (maybe due (min due) (roundNextPossible counted))}
+      RetirementStalled → withdraw >> pure counted
+
+-- | The one recovery policy a retirement step is attempted under, on the owner
+-- turn and in the drain alike: one attempt, never replayed, classified by the
+-- integration's own recognition.
+stepPolicy ∷ AttachmentProtocol → RecoveryPolicy a
+stepPolicy protocol =
+  RecoveryPolicy
+    { policyDisposition = protocolDisposition protocol
+    , policyBudget = 1
+    , policyClassifier = \failure → recognized <$> protocolRecognizes protocol failure
+    , policyWait = \_ → pure ()
+    }
+  where
+    recognized accepted = if accepted then Just Retry else Nothing
 
 -- ---------------------------------------------------------------------------
 -- Completion notices from other threads
@@ -830,52 +1085,51 @@ opportunity
   → Registration
   → DrainOutcome
   → IO (Bool, DrainOutcome)
-opportunity retirement restore registration outcome = do
-  attempted ←
-    tryWithContext . restore . recover retirementOperation policy $
-      protocolStep protocol target (registrationAcknowledgement registration)
-  case attempted of
-    Right (Available recovered) → settleProgress (recoveredValue recovered)
-    -- A recognized failure under an optional disposition: the component is
-    -- unavailable, which is never permission to destroy its dependent. Its
-    -- evidence is kept exactly as a fatal step's is.
-    Right (Unavailable unavailability) → do
-      atomically
-        ( recordFailure
-            retirement
-            target
-            (registrationAcknowledgement registration)
-            (attemptException (unavailableReason unavailability))
-        )
-      withdraw
-      pure (False, outcome)
-    Left caught@(ExceptionWithContext _ failure)
-      -- Withdrawn as a failed step is: an interrupted step may have disposed
-      -- part of what it owns, and nothing here knows whether running it again
-      -- would be safe. Independent evidence revives it.
-      | isCancellation failure → withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
-      | otherwise → do
-          -- Evidence, never a fact: the step is withdrawn rather than replayed,
-          -- and the attachment is not safe.
-          atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
-          withdraw
-          pure (False, retainFailure caught outcome)
+opportunity retirement restore registration outcome
+  -- Refused before the step runs, exactly as a running turn refuses it: an
+  -- owner that declares its step would block is never given the opportunity,
+  -- and the stall policy then retains its window, the session, and every parent
+  -- until independent evidence arrives.
+  | protocolCompletion protocol == BlockingCompletion = withdraw >> pure (False, outcome)
+  | otherwise =
+      tryWithContext (restore (recover retirementOperation (stepPolicy protocol) step)) >>= settleAttempt
   where
+    step = protocolStep protocol target (registrationAcknowledgement registration)
+    settleAttempt = \case
+      Right (Available recovered) → settleProgress (recoveredValue recovered)
+      -- A recognized failure under an optional disposition: the component is
+      -- unavailable, which is never permission to destroy its dependent. Its
+      -- evidence is kept exactly as a fatal step's is.
+      Right (Unavailable unavailability) → do
+        atomically
+          ( recordFailure
+              retirement
+              target
+              (registrationAcknowledgement registration)
+              (attemptException (unavailableReason unavailability))
+          )
+        withdraw
+        pure (False, outcome)
+      Left caught@(ExceptionWithContext _ failure)
+        -- Withdrawn as a failed step is: an interrupted step may have disposed
+        -- part of what it owns, and nothing here knows whether running it again
+        -- would be safe. Independent evidence revives it.
+        | isCancellation failure → withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
+        | otherwise → do
+            -- Evidence, never a fact: the step is withdrawn rather than
+            -- replayed, and the attachment is not safe.
+            atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
+            withdraw
+            pure (False, retainFailure caught outcome)
     target = registrationTarget registration
     protocol = registrationProtocol registration
-    policy =
-      RecoveryPolicy
-        { policyDisposition = protocolDisposition protocol
-        , -- One attempt: a failed retirement step is never replayed.
-          policyBudget = 1
-        , policyClassifier = \failure → recognized <$> protocolRecognizes protocol failure
-        , policyWait = \_ → pure ()
-        }
-    recognized accepted = if accepted then Just Retry else Nothing
     withdraw = atomically (writeProgressing retirement target False)
     settleProgress = \case
       RetirementAdvanced → atomically (pruneRegistrations retirement) >> pure (True, outcome)
       RetirementAwaiting → pure (False, outcome)
+      -- The drain has its own finite bound and its own wake, so an instant is
+      -- nothing it waits for: it is the running loop's to schedule against.
+      RetirementAwaitingUntil _ → pure (False, outcome)
       RetirementStalled → withdraw >> pure (False, outcome)
 
 -- | The one protected diagnostic the stall policy owes, claimed once whatever

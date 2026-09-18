@@ -80,8 +80,31 @@ the session, and every parent are still live, and retains them all when it
 cannot. The `Scoped` constructors — `allocWindowHost` and `allocWindowHostIn` —
 keep their signatures and behaviour and accept no attachment: they are issued no
 attachment identity, so a registration against such a host is refused before any
-effect. No public module exports an attachment operation or type, and no public
-attachment exists yet.
+effect.
+
+`attachWindowGraphics` is the public attachment contract over that boundary, and
+the only way in. It attaches one exclusive graphics owner to one open window of
+a protected host, on the owner thread, taking the caller's own construction,
+bounded retirement step, and completion policy, and answering a typed refusal —
+a closing or ended window, an occupied one, another host or session, closed
+admission, an unprotected host — before any acquisition effect. On success it
+hands back an opaque `GraphicsService`: an identity, an incarnation, and its own
+observation, with no native pointer, no window, no session, and no authority to
+destroy, release, or certify anything. `windowGraphicsStatus` and
+`readGraphicsService` answer whether an owner is attached, retiring, or absent,
+which incarnation holds the slot, which retirement facts are still missing, and
+whether the window's native destruction has completed, from any thread and
+without inference. An accepted close ends that window's graphics admission in
+the same transaction that publishes its closing phase;
+`detachWindowGraphics` runs the same retirement while the window stays open, and
+a later attachment gets a fresh incarnation. Retirement itself progresses on
+owner turns under `hostRetirementBudget`, rotating across pending attachments so
+one window's retirement never blocks another's, and `hostRetirementDemand` feeds
+the scheduled loop so a due step is not delayed by the idle wait. No surface,
+GPU submission, or device wait appears anywhere in it: evidence that GPU work
+has completed is the backend's own, and which mechanism proves it is an open
+question of the graphics design rather than of this package. See
+[docs/glfw.md](../../docs/glfw.md#the-public-attachment-contract).
 
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on

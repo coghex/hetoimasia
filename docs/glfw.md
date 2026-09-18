@@ -2229,18 +2229,26 @@ latest all begin the same protocol:
 1. the window's closing observation is prepared; nothing has changed yet, so a
    cancellation here leaves the window open with its port admitting;
 2. in one transaction, the window is marked closing, its port's admission
-   closes, every command still queued there settles as `NotExecuted`, and its
-   observations publish the `WindowClosing` phase; that transaction and the
-   owner's record of the new observation run masked with nothing interruptible
-   between them, so no cancellation can close the port without publishing the
-   phase, or publish the phase without closing the port;
-3. once no owner-thread borrow is in progress, the window is retired through the
+   closes, every command still queued there settles as `NotExecuted`, its
+   attachment — on a protected host, and only there — stops admitting new
+   graphics use and begins retiring, and its observations publish the
+   `WindowClosing` phase; that transaction and the owner's record of the new
+   observation run masked with nothing interruptible between them, so no
+   cancellation can close the port without publishing the phase, or publish the
+   phase without closing the port, and no new render use can begin after the
+   closing phase is observable;
+3. once no owner-thread borrow is in progress — and, on a protected host, once
+   the window's attachment has retired — the window is retired through the
    collection: callbacks detached, the native window destroyed, storage freed,
    and the terminal phase published before its snapshot closes.
 
 A close command settles as `WindowCloseBegun` once step 2 has committed; its disposal is
-reported by the window's observations, never by the ticket, because closed
-admission alone proves nothing about native destruction. Beginning the protocol
+reported by the window's observations, and by the window's graphics slot when
+it has one, never by the ticket, because closed admission alone proves nothing
+about native destruction. Accepting a close is not acknowledging a destruction,
+and the ticket's meaning is unchanged by attachments:
+[the public attachment contract](#the-public-attachment-contract) is where a
+consumer reads retirement and disposal instead of inferring them. Beginning the protocol
 again answers `CloseAlreadyStarted`, or `WindowIsClosing` for a command, and a
 window the host no longer holds answers `CloseNotServed` or `WindowNotServed`.
 Closing a window stops neither the session, the loop, nor any other window, and
@@ -2659,11 +2667,13 @@ before appears once in `turnCloseRequests`. The application decides:
 `honourHostCloseRequest` begins that window's
 [close protocol](#dynamic-windows) while it is still the latest, answering
 `CloseRequestSuperseded` otherwise; and leaving it latched is equally a decision.
-A closing window's requests are not surfaced. The loop ends only when
-`loopUpdate` answers `Finish`, so a close request — the last window's included —
-ends neither the loop nor the runtime, and destroys nothing unless the
-application honours it. The host supplies no default that finishes on, or
-honours, a close request.
+A closing window's requests are not surfaced. Honouring a request begins the
+same close protocol every other entry point begins, so on a protected host it
+also ends that window's graphics admission in the same transaction. The loop
+ends only when `loopUpdate` answers `Finish`, so a close request — the last
+window's included — ends neither the loop nor the runtime, and destroys nothing
+unless the application honours it. The host supplies no default that finishes
+on, or honours, a close request.
 
 ### Quiescence and shutdown order
 
@@ -2841,11 +2851,13 @@ termination is the escape.
 
 #### The private attachment seam
 
-The public `runtime-glfw` sublibrary exports the protected lifetime and its
-runner and **no attachment operation or type**. Attaching, certifying a fact,
-publishing a notice, and observing an attachment live in the private
-`runtime-glfw-core` sublibrary for this package's own examples until LIFE-4
-exposes the contract. The seam is entered from the protected lifetime's own
+`attachHostWindow`, `hostAttachmentIdentity`, `hostAttachmentView`, and
+`reportHostRetirementFact` stay in the private `runtime-glfw-core` sublibrary
+for this package's own examples.
+[The public attachment contract](#the-public-attachment-contract) below is what
+an application outside the package reaches, and it is this seam underneath: the
+same reservation, the same ordering, the same model. The seam is entered from
+the protected lifetime's own
 consumer path — the consumer it was given, or the private hook that runs just
 before it — never from the host's construction, which the exit handler does not
 yet cover. An attachment reserves its window, registers its protocol,
@@ -2920,6 +2932,218 @@ over a real session, proving the window's native destruction follows the
 scripted owner's completion and the termination follows that destruction, with
 no event, wake, or window call entering GLFW afterwards. It claims nothing about
 GPU synchronization: the owner is a script and its facts are CPU facts.
+
+### The public attachment contract
+
+One window may have one exclusive graphics owner. `attachWindowGraphics` is the
+whole way in, and it exists only for a host built by the protected lifetime; a
+host built with `allocWindowHost` answers `GraphicsHostUnprotected` before any
+effect, because it was issued no identity an attachment could name. It is the
+LIFE-4 slice of
+[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+(P-1, P-2, D-1 to D-4).
+
+Nothing here creates a surface, submits GPU work, or waits on a device.
+**Evidence that GPU work has completed is the backend's own**, supplied through
+the facts its owner certifies; which Vulkan mechanism proves it is the Vulkan
+design's open question (Q-3) and is not decided here.
+
+#### Attaching and the opaque service
+
+`attachWindowGraphics host window owner` runs on the owner thread and takes the
+caller's own `AttachmentProtocol`: how to construct the dependents, how to roll
+a failed construction back, one bounded retirement step, the `CompletionPolicy`
+those steps are offered under, and how a failed step is classified. The boundary
+supplies the exclusivity, the ordering, and the retirement rule, and nothing
+else.
+
+Every refusal is answered **before any acquisition effect**, so a refused
+attachment has constructed nothing:
+
+| Answer | Meaning |
+|---|---|
+| `GraphicsRefused (GraphicsWindowClosing w)` | The window's close protocol has begun |
+| `GraphicsRefused (GraphicsWindowUnavailable w)` | This host holds no such open window: it was never its, or it has ended |
+| `GraphicsRefused (GraphicsWindowOccupied a)` | Another owner holds the slot, and holds it until it has safely retired |
+| `GraphicsRefused GraphicsForeignSession` / `GraphicsForeignHost` | The window belongs to another session or host |
+| `GraphicsRefused GraphicsAdmissionEnded` | Attachment admission has closed; no new graphics use may begin |
+| `GraphicsHostUnprotected` | The host owns no retirement state at all |
+
+On success the application is handed a `GraphicsService` and **nothing else**.
+Its representation is private: it exposes the attachment's identity, its
+incarnation, its window's identity, and its own observation, and it carries no
+native pointer, no window, no session, and no authority to destroy, release, or
+certify anything. It is published only once construction and registration have
+both completed, so a value of this type never names an attachment still being
+built.
+
+A construction that fails runs the caller's own rollback and answers
+`GraphicsRolledBack`. A rollback that established safety retires the attachment
+and frees the slot. One that could not — including a rollback that itself raised
+or was cancelled — **retains** the attachment: the controller keeps the window,
+the exclusive slot, and every dependency the construction left, with the
+original failure and the rollback's own as evidence, until each retirement fact
+is certified separately. Nothing usable is published either way, and no
+retirement is fabricated. A construction that finishes after retirement has
+already begun — a close, a detach, or quiescence overtook it — answers
+`GraphicsSuperseded`: its dependents stay registered for retirement and nothing
+usable is published.
+
+#### Observing the slot
+
+`windowGraphicsStatus host window` reads a window's slot in one transaction,
+from any thread, and answers without inference: `GraphicsAbsent` when the host
+holds the window and no owner is attached, `GraphicsWindowUnknown` when it holds
+no such window, and `GraphicsPresent` with a `GraphicsObservation` otherwise.
+`readGraphicsService` reads the same observation from a retained service.
+
+An observation names the incarnation that held the slot, whether it is
+`SlotAttached`, `SlotRetiring`, or `SlotFree`, which of
+[the retirement facts](#retirement-facts) are still missing, and whether the
+window's own native destruction has completed — `DisposalPending`,
+`DisposalCompleted`, or `DisposalFailed`. The disposal is deliberately distinct
+from the retirement: a retired attachment stops vetoing destruction, and the
+host's close protocol and its ordinary borrows still decide when it happens. A
+failed native release is never reported as a successful destruction; it is
+latched by the collection, never attempted again, and reported here as
+`DisposalFailed`.
+
+A retained service keeps answering after the host has forgotten its window, and
+after the whole application has ended: the cell lives with the value that holds
+it. The host itself keeps at most one cell per window it still holds, so
+repeated detaching and reattaching grows no incarnation history the host owns. A
+service observes its window's native disposal when its own incarnation was that
+window's last; an incarnation the slot moved on from keeps `SlotFree` with the
+disposal its own lifetime ended with.
+
+`hostPendingAttachments` lists the attachments the host still holds, in
+registration order, bounded by the live-window limit.
+
+#### Close and detach
+
+On an accepted close — through a close command, `closeHostWindow`, or
+`honourHostCloseRequest` — the same transaction that marks the window closing
+and closes its port ends the attachment's admission of new use and records its
+logical release, so no new render use can begin after the closing phase is
+observable. Retirement then proceeds through the owner's own protocol on owner
+turns, and native destruction happens only once the model records the attachment
+retired **and** the ordinary borrow rule is satisfied. The close ticket's
+`WindowCloseBegun`, the input closure, and the observation phases are exactly
+what they were.
+
+`detachWindowGraphics host service` asks, on the owner thread, to retire the
+current owner while its window stays open. It uses the same retirement protocol
+a close uses, and the exclusive slot frees only after safe disposal. A later
+attachment then gets a **fresh incarnation**, against which the earlier owner's
+acknowledgement is refused and releases nothing. Detaching an owner that has
+already retired, or one that is already retiring, is a typed no-op —
+`DetachAbsent` or `DetachAlreadyRetiring` — not a failure. Swapping render
+modules inside one backend is not a detach and never reaches this boundary.
+
+#### Progress and scheduling
+
+Retirement runs while the application runs. Each owner turn offers at most
+`hostRetirementBudget` opportunities, in rotating order across the attachments
+that have begun retiring, starting after the one the previous turn served last.
+One window's pending retirement therefore never blocks another window's
+commands, close, attachment, or retirement, and a stalled owner starves nobody.
+An attachment that has not begun retiring is offered nothing: the model refuses
+every fact before retirement has begun, so a step there could establish nothing.
+
+Each opportunity either advances finitely, keeps its path with
+`RetirementAwaiting`, keeps it and names the absolute instant at which progress
+may next be possible with `RetirementAwaitingUntil`, or withdraws it with
+`RetirementStalled`. A withdrawn path is never replayed; only independent
+evidence — a completion notice for that attachment — revives it.
+
+`hostRetirementDemand` publishes what the last round left owed: how many
+attachments are pending, how many are stalled, how many opportunities were
+refused, whether another opportunity is wanted at once, and the earliest instant
+an awaiting owner named.
+[The scheduled owner loop](#the-scheduled-owner-turn) reads it in the same
+inspection that captures demand, so a retirement instant shortens that turn's
+wait exactly as an application deadline does — never lengthens it — and a round
+that advanced, or one the budget could not reach, makes the next turn poll. The
+unscheduled loop reads the same flag and does not wait when a retirement wants
+another opportunity now.
+
+No opportunity performs a blocking GPU wait. The boundary cannot inspect
+arbitrary backend `IO` to prove it returns — finite, nonblocking progress is the
+trusted backend's own contract, and budgets bound opportunities rather than
+wall-clock time in a native call. What it can refuse, it does: an owner whose
+`CompletionPolicy` is `BlockingCompletion` is refused every opportunity **before
+its step runs**, its path is withdrawn, and the refusal is counted in the demand
+the turn publishes. A backend that blocks inside a native call limits the
+latency this contract can claim, and must document that.
+
+Progress runs on the main thread, outside every foundation finalizer, as a
+trusted narrow component operation. It runs no input, event, or game handler and
+no supervisor checkpoint.
+
+#### Authority and races
+
+Only the owner thread advances, completes, or removes an attachment.
+`attachWindowGraphics`, `detachWindowGraphics`, and `certifyGraphicsFact` refuse
+any other thread with `NotSessionOwner`. Other threads read state —
+`windowGraphicsStatus`, `readGraphicsService`, `hostRetirementDemand`,
+`hostPendingAttachments` — and publish bounded completion notices through
+`hostGraphicsPublisher`, which the owner folds. A notice carries no authority
+over the model: it is revalidated on the owner thread exactly as an owner-thread
+report is, it wakes the owner exactly as a command admission does, and the inbox
+holds one notice per fact per window the host may hold. Publication closes in
+the same transaction the exit boundary first finds nothing pending, so a notice
+is either folded or refused outright.
+
+The application never receives a dependent's handle or a release action, and a
+worker scope ending cannot dispose a dependent: the controller owns them until
+retirement.
+
+Whatever the interleaving of a close, a detach, a published completion, and a
+new attachment:
+
+- no new use begins after closing is observable, because admission ends in the
+  transaction that publishes the closing phase;
+- no second owner attaches before the slot is safely free, because the slot is
+  reserved from the reservation until the last fact retires the attachment;
+- no completion is credited to the wrong incarnation, because an acknowledgement
+  names one host, session, window, and incarnation, and a mismatch against a
+  current attachment is refused ahead of terminal idempotence;
+- every construction begun is either registered or fully rolled back with its
+  evidence, and one whose rollback could not establish safety is retained rather
+  than released.
+
+#### Examples
+
+The examples in `glfw-tests` (`--match "attachments"`) run whole applications
+over the seam and assert an order of flags or an observed state, never a time.
+They cover every refusal above with no owner constructed; the service published
+only after registration, with the slot already reserved during construction;
+a construction superseded by another thread's quiescence; safe and unsafe
+rollback, and a cancellation delivered before publication; a close and a
+destruction separately observable, with the destruction after the last fact; a
+retained service answering after the host forgot its window; a failed native
+release kept distinct from the retirement that succeeded; detach then reattach
+with a fresh incarnation and the stale acknowledgement refused on the owner
+thread and through a published notice; a second owner refused while the first
+retires; the typed detach no-ops; three detach-and-reattach cycles leaving one
+window, one port, and no history; two windows where one keeps executing commands
+and completing its own close, retirement, and destruction while the other's
+retirement is pending; a stalled owner's neighbour destroyed first and the
+stalled one finished on independent evidence; a budget of one rotating across
+three pending retirements; a blocking owner refused without its step running;
+the scheduled loop's wait shortened to a retirement's own instant and polling
+once a round advanced; the whole application exit with owners attached; and an
+ordinary window-only application seeing no slot, no demand, and unchanged turns.
+The opacity examples compile external clients that name the service's data
+constructor and reach for its observation cell in the private implementation,
+both refused, beside an accepted client that uses the public contract.
+
+One `glfw-native-tests` scenario (`--match "public attachments"`) repeats two of
+these in a child process of its own over a real session: a real window destroyed
+only after its owner completes while a second real window stays live,
+responsive, and pending, and a detach-and-reattach cycle on a real window that
+creates and destroys no native window. It claims nothing about GPU
+synchronization: the owners are scripts and their facts are CPU facts.
 
 ### What the owner and workers may wait on
 
@@ -3165,15 +3389,17 @@ vetoes the window's destruction. It is the LIFE-1 slice of
 [the window and graphics lifetime design](window_graphics_lifetime_design.md)
 (P-1, P-5, D-1, D-2, D-4).
 
-**No public attachment exists yet.** No module under `packages/glfw/src/` or
-`packages/glfw/runtime-glfw/` exports the model or an operation over it, and an
-external client can import neither it nor the retirement boundary that owns it.
-The one boundary that owns an instance is
-[the protected host lifetime](#the-protected-host-lifetime) (LIFE-3), which
-reaches it through the private `runtime-glfw-core` sublibrary; a host built by
-`allocWindowHost` is issued no identity, so its close protocol, its retirement
-by borrow count, and every public module behave exactly as before. The public
-attachment contract (LIFE-4) follows. The model
+**The model itself is not public.** No module under `packages/glfw/src/` or
+`packages/glfw/runtime-glfw/` exports it or the retirement boundary that owns
+it, and an external client can import neither. The one boundary that owns an
+instance is [the protected host lifetime](#the-protected-host-lifetime)
+(LIFE-3), which reaches it through the private `runtime-glfw-core` sublibrary;
+a host built by `allocWindowHost` is issued no identity, so its close protocol,
+its retirement by borrow count, and every public module behave exactly as
+before. What an application reaches is
+[the public attachment contract](#the-public-attachment-contract) (LIFE-4),
+which is this model under that boundary: the phases, facts, acknowledgements,
+and bookkeeping below are what its answers mean. The model
 names no Vulkan, native, or GPU type, performs no native call, and owns no
 thread; it is a pure state machine with bounded bookkeeping and one bounded
 notice inbox.
@@ -3371,6 +3597,9 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Completion inbox | The protected host lifetime | Any thread offers a notice; the owner takes and folds them | Any; STM | The host | Emptied by each take; bounded by the window limit times the retirement facts |
 | Registered retirement protocols | The protected host lifetime | The owner registers, withdraws, revives, and prunes them | Owner; STM | Until the attachment retires | At most one per window the host may hold; removed as attachments retire |
 | The stall diagnostic | The protected host lifetime | The owner claims it | Owner | The host | Claimed once, whatever it records; never retried |
+| Attachment observation cells | The protected host lifetime, and each `GraphicsService` that retains one | The owner thread writes; any holder of the service reads | Write: owner; read: any | The service value that retains it | At most one per window the host holds; finalized when its incarnation leaves the slot and when its window is disposed, then dropped by the host; never reopened |
+| Retirement rotation cursor | The window host | Each turn's round records the attachment it served last | Owner | The host | Never reset; an identity the pending list no longer holds leaves the order as it is |
+| Published retirement demand | The window host | Each turn's round writes it; the loops and any thread read it | Write: owner; read: any | The host | Replaced by each round; an ordinary host leaves it empty |
 | Host session and window collection | The window host | Construction creates them; creation acquires members; the close protocol retires them; the owner loop pumps and reconciles | Owner | The host's scope | Remaining windows released newest first by the collection's exit, then an owned session ended, when the scope unwinds |
 | Window registry | The window host | Registration inserts; the close protocol marks closing; a retirement that succeeded or failed removes; ports, clients, and dispatch read | Write: owner; read: any | Registration until retirement | Emptied as windows retire; the collection's exit releases what remains |
 | Per-window command hosts | The window host, for each window | The window's port admits; the loop executes; the close protocol and quiescence close | Admit: any; execute and close: owner | Registration until the window is forgotten | Closed at the close protocol or quiescence; never reopened |
@@ -3382,8 +3611,8 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Input channel generation | The input feed | Production sends; reads receive; a reset or closure aborts and drops it; resumption installs the next | Produce and resume: owner; read: any | One generation | Aborted and dropped by a reset or closure |
 | Input phase, epoch, gates, held baseline, episode, and counters | The input feed | Production, admission changes, acknowledgement, warning, resumption, and closure write; statistics read | Any, through the owner operations and capabilities | The feed | Held baseline cleared by focus loss, reset, and closure; the rest frozen at closure; counters never reset |
 | Latest cursor sample | The input feed | The producer records it; button production copies it | Owner | The feed | Replaced by the next sample |
-| Window attachment records | The owning host boundary; no production component yet | Owner transitions write; any holder observes | Owner | The host | A record is removed when its window is forgotten, an attachment when it retires; counters never reissued |
-| Attachment completion inbox | The owning host boundary; no production component yet | Any thread offers; the owner takes and folds | Any; STM | While referenced | Emptied by each take |
+| Window attachment records | The owning host boundary | Owner transitions write; any holder observes | Owner | The host | A record is removed when its window is forgotten, an attachment when it retires; counters never reissued |
+| Attachment completion inbox | The owning host boundary | Any thread offers; the owner takes and folds | Any; STM | While referenced | Emptied by each take |
 | Render demand: per-window scheduling state and the rotation cursor | Whichever caller threads the `RenderDemand` value | Each `renderTurn` folds the turn's captures and frame requests into it; `acknowledgeRender` clears what an offer served | Whatever thread the caller's turn runs on; no shared cell | The caller's own value | An entry is removed when a turn stops listing its window, when its phase is terminal, and by `forgetRenderWindow`; nothing here holds a window, a handle, or any state a driver could name |
 
 The guard holds only occupancy and poison. None of this is application state.

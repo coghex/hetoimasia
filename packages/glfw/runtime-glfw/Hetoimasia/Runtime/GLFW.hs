@@ -432,10 +432,56 @@
 -- attachment can make safe progress the boundary retains everything, writes one
 -- diagnostic under @glfw.retirement@, and waits.
 --
--- Attachments themselves are not public. This library exports no attachment
--- operation or type: the protected lifetime is usable, and what may attach to it
--- is the private seam this package's own examples use until LIFE-4 exposes the
--- contract.
+-- = Window attachments
+--
+-- 'attachWindowGraphics' attaches one exclusive graphics owner to one open
+-- window of a protected host, on the owner thread. The owner is the caller's —
+-- its construction, its owned rollback, one bounded retirement step, the
+-- 'CompletionPolicy' those steps are offered under, and how a failed step is
+-- classified — and this boundary supplies the exclusivity, the ordering, and the
+-- retirement rule. A host built by 'allocWindowHost' owns no retirement state,
+-- so it answers 'GraphicsHostUnprotected' before any effect, and every other
+-- refusal — a closing or ended window, an occupied one, another host or session,
+-- closed admission — is answered before any acquisition effect too.
+--
+-- A successful attachment hands back an opaque 'GraphicsService' and nothing
+-- else: an identity, an incarnation, and its own observation, with no native
+-- pointer, no window, no session, and no authority to destroy, release, or
+-- certify anything. It is published only once construction and registration have
+-- both completed. 'windowGraphicsStatus' and 'readGraphicsService' answer,
+-- from any thread and without inference, whether an owner is attached, retiring,
+-- or absent, which incarnation holds the slot, which retirement facts are still
+-- missing, and whether the window's own native destruction has completed — which
+-- stays distinct from the retirement, and distinct again from a native release
+-- that failed.
+--
+-- An accepted close, through any entry point, ends that window's graphics
+-- admission in the same transaction that publishes its closing phase, so no new
+-- render use can begin after closing is observable; the close ticket's
+-- 'Hetoimasia.GLFW.Command.WindowCloseBegun' still implies nothing about
+-- destruction. 'detachWindowGraphics' runs the same retirement while the window
+-- stays open, and frees the exclusive slot only after safe disposal; a later
+-- attachment gets a fresh incarnation, against which the earlier
+-- acknowledgement is refused.
+--
+-- Retirement progresses while the application runs: each turn offers at most
+-- 'hostRetirementBudget' opportunities, rotating across the attachments that
+-- have begun retiring, so one window's pending retirement never blocks another's
+-- commands, close, attachment, or retirement. 'hostRetirementDemand' publishes
+-- what the last round left owed, and 'runScheduledOwnerLoop' folds it into the
+-- wait it chooses, so a due step is not delayed by the idle bound. No
+-- opportunity performs a blocking GPU wait, and an owner declaring
+-- 'BlockingCompletion' is refused the opportunity before its step runs. Only the
+-- owner thread advances an attachment; other threads read its state and publish
+-- bounded completion notices through 'hostGraphicsPublisher', which the owner
+-- folds and revalidates exactly as an owner-thread report.
+--
+-- Nothing here creates a surface, submits GPU work, or waits on a device:
+-- evidence that GPU work has completed is the backend's own, supplied through
+-- the facts its owner certifies.
+--
+-- The seam underneath — @attachHostWindow@ and the rest — stays private to the
+-- implementation sublibrary for this package's own examples.
 --
 -- See @docs/glfw.md@, \"The window host and owner loop\", for the same contract
 -- in prose.
@@ -525,6 +571,52 @@ module Hetoimasia.Runtime.GLFW
   , withProtectedWindowHost
   , withProtectedWindowHostIn
   , runProtectedWindowApplication
+
+    -- * Window attachments
+  , attachWindowGraphics
+  , GraphicsAttachment (..)
+  , AttachmentProtocol (..)
+  , CompletionPolicy (..)
+  , RetirementProgress (..)
+  , RollbackOutcome (..)
+  , RolledBack (..)
+  , GraphicsRefusal (..)
+  , AttachmentId
+  , attachmentWindow
+  , attachmentIncarnation
+  , Acknowledgement
+  , acknowledgedAttachment
+  , RetirementFact (..)
+  , allRetirementFacts
+  , certifyGraphicsFact
+  , FactAnswer (..)
+  , detachWindowGraphics
+  , DetachAnswer (..)
+
+    -- ** Observing an attachment
+  , GraphicsService
+  , graphicsWindow
+  , graphicsAttachment
+  , graphicsIncarnation
+  , readGraphicsService
+  , GraphicsObservation (..)
+  , SlotState (..)
+  , NativeDisposal (..)
+  , WindowGraphics (..)
+  , windowGraphicsStatus
+  , hostPendingAttachments
+  , RetirementDemand (..)
+  , noRetirementDemand
+  , hostRetirementDemand
+
+    -- ** Completion notices from other threads
+  , hostGraphicsPublisher
+  , CompletionPublisher
+  , CompletionNotice
+  , completionNotice
+  , CompletionPublication (..)
+  , NoticeAdmission (..)
+  , publishCompletion
 
     -- * Applications
   , runWindowApplication

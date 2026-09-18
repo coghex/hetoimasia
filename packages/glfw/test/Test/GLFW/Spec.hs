@@ -7,7 +7,9 @@
 -- inventory, input feed, and window mode
 -- examples use the seam's private drivers, the private command executor, and the
 -- runtime integration's private host hooks, which this suite may name because it
--- belongs to the package; "Test.GLFW.Linking" checks the package's link
+-- belongs to the package; "Test.GLFW.Attachments" drives the public attachment
+-- contract over that same seam, on running owner turns rather than only on the
+-- exit drain; "Test.GLFW.Linking" checks the package's link
 -- declarations against the native manifest; and "Test.GLFW.Opacity" compiles
 -- external clients against the package, which is the only evidence here of what
 -- a client outside the package can reach.
@@ -21,6 +23,7 @@
 module Test.GLFW.Spec (spec) where
 
 import qualified Test.GLFW.Attachment as Attachment
+import qualified Test.GLFW.Attachments as Attachments
 import qualified Test.GLFW.Command as Command
 import qualified Test.GLFW.Control as Control
 import qualified Test.GLFW.Dynamic as Dynamic
@@ -56,5 +59,6 @@ spec = describe "GLFW" $ do
   Input.spec
   Mode.spec
   Attachment.spec
+  Attachments.spec
   Linking.spec
   Opacity.spec

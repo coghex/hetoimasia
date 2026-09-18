@@ -115,12 +115,18 @@ owning subsystem's contract/design when continuing its work.
   owned; committed demand retained across cancellation; expected wake failure
   keeps accepted work, reports once under logging policy and degrades to polling.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
-  #141 and #142 are merged; the protected host #143 lands with its own PR, and
-  #144 remains. One exclusive graphics owner per window. Protected main-thread
-  retirement follows worker drain and precedes dependency release on every exit.
-  Unknown safety retains resources. #144 depends on #138 and #143.
-  Completed #123 no longer blocks this work. The attachment seam #143 adds stays
-  private to `runtime-glfw-core`; #144 owns the public contract.
+  #141, #142, #143, and #144 are merged, so the arc is complete. One exclusive
+  graphics owner per window, attached through `attachWindowGraphics` and held as
+  an opaque `GraphicsService`. Protected main-thread retirement follows worker
+  drain and precedes dependency release on every exit; in-run retirement
+  progresses on owner turns under `hostRetirementBudget`, rotating across pending
+  attachments, and publishes `hostRetirementDemand` for the scheduled loop.
+  Unknown safety retains resources. Completed #123 no longer blocks this work.
+  `attachHostWindow` and the rest of the #143 seam stay private to
+  `runtime-glfw-core` beneath that contract. Still open: no surface, GPU
+  submission, or device wait exists anywhere here — evidence that GPU work has
+  completed is the backend's, and which mechanism proves it is the Vulkan
+  design's Q-3.
 - [Lua](docs/lua_runtime_design.md) is ready for staged processing. Independent
   UI/gameplay execution domains; stop unsafe authoritative gameplay while keeping
   UI available. Untrusted mods require separate processes per mod/domain,

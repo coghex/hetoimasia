@@ -74,10 +74,8 @@ import Hetoimasia.Foundation.Resource
   )
 import Hetoimasia.Foundation.Worker (WorkerDefinition, awaitStopRequest, workerDefinition)
 import Hetoimasia.GLFW.Internal.Attachment
-  ( Acknowledgement
-  , AttachmentConfigRejected
+  ( AttachmentConfigRejected
   , AttachmentEvidence (..)
-  , AttachmentId
   , AttachmentModel
   , OwnerAuthority
   , Registered (..)
@@ -88,12 +86,6 @@ import Hetoimasia.GLFW.Internal.Attachment
   , AttachmentFailure (..)
   , AttachmentPhase (..)
   , AttachmentView (..)
-  , NoticeAdmission (..)
-  , RetirementFact (..)
-  , RollbackOutcome (..)
-  , acknowledgedAttachment
-  , allRetirementFacts
-  , completionNotice
   )
 import Hetoimasia.GLFW.Internal.Window (windowSessionIdentity)
 import Hetoimasia.GLFW.Internal.Seam
@@ -113,7 +105,6 @@ import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
-import Hetoimasia.Runtime.GLFW.Internal.Retirement (CompletionPublication (..), CompletionPublisher, publishCompletion)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
@@ -282,6 +273,7 @@ data OwnerScript = OwnerScript
   , scriptConstruct ∷ IO ()
   , scriptRollback ∷ IO RollbackOutcome
   , scriptPlan ∷ [Step]
+  , scriptCompletion ∷ CompletionPolicy
   , scriptDisposition ∷ Disposition
   , scriptRecognizes ∷ Bool
   }
@@ -289,7 +281,8 @@ data OwnerScript = OwnerScript
 -- | An owner that constructs without effect and certifies every fact, one per
 -- opportunity.
 ownerNamed ∷ Text → OwnerScript
-ownerNamed name = OwnerScript name (pure ()) (pure RollbackSafe) (map Certify allRetirementFacts) Required False
+ownerNamed name =
+  OwnerScript name (pure ()) (pure RollbackSafe) (map Certify allRetirementFacts) FiniteCompletion Required False
 
 -- | One attached scripted owner, as the example observes it.
 data Owner = Owner
@@ -350,6 +343,7 @@ protocolFor journal host owner script =
             [] → pure Stall
             next : rest → next <$ writeTVar (ownerPlan owner) rest
         perform target acknowledgement step
+    , protocolCompletion = scriptCompletion script
     , protocolDisposition = scriptDisposition script
     , protocolRecognizes = \_ → pure (scriptRecognizes script)
     }

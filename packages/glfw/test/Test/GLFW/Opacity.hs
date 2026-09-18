@@ -435,6 +435,51 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that names the opaque graphics service's constructor" $
+    withHostClient "Client.hs" graphicsServiceConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export any children"
+      clientOutput outcome `shouldContain` "GraphicsService"
+
+  it "rejects a client that reaches for the graphics service's representation and its observation cell" $
+    withHostClient "Client.hs" graphicsInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so a service's observation cell is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW.Internal.Graphics"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "accepts and runs a client using the public attachment contract, without initializing GLFW" $
+    withHostClient "Main.hs" attachmentClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the attachment client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "zero retirement budget = Left (RetirementBudgetRejected 0)"
+                   , "no demand = RetirementDemand {retirementPending = 0, retirementStalled = 0, retirementRefused = 0, retirementImmediate = False, retirementNextPossible = Nothing}"
+                   , "refusals = [GraphicsAdmissionEnded,GraphicsForeignHost,GraphicsSlotUnavailable]"
+                   , "facts = [CpuUseRetired,SubmittedWorkEnded,PresentationEnded,DependentsDisposed]"
+                   , "absent = (GraphicsAbsent,DisposalPending,SlotFree)"
+                   ]
+
   it "rejects a client that reaches for the retirement boundary in the host's private implementation" $
     withHostClient "Client.hs" retirementInternalsClient $ \compile → do
       outcome ← compile Typecheck
@@ -888,16 +933,82 @@ publicAttachmentClient =
     [ "module Client (attached) where"
     , ""
     , "import Hetoimasia.Runtime.GLFW"
-    , "  ( AttachmentProtocol"
-    , "  , RetirementProgress"
-    , "  , WindowHost"
+    , "  ( WindowHost"
     , "  , attachHostWindow"
     , "  , hostAttachmentIdentity"
+    , "  , hostCompletionPublisher"
     , "  , reportHostRetirementFact"
     , "  )"
     , ""
-    , "attached ∷ Maybe (WindowHost → AttachmentProtocol → RetirementProgress)"
+    , "attached ∷ Maybe WindowHost"
     , "attached = Nothing"
+    ]
+
+-- | A client naming the opaque graphics service's data constructor. The public
+-- contract exports the type and its accessors and no way to build one.
+graphicsServiceConstructorClient ∷ String
+graphicsServiceConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW (GraphicsService (GraphicsService))"
+    , ""
+    , "forged ∷ Maybe GraphicsService"
+    , "forged = Nothing"
+    ]
+
+-- | A client reaching for the graphics service's own representation, and the
+-- observation cell it retains, in the private @runtime-glfw-core@
+-- implementation.
+graphicsInternalsClient ∷ String
+graphicsInternalsClient =
+  unlines
+    [ "module Client (cell) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Graphics (GraphicsCell, GraphicsObservation, readGraphicsCell)"
+    , ""
+    , "cell ∷ GraphicsCell → STM GraphicsObservation"
+    , "cell = readGraphicsCell"
+    ]
+
+-- | A client using the public attachment contract. It builds no host, so it
+-- initializes no GLFW: what it proves is that the contract is reachable, that
+-- its values are opaque, and that a configuration the attachment budget refuses
+-- is refused before anything is acquired.
+attachmentClient ∷ String
+attachmentClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import qualified Data.Text as Text"
+    , "import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig)"
+    , "import Hetoimasia.Runtime.GLFW"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  let config = defaultHostConfig [hiddenTestWindowConfig (Text.pack \"tool\") 64 48]"
+    , "  putStrLn (\"zero retirement budget = \" <> show (validateHostConfig config {hostRetirementBudget = 0}))"
+    , "  putStrLn (\"no demand = \" <> show noRetirementDemand)"
+    , "  putStrLn (\"refusals = \" <> show [GraphicsAdmissionEnded, GraphicsForeignHost, GraphicsSlotUnavailable])"
+    , "  putStrLn (\"facts = \" <> show allRetirementFacts)"
+    , "  putStrLn (\"absent = \" <> show (GraphicsAbsent, DisposalPending, SlotFree))"
+    , ""
+    , "-- | The contract as a client names it: an owner in, an opaque service out."
+    , "attach ∷ WindowHost → WindowId → AttachmentProtocol → IO GraphicsAttachment"
+    , "attach = attachWindowGraphics"
+    , ""
+    , "detach ∷ WindowHost → GraphicsService → IO DetachAnswer"
+    , "detach = detachWindowGraphics"
+    , ""
+    , "-- | Everything a service exposes: an identity, an incarnation, and its own"
+    , "-- observation. No native pointer, no window, no session, no release."
+    , "observe ∷ GraphicsService → (WindowId, AttachmentId, Integer)"
+    , "observe service ="
+    , "  ( graphicsWindow service"
+    , "  , graphicsAttachment service"
+    , "  , toInteger (graphicsIncarnation service)"
+    , "  )"
     ]
 
 -- | A client reaching for the retirement boundary that owns the attachment

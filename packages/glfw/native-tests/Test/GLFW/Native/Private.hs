@@ -33,7 +33,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import qualified Control.Concurrent.STM as STM
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
-import Control.Monad (unless, when, (>=>))
+import Control.Monad (unless, void, when, (>=>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Ptr (nullFunPtr)
 import qualified Data.Text as Text
@@ -57,6 +57,7 @@ import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.GLFW.Internal.Attachment (RetirementFact, RollbackOutcome (RollbackSafe), allRetirementFacts)
 import qualified Hetoimasia.Runtime.GLFW.Internal as Runtime
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocComposite, withScoped)
@@ -103,6 +104,9 @@ spec gate = describe "private sessions in a child process" $ do
 
   it "destroys a real window only after a scripted owner retires through the protected host, and terminates after that" $
     privateScenarioReporting gate "protected-retirement"
+
+  it "keeps a second real window live and responsive while the first's owner retires, and creates or destroys no native window across a detach and reattach" $
+    privateScenarioReporting gate "public-attachments"
 
 privateScenario ∷ Gate → String → IO ()
 privateScenario gate = launchWith gate $ \name → do
@@ -184,6 +188,15 @@ scenarios =
   , ( "protected-retirement"
     , [ ( "destroys the window only after the scripted owner certified every retirement fact, and terminates with no native call afterwards"
         , protectedRetirement
+        )
+      ]
+    )
+  , ( "public-attachments"
+    , [ ( "destroys the completing owner's window while the other window stays live, responsive, and pending"
+        , attachmentNeighbour
+        )
+      , ( "creates and destroys no native window across a detach and a reattach of a real window"
+        , attachmentDetachCycle
         )
       ]
     )
@@ -488,9 +501,234 @@ scriptedOwner journal remaining host =
             modifyIORef' journal (<> ["certified " <> show fact])
             _ ← Runtime.reportHostRetirementFact host acknowledgement fact
             pure Runtime.RetirementAdvanced
+    , Runtime.protocolCompletion = Runtime.FiniteCompletion
     , Runtime.protocolDisposition = Required
     , Runtime.protocolRecognizes = \_ → pure False
     }
+
+-- | Two real windows, each with a graphics owner attached through the public
+-- contract, in a session of this child's own.
+--
+-- One owner completes and the other does not. The completing one's window must
+-- be destroyed while the other's is still held by its pending retirement, and
+-- that other window must stay live and responsive throughout: the host keeps
+-- serving it, and its own slot reports retiring rather than gone. It claims
+-- nothing about GPU synchronisation; what the real session adds is that the
+-- destruction is the platform's own.
+attachmentNeighbour ∷ IO String
+attachmentNeighbour = do
+  journal ← newIORef []
+  destroys ← newIORef (0 ∷ Int)
+  let traced =
+        productionNative
+          { nativeDestroyWindow = \handle → do
+              modifyIORef' destroys (+ 1)
+              count ← readIORef destroys
+              modifyIORef' journal (<> ["window " <> show count <> " destroyed"])
+              nativeDestroyWindow productionNative handle
+          }
+      config =
+        ( Runtime.defaultHostConfig
+            [ hiddenTestWindowConfig (Text.pack "pending") 64 48
+            , hiddenTestWindowConfig (Text.pack "completing") 64 48
+            ]
+        )
+          {Runtime.hostIdleWait = 0.01}
+      logger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+  pendingFacts ← newIORef []
+  completingFacts ← newIORef allRetirementFacts
+  held ← newIORef Nothing
+  Runtime.runProtectedWindowApplication
+    (withLoggingLifetime logger)
+    (Text.pack "public-attachments")
+    ( \_ use →
+        Runtime.withProtectedWindowHostIn
+          logger
+          (allocComposite (sessionAssembly traced defaultSessionConfig))
+          config
+          ( \host → do
+              (pending, completing) ← twoHostWindows host
+              attachThrough host pending "pending" journal pendingFacts
+              acknowledged ← attachThrough host completing "completing" journal completingFacts
+              writeIORef held (Just acknowledged)
+              use host
+          )
+    )
+    id
+    (\host _ → pure host)
+    ( \host control → do
+        (pending, completing) ← twoHostWindows host
+        -- Both windows close. Only the completing owner can retire, so only its
+        -- window may be destroyed.
+        _ ← Runtime.closeHostWindow host pending
+        _ ← Runtime.closeHostWindow host completing
+        turnsUntilNative host control "the completing window's destruction" ((>= 1) <$> readIORef destroys)
+        -- The other window is still the host's, still pending, and its slot
+        -- still reports a retiring owner rather than a gone one.
+        identities ← atomically (Runtime.hostWindowIdentities host)
+        unless (identities == [pending]) $
+          failCheck ("the pending window was not the one still held: " <> show (length identities))
+        atomically (Runtime.windowGraphicsStatus host pending) >>= \case
+          Runtime.GraphicsPresent observed
+            | Runtime.observedSlot observed == Runtime.SlotRetiring → pure ()
+          other → failCheck ("the pending window's slot was " <> show other)
+          -- Independent evidence finishes it, and its window follows.
+        writeIORef pendingFacts allRetirementFacts
+        turnsUntilNative host control "the pending window's destruction" ((>= 2) <$> readIORef destroys)
+    )
+  entries ← readIORef journal
+  let expected =
+        map (\fact → "completing certified " <> show fact) allRetirementFacts
+          <> ["window 1 destroyed"]
+          <> map (\fact → "pending certified " <> show fact) allRetirementFacts
+          <> ["window 2 destroyed"]
+  unless (entries == expected) $
+    failCheck ("the order was " <> show entries <> ", not " <> show expected)
+  pure ("the order was " <> show entries)
+
+-- | One real window, attached and detached and attached again through the
+-- public contract.
+--
+-- Detaching frees the exclusive slot without touching the window, so the whole
+-- cycle must make exactly one native creation and no destruction at all: the
+-- window the application still owns is destroyed only when the host itself ends.
+attachmentDetachCycle ∷ IO String
+attachmentDetachCycle = do
+  journal ← newIORef []
+  creates ← newIORef (0 ∷ Int)
+  destroys ← newIORef (0 ∷ Int)
+  duringCycle ← newIORef Nothing
+  incarnations ← newIORef []
+  let traced =
+        productionNative
+          { nativeCreateWindow = \width height title → do
+              modifyIORef' creates (+ 1)
+              nativeCreateWindow productionNative width height title
+          , nativeDestroyWindow = \handle → do
+              modifyIORef' destroys (+ 1)
+              nativeDestroyWindow productionNative handle
+          }
+      config =
+        (Runtime.defaultHostConfig [hiddenTestWindowConfig (Text.pack "cycle") 64 48])
+          {Runtime.hostIdleWait = 0.01}
+      logger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+  Runtime.runProtectedWindowApplication
+    (withLoggingLifetime logger)
+    (Text.pack "public-attachments")
+    ( \_ use →
+        Runtime.withProtectedWindowHostIn
+          logger
+          (allocComposite (sessionAssembly traced defaultSessionConfig))
+          config
+          use
+    )
+    id
+    (\host _ → pure host)
+    ( \host control → do
+        window ← onlyHostWindow host
+        first' ← newIORef allRetirementFacts
+        second' ← newIORef allRetirementFacts
+        firstService ← attachServiceThrough host window "first" journal first'
+        _ ← Runtime.detachWindowGraphics host firstService
+        turnsUntilNative host control "the first owner's retirement" (slotFree host window)
+        secondService ← attachServiceThrough host window "second" journal second'
+        writeIORef incarnations
+          [Runtime.graphicsIncarnation firstService, Runtime.graphicsIncarnation secondService]
+        made ← (,) <$> readIORef creates <*> readIORef destroys
+        writeIORef duringCycle (Just made)
+        _ ← Runtime.detachWindowGraphics host secondService
+        turnsUntilNative host control "the second owner's retirement" (slotFree host window)
+    )
+  cycled ← readIORef duringCycle >>= maybe (failCheck "the cycle recorded no native calls") pure
+  unless (cycled == (1, 0)) $
+    failCheck ("the detach and reattach made " <> show cycled <> " native create and destroy calls, not (1,0)")
+  numbered ← readIORef incarnations
+  unless (numbered == [1, 2]) $
+    failCheck ("the incarnations were " <> show numbered <> ", not [1,2]")
+  finalDestroys ← readIORef destroys
+  unless (finalDestroys == 1) $
+    failCheck ("the host destroyed the window " <> show finalDestroys <> " time(s), not once")
+  pure
+    ( "the detach and reattach made "
+        <> show cycled
+        <> " native create and destroy calls, incarnations "
+        <> show numbered
+        <> ", and the host destroyed the window once on the way out"
+    )
+
+-- | Attach one scripted owner through the public contract and keep its
+-- acknowledgement, which the checks above never need themselves.
+attachThrough
+  ∷ Runtime.WindowHost → WindowId → String → IORef [String] → IORef [RetirementFact] → IO ()
+attachThrough host window name journal remaining =
+  void (attachServiceThrough host window name journal remaining)
+
+attachServiceThrough
+  ∷ Runtime.WindowHost
+  → WindowId
+  → String
+  → IORef [String]
+  → IORef [RetirementFact]
+  → IO Runtime.GraphicsService
+attachServiceThrough host window name journal remaining =
+  Runtime.attachWindowGraphics host window (namedOwner journal remaining host name) >>= \case
+    Runtime.GraphicsAttached service → pure service
+    other → failCheck ("the attachment was not established: " <> show other)
+
+-- | A scripted owner that certifies one retirement fact per bounded
+-- opportunity, in order, and keeps its progress path when it has none left, so
+-- independent evidence can still finish it.
+namedOwner
+  ∷ IORef [String] → IORef [RetirementFact] → Runtime.WindowHost → String → Runtime.AttachmentProtocol
+namedOwner journal remaining host name =
+  Runtime.AttachmentProtocol
+    { Runtime.protocolConstruct = \_ _ → pure ()
+    , Runtime.protocolRollback = pure RollbackSafe
+    , Runtime.protocolStep = \_ acknowledgement →
+        readIORef remaining >>= \case
+          [] → pure Runtime.RetirementAwaiting
+          fact : rest → do
+            writeIORef remaining rest
+            modifyIORef' journal (<> [name <> " certified " <> show fact])
+            _ ← Runtime.certifyGraphicsFact host acknowledgement fact
+            pure Runtime.RetirementAdvanced
+    , Runtime.protocolCompletion = Runtime.FiniteCompletion
+    , Runtime.protocolDisposition = Required
+    , Runtime.protocolRecognizes = \_ → pure False
+    }
+
+-- | Whether the window's exclusive slot is free again.
+slotFree ∷ Runtime.WindowHost → WindowId → IO Bool
+slotFree host window =
+  atomically (Runtime.windowGraphicsStatus host window) >>= \case
+    Runtime.GraphicsPresent _ → pure False
+    _ → pure True
+
+-- | Run owner turns until the check answers, failing the scenario rather than
+-- looping if it never does.
+turnsUntilNative ∷ Runtime.WindowHost → RuntimeControl → String → IO Bool → IO ()
+turnsUntilNative host control what ready =
+  Runtime.runOwnerLoop
+    host
+    control
+    Runtime.LoopHooks
+      { Runtime.loopLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+      , Runtime.loopEvent = Runtime.noApplicationEvents
+      , Runtime.loopUpdate = \turn → do
+          done ← ready
+          if done
+            then pure (Runtime.Finish ())
+            else
+              if Runtime.turnNumber turn > 2000
+                then failCheck ("the owner loop never reached " <> what)
+                else pure Runtime.Continue
+      }
+
+twoHostWindows ∷ Runtime.WindowHost → IO (WindowId, WindowId)
+twoHostWindows host =
+  atomically (Runtime.hostWindowIdentities host) >>= \case
+    [first', second'] → pure (first', second')
+    windows → failCheck ("expected two windows, found " <> show (length windows))
 
 onlyHostWindow ∷ Runtime.WindowHost → IO WindowId
 onlyHostWindow host =
