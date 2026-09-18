@@ -3000,13 +3000,23 @@ usable is published. The check and the publication commit together, so no
 service is ever handed back for an owner that may admit no use.
 
 One protected region covers the reservation, the construction, and the
-publication together. An interruption anywhere in it leaves nothing admitting
-use that nobody can end: the reservation itself is what frees an earlier
-incarnation's bookkeeping, and an interruption after the attachment became
-active is counted as the model's own evidence and begins exactly the retirement
-a detach begins, so an owner turn retires it and frees the slot even though no
-service was ever handed over. The failure is re-raised unchanged and establishes
-no fact.
+publication together. An interruption anywhere inside it leaves nothing
+admitting use that nobody can end: the reservation itself is what frees an
+earlier incarnation's bookkeeping, and an interruption after the attachment
+became active is counted as the model's own evidence and begins exactly the
+retirement a detach begins, so an owner turn retires it and frees the slot even
+though no service was ever handed over. The failure is re-raised unchanged and
+establishes no fact. A construction that was cancelled, and a rollback that
+could not establish safety, re-raise rather than answering, and they say the
+same thing to the schedule that an answered retirement does.
+
+One instant is beyond any handler: an interruption can reach the calling thread
+as the operation restores its masking state, with the attachment already active
+and its service already published. Nothing in Haskell can catch a value's
+delivery, so the contract promises something else instead — that such an
+attachment is never unreachable. `windowGraphicsService` hands the very same
+service back by window, so a caller that catches such an interruption and keeps
+running can detach exactly what it attached.
 
 #### Observing the slot
 
@@ -3049,6 +3059,12 @@ released by the collection's own exit instead, and the host's last release step
 runs after that exit and tells each cell it still holds what its member's
 settled status says — a destruction that happened, or a release that failed. It
 fills only a disposal still pending, so nothing already recorded is rewritten.
+
+`windowGraphicsService` answers a window's current owner's service, which is the
+one that attachment published — the same identity and the same retained cell, so
+it is equal to it and interchangeable with it. A free slot, a window the host no
+longer holds, and a reservation that never published answer `Nothing`. It builds
+no new capability: everything it names, the host already holds.
 
 `hostPendingAttachments` lists the attachments the host still holds, in
 registration order, bounded by the live-window limit.
@@ -3191,7 +3207,11 @@ the scheduled loop polling the turn a detach begins,
 shortening the next wait to the instant that owner named, and polling again once
 a round advanced; an attachment whose caller was interrupted in the handoff
 before its service arrived, left retiring and retired by ordinary turns with the
-slot freed for a fresh incarnation; the whole application exit with owners attached; and an
+slot freed for a fresh incarnation; a published service thrown away and
+recovered from the host by window, then detached with; a construction that
+closes its own window reentrantly, superseding its own publication and keeping
+what it built for retirement; a cancelled construction whose rollback could not
+establish safety asking for a turn at once; the whole application exit with owners attached; and an
 ordinary window-only application seeing no slot, no demand, and unchanged turns.
 The opacity examples compile external clients that name the service's data
 constructor and reach for its observation cell in the private implementation,

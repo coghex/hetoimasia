@@ -91,7 +91,8 @@ another session, closed admission, an unprotected host — before any acquisitio
 effect. On success it
 hands back an opaque `GraphicsService`: an identity, an incarnation, and its own
 observation, with no native pointer, no window, no session, and no authority to
-destroy, release, or certify anything. `windowGraphicsStatus` and
+destroy, release, or certify anything. `windowGraphicsStatus`,
+`windowGraphicsService`, and
 `readGraphicsService` answer whether an owner is attached, retiring, or absent,
 which incarnation holds the slot, which retirement facts are still missing, and
 whether the window's native destruction has completed, from any thread and

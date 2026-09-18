@@ -981,6 +981,7 @@ attachmentClient =
   unlines
     [ "module Main (main) where"
     , ""
+    , "import Control.Concurrent.STM (STM)"
     , "import qualified Data.Text as Text"
     , "import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig)"
     , "import Hetoimasia.Runtime.GLFW"
@@ -1000,6 +1001,10 @@ attachmentClient =
     , ""
     , "detach ∷ WindowHost → GraphicsService → IO DetachAnswer"
     , "detach = detachWindowGraphics"
+    , ""
+    , "-- | The service the host holds for a window, which is the one it published."
+    , "recover ∷ WindowHost → WindowId → STM (Maybe GraphicsService)"
+    , "recover = windowGraphicsService"
     , ""
     , "-- | Everything a service exposes: an identity, an incarnation, and its own"
     , "-- observation. No native pointer, no window, no session, no release."

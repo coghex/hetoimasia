@@ -102,6 +102,12 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testCancelledConstruction)
     it "retires an attachment its caller was interrupted out of, so a turn frees the slot"
       (boundedExample testCancelledAtPublication)
+    it "hands a published attachment back by window, so a caller that lost the answer can still detach it"
+      (boundedExample testServiceRecoverableFromHost)
+    it "publishes nothing usable when the construction closes its own window, and keeps it for retirement"
+      (boundedExample testClosedDuringConstruction)
+    it "asks for a turn at once after a cancelled construction its rollback could not make safe"
+      (boundedExample testCancelledRollbackWantsATurn)
 
   describe "observing the slot" $ do
     it "separates the close from the destruction, which follows the last retirement fact"
@@ -890,6 +896,138 @@ testCancelledAtPublication = do
     other → unexpected ("the stranded attachment was not retiring: " <> show other)
   -- Incarnations are never reissued, so the later owner is the second.
   readIORef reattached `shouldReturn` Just 2
+
+-- | A value returned from an operation is not something the runtime can promise
+-- to deliver: an interruption can reach the calling thread at the instant the
+-- attach restores its masking state, beyond any handler it could install, with
+-- the attachment already active and its service already published.
+--
+-- What the contract promises instead is that such an attachment is never
+-- unreachable. The host hands the very same service back by window, and
+-- detaching with it retires the slot exactly as detaching with the original
+-- would. This example throws the answer away to prove it.
+testServiceRecoverableFromHost ∷ Expectation
+testServiceRecoverableFromHost = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  recovered ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    (owner, published) ← attachedOwner journal host window (ownerNamed "alpha")
+    -- Everything the caller kept of the attachment, discarded.
+    same ← atomically (windowGraphicsService host window)
+    writeIORef recovered ((== published) <$> same)
+    service ← maybe (unexpected "the host handed back no service") pure same
+    graphicsIncarnation service `shouldBe` graphicsIncarnation published
+    detachWindowGraphics host service `shouldReturn` DetachBegun
+    turnsUntil host control "the recovered owner's retirement" (not <$> slotOccupied host window)
+    -- A free slot has no service to hand back, and neither has a window the
+    -- host no longer holds.
+    atomically (windowGraphicsService host window) >>= \case
+      Nothing → pure ()
+      Just _ → unexpected "a free slot handed back a service"
+    atomically (readTVar (ownerSteps owner)) >>= \offered → offered `shouldSatisfy` (> 0)
+    void (closeHostWindow host window)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+    atomically (windowGraphicsService host window) >>= \case
+      Nothing → pure ()
+      Just _ → unexpected "an ended window handed back a service"
+  readIORef recovered `shouldReturn` Just True
+
+-- | A construction that closes its own window, reentrantly, on the very thread
+-- the attach is running on.
+--
+-- The close begins the attachment's retirement before the construction has
+-- returned, so the publication is superseded: nothing usable is handed over,
+-- and whatever the construction built stays registered for retirement rather
+-- than being abandoned.
+testClosedDuringConstruction ∷ Expectation
+testClosedDuringConstruction = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  answered ← newIORef Nothing
+  begun ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    owner ← newOwner (ownerNamed "alpha")
+    let script = ownerNamed "alpha"
+        closing =
+          (protocolFor journal host owner script)
+            { protocolConstruct = \_ acknowledgement → do
+                atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
+                atomically (note journal (Constructed "alpha"))
+                -- Reentrant, on the owner thread, inside the attach itself.
+                closeHostWindow host window >>= writeIORef begun . Just
+            }
+    outcome ← attachWindowGraphics host window closing
+    writeIORef answered (Just outcome)
+    -- Nothing usable was published, and the attachment is still the window's.
+    atomically (windowGraphicsService host window) >>= \case
+      Nothing → pure ()
+      Just _ → unexpected "a superseded construction published a service"
+    atomically (windowGraphicsStatus host window) >>= \case
+      GraphicsPresent observed → do
+        observedSlot observed `shouldBe` SlotRetiring
+        observedMissing observed `shouldBe` allRetirementFacts
+      other → unexpected ("the superseded attachment was not retained: " <> show other)
+    destroyCalls seam `shouldReturn` []
+    -- It retires through its own protocol, and only then is the window
+    -- destroyed.
+    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  readIORef begun `shouldReturn` Just CloseStarted
+  readIORef answered >>= \case
+    Just (GraphicsSuperseded _) → pure ()
+    other → unexpected ("the reentrant close did not supersede the publication: " <> show other)
+  entries ← readTVarIO journal
+  filter (/= Constructed "alpha") entries `shouldBe` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A construction cancelled with a rollback that could not establish safety
+-- re-raises rather than answering, so nothing settles its outcome — but it
+-- leaves an attachment retiring all the same, and a caller that catches the
+-- cancellation must not enter a loop that waits before offering it a turn.
+testCancelledRollbackWantsATurn ∷ Expectation
+testCancelledRollbackWantsATurn = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  (clock, _) ← scriptedClock (concatMap (\turn → [turn, turn]) (map millis [0 .. 7]))
+  pacings ← newTVarIO []
+  owned ← newTVarIO Nothing
+  let config = (settings [windowNamed "alpha"]) {hostIdleWait = 0.25, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    owner ← newOwner (ownerNamed "alpha")
+    atomically (writeTVar owned (Just owner))
+    let script = ownerNamed "alpha"
+        cancelling =
+          (protocolFor journal host owner script)
+            { protocolConstruct = \_ acknowledgement → do
+                atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
+                throwIO ThreadKilled
+            , protocolRollback = pure RollbackUnsafe
+            }
+    interrupted ← try (attachWindowGraphics host window cancelling)
+    case (interrupted ∷ Either SomeException GraphicsAttachment) of
+      Left failure → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right answered → unexpected ("the cancelled construction answered: " <> show answered)
+    -- Retained, owing everything, and never offered an opportunity.
+    atomically (windowGraphicsStatus host window) >>= \case
+      GraphicsPresent observed → observedMissing observed `shouldBe` allRetirementFacts
+      other → unexpected ("the cancelled construction retained nothing: " <> show other)
+    void
+      ( runScheduledOwnerLoop host control $
+          (defaultScheduledHooks quietLogger (\_ → pure (FinishWith ())))
+            { scheduledUpdate = \turn → do
+                atomically (modifyTVar' pacings (<> [scheduledPacing turn]))
+                pure (if turnNumber (scheduledTurn turn) >= 2 then FinishWith () else ContinueWith NoUpdateDemand)
+            }
+      )
+    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    void (closeHostWindow host window)
+    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  readTVarIO pacings >>= \case
+    first' : _ → first' `shouldBe` PolledForWork
+    [] → unexpected "the scheduled loop ran no turns"
 
 -- ---------------------------------------------------------------------------
 -- Observing the slot

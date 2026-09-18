@@ -604,6 +604,7 @@ module Hetoimasia.Runtime.GLFW
   , NativeDisposal (..)
   , WindowGraphics (..)
   , windowGraphicsStatus
+  , windowGraphicsService
   , hostPendingAttachments
   , RetirementDemand (..)
   , noRetirementDemand

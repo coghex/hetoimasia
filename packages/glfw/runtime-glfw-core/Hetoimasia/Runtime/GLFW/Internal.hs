@@ -115,6 +115,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , SlotState (..)
   , NativeDisposal (..)
   , WindowGraphics (..)
+  , windowGraphicsService
   , GraphicsAttachment (..)
   , attachWindowGraphics
   , detachWindowGraphics
@@ -2164,20 +2165,25 @@ attachWindowGraphics host target protocol =
         -- otherwise leave an attachment admitting use that nobody holds a
         -- service to end.
         mask $ \restore → do
-          outcome ← attachRetirement retirement restore target protocol (releaseEarlierCell host)
-          settleAttachment host retirement restore outcome
+          attempted ←
+            tryWithContext (attachRetirement retirement restore target protocol (releaseEarlierCell host))
+          case attempted of
+            Right outcome → settleAttachment host retirement outcome
+            Left (caught ∷ ExceptionWithContext SomeException) → do
+              -- A construction that was cancelled, and a rollback that could not
+              -- establish safety, both leave the attachment retiring and
+              -- re-raise rather than answering. That retirement has never been
+              -- offered an opportunity either, so a caller that catches this and
+              -- keeps running must not wait its idle bound before one.
+              atomically (markRetirementImmediate host)
+              rethrowIO caught
 
 -- | Turn a settled reservation into the public answer, inside the same
 -- protected region that made it.
 settleAttachment
-  ∷ HasCallStack
-  ⇒ WindowHost
-  → HostRetirement
-  → (∀ a. IO a → IO a)
-  → AttachmentOutcome
-  → IO GraphicsAttachment
-settleAttachment host retirement restore = \case
-  AttachmentEstablished active _ → publishOrRetire host retirement restore (activeAttachment active)
+  ∷ HasCallStack ⇒ WindowHost → HostRetirement → AttachmentOutcome → IO GraphicsAttachment
+settleAttachment host retirement = \case
+  AttachmentEstablished active _ → publishOrRetire host retirement (activeAttachment active)
   AttachmentSuperseded identity _ → begunRetiring (GraphicsSuperseded identity)
   AttachmentRolledBack settled → begunRetiring (GraphicsRolledBack settled)
   AttachmentRefused refusal → pure (GraphicsRefused (refusalOf refusal))
@@ -2200,15 +2206,9 @@ settleAttachment host retirement restore = \case
 -- and an owner turn then retires it and frees the slot. It establishes no fact,
 -- and the failure is re-raised unchanged.
 publishOrRetire
-  ∷ HasCallStack
-  ⇒ WindowHost
-  → HostRetirement
-  → (∀ a. IO a → IO a)
-  → AttachmentId
-  → IO GraphicsAttachment
-publishOrRetire host retirement restore identity = do
-  attempted ←
-    tryWithContext (restore (beforePublication (hostHooks host)) >> publishService host identity)
+  ∷ HasCallStack ⇒ WindowHost → HostRetirement → AttachmentId → IO GraphicsAttachment
+publishOrRetire host retirement identity = do
+  attempted ← tryWithContext (beforePublication (hostHooks host) >> publishService host identity)
   case attempted of
     Right answered → pure answered
     Left (caught ∷ ExceptionWithContext SomeException) → do
@@ -2323,6 +2323,41 @@ windowGraphicsStatus host target = case hostRetirementState host of
             , observedMissing = missing
             , observedDisposal = disposal
             }
+
+-- | The service of the window's current owner, or 'Nothing' when its slot is
+-- free, when the host holds no such window, or when the owner's own attachment
+-- has not been published yet.
+--
+-- It builds no new capability: a service is an identity and the observation
+-- cell the host already holds for that incarnation, so what comes back here is
+-- the very service the attachment published, equal to it and interchangeable
+-- with it.
+--
+-- It exists because a value returned from an operation is not something a
+-- runtime can promise to deliver. An interruption can be delivered to the
+-- calling thread at the instant 'attachWindowGraphics' restores its masking
+-- state — after the attachment is active and its service published, and beyond
+-- any handler that operation could install. The attachment is still perfectly
+-- reachable; only the caller's copy of the answer was lost. Asking the host by
+-- window returns it, so a caller that catches such an interruption and keeps
+-- running can always detach what it attached.
+windowGraphicsService ∷ WindowHost → WindowId → STM (Maybe GraphicsService)
+windowGraphicsService host target = case hostRetirementState host of
+  Nothing → pure Nothing
+  Just retirement → do
+    occupant ← windowAttachmentState retirement target
+    cells ← readTVar (hostGraphicsCells host)
+    matching ← traverse readGraphicsCell (Map.lookup target cells)
+    pure $ do
+      (identity, _, _) ← occupant
+      cell ← Map.lookup target cells
+      observed ← matching
+      -- The cell of an incarnation the slot has moved past is dropped when the
+      -- later one reserves, so this only ever disagrees when the later
+      -- reservation published nothing at all.
+      if observedIncarnation observed == attachmentIncarnation identity
+        then pure (serviceFor identity cell)
+        else Nothing
 
 -- | The capability a thread that is not the owner publishes one certified
 -- retirement fact through, or 'Nothing' for a host that owns no attachment
