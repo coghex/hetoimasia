@@ -3,8 +3,8 @@
 -- None of them initializes GLFW, opens a window, or needs a display. The
 -- session examples in "Test.GLFW.Session" and the wake examples in
 -- "Test.GLFW.Wake" drive the production session model through the test seam; the window model, window command, window control,
--- window host, scheduled owner turn, dynamic window, monitor inventory, input
--- feed, and window mode
+-- window host, scheduled owner turn, render demand, dynamic window, monitor
+-- inventory, input feed, and window mode
 -- examples use the seam's private drivers, the private command executor, and the
 -- runtime integration's private host hooks, which this suite may name because it
 -- belongs to the package; "Test.GLFW.Linking" checks the package's link
@@ -31,6 +31,7 @@ import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
 import qualified Test.GLFW.Opacity as Opacity
 import qualified Test.GLFW.Protected as Protected
+import qualified Test.GLFW.Render as Render
 import qualified Test.GLFW.Scheduled as Scheduled
 import qualified Test.GLFW.Session as Session
 import qualified Test.GLFW.Notify as Notify
@@ -49,6 +50,7 @@ spec = describe "GLFW" $ do
   Host.spec
   Protected.spec
   Scheduled.spec
+  Render.spec
   Dynamic.spec
   Monitor.spec
   Input.spec

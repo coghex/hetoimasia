@@ -129,7 +129,9 @@ library runtime-glfw
         hetoimasia-glfw:runtime-glfw-core
 
 -- The runtime integration's implementation, including the test-only host hooks
--- the dynamic window examples use to deliver a cancellation at a precise point.
+-- the dynamic window examples use to deliver a cancellation at a precise point,
+-- and the pure render demand helper that composes the runtime's simulation
+-- demand with each window's observed eligibility and published demand.
 -- Private, so no package outside this one can name them; the public
 -- runtime-glfw sublibrary re-exports everything else.
 library runtime-glfw-core
@@ -138,6 +140,7 @@ library runtime-glfw-core
     hs-source-dirs: runtime-glfw-core
     exposed-modules:
         Hetoimasia.Runtime.GLFW.Internal
+        Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
     build-depends:
         base >=4.21 && <4.22,
@@ -184,7 +187,8 @@ library seam-core
 -- the window model, window command, window control, window host, dynamic
 -- window, monitor inventory, input feed, and window mode examples that use the
 -- private window and monitor drivers, the private command executor, and the
--- host's private test hooks, the pure window attachment model examples, the
+-- host's private test hooks, the scheduled owner turn and render demand
+-- examples over a scripted clock, the pure window attachment model examples, the
 -- link-declaration check against the native
 -- manifest, and the external-client opacity examples. It initializes no GLFW,
 -- opens no window, and needs no display; it links the pinned native SDK only
@@ -209,6 +213,7 @@ test-suite glfw-tests
         Test.GLFW.Notify
         Test.GLFW.Opacity
         Test.GLFW.Protected
+        Test.GLFW.Render
         Test.GLFW.Scheduled
         Test.GLFW.Session
         Test.GLFW.Spec

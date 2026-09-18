@@ -88,6 +88,9 @@ owning subsystem's contract/design when continuing its work.
   owner has two loops: `runOwnerLoop`, unchanged and paced by the turn before
   it, and the additive `runScheduledOwnerLoop`, paced by absolute deadlines from
   the host's injected monotonic clock and bounded by the same finite fallback.
+  `renderTurn` is the pure helper that maps the runtime's simulation demand and
+  each window's captured demand onto that schedule; it knows no GPU, and
+  retirement is never gated by render eligibility.
   `withProtectedWindowHost` builds the same host inside an IO continuation
   boundary that owns attachment retirement; the `Scoped` constructors keep their
   behaviour and accept no attachment. On every exit that boundary ends new

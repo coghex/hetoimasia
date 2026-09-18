@@ -10,9 +10,15 @@ Scope: pure policy over the [time values](time.md) the foundation supplies.
 The policy owns no rendering decision: it does not decide when a frame is
 drawn, and it composes no per-window render demand. Window visibility is not a
 pause; hiding or minimizing a window never invokes pause or resume. Converting
-a demand into a native wait belongs to GLFW, and driving owner turns from
-demand is later work. Nothing in the owner loop, the command path, supervision,
-or the console executable uses this module today.
+a demand into a native wait belongs to GLFW, and so does composing a `Demand`
+with per-window demand: GLFW's [render demand
+helper](glfw.md#render-demand) takes the `Demand` this module produces,
+weighs it against each window's observed eligibility and its own dirtiness and
+frame deadline, and answers the schedule GLFW's [scheduled owner
+turn](glfw.md#the-scheduled-owner-turn) waits on. That helper's worked
+composition is the reference for driving owner turns from this module. Nothing
+in the command path, supervision, or the console executable uses this module
+today.
 
 The module imports only `base` and `Hetoimasia.Foundation.Time`. It reads no
 clock, sleeps, starts no thread, holds no global, and needs no logger.

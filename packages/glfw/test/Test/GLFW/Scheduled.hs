@@ -13,7 +13,20 @@
 -- are the seconds the production code passed to the seam's
 -- @glfwWaitEventsTimeout@, recorded as @WaitEvents@, and the turn sequences are
 -- the production loop's own.
-module Test.GLFW.Scheduled (spec) where
+module Test.GLFW.Scheduled
+  ( spec
+
+    -- * Support shared with the render demand examples
+  , at
+  , durationOf
+  , hosted
+  , millis
+  , pumps
+  , quietLogger
+  , scriptedClock
+  , settings
+  , windowNamed
+  ) where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
