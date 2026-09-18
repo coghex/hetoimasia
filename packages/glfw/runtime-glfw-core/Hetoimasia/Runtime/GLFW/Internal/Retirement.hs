@@ -112,6 +112,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
 
     -- * Completion notices from other threads
   , CompletionPublisher
+  , CompletionPublication (..)
   , completionPublisher
   , publishCompletion
 
@@ -189,7 +190,7 @@ import Hetoimasia.GLFW.Internal.Attachment
   , beginRetirement
   , constructionFailed
   , constructionSucceeded
-  , FactAnswer
+  , FactAnswer (..)
   , RetirementFact
   , recordRetirementFact
   , foldCompletions
@@ -224,6 +225,11 @@ data HostRetirement = HostRetirement
   , retirementState ∷ !(TVar (AttachmentModel Evidence))
   , retirementInbox ∷ !CompletionInbox
   , retirementAdmitting ∷ !(TVar Bool)
+  , retirementPublishing ∷ !(TVar Bool)
+    -- ^ Whether a completion notice may still be offered. The drain closes it
+    -- in the same transaction that finds nothing pending, so no notice — and so
+    -- no notification obligation, and no wake — can be registered after the
+    -- boundary has decided retirement is over.
   , retirementRegistrations ∷ !(TVar [Registration])
     -- ^ In registration order, at most one per window the host may hold.
   , retirementDiagnosed ∷ !(IORef Bool)
@@ -279,6 +285,7 @@ newHostRetirement session limit = do
   HostRetirement identity authority
     <$> newTVarIO model
     <*> pure inbox
+    <*> newTVarIO True
     <*> newTVarIO True
     <*> newTVarIO []
     <*> newIORef False
@@ -555,9 +562,17 @@ settleFailed retirement restore protocol target acknowledgement caught@(Exceptio
     mapM_ (recordFailure retirement target acknowledgement) rolledBack
     pruneRegistrations retirement
   let settled = RolledBack target outcome caught rolledBack
-  if cancelled
-    then maybe (rethrowIO caught) (`raiseRetaining` caught) rolledBack
-    else pure (AttachmentRolledBack settled)
+  case (cancelled, rolledBack) of
+    -- The construction's own cancellation stays primary; a rollback failure of
+    -- any kind is retained beside it.
+    (True, Nothing) → rethrowIO caught
+    (True, Just failed) → raiseRetaining failed caught
+    -- A cancellation the rollback received is still this thread's to answer,
+    -- and is never traded for a synchronous construction failure, which is
+    -- retained beside it instead.
+    (False, Just failed)
+      | isCancellation (exceptionOf failed) → raiseRetaining caught failed
+    (False, _) → pure (AttachmentRolledBack settled)
   where
     cancelled = isCancellation failure
 
@@ -622,10 +637,20 @@ attachmentViewOf retirement target = do
 -- through. It holds no authority over the model and no native handle: an
 -- admitted notice is revalidated on the owner thread exactly as an owner-thread
 -- report is.
-data CompletionPublisher = CompletionPublisher !CompletionInbox !Notifier
+data CompletionPublisher = CompletionPublisher !(TVar Bool) !CompletionInbox !Notifier
 
 completionPublisher ∷ HostRetirement → Notifier → CompletionPublisher
-completionPublisher retirement = CompletionPublisher (retirementInbox retirement)
+completionPublisher retirement =
+  CompletionPublisher (retirementPublishing retirement) (retirementInbox retirement)
+
+-- | What one offered notice did.
+data CompletionPublication
+  = CompletionOffered !NoticeAdmission
+  | CompletionClosed
+    -- ^ The boundary has already found retirement complete, so nothing further
+    -- may be published: a later notice could register a notification obligation
+    -- the one degradation report has already passed.
+  deriving (Eq, Show)
 
 -- | Offer one notice and wake the owner, from any thread.
 --
@@ -633,16 +658,25 @@ completionPublisher retirement = CompletionPublisher (retirementInbox retirement
 -- obligation in the same transaction that admitted it, and that obligation is
 -- discharged by exactly one wake call, so a notice published while the owner is
 -- inside its finite retirement wait ends that wait, and a wake that finds the
--- session terminal enters GLFW not at all. A coalesced or rejected notice
--- registers nothing and wakes nobody.
-publishCompletion ∷ CompletionPublisher → CompletionNotice → IO NoticeAdmission
-publishCompletion (CompletionPublisher inbox notifier) notice = mask_ $ do
-  admission ← atomically $ do
-    admission ← offerCompletion inbox notice
-    when (admission == NoticeAdmitted) (registerNotification notifier)
-    pure admission
-  when (admission == NoticeAdmitted) (void (dischargeNotification notifier))
-  pure admission
+-- session terminal enters GLFW not at all. A coalesced, rejected, or closed
+-- notice registers nothing and wakes nobody.
+--
+-- Admission is decided in the same transaction as the offer, and the drain
+-- closes it in the same transaction that finds nothing pending, so a notice is
+-- either folded by the drain or refused outright — never accepted after the
+-- boundary has stopped looking.
+publishCompletion ∷ CompletionPublisher → CompletionNotice → IO CompletionPublication
+publishCompletion (CompletionPublisher publishing inbox notifier) notice = mask_ $ do
+  published ← atomically $ do
+    open ← readTVar publishing
+    if not open
+      then pure CompletionClosed
+      else do
+        admission ← offerCompletion inbox notice
+        when (admission == NoticeAdmitted) (registerNotification notifier)
+        pure (CompletionOffered admission)
+  when (published == CompletionOffered NoticeAdmitted) (void (dischargeNotification notifier))
+  pure published
 
 -- ---------------------------------------------------------------------------
 -- The drain
@@ -697,8 +731,9 @@ drainRetirement retirement environment restore = go True noDrainOutcome
   where
     go pumping outcome = do
       revived ← foldNotices retirement
+      sealed ← atomically (sealIfFinished retirement)
       pending ← atomically (livePending retirement)
-      if null pending
+      if sealed
         then pure outcome
         else do
           (advanced, stepped) ← opportunities retirement restore pending outcome
@@ -718,21 +753,55 @@ drainRetirement retirement environment restore = go True noDrainOutcome
           (pumping', waited) ← waitRound retirement environment restore pumping progressed diagnosed
           go pumping' waited
 
+-- | Find whether retirement is over, and close publication in the same
+-- transaction if it is.
+--
+-- Whatever a publisher committed before this transaction is folded here; a
+-- publisher that commits after it is refused. Nothing in between can leave a
+-- notice unfolded or an obligation the one degradation report would miss.
+sealIfFinished ∷ HostRetirement → STM Bool
+sealIfFinished retirement = do
+  pending ← livePending retirement
+  if not (null pending)
+    then pure False
+    else do
+      _ ← fold retirement
+      remaining ← livePending retirement
+      if null remaining
+        then True <$ writeTVar (retirementPublishing retirement) False
+        else pure False
+
 -- | Take every pending notice and fold it, revalidating each exactly as an
--- owner-thread report is. A notice naming an attachment whose step had
--- withdrawn its path is the independent evidence that revives it.
+-- owner-thread report is.
+--
+-- Only a notice that actually recorded new evidence counts as progress and
+-- revives a withdrawn path: a refusal, and a duplicate fact the model already
+-- holds, establish nothing, so neither may make a failed disposal run again.
 foldNotices ∷ HostRetirement → IO Bool
-foldNotices retirement = atomically $ do
+foldNotices = atomically . fold
+
+fold ∷ HostRetirement → STM Bool
+fold retirement = do
   notices ← takeCompletions (retirementInbox retirement)
   if null notices
     then pure False
     else do
       model ← readTVar (retirementState retirement)
-      let (_, next) = foldCompletions (retirementOwner retirement) notices model
+      let (answers, next) = foldCompletions (retirementOwner retirement) notices model
+          recorded = [notice | (notice, Right answer) ← answers, established answer]
       writeTVar (retirementState retirement) next
-      mapM_ (reviveRegistration retirement . noticeTarget) notices
+      mapM_ (reviveRegistration retirement . noticeTarget) recorded
       pruneRegistrations retirement
-      pure True
+      pure (not (null recorded))
+
+-- | Whether one folded notice established evidence the model did not already
+-- hold.
+established ∷ FactAnswer → Bool
+established = \case
+  FactRecorded _ → True
+  AttachmentNowRetired → True
+  FactAlreadyRecorded → False
+  AttachmentAlreadyRetired → False
 
 -- | Give each pending attachment that still has a progress path one bounded
 -- opportunity, in registration order.
@@ -776,7 +845,10 @@ opportunity retirement restore registration outcome = do
       withdraw
       pure (False, outcome)
     Left caught@(ExceptionWithContext _ failure)
-      | isCancellation failure → (,) False <$> absorb retirement (Left caught) outcome
+      -- Withdrawn as a failed step is: an interrupted step may have disposed
+      -- part of what it owns, and nothing here knows whether running it again
+      -- would be safe. Independent evidence revives it.
+      | isCancellation failure → withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
       | otherwise → do
           -- Evidence, never a fact: the step is withdrawn rather than replayed,
           -- and the attachment is not safe.

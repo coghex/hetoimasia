@@ -21,7 +21,7 @@
 -- waits and a completion published from another thread really ends that wait.
 module Test.GLFW.Protected (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, killThread)
+import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
@@ -43,9 +43,12 @@ import Control.Exception
   , fromException
   , throwIO
   , try
+  , uninterruptibleMask_
   )
+import Data.Unique (newUnique)
 import Control.Monad (forM_, void, when)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnException, BlockedOnSTM), ThreadStatus (..), threadStatus)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log
   ( Component
@@ -63,7 +66,16 @@ import Hetoimasia.Foundation.Resource (Scoped, allocResource, withScoped)
 import Hetoimasia.Foundation.Worker (WorkerDefinition, awaitStopRequest, workerDefinition)
 import Hetoimasia.GLFW.Internal.Attachment
   ( Acknowledgement
+  , AttachmentConfigRejected
   , AttachmentEvidence (..)
+  , AttachmentId
+  , AttachmentModel
+  , OwnerAuthority
+  , Registered (..)
+  , attachWindow
+  , hostIdentity
+  , newAttachmentModel
+  , registerWindow
   , AttachmentFailure (..)
   , AttachmentPhase (..)
   , AttachmentView (..)
@@ -74,6 +86,7 @@ import Hetoimasia.GLFW.Internal.Attachment
   , allRetirementFacts
   , completionNotice
   )
+import Hetoimasia.GLFW.Internal.Window (windowSessionIdentity)
 import Hetoimasia.GLFW.Internal.Seam
   ( NativeCall (DestroyWindow)
   , Seam
@@ -89,7 +102,7 @@ import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
-import Hetoimasia.Runtime.GLFW.Internal.Retirement (publishCompletion)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (CompletionPublication (..), CompletionPublisher, publishCompletion)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
@@ -142,6 +155,8 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testRollbackFails)
     it "retains one whose rollback was cancelled too, keeping both cancellations and finishing the drain"
       (boundedExample testCancelledRollback)
+    it "re-raises a cancellation the rollback received after a construction that failed synchronously"
+      (boundedExample testRollbackCancelledAfterFailure)
 
   describe "the drain" $ do
     it "retains repeated cancellation as evidence, establishes no fact, and re-raises one only once retirement is safe"
@@ -156,6 +171,16 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testDeferredWindowRetired)
     it "admits one completion notice per fact per window the host may hold"
       (boundedExample testInboxHoldsEveryFact)
+    it "settles a cancellation queued in the handoff out of construction, rather than skipping its exit"
+      (boundedExample testCancelledAtHandoff)
+    it "refuses a completion published once it has found retirement complete"
+      (boundedExample testPublicationCloses)
+    it "withdraws an interrupted step rather than running it again, and reports the stall"
+      (boundedExample testInterruptedStepWithdrawn)
+    it "revives a withdrawn path for new evidence only, never for a duplicate or a refused notice"
+      (boundedExample testOnlyNewEvidenceRevives)
+    it "defers a cancellation queued as the last fact is certified until the window is destroyed"
+      (boundedExample testCancelledIntoDisposal)
 
   describe "failed retirement steps" $ do
     it "keeps a required step's failure and evidence, never marks the attachment safe, and never replays the step"
@@ -219,6 +244,9 @@ data Step
   | Stall
     -- ^ No safe progress path; the path is withdrawn.
   | FailWith !Text
+  | Blocking
+    -- ^ A step that begins disposing and never returns, so an example can
+    -- interrupt it partway.
   deriving (Eq, Show)
 
 -- | What an example scripts one owner to do.
@@ -244,6 +272,9 @@ data Owner = Owner
   , ownerPlan ∷ !(TVar [Step])
   , ownerStalls ∷ !(TVar Int)
   , ownerAwaits ∷ !(TVar Int)
+  , ownerSteps ∷ !(TVar Int)
+    -- ^ Every opportunity the boundary offered, so an example can prove a step
+    -- was not replayed and a withdrawn path was not revived.
   , ownerViews ∷ !(TVar [AttachmentView Evidence])
     -- ^ The view each certifying opportunity saw before it certified, so an
     -- example can assert the evidence an attachment carried while it was live.
@@ -263,6 +294,7 @@ attachOwner journal host window script = do
     Owner (scriptName script)
       <$> newTVarIO Nothing
       <*> newTVarIO (scriptPlan script)
+      <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO 0
       <*> newTVarIO []
@@ -285,6 +317,7 @@ protocolFor journal host owner script =
     , protocolRollback = scriptRollback script
     , protocolStep = \target acknowledgement → do
         step ← atomically $ do
+          modifyTVar' (ownerSteps owner) (+ 1)
           plan ← readTVar (ownerPlan owner)
           case plan of
             [] → pure Stall
@@ -298,6 +331,9 @@ protocolFor journal host owner script =
       Await → RetirementAwaiting <$ atomically (modifyTVar' (ownerAwaits owner) (+ 1))
       Stall → RetirementStalled <$ atomically (modifyTVar' (ownerStalls owner) (+ 1))
       FailWith message → throwIO (Scripted message)
+      -- Reads a variable another thread writes, so this is a park rather than a
+      -- deadlock the runtime would break.
+      Blocking → atomically (readTVar (ownerPlan owner) >> retry)
       Certify fact → do
         atomically $ do
           seen ← hostAttachmentView host target
@@ -316,7 +352,8 @@ publishFacts journal host owner facts = do
   forM_ facts $ \fact → do
     atomically (note journal (flagOf (ownerName owner) fact))
     publishCompletion publisher (completionNotice target acknowledgement fact) >>= \case
-      NoticeRejectedFull → unexpected "the completion inbox refused a notice"
+      CompletionOffered NoticeRejectedFull → unexpected "the completion inbox refused a notice"
+      CompletionClosed → unexpected "the boundary had already closed publication"
       _ → pure ()
 
 -- | A supervised job that waits until its attachment stops admitting new
@@ -379,10 +416,11 @@ journallingSeamWaiting blocking journal = do
         }
   writeIORef held (Just seam)
   pure seam
-  where
-    -- The seam records the call before it runs this hook, so the last one
-    -- recorded is the window being destroyed now.
-    latestDestroyed calls = last (0 : [key | DestroyWindow key ← calls])
+
+-- | The window being destroyed now: the seam records the call before it runs
+-- the destroy hook, so the last one recorded is this one.
+latestDestroyed ∷ [NativeCall] → Int
+latestDestroyed calls = last (0 : [key | DestroyWindow key ← calls])
 
 -- | Run one application over a protected host in the seam's session, on a bound
 -- thread designated as the process main thread.
@@ -941,7 +979,7 @@ scriptedParent journal name = allocResource (pure ()) (\() → atomically (note 
 testStalledThenEvidence ∷ Expectation
 testStalledThenEvidence = do
   journal ← newTVarIO []
-  entries ← newIORef []
+  entries ← newTVarIO []
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
@@ -1106,6 +1144,328 @@ testWindowLimitBounds = do
   validateHostConfig (settings [windowNamed "alpha", windowNamed "beta"]) {hostWindowLimit = 1}
     `shouldBe` Left (WindowLimitRejected 1)
 
+
+-- | A construction that failed synchronously and a rollback that was then
+-- cancelled: the cancellation is this thread's to answer and is never traded
+-- for the synchronous failure, which is retained beside it.
+testRollbackCancelledAfterFailure ∷ Expectation
+testRollbackCancelledAfterFailure = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  rollingBack ← newEmptyMVar
+  never ← newEmptyMVar
+  (runner, finished) ←
+    onMainThread seam $
+      protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = throwIO (Scripted "construction")
+                  , scriptRollback = putMVar rollingBack () >> takeMVar never
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+  takeMVar rollingBack
+  killThread runner
+  takeMVar finished >>= \case
+    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+    Right () → unexpected "the cancelled rollback returned"
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The exit handler covers the handoff out of the scope's own construction.
+--
+-- The cancellation is queued while the construction is uninterruptible — the
+-- killer is waited for until it is itself parked in its delivery — so it is
+-- delivered at the first point the boundary restores, which is that handoff.
+-- The protected exit must still run: it closes attachment publication, which
+-- the ordinary scope release does not, so a notice offered afterwards is
+-- refused rather than admitted.
+testCancelledAtHandoff ∷ Expectation
+testCancelledAtHandoff = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  registered ← newEmptyMVar
+  proceed ← newEmptyMVar
+  captured ← newIORef Nothing
+  let hooks =
+        noHostHooks
+          { afterRegistration = putMVar registered () >> uninterruptibleMask_ (takeMVar proceed)
+          , -- Capture only: nothing is attached here, because a cancellation
+            -- during construction unwinds the scope without the exit handler.
+            afterHostBuilt = writeIORef captured . Just
+          }
+  (runner, finished) ←
+    onMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            withProtectedWindowHostWith hooks quietLogger (seamSession seam defaultSessionConfig) (settings [windowNamed "alpha"]) use
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  takeMVar registered
+  awaitBlockedOn BlockedOnMVar runner
+  killer ← forkIO (killThread runner)
+  -- Once the killer is parked delivering it, the exception is queued: the
+  -- construction then runs to the handoff with nothing interruptible in
+  -- between.
+  awaitBlockedOn BlockedOnException killer
+  putMVar proceed ()
+  takeMVar finished >>= \case
+    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+    Right () → unexpected "the cancelled handoff returned"
+  host ← readIORef captured >>= maybe (unexpected "the host was not captured") pure
+  publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
+  closedPublication publisher `shouldReturn` True
+  readTVarIO journal `shouldReturn` [WindowGone 1, SessionEnded]
+
+-- | Whether the boundary has closed completion publication, asked with a notice
+-- of its own that names nothing the model can accept.
+closedPublication ∷ CompletionPublisher → IO Bool
+closedPublication publisher = do
+  (_, acknowledgement) ← strayAttachment
+  publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledgement) acknowledgement CpuUseRetired)
+    >>= \case
+      CompletionClosed → pure True
+      _ → pure False
+
+-- | An identity and acknowledgement from a model of another host entirely: the
+-- owner refuses every notice naming it, so offering one asks about admission
+-- and nothing else.
+strayAttachment ∷ IO (AttachmentId, Acknowledgement)
+strayAttachment = do
+  seam ← newSeam defaultScript
+  identity ← hostIdentity <$> newUnique
+  window ←
+    asProcessMainThread seam $
+      withScoped (seamSession seam defaultSessionConfig) $ \built →
+        withWindow built (windowNamed "stray") (pure . windowIdentity)
+  let session = windowSessionIdentity window
+  case newAttachmentModel identity session 1 ∷ Either AttachmentConfigRejected (OwnerAuthority, AttachmentModel ()) of
+    Left rejected → unexpected ("the stray model was refused: " <> show rejected)
+    Right (authority, model) →
+      case registerWindow authority window model >>= \(_, registered) → attachWindow authority identity window registered of
+        Left refusal → unexpected ("the stray attachment was refused: " <> show refusal)
+        Right (reserved, _) → pure (registeredAttachment reserved, registeredAcknowledgement reserved)
+
+-- | Once the boundary has found retirement complete it closes publication in
+-- that same transaction, so no later notice can register a notification the one
+-- degradation report has already passed.
+testPublicationCloses ∷ Expectation
+testPublicationCloses = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  captured ← newIORef Nothing
+  duringRun ← newIORef Nothing
+  asProcessMainThread seam $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          withProtectedWindowHostWith
+            noHostHooks {afterHostBuilt = writeIORef captured . Just}
+            quietLogger
+            (seamSession seam defaultSessionConfig)
+            (settings [windowNamed "alpha"])
+            ( \host → do
+                window ← onlyWindow host
+                void (establishedOwner journal host window (ownerNamed "alpha"))
+                use host
+            )
+      )
+      id
+      (\host _ → pure host)
+      ( \host _ → do
+          publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
+          closedPublication publisher >>= writeIORef duringRun . Just
+      )
+  -- Open while the application runs, closed once the drain has finished.
+  readIORef duringRun `shouldReturn` Just False
+  host ← readIORef captured >>= maybe (unexpected "the host was not captured") pure
+  publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
+  closedPublication publisher `shouldReturn` True
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A step interrupted partway may have disposed part of what it owns, and
+-- nothing knows whether running it again would be safe, so its path is
+-- withdrawn exactly as a failed step's is — which the stall diagnostic, owed
+-- only when no path is left, is the evidence of.
+testInterruptedStepWithdrawn ∷ Expectation
+testInterruptedStepWithdrawn = do
+  journal ← newTVarIO []
+  entries ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  let logger = recordingLogger entries
+  (runner, finished) ←
+    onMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Blocking]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  owner ← awaitHeld owned
+  host ← awaitHeld hostHeld
+  -- The step has begun disposing and cannot return.
+  atomically (readTVar (ownerSteps owner) >>= check . (>= 1))
+  awaitBlockedOn BlockedOnSTM runner
+  killThread runner
+  -- With the path withdrawn, and no other, the boundary owes its one stall
+  -- diagnostic; the step is never offered again until evidence arrives.
+  atomically (afterStallReported entries)
+  readTVarIO (ownerSteps owner) `shouldReturn` 1
+  publishFacts journal host owner allRetirementFacts
+  takeMVar finished >>= \case
+    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+    Right () → unexpected "the cancelled drain returned"
+  stallReports entries `shouldReturn` 1
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A refused notice and a duplicate fact establish nothing, so neither may
+-- revive a withdrawn path and make a failed disposal run again.
+testOnlyNewEvidenceRevives ∷ Expectation
+testOnlyNewEvidenceRevives = do
+  journal ← newTVarIO []
+  entries ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  let logger = recordingLogger entries
+  (runner, finished) ←
+    onMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ←
+                establishedOwner
+                  journal
+                  host
+                  window
+                  (ownerNamed "alpha") {scriptPlan = [Certify CpuUseRetired, FailWith "disposal"]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  owner ← awaitHeld owned
+  host ← awaitHeld hostHeld
+  publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
+  acknowledgement ← atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
+  -- The first fact was certified and the second step failed, so nothing has a
+  -- path left and the stall is owed.
+  atomically (afterStallReported entries)
+  awaitBlockedOn BlockedOnSTM runner
+  stepsBefore ← readTVarIO (ownerSteps owner)
+  -- A duplicate of the fact already recorded, and a notice for another host's
+  -- attachment entirely. Both are folded and both establish nothing.
+  (stray, strayAcknowledgement) ← strayAttachment
+  let target = acknowledgedAttachment acknowledgement
+  void (publishCompletion publisher (completionNotice target acknowledgement CpuUseRetired))
+  void (publishCompletion publisher (completionNotice stray strayAcknowledgement CpuUseRetired))
+  -- The round that folded them has finished and parked again.
+  awaitBlockedOn BlockedOnSTM runner
+  readTVarIO (ownerSteps owner) `shouldReturn` stepsBefore
+  -- Real evidence does revive it, and the run then finishes.
+  publishFacts journal host owner (filter (/= CpuUseRetired) allRetirementFacts)
+  takeMVar finished >>= \case
+    Right () → unexpected "the required step's failure did not fail the run"
+    Left caught → (fromException caught ∷ Maybe Scripted) `shouldBe` Just (Scripted "disposal")
+  stallReports entries `shouldReturn` 1
+  -- The first flag is the step's own certification; the rest are the published
+  -- facts. The duplicate and the refused notice are offered directly, so they
+  -- journal nothing and, having established nothing, change nothing.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A cancellation queued as the last fact is certified, while the window's own
+-- destruction is under way, is deferred: the destruction completes once, the
+-- session and the parent outlive it, and the cancellation is the outcome only
+-- afterwards.
+testCancelledIntoDisposal ∷ Expectation
+testCancelledIntoDisposal = do
+  journal ← newTVarIO []
+  destroying ← newEmptyMVar
+  proceed ← newEmptyMVar
+  seam ← destroyGatedSeam journal destroying proceed
+  (runner, finished) ←
+    onMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            withScoped (scriptedParent journal "parent") $ \() →
+              protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                void (establishedOwner journal host window (ownerNamed "alpha"))
+                use host
+        )
+        id
+        (\host _ → pure host)
+        ( \host _ → do
+            window ← onlyWindow host
+            closeHostWindow host window `shouldReturn` CloseStarted
+        )
+  -- The drain certified the last fact and is inside the window's destruction,
+  -- which runs uninterruptibly.
+  takeMVar destroying
+  killer ← forkIO (killThread runner)
+  awaitBlockedOn BlockedOnException killer
+  putMVar proceed ()
+  takeMVar finished >>= \case
+    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+    Right () → unexpected "the cancelled disposal returned"
+  -- Destroyed exactly once, and the session and the parent released only after
+  -- it, whatever was queued during it.
+  readTVarIO journal
+    `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded, ParentReleased "parent"])
+
+-- | 'journallingSeam' whose destroy hook parks until the example releases it,
+-- so a cancellation can be queued while the destruction is in flight.
+destroyGatedSeam ∷ TVar [Flag] → MVar () → MVar () → IO Seam
+destroyGatedSeam journal destroying proceed = do
+  posts ← newTVarIO (0 ∷ Int)
+  held ← newIORef Nothing
+  seam ←
+    newSeam
+      defaultScript
+        { scriptDestroyWindow = \_ → do
+            destroyed ← readIORef held >>= maybe (pure 0) (fmap latestDestroyed . seamCalls)
+            atomically (note journal (WindowGone destroyed))
+            putMVar destroying ()
+            takeMVar proceed
+        , scriptTerminate = \_ → atomically (note journal SessionEnded)
+        , scriptWaitEvents = \_ _ →
+            atomically (readTVar posts >>= \pending → if pending <= 0 then retry else writeTVar posts (pending - 1))
+        , scriptPostEmptyEvent = \_ → atomically (modifyTVar' posts (+ 1))
+        }
+  writeIORef held (Just seam)
+  pure seam
+
 -- ---------------------------------------------------------------------------
 -- Failed retirement steps
 
@@ -1262,9 +1622,9 @@ twoWindows host =
 quietLogger ∷ Logger
 quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
 
-recordingLogger ∷ IORef [LogEntry] → Logger
+recordingLogger ∷ TVar [LogEntry] → Logger
 recordingLogger entries =
-  mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\entry → modifyIORef' entries (<> [entry])))
+  mkLoggerWith defaultLogFilter systemMetadata (callbackSink (atomically . modifyTVar' entries . flip (<>) . pure))
 
 -- | A logger whose sink fails for one component's entries alone.
 failingLogger ∷ Text → Logger
@@ -1272,9 +1632,25 @@ failingLogger component =
   mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \entry →
     when (componentText (entryComponent entry) == component) (throwIO (Scripted "sink"))
 
-stallReports ∷ IORef [LogEntry] → IO Int
-stallReports entries =
-  length . filter ((== "glfw.retirement") . componentText . entryComponent) <$> readIORef entries
+stallReports ∷ TVar [LogEntry] → IO Int
+stallReports = fmap (length . stalls) . readTVarIO
+
+stalls ∷ [LogEntry] → [LogEntry]
+stalls = filter ((== "glfw.retirement") . componentText . entryComponent)
+
+-- | The stall diagnostic has been written.
+afterStallReported ∷ TVar [LogEntry] → STM ()
+afterStallReported entries = readTVar entries >>= check . not . null . stalls
+
+-- | Wait until a thread is parked for this reason, so an example can act at a
+-- point the boundary has actually reached rather than one it hopes for.
+awaitBlockedOn ∷ BlockReason → ThreadId → IO ()
+awaitBlockedOn reason target =
+  threadStatus target >>= \case
+    ThreadBlocked blocked | blocked == reason → pure ()
+    ThreadFinished → unexpected "the thread finished instead of parking"
+    ThreadDied → unexpected "the thread died instead of parking"
+    _ → yield >> awaitBlockedOn reason target
 
 -- | Run an action on a new bound thread designated as the process main thread,
 -- so an example can cancel it.

@@ -489,10 +489,16 @@ data HostHooks = HostHooks
     -- ^ Runs at the end of a window's registration, masked and with nothing
     -- interruptible before it: after the collection and the host have both
     -- registered the window, before its creation's result is published.
+  , afterHostBuilt ∷ WindowHost → IO ()
+    -- ^ Runs once the host is built and its configured windows registered,
+    -- still inside its construction and before its consumer is entered. For a
+    -- protected host this is inside the exit handler's mask, so an example may
+    -- attach here and prove that even a cancellation delivered in the handoff
+    -- is retired rather than skipped.
   }
 
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ())
+noHostHooks = HostHooks (pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol
@@ -578,6 +584,7 @@ allocHostOver protection hooks sessionScope config = do
         <*> pure hooks
         <*> pure retirement
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
+  liftIO (afterHostBuilt hooks host)
   pure host
 
 -- | The read endpoint of the host session's monitor inventory, which any thread
@@ -1654,10 +1661,14 @@ withProtectedWindowHostIn = withProtectedWindowHostWith noHostHooks
 withProtectedWindowHostWith
   ∷ HasCallStack ⇒ HostHooks → Logger → Scoped Session → HostConfig → (WindowHost → IO r) → IO r
 withProtectedWindowHostWith hooks logger sessionScope config use =
-  withScoped (allocHostOver Protected hooks sessionScope config) $ \host →
-    -- Installed here, masked, before the host reaches its consumer and before
-    -- anything the consumer constructs can restore interruptibility.
-    mask $ \restore → do
+  -- The scope is entered under this mask, so the handler below is installed
+  -- before anything at all can be delivered — including in the handoff out of
+  -- the scope's own construction and into the consumer, which is a point the
+  -- scope restores at. Each part still acquires exactly as it does for
+  -- 'allocWindowHost', which already acquires under a mask of its own, and the
+  -- consumer is lent the restore.
+  mask $ \restore →
+    withScoped (allocHostOver Protected hooks sessionScope config) $ \host → do
       outcome ← tryWithContext (restore (use host))
       settleProtectedExit restore logger host outcome
 

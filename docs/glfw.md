@@ -2566,9 +2566,10 @@ either.
 [`runManagedApplication`](resources.md#managed-dependency-lifetimes) accepts, and
 `runProtectedWindowApplication` is `runWindowApplication` over one of them. It
 invokes its consumer exactly once, synchronously on the calling thread, with
-every dependency it built live, and not at all when its own construction failed;
-its exit handler is installed under masking before the host is handed over and
-before interruptibility is restored for any dependent the consumer constructs.
+every dependency it built live, and not at all when its own construction failed.
+Its exit handler is installed under masking before the scope is entered at all,
+so it covers the handoff out of construction and into the consumer — itself a
+point the scope restores at — as well as everything the consumer then does.
 It is the LIFE-3 slice of
 [the window and graphics lifetime design](window_graphics_lifetime_design.md)
 (P-3, D-1 to D-4).
@@ -2624,7 +2625,17 @@ Another thread publishes a certified fact as a bounded completion notice, which
 registers its notification obligation in the transaction that admitted it and
 discharges it with exactly one wake — the same accounting an admission uses — so
 a notice published during retirement really ends the owner's wait, and a wake
-that finds the session terminal enters GLFW not at all.
+that finds the session terminal enters GLFW not at all. Publication closes in the
+same transaction that first finds nothing pending, so a notice is either folded
+by the drain or refused outright: none can register an obligation after the one
+degradation report has passed.
+
+Only a notice that recorded evidence the model did not already hold counts as
+progress and revives a withdrawn path. A refusal, and a duplicate of a fact
+already recorded, establish nothing, so neither can make a failed disposal run
+again. An interrupted step withdraws its path exactly as a failed one does: it
+may have disposed part of what it owns, and nothing knows whether running it
+again would be safe.
 
 #### Outcome and cancellation
 
@@ -2684,7 +2695,9 @@ recorded as unsafe: the attachment is retained owing every fact rather than left
 with its construction pending, where no fact could ever be recorded and the
 drain could never finish. Its own failure is retained beside the construction
 failure the model keeps first, and a cancelled construction re-raises with it
-retained under `glfw attachment rollback`. Because a safe rollback retires the
+retained under `glfw attachment rollback`. A cancellation the rollback itself
+received is equally this thread's to answer: it is re-raised with the
+synchronous construction failure retained beside it, never traded for it. Because a safe rollback retires the
 attachment and removes its evidence with it, the answer carries the original
 construction failure and the rollback's own back to the integration that
 attached; this boundary raises neither.
@@ -2708,8 +2721,14 @@ only one can retire, with the other's window, the session, and a scripted parent
 retained while the first retires and its closed window is destroyed; a window
 that became safe before the drain being destroyed in a round that made no
 progress at all; one completion notice per fact per window admitted at once; a
-rollback that itself fails and one that is cancelled, each retained rather than
-stranded in construction; the window limit's bounds; a stalled
+rollback that itself fails, one that is cancelled, and one cancelled after a
+construction that failed synchronously, each retained rather than stranded in
+construction and each re-raising what it received; the window limit's bounds; a
+cancellation queued in the handoff out of construction, which the exit still
+settles; a notice refused once retirement is complete; an interrupted step
+withdrawn rather than run again; a duplicate and a refused notice reviving
+nothing; a cancellation queued while the window's own destruction is in flight,
+which defers until the session and a parent have outlived it; a stalled
 attachment finishing on later independent evidence, with the stall reported
 once; a stall diagnostic that itself fails, unwinding nothing; required and
 recognized-optional retirement-step failures with their evidence retained and
@@ -3139,6 +3158,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Release failure | The window | A failing release part sets it; the observation release reads it | Owner | The window | Read at release |
 | Attachment model and its owner authority | The protected host lifetime | The owner thread writes; any thread may read the phases, facts, and evidence | Owner; STM | The host | Ends with the host, every attachment retired first |
 | Attachment admission | The protected host lifetime | Quiescence closes it, and the host's own exit closes it again | Any; STM | The host | Closed on every exit, idempotently; never reopened |
+| Completion publication | The protected host lifetime | Every offer reads it; the drain closes it | Any; STM | The host | Closed in the transaction that first finds nothing pending; never reopened |
 | Completion inbox | The protected host lifetime | Any thread offers a notice; the owner takes and folds them | Any; STM | The host | Emptied by each take; bounded by the window limit times the retirement facts |
 | Registered retirement protocols | The protected host lifetime | The owner registers, withdraws, revives, and prunes them | Owner; STM | Until the attachment retires | At most one per window the host may hold; removed as attachments retire |
 | The stall diagnostic | The protected host lifetime | The owner claims it | Owner | The host | Claimed once, whatever it records; never retried |
