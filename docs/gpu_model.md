@@ -137,6 +137,11 @@ shares exactly one record and discharges once, while frames submitted by separat
 calls owe separate records; and rendering completion never recycles presentation
 synchronization, because the two are different keys on different holds.
 
+A subject whose logical release or ended CPU use has been certified takes no new
+recorded reference: the owner has already said that nothing can still record it,
+and a batch admitted afterwards would make that certification false. Batches
+already recorded are untouched by a later certification.
+
 Discarding a batch, resetting a recorder and abandoning unsubmitted work each
 discharge exactly their own references and nothing else. Recording retains the
 exact generations it referenced: rebuilding a managed resource beneath a recorded
@@ -271,16 +276,29 @@ Close wins. A target that is closing admits no retry, and a construction that
 succeeds after the close was observed is retired rather than published back into
 active rendering.
 
-Handing a generation over as `oldSwapchain` retires it *there*, before anything is
-known about the replacement, and that retirement is irreversible: a failed
-construction leaves it retired, and it cannot be handed over a second time.
+Only the target's current published generation may be handed over as
+`oldSwapchain`. A candidate that is still constructing has nothing to retire and
+is not the active generation, so handing it over would record an irreversible
+retirement of something that never rendered — and would clear the generation that
+actually is active. Handing over the right one retires it *there*, before
+anything is known about the replacement, and that retirement is irreversible: a
+failed construction leaves it retired, and it cannot be handed over a second time.
 
 An allocation attempt carries its own stable identity and exactly one spent-retry
 bit. It may retry only after a reclamation pass confirmed a **successful
 disposal**: examining records is not progress, and neither is requesting a
 disposal that then failed. If the attempt's construction already retired a
 generation as `oldSwapchain`, the retry is refused outright, because the previous
-creation arguments no longer describe the state to construct from.
+creation arguments no longer describe the state to construct from. A terminal
+session refuses one too: a retry is an admission of new native work, and
+permitting it would invite a construction whose successful result the model would
+then decline to record.
+
+A reclamation pass reads a bounded window of the records the model holds, not of
+the eligible ones — deciding that a record is ineligible is itself an examination,
+and filtering first would let a pass read everything while reporting that it read
+almost nothing. A cursor carries from pass to pass, so a record beyond one
+window is reached by a later pass rather than never.
 
 A failed disposal retains the subject's ownership and its accounting, is never
 replayed, and escalates the session. A cleanup failure is never permission to
@@ -306,6 +324,13 @@ out; each poll that finds nothing moves one step along, and the last step is the
 steady state it stays at. New demand, a new obligation, an observed completion
 and a close transition each schedule an immediate opportunity and start the
 schedule over.
+
+The reset is about new work existing, not about who made it. Retiring a
+generation, failing or superseding a construction, certifying ended CPU use,
+releasing a resource and discarding a recorded batch all create retirement or
+disposal work, and each starts the schedule over — a target that retires a
+generation while the session has backed off to its idle interval must not wait
+that interval out before the owner looks at it.
 
 A suspended target contributes no render deadline and keeps every obligation it
 had, including its retirement demand, so suspension silences a deadline and never
@@ -372,6 +397,14 @@ served it while a newer one stays pending; an image still named by the record
 that outlived its frame, in either completion order, and not acquirable twice;
 and a logical resource forgotten after its last generation is disposed of while a
 retained identity for it is still called stale.
+
+It covers the same class of edge for the transitions themselves: a still-
+constructing candidate refused as an `oldSwapchain` predecessor without mutating
+anything; recording refused against a released or CPU-use-ended subject while an
+already-recorded batch survives; a retry refused in a terminal session for every
+cause that ends one; a reclamation pass reading exactly its window of raw records
+and reaching an eligible one beyond that window on a later pass; and the backoff
+restarting for retirement work whoever created it.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

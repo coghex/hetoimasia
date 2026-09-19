@@ -159,6 +159,42 @@ spec = describe "holds" $ do
     disposalEligible (ResourceSubject original) rebuilt `shouldBe` False
     recorded rebuilt (ResourceSubject replacement) `shouldBe` []
 
+  it "refuses to record against a subject whose release or ended CPU use has been certified" $ do
+    model ← freshModel
+    (active, target, generation) ← activeTarget 2 model
+    (resourced, released) ← aResource 1024 active
+    (resourcedAgain, ended) ← aResource 1024 resourced
+    (usable, live) ← aResource 1024 resourcedAgain
+    (framed, frame) ← acquiredFrame target usable
+
+    -- Both certifications say the same thing in different words: nothing can
+    -- record this any more. A batch admitted afterwards would make that false.
+    sealedByRelease ← admitted_ "releasing one resource" (releaseResource released framed)
+    sealedByCpu ← admitted_ "ending another's CPU use" (endResourceCpuUse ended sealedByRelease)
+
+    rejected "recording a released resource" (recordBatch frame [released] sealedByCpu)
+      >>= (`shouldBe` WrongPhase ResourceIdentity)
+    rejected "recording a resource whose CPU use ended" (recordBatch frame [ended] sealedByCpu)
+      >>= (`shouldBe` WrongPhase ResourceIdentity)
+    -- Nothing was charged and nothing was written by either refusal.
+    usageBatches (usage sealedByCpu) `shouldBe` 0
+    usageObjects (usage sealedByCpu) `shouldBe` usageObjects (usage framed)
+
+    -- The still-live resource records normally, so this is about the
+    -- certification and not about recording.
+    (recorded', batch) ← admitted "recording a live resource" (recordBatch frame [live] sealedByCpu)
+    recorded recorded' (ResourceSubject live) `shouldBe` [batch]
+    -- And the batch already recorded survives a later certification.
+    afterwards ← admitted_ "releasing it afterwards" (releaseResource live recorded')
+    recorded afterwards (ResourceSubject live) `shouldBe` [batch]
+
+    -- The frame's own generation is held to the same rule, proved with a
+    -- resource that is still recordable so the generation is what refuses.
+    (spare, another) ← aResource 1024 afterwards
+    sealedGeneration ← admitted_ "ending the generation's CPU use" (endGenerationCpuUse generation spare)
+    rejected "recording into a sealed generation" (recordBatch frame [another] sealedGeneration)
+      >>= (`shouldBe` WrongPhase GenerationIdentity)
+
   it "refuses a rebuild through a retained older identity, so a live generation is never reissued" $ do
     model ← freshModel
     (resourced, first) ← aResource 1024 model

@@ -170,18 +170,32 @@ spec = describe "admission budgets" $ do
       reclaimDisposed report `shouldBe` [GenerationSubject generation]
       usageObjects (usage reclaimed) `shouldBe` published - 2
 
-    it "examines no more records in one reclamation pass than its budget allows" $ do
+    it "reads no more records in one reclamation pass than its budget allows, and reaches the rest later" $ do
+      -- Two records the pass must skip and one it can dispose of, with a window
+      -- of one. Deciding that a record is ineligible is itself an examination,
+      -- so a pass that filtered first would read all three while reporting that
+      -- it had read almost nothing.
       model ← freshModelWith smallRequest {requestedReclaimExamination = 1, requestedBytes = 8192}
-      (one, first) ← aResource 1024 model
-      (two, second) ← aResource 1024 one
-      settledOne ← settleResource first two
-      settledTwo ← settleResource second settledOne
-      let (afterFirst, firstReport) = reclaimPass disposing settledTwo
-      reclaimExamined firstReport `shouldBe` 1
-      length (reclaimDisposed firstReport) `shouldBe` 1
-      let (_, secondReport) = reclaimPass disposing afterFirst
-      reclaimExamined secondReport `shouldBe` 1
-      length (reclaimDisposed secondReport) `shouldBe` 1
+      (one, held) ← aResource 1024 model
+      (two, alsoHeld) ← aResource 1024 one
+      (three, disposable) ← aResource 1024 two
+      settled ← settleResource disposable three
+      usageResources (usage settled) `shouldBe` 3
+
+      -- Each pass reads exactly one record, whether or not that record is
+      -- eligible, and the cursor moves on.
+      let passes 0 current examined disposed' = pure (current, reverse examined, reverse disposed')
+          passes count current examined disposed' =
+            let (next, report) = reclaimPass disposing current
+             in passes (count - 1 ∷ Int) next (reclaimExamined report : examined) (length (reclaimDisposed report) : disposed')
+      (final, examinedCounts, disposedCounts) ← passes 3 settled [] []
+      examinedCounts `shouldBe` [1, 1, 1]
+      -- Only one of the three is eligible, and the rotation reaches it within
+      -- three passes rather than reading the same record for ever.
+      sum disposedCounts `shouldBe` 1
+      usageResources (usage final) `shouldBe` 2
+      disposalEligible (ResourceSubject held) final `shouldBe` False
+      disposalEligible (ResourceSubject alsoHeld) final `shouldBe` False
 
     it "commits a submission whose object was reserved with its frame, even with the budget full" $ do
       -- One tracked image and three objects: the published generation's image,

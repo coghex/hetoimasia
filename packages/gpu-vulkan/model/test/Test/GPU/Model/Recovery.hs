@@ -114,6 +114,30 @@ spec = describe "recovery" $ do
     rejected "handing the retired generation over again" (beginGeneration target (Just generation) failed)
       >>= (`shouldBe` AlreadyConsumed GenerationIdentity)
 
+  it "hands over only the target's published active generation as oldSwapchain" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedGenerations = 3}
+    (active, target, generation) ← activeTarget 2 model
+    (constructing, candidate) ← admitted "constructing a replacement" (beginGeneration target (Just generation) active)
+
+    -- The candidate has nothing to retire: it was never published, and it is not
+    -- the target's active generation. Handing it over would record an
+    -- irreversible retirement of something that never rendered.
+    rejected "handing over a still-constructing candidate" (beginGeneration target (Just candidate) constructing)
+      >>= (`shouldBe` WrongPhase GenerationIdentity)
+    -- And the refusal wrote nothing: the candidate is still constructing, so it
+    -- can still be published.
+    fmap viewTargetGenerations (targetView target constructing) `shouldBe` Just 2
+    (published, answer) ← admitted "publishing the candidate" (publishGeneration candidate 2 constructing)
+    answer `shouldSatisfy` \case
+      GenerationPublished _ → True
+      _ → False
+    fmap viewTargetActive (targetView target published) `shouldBe` Just (Just candidate)
+
+    -- The already-retired predecessor is refused as consumed rather than as a
+    -- phase error, because it really was handed over once.
+    rejected "handing over the retired predecessor" (beginGeneration target (Just generation) published)
+      >>= (`shouldBe` AlreadyConsumed GenerationIdentity)
+
   it "marks an optional target unavailable and fails the session for a required one" $ do
     optionalModel ← freshModel
     (optionalActive, optionalTarget, _) ← activeTarget 2 optionalModel
@@ -235,12 +259,15 @@ spec = describe "recovery" $ do
       (_, stillTooSoon) ← admitted "retrying after a pass that disposed of nothing" (retryAllocation allocation refusing)
       stillTooSoon `shouldBe` RetryWithoutReclamation
 
-      -- A pass that failed a disposal is not progress either; it escalates.
+      -- A pass that failed a disposal is not progress either; it escalates, and
+      -- a terminal session then admits no retry at all — permitting one would
+      -- invite a native construction whose result the model would refuse to
+      -- record.
       let (broken, failureReport) = reclaimPass (silentEvidence {disposalEvidence = const DisposalFailed}) ended
       reclaimFailures failureReport `shouldBe` [ResourceSubject resource]
       sessionState broken `shouldBe` SessionFailed CleanupFailed
-      (_, afterFailure) ← admitted "retrying after a failed disposal" (retryAllocation allocation broken)
-      afterFailure `shouldBe` RetryWithoutReclamation
+      rejected "retrying after a failed disposal" (retryAllocation allocation broken)
+        >>= (`shouldBe` SessionAlreadyFailed)
 
       -- A confirmed disposal is.
       let (reclaimed, report) = reclaimPass (silentEvidence {disposalEvidence = const DisposalCompleted}) ended
@@ -254,6 +281,26 @@ spec = describe "recovery" $ do
       second `shouldBe` RetryAlreadySpent
       (_, third) ← admitted "retrying a third time" (retryAllocation allocation again)
       third `shouldBe` RetryAlreadySpent
+
+    it "refuses a retry in a terminal session, whatever ended it" $ do
+      let refusedAfter cause = do
+            model ← freshModel
+            (active, _, _) ← activeTarget 2 model
+            (allocated, allocation) ← admitted "reserving an allocation" (beginAllocation 1024 1 active)
+            failed ← admitted_ "failing it" (recordAllocationFailure allocation allocated)
+            (resourced, resource) ← aResource 2048 failed
+            settled ← settleResource resource resourced
+            let (reclaimed, _) = reclaimPass (silentEvidence {disposalEvidence = const DisposalCompleted}) settled
+            -- With reclamation credit in hand the retry would otherwise be
+            -- permitted, so the session state is the only thing refusing it.
+            (_, permitted) ← admitted "retrying while running" (retryAllocation allocation reclaimed)
+            permitted `shouldBe` RetryPermitted
+            rejected "retrying in a terminal session" (retryAllocation allocation (escalateSession cause reclaimed))
+              >>= (`shouldBe` SessionAlreadyFailed)
+      refusedAfter DeviceLost
+      refusedAfter ValidationError
+      refusedAfter UnknownSubmissionEffect
+      refusedAfter CleanupFailed
 
     it "refuses a retry whose attempt already retired a generation as oldSwapchain" $ do
       model ← freshModel

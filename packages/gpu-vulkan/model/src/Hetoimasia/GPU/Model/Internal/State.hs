@@ -142,7 +142,7 @@ import Hetoimasia.GPU.Model.Internal.Budget
   )
 import Hetoimasia.GPU.Model.Internal.Hold
   ( HoldKind
-  , Holds (logicalReleased, presentationObligations, recordedReferences, submittedUses)
+  , Holds (cpuUseEnded, logicalReleased, presentationObligations, recordedReferences, submittedUses)
   , dischargePresentation
   , dischargeRecorded
   , dischargeSubmitted
@@ -400,6 +400,10 @@ data GpuModel = GpuModel
   , gpuDisposalFailures ∷ !(Set SubjectKey)
   , gpuBackoff ∷ !BackoffState
   , gpuCursor ∷ !Natural
+  , gpuReclaimCursor ∷ !Natural
+    -- ^ Where the next reclamation pass starts reading the subject stream. A
+    -- pass examines a bounded window of it, so the cursor is what guarantees a
+    -- record beyond one window is reached by a later pass rather than never.
   , gpuEscalations ∷ ![Escalation]
   , gpuState ∷ !SessionState
   }
@@ -433,6 +437,7 @@ newGpuModel session budgets = (model, device)
         , gpuDisposalFailures = Set.empty
         , gpuBackoff = freshBackoff
         , gpuCursor = 0
+        , gpuReclaimCursor = 0
         , gpuEscalations = []
         , gpuState = SessionRunning
         }
@@ -467,6 +472,14 @@ note ∷ Escalation → GpuModel → GpuModel
 note escalation model
   | escalation `elem` gpuEscalations model = model
   | otherwise = model {gpuEscalations = escalation : gpuEscalations model}
+
+-- | Schedule an immediate progress opportunity. Every transition that creates a
+-- retirement or disposal obligation goes through this, because requirement 7's
+-- reset is about new work existing and not about who made it: a target that
+-- retires a generation while the session has backed off to its idle interval
+-- must not wait that interval out before the owner looks at it.
+roused ∷ GpuModel → GpuModel
+roused model = model {gpuBackoff = resetBackoff (gpuBackoff model)}
 
 running ∷ GpuModel → Either Misuse ()
 running model = case gpuState model of
@@ -799,7 +812,16 @@ beginGeneration identity replacing model =
           else
             if generationPhase record == GenerationRetired
               then Rejected (AlreadyConsumed GenerationIdentity)
-              else bounded target (replace number oldNumber)
+              else
+                -- Only the target's current published generation may be handed
+                -- over. A candidate that is still constructing has nothing to
+                -- retire and is not the target's active generation, so accepting
+                -- it would record an irreversible retirement of something that
+                -- was never published — and would clear the generation that
+                -- actually is active.
+                if targetActiveGeneration target /= Just oldNumber
+                  then Rejected (WrongPhase GenerationIdentity)
+                  else bounded target (replace number oldNumber)
     bounded target continue
       | fromIntegral (Map.size (targetGenerations target)) >= generationLimit budgets =
           Backpressure GenerationBudget
@@ -926,7 +948,7 @@ publishGeneration identity images model =
               , generationHolds = releaseLogically (generationHolds entry)
               }
         )
-        model
+        (roused model)
 
 -- | The construction failed. The candidate is retired; any @oldSwapchain@
 -- retirement it performed stays performed.
@@ -946,7 +968,7 @@ failGenerationConstruction identity model =
                     , generationHolds = releaseLogically (generationHolds entry)
                     }
               )
-              model
+              (roused model)
           )
 
 -- | Retire an active generation without replacing it.
@@ -976,7 +998,7 @@ retireGeneration identity model =
                         , generationHolds = releaseLogically (generationHolds entry)
                         }
                   )
-                  model
+                  (roused model)
               )
           )
 
@@ -986,7 +1008,7 @@ retireGeneration identity model =
 endGenerationCpuUse ∷ GenerationId → GpuModel → Outcome GpuModel
 endGenerationCpuUse identity model =
   resolved (resolveGeneration model identity) $ \(number, generation, _) →
-    Admitted (editGeneration number generation (\entry → entry {generationHolds = endCpuUse (generationHolds entry)}) model)
+    Admitted (editGeneration number generation (\entry → entry {generationHolds = endCpuUse (generationHolds entry)}) (roused model))
 
 -- ---------------------------------------------------------------------------
 -- Managed resources
@@ -1045,7 +1067,7 @@ rebuildResource identity allocation model =
                             , resourceBytes = attemptBytes attempt
                             , resourceObjects = attemptObjects attempt
                             }
-                        released = editHolds (ResourceKey logical generation) releaseLogically model
+                        released = editHolds (ResourceKey logical generation) releaseLogically (roused model)
                      in Admitted
                           ( released
                               { gpuResources = Map.insert (logical, next) built (gpuResources released)
@@ -1058,12 +1080,12 @@ rebuildResource identity allocation model =
 releaseResource ∷ ResourceId → GpuModel → Outcome GpuModel
 releaseResource identity model =
   resolved (resolveResource model identity) $ \(key, _) →
-    Admitted (editHolds (uncurry ResourceKey key) releaseLogically model)
+    Admitted (editHolds (uncurry ResourceKey key) releaseLogically (roused model))
 
 endResourceCpuUse ∷ ResourceId → GpuModel → Outcome GpuModel
 endResourceCpuUse identity model =
   resolved (resolveResource model identity) $ \(key, _) →
-    Admitted (editHolds (uncurry ResourceKey key) endCpuUse model)
+    Admitted (editHolds (uncurry ResourceKey key) endCpuUse (roused model))
 
 -- ---------------------------------------------------------------------------
 -- Frames
@@ -1282,7 +1304,19 @@ recordBatch identity references model =
           let keys = map (uncurry ResourceKey . fst) resolvedResources
            in if length (Set.toList (Set.fromList keys)) /= length keys
                 then Rejected (DuplicateSubject ResourceIdentity)
-                else case chargeObjects 1 model of
+                else
+                  -- A subject whose logical release or ended CPU use has been
+                  -- certified may not gain a new recorded reference: the owner
+                  -- has already said that nothing can still record it, and a
+                  -- batch admitted afterwards would make that certification
+                  -- false. Batches already recorded are untouched, and this is
+                  -- decided before anything is charged or written.
+                  if any (sealed model) (map (uncurry ResourceKey . fst) resolvedResources)
+                    then Rejected (WrongPhase ResourceIdentity)
+                    else
+                      if any (sealed model) [GenerationKey number generation | Just generation ← [frameGeneration frame]]
+                        then Rejected (WrongPhase GenerationIdentity)
+                        else case chargeObjects 1 model of
                   Left kind → Backpressure kind
                   Right charged →
                     let batch = gpuNextBatch charged
@@ -1311,6 +1345,13 @@ recordBatch identity references model =
                           , BatchId (frameTarget identity) batch
                           )
 
+-- | Whether a subject has been certified as recordable no longer: either the
+-- owner released it, or it certified that no retained capability can reach it.
+sealed ∷ GpuModel → SubjectKey → Bool
+sealed model key = case holdsOf model key of
+  Nothing → True
+  Just holds → logicalReleased holds || cpuUseEnded holds
+
 -- | Discard one recorded batch. It discharges exactly its own references.
 discardBatch ∷ BatchId → GpuModel → Outcome GpuModel
 discardBatch identity model =
@@ -1318,8 +1359,9 @@ discardBatch identity model =
     Admitted (dropBatch number batch model)
 
 dropBatch ∷ Natural → Batch → GpuModel → GpuModel
-dropBatch number batch model =
-  releaseObjects 1 $
+dropBatch number batch model' =
+  let model = roused model'
+   in releaseObjects 1 $
     editFrame
       (batchTargetNumber batch)
       (batchSlot batch)
@@ -2112,20 +2154,25 @@ noteOldSwapchainRetired identity generation model =
 -- | Whether this attempt may retry, spending its one retry bit if it may.
 retryAllocation ∷ AllocationId → GpuModel → Outcome (GpuModel, RetryVerdict)
 retryAllocation identity model =
-  resolved (resolveAllocation model identity) $ \(number, attempt) →
-    case judgeRetry attempt of
-      RetryPermitted →
-        Admitted
-          ( model
-              { gpuAllocations =
-                  Map.insert
-                    number
-                    attempt {attemptRetrySpent = True, attemptFailed = False, attemptReclaimedSince = False}
-                    (gpuAllocations model)
-              }
-          , RetryPermitted
-          )
-      verdict → Admitted (model, verdict)
+  -- A retry is an admission of new native work, so a terminal session refuses
+  -- it. Permitting one would invite a native construction whose successful
+  -- result 'createResource' then refuses, leaving the boundary holding something
+  -- the model has no record of.
+  resolved (running model) $ \() →
+    resolved (resolveAllocation model identity) $ \(number, attempt) →
+      case judgeRetry attempt of
+        RetryPermitted →
+          Admitted
+            ( model
+                { gpuAllocations =
+                    Map.insert
+                      number
+                      attempt {attemptRetrySpent = True, attemptFailed = False, attemptReclaimedSince = False}
+                      (gpuAllocations model)
+                }
+            , RetryPermitted
+            )
+        verdict → Admitted (model, verdict)
 
 -- | Give up an attempt and release the accounting it reserved.
 abandonAllocation ∷ AllocationId → GpuModel → Outcome GpuModel
@@ -2150,9 +2197,15 @@ data ReclaimReport = ReclaimReport
 -- finding eligible work, or asking for a disposal that then failed, is not
 -- progress and unlocks no retry.
 reclaimPass ∷ EvidenceSource → GpuModel → (GpuModel, ReclaimReport)
-reclaimPass source model = (marked, report)
+reclaimPass source model = (advanced, report)
   where
-    candidates = take (fromIntegral (reclaimExaminationLimit (gpuBudgets model))) (eligibleSubjects model)
+    limit = fromIntegral (reclaimExaminationLimit (gpuBudgets model))
+    -- The window is taken from every record the model holds, not from the
+    -- eligible ones, because deciding that a record is ineligible is itself an
+    -- examination. Filtering first would let a pass read the whole model while
+    -- reporting that it read almost nothing.
+    examined = take limit (rotated (gpuReclaimCursor model) (allSubjects model))
+    candidates = filter (eligible model) examined
     (worked, disposedSubjects, failedSubjects) = foldl' step (model, [], []) candidates
     step (current, disposedSoFar, failed) key = case subjectIdentity current key of
       Nothing → (current, disposedSoFar, failed)
@@ -2160,6 +2213,7 @@ reclaimPass source model = (marked, report)
         DisposalRefused → (current, disposedSoFar, failed)
         DisposalCompleted → (dispose key current, subject : disposedSoFar, failed)
         DisposalFailed → (escalateSession CleanupFailed (rememberFailure key current), disposedSoFar, subject : failed)
+    advanced = marked {gpuReclaimCursor = gpuReclaimCursor marked + fromIntegral (length examined)}
     marked
       | null disposedSubjects = worked
       | otherwise = worked {gpuAllocations = Map.map credit (gpuAllocations worked)}
@@ -2168,7 +2222,7 @@ reclaimPass source model = (marked, report)
       | otherwise = attempt
     report =
       ReclaimReport
-        { reclaimExamined = fromIntegral (length candidates)
+        { reclaimExamined = fromIntegral (length examined)
         , reclaimDisposed = reverse disposedSubjects
         , reclaimFailures = reverse failedSubjects
         }
@@ -2179,21 +2233,33 @@ rememberFailure ∷ SubjectKey → GpuModel → GpuModel
 rememberFailure key model =
   model {gpuDisposalFailures = Set.insert key (gpuDisposalFailures model)}
 
+-- | Every record the model holds, in a stable order. This is what a bounded
+-- reclamation pass reads a window of.
+allSubjects ∷ GpuModel → [SubjectKey]
+allSubjects model =
+  [ GenerationKey number generation
+  | (number, target) ← Map.toList (gpuTargets model)
+  , generation ← Map.keys (targetGenerations target)
+  ]
+    ++ [ResourceKey logical generation | (logical, generation) ← Map.keys (gpuResources model)]
+
+-- | Whether this record may be disposed of: every hold has ended, a generation
+-- has been retired, and no earlier disposal of it failed.
+eligible ∷ GpuModel → SubjectKey → Bool
+eligible model key
+  | key `Set.member` gpuDisposalFailures model = False
+  | otherwise = case key of
+      GenerationKey number generation →
+        case Map.lookup number (gpuTargets model) >>= Map.lookup generation . targetGenerations of
+          Nothing → False
+          Just record → generationPhase record == GenerationRetired && holdsSettled (generationHolds record)
+      ResourceKey logical generation →
+        maybe False (holdsSettled . resourceHolds) (Map.lookup (logical, generation) (gpuResources model))
+
 -- | Every subject whose holds have all ended and whose disposal has not already
 -- been attempted and failed.
 eligibleSubjects ∷ GpuModel → [SubjectKey]
-eligibleSubjects model =
-  filter (`Set.notMember` gpuDisposalFailures model) $
-    [ GenerationKey number generation
-    | (number, target) ← Map.toList (gpuTargets model)
-    , (generation, record) ← Map.toList (targetGenerations target)
-    , generationPhase record == GenerationRetired
-    , holdsSettled (generationHolds record)
-    ]
-      ++ [ ResourceKey logical generation
-         | ((logical, generation), record) ← Map.toList (gpuResources model)
-         , holdsSettled (resourceHolds record)
-         ]
+eligibleSubjects model = filter (eligible model) (allSubjects model)
 
 -- ---------------------------------------------------------------------------
 -- Observation

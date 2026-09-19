@@ -113,6 +113,62 @@ spec = describe "owner progress" $ do
     closed ← admitted_ "closing" (closeTarget target backedOffOnceMore)
     nextDeadline (atMilliseconds 0) closed `shouldBe` Just (atMilliseconds 5)
 
+  it "restarts the backoff for retirement work, whoever created it" $ do
+    -- Requirement 7's reset is about new work existing, not about who made it.
+    -- A target that retires a generation while the session has backed off to its
+    -- idle interval must not wait that interval out before the owner looks.
+    -- One submission stays pending throughout, so there is always something to
+    -- have a deadline for and the example is about when it fires.
+    model ← freshModel
+    (active, target, generation) ← activeTarget 2 model
+    (loaded, _) ← enqueueFrames target 1 active
+    (resourced, resource) ← aResource 1024 loaded
+
+    let backedOff = walk 3 resourced
+    nextDeadline (atMilliseconds 0) backedOff `shouldBe` Just (atMilliseconds 40)
+    retired ← admitted_ "retiring a generation" (retireGeneration generation backedOff)
+    nextDeadline (atMilliseconds 0) retired `shouldBe` Just (atMilliseconds 5)
+
+    -- Certifying that a generation's CPU use has ended can make it disposable,
+    -- which is new work for the same reason.
+    let backedOffAgain = walk 3 retired
+    nextDeadline (atMilliseconds 0) backedOffAgain `shouldBe` Just (atMilliseconds 40)
+    ended ← admitted_ "ending the generation's CPU use" (endGenerationCpuUse generation backedOffAgain)
+    nextDeadline (atMilliseconds 0) ended `shouldBe` Just (atMilliseconds 5)
+
+    -- And so can releasing a managed resource, or ending its CPU use.
+    let backedOffOnceMore = walk 3 ended
+    nextDeadline (atMilliseconds 0) backedOffOnceMore `shouldBe` Just (atMilliseconds 40)
+    released ← admitted_ "releasing a resource" (releaseResource resource backedOffOnceMore)
+    nextDeadline (atMilliseconds 0) released `shouldBe` Just (atMilliseconds 5)
+    let backedOffLast = walk 3 released
+    nextDeadline (atMilliseconds 0) backedOffLast `shouldBe` Just (atMilliseconds 40)
+    settled ← admitted_ "ending the resource's CPU use" (endResourceCpuUse resource backedOffLast)
+    nextDeadline (atMilliseconds 0) settled `shouldBe` Just (atMilliseconds 5)
+
+  it "restarts the backoff when a construction fails or is superseded" $ do
+    model ← freshModel
+    (active, target, generation) ← activeTarget 2 model
+    (loaded, _) ← enqueueFrames target 1 active
+    (constructing, candidate) ← admitted "constructing a replacement" (beginGeneration target (Just generation) loaded)
+
+    let backedOff = walk 3 constructing
+    nextDeadline (atMilliseconds 0) backedOff `shouldBe` Just (atMilliseconds 40)
+    failed ← admitted_ "failing the construction" (failGenerationConstruction candidate backedOff)
+    nextDeadline (atMilliseconds 0) failed `shouldBe` Just (atMilliseconds 5)
+
+    -- A superseded publication leaves the same kind of work behind.
+    (second, secondTarget, secondGeneration) ← activeTarget 2 model
+    (secondLoaded, _) ← enqueueFrames secondTarget 1 second
+    (secondConstructing, secondCandidate) ←
+      admitted "constructing another replacement" (beginGeneration secondTarget (Just secondGeneration) secondLoaded)
+    closed ← admitted_ "closing the target" (closeTarget secondTarget secondConstructing)
+    let secondBackedOff = walk 3 closed
+    nextDeadline (atMilliseconds 0) secondBackedOff `shouldBe` Just (atMilliseconds 40)
+    (superseded, answer) ← admitted "publishing after the close" (publishGeneration secondCandidate 2 secondBackedOff)
+    answer `shouldBe` PublicationSuperseded
+    nextDeadline (atMilliseconds 0) superseded `shouldBe` Just (atMilliseconds 5)
+
   it "drops a suspended target's render deadline while keeping its retirement demand" $ do
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
     (active, target, _) ← activeTarget 2 model
