@@ -194,9 +194,10 @@ owning subsystem's contract/design when continuing its work.
   assume wrongly later: the KHR maintenance spelling is an alias neither
   MoltenVK nor Lavapipe resolves, and no device loss was induced, so those rows
   are specification evidence. A third is easy to assume from one
-  platform: a present fence is usually already signalled when the call returns
-  on Lavapipe and never is on MoltenVK, and two runs of the same Linux container
-  disagreed, so the fence must be waited for and its pre-wait status is a race. Later
+  run: whether a present fence is already signalled when the call returns varies
+  between platforms, between frames of one run, and between runs of the same
+  container, so the fence must be waited for and no frequency should be read
+  into it. Later
   native slices stay gated until #158's pull request merges. Host-retirement
   repairs must precede real GPU attachment integration; the current three
   Vulkan issues do not depend on the defective host paths.

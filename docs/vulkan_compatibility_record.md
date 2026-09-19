@@ -224,29 +224,31 @@ extent, never from the window size. VK-5 and VK-10 inherit that, and a consumer
 that reasons from the requested window size will be wrong by the backing scale
 factor on exactly the platform where nobody tests it first.
 
-### The two platforms disagree about when a present fence is already signalled, which is the point
+### Whether a present fence is already signalled is a race, not a property
 
 The proof reads each present fence's status immediately after
-`vkQueuePresentKHR` returns, before waiting on it, and the two platforms answer
-differently:
+`vkQueuePresentKHR` returns and before waiting on it. That reading is not
+stable, and the retained records show it three ways at once:
 
-- **macOS/MoltenVK:** `VK_NOT_READY` on every frame of every run. Retirement is
-  always asynchronous there.
-- **Linux/Lavapipe:** already signalled on most frames. A software presentation
-  engine finishes with the image almost immediately.
+- Every frame in the macOS record reads `VK_NOT_READY`. Retirement is
+  asynchronous there.
+- The Linux record disagrees *with itself*: one frame was already signalled and
+  the rest were not.
+- Successive dispatches of the identical Linux container disagree with each
+  other about which frames those are.
 
-It is not even stable within one platform. Two dispatches of the identical Linux
-container disagreed about the delayed frame — `VK_NOT_READY` in one and already
-signalled in the other — so the pre-wait status is a race, not a property, and
-the retained record happens to capture one side of it.
+No frequency is claimed for any of this, and none should be: the numbers move
+between runs, so a summary that quoted one would be describing a coin toss. The
+records hold whatever the run saw, and `tools/test/VulkanProof.hs` checks that
+the two statements above are still what they hold.
 
-That is exactly why D-9's rule has to be the rule rather than a precaution. A
-design that retired a presentation semaphore on the rendering fence would be
-wrong on every frame on MoltenVK, and would usually get away with it on
-Lavapipe until something was delayed or the machine was loaded — which is the
-worst way for a synchronization bug to behave. The proof therefore records the
-pre-wait status and asserts nothing about it; what it asserts is that the fence
-was waited for and signalled, on every frame, on both platforms.
+That variability is exactly why D-9's rule has to be a rule rather than a
+precaution. A design that retired a presentation semaphore on the rendering
+fence would be wrong on every frame on MoltenVK, and on Lavapipe would be wrong
+only sometimes — which is the worse failure, because it survives testing. The
+proof therefore records the pre-wait status and asserts nothing about it; what
+it asserts is that the fence was waited for and signalled, on every frame, on
+both platforms.
 
 ## What is deliberately not proved
 

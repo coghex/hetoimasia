@@ -22,7 +22,7 @@
 -- checkout they run in. They start no session and build nothing.
 module VulkanProof (spec) where
 
-import Data.Char (isHexDigit, isSpace)
+import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
@@ -153,6 +153,23 @@ spec = describe "The Vulkan proof boundary" $ do
     -- container recipe copied on the other, with no checkout to consult.
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 
+  it "still shows the pre-wait fence status the summary describes" $ do
+    -- The summary makes exactly two claims about this column, and both are
+    -- machine-derived, so both are checked here rather than trusted. It
+    -- deliberately claims no frequency: the numbers move between runs, and a
+    -- quoted one would be describing a coin toss.
+    statuses ← mapM (\(platform, path) → (,) platform . preWaitStatuses <$> readFile path) retainedRecords
+    case lookup "macOS" statuses of
+      Nothing → expectationFailure "no macOS record"
+      Just macOS → do
+        macOS `shouldSatisfy` (not . null)
+        -- "Every frame in the macOS record reads VK_NOT_READY."
+        filter (/= "not ready") macOS `shouldBe` []
+    -- "The Linux record disagrees with itself", and more generally the corpus
+    -- shows both answers. If a future run made this uniform, the summary would
+    -- be overclaiming and this fails rather than going quietly stale.
+    nub (concatMap snd statuses) `shouldSatisfy` (\seen → length seen > 1)
+
   it "quotes no digest the records disagree with" $ do
     -- The summary names the digest for a reader's benefit, which means it can
     -- go stale every time the harness changes — and did. Any digest-shaped
@@ -228,6 +245,23 @@ settingOf text prefix =
     (value : _) → Just value
     [] → Nothing
 
+-- | The "present fence before wait" cell of every frame row in a record's
+-- completion table, found through the table's own header so a reordered column
+-- cannot silently change what is read.
+preWaitStatuses ∷ String → [String]
+preWaitStatuses record = case tableRow "| frame |" record of
+  Nothing → []
+  Just header → case lookup "present fence before wait" (zip header [0 ..]) of
+    Nothing → []
+    Just column ->
+      [ cell
+      | line ← map trim (lines record)
+      , "| " `isPrefixOf` line
+      , (digit : _) ← [drop 2 line]
+      , isDigit digit
+      , Just cell ← [cellAt column (map trim (dropEdgeCells (splitOn '|' line)))]
+      ]
+
 -- | Every backticked span in a document, which is where this summary puts a
 -- digest when it quotes one.
 backticked ∷ String → [String]
@@ -250,9 +284,13 @@ tableRow prefix text =
     (row : _) → Just (map trim (dropEdges (splitOn '|' row)))
     [] → Nothing
   where
-    dropEdges cells = case cells of
-      (_ : rest) → if null rest then [] else init rest
-      [] → []
+    dropEdges = dropEdgeCells
+
+-- | A Markdown row's cells without the empty spans its outer pipes create.
+dropEdgeCells ∷ [String] → [String]
+dropEdgeCells cells = case cells of
+  (_ : rest) → if null rest then [] else init rest
+  [] → []
 
 cellAt ∷ Int → [String] → Maybe String
 cellAt index cells = if index < length cells then Just (cells !! index) else Nothing
