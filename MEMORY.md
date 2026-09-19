@@ -46,9 +46,10 @@ owning subsystem's contract/design when continuing its work.
 - Logging, CPU scopes/collections, structured failures and bounded recovery,
   application composition, workers/supervision, bounded channels/snapshots,
   supervised inboxes, and GLFW dynamic windows/controls/monitors/input exist.
-- Six Cabal packages are active: root, foundation, runtime, GLFW, the Lua host
-  `hetoimasia-scripting-lua`, and the test-only `hetoimasia-test-support`.
-  Vulkan, fonts and renderers are still plans/ownership notes, not implemented
+- Seven Cabal packages are active: root, foundation, runtime, GLFW, the Lua host
+  `hetoimasia-scripting-lua`, the test-only `hetoimasia-test-support`, and
+  `hetoimasia-gpu-vulkan-model` (VK-3). The native Vulkan backend package,
+  fonts and renderers are still plans/ownership notes, not implemented
   packages.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
@@ -107,6 +108,20 @@ owning subsystem's contract/design when continuing its work.
   once.
 
 ## Contracts to preserve
+
+- [GPU model](docs/gpu_model.md) (VK-3, `packages/gpu-vulkan/model`): the pure
+  retention and frame-ownership model, a separate package whose only project
+  dependency is the foundation, listed in both project files so it and its suite
+  build with no Vulkan SDK permanently. It proves no native completion: a
+  submitted use, a presentation obligation and an unpresented frame's
+  synchronization end only on a fact the boundary injects. Five holds are tracked
+  separately per generation and per managed resource, and nothing is disposed of
+  until every one has ended. Budget exhaustion is typed backpressure, never
+  failure, and never takes a cleanup record reserved for admitted work. Recovery
+  is three attempts at 100 ms and 500 ms, replenished only by a retirement cycle
+  plus a healthy second; an `oldSwapchain` retirement is irreversible; a failed
+  disposal is preserved, not replayed, and escalates the session. Its suite is
+  the non-floor CPU group `test.vulkan`, which runs through `cabal.project.cpu`.
 
 - [Resources](docs/resources.md): scoped continuation over CPU ownership;
   construction rollback and once-only consumer; original failure/cancellation

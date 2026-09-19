@@ -9,4 +9,5 @@ packages:
   packages/foundation
   packages/runtime
   packages/scripting-lua
+  packages/gpu-vulkan/model
   tools/test-support
