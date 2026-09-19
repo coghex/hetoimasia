@@ -86,6 +86,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , RecoveryAnswer (..)
   , beginTargetRecovery
   , recordRecoveryFailure
+  , recordRecoverySuccess
 
     -- * Allocation attempts
   , beginAllocation
@@ -102,6 +103,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , disposalEligible
   , FrameView (..)
   , frameView
+  , presentationImage
   , TargetView (..)
   , targetView
   , Usage (..)
@@ -140,7 +142,7 @@ import Hetoimasia.GPU.Model.Internal.Budget
   )
 import Hetoimasia.GPU.Model.Internal.Hold
   ( HoldKind
-  , Holds (presentationObligations, recordedReferences, submittedUses)
+  , Holds (logicalReleased, presentationObligations, recordedReferences, submittedUses)
   , dischargePresentation
   , dischargeRecorded
   , dischargeSubmitted
@@ -164,8 +166,13 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       , attemptRetrySpent
       )
   , BackoffState
-  , RecoveryEpisode (episodeAttempts)
-  , RecoveryProgress (AttemptAdmitted, AttemptBudgetExhausted, AttemptDeferredUntil)
+  , RecoveryEpisode (episodeAttempts, episodeOutstanding)
+  , RecoveryProgress
+      ( AttemptAdmitted
+      , AttemptBudgetExhausted
+      , AttemptDeferredUntil
+      , AttemptStillOutstanding
+      )
   , RetryVerdict (RetryPermitted)
   , advanceBackoff
   , attemptRecovery
@@ -177,6 +184,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
   , noteRetirementCycle
   , observeHealthyProgress
   , recordAttemptFailure
+  , recordAttemptSuccess
   , resetBackoff
   )
 import Numeric.Natural (Natural)
@@ -281,6 +289,11 @@ data PoolState
 data PoolRecord = PoolRecord
   { poolState ∷ !PoolState
   , poolGeneration ∷ !(Maybe Natural)
+  , poolImage ∷ !(Maybe Natural)
+    -- ^ The exact image this record took ownership of at acquisition. The record
+    -- outlives its frame once a presentation is enqueued, so the image cannot be
+    -- remembered on the frame: the slot is reusable as soon as its own submission
+    -- completes, while this record still owes a retirement.
   }
   deriving (Eq, Show)
 
@@ -290,6 +303,10 @@ data Generation = Generation
   , generationImages ∷ !Natural
   , generationReservedObjects ∷ !Natural
   , generationOldSwapchain ∷ !Bool
+  , generationServes ∷ !Natural
+    -- ^ The replacement request this construction was begun to serve. Publishing
+    -- it satisfies exactly that request; one raised while it was constructing
+    -- stays pending.
   }
   deriving (Eq, Show)
 
@@ -302,6 +319,10 @@ data Frame = Frame
   , framePoolRecord ∷ !(Maybe Natural)
   , frameBatches ∷ !(Set Natural)
   , frameSubmission ∷ !(Maybe Natural)
+  , frameSubmissionReserved ∷ !Bool
+    -- ^ Whether this frame still holds the object capacity its submission record
+    -- will need. Reserved with the frame, so committing a submission that the
+    -- native call already performed can never be refused for want of accounting.
   , frameFenceReset ∷ !Bool
   }
   deriving (Eq, Show)
@@ -317,7 +338,11 @@ data Target = Target
   , targetSlotUse ∷ !(Map Natural Natural)
   , targetPool ∷ !(Map Natural PoolRecord)
   , targetRecovery ∷ !RecoveryEpisode
-  , targetReplacementRequested ∷ !Bool
+  , targetReplacementRequested ∷ !Natural
+    -- ^ How many replacement requests this target has raised. Compared against
+    -- 'targetReplacementServed' rather than cleared, so a request raised while a
+    -- replacement was already constructing is not satisfied by that publication.
+  , targetReplacementServed ∷ !Natural
   , targetRenderDemand ∷ !Bool
   , targetSuboptimalSeen ∷ !Bool
   }
@@ -524,7 +549,12 @@ resolveResource ∷ GpuModel → ResourceId → Either Misuse ((Natural, Natural
 resolveResource model identity
   | resourceSession identity /= gpuSession model = Left (ForeignIdentity ResourceIdentity)
   | otherwise = case Map.lookup number (gpuResourceGenerations model) of
-      Nothing → Left (UnknownIdentity ResourceIdentity)
+      Nothing
+        -- The resource's last generation has been disposed of and its entry
+        -- forgotten. The counter still separates a number this session issued
+        -- from one it never did.
+        | number < gpuNextResource model → Left (StaleIdentity ResourceIdentity)
+        | otherwise → Left (UnknownIdentity ResourceIdentity)
       Just current
         | generation > current → Left (UnknownIdentity ResourceIdentity)
         | otherwise → case Map.lookup key (gpuResources model) of
@@ -616,6 +646,13 @@ chargeObjects count model
   | gpuObjects model + count > objectLimit (gpuBudgets model) = Left ObjectBudget
   | otherwise = Right model {gpuObjects = gpuObjects model + count}
 
+-- | Subtraction that cannot go below zero, for counters the accounting keeps as
+-- 'Natural'.
+saturatingMinus ∷ Natural → Natural → Natural
+saturatingMinus left right
+  | right >= left = 0
+  | otherwise = left - right
+
 releaseObjects ∷ Natural → GpuModel → GpuModel
 releaseObjects count model
   | count >= gpuObjects model = model {gpuObjects = 0}
@@ -654,7 +691,8 @@ admitTarget classification model =
                 , targetSlotUse = Map.empty
                 , targetPool = Map.empty
                 , targetRecovery = freshEpisode
-                , targetReplacementRequested = False
+                , targetReplacementRequested = 0
+                , targetReplacementServed = 0
                 , targetRenderDemand = False
                 , targetSuboptimalSeen = False
                 }
@@ -796,6 +834,7 @@ beginGeneration identity replacing model =
                   , generationImages = 0
                   , generationReservedObjects = imageTrackingLimit budgets
                   , generationOldSwapchain = False
+                  , generationServes = targetReplacementRequested target
                   }
            in Admitted
                 ( editTarget
@@ -835,10 +874,17 @@ publishGeneration identity images model =
       else case Map.lookup number (gpuTargets model) of
         Nothing → Rejected (UnknownIdentity TargetIdentity)
         Just target
-          -- Close wins, and so does an unusable image count. In both cases the
-          -- candidate is retired rather than published, and it keeps the object
-          -- accounting it reserved until it is actually disposed of: retired
-          -- work never vanishes from the metrics.
+          -- Close wins, a failed session wins, and so does an unusable image
+          -- count. In each case the candidate is retired rather than published,
+          -- and it keeps the object accounting it reserved until it is actually
+          -- disposed of: retired work never vanishes from the metrics.
+          --
+          -- A failed session is terminal, so a construction that only finished
+          -- after the failure has nothing to be published into. It is answered
+          -- here rather than refused at the call because the native construction
+          -- already happened: its result has to be owned for retirement.
+          | gpuState model /= SessionRunning →
+              Admitted (retireCandidate number generation, PublicationSuperseded)
           | targetPhase target `elem` [TargetRetiring, TargetUnavailable] →
               Admitted (retireCandidate number generation, PublicationSuperseded)
           | images == 0 || images > limit →
@@ -847,7 +893,13 @@ publishGeneration identity images model =
               Admitted
                 ( editTarget
                     number
-                    (\entry → entry {targetActiveGeneration = Just generation})
+                    ( \entry →
+                        entry
+                          { targetActiveGeneration = Just generation
+                          , targetReplacementServed =
+                              max (targetReplacementServed entry) (generationServes record)
+                          }
+                    )
                     ( editGeneration
                         number
                         generation
@@ -970,28 +1022,38 @@ createResource identity model =
 rebuildResource ∷ ResourceId → AllocationId → GpuModel → Outcome (GpuModel, ResourceId)
 rebuildResource identity allocation model =
   resolved (running model) $ \() →
-    resolved (resolveResource model identity) $ \((logical, generation), _) →
+    resolved (resolveResource model identity) $ \((logical, generation), existing) →
       resolved (resolveAllocation model allocation) $ \(number, attempt) →
-        if attemptFailed attempt
-          then Rejected (WrongPhase AllocationIdentity)
+        -- Only the resource's current generation may be rebuilt, and the
+        -- successor is derived from the resource's own counter rather than from
+        -- the identity handed in. Rebuilding through a retained older identity
+        -- would otherwise reissue a number that is already live, overwriting one
+        -- replacement with another and leaking the accounting of the first.
+        if Map.lookup logical (gpuResourceGenerations model) /= Just generation
+          then Rejected (StaleIdentity ResourceIdentity)
           else
-            let next = generation + 1
-                record =
-                  Resource
-                    { resourceHolds = newHolds
-                    , resourceBytes = attemptBytes attempt
-                    , resourceObjects = attemptObjects attempt
-                    }
-                released =
-                  editHolds (ResourceKey logical generation) releaseLogically model
-             in Admitted
-                  ( released
-                      { gpuResources = Map.insert (logical, next) record (gpuResources released)
-                      , gpuResourceGenerations = Map.insert logical next (gpuResourceGenerations released)
-                      , gpuAllocations = Map.delete number (gpuAllocations released)
-                      }
-                  , ResourceId (gpuSession model) logical next
-                  )
+            if logicalReleased (resourceHolds existing)
+              then Rejected (AlreadyConsumed ResourceIdentity)
+              else
+                if attemptFailed attempt
+                  then Rejected (WrongPhase AllocationIdentity)
+                  else
+                    let next = generation + 1
+                        built =
+                          Resource
+                            { resourceHolds = newHolds
+                            , resourceBytes = attemptBytes attempt
+                            , resourceObjects = attemptObjects attempt
+                            }
+                        released = editHolds (ResourceKey logical generation) releaseLogically model
+                     in Admitted
+                          ( released
+                              { gpuResources = Map.insert (logical, next) built (gpuResources released)
+                              , gpuResourceGenerations = Map.insert logical next (gpuResourceGenerations released)
+                              , gpuAllocations = Map.delete number (gpuAllocations released)
+                              }
+                          , ResourceId (gpuSession model) logical next
+                          )
 
 releaseResource ∷ ResourceId → GpuModel → Outcome GpuModel
 releaseResource identity model =
@@ -1026,7 +1088,11 @@ reserveFrame identity model =
           Backpressure AggregateFrameSlotBudget
       | fromIntegral (Map.size (targetPool target)) >= presentationPoolCapacity budgets =
           Backpressure PresentationPoolBudget
-      | otherwise = case chargeObjects 1 model of
+      -- Two objects, not one: the presentation-pool record this frame may need,
+      -- and the submission record it may need. Both are reserved before the
+      -- native calls whose outcomes they account for, so neither can be refused
+      -- after one of those calls has already had an effect.
+      | otherwise = case chargeObjects 2 model of
           Left kind → Backpressure kind
           Right charged →
             let slot = freeSlot target
@@ -1042,6 +1108,7 @@ reserveFrame identity model =
                     , framePoolRecord = Just record
                     , frameBatches = Set.empty
                     , frameSubmission = Nothing
+                    , frameSubmissionReserved = True
                     , frameFenceReset = False
                     }
              in Admitted
@@ -1054,7 +1121,12 @@ reserveFrame identity model =
                             , targetPool =
                                 Map.insert
                                   record
-                                  (PoolRecord {poolState = PoolReserved, poolGeneration = Nothing})
+                                  ( PoolRecord
+                                      { poolState = PoolReserved
+                                      , poolGeneration = Nothing
+                                      , poolImage = Nothing
+                                      }
+                                  )
                                   (targetPool entry)
                             }
                       )
@@ -1105,16 +1177,8 @@ acquireImage identity outcome model =
           Nothing → Rejected (UnknownIdentity TargetIdentity)
           Just target → case outcome of
             AcquireNotReady → Admitted (returnReservation number slot frame model, ReservationReturned)
-            AcquireOutOfDate →
-              Admitted
-                ( editTarget number (\entry → entry {targetReplacementRequested = True}) (returnReservation number slot frame model)
-                , ReplacementRequested
-                )
-            AcquireSurfaceLost →
-              Admitted
-                ( editTarget number (\entry → entry {targetReplacementRequested = True}) (returnReservation number slot frame model)
-                , ReplacementRequested
-                )
+            AcquireOutOfDate → Admitted (requestReplacement number (returnReservation number slot frame model), ReplacementRequested)
+            AcquireSurfaceLost → Admitted (requestReplacement number (returnReservation number slot frame model), ReplacementRequested)
             AcquiredImage index → own number slot frame target index False
             AcquiredSuboptimalImage index → own number slot frame target index True
   where
@@ -1124,6 +1188,11 @@ acquireImage identity outcome model =
         Nothing → Rejected (WrongPhase GenerationIdentity)
         Just (generation, record)
           | index >= generationImages record → Rejected (UnknownIdentity ImageIdentity)
+          -- One image, one owner. A record that took an image keeps it until its
+          -- presentation retires or its unpresented frame is settled, and that
+          -- record can outlive the frame, so the check is against the pool rather
+          -- than against the frames.
+          | imageOwned target generation index → Rejected (AlreadyConsumed ImageIdentity)
           | otherwise → case framePoolRecord frame of
               Nothing → Rejected (WrongPhase PresentationIdentity)
               Just pool →
@@ -1137,11 +1206,17 @@ acquireImage identity outcome model =
                               entry
                                 { targetPool =
                                     Map.adjust
-                                      (\poolRecord → poolRecord {poolGeneration = Just generation})
+                                      ( \poolRecord →
+                                        poolRecord
+                                          { poolGeneration = Just generation
+                                          , poolImage = Just index
+                                          }
+                                    )
                                       pool
                                       (targetPool entry)
                                 , targetSuboptimalSeen = targetSuboptimalSeen entry || suboptimal
-                                , targetReplacementRequested = targetReplacementRequested entry || suboptimal
+                                , targetReplacementRequested =
+                                    targetReplacementRequested entry + (if suboptimal then 1 else 0)
                                 }
                           )
                           ( editFrame
@@ -1164,11 +1239,27 @@ acquireImage identity outcome model =
                       suboptimal
                   )
 
--- | Release a frame that never created an obligation: its slot and its
--- untouched pool record both go back.
+-- | Whether a live pool record of this target already owns that image of that
+-- generation.
+imageOwned ∷ Target → Natural → Natural → Bool
+imageOwned target generation index =
+  or
+    [ poolGeneration entry == Just generation && poolImage entry == Just index
+    | entry ← Map.elems (targetPool target)
+    ]
+
+-- | The object capacity a frame is still holding for a submission record it has
+-- not yet used.
+reservedSubmission ∷ Frame → Natural
+reservedSubmission frame
+  | frameSubmissionReserved frame = 1
+  | otherwise = 0
+
+-- | Release a frame that never created an obligation: its slot, its untouched
+-- pool record and its unused submission reservation all go back.
 returnReservation ∷ Natural → Natural → Frame → GpuModel → GpuModel
 returnReservation number slot frame model =
-  releaseObjects (maybe 0 (const 1) (framePoolRecord frame)) $
+  releaseObjects (maybe 0 (const 1) (framePoolRecord frame) + reservedSubmission frame) $
     editTarget
       number
       ( \entry →
@@ -1296,9 +1387,17 @@ submitFrames identities outcome model
   where
     clearFence current (number, slot, _) =
       editFrame number slot (\entry → entry {frameFenceReset = False}) current
-    accept frames uncertain = case chargeObjects 1 model of
-      Left kind → Backpressure kind
-      Right charged →
+    -- No accounting is charged here, and none can be refused here. The object
+    -- this record occupies was reserved with the frame, before the native call
+    -- whose outcome is now being committed; the other frames of a shared
+    -- submission give theirs back, because one record covers them all.
+    accept frames uncertain =
+      let charged =
+            releaseObjects
+              (sum [reservedSubmission frame | (_, _, frame) ← frames] `saturatingMinus` 1)
+              model
+       in accepted charged frames uncertain
+    accepted charged frames uncertain =
         let submission = gpuNextSubmission charged
             batches = concat [Set.toList (frameBatches frame) | (_, _, frame) ← frames]
             referenced batch = maybe Set.empty batchSubjects (Map.lookup batch (gpuBatches charged))
@@ -1336,6 +1435,7 @@ submitFrames identities outcome model
                           entry
                             { framePhase = phase
                             , frameSubmission = Just submission
+                            , frameSubmissionReserved = False
                             , frameBatches = Set.empty
                             , frameFenceReset = False
                             }
@@ -1361,6 +1461,12 @@ submitFrames identities outcome model
          in if uncertain
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
               else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
+
+-- | Raise a replacement request on a target. Requests are counted rather than
+-- flagged, so a publication can satisfy exactly the request it was begun for.
+requestReplacement ∷ Natural → GpuModel → GpuModel
+requestReplacement number =
+  editTarget number (\entry → entry {targetReplacementRequested = targetReplacementRequested entry + 1})
 
 -- | What the presentation call did.
 data PresentOutcome
@@ -1397,7 +1503,8 @@ enqueuePresentation identity outcome model =
                   ( \entry →
                       entry
                         { targetPool = Map.adjust (\record → record {poolState = PoolEnqueued}) pool (targetPool entry)
-                        , targetReplacementRequested = targetReplacementRequested entry || replacing
+                        , targetReplacementRequested =
+                            targetReplacementRequested entry + (if replacing then 1 else 0)
                         , targetRenderDemand = False
                         }
                   )
@@ -1588,7 +1695,9 @@ settleFrames frames model = foldl' settle model frames
       Nothing → current
       Just frame
         | frameSettled current frame →
-            editTarget number (\entry → entry {targetFrames = Map.delete slot (targetFrames entry)}) current
+            releaseObjects
+              (reservedSubmission frame)
+              (editTarget number (\entry → entry {targetFrames = Map.delete slot (targetFrames entry)}) current)
         | otherwise → current
 
 frameSettled ∷ GpuModel → Frame → Bool
@@ -1799,9 +1908,21 @@ dispose key model = case key of
   ResourceKey logical generation → case Map.lookup (logical, generation) (gpuResources model) of
     Nothing → model
     Just record →
-      releaseBytes
-        (resourceBytes record)
-        (releaseObjects (resourceObjects record) model {gpuResources = Map.delete (logical, generation) (gpuResources model)})
+      let remaining = Map.delete (logical, generation) (gpuResources model)
+          -- Once no generation of a logical resource is left, its current-
+          -- generation entry is history rather than state, and keeping it would
+          -- grow a map that nothing accounts for. A retained identity for it is
+          -- still classified as stale, by the monotonic resource counter rather
+          -- than by remembering the resource.
+          generations
+            | any ((== logical) . fst) (Map.keys remaining) = gpuResourceGenerations model
+            | otherwise = Map.delete logical (gpuResourceGenerations model)
+       in releaseBytes
+            (resourceBytes record)
+            ( releaseObjects
+                (resourceObjects record)
+                model {gpuResources = remaining, gpuResourceGenerations = generations}
+            )
 
 -- | A retiring target whose records have all gone leaves the model, freeing its
 -- number for reuse under a fresh incarnation.
@@ -1868,24 +1989,32 @@ data RecoveryAnswer
   | RecoveryDeferred !Instant
   | RecoveryClosed
     -- ^ Close takes precedence over retry admission.
+  | RecoveryOutstanding
+    -- ^ An attempt is already in flight. It must be settled with
+    -- 'recordRecoveryFailure' or 'recordRecoverySuccess' first, so one
+    -- construction can never spend two of the episode's three attempts.
   | RecoveryExhausted !Escalation
   deriving (Eq, Show)
 
 -- | Ask to begin this target's next recovery construction attempt.
 beginTargetRecovery ∷ Instant → TargetId → GpuModel → Outcome (GpuModel, RecoveryAnswer)
 beginTargetRecovery now identity model =
-  resolved (resolveTarget model identity) $ \(number, target) →
-    case targetPhase target of
-      TargetRetiring → Admitted (model, RecoveryClosed)
-      TargetUnavailable → Admitted (model, RecoveryClosed)
-      _ → case attemptRecovery now (targetRecovery target) of
-        (_, AttemptBudgetExhausted) → Admitted (exhaust number target)
-        (_, AttemptDeferredUntil at) → Admitted (model, RecoveryDeferred at)
-        (episode, AttemptAdmitted attempt) →
-          Admitted
-            ( editTarget number (\entry → entry {targetRecovery = episode}) model
-            , RecoveryAttempt attempt
-            )
+  -- A terminal session begins no new recovery work. Device loss and the other
+  -- session causes are not conditions a target can construct its way out of.
+  resolved (running model) $ \() →
+    resolved (resolveTarget model identity) $ \(number, target) →
+      case targetPhase target of
+        TargetRetiring → Admitted (model, RecoveryClosed)
+        TargetUnavailable → Admitted (model, RecoveryClosed)
+        _ → case attemptRecovery now (targetRecovery target) of
+          (_, AttemptStillOutstanding) → Admitted (model, RecoveryOutstanding)
+          (_, AttemptBudgetExhausted) → Admitted (exhaust number target)
+          (_, AttemptDeferredUntil at) → Admitted (model, RecoveryDeferred at)
+          (episode, AttemptAdmitted attempt) →
+            Admitted
+              ( editTarget number (\entry → entry {targetRecovery = episode}) model
+              , RecoveryAttempt attempt
+              )
   where
     exhaust number target = case targetClassOf target of
       OptionalTarget →
@@ -1904,8 +2033,23 @@ beginTargetRecovery now identity model =
 -- except through 'beginTargetRecovery', so none of them can replenish it.
 recordRecoveryFailure ∷ Instant → TargetId → GpuModel → Outcome GpuModel
 recordRecoveryFailure now identity model =
-  resolved (resolveTarget model identity) $ \(number, _) →
-    Admitted (editTarget number (\entry → entry {targetRecovery = recordAttemptFailure now (targetRecovery entry)}) model)
+  resolved (resolveTarget model identity) $ \(number, target) →
+    -- A failure is a report about an attempt this episode admitted. Accepting
+    -- one with nothing outstanding would spend an attempt on a construction that
+    -- never began, and would install a retry delay out of nowhere.
+    if not (episodeOutstanding (targetRecovery target))
+      then Rejected (WrongPhase TargetIdentity)
+      else Admitted (editTarget number (\entry → entry {targetRecovery = recordAttemptFailure now (targetRecovery entry)}) model)
+
+-- | Record that the attempt just made succeeded. It settles the attempt so the
+-- episode can admit another later; it does not give the spent attempt back,
+-- which only a completed retirement cycle and a healthy second do.
+recordRecoverySuccess ∷ TargetId → GpuModel → Outcome GpuModel
+recordRecoverySuccess identity model =
+  resolved (resolveTarget model identity) $ \(number, target) →
+    if not (episodeOutstanding (targetRecovery target))
+      then Rejected (WrongPhase TargetIdentity)
+      else Admitted (editTarget number (\entry → entry {targetRecovery = recordAttemptSuccess (targetRecovery entry)}) model)
 
 -- ---------------------------------------------------------------------------
 -- Allocation attempts
@@ -1916,20 +2060,29 @@ recordRecoveryFailure now identity model =
 beginAllocation ∷ Natural → Natural → GpuModel → Outcome (GpuModel, AllocationId)
 beginAllocation bytes objects model =
   resolved (running model) $ \() →
-    if gpuBytes model + bytes > byteLimit (gpuBudgets model)
-      then Backpressure ByteBudget
-      else case chargeObjects objects model of
-        Left kind → Backpressure kind
-        Right charged →
-          let number = gpuNextAllocation charged
-           in Admitted
-                ( charged
-                    { gpuBytes = gpuBytes charged + bytes
-                    , gpuAllocations = Map.insert number (newAllocationAttempt bytes objects) (gpuAllocations charged)
-                    , gpuNextAllocation = number + 1
-                    }
-                , AllocationId (gpuSession charged) number
-                )
+    -- An attempt that reserves neither bytes nor objects would be a record
+    -- costing nothing and therefore bounding nothing, which is the one way
+    -- attempts could accumulate without limit.
+    if bytes == 0 && objects == 0
+      then Rejected EmptyAllocation
+      else admit
+  where
+    admit
+      | gpuBytes model + bytes > byteLimit (gpuBudgets model)
+      =
+          Backpressure ByteBudget
+      | otherwise = case chargeObjects objects model of
+          Left kind → Backpressure kind
+          Right charged →
+            let number = gpuNextAllocation charged
+             in Admitted
+                  ( charged
+                      { gpuBytes = gpuBytes charged + bytes
+                      , gpuAllocations = Map.insert number (newAllocationAttempt bytes objects) (gpuAllocations charged)
+                      , gpuNextAllocation = number + 1
+                      }
+                  , AllocationId (gpuSession charged) number
+                  )
 
 recordAllocationFailure ∷ AllocationId → GpuModel → Outcome GpuModel
 recordAllocationFailure identity model =
@@ -2118,6 +2271,18 @@ frameView identity model = case resolveFrame model identity of
           , viewFrameFenceReset = frameFenceReset frame
           }
 
+-- | The exact image a live presentation record owns. The record outlives its
+-- frame, so this answers after the frame slot has been reused and until the
+-- retirement — or the explicit settlement of an unpresented frame — that ends it.
+presentationImage ∷ PresentationId → GpuModel → Maybe ImageId
+presentationImage identity model = case resolvePresentation model identity of
+  Left _ → Nothing
+  Right (number, _, entry) → do
+    generation ← poolGeneration entry
+    index ← poolImage entry
+    target ← Map.lookup number (gpuTargets model)
+    pure (ImageId (GenerationId (targetIdOf model number target) generation) index)
+
 data TargetView = TargetView
   { viewTargetPhase ∷ !TargetPhase
   , viewTargetClass ∷ !TargetClass
@@ -2146,7 +2311,8 @@ targetView identity model = case resolveTarget model identity of
         , viewTargetPoolRecords = fromIntegral (Map.size (targetPool target))
         , viewTargetRenderDemand = targetRenderDemand target && targetPhase target == TargetAdmitted
         , viewTargetRetirementDemand = retirementDemand target
-        , viewTargetReplacementRequested = targetReplacementRequested target
+        , viewTargetReplacementRequested =
+            targetReplacementRequested target > targetReplacementServed target
         , viewTargetRecoveryAttempts = recoveryAttemptsOf target
         }
 

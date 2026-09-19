@@ -323,6 +323,10 @@ data Misuse
     -- listing a slot more than once.
   | EmptySubmission
     -- ^ A submission named no frame at all.
+  | EmptyAllocation
+    -- ^ An allocation attempt reserved neither bytes nor objects. It would be a
+    -- record that costs nothing and therefore bounds nothing, which is the one
+    -- way an attempt could grow storage without limit.
   | SessionAlreadyFailed
     -- ^ The session has escalated; it admits no further work.
   deriving (Eq, Ord, Show)

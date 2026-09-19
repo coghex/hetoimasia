@@ -109,7 +109,7 @@ spec = describe "holds" $ do
     -- Four slots, because this example keeps four frames submitted at once and
     -- a submitted frame holds its slot until its own record completes.
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 4}
-    (active, target, _) ← activeTarget 2 model
+    (active, target, _) ← activeTarget 4 model
     (resourced, resource) ← aResource 1024 active
     (first, frameOne) ← acquiredFrame target resourced
     (second, frameTwo) ← acquiredFrame target first
@@ -158,6 +158,35 @@ spec = describe "holds" $ do
     recorded rebuilt (ResourceSubject original) `shouldBe` [batch]
     disposalEligible (ResourceSubject original) rebuilt `shouldBe` False
     recorded rebuilt (ResourceSubject replacement) `shouldBe` []
+
+  it "refuses a rebuild through a retained older identity, so a live generation is never reissued" $ do
+    model ← freshModel
+    (resourced, first) ← aResource 1024 model
+    (allocatedOnce, allocationOnce) ← admitted "reserving a rebuild" (beginAllocation 2048 1 resourced)
+    (rebuilt, second) ← admitted "rebuilding once" (rebuildResource first allocationOnce allocatedOnce)
+    resourceGeneration second `shouldBe` resourceGeneration first + 1
+
+    -- The older identity still resolves — its generation is live and still
+    -- undisposable — but it is no longer the resource's current generation.
+    -- Rebuilding through it would insert a second record under the number the
+    -- first replacement already holds, reissuing that identity and leaking the
+    -- accounting of whichever record it overwrote.
+    (allocatedTwice, allocationTwice) ← admitted "reserving another rebuild" (beginAllocation 4096 1 rebuilt)
+    rejected "rebuilding through the older identity" (rebuildResource first allocationTwice allocatedTwice)
+      >>= (`shouldBe` StaleIdentity ResourceIdentity)
+    usageResources (usage allocatedTwice) `shouldBe` 2
+
+    -- The current identity rebuilds, and its successor is the counter's, not the
+    -- one the caller happened to hand in.
+    (again, third) ← admitted "rebuilding through the current identity" (rebuildResource second allocationTwice allocatedTwice)
+    resourceGeneration third `shouldBe` resourceGeneration second + 1
+    usageResources (usage again) `shouldBe` 3
+
+    -- A released current generation is not a rebuild candidate either.
+    (allocatedThrice, allocationThrice) ← admitted "reserving once more" (beginAllocation 1024 1 again)
+    released ← admitted_ "releasing the current generation" (releaseResource third allocatedThrice)
+    rejected "rebuilding a released generation" (rebuildResource third allocationThrice released)
+      >>= (`shouldBe` AlreadyConsumed ResourceIdentity)
 
   it "settles a resource only when its release, its CPU use and every record naming it have ended" $ do
     model ← freshModel

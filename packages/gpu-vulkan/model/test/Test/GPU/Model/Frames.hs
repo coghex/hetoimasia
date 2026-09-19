@@ -9,6 +9,7 @@
 module Test.GPU.Model.Frames (spec) where
 
 import Hetoimasia.GPU.Model
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (requestedImageTracking), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity
 import Test.GPU.Model.Support
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -172,6 +173,58 @@ spec = describe "frame ownership" $ do
     usageSubmissions (usage worked) `shouldBe` 1
     disposalEligible (GenerationSubject generation) worked `shouldBe` False
 
+  it "keeps the exact image on the record that outlives the frame, in either completion order" $ do
+    let enqueued = do
+          model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+          (active, target, generation) ← activeTarget 2 model
+          (reserved, frame) ← admitted "reserving" (reserveFrame target active)
+          (acquired, acquireAnswer) ← admitted "acquiring" (acquireImage frame (AcquiredImage 1) reserved)
+          image ← case acquireAnswer of
+            ImageOwned owned _ → pure owned
+            other → fail ("the fixture should own an image, got " ++ show other)
+          (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted acquired)
+          submission ← submissionOf submitAnswer
+          (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued submitted)
+          presentation ← presentationOf presentAnswer
+          pure (presented, target, generation, frame, image, submission, presentation)
+
+    -- The submission completes first, so the slot is reusable while the
+    -- presentation is still owed. The image must not go with the slot: the
+    -- record that outlives the frame is what still owns it.
+    (presented, target, _, frame, image, submission, presentation) ← enqueued
+    slotFree ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) presented)
+    frameView frame slotFree `shouldBe` Nothing
+    presentationImage presentation slotFree `shouldBe` Just image
+
+    -- While that record owns the image, no second owner is admitted.
+    (reserved, other) ← admitted "reserving another frame" (reserveFrame target slotFree)
+    outcomeModel (acquireImage other (AcquiredImage 1) reserved)
+      `shouldBe` Rejected (AlreadyConsumed ImageIdentity)
+    -- The generation's other image is free, so this is about the image rather
+    -- than about the generation.
+    (elsewhere, _) ← admitted "acquiring the other image" (acquireImage other (AcquiredImage 0) reserved)
+    fmap viewFramePhase (frameView other elsewhere) `shouldBe` Just FrameAcquired
+
+    -- Retirement is what releases it, and then it can be acquired again.
+    retired ← admitted_ "retiring the presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) slotFree)
+    presentationImage presentation retired `shouldBe` Nothing
+    (reacquiring, again) ← admitted "reserving once more" (reserveFrame target retired)
+    (reacquired, _) ← admitted "reacquiring the released image" (acquireImage again (AcquiredImage 1) reacquiring)
+    fmap viewFrameImage (frameView again reacquired) `shouldBe` Just (Just image)
+
+    -- The other order: the presentation retires while the submission is still
+    -- pending. The record goes, and the frame stays until its own work ends.
+    (alsoPresented, _, otherGeneration, otherFrame, _, otherSubmission, otherPresentation) ← enqueued
+    retiredFirst ←
+      admitted_ "retiring the presentation first" (recordCompletion (atMilliseconds 1) (PresentationRetired otherPresentation) alsoPresented)
+    presentationImage otherPresentation retiredFirst `shouldBe` Nothing
+    fmap viewFramePhase (frameView otherFrame retiredFirst) `shouldBe` Just FramePresentationEnqueued
+    completedLast ←
+      admitted_ "completing the submission last" (recordCompletion (atMilliseconds 2) (SubmissionCompleted otherSubmission) retiredFirst)
+    frameView otherFrame completedLast `shouldBe` Nothing
+    fmap viewOutstanding (holdView (GenerationSubject otherGeneration) completedLast)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
+
   it "refuses a transition that is not legal from the frame's current phase" $ do
     model ← freshModel
     (active, target, _) ← activeTarget 2 model
@@ -205,5 +258,8 @@ spec = describe "frame ownership" $ do
     submissionOf = \case
       SubmissionRecorded identity → pure identity
       other → fail ("expected a submission record, got " ++ show other)
+    presentationOf = \case
+      PresentationTracked identity → pure identity
+      other → fail ("expected a presentation record, got " ++ show other)
     rejectedAs outcome expected = outcomeModel outcome `shouldBe` Rejected expected
     rejectedAs' outcome expected = outcome `shouldBe` Rejected expected

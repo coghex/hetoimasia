@@ -87,11 +87,28 @@ successor, and staleness is decidable by comparing counters rather than by
 remembering every identity ever issued.
 
 `Misuse` distinguishes `ForeignIdentity` (another session's), `UnknownIdentity`
-(never issued), `StaleIdentity` (issued, since retired), `AlreadyConsumed` (a
-one-shot record settled twice), `WrongPhase`, `DuplicateSubject` (one call naming
-the same object twice), `EmptySubmission`, and `SessionAlreadyFailed`. Each names
-only the *kind* of identity, never the value, so a refusal about a foreign value
-cannot smuggle that value back out.
+(never issued), `StaleIdentity` (issued, since retired or superseded),
+`AlreadyConsumed` (a one-shot record settled twice), `WrongPhase`,
+`DuplicateSubject` (one call naming the same object twice), `EmptySubmission`,
+`EmptyAllocation`, and `SessionAlreadyFailed`. Each names only the *kind* of
+identity, never the value, so a refusal about a foreign value cannot smuggle that
+value back out.
+
+A managed resource is rebuilt only through its *current* generation, and the
+successor is derived from the resource's own counter rather than from the
+identity handed in. Rebuilding through a retained older identity would otherwise
+reissue a number that is already live, overwriting one replacement with another
+and leaking the accounting of the first. Once the last generation of a logical
+resource is disposed of, its current-generation entry is forgotten rather than
+kept as permanent history; a retained identity for it is still stale, decided by
+the monotonic resource counter.
+
+An image belongs to one owner at a time. The presentation record that takes an
+image at acquisition carries that exact image, and that record outlives its frame
+— the slot is reusable as soon as its own submission completes, while the record
+still owes a retirement. Reacquiring the same image of the same generation is
+refused until that retirement, or until the explicit settlement of an unpresented
+frame, releases it.
 
 A target is classified `RequiredTarget` or `OptionalTarget` when it is admitted.
 The classification decides only what exhausted recovery escalates to; it never
@@ -163,12 +180,17 @@ The distinctions that lose obligations when collapsed:
 - **A presentation that enqueued nothing.** The prior rendering and the still-owned
   image stay owned, and no presentation fence exists to wait on.
 
-The presentation-pool record is reserved at *reservation*, before acquisition, so
-backpressure can never leave an admitted frame without the cleanup capacity it
-needs to be abandoned safely. A reservation that creates no obligation returns
-its record immediately; a record that ever covered an acquired image is recycled
-only by retirement evidence for an enqueued presentation, or by explicit
-settlement evidence for a frame that was never presented.
+A frame reserves *two* objects at reservation, before either of the native calls
+whose outcomes they account for: the presentation-pool record it may need, and
+the submission record it may need. Backpressure can therefore never leave an
+admitted frame without the cleanup capacity it needs to be abandoned safely, and
+committing a submission the native call has already performed can never be
+refused for want of accounting — a refusal there would drop the holds for work
+that really was submitted. Frames of one shared submission give back the
+reservations the single record does not need. A reservation that creates no
+obligation returns everything it took; a record that ever covered an acquired
+image is recycled only by retirement evidence for an enqueued presentation, or by
+explicit settlement evidence for a frame that was never presented.
 
 ## Admission budgets
 
@@ -204,7 +226,16 @@ nothing vanishes from the metrics by being retired.
 
 An image count the driver returns that is zero, or above the tracking limit, is
 refused rather than published: the candidate is retired instead, and its
-accounting stays until it is safely disposed of.
+accounting stays until it is safely disposed of. So is a candidate whose
+construction only finished after the session failed — device loss is terminal, so
+its result is owned for retirement rather than published into a session that is
+over. A replacement request is *counted*, not flagged, and a publication serves
+exactly the request its construction was begun for, so one raised while that
+construction was in flight stays pending.
+
+An allocation attempt that reserves neither bytes nor objects is refused as
+`EmptyAllocation`: it would be a record that costs nothing and therefore bounds
+nothing, which is the one way attempts could accumulate without limit.
 
 Because every admission point is bounded and every record is accounted, storage
 is finite even when no completion ever arrives. The record count is a function of
@@ -216,6 +247,13 @@ A recovery episode belongs to its target and survives owner turns. It allows at
 most three construction attempts, with the second 100 ms after the first failure
 and the third 500 ms after the second. Asking early reports the deadline rather
 than spending an attempt.
+
+An episode holds at most one attempt in flight. A second request while the first
+is outstanding answers `RecoveryOutstanding` rather than spending another of the
+three on one construction, and a failure or success reported with nothing
+outstanding is refused rather than spending one on a construction that never
+began. A terminal session admits no new recovery work at all: device loss is not
+a condition a target can construct its way out of.
 
 Nothing raises a spent budget. A nested helper, a changed framebuffer
 observation and an allocation sub-retry all reach the same accounting, which only
@@ -283,6 +321,11 @@ prove the whole schedule.
 | ----------------- | ------------------ | ------------------------- | ------ | ------------ | -------------------------------------------- |
 | The `GpuModel`    | The owning boundary| Whoever threads the value | Any    | The session  | A record leaves only when every hold has ended |
 
+Nothing accumulates as history. A disposed resource's current-generation entry is
+removed, a settled frame gives back the reservations it never used, and a
+disposal that failed is remembered once rather than retried, so the model's record
+count stays a function of the configuration.
+
 The model owns no mutable state at all: it is an immutable value, and every
 operation returns the next one. Concurrency, if any, belongs to the boundary that
 threads it.
@@ -318,6 +361,17 @@ defeating late publication; the backoff schedule and its resets under a scripted
 clock; bounded round-robin progress across several targets; suspended targets
 retaining retirement demand; disposal failure retaining ownership and accounting
 while escalating the session; and finite storage when completions never arrive.
+
+It also covers the guarantees that are easy to lose at the edges: a submission
+committing with the object budget full, because its record was reserved with the
+frame; a rebuild refused through a retained older identity; an allocation that
+reserves nothing refused outright; one recovery attempt at a time and none at all
+in a failed session; a construction that finished after device loss retired
+rather than published; a replacement request cleared by the publication that
+served it while a newer one stays pending; an image still named by the record
+that outlived its frame, in either completion order, and not acquirable twice;
+and a logical resource forgotten after its last generation is disposed of while a
+retained identity for it is still called stale.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

@@ -122,6 +122,7 @@ module Hetoimasia.GPU.Model
   , RecoveryAnswer (..)
   , beginTargetRecovery
   , recordRecoveryFailure
+  , recordRecoverySuccess
 
     -- * Allocation attempts
   , RetryVerdict (..)
@@ -140,6 +141,7 @@ module Hetoimasia.GPU.Model
   , disposalEligible
   , FrameView (..)
   , frameView
+  , presentationImage
   , TargetView (..)
   , targetView
   , Usage (..)

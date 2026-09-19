@@ -22,6 +22,7 @@ module Hetoimasia.GPU.Model.Internal.Recovery
   , RecoveryProgress (..)
   , attemptRecovery
   , recordAttemptFailure
+  , recordAttemptSuccess
   , noteRetirementCycle
   , observeHealthyProgress
 
@@ -70,6 +71,11 @@ data RecoveryEpisode = RecoveryEpisode
     -- last failure.
   , episodeHealthySince ∷ !(Maybe Instant)
     -- ^ When that cycle completed; the healthy period is measured from here.
+  , episodeOutstanding ∷ !Bool
+    -- ^ Whether an admitted attempt is still in flight. An episode holds at most
+    -- one: a second 'attemptRecovery' before the first is settled would spend a
+    -- second attempt for one construction, and a failure reported with none
+    -- outstanding would spend one for a construction that never began.
   }
   deriving (Eq, Show)
 
@@ -81,6 +87,7 @@ freshEpisode =
     , episodeNextAttemptAt = Nothing
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
+    , episodeOutstanding = False
     }
 
 -- | What an attempt request may answer.
@@ -91,17 +98,20 @@ data RecoveryProgress
     -- ^ The budget is not spent, but the retry delay has not elapsed.
   | AttemptBudgetExhausted
     -- ^ Three attempts have been made in this episode.
+  | AttemptStillOutstanding
+    -- ^ The previous attempt has neither failed nor succeeded yet.
   deriving (Eq, Show)
 
 -- | Ask to begin the next construction attempt of this episode.
 attemptRecovery ∷ Instant → RecoveryEpisode → (RecoveryEpisode, RecoveryProgress)
 attemptRecovery now episode
+  | episodeOutstanding episode = (episode, AttemptStillOutstanding)
   | episodeAttempts episode >= recoveryAttemptLimit = (episode, AttemptBudgetExhausted)
   | Just at ← episodeNextAttemptAt episode
   , not (deadlineReached now at) =
       (episode, AttemptDeferredUntil at)
   | otherwise =
-      ( episode {episodeAttempts = attempt, episodeNextAttemptAt = Nothing}
+      ( episode {episodeAttempts = attempt, episodeNextAttemptAt = Nothing, episodeOutstanding = True}
       , AttemptAdmitted attempt
       )
   where
@@ -113,12 +123,15 @@ attemptRecovery now episode
 --
 -- A failure also clears any healthy-progress evidence: a target that has just
 -- failed again has not been healthy, however long the previous quiet spell was.
+-- Reporting it also settles the attempt, so the next one may be admitted once
+-- its delay has elapsed.
 recordAttemptFailure ∷ Instant → RecoveryEpisode → RecoveryEpisode
 recordAttemptFailure now episode =
   episode
     { episodeNextAttemptAt = delayFor (episodeAttempts episode) >>= schedule
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
+    , episodeOutstanding = False
     }
   where
     delayFor attempts
@@ -131,6 +144,12 @@ recordAttemptFailure now episode =
     schedule ∷ Duration → Maybe Instant
     schedule delay = either (const Nothing) Just (addDuration now delay)
 
+-- | Record that the attempt just made succeeded. It settles the attempt without
+-- returning it: the budget an episode has spent is spent, and only a completed
+-- retirement cycle plus a healthy period gives any of it back.
+recordAttemptSuccess ∷ RecoveryEpisode → RecoveryEpisode
+recordAttemptSuccess episode = episode {episodeOutstanding = False}
+
 -- | A normal presentation-retirement cycle completed on this target. This is
 -- the first of the two conditions a reset needs; on its own it resets nothing.
 noteRetirementCycle ∷ Instant → RecoveryEpisode → RecoveryEpisode
@@ -140,8 +159,13 @@ noteRetirementCycle now episode
 
 -- | Reset the episode if, and only if, a retirement cycle has completed and a
 -- full healthy period has elapsed since it did without another failure.
+--
+-- An attempt still in flight blocks the reset, because a reset would settle it
+-- by forgetting it: the construction would then be free to report a failure
+-- against a budget that had already been handed back.
 observeHealthyProgress ∷ Instant → RecoveryEpisode → RecoveryEpisode
 observeHealthyProgress now episode
+  | episodeOutstanding episode = episode
   | not (episodeRetirementCycle episode) = episode
   | Just since ← episodeHealthySince episode
   , Right healthy ← addDuration since healthyProgressPeriod

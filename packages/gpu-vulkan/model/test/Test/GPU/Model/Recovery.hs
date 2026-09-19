@@ -4,6 +4,7 @@
 module Test.GPU.Model.Recovery (spec) where
 
 import Hetoimasia.GPU.Model
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (requestedFrameSlots, requestedGenerations), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity
 import Numeric.Natural (Natural)
 import Test.GPU.Model.Support
@@ -129,6 +130,90 @@ spec = describe "recovery" $ do
     failedModel ← exhaust requiredTarget requiredSpent
     sessionState failedModel `shouldBe` SessionFailed RequiredTargetUnrecoverable
     escalations failedModel `shouldSatisfy` elem (RequiredTargetFailedSession requiredTarget)
+
+  it "admits one attempt at a time, and only a settled one lets the next begin" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    (begun, first) ← admitted "the first attempt" (beginTargetRecovery (atMilliseconds 0) target active)
+    first `shouldBe` RecoveryAttempt 1
+
+    -- One construction, one attempt. Asking again while it is in flight would
+    -- otherwise spend a second of the episode's three on the same construction.
+    (unchanged, again) ← admitted "asking while one is outstanding" (beginTargetRecovery (atMilliseconds 0) target begun)
+    again `shouldBe` RecoveryOutstanding
+    fmap viewTargetRecoveryAttempts (targetView target unchanged) `shouldBe` Just 1
+    (_, andAgain) ← admitted "asking a third time" (beginTargetRecovery (atMilliseconds 0) target unchanged)
+    andAgain `shouldBe` RecoveryOutstanding
+
+    -- A success settles it without giving the attempt back, and the next one is
+    -- admitted with no delay, because delays follow failures.
+    settled ← admitted_ "recording the success" (recordRecoverySuccess target begun)
+    fmap viewTargetRecoveryAttempts (targetView target settled) `shouldBe` Just 1
+    (second, secondAnswer) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 0) target settled)
+    secondAnswer `shouldBe` RecoveryAttempt 2
+    fmap viewTargetRecoveryAttempts (targetView target second) `shouldBe` Just 2
+
+  it "refuses a failure report with no attempt outstanding, and any recovery once the session has failed" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    -- Accepting this would spend an attempt on a construction that never began,
+    -- and install a retry delay out of nowhere.
+    rejected_ "reporting a failure with nothing outstanding" (recordRecoveryFailure (atMilliseconds 0) target active)
+      >>= (`shouldBe` WrongPhase TargetIdentity)
+    rejected_ "reporting a success with nothing outstanding" (recordRecoverySuccess target active)
+      >>= (`shouldBe` WrongPhase TargetIdentity)
+    fmap viewTargetRecoveryAttempts (targetView target active) `shouldBe` Just 0
+
+    -- Device loss is terminal to the session. A target cannot construct its way
+    -- out of it, so no new episode work is admitted.
+    let lost = escalateSession DeviceLost active
+    rejected "beginning recovery in a failed session" (beginTargetRecovery (atMilliseconds 0) target lost)
+      >>= (`shouldBe` SessionAlreadyFailed)
+
+  it "retires rather than publishes a construction that finished after the session failed" $ do
+    model ← freshModel
+    (active, target, generation) ← activeTarget 2 model
+    (constructing, replacement) ← admitted "constructing a replacement" (beginGeneration target (Just generation) active)
+    let lost = escalateSession DeviceLost constructing
+    let accounted = usageObjects (usage lost)
+
+    -- The native construction already happened, so its result has to be owned
+    -- for retirement rather than refused at the call or published into a session
+    -- that is finished.
+    (answered, answer) ← admitted "publishing after device loss" (publishGeneration replacement 2 lost)
+    answer `shouldBe` PublicationSuperseded
+    fmap viewTargetActive (targetView target answered) `shouldBe` Just Nothing
+    disposalEligible (GenerationSubject replacement) answered `shouldBe` False
+    usageObjects (usage answered) `shouldBe` accounted
+    sessionState answered `shouldBe` SessionFailed DeviceLost
+
+  it "clears a replacement request with the publication that served it, and keeps a newer one pending" $ do
+    -- Three live generations, because this example replaces twice and each
+    -- superseded generation still owes the presentation obligation of the frame
+    -- whose suboptimal acquisition asked for the replacement.
+    model ← freshModelWith defaultBudgetRequest {requestedGenerations = 3, requestedFrameSlots = 3}
+    (active, target, generation) ← activeTarget 2 model
+    fmap viewTargetReplacementRequested (targetView target active) `shouldBe` Just False
+
+    (reserved, frame) ← admitted "reserving" (reserveFrame target active)
+    (suboptimal, _) ← admitted "acquiring suboptimally" (acquireImage frame (AcquiredSuboptimalImage 0) reserved)
+    fmap viewTargetReplacementRequested (targetView target suboptimal) `shouldBe` Just True
+
+    (constructing, replacement) ← admitted "constructing the replacement" (beginGeneration target (Just generation) suboptimal)
+    (published, _) ← admitted "publishing it" (publishGeneration replacement 2 constructing)
+    -- The request this construction was begun for is served, so the target no
+    -- longer reports one pending.
+    fmap viewTargetReplacementRequested (targetView target published) `shouldBe` Just False
+
+    -- A request raised while a replacement is constructing is a different
+    -- request, and publishing that replacement does not answer it.
+    (secondFrame, second) ← admitted "reserving again" (reserveFrame target published)
+    (requested, _) ← admitted "acquiring suboptimally again" (acquireImage second (AcquiredSuboptimalImage 1) secondFrame)
+    (constructingAgain, another) ← admitted "constructing again" (beginGeneration target (Just replacement) requested)
+    (thirdFrame, third) ← admitted "reserving during construction" (reserveFrame target constructingAgain)
+    (later, _) ← admitted "an out-of-date acquisition during construction" (acquireImage third AcquireOutOfDate thirdFrame)
+    (publishedAgain, _) ← admitted "publishing the second replacement" (publishGeneration another 2 later)
+    fmap viewTargetReplacementRequested (targetView target publishedAgain) `shouldBe` Just True
 
   describe "allocation attempts" $ do
     it "refuses a retry until a reclamation pass has actually disposed of something" $ do

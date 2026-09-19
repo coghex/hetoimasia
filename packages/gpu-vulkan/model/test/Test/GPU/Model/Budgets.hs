@@ -12,7 +12,7 @@ import Hetoimasia.GPU.Model.Budget
 import Hetoimasia.GPU.Model.Identity
 import Numeric.Natural (Natural)
 import Test.GPU.Model.Support
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "admission budgets" $ do
@@ -97,16 +97,28 @@ spec = describe "admission budgets" $ do
       backpressured "constructing a third generation after publication" (beginGeneration target Nothing published)
         >>= (`shouldBe` GenerationBudget)
 
-    it "answers backpressure for the presentation pool, without touching a record already reserved for an admitted frame" $ do
-      -- Two frame slots and a two-image tracking limit give a pool of four.
-      model ← freshModelWith smallRequest {requestedFrameSlots = 2, requestedAggregateFrameSlots = 4}
-      (active, target, _) ← activeTarget 2 model
-      filled ← leaveEnqueued target 3 active
-      fmap viewTargetPoolRecords (targetView target filled) `shouldBe` Just 3
+    it "answers backpressure for the presentation pool a retired generation shares with the active one" $ do
+      -- Three tracked images and two frame slots give a pool of five. A new
+      -- generation consumes the target's existing pool, including the records a
+      -- retired generation still owes retirements on, rather than receiving one
+      -- of its own — which is the only way the derived pool binds at all.
+      model ← freshModelWith smallRequest {requestedFrameSlots = 2, requestedAggregateFrameSlots = 4, requestedImageTracking = 3}
+      (active, target, first) ← activeTarget 3 model
+      retiring ← leaveEnqueued target 3 active
+      fmap viewTargetPoolRecords (targetView target retiring) `shouldBe` Just 3
 
-      (reserved, frame) ← admitted "reserving the pool's last record" (reserveFrame target filled)
-      (acquired, _) ← admitted "acquiring" (acquireImage frame (AcquiredImage 0) reserved)
-      fmap viewTargetPoolRecords (targetView target acquired) `shouldBe` Just 4
+      (replacing, replacement) ← admitted "replacing the generation" (beginGeneration target (Just first) retiring)
+      (published, _) ← admitted "publishing the replacement" (publishGeneration replacement 3 replacing)
+      -- The retired generation's three records are still pending, so the
+      -- replacement starts with two of the five left.
+      next ← leaveEnqueued target 1 published
+      fmap viewTargetPoolRecords (targetView target next) `shouldBe` Just 4
+
+      (reserved, frame) ← admitted "reserving the pool's last record" (reserveFrame target next)
+      (acquired, _) ← admitted "acquiring" (acquireImage frame (AcquiredImage 1) reserved)
+      fmap viewTargetPoolRecords (targetView target acquired) `shouldBe` Just 5
+      -- A slot is still free, so this is the pool answering and not the slots.
+      fmap viewTargetFrames (targetView target acquired) `shouldBe` Just 1
       backpressured "reserving beyond the pool" (reserveFrame target acquired)
         >>= (`shouldBe` PresentationPoolBudget)
 
@@ -114,7 +126,7 @@ spec = describe "admission budgets" $ do
       -- still there, so it can still be abandoned safely.
       skipped ← admitted_ "skipping the admitted frame" (skipUnsubmittedFrame frame acquired)
       settled ← admitted_ "settling it" (recordCompletion (atMilliseconds 1) (UnpresentedFrameSettled frame) skipped)
-      fmap viewTargetPoolRecords (targetView target settled) `shouldBe` Just 3
+      fmap viewTargetPoolRecords (targetView target settled) `shouldBe` Just 4
 
     it "answers backpressure for the byte and object budgets" $ do
       model ← freshModelWith smallRequest {requestedBytes = 2048, requestedObjects = 8}
@@ -171,6 +183,54 @@ spec = describe "admission budgets" $ do
       reclaimExamined secondReport `shouldBe` 1
       length (reclaimDisposed secondReport) `shouldBe` 1
 
+    it "commits a submission whose object was reserved with its frame, even with the budget full" $ do
+      -- One tracked image and three objects: the published generation's image,
+      -- and the two a reserved frame takes for the pool record and the
+      -- submission record it may need.
+      model ←
+        freshModelWith
+          smallRequest {requestedImageTracking = 1, requestedFrameSlots = 1, requestedObjects = 3}
+      (active, target, generation) ← activeTarget 1 model
+      (framed, frame) ← acquiredFrame target active
+      usageObjects (usage framed) `shouldBe` 3
+
+      -- The budget is now full. The native call has already happened by the time
+      -- an outcome is reported, so a refusal here would drop the holds for work
+      -- that really was submitted. It cannot happen: the object was reserved
+      -- before the call, and committing only consumes it.
+      (submitted, answer) ← admitted "committing the submission" (submitFrames [frame] SubmissionAccepted framed)
+      answer `shouldSatisfy` \case
+        SubmissionRecorded _ → True
+        _ → False
+      usageObjects (usage submitted) `shouldBe` 3
+      maybe [] viewOutstanding (holdView (GenerationSubject generation) submitted)
+        `shouldContain` [SubmittedUseOwed]
+
+    it "refuses an allocation attempt that reserves neither bytes nor objects" $ do
+      model ← freshModelWith smallRequest
+      rejected "reserving nothing" (beginAllocation 0 0 model) >>= (`shouldBe` EmptyAllocation)
+      -- Such an attempt would be a record that costs nothing and therefore
+      -- bounds nothing. Refusing it is what keeps the attempt map finite.
+      let before = liveRecordCount model
+          attempt current _ = case beginAllocation 0 0 current of
+            Admitted (next, _) → next
+            _ → current
+      liveRecordCount (foldl attempt model [1 .. 200 ∷ Int]) `shouldBe` before
+
+    it "forgets a logical resource once its last generation is disposed of, while still calling it stale" $ do
+      model ← freshModelWith smallRequest {requestedBytes = 65536, requestedObjects = 64}
+      -- Twenty create/release/dispose cycles. Every record is gone each time, so
+      -- the count the model carries is the count it started with rather than one
+      -- entry per resource it has ever owned.
+      (final, lastResource) ← repeatCycles model (20 ∷ Int)
+      liveRecordCount final `shouldBe` liveRecordCount model
+      usageResources (usage final) `shouldBe` 0
+      usageObjects (usage final) `shouldBe` usageObjects (usage model)
+      -- The identity of a resource this session issued is still stale rather
+      -- than unknown, decided by the counter rather than by remembering it.
+      rejected_ "releasing a disposed resource" (releaseResource lastResource final)
+        >>= (`shouldBe` StaleIdentity ResourceIdentity)
+
   describe "storage" $
     it "stays finite when no completion ever arrives" $ do
       model ← freshModelWith smallRequest
@@ -194,6 +254,20 @@ spec = describe "admission budgets" $ do
       sessionState final `shouldBe` SessionRunning
   where
     validated request = either (fail . show) pure (validateBudgets request)
+    -- One create / release / end-CPU-use / dispose cycle, answering the model
+    -- and the identity the cycle disposed of.
+    oneCycle current = do
+      (created, resource) ← aResource 1024 current
+      released ← admitted_ "releasing" (releaseResource resource created)
+      ended ← admitted_ "ending CPU use" (endResourceCpuUse resource released)
+      let (reclaimed, report) = reclaimPass disposing ended
+      reclaimDisposed report `shouldContain` [ResourceSubject resource]
+      pure (reclaimed, resource)
+    repeatCycles start count
+      | count <= 0 = fail "the fixture ran no cycle at all"
+      | otherwise = do
+          (next, resource) ← oneCycle start
+          if count == 1 then pure (next, resource) else repeatCycles next (count - 1)
     disposing = silentEvidence {disposalEvidence = const DisposalCompleted}
     settleResource resource model = do
       released ← admitted_ "releasing" (releaseResource resource model)

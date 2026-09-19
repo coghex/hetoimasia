@@ -145,14 +145,27 @@ activeTargetWith classification images model = do
     GenerationPublished _ → pure (published, target, generation)
     other → fail ("the fixture's generation should have published, but the answer was " ++ show other)
 
--- | A frame of that target holding image zero of its active generation.
+-- | A frame of that target holding the lowest image of its active generation
+-- that no live presentation record already owns.
+--
+-- The index is searched rather than fixed, because an image belongs to one owner
+-- at a time and a record can outlive its frame: a fixture that always asked for
+-- image zero would be asking for an image the previous frame's record still owes
+-- a retirement on. A presentation engine does not hand the same image out twice
+-- either, so this is the realistic fixture as well as the admissible one.
 acquiredFrame ∷ HasCallStack ⇒ TargetId → GpuModel → IO (GpuModel, FrameSlotId)
 acquiredFrame target model = do
   (reserved, frame) ← admitted "reserving a frame" (reserveFrame target model)
-  (acquired, answer) ← admitted "acquiring an image" (acquireImage frame (AcquiredImage 0) reserved)
-  case answer of
-    ImageOwned _ _ → pure (acquired, frame)
-    other → fail ("the fixture's acquisition should have owned an image, but the answer was " ++ show other)
+  let attempt index = case acquireImage frame (AcquiredImage index) reserved of
+        Rejected (AlreadyConsumed ImageIdentity) → attempt (index + 1)
+        Rejected (UnknownIdentity ImageIdentity) →
+          fail "the fixture's target has no free image left to acquire"
+        answered → do
+          (acquired, answer) ← admitted "acquiring an image" answered
+          case answer of
+            ImageOwned _ _ → pure (acquired, frame)
+            other → fail ("the fixture's acquisition should have owned an image, but the answer was " ++ show other)
+  attempt (0 ∷ Natural)
 
 -- | One managed resource, through the allocation attempt that reserved it.
 aResource ∷ HasCallStack ⇒ Natural → GpuModel → IO (GpuModel, ResourceId)
