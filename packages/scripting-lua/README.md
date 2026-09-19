@@ -512,7 +512,8 @@ provider-work accounting. It invalidates only what still holds a local
 interest: a stub whose owner already revoked it — by having its task
 invalidated, or by observing its cancellation and walking away — is carried for
 provider accounting and is not invalidated, or counted, a second time. Session
-failure and stop follow the same rule. `reportFailure` with `RecoveryUnsafe` moves the
+failure, stop, and the invalidation of one task's own holdings all follow that
+same rule. `reportFailure` with `RecoveryUnsafe` moves the
 session to its terminal failed state: mutation admission closes, live work is
 invalidated, and the record is kept beside the identity of the last good
 snapshot. `Observing` admission stays open, because a failed gameplay session

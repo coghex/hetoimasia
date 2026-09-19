@@ -531,15 +531,22 @@ retire identity result session =
     session {sessionResults = Map.insert identity result (sessionResults session)}
 
 -- | Revoke the requests and subscriptions one task owned.
+--
+-- Only the requests that still hold a local interest, for the reason
+-- 'revocableRequests' gives: an owner that already observed how its request
+-- ended has discharged that interest, and the stub left behind carries
+-- provider accounting alone. Revoking it again would settle nothing and
+-- discard nothing, and still count an invalidation that had already happened.
 invalidateHoldingsOf ∷ TaskId → CancelCause → Session v → Session v
 invalidateHoldingsOf identity cause session =
   dropSubscriptions (revokeRequests session)
   where
+    ownedAndLive record = requestOwner record == identity && requestResultHeld record
     revokeRequests initial =
       foldl'
         (\current record → revokeOne cause (requestIdentity record) current)
         initial
-        (Map.elems (Map.filter ((== identity) . requestOwner) (sessionRequests initial)))
+        (Map.elems (Map.filter ownedAndLive (sessionRequests initial)))
     dropSubscriptions current =
       let (ended, kept) =
             Map.partition ((== identity) . subscriptionOwner) (sessionSubscriptions current)

@@ -19,7 +19,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   , Limits (maxOutstandingRequests, maxPayloadBytes)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
-  ( CancelCause (CancelledByOwner)
+  ( CancelCause (CancelledByOwner, CancelledByTaskInvalidation)
   , ObserveRejection (ResultNotHeld, ResultUnsettled)
   , ProviderRejection (ProviderAlreadyComplete, ProviderStillAwaitingReply)
   , Reply (ReplyFailure, ReplyResult)
@@ -30,7 +30,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   , settlementKind
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
-  ( Counters (countLateProviderCompletions, countLateReplies, countOversizePayloads, countUnknownReplies)
+  ( Counters (countInvalidatedRequests, countLateProviderCompletions, countLateReplies, countOversizePayloads, countUnknownReplies)
   , Session (sessionCounters, sessionRequests, sessionTasks)
   , SessionRejection (CapReached, NotTaskOwner, ObserveRefused, PayloadTooLarge, ProviderRefused, ReplyRefused, UnknownRequest)
   , acceptRequest
@@ -38,6 +38,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   , applyOutcome
   , applyReplyIn
   , cancelRequestIn
+  , cancelTaskIn
   , completeProviderWorkIn
   , observeRequestIn
   )
@@ -202,6 +203,33 @@ spec = describe "requests" $ do
     Map.size (sessionRequests h) `shouldBe` 1
     (final, _) ← ok (acceptRequest owner (RequestName 3) endpoint h)
     Map.size (sessionRequests final) `shouldBe` 2
+
+  it "does not re-invalidate a stub when its owning task terminates" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, identity) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, ()) ← ok (cancelRequestIn identity b)
+    (d, _) ← ok (observeRequestIn identity c)
+    countInvalidatedRequests (sessionCounters d) `shouldBe` 0
+    (e, ()) ← ok (cancelTaskIn owner d)
+    countInvalidatedRequests (sessionCounters e) `shouldBe` 0
+    record ← heldRecord identity e
+    requestSettlement record `shouldBe` Just (SettledCancelled CancelledByOwner)
+    requestProviderOutstanding record `shouldBe` True
+    (f, ()) ← ok (completeProviderWorkIn identity e)
+    Map.member identity (sessionRequests f) `shouldBe` False
+
+  it "still invalidates a live request when its owning task terminates" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, identity) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, ()) ← ok (cancelTaskIn owner b)
+    countInvalidatedRequests (sessionCounters c) `shouldBe` 1
+    record ← heldRecord identity c
+    requestSettlement record
+      `shouldBe` Just (SettledCancelled CancelledByTaskInvalidation)
+    requestResultHeld record `shouldBe` False
+    requestProviderOutstanding record `shouldBe` True
 
   it "stamps a new generation on every reuse of one request handle" $ do
     session ← openSession
