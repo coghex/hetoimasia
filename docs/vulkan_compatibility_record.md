@@ -19,7 +19,7 @@ be committed — and inside the Linux container there is no checkout to resolve
 one from at all. The digest is what pins the record either way.
 
 It also does something the revision cannot: the two retained records carry the
-*same* digest, `54a027aa…`, computed independently — on macOS from a Git
+*same* digest, `f50261a8…`, computed independently — on macOS from a Git
 checkout, and inside the Linux container from the files the recipe copied into
 it, with no checkout to consult. That is direct evidence the two platforms
 proved one tree rather than two that were believed to match.

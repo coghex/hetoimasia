@@ -22,7 +22,7 @@
 -- checkout they run in. They start no session and build nothing.
 module VulkanProof (spec) where
 
-import Data.Char (isSpace)
+import Data.Char (isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
@@ -153,6 +153,21 @@ spec = describe "The Vulkan proof boundary" $ do
     -- container recipe copied on the other, with no checkout to consult.
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 
+  it "quotes no digest the records disagree with" $ do
+    -- The summary names the digest for a reader's benefit, which means it can
+    -- go stale every time the harness changes — and did. Any digest-shaped
+    -- token it quotes, in full or abbreviated, must be the one the records
+    -- carry; removing the quotation is allowed, contradicting it is not.
+    summary ← readFile compatibilityRecord
+    recorded ← case retainedRecords of
+      ((_, path) : _) → (settingOf <$> readFile path) <*> pure "- source digest:"
+      [] → pure Nothing
+    case fmap trim recorded of
+      Nothing → expectationFailure "the retained record names no source digest"
+      Just digest → do
+        let quoted = filter looksLikeDigest (map (takeWhile isHexDigit) (backticked summary))
+        quoted `shouldSatisfy` all (`isPrefixOf` digest)
+
   it "is selected by the planner whenever anything it reads changes" $ do
     catalog ← readFile "tools/validation/catalog.json"
     case parseJson catalog >>= field "groups" >>= asArray of
@@ -212,6 +227,19 @@ settingOf text prefix =
   case [rest | line ← map trim (lines text), Just rest ← [stripPrefix prefix line]] of
     (value : _) → Just value
     [] → Nothing
+
+-- | Every backticked span in a document, which is where this summary puts a
+-- digest when it quotes one.
+backticked ∷ String → [String]
+backticked text = case break (== '`') text of
+  (_, []) → []
+  (_, _ : rest) → case break (== '`') rest of
+    (_, []) → []
+    (span', _ : more) → span' : backticked more
+
+-- | Long enough to be a digest rather than a word that happens to be hex.
+looksLikeDigest ∷ String → Bool
+looksLikeDigest token = length token >= 8
 
 -- | A Markdown table row, as its trimmed cells. The leading and trailing pipes
 -- produce empty edges, which are dropped so a cell index matches the column a
