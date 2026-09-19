@@ -190,12 +190,43 @@ owning subsystem's contract/design when continuing its work.
   (platform proofs) and #149 (pure protocol model) follow #146 and can then run
   in parallel. The backlog review identified one amendment for #147: it needs
   the same bounded Cabal OS/buildable parser support already specified in #148,
-  or must reuse that support if #148 lands first. No tracker edit has been made.
+  or must reuse that support if #148 lands first. #148 landed it: `buildable` is
+  now the one non-link field the validation planner accepts inside an
+  `if os(...)` block, and it is invisible to input derivation, so a
+  platform-only component's sources still count as changed inputs everywhere.
   LUA-14/LUA-15 must prove viable Linux and macOS confinement before dependent
   process/integration slices are drafted.
   Signed bundled macOS helpers may be evaluated while preserving headless CLI
   operation; no assumed privileged install or paid signing account. A failed or
   inconclusive proof returns the design to exploring; never weaken isolation.
+- **LUA-15's macOS verdict (#148) is `inconclusive`**, recorded in
+  [docs/macos_confinement_verdict.md](docs/macos_confinement_verdict.md) with
+  its probe at `packages/scripting-lua/macos/`. Every proof row was demonstrated
+  on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
+  no entitlement or privilege) — per-instance SBPL confinement, all four denied
+  accesses natively (three of them again from Lua; Lua has no socket API, and
+  that gap is named in the verdict rather than counted as a pass),
+  two-instance isolation including inherited descriptors, a fatal whole-process
+  footprint cap, an enforced execution budget, and the three lifetime endings.
+  It is not `supported` because both load-bearing mechanisms are unsupported:
+  `sandbox_init_with_parameters` (undeclared; the family its header does declare
+  is marked "No longer supported") and `posix_spawnattr_setjetsam_ext`
+  (undeclared SPI). Four measurements worth not rediscovering: a spawn-time
+  jetsam memory limit is **cleared by any later `exec`**, so an exec-based
+  wrapper such as `sandbox-exec` silently drops it and the helper must confine
+  itself; the cap is on **physical footprint**, so the threaded RTS's ~1.44 TiB
+  virtual reservation does not count against it; `RLIMIT_AS`/`RLIMIT_DATA`
+  cannot be installed below ~1.44 TiB in that helper (~415 GiB even in a trivial
+  C process) and so cannot express any mod budget; and App Sandbox — the
+  supported alternative — permits `exec`, shares one container per bundle
+  identifier, and leaves a `~/Library/Containers/<id>` an unprivileged process
+  **cannot delete**. A fifth, found in review: a confinement profile bounds what
+  a process may reach *by name* and says nothing about descriptors it was
+  *handed* — the parent's listening endpoints were inherited across the spawn
+  until `FD_CLOEXEC` and `POSIX_SPAWN_CLOEXEC_DEFAULT` closed them. Q-5's macOS row is the owner's: accept the unsupported-SPI
+  profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
+  untrusted-mod targets. Until then the design stays `exploring` and LUA-9
+  through LUA-13 stay undrafted, whatever #147 concludes.
 - [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
   tracked by epic #155. #157 merged and pinned the shared toolchain; native
   proof #158 and pure ownership model #160 follow it, and Lua #146 can run in
