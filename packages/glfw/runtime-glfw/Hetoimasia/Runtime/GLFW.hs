@@ -480,7 +480,11 @@
 -- have begun retiring, so one window's pending retirement never blocks another's
 -- commands, close, attachment, or retirement. 'hostRetirementDemand' publishes
 -- what the last round left owed, and 'runScheduledOwnerLoop' folds it into the
--- wait it chooses, so a due step is not delayed by the idle bound. No
+-- wait it chooses, so a due step is not delayed by the idle bound. An
+-- attachment no round has yet offered an opportunity to, and one fresh evidence
+-- has just revived, both keep the next turn immediate however short the budget
+-- fell; once every one of them has been inspected and is waiting, the turn
+-- waits toward the earliest instant they named, bounded by 'hostIdleWait'. No
 -- opportunity performs a blocking GPU wait, and an owner declaring
 -- 'BlockingCompletion' is refused the opportunity before its step runs. Only the
 -- owner thread advances an attachment; other threads read its state and publish

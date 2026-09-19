@@ -47,7 +47,7 @@ import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.Foundation.Resource (allocResource, withScoped)
 import Hetoimasia.Foundation.Worker (WorkerDefinition, awaitStopRequest, workerDefinition)
-import Hetoimasia.Foundation.Time (Instant)
+import Hetoimasia.Foundation.Time (Instant, MonotonicSource)
 import Hetoimasia.GLFW.Command
   ( SubmitResult (..)
   , clientCommandPort
@@ -87,7 +87,16 @@ import Hetoimasia.Runtime.Supervision
   , startSupervised
   )
 import Numeric.Natural (Natural)
-import Test.GLFW.Support (at, boundedExample, millis, quietLogger, scriptedClock, unexpected, windowNamed)
+import Test.GLFW.Support
+  ( at
+  , boundedExample
+  , durationOf
+  , millis
+  , quietLogger
+  , scriptedClock
+  , unexpected
+  , windowNamed
+  )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -176,9 +185,31 @@ spec = describe "GLFW window attachments" $ do
     it "revives nothing for a report the model refuses, on the owner thread or through a notice"
       (boundedExample testRefusedReportRevivesNothing)
 
-  describe "the schedule" $
+  describe "the schedule" $ do
     it "polls the turn a detach begins, shortens the next wait to the instant the owner named, and polls once a round advanced"
       (boundedExample testRetirementSchedule)
+    it "waits once every owner beyond the budget has been offered one opportunity and is awaiting"
+      (boundedExample testWaitingOwnersBeyondBudgetWait)
+    it "waits to an instant an earlier round learned, polls for it when it comes due unserved, and clears it when its owner names none"
+      (boundedExample testRetainedDeadlinesBoundLaterWaits)
+    it "keeps the turn immediate for an owner whose latest opportunity advanced, through rounds that leave it unserved"
+      (boundedExample testAdvancedOwnerStaysImmediate)
+    it "polls while a stalled owner's neighbour is still owed its first opportunity, then waits beside the stalled one"
+      (boundedExample testStalledNeighbourThenWaits)
+    it "polls again for a retirement begun between two waiting turns"
+      (boundedExample testNewRetirementEndsTheWaiting)
+    it "polls again for an owner whose waiting assessment new evidence outdated"
+      (boundedExample testNewEvidenceEndsTheWaiting)
+    it "polls again for a fact certified on the owner thread between waiting turns, and not for a duplicate of it"
+      (boundedExample testDirectCertificationEndsTheWaiting)
+    it "replaces a retained instant with the one its owner named later, and drops it when that owner withdraws"
+      (boundedExample testLatestInstantReplacesTheRetainedOne)
+    it "drops a retained instant when the attachment that named it retires"
+      (boundedExample testRetiringRemovesTheRetainedInstant)
+    it "drops it when the retirement is completed by certification on the owner thread between turns"
+      (boundedExample testDirectRetirementRemovesTheRetainedInstant)
+    it "drops that instant even when the completing certification is the only thing between the two turns"
+      (boundedExample testDirectRetirementDropsTheInstantAlone)
 
   describe "the application exit" $
     it "retires every attached owner, then destroys the windows and ends the session"
@@ -1670,6 +1701,13 @@ testStalledNeighbour = do
 
 -- | Opportunities are bounded per turn and rotate, so a pending retirement
 -- never starves another.
+--
+-- The budget falling short of the pending attachments is not itself work: it
+-- keeps the next turn immediate only while some attachment is still owed a
+-- first opportunity. Once the rotation has reached every one of them and each
+-- is waiting, the demand stops asking for another turn at once — which is what
+-- lets more waiting attachments than the budget settle into ordinary idle waits
+-- rather than an unbounded stream of polling turns.
 testRotatingBudget ∷ Expectation
 testRotatingBudget = do
   journal ← newTVarIO []
@@ -1682,15 +1720,21 @@ testRotatingBudget = do
       (owner, _) ← attachedOwner journal host window (ownerNamed name) {scriptPlan = repeat Await}
       void (closeHostWindow host window)
       pure owner
-    -- One opportunity per turn, to a different owner each turn: after three
-    -- turns every owner has been offered exactly one.
-    turnsExactly host control 3
+    -- Two turns, two opportunities, to a different owner each time: the third
+    -- owner has still had none, which is what keeps the next turn immediate
+    -- however short the budget fell.
+    turnsExactly host control 2
+    partway ← atomically (hostRetirementDemand host)
+    retirementImmediate partway `shouldBe` True
+    -- One more turn reaches the third. Now every owner has been offered exactly
+    -- one opportunity and every one of them is waiting, so the budget the round
+    -- could not spend on all three is no longer a reason to come back at once.
+    turnsExactly host control 1
     offered ← traverse (atomically . readTVar . ownerSteps) owners
     writeIORef counts offered
     demand ← atomically (hostRetirementDemand host)
     retirementPending demand `shouldBe` 3
-    -- Work the budget could not reach keeps the next turn immediate.
-    retirementImmediate demand `shouldBe` True
+    retirementImmediate demand `shouldBe` False
     forM_ owners $ \owner → atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
     turnsUntil host control "every destruction" ((== 3) . length <$> destroyCalls seam)
   readIORef counts `shouldReturn` [1, 1, 1]
@@ -2109,6 +2153,563 @@ testRetirementSchedule = do
       -- Once a round advanced, the turn after it polls again.
       rest `shouldSatisfy` all (== PolledForWork)
     _ → unexpected ("the scheduled loop ran too few turns: " <> show observed)
+
+-- ---------------------------------------------------------------------------
+-- Waiting beyond the budget
+
+-- | Run a fixed number of scheduled turns, collecting the pacing each one
+-- chose, and run @between@ on the owner thread at the end of every turn.
+--
+-- The pacing is recorded before @between@ runs, so a turn's own choice is never
+-- confused with what the example arranged after it: a wake arranged at the end
+-- of turn @n@ is a question about turn @n + 1@.
+pacingsOver ∷ WindowHost → RuntimeControl → Natural → (Natural → IO ()) → IO [TurnPacing]
+pacingsOver host control count between = do
+  pacings ← newTVarIO []
+  void
+    ( runScheduledOwnerLoop host control $
+        (defaultScheduledHooks quietLogger (\_ → pure (FinishWith ())))
+          { scheduledUpdate = \turn → do
+              let number = turnNumber (scheduledTurn turn)
+              atomically (modifyTVar' pacings (<> [scheduledPacing turn]))
+              between number
+              pure (if number >= count then FinishWith () else ContinueWith NoUpdateDemand)
+          }
+    )
+  readTVarIO pacings
+
+-- | Whether a turn waited its configured fallback bound, which is what an owner
+-- with nothing else to do does.
+waitedTheBound ∷ TurnPacing → Bool
+waitedTheBound = \case
+  WaitedForFallback _ → True
+  _ → False
+
+-- | One detached, scripted owner per window, in the order given.
+detachedOwners ∷ TVar [Note] → WindowHost → [(WindowId, Text, [Step])] → IO [Owner]
+detachedOwners journal host scripted =
+  forM scripted $ \(window, name, plan) → do
+    (owner, service) ← attachedOwner journal host window (ownerNamed name) {scriptPlan = plan}
+    detachWindowGraphics host service `shouldReturn` DetachBegun
+    pure owner
+
+-- | Let every scripted owner certify what it owes on its next opportunity,
+-- close every window, and run ordinary turns until each has been destroyed.
+--
+-- The assertions an example makes about pacing are made after this has run and
+-- the application has exited: one made while an attachment is still pending
+-- would leave the protected exit waiting for a retirement that can no longer
+-- happen, and an example that is wrong must fail rather than hang.
+finishOwners ∷ WindowHost → RuntimeControl → Seam → [WindowId] → [Owner] → IO ()
+finishOwners host control seam windows owners = do
+  forM_ owners $ \owner → atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+  forM_ windows $ \window → void (closeHostWindow host window)
+  turnsUntil
+    host
+    control
+    "every destruction"
+    ((== length windows) . length <$> destroyCalls seam)
+
+-- | A clock held at one instant, for an example whose pacing turns on what the
+-- owners answered rather than on time passing.
+heldClock ∷ IO MonotonicSource
+heldClock = fst <$> scriptedClock (replicate 32 0)
+
+-- | More waiting owners than the budget is an idle host, not a polling one.
+--
+-- Two owners, a budget of one, and no deadline between them: the first two
+-- turns poll because an owner is still owed its first opportunity, and once the
+-- rotation has reached both, the turns wait their configured bound. Counting
+-- every unserved owner as work instead makes this an unbounded stream of
+-- polling turns, which is the defect.
+testWaitingOwnersBeyondBudgetWait ∷ Expectation
+testWaitingOwnersBeyondBudgetWait = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  offered ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners journal host [(alpha, "alpha", repeat Await), (beta, "beta", repeat Await)]
+    pacingsOver host control 4 (\_ → pure ()) >>= writeIORef observed
+    traverse (atomically . readTVar . ownerSteps) owners >>= writeIORef offered
+    finishOwners host control seam [alpha, beta] owners
+  -- Rotation is unchanged: four turns of one opportunity each reached both
+  -- owners twice.
+  readIORef offered `shouldReturn` [2, 2]
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      thirdTurn `shouldSatisfy` waitedTheBound
+      fourthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A deadline an earlier round learned still bounds a later round's wait, is
+-- still served when it comes due while its owner is unserved, and is cleared
+-- when that owner next names none.
+--
+-- Three owners, a budget of one, and three different instants. The round that
+-- learns the nearest of them is not the round the loop waits after, so a demand
+-- carrying only the instants its own round named would wait straight past it.
+testRetainedDeadlinesBoundLaterWaits ∷ Expectation
+testRetainedDeadlinesBoundLaterWaits = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  -- Held at the origin while the three instants are learned, then moved past
+  -- the nearest of them. Each turn samples twice: once to choose its pacing,
+  -- once to give the update.
+  (clock, _) ←
+    scriptedClock (concatMap (\turn → [turn, turn]) [0, 0, 0, 0, millis 60, millis 60, millis 60])
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta", windowNamed "gamma"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta, gamma) ← threeWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", AwaitUntil (at (millis 80)) : repeat Await)
+        , (beta, "beta", AwaitUntil (at (millis 40)) : repeat Await)
+        , (gamma, "gamma", AwaitUntil (at (millis 120)) : repeat Await)
+        ]
+    pacingsOver host control 7 (\_ → pure ()) >>= writeIORef observed
+    finishOwners host control seam [alpha, beta, gamma] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn, seventhTurn] → do
+      -- One first opportunity per turn while any owner is still owed one.
+      [firstTurn, secondTurn, thirdTurn] `shouldSatisfy` all (== PolledForWork)
+      -- Beta named the nearest instant on the second turn and the third turn
+      -- served gamma instead; the wait is still beta's.
+      fourthTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- That instant came due while beta was unserved, so the turn polls for it
+      -- however little else the last round left owed.
+      fifthTurn `shouldBe` PolledForDeadline
+      -- Beta's second opportunity named no instant, which clears the one it
+      -- named before rather than leaving it standing; gamma's is now nearest.
+      sixthTurn `shouldBe` WaitedForDeadline (durationOf (millis 60))
+      -- And once gamma's is cleared too, the owner is simply idle.
+      seventhTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | An owner whose latest opportunity advanced keeps the next turn immediate
+-- while later rounds leave it unserved.
+--
+-- Alpha advances on the first turn and is not reached again until the fourth.
+-- The second and third turns are immediate because another owner is still owed
+-- a first opportunity; the fourth is immediate because of alpha alone.
+testAdvancedOwnerStaysImmediate ∷ Expectation
+testAdvancedOwnerStaysImmediate = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta", windowNamed "gamma"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta, gamma) ← threeWindows host
+    fact ← case allRetirementFacts of
+      known : _ → pure known
+      [] → unexpected "the attachment model declares no retirement facts"
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", Certify fact : repeat Await)
+        , (beta, "beta", repeat Await)
+        , (gamma, "gamma", repeat Await)
+        ]
+    pacingsOver host control 5 (\_ → pure ()) >>= writeIORef observed
+    finishOwners host control seam [alpha, beta, gamma] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn] → do
+      [firstTurn, secondTurn, thirdTurn, fourthTurn] `shouldSatisfy` all (== PolledForWork)
+      -- Alpha's fourth-turn opportunity named no instant either, so by the
+      -- fifth every owner has been inspected and is waiting.
+      fifthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A stalled owner never starves its unserved neighbour, and never keeps the
+-- turns polling once that neighbour has been inspected.
+--
+-- The one opportunity the budget allows goes to the owner that withdraws its
+-- path, so the round serves nobody at all: the next turn must still poll,
+-- because the neighbour has had none. Once it has had one and is waiting, the
+-- stalled owner — which only independent evidence revives — is no reason to
+-- keep polling, and its one step is never replayed.
+testStalledNeighbourThenWaits ∷ Expectation
+testStalledNeighbourThenWaits = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  offered ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
+    pacingsOver host control 4 (\_ → pure ()) >>= writeIORef observed
+    traverse (atomically . readTVar . ownerSteps) owners >>= writeIORef offered
+    -- Alpha withdrew its own path, so only independent evidence can finish it.
+    forM_ (take 1 owners) $ \owner →
+      void (forkIO (publishFacts journal host owner allRetirementFacts))
+    finishOwners host control seam [alpha, beta] owners
+  -- Alpha stalled on its one opportunity and was never offered another; beta
+  -- was offered one on every turn the budget could no longer spend on alpha.
+  readIORef offered `shouldReturn` [1, 3]
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      thirdTurn `shouldSatisfy` waitedTheBound
+      fourthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A retirement begun between two waiting turns makes the next turn immediate,
+-- exactly as the first ones did.
+testNewRetirementEndsTheWaiting ∷ Expectation
+testNewRetirementEndsTheWaiting = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta", windowNamed "gamma"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta, gamma) ← threeWindows host
+    waiting ←
+      detachedOwners journal host [(alpha, "alpha", repeat Await), (beta, "beta", repeat Await)]
+    late ← newIORef []
+    pacings ←
+      pacingsOver host control 4 $ \number →
+        when (number == 3) $
+          detachedOwners journal host [(gamma, "gamma", repeat Await)] >>= writeIORef late
+    writeIORef observed pacings
+    arrived ← readIORef late
+    finishOwners host control seam [alpha, beta, gamma] (waiting <> arrived)
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Both owners inspected and waiting, so the third turn is idle.
+      thirdTurn `shouldSatisfy` waitedTheBound
+      -- A third retirement began at the end of it, and no round has offered it
+      -- anything.
+      fourthTurn `shouldBe` PolledForWork
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | Evidence that arrives between two waiting turns invalidates that owner's
+-- waiting assessment, so a turn is immediate again once a round has left it
+-- unserved.
+--
+-- The notice ends the wait it is published into, but the turn it wakes is still
+-- recorded as the wait that turn chose, and that turn's own round is what folds
+-- the evidence. The owner it revived is the one the rotation does not reach, so
+-- the turn after it polls rather than waiting on an assessment the new evidence
+-- has already outdated.
+testNewEvidenceEndsTheWaiting ∷ Expectation
+testNewEvidenceEndsTheWaiting = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners journal host [(alpha, "alpha", repeat Await), (beta, "beta", repeat Await)]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    fact ← case allRetirementFacts of
+      known : _ → pure known
+      [] → unexpected "the attachment model declares no retirement facts"
+    pacings ←
+      pacingsOver host control 6 $ \number →
+        when (number == 3) (publishFacts journal host alphaOwner [fact])
+    writeIORef observed pacings
+    finishOwners host control seam [alpha, beta] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      thirdTurn `shouldSatisfy` waitedTheBound
+      -- The notice was published at the end of the third turn, so the fourth
+      -- had already chosen its wait; folding the evidence is that turn's own
+      -- round's work.
+      fourthTurn `shouldSatisfy` waitedTheBound
+      -- That round served beta, leaving the revived owner owed an opportunity.
+      fifthTurn `shouldBe` PolledForWork
+      -- Which that turn gave it, and which found it waiting again.
+      sixthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A fact certified directly on the owner thread between two waiting turns
+-- makes the next turn immediate, and a duplicate of it makes nothing immediate.
+--
+-- This transport has neither of the things the notice transport has: it is
+-- recorded between two rounds rather than by one, and it registers no wake to
+-- end a wait with. Without the demand saying so in the transaction that records
+-- it, the turn after would wait its idle bound before offering the attachment
+-- the opportunity that evidence earned it.
+testDirectCertificationEndsTheWaiting ∷ Expectation
+testDirectCertificationEndsTheWaiting = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners journal host [(alpha, "alpha", repeat Await), (beta, "beta", repeat Await)]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    fact ← case allRetirementFacts of
+      known : _ → pure known
+      [] → unexpected "the attachment model declares no retirement facts"
+    pacings ←
+      pacingsOver host control 7 $ \number →
+        when (number == 3 || number == 6) (void (certifyGraphicsFact host acknowledgement fact))
+    writeIORef observed pacings
+    finishOwners host control seam [alpha, beta] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn, seventhTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      thirdTurn `shouldSatisfy` waitedTheBound
+      -- The fact was recorded at the end of the third turn, and the fourth is
+      -- immediate for it rather than waiting.
+      fourthTurn `shouldBe` PolledForWork
+      -- That round served beta, so the revived owner is still owed one.
+      fifthTurn `shouldBe` PolledForWork
+      -- Which that turn gave it, and which found it waiting again.
+      sixthTurn `shouldSatisfy` waitedTheBound
+      -- The same fact again at the end of the sixth establishes nothing, so it
+      -- revives nothing and the seventh turn waits exactly as the sixth did.
+      seventhTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A later instant replaces the one an owner named before, rather than the
+-- boundary keeping the nearest it has ever seen, and withdrawing a path removes
+-- the instant that owner had named.
+--
+-- A budget of one and two owners keeps the replacing round from being the only
+-- contributor: a retained historical minimum would keep waiting to alpha's
+-- first instant long after alpha named a later one.
+testLatestInstantReplacesTheRetainedOne ∷ Expectation
+testLatestInstantReplacesTheRetainedOne = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", [AwaitUntil (at (millis 40)), AwaitUntil (at (millis 120)), Stall])
+        , (beta, "beta", AwaitUntil (at (millis 200)) : repeat Await)
+        ]
+    pacingsOver host control 6 (\_ → pure ()) >>= writeIORef observed
+    -- Alpha withdrew its own path, so only independent evidence finishes it.
+    forM_ (take 1 owners) $ \owner →
+      void (forkIO (publishFacts journal host owner allRetirementFacts))
+    finishOwners host control seam [alpha, beta] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha's first instant is the nearest of the two named so far.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- That turn's own opportunity replaced it with a later one, so the wait
+      -- lengthens to it. Keeping the nearest instant ever seen would wait to
+      -- forty milliseconds here, and every turn after it.
+      fourthTurn `shouldBe` WaitedForDeadline (durationOf (millis 120))
+      -- Beta's second opportunity named none, leaving alpha's as the only one.
+      fifthTurn `shouldBe` WaitedForDeadline (durationOf (millis 120))
+      -- And that turn's opportunity withdrew alpha's path, which removes the
+      -- instant alpha had named along with it.
+      sixthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | Retiring an attachment removes the instant it had named, exactly as
+-- withdrawing its path does.
+testRetiringRemovesTheRetainedInstant ∷ Expectation
+testRetiringRemovesTheRetainedInstant = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    pacings ←
+      pacingsOver host control 5 $ \number →
+        -- Published rather than certified here: every fact lands in one fold,
+        -- so the fourth turn's round retires alpha outright instead of giving
+        -- it another opportunity to name its instant again.
+        when (number == 3) (publishFacts journal host alphaOwner allRetirementFacts)
+    writeIORef observed pacings
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha names the same instant on every opportunity, so it is retained
+      -- across the rounds that serve beta instead.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      fourthTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- That turn's round folded alpha's remaining facts and retired it, which
+      -- takes the instant it had named with it.
+      fifthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A retirement completed by certification on the owner thread takes the
+-- instant it had named with it, so the next turn is not paced by a deadline
+-- nothing is waiting for.
+--
+-- Its neighbour named no instant, so alpha's is the only one the demand carries
+-- when the last fact lands. Nothing else runs between that transaction and the
+-- next turn's pacing choice: no round recomputes the demand, and the notice
+-- transport's wake is not involved, so the transaction that retires the
+-- attachment is the one that has to say its instant is gone.
+testDirectRetirementRemovesTheRetainedInstant ∷ Expectation
+testDirectRetirementRemovesTheRetainedInstant = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  remaining ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    pacings ←
+      pacingsOver host control 4 $ \number →
+        when (number == 3) $
+          forM_ allRetirementFacts $ \fact → do
+            atomically (note journal (Certified (ownerName alphaOwner) fact))
+            void (certifyGraphicsFact host acknowledgement fact)
+    writeIORef observed pacings
+    atomically (hostPendingAttachments host) >>= writeIORef remaining
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  -- Alpha really did retire on the owner thread, leaving one attachment.
+  readIORef remaining >>= \held → length held `shouldBe` 1
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha names the same instant on every opportunity, and beta names none,
+      -- so it is the only instant the demand carries.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- Alpha retired at the end of that turn, so the instant goes with it and
+      -- the fourth turn is simply idle beside the owner that is still awaiting.
+      fourthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | The instant alone: an attachment assessed as waiting until an instant, and
+-- then retired by one certification on the owner thread, leaves no reason to
+-- hurry behind it — only the obsolete instant, which must go with it.
+--
+-- Alpha certifies its first three facts through its own opportunities, so it is
+-- owed nothing by the time it names an instant and owes exactly one fact. The
+-- certification that completes it is therefore the only thing between two
+-- turns, and the turn after it is paced by that instant or by nothing at all.
+testDirectRetirementDropsTheInstantAlone ∷ Expectation
+testDirectRetirementDropsTheInstantAlone = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owed ← case allRetirementFacts of
+      [] → unexpected "the attachment model declares no retirement facts"
+      facts → pure facts
+    let (certified, final') = splitAt (length owed - 1) owed
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", map Certify certified <> repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    -- Alpha is offered an opportunity on every other turn, so the turn on which
+    -- it first names an instant is the one after its last certifying turn.
+    let naming = 2 * length certified + 1
+    pacings ←
+      pacingsOver host control (fromIntegral (naming + 2)) $ \number →
+        when (number == fromIntegral (naming + 1)) $
+          forM_ final' $ \fact → do
+            atomically (note journal (Certified (ownerName alphaOwner) fact))
+            void (certifyGraphicsFact host acknowledgement fact)
+    writeIORef observed (drop (naming - 1) pacings)
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  readIORef observed >>= \case
+    [namingTurn, waitingTurn, afterTurn] → do
+      -- Alpha's last certifying opportunity kept the turns immediate.
+      namingTurn `shouldBe` PolledForWork
+      -- Then it named an instant and owed nothing, and beta names none, so that
+      -- instant is the only thing pacing the turn after.
+      waitingTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- One certification retired alpha at the end of it. The instant it named
+      -- is nothing's now, so the turn after waits its bound beside beta rather
+      -- than being paced by a deadline nobody is waiting for.
+      afterTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
 
 -- ---------------------------------------------------------------------------
 -- The application exit
