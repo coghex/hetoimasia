@@ -27,14 +27,14 @@ Status legend: `[ ]` unprocessed · `[#N]` filed as issue N · `[no-issue]` revi
 
 ## Status
 
-- [ ] PRR-1. Contain completion-policy evaluation before dependent construction
-- [ ] PRR-2. Revive retirement consistently when the owner certifies new evidence
-- [ ] PRR-3. Let waiting retirements beyond the turn budget become idle
-- [ ] PRR-4. Preserve diagnostic-failure identity across GLFW lifecycle reporting
+- [x] PRR-1. Contain completion-policy evaluation before dependent construction — [#166]
+- [x] PRR-2. Revive retirement consistently when the owner certifies new evidence — [#167]
+- [x] PRR-3. Let waiting retirements beyond the turn budget become idle — [#168]
+- [x] PRR-4. Preserve diagnostic-failure identity across GLFW lifecycle reporting — [#169]
 
 ## 1. Protected lifetime safety
 
-### PRR-1. Contain completion-policy evaluation before dependent construction
+### [#166] PRR-1. Contain completion-policy evaluation before dependent construction
 
 > **Captured note:** P1. PR #165 adds a lazy `protocolCompletion` field which
 > is evaluated outside the retirement attempt's exception boundary. An exception
@@ -95,7 +95,7 @@ escape from the protected boundary, not merely an unhelpful error message.
 
 ## 2. Retirement progress and scheduling
 
-### PRR-2. Revive retirement consistently when the owner certifies new evidence
+### [#167] PRR-2. Revive retirement consistently when the owner certifies new evidence
 
 > **Captured note:** P2. The direct owner-thread certification path records a
 > new fact but leaves a stalled registration withdrawn. The queued publication
@@ -157,7 +157,7 @@ cannot rescue it either: duplicates correctly do not revive a path.
   explicit. This finding calls out an integration-contract gap as well as the
   reproduced liveness difference; update the contract deliberately in the repair.
 
-### PRR-3. Let waiting retirements beyond the turn budget become idle
+### [#168] PRR-3. Let waiting retirements beyond the turn budget become idle
 
 > **Captured note:** P2. PR #165 treats every progressing attachment not visited
 > in the current turn as immediate deferred work, including attachments already
@@ -215,7 +215,7 @@ exit; it neither sleeps nor leaves a hanging drain.
 
 ## 3. Diagnostic lifecycle integration
 
-### PRR-4. Preserve diagnostic-failure identity across GLFW lifecycle reporting
+### [#169] PRR-4. Preserve diagnostic-failure identity across GLFW lifecycle reporting
 
 > **Captured note:** P2. The wake warning introduced by PR #161 and the stall
 > warning introduced by PR #163 propagate unmarked diagnostic failures. The
