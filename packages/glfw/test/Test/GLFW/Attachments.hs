@@ -200,6 +200,12 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testNewRetirementEndsTheWaiting)
     it "polls again for an owner whose waiting assessment new evidence outdated"
       (boundedExample testNewEvidenceEndsTheWaiting)
+    it "polls again for a fact certified on the owner thread between waiting turns, and not for a duplicate of it"
+      (boundedExample testDirectCertificationEndsTheWaiting)
+    it "replaces a retained instant with the one its owner named later, and drops it when that owner withdraws"
+      (boundedExample testLatestInstantReplacesTheRetainedOne)
+    it "drops a retained instant when the attachment that named it retires"
+      (boundedExample testRetiringRemovesTheRetainedInstant)
 
   describe "the application exit" $
     it "retires every attached owner, then destroys the windows and ends the session"
@@ -2445,6 +2451,147 @@ testNewEvidenceEndsTheWaiting = do
       fifthTurn `shouldBe` PolledForWork
       -- Which that turn gave it, and which found it waiting again.
       sixthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A fact certified directly on the owner thread between two waiting turns
+-- makes the next turn immediate, and a duplicate of it makes nothing immediate.
+--
+-- This transport has neither of the things the notice transport has: it is
+-- recorded between two rounds rather than by one, and it registers no wake to
+-- end a wait with. Without the demand saying so in the transaction that records
+-- it, the turn after would wait its idle bound before offering the attachment
+-- the opportunity that evidence earned it.
+testDirectCertificationEndsTheWaiting ∷ Expectation
+testDirectCertificationEndsTheWaiting = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners journal host [(alpha, "alpha", repeat Await), (beta, "beta", repeat Await)]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    fact ← case allRetirementFacts of
+      known : _ → pure known
+      [] → unexpected "the attachment model declares no retirement facts"
+    pacings ←
+      pacingsOver host control 7 $ \number →
+        when (number == 3 || number == 6) (void (certifyGraphicsFact host acknowledgement fact))
+    writeIORef observed pacings
+    finishOwners host control seam [alpha, beta] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn, seventhTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      thirdTurn `shouldSatisfy` waitedTheBound
+      -- The fact was recorded at the end of the third turn, and the fourth is
+      -- immediate for it rather than waiting.
+      fourthTurn `shouldBe` PolledForWork
+      -- That round served beta, so the revived owner is still owed one.
+      fifthTurn `shouldBe` PolledForWork
+      -- Which that turn gave it, and which found it waiting again.
+      sixthTurn `shouldSatisfy` waitedTheBound
+      -- The same fact again at the end of the sixth establishes nothing, so it
+      -- revives nothing and the seventh turn waits exactly as the sixth did.
+      seventhTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A later instant replaces the one an owner named before, rather than the
+-- boundary keeping the nearest it has ever seen, and withdrawing a path removes
+-- the instant that owner had named.
+--
+-- A budget of one and two owners keeps the replacing round from being the only
+-- contributor: a retained historical minimum would keep waiting to alpha's
+-- first instant long after alpha named a later one.
+testLatestInstantReplacesTheRetainedOne ∷ Expectation
+testLatestInstantReplacesTheRetainedOne = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", [AwaitUntil (at (millis 40)), AwaitUntil (at (millis 120)), Stall])
+        , (beta, "beta", AwaitUntil (at (millis 200)) : repeat Await)
+        ]
+    pacingsOver host control 6 (\_ → pure ()) >>= writeIORef observed
+    -- Alpha withdrew its own path, so only independent evidence finishes it.
+    forM_ (take 1 owners) $ \owner →
+      void (forkIO (publishFacts journal host owner allRetirementFacts))
+    finishOwners host control seam [alpha, beta] owners
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha's first instant is the nearest of the two named so far.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- That turn's own opportunity replaced it with a later one, so the wait
+      -- lengthens to it. Keeping the nearest instant ever seen would wait to
+      -- forty milliseconds here, and every turn after it.
+      fourthTurn `shouldBe` WaitedForDeadline (durationOf (millis 120))
+      -- Beta's second opportunity named none, leaving alpha's as the only one.
+      fifthTurn `shouldBe` WaitedForDeadline (durationOf (millis 120))
+      -- And that turn's opportunity withdrew alpha's path, which removes the
+      -- instant alpha had named along with it.
+      sixthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | Retiring an attachment removes the instant it had named, exactly as
+-- withdrawing its path does.
+testRetiringRemovesTheRetainedInstant ∷ Expectation
+testRetiringRemovesTheRetainedInstant = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    pacings ←
+      pacingsOver host control 5 $ \number →
+        -- Published rather than certified here: every fact lands in one fold,
+        -- so the fourth turn's round retires alpha outright instead of giving
+        -- it another opportunity to name its instant again.
+        when (number == 3) (publishFacts journal host alphaOwner allRetirementFacts)
+    writeIORef observed pacings
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha names the same instant on every opportunity, so it is retained
+      -- across the rounds that serve beta instead.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      fourthTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- That turn's round folded alpha's remaining facts and retired it, which
+      -- takes the instant it had named with it.
+      fifthTurn `shouldSatisfy` waitedTheBound
     other → unexpected ("the scheduled loop paced too few turns: " <> show other)
 
 -- ---------------------------------------------------------------------------

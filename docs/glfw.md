@@ -3180,6 +3180,18 @@ any turn waits on it again, exactly as a newly begun retirement is. It is one
 small value per live registration, so the whole of it stays bounded by the
 window limit and needs no thread, timer, or larger budget.
 
+Where that is *said* differs by transport, because the two arrive at different
+moments. A notice is folded by the very round that reads the demand, so that
+round's own accounting already sees the attachment it revived, and the wake the
+notice registered is what ends the wait it was published into. A fact certified
+directly on the owner thread through `certifyGraphicsFact` has neither: it is
+recorded between two rounds, with no wake to ride. So recording one says so in
+the demand in the same transaction, exactly as beginning a retirement does, and
+the turn after it offers that attachment its opportunity rather than waiting its
+idle bound or an instant the same evidence has just outdated. Only a recorded
+fact says it: a duplicate and a refusal establish nothing, and the fact that
+completes a retirement leaves nothing to offer an opportunity to.
+
 `hostRetirementDemand` publishes what the last round left owed: how many
 attachments are pending, how many are stalled, how many opportunities were
 refused, whether another opportunity is wanted at once, and the earliest instant
@@ -3326,7 +3338,11 @@ advanced keeping later turns immediate while rounds leave it unserved; a stalled
 owner's unserved neighbour keeping the turn immediate until it has been offered
 one, and the turns waiting beside the stalled owner afterwards; a retirement
 begun between two waiting turns, and evidence that outdates a waiting owner's
-assessment, each making a later turn immediate again; an attachment whose caller was interrupted in the handoff
+assessment, each making a later turn immediate again; a fact certified on the
+owner thread between two waiting turns making the next one immediate while a
+duplicate of it makes nothing immediate; a later instant replacing the one its
+owner named before rather than the nearest ever seen, and being dropped when
+that owner withdraws its path or retires; an attachment whose caller was interrupted in the handoff
 before its service arrived, left retiring and retired by ordinary turns with the
 slot freed for a fresh incarnation; a published service thrown away and
 recovered from the host by window, then detached with; a construction that

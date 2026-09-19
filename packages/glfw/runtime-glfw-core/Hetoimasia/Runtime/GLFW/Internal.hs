@@ -2092,15 +2092,30 @@ hostAttachmentView host target = maybe (pure Nothing) (`attachmentViewOf` target
 -- 'hostCompletionPublisher' obeys once it is folded: the evidence decides, not
 -- the transport. A duplicate fact and a refusal establish nothing and revive
 -- nothing.
+--
+-- A fact recorded here also says so in the demand, in the same transaction that
+-- records it. The two transports need that said in different places: a notice
+-- is folded by the very round that reads the demand, so that round's own
+-- accounting already sees the attachment it revived, and the wake the notice
+-- registered is what ends the wait it was published into. A fact certified
+-- directly on the owner thread has neither — it is recorded between two rounds,
+-- with no wake to ride — so without this the turn after it could wait its idle
+-- bound, or an instant this evidence has just outdated, before offering the
+-- attachment the opportunity that evidence earned it. Only a recorded fact says
+-- it: a duplicate and a refusal establish nothing, and the fact that completes a
+-- retirement leaves nothing to offer an opportunity to.
 reportHostRetirementFact
   ∷ HasCallStack ⇒ WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
 reportHostRetirementFact host acknowledgement fact =
   ownerOperation (hostSession host) certifyOperation (windowIdentifiers (attachmentWindow target)) $
     case hostRetirementState host of
       Nothing → pure Nothing
-      Just retirement →
-        either (const Nothing) Just
-          <$> atomically (certifyRetirementFact retirement target acknowledgement fact)
+      Just retirement → atomically $ do
+        answered ← certifyRetirementFact retirement target acknowledgement fact
+        case answered of
+          Right (FactRecorded _) → markRetirementImmediate host
+          _ → pure ()
+        pure (either (const Nothing) Just answered)
   where
     target = acknowledgedAttachment acknowledgement
 
@@ -2467,11 +2482,12 @@ hostRetirementDemand = readTVar . hostRetirementDemandState
 -- | Record that a retirement wants an opportunity now.
 --
 -- Every round republishes the demand from its own accounting, so this is only
--- ever read by the turn that follows the transaction which began a retirement —
--- which is exactly the turn that would otherwise wait its idle bound before
--- offering that retirement its first opportunity. It says so only when
--- something really is retiring, so an ordinary host, and a protected host with
--- nothing pending, report no demand at all.
+-- ever read by the turn that follows a transaction the round did not see: one
+-- that began a retirement, or one that recorded a retirement fact on the owner
+-- thread — which is exactly the turn that would otherwise wait its idle bound
+-- before offering that attachment the opportunity it is owed. It says so only
+-- when something really is retiring, so an ordinary host, and a protected host
+-- with nothing pending, report no demand at all.
 markRetirementImmediate ∷ WindowHost → STM ()
 markRetirementImmediate host =
   demandRetirementNow (hostRetirementState host) (hostRetirementDemandState host)
