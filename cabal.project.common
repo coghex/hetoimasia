@@ -28,6 +28,9 @@ package hetoimasia-glfw
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 
+package hetoimasia-vulkan-proof
+  ghc-options: -Werror -j
+
 -- The Lua interpreter is the copy the `lua` package bundles, never one found
 -- on the machine: `system-lua` and `pkg-config` would link whatever the
 -- developer's PATH happens to offer, which is a different interpreter version

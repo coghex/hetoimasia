@@ -182,14 +182,24 @@ owning subsystem's contract/design when continuing its work.
   operation; no assumed privileged install or paid signing account. A failed or
   inconclusive proof returns the design to exploring; never weaken isolation.
 - [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
-  tracked by epic #155. Approved #157 qualifies the shared toolchain first;
-  after #157 merges, native proof #158, pure ownership model #160, and Lua
-  #146 can run in parallel. Vulkan 1.3 minimum, a shared loader,
-  managed retention, present-fence retirement, and default two frame slots are
-  accepted design choices; native compatibility remains unproven until #158.
-  Later native slices remain gated on that proof. Host-retirement repairs must
-  precede real GPU attachment integration; the current three Vulkan issues do
-  not depend on the defective host paths.
+  tracked by epic #155. #157 merged and pinned the shared toolchain; native
+  proof #158 and pure ownership model #160 follow it, and Lua #146 can run in
+  parallel. Vulkan 1.3 minimum, a shared loader, managed retention,
+  present-fence retirement, and default two frame slots are accepted design
+  choices. #158 proved the native profile on both platforms and recorded it in
+  [docs/vulkan_compatibility_record.md](docs/vulkan_compatibility_record.md):
+  Vulkan 1.3 with dynamic rendering and synchronization2, one shared standard
+  loader, `VK_EXT_swapchain_maintenance1` present fences and image release, and
+  a transfer-source capture. Two things that record leaves unproved are easy to
+  assume wrongly later: the KHR maintenance spelling is an alias neither
+  MoltenVK nor Lavapipe resolves, and no device loss was induced, so those rows
+  are specification evidence. A third is a rule rather than an
+  observation: a present fence's status before it is waited on is not a
+  contract on either platform, so the fence is waited for and nothing is read
+  into whether it happened to be signalled already. Later
+  native slices stay gated until #158's pull request merges. Host-retirement
+  repairs must precede real GPU attachment integration; the current three
+  Vulkan issues do not depend on the defective host paths.
 - CI-5 (`test`/`autotest` adapter integration) remains explicitly deferred.
   The old foundation umbrella is architectural context, not another queue for
   duplicating completed resources/runtime/GLFW or the newer TIME/LIFE arcs.

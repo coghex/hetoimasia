@@ -1187,21 +1187,24 @@ These findings were checked in the locally cached `vulkan-3.27` source
 VK-2 must recheck the actually pinned version, calling conventions, callback
 reentry, and dispatch identity on both platforms.
 
-#### Compatibility profile under discussion — 2026-09-17
+#### Compatibility profile — proved on 2026-09-18
 
-This table records accepted directions (D-8 through D-14) and candidate versions;
-it is not a proven platform profile. Q-9/Q-10 are resolved policy decisions.
-Keep build-tool versions distinct from the runtime capabilities required from
-a device; installing a newer SDK does not itself raise that minimum.
+VK-2 (#158) ran the proof this table was waiting for, on both selected
+platforms, and [docs/vulkan_compatibility_record.md](vulkan_compatibility_record.md)
+is its record. The rows below now state what was proved rather than what was
+proposed; where a row is still a direction rather than an observation, it says
+so. Q-9/Q-10 remain resolved policy decisions. Keep build-tool versions distinct
+from the runtime capabilities required from a device; installing a newer SDK
+does not itself raise that minimum.
 
-| Choice | Recommended candidate | Next reasonable alternative |
+| Choice | Proved profile, or the accepted direction where none was proved | Next reasonable alternative |
 |---|---|---|
 | Haskell binding/toolchain | **Proven and pinned by VK-1 (#157) on 2026-09-18**: GHC 9.14.1, cabal-install 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, `vulkan-3.27` with `vulkan-utils-0.5.11.0` at `+safe-foreign-calls -darwin-lib-dirs`. GHC 9.14.2-rc2 was the newer D-13 candidate and was excluded by a documented compatibility blocker. See [docs/toolchain.md](toolchain.md). | The candidate row this replaced recorded GHC 9.14.2-rc2 as the recommended candidate on 2026-09-17, subject to proof before pinning; that proof is what excluded it. |
-| Runtime baseline | D-12 selects one Vulkan backend with a 1.3 minimum and newer capabilities explicitly enabled. Modern bindings/SDKs do not force a higher runtime minimum. | A 1.4-only minimum was considered and not selected. A later 1.2 profile needs its own supported features and tests, not another copied backend. |
-| Presentation retirement | Start with `VK_EXT_swapchain_maintenance1` plus its required dependencies/features; the binding also supplies KHR, which can be an explicitly proved alias. | Requiring KHR alone could force a newer Mesa build without strengthening this arc's contract. Neither variant is accepted from a distro/version assumption; prove the selected drivers. |
-| Loader and drivers | D-14 selects the standard Vulkan loader shared with GLFW; MoltenVK locally and D-10's pinned Lavapipe in isolated Linux CI. | Direct MoltenVK loading was considered and not selected because it bypasses the ordinary loader/layer path and needs different integration. |
+| Runtime baseline | **Proved by VK-2 (#158) on 2026-09-18**: Vulkan 1.3 with `dynamicRendering` and `synchronization2` supported, requested, and accepted on both platforms — MoltenVK 1.4.0 reports device API 1.3.323 on an Apple M3 Max, and pinned Mesa 25.2.8 Lavapipe reports 1.4.318 in the Linux proof container. D-12's 1.3 minimum stands as a requirement downstream slices may assume. | A 1.4-only minimum was considered and not selected. A later 1.2 profile needs its own supported features and tests, not another copied backend. |
+| Presentation retirement | **Proved by VK-2 (#158)**: `VK_EXT_swapchain_maintenance1` with `VK_KHR_swapchain`, `VK_EXT_surface_maintenance1`, and `VK_KHR_get_surface_capabilities2`, and its `swapchainMaintenance1` feature enabled. Present fences signal, and both abandonment paths return an image through `vkReleaseSwapchainImagesEXT` with no swapchain rebuild. The KHR spelling remains an **unproved alias** on both platforms: neither MoltenVK 1.4.0 nor Mesa 25.2.8 Lavapipe resolves `vkReleaseSwapchainImagesKHR`, and `vulkan-3.27` hides the difference by exposing the KHR types as aliases and trying the EXT name first. | Requiring KHR alone could force a newer Mesa build without strengthening this arc's contract. Proving the KHR alias needs a driver that offers it and is its own piece of evidence. |
+| Loader and drivers | **Proved by VK-2 (#158)**: the standard loader is shared by construction — GLFW is handed the Haskell binding's own `vkGetInstanceProcAddr` before `glfwInit`, and both sides then resolve identical addresses in one image. Locally that is LunarG 1.3.296 loading **Homebrew MoltenVK 1.4.0**, named by an absolute `VK_DRIVER_FILES` manifest, because the SDK's own default ICD declares API 1.2 and cannot meet D-12. Linux is D-10's pinned Lavapipe (Mesa 25.2.8, `lvp_icd.json`), selected the same way from among the eight ICD manifests that container installs. Device-level entry points resolve into the enabled validation layer's image, which is the layer chain working as asked. | Direct MoltenVK loading was considered and not selected because it bypasses the ordinary loader/layer path and needs different integration. |
 | Shader build | D-11 selects Template Haskell GLSL-to-SPIR-V compilation using pinned glslang, with an explicit target environment. | A different compiler behind the same TH interface would require a reason to change the selected glslang workflow; a separate manual pipeline is not selected. |
-| Provisioning | Extend the existing digest-pinned Linux image and local native manifest/cache; record all relevant versions and capabilities in proof evidence. | System packages for local exploration, but still pin the CI environment and reject incompatible capabilities explicitly. |
+| Provisioning | Accepted direction, not yet delivered. VK-2 proved the recipe in a throwaway container (`tools/vulkan-proof/Dockerfile.linux-proof`) and a project-local macOS selection (`tools/vulkan-proof/environment.pin`); the published CI image still carries no Vulkan input and the native manifest still describes GLFW alone. Promoting either is VK-4. | System packages for local exploration, but still pin the CI environment and reject incompatible capabilities explicitly. |
 
 Read-only environment audit on 2026-09-17:
 
@@ -1219,25 +1222,27 @@ Read-only environment audit on 2026-09-17:
   GHC 9.12.2 / `vulkan-3.26.6`; its shader workflow is precedent, not evidence
   that Hetoimasia's 1.3 profile is already running.
 
-These are static configuration observations, not a Vulkan launch/driver query.
-The default SDK path advertises a profile below D-12; Homebrew release notes
-cannot prove which driver a process uses. VK-2/VK-4 pin loader, driver and layers
-and launch with an explicit absolute `VK_DRIVER_FILES` manifest path plus
-controlled layer discovery. Clear conflicting discovery overrides in that child
-environment and record actual loaded identities. A pinned Homebrew loader with
-the newer MoltenVK manifest is a candidate, not approval for an ambient install.
-Use the [loader's explicit driver selection](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#overriding-the-default-driver-discovery).
-Keep this environment project-local; do not upgrade Synarchy or edit shell
-profiles. Runtime queries remain mandatory proof.
+Those were static configuration observations, not a Vulkan launch or driver
+query, and VK-2 has now superseded them with one. It confirmed the shape of the
+problem — the default SDK path does advertise a profile below D-12 — and
+resolved it the way this paragraph proposed: an absolute `VK_DRIVER_FILES`
+manifest naming Homebrew's MoltenVK 1.4.0, controlled layer discovery, and
+conflicting discovery overrides cleared in the child environment, with the
+actually loaded identities recorded. Nothing was installed, no shell profile was
+edited, and Synarchy's installation is untouched. See
+[the loader's explicit driver selection](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#overriding-the-default-driver-discovery)
+and [the compatibility record](vulkan_compatibility_record.md).
 
 [MoltenVK 1.4.0's release](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.0)
 supports Vulkan 1.4; its tagged runtime guide lists dynamic rendering,
-synchronization2 and EXT swapchain maintenance. That makes the proposed 1.3
-profile plausible, not verified on this machine. The
+synchronization2 and EXT swapchain maintenance. That made the proposed 1.3
+profile plausible; VK-2 verified it on this machine, and also found that the EXT
+maintenance variant is the only one MoltenVK offers. The
 [Vulkan version guide](https://docs.vulkan.org/guide/latest/versions.html)
 explains the promoted 1.3 APIs and separate instance/device version checks.
-The proof must build the selected binding and query/enable the exact capabilities
-on both selected platforms before any downstream issue assumes them.
+The proof had to build the selected binding and query and enable the exact
+capabilities on both selected platforms before any downstream issue assumed
+them; it did.
 
 Availability evidence checked on 2026-09-17: [GHC 9.14.1](https://www.haskell.org/ghc/download_ghc_9_14_1.html)
 was the latest stable compiler listed by the official site/GHCup metadata;
@@ -1619,6 +1624,15 @@ Device loss remains terminal, and a UI sharing that device cannot be promised
 to keep rendering. The proof must state which device-loss rules authorize
 destruction; it cannot mark unfinished work as a successfully signaled fence.
 Unresolved safety retains ownership under P-12 rather than releasing parents.
+
+**Answered on 2026-09-18 by #158**, which passed on both platforms:
+[docs/vulkan_compatibility_record.md](vulkan_compatibility_record.md) records
+the profile, the loader identity evidence, the completion and abandonment
+results, the cited operation matrix, and the unknowns it deliberately leaves —
+the KHR maintenance alias, every rare result, and any real device loss. The
+compatibility profile table above now states what was proved. This gate is
+cleared for downstream slices only once that pull request merges; the deferred
+entries in the processing status say so in their own words.
 
 ### Q-3. Accept P-2's window scope, and where will Linux graphics execute?
 

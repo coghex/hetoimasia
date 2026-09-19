@@ -1,0 +1,145 @@
+# A throwaway x86_64 Linux container for one job: running the VK-2 native
+# Vulkan compatibility proof against pinned Mesa Lavapipe on an isolated X11
+# display.
+#
+# It is NOT the CI image, nothing published depends on it, and no validation
+# worker ever runs it. The CI image deliberately carries no Vulkan input, and
+# must keep carrying none until VK-4 provisions one on purpose; this recipe is
+# where the loader, the software driver, and the validation layers live until
+# then. It is the Linux counterpart of tools/toolchain/Dockerfile.linux-binding,
+# which proves the binding builds; this one proves the runtime profile works.
+#
+# Every input is pinned: the base image by digest, the distribution packages by
+# an Ubuntu archive snapshot, the toolchain by the same
+# `tools/ci-image/toolchain.pin` the real image installs from, GLFW by
+# `tools/native/glfw.pin`, the Hackage view by `cabal.project.common`'s
+# index-state, the binding by `tools/toolchain/binding.pin`, and the driver and
+# layer selection by `tools/vulkan-proof/environment.pin`. The resolved package
+# set is recorded at `/opt/packages.txt`, because an archive snapshot pins what
+# was offered and only the resolved set records what was actually installed.
+#
+# Build and run it from the repository root:
+#
+#   docker build -f tools/vulkan-proof/Dockerfile.linux-proof \
+#     --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+#     -t hetoimasia-vulkan-proof .
+#   docker run --rm hetoimasia-vulkan-proof
+#
+# The `.github/workflows/ci-image.yml` proof route does exactly that and uploads
+# the record. See docs/vulkan_compatibility_record.md.
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
+
+# The Ubuntu archive snapshot the packages come from. `ubuntu:24.04` pins the
+# base filesystem but not what `apt-get` would fetch later, so without this a
+# rebuild can install a different driver than the one that was proved.
+ARG UBUNTU_SNAPSHOT=20260915T000000Z
+
+# The repository revision this recipe was built from, reported by the proof so
+# its evidence can be attributed. There is no checkout inside to derive it from.
+ARG SOURCE_REVISION=unknown
+
+ENV HETOIMASIA_PROOF_REVISION=${SOURCE_REVISION} \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    CABAL_DIR=/opt/hetoimasia/cabal \
+    HETOIMASIA_NATIVE_PREFIX=/opt/hetoimasia/native/glfw \
+    PATH=/opt/hetoimasia/ghc/bin:/opt/hetoimasia/cabal-install/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The CI image's own package set, plus the three things it deliberately does not
+# have: the Vulkan loader and headers the binding's `pkgconfig-depends: vulkan`
+# needs, Mesa's Lavapipe software driver that D-10 selects for Linux graphics
+# verification, and the Khronos validation layers the proof runs under.
+#
+# Nothing here comes from a mutable archive, including the trust material.
+# `snapshot.ubuntu.com` redirects to HTTPS and this base image ships no CA
+# bundle, and taking `ca-certificates` from the default archive would drag in
+# whatever `openssl` happens to be current — the drift the snapshot exists to
+# prevent. Apt does not depend on TLS for integrity: it verifies each archive's
+# `InRelease` GPG signature against the Ubuntu keyring this pinned base image
+# already carries. So peer verification is disabled for the snapshot host alone,
+# just long enough to install that snapshot's own `ca-certificates`, and then
+# removed. A tampered archive is rejected either way; what the exemption costs
+# is transport privacy, not authenticity.
+RUN set -eux; \
+    printf 'deb https://snapshot.ubuntu.com/ubuntu/%s noble main universe\n\
+deb https://snapshot.ubuntu.com/ubuntu/%s noble-updates main universe\n\
+deb https://snapshot.ubuntu.com/ubuntu/%s noble-security main universe\n' \
+      "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" "$UBUNTU_SNAPSHOT" \
+      > /etc/apt/sources.list.d/ubuntu.sources.list; \
+    rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    printf 'Acquire::https::snapshot.ubuntu.com::Verify-Peer "false";\n' \
+      > /etc/apt/apt.conf.d/99snapshot-bootstrap; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends ca-certificates; \
+    rm -f /etc/apt/apt.conf.d/99snapshot-bootstrap; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends \
+      binutils build-essential cmake curl git pkg-config python3 unzip xz-utils \
+      libffi-dev libgmp-dev libncurses-dev libnuma-dev zlib1g-dev \
+      libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxrandr-dev \
+      openbox x11-utils xvfb \
+      libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-validationlayers; \
+    rm -rf /var/lib/apt/lists/*; \
+    dpkg-query -W -f='${Package} ${Version}\n' | sort > /opt/packages.txt; \
+    { echo "drivers:"; ls -1 /usr/share/vulkan/icd.d/ 2>&1 | sed 's/^/  /'; \
+      echo "layers:"; ls -1 /usr/share/vulkan/explicit_layer.d/ 2>&1 | sed 's/^/  /'; } \
+      > /opt/vulkan-inventory.txt
+
+COPY tools/ci-image/toolchain.pin /opt/hetoimasia/recipe/tools/ci-image/toolchain.pin
+
+# The same checksummed upstream bindists the CI image installs, so a profile
+# proved here is proved on the toolchain Linux CI actually runs. The bindist's
+# HTML documentation is dropped before installing: nothing here reads it, and
+# installing those files dominates the build. It changes no compiler, library,
+# or link behaviour.
+RUN set -eux; \
+    . /opt/hetoimasia/recipe/tools/ci-image/toolchain.pin; \
+    scratch="$(mktemp -d)"; \
+    curl --fail --silent --show-error --location --retry 3 --output "$scratch/ghc.tar.xz" "$GHC_URL"; \
+    echo "$GHC_SHA256  $scratch/ghc.tar.xz" | sha256sum --check --strict -; \
+    mkdir "$scratch/ghc"; \
+    tar -xJf "$scratch/ghc.tar.xz" -C "$scratch/ghc"; \
+    bindist="$(find "$scratch/ghc" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; \
+    rm -rf "$bindist/doc"; \
+    (cd "$bindist" && ./configure --prefix=/opt/hetoimasia/ghc && make install); \
+    curl --fail --silent --show-error --location --retry 3 --output "$scratch/cabal.tar.xz" "$CABAL_URL"; \
+    echo "$CABAL_SHA256  $scratch/cabal.tar.xz" | sha256sum --check --strict -; \
+    mkdir "$scratch/cabal"; \
+    tar -xJf "$scratch/cabal.tar.xz" -C "$scratch/cabal"; \
+    install -D -m 0755 "$(find "$scratch/cabal" -type f -name cabal | head -n 1)" /opt/hetoimasia/cabal-install/bin/cabal; \
+    rm -rf "$scratch"; \
+    test "$(ghc --numeric-version)" = "$GHC_VERSION"; \
+    test "$(cabal --numeric-version)" = "$CABAL_VERSION"
+
+RUN cabal update
+
+# The private GLFW prefix, built by the same recipe every other native build
+# here uses, so the proof links the GLFW this repository pins rather than the
+# distribution's.
+COPY tools/native/ /opt/hetoimasia/recipe/tools/native/
+RUN python3 /opt/hetoimasia/recipe/tools/native/native.py build --prefix "$HETOIMASIA_NATIVE_PREFIX" \
+ && python3 /opt/hetoimasia/recipe/tools/native/native.py link-check --prefix "$HETOIMASIA_NATIVE_PREFIX"
+
+# Only what the proof reads: its own package, the project files that select it,
+# the pins it checks itself against, and the isolated-display helper that runs
+# it. The engine's own sources are deliberately absent, because nothing here
+# builds them.
+COPY cabal.project.common /work/cabal.project.common
+COPY cabal.project.vulkan /work/cabal.project.vulkan
+COPY tools/ci-image/toolchain.pin /work/tools/ci-image/toolchain.pin
+COPY tools/toolchain/binding.pin /work/tools/toolchain/binding.pin
+COPY tools/native/ /work/tools/native/
+COPY tools/display/ /work/tools/display/
+COPY tools/vulkan-proof/ /work/tools/vulkan-proof/
+
+WORKDIR /work
+
+# Compile at image-build time so a build failure is a build failure, and so the
+# run itself is only the proof.
+RUN PKG_CONFIG_PATH="$HETOIMASIA_NATIVE_PREFIX/lib/pkgconfig" \
+    cabal build --project-file=cabal.project.vulkan --builddir=dist-vulkan-proof --enable-tests all
+
+# `x11.sh` starts a private Xvfb display with a window manager and supplies the
+# isolated-display consent for that display alone. It is never a stand-in for a
+# human's approval on a real desktop, and it needs none here.
+CMD ["bash", "tools/display/x11.sh", "--", "bash", "tools/vulkan-proof/run-proof.sh"]

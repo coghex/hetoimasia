@@ -21,6 +21,7 @@ extra-doc-files:
     CLAUDE.md
     docs/*.md
     docs/toolchain/*.md
+    docs/vulkan/*.md
     tools/README.md
     tools/KANBAN-LICENSE
 extra-source-files:
@@ -39,6 +40,10 @@ extra-source-files:
     tools/toolchain/capture-build.sh
     tools/toolchain/qualify-binding.sh
     tools/toolchain/Dockerfile.linux-binding
+    tools/vulkan-proof/Dockerfile.linux-proof
+    tools/vulkan-proof/environment.pin
+    tools/vulkan-proof/run-proof.sh
+    cabal.project.vulkan
     tools/docs_land_paths.py
     tools/native/glfw.pin
     tools/native/native.py
@@ -107,6 +112,7 @@ test-suite workflow-tests
         Timings
         TimingStep
         Validation
+        VulkanProof
     build-depends:
         base >=4.22 && <4.23,
         directory >=1.3 && <1.4,
