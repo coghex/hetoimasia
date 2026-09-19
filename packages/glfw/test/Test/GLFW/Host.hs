@@ -16,7 +16,17 @@ module Test.GLFW.Host (spec) where
 import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, displayException, fromException, throwIO, try)
+import Control.Exception
+  ( AsyncException (ThreadKilled)
+  , Exception
+  , ExceptionWithContext
+  , SomeException
+  , displayException
+  , fromException
+  , throwIO
+  , try
+  , tryWithContext
+  )
 import Control.Monad (forM, join, replicateM, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -28,7 +38,8 @@ import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (..), threadStatus)
 import Hetoimasia.Foundation.Log
   ( Component
   , LogEntry (..)
-  , LogLevel (Warning)
+  , LogFilter (..)
+  , LogLevel (Error, Warning)
   , Logger
   , callbackSink
   , componentText
@@ -86,6 +97,8 @@ import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
+import qualified Hetoimasia.Runtime.Logging as Logging
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..))
 import Numeric.Natural (Natural)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
@@ -101,7 +114,27 @@ import Hetoimasia.Runtime.Supervision
   , workerStatus
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Test.GLFW.Support (boundedExample, caughtAs, current, entered, onThread, operationOf, unexpected)
+import Test.GLFW.Support
+  ( SinkFailed (..)
+  , SinkMark (..)
+  , boundedExample
+  , caughtAs
+  , current
+  , diagnosticMarks
+  , entered
+  , failingSink
+  , flushed
+  , newSinkTrace
+  , onThread
+  , operationOf
+  , raisedWith
+  , retainedAs
+  , retainedDiagnostics
+  , sinkFailingOn
+  , sinkMarks
+  , traced
+  , unexpected
+  )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -203,6 +236,20 @@ spec = describe "GLFW window host" $ do
       (boundedExample testCancelledDuringACustomShutdown)
     it "ends a run whose worker keeps publishing until supervision stops it, on a finish and on a cancellation"
       (boundedExample testPublisherUntilStopped)
+
+  describe "a failed wake warning" $ do
+    it "leaves the host as a diagnostic failure, with no second write and no final flush"
+      (boundedExample testWakeWarningFailsAtExit)
+    it "keeps an application failure primary, retaining the warning's own failure beside it unreported"
+      (boundedExample testWakeWarningFailsBesideAPrimary)
+    it "is a diagnostic failure when it is a turn's own attempt that fails"
+      (boundedExample testWakeWarningFailsDuringATurn)
+    it "propagates a cancellation delivered at its sink as a cancellation, unmarked and unflushed"
+      (boundedExample testWakeWarningCancelledAtItsSink)
+    it "leaves the ordinary write-then-flush path alone when the warning is filtered out"
+      (boundedExample testFilteredWakeWarningFlushes)
+    it "leaves the ordinary write-then-flush path alone when the warning succeeds"
+      (boundedExample testSucceedingWakeWarningFlushes)
 
 -- ---------------------------------------------------------------------------
 -- Owner turns
@@ -1643,6 +1690,193 @@ testAbandonedStartup = do
                    , "released with NotExecuted while its window was live"
                    ]
   heldWindow held >>= windowEnded >>= (`shouldBe` True)
+
+-- ---------------------------------------------------------------------------
+-- Failed wake warnings
+
+-- | Run an application over a seam host and hand back the failure it raised,
+-- with its context.
+--
+-- The catch is inside the thread the seam designates because
+-- 'Control.Concurrent.runInBoundThread' carries an outcome back out by
+-- rethrowing a plain 'SomeException', which leaves an example nothing to
+-- inspect; every assertion below is about evidence the exception carries.
+hostedFailure
+  ∷ Logger
+  → Seam
+  → HostConfig
+  → (WindowHost → RuntimeControl → IO s)
+  → (s → RuntimeControl → IO a)
+  → IO (ExceptionWithContext SomeException)
+hostedFailure logger seam config startup action = do
+  outcome ←
+    asProcessMainThread seam . tryWithContext $
+      runWindowApplication (withLoggingLifetime logger) "host-example" (hostOver seam config) id startup action
+  either pure (\_ → unexpected "the run returned instead of failing") outcome
+
+-- | 'onMainThread' keeping the context of whatever the run raised, for the same
+-- reason.
+onMainThreadKeepingContext
+  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
+onMainThreadKeepingContext seam action = do
+  finished ← newEmptyMVar
+  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+  pure (runner, finished)
+
+-- | Whether a native call released something the wake report must not have
+-- outlived: the host's window, or the session itself.
+releasing ∷ NativeCall → Bool
+releasing = \case
+  DestroyWindow _ → True
+  Terminate → True
+  _ → False
+
+released ∷ Seam → IO [NativeCall]
+released seam = filter releasing <$> seamCalls seam
+
+-- | The wake path's one warning fails at the runner's own boundary, after a run
+-- that otherwise succeeded.
+--
+-- The failure that leaves the host is the sink's own, carrying the runtime's
+-- diagnostic-failure identity: the runtime attempts no terminal report through
+-- the sink that just failed, and the logging lifetime attempts no final flush
+-- through it.
+testWakeWarningFailsAtExit ∷ Expectation
+testWakeWarningFailsAtExit = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  live ← newIORef ([] ∷ [NativeCall])
+  let logger = failingSink defaultLogFilter "glfw.wake" (\_ → released seam >>= writeIORef live) trace
+  (failure, context) ←
+    raisedWith
+      =<< hostedFailure logger seam (settings [windowNamed "warned"]) (\host _ → pure host) (\host _ → degradeWakePath host)
+  failure `shouldBe` SinkFailed "glfw.wake"
+  -- One attempt through the sink and nothing after it: no second write.
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` [DiagnosticFailure]
+  -- The lifetime was told as well, so its own finalization had the same answer
+  -- and attached the failed attempt rather than a flush failure.
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  null (Logging.flushFailuresInContext context) `shouldBe` True
+  -- The mark the sink raised it with rides on the same context, so what
+  -- propagated is the exception it threw rather than a copy of it.
+  sinkMarks context `shouldBe` [SinkMark]
+  -- The attempt ran with the window and the session still live, and the failure
+  -- released neither early: both went at the ordinary unwind.
+  readIORef live `shouldReturn` []
+  released seam `shouldReturn` [DestroyWindow 1, Terminate]
+
+-- | The same warning fails while an application failure is already primary.
+--
+-- That failure stays primary and is not marked as a diagnostic's, because no
+-- diagnostic raised it; the warning's own failure is retained beside it under
+-- the wake report's label, carrying the mark. The runtime still makes no second
+-- write and the lifetime still no flush, because the lifetime was told the
+-- attempt failed.
+testWakeWarningFailsBesideAPrimary ∷ Expectation
+testWakeWarningFailsBesideAPrimary = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  (failure, context) ←
+    raisedWith
+      =<< hostedFailure (sinkFailingOn "glfw.wake" trace) seam (settings [windowNamed "primary"])
+        (\host _ → pure host)
+        (\host _ → degradeWakePath host >> throwIO (Broken "the action failed"))
+  failure `shouldBe` Broken "the action failed"
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` []
+  retainedDiagnostics context `shouldBe` [("glfw wake degradation report", True)]
+  -- Retained as the sink raised it: the warning's own exception, not a copy.
+  retainedAs "glfw wake degradation report" context
+    `shouldBe` [(Just (SinkFailed "glfw.wake"), [SinkMark])]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  released seam `shouldReturn` [DestroyWindow 1, Terminate]
+
+-- | A turn's own attempt is the one that fails, before the loop-end wrapper and
+-- the runner's boundary ever run. It spends the notifier's one report, so
+-- neither of them claims anything, and the failure it raised ends the loop as
+-- the diagnostic failure it is.
+testWakeWarningFailsDuringATurn ∷ Expectation
+testWakeWarningFailsDuringATurn = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  let logger = sinkFailingOn "glfw.wake" trace
+  (failure, context) ←
+    raisedWith =<< hostedFailure logger seam (settings [windowNamed "turning"]) (\host _ → pure host) (\host control → do
+      window ← onlyWindow host
+      -- The admission's failing wake degrades the path before the first turn,
+      -- so it is that turn's own attempt that writes and fails.
+      _ ← submitWindowCommand (hostCommandPort host) [] (observeOf window)
+      runOwnerLoop host control (turningUntil logger 3))
+  failure `shouldBe` SinkFailed "glfw.wake"
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` [DiagnosticFailure]
+  sinkMarks context `shouldBe` [SinkMark]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  released seam `shouldReturn` [DestroyWindow 1, Terminate]
+
+-- | A cancellation delivered while the warning's sink is running is never
+-- turned into a synchronous logging failure: it propagates as the cancellation
+-- it is, unmarked and with its own context, and nothing is flushed through the
+-- sink it was delivered in.
+testWakeWarningCancelledAtItsSink ∷ Expectation
+testWakeWarningCancelledAtItsSink = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  reached ← newEmptyMVar
+  never ← newEmptyMVar
+  let holding =
+        failingSink defaultLogFilter "glfw.wake" (\_ → putMVar reached () >> takeMVar never) trace
+  (runner, finished) ←
+    onMainThreadKeepingContext seam $
+      runWindowApplication
+        (withLoggingLifetime holding)
+        "host-example"
+        (hostOver seam (settings [windowNamed "cancelled"]))
+        id
+        (\host _ → pure host)
+        (\host _ → degradeWakePath host)
+  -- The action has ended; the boundary's one attempt is inside the sink.
+  takeMVar reached
+  killThread runner
+  cancelled ← takeMVar finished
+  (failure, context) ← either raisedWith (\_ → unexpected "the cancelled run returned") cancelled
+  failure `shouldBe` ThreadKilled
+  diagnosticMarks context `shouldBe` []
+  null (Logging.failedReportsInContext context) `shouldBe` True
+  -- The attempt was spent, and the cancellation stopped it before it returned.
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+
+-- | A warning the filter drops spends the attempt without reaching the sink, so
+-- nothing failed and the lifetime's ordinary final flush still happens.
+testFilteredWakeWarningFlushes ∷ Expectation
+testFilteredWakeWarningFlushes = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  let quiet = defaultLogFilter {filterGlobalLevel = Error}
+  hostedLogging (failingSink quiet "glfw.wake" (\_ → pure ()) trace) seam
+    (settings [windowNamed "filtered"])
+    (\host _ → pure host)
+    (\host _ → degradeWakePath host)
+  traced trace `shouldReturn` []
+  flushed trace `shouldReturn` 1
+
+-- | A warning the sink accepts leaves the lifetime nothing to avoid: the entry
+-- is written once and the one final flush follows it.
+testSucceedingWakeWarningFlushes ∷ Expectation
+testSucceedingWakeWarningFlushes = do
+  seam ← newSeam (failingPostScript "scripted wake failure")
+  trace ← newSinkTrace
+  hostedLogging (sinkFailingOn "no.such.component" trace) seam
+    (settings [windowNamed "written"])
+    (\host _ → pure host)
+    (\host _ → degradeWakePath host)
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 1
 
 -- ---------------------------------------------------------------------------
 -- Applications and workers

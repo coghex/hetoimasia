@@ -18,11 +18,11 @@ module Test.GLFW.Scheduled (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, writeTVar)
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO, tryWithContext)
 import Control.Monad (forM, forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Log (Component, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Time (Duration)
 import Hetoimasia.Foundation.Worker (WorkerDefinition, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
@@ -43,8 +43,11 @@ import Hetoimasia.GLFW.Internal.Seam
   , asProcessMainThread
   , defaultScript
   , newSeam
+  , reportError
   , seamCalls
+  , seamSession
   )
+import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
   ( Window
   , WindowId
@@ -53,9 +56,13 @@ import Hetoimasia.GLFW.Window
   , withWindow
   )
 import Hetoimasia.Runtime.GLFW
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import qualified Hetoimasia.Runtime.Logging as Logging
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..))
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
   , Role (..)
+  , RuntimeControl
   , SupervisedStart (..)
   , SupervisedWorker
   , WorkerPolicy (..)
@@ -65,17 +72,26 @@ import Hetoimasia.Runtime.Supervision
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
 import Test.GLFW.Support
-  ( at
+  ( SinkFailed (..)
+  , SinkMark (..)
+  , at
   , boundedExample
   , caughtAs
+  , diagnosticMarks
   , durationOf
   , entered
+  , flushed
   , hosted
   , millis
+  , newSinkTrace
   , pumps
   , quietLogger
+  , raisedWith
   , scriptedClock
   , settings
+  , sinkFailingOn
+  , sinkMarks
+  , traced
   , unexpected
   , windowNamed
   )
@@ -128,6 +144,8 @@ spec = describe "GLFW scheduled owner turns" $ do
       (boundedExample testFinishes)
     it "refuses an idle wait it cannot bound before acquiring anything"
       (boundedExample testUnboundableIdleWait)
+    it "ends as a diagnostic failure when the wake warning its own last update caused fails at its sink"
+      (boundedExample testWakeWarningFailsAsTheLoopEnds)
 
 -- ---------------------------------------------------------------------------
 -- Wait selection
@@ -561,6 +579,80 @@ turning start decide = do
 
 recording ∷ IORef [ScheduledTurn] → (ScheduledTurn → IO (ScheduledStep a)) → ScheduledTurn → IO (ScheduledStep a)
 recording seen decide turn = modifyIORef' seen (<> [turn]) >> decide turn
+
+-- | A degradation caused inside the scheduled loop's final update, after that
+-- turn's own reporting boundary has already run, so it is the loop-end claim
+-- that writes the warning — and its sink fails.
+--
+-- That failure leaves the loop carrying the runtime's diagnostic-failure
+-- identity, so the runtime attempts no terminal report through the sink that
+-- just failed and the logging lifetime attempts no final flush through it.
+testWakeWarningFailsAsTheLoopEnds ∷ Expectation
+testWakeWarningFailsAsTheLoopEnds = do
+  seam ←
+    newSeam
+      defaultScript {scriptPostEmptyEvent = \reporter → reportError reporter 0x00010008 "scripted wake failure"}
+  (clock, unread) ← scriptedClock [0, 1]
+  trace ← newSinkTrace
+  let logger = sinkFailingOn "glfw.wake" trace
+  (failure, context) ←
+    raisedWith =<< scheduledFailure logger seam (settings [windowNamed "ending"] clock) (\host _ → pure host) (\host control → do
+      window ← onlyWindow host
+      runScheduledOwnerLoop host control . defaultScheduledHooks logger $ \_ → do
+        -- Inside the update, so the turn's own boundary has already passed and
+        -- only the loop's own ending can claim what this degrades.
+        duringUpdate ← traced trace
+        duringUpdate `shouldBe` []
+        _ ← submitWindowCommand (hostCommandPort host) [] (observeWindowCommand (windowIdentity window))
+        pure (FinishWith ()))
+  failure `shouldBe` SinkFailed "glfw.wake"
+  -- One attempt through the sink and nothing after it: no second write.
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` [DiagnosticFailure]
+  sinkMarks context `shouldBe` [SinkMark]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  -- One turn's own steps, and the one post its admission made.
+  pumps seam `shouldReturn` [WaitEvents 0.25]
+  posts seam `shouldReturn` 1
+  released seam `shouldReturn` [DestroyWindow 1, Terminate]
+  unread `shouldReturn` 0
+
+-- | Run a scheduled application over a seam host and hand back the failure it
+-- raised, with its context.
+--
+-- The catch is inside the thread the seam designates because
+-- 'Control.Concurrent.runInBoundThread' carries an outcome back out by
+-- rethrowing a plain 'SomeException', which leaves an example nothing to
+-- inspect.
+scheduledFailure
+  ∷ Logger
+  → Seam
+  → HostConfig
+  → (WindowHost → RuntimeControl → IO s)
+  → (s → RuntimeControl → IO a)
+  → IO (ExceptionWithContext SomeException)
+scheduledFailure logger seam config startup action = do
+  outcome ←
+    asProcessMainThread seam . tryWithContext $
+      runWindowApplication
+        (withLoggingLifetime logger)
+        "scheduled-example"
+        (allocWindowHostIn (seamSession seam defaultSessionConfig) config)
+        id
+        startup
+        action
+  either pure (\_ → unexpected "the run returned instead of failing") outcome
+
+-- | The native calls that released the host's window or the session, so an
+-- example can show a failed warning released neither early.
+released ∷ Seam → IO [NativeCall]
+released seam = filter releasing <$> seamCalls seam
+  where
+    releasing = \case
+      DestroyWindow _ → True
+      Terminate → True
+      _ → False
 
 -- ---------------------------------------------------------------------------
 -- The scripted platform
