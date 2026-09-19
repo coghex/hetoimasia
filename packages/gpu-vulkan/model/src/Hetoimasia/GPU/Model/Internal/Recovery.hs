@@ -35,10 +35,12 @@ module Hetoimasia.GPU.Model.Internal.Recovery
 
     -- * The idle polling backoff
   , BackoffState (..)
+  , DueAt (..)
   , freshBackoff
   , resetBackoff
   , currentBackoff
   , advanceBackoff
+  , scheduleNextPoll
   ) where
 
 import Hetoimasia.Foundation.Time
@@ -134,6 +136,12 @@ attemptRecovery now episode
           { episodeAttempts = attempt
           , episodeNextAttemptAt = AttemptUnscheduled
           , episodeOutstanding = True
+          , -- Evidence gathered before this attempt says nothing about a target
+            -- that has just had to be reconstructed again. Carrying it forward
+            -- would let a cycle that the attempt itself interrupted hand the
+            -- episode its budget back.
+            episodeRetirementCycle = False
+          , episodeHealthySince = Nothing
           }
       , AttemptAdmitted attempt
       )
@@ -182,8 +190,9 @@ noteRetirementCycle now episode
   | episodeRetirementCycle episode = episode
   | otherwise = episode {episodeRetirementCycle = True, episodeHealthySince = Just now}
 
--- | Reset the episode if, and only if, a retirement cycle has completed and a
--- full healthy period has elapsed since it did without another failure.
+-- | Reset the episode if, and only if, a retirement cycle has completed since
+-- the last attempt and a full healthy period has elapsed since it did, without
+-- another failure.
 --
 -- An attempt still in flight blocks the reset, because a reset would settle it
 -- by forgetting it: the construction would then be free to report a failure
@@ -253,16 +262,34 @@ judgeRetry attempt
 -- ---------------------------------------------------------------------------
 -- The idle polling backoff
 
--- | Where the session is in its idle polling schedule.
+-- | When the next idle poll falls due.
+data DueAt
+  = DueImmediately
+    -- ^ Something has been scheduled since the last turn — new demand, a new
+    -- obligation, an observed completion or a close — and the owner is asked for
+    -- an opportunity now. It is an answer in its own right rather than an
+    -- instant, because the transitions that set it carry no clock reading, and
+    -- inventing one at each observation is what would let repeated reads of an
+    -- unchanged model push the poll further away.
+  | DueAt !Instant
+    -- ^ The absolute instant the last turn anchored. Reading it again does not
+    -- move it.
+  | DueUnschedulable
+    -- ^ That instant does not fit the clock's representation.
+  deriving (Eq, Show)
+
+-- | Where the session is in its idle polling schedule, and when its next poll is
+-- due.
 data BackoffState = BackoffState
   { backoffStep ∷ !Natural
     -- ^ The index into 'backoffSchedule'; it stops advancing at the last entry,
     -- which is the steady state.
+  , backoffDueAt ∷ !DueAt
   }
   deriving (Eq, Show)
 
 freshBackoff ∷ BackoffState
-freshBackoff = BackoffState {backoffStep = 0}
+freshBackoff = BackoffState {backoffStep = 0, backoffDueAt = DueImmediately}
 
 -- | New demand, a new obligation, an observed completion or a close transition
 -- all schedule an immediate opportunity and start the schedule over.
@@ -286,3 +313,21 @@ advanceBackoff budgets state
   | backoffStep state + 1 >= fromIntegral (length (backoffSchedule budgets)) =
       state {backoffStep = fromIntegral (length (backoffSchedule budgets)) - 1}
   | otherwise = state {backoffStep = backoffStep state + 1}
+
+-- | Anchor the next poll at the instant this turn ran, and move the schedule on.
+--
+-- A turn is the only place an instant reaches the backoff, so it is the only
+-- place the deadline can be anchored. The interval announced is the one the
+-- schedule is currently at; the advance applies to the turn after it, so a turn
+-- that made progress starts again at the first interval rather than carrying the
+-- idle one forward.
+scheduleNextPoll ∷ Budgets → Instant → Bool → BackoffState → BackoffState
+scheduleNextPoll budgets now progressed state
+  | progressed = BackoffState {backoffStep = 0, backoffDueAt = anchored (currentBackoff budgets freshBackoff)}
+  | otherwise =
+      BackoffState
+        { backoffStep = backoffStep (advanceBackoff budgets state)
+        , backoffDueAt = anchored (currentBackoff budgets state)
+        }
+  where
+    anchored interval = either (const DueUnschedulable) DueAt (addDuration now interval)

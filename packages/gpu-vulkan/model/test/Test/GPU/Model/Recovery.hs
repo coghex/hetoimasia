@@ -36,8 +36,15 @@ spec = describe "recovery" $ do
     fmap viewTargetRecoveryAttempts (targetView target thirdBegun) `shouldBe` Just 3
     thirdFailed ← admitted_ "failing the third attempt" (recordRecoveryFailure (atMilliseconds 600) target thirdBegun)
 
+    -- The last failure of an episode is where recovery is exhausted. Leaving it
+    -- to whoever next asks for an attempt would leave the target admitted,
+    -- unescalated and unscheduled — and on an idle target nobody ever asks.
+    fmap viewTargetPhase (targetView target thirdFailed) `shouldBe` Just TargetUnavailable
+    escalations thirdFailed `shouldBe` [OptionalTargetUnavailable target]
+    fmap viewTargetRenderDemand (targetView target thirdFailed) `shouldBe` Just False
+    nextDeadline thirdFailed `shouldBe` NoTurnNeeded
     (_, exhausted) ← admitted "asking for a fourth attempt" (beginTargetRecovery (atMilliseconds 10000) target thirdFailed)
-    exhausted `shouldBe` RecoveryExhausted (OptionalTargetUnavailable target)
+    exhausted `shouldBe` RecoveryClosed
 
   it "refuses the next attempt when its delay cannot be expressed, rather than skipping the delay" $ do
     model ← freshModel
@@ -57,7 +64,7 @@ spec = describe "recovery" $ do
 
     -- The owner is told there is work it cannot be given an instant for, rather
     -- than told there is nothing to do.
-    nextDeadline lastInstant failed `shouldBe` TurnUnschedulable
+    nextDeadline failed `shouldBe` TurnUnschedulable
 
   it "is not replenished by a nested helper, by another turn, or by an allocation sub-retry" $ do
     model ← freshModel
@@ -66,13 +73,15 @@ spec = describe "recovery" $ do
 
     -- A nested helper is just another caller of the same accounting.
     (_, nested) ← admitted "a nested helper asking again" (beginTargetRecovery (atMilliseconds 10000) target spent)
-    nested `shouldSatisfy` isExhausted
+    nested `shouldSatisfy` isSpent
+    fmap viewTargetRecoveryAttempts (targetView target spent) `shouldBe` Just 3
 
     -- Turns pass; the budget does not come back.
     let (turned, _) = runProgressTurn silentEvidence (atMilliseconds 20000) spent
         (turnedAgain, _) = runProgressTurn silentEvidence (atMilliseconds 30000) turned
     (_, afterTurns) ← admitted "asking after two turns" (beginTargetRecovery (atMilliseconds 40000) target turnedAgain)
-    afterTurns `shouldSatisfy` isExhausted
+    afterTurns `shouldSatisfy` isSpent
+    fmap viewTargetRecoveryAttempts (targetView target turnedAgain) `shouldBe` Just 3
 
     -- An allocation attempt's own retry is separate accounting and does not
     -- touch the target's episode.
@@ -82,7 +91,7 @@ spec = describe "recovery" $ do
     (retried, verdict) ← admitted "retrying the allocation" (retryAllocation allocation reclaimed)
     verdict `shouldSatisfy` (`elem` [RetryPermitted, RetryWithoutReclamation])
     (_, afterSubRetry) ← admitted "asking after the sub-retry" (beginTargetRecovery (atMilliseconds 50000) target retried)
-    afterSubRetry `shouldSatisfy` isExhausted
+    afterSubRetry `shouldSatisfy` isSpent
 
   it "resets the episode only after a retirement cycle and a full second of healthy progress" $ do
     model ← freshModel
@@ -161,17 +170,15 @@ spec = describe "recovery" $ do
   it "marks an optional target unavailable and fails the session for a required one" $ do
     optionalModel ← freshModel
     (optionalActive, optionalTarget, _) ← activeTarget 2 optionalModel
-    optionalSpent ← spendEpisode optionalTarget optionalActive
-    (_, optionalAnswer) ← admitted "exhausting an optional target" (beginTargetRecovery (atMilliseconds 9999) optionalTarget optionalSpent)
-    exhaustedModel ← exhaust optionalTarget optionalSpent
-    optionalAnswer `shouldBe` RecoveryExhausted (OptionalTargetUnavailable optionalTarget)
+    exhaustedModel ← spendEpisode optionalTarget optionalActive
+    -- The optional target is isolated: it is unavailable and the session runs on.
+    fmap viewTargetPhase (targetView optionalTarget exhaustedModel) `shouldBe` Just TargetUnavailable
     sessionState exhaustedModel `shouldBe` SessionRunning
     escalations exhaustedModel `shouldBe` [OptionalTargetUnavailable optionalTarget]
 
     requiredModel ← freshModel
     (requiredActive, requiredTarget, _) ← activeTargetWith RequiredTarget 2 requiredModel
-    requiredSpent ← spendEpisode requiredTarget requiredActive
-    failedModel ← exhaust requiredTarget requiredSpent
+    failedModel ← spendEpisode requiredTarget requiredActive
     sessionState failedModel `shouldBe` SessionFailed RequiredTargetUnrecoverable
     escalations failedModel `shouldSatisfy` elem (RequiredTargetFailedSession requiredTarget)
 
@@ -350,9 +357,10 @@ spec = describe "recovery" $ do
         >>= (`shouldBe` WrongPhase GenerationIdentity)
       fmap viewTargetActive (targetView target retired) `shouldBe` Just Nothing
   where
-    isExhausted = \case
-      RecoveryExhausted _ → True
-      _ → False
+    -- Whatever the answer, it is not the admission of a fresh attempt.
+    isSpent = \case
+      RecoveryAttempt _ → False
+      _ → True
     settleResource resource model = do
       released ← admitted_ "releasing" (releaseResource resource model)
       admitted_ "ending CPU use" (endResourceCpuUse resource released)
@@ -364,9 +372,6 @@ spec = describe "recovery" $ do
           (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds now) target current)
           failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds now) target begun)
           go (now + 1000) (count + 1) failed
-    exhaust target model = do
-      (exhausted, _) ← admitted "exhausting the episode" (beginTargetRecovery (atMilliseconds 99999) target model)
-      pure exhausted
     -- One full presentation-retirement cycle on the target, which is the first
     -- of the two conditions a recovery reset needs.
     completeRetirementCycle target now model = do

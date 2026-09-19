@@ -121,7 +121,7 @@ import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Either (isLeft)
-import Hetoimasia.Foundation.Time (Duration, Instant, TimeOverflow (TimeOverflow), addDuration)
+import Hetoimasia.Foundation.Time (Instant, TimeOverflow (TimeOverflow), addDuration)
 import Hetoimasia.GPU.Model.Internal.Budget
   ( BudgetKind
       ( AggregateFrameSlotBudget
@@ -138,6 +138,7 @@ import Hetoimasia.GPU.Model.Internal.Budget
   , frameSlotLimit
   , generationLimit
   , healthyProgressPeriod
+  , recoveryAttemptLimit
   , imageTrackingLimit
   , objectLimit
   , presentationPoolCapacity
@@ -170,7 +171,8 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       , attemptRetiredOldSwapchain
       , attemptRetrySpent
       )
-  , BackoffState
+  , BackoffState (backoffDueAt)
+  , DueAt (DueAt, DueImmediately, DueUnschedulable)
   , NextAttempt (AttemptAt, AttemptUnschedulable, AttemptUnscheduled)
   , RecoveryEpisode
       ( episodeAttempts
@@ -187,9 +189,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       , AttemptStillOutstanding
       )
   , RetryVerdict (RetryPermitted)
-  , advanceBackoff
   , attemptRecovery
-  , currentBackoff
   , freshBackoff
   , freshEpisode
   , judgeRetry
@@ -199,6 +199,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
   , recordAttemptFailure
   , recordAttemptSuccess
   , resetBackoff
+  , scheduleNextPoll
   )
 import Numeric.Natural (Natural)
 
@@ -1873,9 +1874,9 @@ runProgressTurn source now model = (finished, report)
             ActionDeclined → accumulated
     healthy = foldl' (\current number → editTarget number (\entry → entry {targetRecovery = observeHealthyProgress now (targetRecovery entry)}) current) worked order
     retired = foldl' forgetIfRetired healthy order
-    backoff
-      | actions > 0 = resetBackoff (gpuBackoff retired)
-      | otherwise = advanceBackoff (gpuBudgets retired) (gpuBackoff retired)
+    -- The turn is the only place an instant reaches the backoff, so it is the
+    -- only place the next poll can be anchored to one.
+    backoff = scheduleNextPoll (gpuBudgets retired) now (actions > 0) (gpuBackoff retired)
     finished = retired {gpuBackoff = backoff, gpuCursor = gpuCursor retired + 1}
     report =
       TurnReport
@@ -1888,7 +1889,7 @@ runProgressTurn source now model = (finished, report)
             | number ← order
             , Just target ← [Map.lookup number (gpuTargets model)]
             ]
-        , turnNextDeadline = nextDeadline now finished
+        , turnNextDeadline = nextDeadline finished
         }
 
 rotated ∷ Natural → [a] → [a]
@@ -2053,6 +2054,10 @@ forgetIfRetired model number = case Map.lookup number (gpuTargets model) of
 data NextTurn
   = NoTurnNeeded
     -- ^ Nothing is pending and nothing is scheduled.
+  | TurnNow
+    -- ^ An opportunity is owed immediately: something was scheduled since the
+    -- last turn, and the transition that scheduled it carried no clock reading
+    -- to anchor an instant to.
   | TurnAt !Instant
     -- ^ The absolute instant of the next turn. One in the past means the owner
     -- is overdue, and is reported as it stands.
@@ -2065,37 +2070,45 @@ data NextTurn
 
 -- | When the next owner turn is due.
 --
--- A target with render demand that is not suspended asks for an immediate
--- opportunity. Otherwise it is the earliest of the instants the model is
--- committed to: one idle backoff away if any obligation is pending — a suspended
--- target keeps its retirement demand here even though it contributes no render
--- deadline — and every absolute recovery deadline. With nothing pending and
--- nothing scheduled there is nothing to wait for.
-nextDeadline ∷ Instant → GpuModel → NextTurn
-nextDeadline now model
-  | renderDemand = TurnAt now
-  -- An overflow is reported rather than filtered: the work is real and the
-  -- instant is not representable, and those two facts together are not absence.
+-- It takes no instant, and that is the point: the answer is a property of the
+-- model alone, so reading the same unchanged model twice gives the same answer
+-- however much time has passed between the reads. A deadline recomputed from the
+-- reading instant would let an unrelated observation push the next poll further
+-- away each time it happened.
+--
+-- A target with render demand that is not suspended asks for an opportunity now.
+-- Otherwise it is the earliest of the instants the model is committed to: the
+-- poll the last turn anchored, if any obligation is pending — a suspended target
+-- keeps its retirement demand here even though it contributes no render deadline
+-- — and every absolute recovery deadline. With nothing pending and nothing
+-- scheduled there is nothing to wait for.
+nextDeadline ∷ GpuModel → NextTurn
+nextDeadline model
+  | renderDemand = TurnNow
+  | immediate = TurnNow
+  -- The earliest representable instant wins. An overflow is reported only when
+  -- there is no representable instant at all, because a deadline that is both
+  -- actionable and sooner is not made unreachable by some other candidate's
+  -- arithmetic failing.
+  | not (null scheduled) = TurnAt (minimum scheduled)
   | any isLeft results = TurnUnschedulable
-  | otherwise = case scheduled of
-      [] → NoTurnNeeded
-      entries → TurnAt (minimum entries)
+  | otherwise = NoTurnNeeded
   where
     renderDemand =
       or
         [ targetRenderDemand target && targetPhase target == TargetAdmitted
         | target ← Map.elems (gpuTargets model)
         ]
-    -- The backoff paces the polling of obligations; the recovery deadlines are
-    -- absolute instants the model has already committed to. The earliest of them
-    -- all is the next time the owner has something to do. A deadline in the past
-    -- means the owner is overdue, and is reported as it stands.
+    immediate = obligations > 0 && backoffDueAt (gpuBackoff model) == DueImmediately
     scheduled = [instant | Right instant ← results]
-    results = [addDuration now interval | obligations > 0] ++ recoveries
-    recoveries = recoveryDeadlines model
+    results = poll ++ recoveryDeadlines model
+    poll
+      | obligations <= 0 = []
+      | otherwise = case backoffDueAt (gpuBackoff model) of
+          DueImmediately → []
+          DueAt at → [Right at]
+          DueUnschedulable → [Left TimeOverflow]
     obligations = fromIntegral (Map.size (gpuSubmissions model)) + recordObligations model ∷ Natural
-    interval ∷ Duration
-    interval = currentBackoff (gpuBudgets model) (gpuBackoff model)
 
 -- | Every absolute instant a target's recovery accounting has committed to: when
 -- its next construction attempt may begin, and when a healthy period that has
@@ -2193,25 +2206,18 @@ beginTargetRecovery now identity model =
         _ → case attemptRecovery now (targetRecovery target) of
           (_, AttemptStillOutstanding) → Admitted (model, RecoveryOutstanding)
           (_, AttemptDelayUnrepresentable) → Admitted (model, RecoveryUnschedulable)
-          (_, AttemptBudgetExhausted) → Admitted (exhaust number target)
+          -- Reachable only for a target readmitted since its episode was spent:
+          -- the final failure exhausts it where it happens, rather than waiting
+          -- for someone to ask for an attempt that does not exist.
+          (_, AttemptBudgetExhausted) →
+            let (next, escalation) = exhaustTarget number target model
+             in Admitted (next, RecoveryExhausted escalation)
           (_, AttemptDeferredUntil at) → Admitted (model, RecoveryDeferred at)
           (episode, AttemptAdmitted attempt) →
             Admitted
               ( editTarget number (\entry → entry {targetRecovery = episode}) model
               , RecoveryAttempt attempt
               )
-  where
-    exhaust number target = case targetClassOf target of
-      OptionalTarget →
-        let escalation = OptionalTargetUnavailable (targetIdOf model number target)
-         in ( note escalation (editTarget number (\entry → entry {targetPhase = TargetUnavailable, targetRenderDemand = False}) model)
-            , RecoveryExhausted escalation
-            )
-      RequiredTarget →
-        let escalation = RequiredTargetFailedSession (targetIdOf model number target)
-         in ( note escalation (escalateSession RequiredTargetUnrecoverable (editTarget number (\entry → entry {targetPhase = TargetRetiring, targetRenderDemand = False}) model))
-            , RecoveryExhausted escalation
-            )
 
 -- | Record that the attempt just made failed. Nothing about a nested helper, a
 -- changed geometry observation or an allocation sub-retry reaches this counter
@@ -2224,7 +2230,40 @@ recordRecoveryFailure now identity model =
     -- never began, and would install a retry delay out of nowhere.
     if not (episodeOutstanding (targetRecovery target))
       then Rejected (WrongPhase TargetIdentity)
-      else Admitted (editTarget number (\entry → entry {targetRecovery = recordAttemptFailure now (targetRecovery entry)}) model)
+      else
+        let recorded =
+              editTarget number (\entry → entry {targetRecovery = recordAttemptFailure now (targetRecovery entry)}) model
+         in -- The last failure of an episode is where recovery is exhausted.
+            -- Leaving that to whoever next asks for an attempt would leave the
+            -- target admitted, unescalated and unscheduled — and on an otherwise
+            -- idle target nobody ever asks.
+            if episodeAttempts (targetRecovery target) < recoveryAttemptLimit
+              then Admitted recorded
+              else case Map.lookup number (gpuTargets recorded) of
+                Nothing → Admitted recorded
+                Just spent → Admitted (fst (exhaustTarget number spent recorded))
+
+-- | Mark a target whose recovery budget is spent: an optional one becomes
+-- unavailable and the session continues; a required one fails the session.
+exhaustTarget ∷ Natural → Target → GpuModel → (GpuModel, Escalation)
+exhaustTarget number target model = case targetClassOf target of
+  OptionalTarget →
+    let escalation = OptionalTargetUnavailable (targetIdOf model number target)
+     in ( note
+            escalation
+            (editTarget number (\entry → entry {targetPhase = TargetUnavailable, targetRenderDemand = False}) model)
+        , escalation
+        )
+  RequiredTarget →
+    let escalation = RequiredTargetFailedSession (targetIdOf model number target)
+     in ( note
+            escalation
+            ( escalateSession
+                RequiredTargetUnrecoverable
+                (editTarget number (\entry → entry {targetPhase = TargetRetiring, targetRenderDemand = False}) model)
+            )
+        , escalation
+        )
 
 -- | Record that the attempt just made succeeded. It settles the attempt so the
 -- episode can admit another later; it does not give the spent attempt back,

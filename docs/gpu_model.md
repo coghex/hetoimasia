@@ -275,6 +275,16 @@ outstanding is refused rather than spending one on a construction that never
 began. A terminal session admits no new recovery work at all: device loss is not
 a condition a target can construct its way out of.
 
+The **last** failure of an episode is where recovery is exhausted, not the next
+request for an attempt that no longer exists. Leaving it until someone asked
+would leave the target admitted, unescalated and with nothing scheduled — and on
+an otherwise idle target nobody ever asks.
+
+Admitting an attempt clears any healthy-progress evidence gathered before it. A
+cycle that the attempt itself interrupted says nothing about a target that has
+just had to be reconstructed again, and carrying it forward would hand the
+episode its budget back on the strength of it.
+
 Nothing raises a spent budget. A nested helper, a changed framebuffer
 observation and an allocation sub-retry all reach the same accounting, which only
 counts up. The single path back to a full budget requires **two** separate
@@ -328,20 +338,29 @@ the report names the order it visited.
 
 The turn answers the absolute instant of the next one:
 
-- a target with render demand that is **not suspended** asks for an immediate
-  opportunity;
-- otherwise it is the earliest of the instants the model is committed to: one
-  backoff interval away if any obligation is pending, and every absolute recovery
-  deadline — when a target's next construction attempt may begin, and when a
-  healthy period that has started would complete and reset its episode;
+- a target with render demand that is **not suspended** asks for an opportunity
+  now;
+- so does a pending obligation created since the last turn, because the
+  transition that created it carried no clock reading to anchor an instant to;
+- otherwise it is the earliest of the instants the model is committed to: the
+  poll the last turn anchored, and every absolute recovery deadline — when a
+  target's next construction attempt may begin, and when a healthy period that
+  has started would complete and reset its episode;
 - with nothing pending and nothing scheduled there is no turn to schedule.
 
-`nextDeadline` answers `NoTurnNeeded`, `TurnAt` an instant, or
-`TurnUnschedulable`. The third is not a fourth way of saying the second is
-missing: it means there *is* work and the instant it is due at does not fit the
-clock's representation. Reading an arithmetic failure as an absence would tell
-the owner that nothing needs doing while work is outstanding, so the overflow is
-reported instead. A recovery delay that overflows when it is recorded is kept as
+`nextDeadline` takes **no instant**, and that is the point: the answer is a
+property of the model alone, so reading the same unchanged model twice gives the
+same answer however much time passed between the reads. A deadline recomputed
+from the reading instant would let an unrelated observation push the next poll
+further away every time something happened to ask. The turn is the only place an
+instant reaches the backoff, so the turn is where the next poll is anchored.
+
+It answers `NoTurnNeeded`, `TurnNow`, `TurnAt` an instant, or
+`TurnUnschedulable`. The last is not another way of saying there is no deadline:
+it means there *is* work and the instant it is due at does not fit the clock's
+representation. It is reported only when no candidate is representable, because a
+deadline that is both actionable and sooner is not made unreachable by some other
+candidate's arithmetic failing. A recovery delay that overflows when it is recorded is kept as
 its own state for the same reason — `AttemptUnscheduled` says no delay is owed
 and `AttemptUnschedulable` says one is owed that cannot be expressed, and
 collapsing the second into the first would admit the next attempt immediately,
@@ -462,7 +481,13 @@ offered to another called a wrong parent rather than a foreigner.
 And the arithmetic edges at the end of the clock's range: a retry delay that
 overflows refusing the next attempt rather than skipping the delay, and a
 schedule that cannot express its next instant saying so rather than reporting
-that no turn is needed.
+that no turn is needed — while still answering a finite deadline that is sooner
+when one exists.
+
+And the scheduling contract itself: the same unchanged model read repeatedly
+answering the same deadline; a spent episode marking its target unavailable and
+escalating at the failure that spent it; and evidence gathered before an attempt
+refusing to replenish the episode that attempt belongs to.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

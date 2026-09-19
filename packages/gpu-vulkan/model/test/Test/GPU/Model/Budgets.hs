@@ -290,9 +290,8 @@ spec = describe "admission budgets" $ do
     loseOne model = do
       (withTarget, target) ← admitted "admitting an optional target" (admitTarget OptionalTarget model)
       spent ← spend target withTarget (3 ∷ Int) 0
-      (exhausted, answer) ← admitted "exhausting it" (beginTargetRecovery (atMilliseconds 99999) target spent)
-      answer `shouldBe` RecoveryExhausted (OptionalTargetUnavailable target)
-      pure (fst (runProgressTurn silentEvidence (atMilliseconds 99999) exhausted))
+      escalations spent `shouldContain` [OptionalTargetUnavailable target]
+      pure (fst (runProgressTurn silentEvidence (atMilliseconds 99999) spent))
     spend target model count now
       | count <= 0 = pure model
       | otherwise = do
