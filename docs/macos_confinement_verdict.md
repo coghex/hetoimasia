@@ -87,6 +87,29 @@ that argues from it.
 `runner_os` is `Darwin`. Remote CI never runs macOS, so this receipt is local
 evidence only: it can never satisfy a Linux plan.
 
+Its `executed_commit` is not this pull request's head, and it does not need to
+be. Everything committed after it is Markdown, which is
+[harmless prose](validation.md#harmless-prose) excluded from `input_identity` —
+and the head's `input_identity` is still
+`8be6745a824ec37093e02c6537789ec85b87a821fc8244711cee37b109505d7c`, the value
+the receipt carries. The receipt answers for the tree this pull request asks to
+merge.
+
+### Exclusion off Darwin, checked rather than assumed
+
+Requirement 11 turns on a component that is *not built* elsewhere behaving
+differently from one that is built and passes vacuously. That was verified here
+by inverting the conditional to `if os(linux)` on this macOS host and rebuilding:
+
+- `cabal build all` succeeds and mentions none of the three components.
+- `cabal test hetoimasia-scripting-lua:macos-confinement-probe` fails with
+  `Cabal-7127`: *Cannot build the test suite 'macos-confinement-probe' because
+  it is marked as 'buildable: False'*.
+
+A Linux worker that is nonetheless asked to run `test.macos-confinement` gets
+that second outcome — an explicit refusal, with no receipt — rather than a pass.
+The inversion was reverted; the committed file reads `if os(darwin)`.
+
 ## The candidate profile
 
 A trusted parent process, per admitted `(mod, domain, generation)`:
