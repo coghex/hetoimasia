@@ -109,25 +109,38 @@ owning subsystem's contract/design when continuing its work.
 - LUA-14 (#147) is the Linux confinement and resource-limit feasibility proof,
   and **its verdict is `inconclusive`** — recorded in
   [the Linux confinement verdict](docs/lua_linux_confinement_verdict.md). The
-  candidate profile (no-new-privs, a user namespace entered from a freshly
-  forked single-threaded child, mount/network/IPC/UTS namespaces, a `tmpfs`
-  private root reached by `pivot_root`, `RLIMIT_AS`, and a `TSYNC` seccomp
-  filter) was exercised only in the Linux CI worker container. No ordinary
-  unprivileged Linux launch was available to the solver, so the deployment
-  baseline a person's own machine would use is unproven, and under D-11 that
-  returns the Lua design to `exploring` rather than selecting Q-5's Linux half.
-  What would close it is one run of
-  `cabal test hetoimasia-scripting-lua:linux-confinement-probe` on an ordinary
-  unprivileged Linux machine; the probe needs no change to produce that record.
-  The memory ceiling is an address-space limit, so it counts reservations and
-  not resident size, which is why the child is built with `-xr256m` — a
-  prerequisite of the experiment, not a tuning choice. The probe is private to
-  `packages/scripting-lua/linux/`, built on Linux alone, and admits no mod
-  source; its group is `test.lua-confinement-linux`. Registering it needed the
-  validation planner to accept `buildable` inside an `if os(...)` conditional,
-  which it now does without reading the body, so a platform component's sources
-  select their group on every platform rather than only the one that builds
-  them.
+  candidate profile works: on an ordinary unprivileged Linux machine (Ubuntu
+  24.04, kernel 6.8, aarch64, non-root, no capability) every row of Q-5's proof
+  matrix was demonstrated. It works only where the distribution gives an
+  unprivileged process a *usable* user namespace, and neither required
+  environment does. Ubuntu 24.04 ships
+  `kernel.apparmor_restrict_unprivileged_userns=1`, which lets the `unshare`
+  succeed and then denies `CAP_SYS_ADMIN` inside the namespace it created; the
+  Linux CI container refuses the `unshare` outright. So the mechanism is proven
+  and the deployment baseline is not, which returns the Lua design to
+  `exploring` under D-11. The obstacle is the owner's to resolve: relaxing that
+  restriction, shipping an AppArmor profile, a file-capability helper, and
+  **Landlock instead of namespaces** (unprivileged, no namespace needed, TCP
+  rules since kernel 6.7) are the alternatives, the last being the one worth
+  evaluating next. No CI image or container option was changed.
+- The probe's own shape is the reusable part. It is private to
+  `packages/scripting-lua/linux/`, Linux-only, admits no mod source, and its
+  group is `test.lua-confinement-linux`; a green run is evidence and never a
+  verdict, because each example either proves its property or prints that the
+  machine could not install the profile. Facts it fixed: an unprivileged user
+  namespace must be entered from a freshly `fork`ed child, because
+  `unshare(CLONE_NEWUSER)` is refused to a threaded process; asking whether one
+  can be *created* is the wrong question, and the whole sequence through the
+  identity maps must be attempted; a bind mount remounted read-only inside a
+  user namespace must carry the source's locked flags forward or the remount is
+  `EPERM`; `RLIMIT_AS` is a whole-process ceiling but counts the runtime's
+  address-space reservation, so the child needs `-xr256m` and enough headroom
+  for eight megabytes of stack per runtime thread; and a `dlopen` fixture must
+  be a module the program does not already link. Registering the group needed
+  the validation planner to accept `buildable` inside an `if os(...)`
+  conditional, which it now does without reading the body, so a platform
+  component's sources select their group on every platform rather than only the
+  one that builds them.
 
 ## Contracts to preserve
 

@@ -18,6 +18,7 @@ import Test.Confinement.Support
   , controls
   , environment
   , newLedger
+  , reportedLines
   )
 import Test.Hspec (hspec)
 
@@ -31,4 +32,9 @@ main =
     available ← controls sentinels
     machine ← environment
     installed ← availability ledger available sentinels
+    -- The trial child's own report, verbatim and before any example reads it.
+    -- Requirement 8 asks for retained evidence, and the examples below quote
+    -- this report rather than reproducing it: without it a reader of a CI log
+    -- would have the conclusions and not the observations.
+    mapM_ (\line → putStrLn ("TRIAL " <> line)) (reportedLines installed)
     hspec (Test.Confinement.Spec.spec ledger available sentinels machine installed)

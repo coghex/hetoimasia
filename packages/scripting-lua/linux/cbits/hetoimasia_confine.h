@@ -140,6 +140,14 @@ int hetoimasia_probe_execute(const char *program);
 ** else -1 with the loader's message copied into `message`. */
 int hetoimasia_probe_load_module(const char *path, char *message, size_t length);
 
+/* Whether `path` is already loaded into this process.
+**
+** A module the program already links is not a fixture: `dlopen` on one takes a
+** reference to what is mapped and never maps a file, so it would succeed
+** inside the child and say nothing about whether loading a native module is
+** possible there. Answers 1 when it is already loaded, 0 when it is not. */
+int hetoimasia_probe_module_loaded(const char *path);
+
 /* Map a file-backed page with PROT_EXEC, and the same page without it.
 **
 ** Together these are the control and the probe for the one seccomp rule whose
@@ -172,10 +180,13 @@ unsigned long hetoimasia_confine_address_space_limit(void);
 /* Whether this process holds CAP_SYS_ADMIN in its current user namespace. */
 int hetoimasia_confine_has_sys_admin(void);
 
-/* Whether an unprivileged user namespace can be created from this process.
+/* Whether this process can create a user namespace it could confine a child in.
 **
-** Asked by forking a child that tries it, so the answer costs the caller no
-** namespace of its own. Answers 1, or 0 with `*observed_errno` set. */
+** Asked by forking a child that tries the whole sequence -- the namespace, the
+** identity maps, and a mount namespace under it -- so the answer costs the
+** caller no namespace of its own and is about a namespace that would be usable
+** rather than one that merely exists. Answers 1, or 0 with `*observed_errno`
+** set to the first step's failure. */
 int hetoimasia_confine_user_namespace_available(int *observed_errno);
 
 /* The name of a layer, for a report. Never null. */

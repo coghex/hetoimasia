@@ -7,10 +7,13 @@
 -- children would be four answers about four processes rather than one answer
 -- about the profile.
 --
--- Every denial example checks the same operation in three places -- native
--- helper code before source loads, a thread the runtime started after the
--- filter went in, and Lua after the source loaded -- because a denial that held
--- in only one of them would not be a property of this process.
+-- Every denial example checks the same operation in four places -- native
+-- helper code before source loads, a thread that existed before the filter
+-- did, a thread the runtime started after it, and Lua once the source loaded --
+-- because a denial that held in only one of them would not be a property of
+-- this process. The two threads are the halves of the filter's whole-child
+-- claim: @TSYNC@ reaches the ones already running, and inheritance reaches the
+-- ones started later.
 module Test.Confinement.Profile (spec) where
 
 import Test.Confinement.Support
@@ -128,12 +131,13 @@ denial installed subject nativeName luaName =
     whenAvailable installed nativeName $ do
       let reported = reportedObservations installed
       denied reported "native" nativeName
+      denied reported "existing-thread" nativeName
       denied reported "started-thread" nativeName
       denied reported "lua" luaName
       announce
         ( "PROVED "
             <> nativeName
-            <> " denied-in=native,started-thread,lua errno="
+            <> " denied-in=native,existing-thread,started-thread,lua errno="
             <> errnoOf reported "native" nativeName
             <> " mechanism="
             <> mechanismFor nativeName

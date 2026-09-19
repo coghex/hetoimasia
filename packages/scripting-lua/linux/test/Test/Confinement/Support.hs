@@ -131,7 +131,16 @@ data Environment = Environment
   , environmentUser ∷ !String
   , environmentSysAdmin ∷ !Bool
   , environmentUserNamespace ∷ !(Either Int ())
-  -- ^ @Left errno@ when an unprivileged user namespace cannot be created.
+  -- ^ @Left errno@ when no user namespace this process could confine a child
+  -- in can be created. The whole sequence is attempted, not only the
+  -- @unshare@: a namespace the creator holds no capability inside is not one
+  -- anything can be confined in, and on a distribution that restricts
+  -- unprivileged user namespaces that is exactly what the bare call produces.
+  , environmentUsernsRestriction ∷ !(Maybe String)
+  -- ^ The distribution's unprivileged-user-namespace restriction, when it has
+  -- one. Ubuntu 24.04 ships @kernel.apparmor_restrict_unprivileged_userns@ set,
+  -- which is administrative setup requirement 8 asks a record of and which a
+  -- reader of a refusal would otherwise have to guess at.
   , environmentCgroupControllers ∷ !String
   , environmentCgroupDelegated ∷ !Bool
   , environmentContainerised ∷ !Bool
@@ -145,6 +154,7 @@ environment = do
   controllers ← textIn "/sys/fs/cgroup/cgroup.controllers"
   delegated ← writable "/sys/fs/cgroup/cgroup.subtree_control"
   container ← doesFileExist "/.dockerenv"
+  restriction ← textIn "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
   admin ← (/= 0) <$> hetoimasia_confine_has_sys_admin
   (available, reported) ←
     alloca $ \observed → do
@@ -158,6 +168,10 @@ environment = do
       , environmentSysAdmin = admin
       , environmentUserNamespace =
           if available /= 0 then Right () else Left (fromIntegral reported)
+      , environmentUsernsRestriction =
+          case words restriction of
+            [] → Nothing
+            (setting : _) → Just ("apparmor_restrict_unprivileged_userns=" <> setting)
       , environmentCgroupControllers = firstLine controllers
       , environmentCgroupDelegated = delegated
       , environmentContainerised = container
@@ -209,6 +223,8 @@ describeEnvironment record =
       (\code → "denied:errno=" <> show code)
       (const "available")
       (environmentUserNamespace record)
+    <> " userns-restriction="
+    <> maybe "none" show (environmentUsernsRestriction record)
     <> " cgroup-controllers="
     <> show (environmentCgroupControllers record)
     <> " cgroup-subtree-writable="
@@ -233,7 +249,8 @@ data Controls = Controls
   -- ^ Each host sentinel and the @errno@ the parent saw reading it; 0 is the
   -- only value that makes the child's failure to read it mean anything.
   , controlModule ∷ !(Maybe String)
-  -- ^ A native module this machine has and the parent could load.
+  -- ^ A native module this machine has, that the parent could load, and that
+  -- neither process already links.
   }
 
 controls ∷ [FilePath] → IO Controls
@@ -245,18 +262,31 @@ controls sentinels = do
   loadable ← firstLoadable moduleCandidates
   pure Controls {controlSentinels = readable, controlModule = loadable}
   where
-    -- Ordinary shared libraries a Linux with a C toolchain has. The probe needs
-    -- one the parent can load, so that the child failing to load it is about
-    -- the child.
+    -- Ordinary shared libraries a Linux distribution has and a Haskell program
+    -- does not link. Both halves matter. The parent must be able to load it,
+    -- so that the child failing to is about the child; and neither may already
+    -- have it loaded, because `dlopen` on a module the program links takes a
+    -- reference to what is already mapped without mapping a file, which would
+    -- succeed inside the child and prove nothing.
     moduleCandidates =
-      ["libm.so.6", "libz.so.1", "libgcc_s.so.1", "libffi.so.8", "libc.so.6"]
+      [ "libbz2.so.1.0"
+      , "liblzma.so.5"
+      , "libzstd.so.1"
+      , "libz.so.1"
+      , "libexpat.so.1"
+      , "libcrypt.so.1"
+      ]
     firstLoadable [] = pure Nothing
     firstLoadable (candidate : rest) = do
-      outcome ←
-        allocaBytes 256 $ \message →
-          withCString candidate $ \path →
-            hetoimasia_probe_load_module path message 256
-      if outcome == 0 then pure (Just candidate) else firstLoadable rest
+      alreadyHere ← withCString candidate hetoimasia_probe_module_loaded
+      if alreadyHere /= 0
+        then firstLoadable rest
+        else do
+          outcome ←
+            allocaBytes 256 $ \message →
+              withCString candidate $ \path →
+                hetoimasia_probe_load_module path message 256
+          if outcome == 0 then pure (Just candidate) else firstLoadable rest
 
 -- --------------------------------------------------------------------------
 -- Launching
@@ -646,6 +676,9 @@ foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_read_file"
 
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_load_module"
   hetoimasia_probe_load_module ∷ CString → Ptr CChar → CSize → IO CInt
+
+foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_module_loaded"
+  hetoimasia_probe_module_loaded ∷ CString → IO CInt
 
 foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_confine_has_sys_admin"
   hetoimasia_confine_has_sys_admin ∷ IO CInt

@@ -54,10 +54,13 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 -- | How much address space the memory experiment's child may have.
 --
 -- Small enough that a modest Lua workload reaches it in seconds, large enough
--- that the runtime's bounded reservation and the shared libraries fit under it
--- with room to spare.
+-- that the child can start at all. Starting is not free under an address-space
+-- ceiling: the runtime's bounded reservation, the shared libraries, and eight
+-- megabytes of reserved stack for every thread the threaded runtime creates all
+-- come out of it before `main` runs, and a ceiling that fits the workload but
+-- not the startup measures the startup.
 ceilingBytes ∷ Integer
-ceilingBytes = 512 * 1024 * 1024
+ceilingBytes = 1024 * 1024 * 1024
 
 -- | The status the child exits with once it has observed its own refusal.
 memoryRefusedStatus ∷ Int

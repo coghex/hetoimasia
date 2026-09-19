@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -179,6 +180,50 @@ static int hetoimasia_make_file(const char *path) {
   return 0;
 }
 
+/* The mount flags a remount inside this user namespace may not drop.
+**
+** Every mount this namespace inherited is locked: the kernel refuses a
+** bind-remount that would clear its nosuid, nodev, noexec, or access-time
+** settings, and a remount that simply names the flags it wants is asking to
+** clear whichever of those it did not name. Almost every Linux filesystem is
+** mounted `relatime`, so a remount that forgot it would fail with EPERM on
+** almost every Linux -- as a refusal to install the private root, which is a
+** confusing way to be told about a missing flag.
+**
+** So the current settings are read back and carried forward. Only `read-only`
+** is added, which locking permits because it narrows. */
+static unsigned long hetoimasia_locked_flags(const char *path) {
+  struct statvfs current;
+  unsigned long flags = 0;
+  if (statvfs(path, &current) != 0) {
+    /* Unknown is not the same as none: carrying the common defaults forward is
+    ** the safe direction, since adding an access-time flag the mount already
+    ** has is a no-op and dropping one it has is the failure. */
+    return MS_RELATIME;
+  }
+  if (current.f_flag & ST_NOSUID) {
+    flags |= MS_NOSUID;
+  }
+  if (current.f_flag & ST_NODEV) {
+    flags |= MS_NODEV;
+  }
+  if (current.f_flag & ST_NOEXEC) {
+    flags |= MS_NOEXEC;
+  }
+  if (current.f_flag & ST_NOATIME) {
+    flags |= MS_NOATIME;
+  }
+  if (current.f_flag & ST_NODIRATIME) {
+    flags |= MS_NODIRATIME;
+  }
+#ifdef ST_RELATIME
+  if (current.f_flag & ST_RELATIME) {
+    flags |= MS_RELATIME;
+  }
+#endif
+  return flags;
+}
+
 /* Bind `source` into the private root, read-only.
 **
 ** The remount is a second call because a bind mount does not take its flags
@@ -206,7 +251,9 @@ static int hetoimasia_bind_read_only(const char *root, const char *source) {
     return -1;
   }
   if (mount(NULL, target, NULL,
-            MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL) != 0) {
+            MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV |
+              hetoimasia_locked_flags(target),
+            NULL) != 0) {
     return -1;
   }
   return 0;
@@ -317,7 +364,9 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
   if (hetoimasia_join(path, sizeof(path), root_directory, "/probe") != 0 ||
       hetoimasia_make_file(path) != 0 ||
       mount(program, path, NULL, MS_BIND, NULL) != 0 ||
-      mount(NULL, path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID,
+      mount(NULL, path, NULL,
+            MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID |
+              hetoimasia_locked_flags(path),
             NULL) != 0) {
     hetoimasia_refuse(report, HETOIMASIA_LAYER_PRIVATE_ROOT, errno);
   }
@@ -339,8 +388,11 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
 
   {
     struct rlimit limit;
-    limit.rlim_cur = 64;
-    limit.rlim_max = 64;
+    /* Enough for the runtime's own descriptors -- an event manager per
+    ** capability, its timers and its wake-up pipes -- plus the handful this
+    ** probe opens, and far short of what a descriptor exhaustion would need. */
+    limit.rlim_cur = 256;
+    limit.rlim_max = 256;
     if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
       hetoimasia_refuse(report, HETOIMASIA_LAYER_RESOURCE_LIMITS, errno);
     }
@@ -504,6 +556,19 @@ int hetoimasia_confine_seal(int allow_executable_file_mappings,
       (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
   program[length++] = (struct sock_filter)BPF_STMT(
       BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+
+#if defined(__x86_64__)
+  /* The x32 ABI reaches the same kernel under the same audit architecture, with
+  ** its own syscall numbers formed by setting the high bit. Every comparison
+  ** below is against an ordinary number, so an x32 call would match none of
+  ** them and fall through to the allow -- which is the whole table bypassed by
+  ** setting one bit. There is nothing here for x32 to do, so it is refused
+  ** before the table rather than filtered through it. */
+  program[length++] =
+      (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1);
+  program[length++] =
+      (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+#endif
 
   /* Launching another program, in either spelling. */
   HETOIMASIA_DENY(__NR_execve, EACCES);
@@ -854,6 +919,15 @@ int hetoimasia_probe_load_module(const char *path, char *message,
   }
 }
 
+int hetoimasia_probe_module_loaded(const char *path) {
+  void *handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+  if (handle == NULL) {
+    return 0;
+  }
+  dlclose(handle);
+  return 1;
+}
+
 int hetoimasia_probe_executable_mapping(const char *path, int *with_exec,
                                         int *without_exec) {
   char page[64];
@@ -966,7 +1040,31 @@ int hetoimasia_confine_user_namespace_available(int *observed_errno) {
     return 0;
   }
   if (child == 0) {
-    int failure = unshare(CLONE_NEWUSER) == 0 ? 0 : errno;
+    /* The whole sequence, not just the `unshare`.
+    **
+    ** Creating the namespace is the easy half and answers the wrong question.
+    ** On a distribution that restricts unprivileged user namespaces -- Ubuntu
+    ** 24.04 and its derivatives do, by transitioning the creator into an
+    ** AppArmor profile that denies every capability -- the `unshare` succeeds
+    ** and the process then holds nothing inside the namespace it just made.
+    ** What makes a namespace usable for confinement is writing the identity
+    ** maps and unsharing a mount namespace under it, so that is what is
+    ** attempted here and the first failure is what is reported. */
+    char mapping[64];
+    int failure = 0;
+    if (unshare(CLONE_NEWUSER) != 0) {
+      failure = errno;
+    } else if (hetoimasia_write_whole("/proc/self/setgroups", "deny") != 0 &&
+               errno != ENOENT) {
+      failure = errno;
+    } else {
+      snprintf(mapping, sizeof(mapping), "0 %u 1\n", (unsigned)geteuid());
+      if (hetoimasia_write_whole("/proc/self/uid_map", mapping) != 0) {
+        failure = errno;
+      } else if (unshare(CLONE_NEWNS) != 0) {
+        failure = errno;
+      }
+    }
     ssize_t ignored = write(channel[1], &failure, sizeof(failure));
     (void)ignored;
     _exit(0);

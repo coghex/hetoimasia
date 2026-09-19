@@ -15,10 +15,10 @@
 --      work -- because a denial observed without one is evidence about a
 --      broken fixture rather than about confinement;
 --   3. attempt the forbidden operations from native helper code;
---   4. attempt them again from a thread the runtime started /after/ the filter
---      went in, because a filter that bound one thread would not be a
---      confinement of this process;
---   5. only then construct a VM and load source, and attempt them a third time
+--   4. attempt them again from a thread that existed /before/ the filter did
+--      and again from one the runtime started /after/ it, because a filter
+--      that bound one thread would not be a confinement of this process;
+--   5. only then construct a VM and load source, and attempt them once more
 --      from inside Lua through trusted test bindings.
 --
 -- Every observation is printed as one line on standard output, in a shape the
@@ -172,19 +172,37 @@ settingsFrom arguments = do
 
 run ∷ Settings → IO ()
 run settings = do
+  -- Started before the filter exists, and asked its questions afterwards.
+  --
+  -- `TSYNC` claims to reach every thread already running, and a threaded
+  -- runtime always has several by the time `main` does anything. An assertion
+  -- about them is not an observation of them, so one is made here: this thread
+  -- is an ordinary bound OS thread that predates the filter, parked until
+  -- there is something to ask.
+  begin ← newEmptyMVar
+  fromExistingThread ← newEmptyMVar
+  _ ←
+    forkOS $ do
+      own ← takeMVar begin
+      probeNatively "existing-thread" settings own >>= putMVar fromExistingThread
+
   seal
   own ← control settings
   attempts ← probeNatively "native" settings own
-  -- Inheritance is what this second pass checks. A filter that covered only
-  -- the installing thread would leave every worker the RTS starts afterwards
-  -- unconfined, and the RTS starts them whether or not anyone asked.
+  putMVar begin own
+  fromExisting ← takeMVar fromExistingThread
+
+  -- And inheritance is the other half. A filter that covered only the threads
+  -- alive when it went in would leave every worker the runtime starts
+  -- afterwards unconfined, and the runtime starts them whether or not anyone
+  -- asked it to.
   afterwards ← newEmptyMVar
   _ ← forkOS (probeNatively "started-thread" settings own >>= putMVar afterwards)
   fromNewThread ← takeMVar afterwards
 
   let escaped =
         [ name
-        | (name, forbidden, observed) ← attempts <> fromNewThread
+        | (name, forbidden, observed) ← attempts <> fromExisting <> fromNewThread
         , forbidden
         , observed == 0
         ]
