@@ -49,6 +49,7 @@ import Test.Confinement.Support
   )
 import System.Exit (ExitCode (ExitFailure))
 import System.Posix.Process (ProcessStatus (Exited, Terminated))
+import System.Posix.Signals (Signal, sigKILL)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 
 -- | How much address space the memory experiment's child may have.
@@ -69,6 +70,11 @@ memoryRefusedStatus = 20
 -- | How long the parent waits for a cooperative stop before escalating.
 graceMicroseconds ∷ Int
 graceMicroseconds = 750000
+
+-- | The signal the escalation ends with, and the one the example requires to
+-- have been the cause of death.
+forceSignal ∷ Signal
+forceSignal = sigKILL
 
 spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
 spec ledger available sentinels installed = describe "limits" $ do
@@ -137,14 +143,14 @@ spec ledger available sentinels installed = describe "limits" $ do
             (escalated, status) ← enforce child
             owners ← releaseAfter ledger child >> admittedOwners ledger
             owners `shouldBe` []
-            -- Termination observed, not a signal successfully sent.
-            case status of
-              Terminated _ _ → pure ()
-              Exited _ →
-                expectationFailure
-                  "the child that never yields ended itself, so nothing was enforced"
-              other →
-                expectationFailure ("the child did not terminate: " <> describeStatus other)
+            -- The escalation is the claim, so it is asserted rather than
+            -- recorded. A child that the cooperative request had ended would
+            -- leave the path this example exists to exercise unexercised, and
+            -- an example that accepted that outcome would pass without it.
+            escalated `shouldBe` True
+            -- And termination by the force signal specifically, observed
+            -- rather than inferred from a signal having been sent.
+            status `shouldBe` Terminated forceSignal False
             announce
               ( "PROVED execution-bound reason=deadline-exceeded grace-microseconds="
                   <> show graceMicroseconds

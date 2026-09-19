@@ -85,7 +85,16 @@ order. The order is load-bearing: each layer's prerequisite is the one above it.
    with more than one thread, and the threaded runtime always has several. It is
    skipped when the process already holds `CAP_SYS_ADMIN`, which is recorded
    rather than assumed either way.
-3. **Mount, network, IPC, and UTS namespaces.**
+3. **Mount, network, IPC, UTS, and PID namespaces.** The PID namespace is what
+   makes "cannot reach another instance" a property of the kernel rather than
+   of the child's ignorance: sharing the host's process numbering and the
+   caller's own user id, a child could signal a sibling, the engine, or
+   anything else that user is running, and a syscall filter cannot tell those
+   apart from a process signalling itself because it cannot see who is asking.
+   `unshare` moves the caller's *children* into the new namespace rather than
+   the caller, so the confined program is one fork further down and what remains
+   above it is a supervisor holding no Lua, forwarding a cooperative stop
+   inwards and reproducing the confined process's own termination as its own.
 4. **A private root**: a fresh `tmpfs`, into which the runtime's own read-only
    directories and the probe binary are bind-mounted, with `/work` as the
    child's private disposable working area, reached by `pivot_root`. No host
@@ -94,6 +103,13 @@ order. The order is load-bearing: each layer's prerequisite is the one above it.
    asks for one — an address-space ceiling.
 6. **A seccomp filter**, installed from inside the child before any Lua state
    exists, with `SECCOMP_FILTER_FLAG_TSYNC`.
+
+Between the limits and the exec, every descriptor above the four the child is
+given is closed — the whole range rather than a guess at it, through
+`close_range` where the kernel has it and to the descriptor ceiling read before
+the limits narrowed it where it does not. Lowering `RLIMIT_NOFILE` closes
+nothing that is already open, so a caller's descriptor at any number its own
+limit allowed would otherwise survive the `execve` as an ambient capability.
 
 Launch is fail-closed at every step: a layer that cannot be installed reports
 `{layer, errno}` to the parent over a close-on-exec pipe and the pre-exec child
@@ -108,7 +124,7 @@ PROVED lifetime-initialization-failure layer=user-namespace errno=13 admitted-ow
 
 ## Observed, with the profile installed
 
-Environment 2, `apparmor_restrict_unprivileged_userns=0`, 17 examples, 0
+Environment 2, `apparmor_restrict_unprivileged_userns=0`, 20 examples, 0
 failures. Each line below is the run's own output.
 
 ```
@@ -118,8 +134,10 @@ ENVIRONMENT kernel="6.8.0-101-generic" distribution="Ubuntu 24.04.4 LTS" uid="50
             cgroup-controllers="cpuset cpu io memory hugetlb pids rdma misc"
             cgroup-subtree-writable=no container=no
 AVAILABILITY profile=installed
-CONTROLS sentinels=readable native-module=libbz2.so.1.0
+CONTROLS sentinels=readable inet-socket=created native-module=libbz2.so.1.0
+         inherited-descriptor=1100
 PROVED confinement-installed layers=513 before-source=yes controls=allowed
+PROVED pid-namespace child-pid=1
 PROVED read-outside-sentinel:…/alpha-sentinel denied-in=native,existing-thread,started-thread,lua
        errno=2 mechanism=mount-namespace:the path is not in the private root
 PROVED open-inet-socket denied-in=native,existing-thread,started-thread,lua
@@ -128,10 +146,14 @@ PROVED execute-program denied-in=native,existing-thread,started-thread,lua
        errno=13 mechanism=seccomp-filter:execve refused
 PROVED load-native-module denied-in=native,existing-thread,started-thread,lua
        errno=-1 mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
+PROVED signal-outside-process denied-in=native,existing-thread,started-thread
+       errno=3 mechanism=pid-namespace:no process outside it has a number in here
+PROVED inherited-descriptor number=1100 visible-in-child=no errno=9
+       mechanism=launcher:every descriptor above the four it is given is closed before the exec
 PROVED executable-file-mapping mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
        control=allowed errno=13
-PROVED two-instance-isolation owners=[79355,79356] peer-endpoint=denied peer-sentinel=denied
-       own-endpoint=allowed
+PROVED two-instance-isolation owners=[81251,81253] peer-endpoint=denied peer-sentinel=denied
+       peer-process=denied own-endpoint=allowed
 PROVED independent-termination ended=Terminated 9 False survivor-finished=Exited ExitSuccess
        admitted-owners=0
 PROVED whole-process-memory ceiling=1073741824 measures=address-space lua=refused
@@ -164,21 +186,29 @@ namespaces, the private root, and the limits went in before it existed.
 | Connecting to another instance's IPC endpoint | The network namespace: an abstract `AF_UNIX` name is scoped to one | `ECONNREFUSED` |
 | Executing another program | The seccomp filter: `execve` and `execveat` are refused | `EACCES` |
 | Loading a native module | The seccomp filter: a file-backed `PROT_EXEC` mapping is refused | `dlopen`: *failed to map segment from shared object* |
+| Signalling a process outside the child | The PID namespace: nothing outside it has a number in here | `ESRCH` |
+| Seeing a descriptor the caller left open | The launcher: every descriptor above the four it is given is closed before the exec | `EBADF` |
 
 Every one has a control that passes beside it: the child reads its own sentinel,
 binds and connects to its own endpoint, and maps the same file without
-`PROT_EXEC`. The parent, unconfined, reads every host sentinel and loads the same
-native module before any child is launched. A denial whose control failed is a
+`PROT_EXEC`. The parent, unconfined, reads every host sentinel, creates an
+`AF_INET` socket, and loads the same native module before any child is launched
+— the socket because the filter treats that domain differently from `AF_UNIX`,
+so the child's `AF_UNIX` control says nothing about it and a machine with no
+network stack would otherwise produce the same refusal for its own reasons. A denial whose control failed is a
 report about a broken fixture, not about confinement, and the suite asserts the
 controls first for that reason.
 
-Two of those controls are sharper than they look. The peer endpoint and the
+Three of those controls are sharper than they look. The peer endpoint and the
 child's own endpoint are the same operation on the same kind of name, differing
 only in whose network namespace the name lives in — in a shared namespace both
-would connect. And the native module is chosen at run time from modules the
-program does *not* already link, because `dlopen` on one the program links takes
-a reference to what is already mapped without mapping a file, and would have
-succeeded inside the child while proving nothing.
+would connect. The native module is chosen at run time from modules the program does *not*
+already link, because `dlopen` on one the program links takes a reference to
+what is already mapped without mapping a file, and would have succeeded inside
+the child while proving nothing. And the signalling probe is adversarial rather
+than a guess: each child is told, over its inherited endpoint after both are
+bound, exactly where its sibling is on the host, so a refusal is the kernel's
+and not the child's ignorance.
 
 `AF_UNIX` is deliberately left open. The child's own endpoint and the
 peer-reachability question are both `AF_UNIX`, and a unix socket inside an empty
@@ -262,11 +292,13 @@ Each is a thing a production profile would have to close rather than inherit.
 - **`mprotect` is not filtered.** A child could map a file readable and then make
   it executable. Filtering it risks the runtime's own executable allocations, and
   settling that needs measurement this slice did not do.
-- **There is no PID namespace.** The children have distinct process identities
-  and no `/proc` in their view, so neither can enumerate the other, but process
-  isolation rests on the absence of procfs rather than on a namespace. Adding one
-  needs a second fork and a scheme for forwarding the grandchild's exit status,
-  which would have complicated the very evidence these experiments produce.
+- **The caller's handle is the supervisor, not the confined process.** A PID
+  namespace's init must have a parent outside it, so what the caller waits on
+  and signals is one process further out. It reproduces the confined process's
+  exit status and terminating signal as its own and forwards a cooperative stop
+  inwards, and its parent-death signal ends the confined process if it dies
+  itself, but the two are not the same process and a reader of a status should
+  know which one answered.
 - **The read-only runtime view is coarse.** The child sees the host's runtime
   library directories read-only so that its loader and its locale support work.
   No user data is in that set, but a shipped profile would ship a minimal library

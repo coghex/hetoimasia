@@ -56,6 +56,8 @@
 #define HETOIMASIA_LAYER_MEMORY_LIMIT 0x0100
 #define HETOIMASIA_LAYER_SECCOMP 0x0200
 #define HETOIMASIA_LAYER_EXEC 0x0400
+#define HETOIMASIA_LAYER_PID_NS 0x0800
+#define HETOIMASIA_LAYER_SUPERVISOR 0x1000
 
 /* Where the private IPC endpoint the child inherits always lands.
 **
@@ -64,6 +66,13 @@
 ** argv would be handing untrusted code a number it could have guessed anyway.
 ** Nothing else is inherited -- every other descriptor is closed before exec. */
 #define HETOIMASIA_CONFINE_IPC_FD 3
+
+/* Where the pre-exec child's refusal channel sits while it is still open.
+**
+** Fixed so that closing every other descriptor is one range rather than a list
+** with a hole in it. It is close-on-exec, so a successful exec closes it and
+** the caller reads end-of-file instead of a refusal. */
+#define HETOIMASIA_CONFINE_REPORT_FD 4
 
 /* Launch `program` inside the candidate profile.
 **
@@ -140,6 +149,28 @@ int hetoimasia_probe_execute(const char *program);
 ** else -1 with the loader's message copied into `message`. */
 int hetoimasia_probe_load_module(const char *path, char *message, size_t length);
 
+/* Ask whether `pid` can be signalled from here, without signalling it.
+**
+** Signal zero performs every permission and existence check and delivers
+** nothing, so this is the adversarial question by itself: can this process
+** reach that one. Answers 0 when it could, else the `errno` that stopped it --
+** `ESRCH` from inside a PID namespace that does not contain it. */
+int hetoimasia_probe_signal(int pid);
+
+/* This process's identity as it sees it, which is 1 inside a PID namespace of
+** its own. */
+int hetoimasia_probe_own_pid(void);
+
+/* Whether `descriptor` is open in this process.
+**
+** The question a descriptor sweep has to answer from the far side of an
+** `execve`: the caller deliberately leaves one open at a number above any
+** range a guess would have swept, and a confined child that can still see it
+** has been handed an ambient capability. */
+int hetoimasia_probe_descriptor_open(int descriptor);
+/* Answers 0 when it is open, else the `errno` that says it is not -- the same
+** shape as every other probe here, so a report reads the same way. */
+
 /* Whether `path` is already loaded into this process.
 **
 ** A module the program already links is not a fixture: `dlopen` on one takes a
@@ -173,6 +204,14 @@ int hetoimasia_probe_allocate(size_t bytes);
 ** the experiment exercise the path a real stuck mod would force. Answers 0, or
 ** -1 with `errno` set. */
 int hetoimasia_confine_hold_term(void);
+
+/* Raise this process's soft descriptor limit to its hard one.
+**
+** The caller needs room above any number a swept range might have stopped at
+** in order to put a fixture there, and a soft limit of 1024 leaves the highest
+** usable descriptor at exactly the boundary the fixture exists to test past.
+** Answers the soft limit now in force. */
+unsigned long hetoimasia_raise_descriptor_limit(void);
 
 /* This process's address-space ceiling in bytes, or 0 when it is unlimited. */
 unsigned long hetoimasia_confine_address_space_limit(void);

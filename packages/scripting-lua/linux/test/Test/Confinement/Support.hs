@@ -59,6 +59,7 @@ module Test.Confinement.Support
   , fieldIn
   , collect
   , awaitReady
+  , awaitLine
   , instruct
 
     -- * Ending a child
@@ -110,9 +111,13 @@ import System.IO
 import System.IO.Error (isEOFError)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.IO (closeFd, createPipe, fdToHandle, handleToFd)
-import System.Posix.Process (ProcessStatus (Exited, Stopped, Terminated), getProcessStatus)
+import System.Posix.Process
+  ( ProcessStatus (Exited, Stopped, Terminated)
+  , getProcessID
+  , getProcessStatus
+  )
 import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess)
-import System.Posix.Types (CPid (CPid), ProcessID)
+import System.Posix.Types (CPid (CPid), Fd, ProcessID)
 import Test.Hspec (Expectation, shouldNotBe)
 import Test.Support.Bounded (bounded)
 
@@ -251,6 +256,16 @@ data Controls = Controls
   , controlModule ∷ !(Maybe String)
   -- ^ A native module this machine has, that the parent could load, and that
   -- neither process already links.
+  , controlInetSocket ∷ !Int
+  -- ^ The @errno@ the parent saw creating an @AF_INET@ socket. The filter
+  -- treats that domain differently from @AF_UNIX@, so the child's @AF_UNIX@
+  -- control says nothing about it: without this, a machine with no network
+  -- stack at all would produce the same refusal inside the child and it would
+  -- be read as the filter's work.
+  , controlInheritedDescriptor ∷ !Int
+  -- ^ A descriptor the parent holds open, without close-on-exec, at a number
+  -- above any range a sweep might have guessed at. A child that can still see
+  -- it was handed an ambient capability.
   }
 
 controls ∷ [FilePath] → IO Controls
@@ -260,7 +275,23 @@ controls sentinels = do
       (\path → (,) path . fromIntegral <$> withCString path hetoimasia_probe_read_file)
       sentinels
   loadable ← firstLoadable moduleCandidates
-  pure Controls {controlSentinels = readable, controlModule = loadable}
+  inet ← fromIntegral <$> hetoimasia_probe_open_socket afInet
+  -- The fixture has to sit above the number a swept range would have stopped
+  -- at, and the default soft limit puts the highest usable descriptor exactly
+  -- at that boundary, so the limit is raised to its hard value first.
+  ceilingNow ← hetoimasia_raise_descriptor_limit
+  held ← openFile "/dev/null" ReadMode >>= handleToFd
+  -- Left inheritable on purpose. Nothing closes it: it must still be there
+  -- when every child is launched.
+  raised ← fcntlDuplicateAbove held (placeFixtureAt ceilingNow)
+  closeFd held
+  pure
+    Controls
+      { controlSentinels = readable
+      , controlModule = loadable
+      , controlInetSocket = inet
+      , controlInheritedDescriptor = fromIntegral raised
+      }
   where
     -- Ordinary shared libraries a Linux distribution has and a Haskell program
     -- does not link. Both halves matter. The parent must be able to load it,
@@ -288,6 +319,38 @@ controls sentinels = do
                 hetoimasia_probe_load_module path message 256
           if outcome == 0 then pure (Just candidate) else firstLoadable rest
 
+-- | Where the deliberately inherited descriptor is put.
+--
+-- Above 1024, because a sweep that loops to a round number is exactly the
+-- mistake this fixture exists to catch, and below the limit now in force
+-- because otherwise it cannot be placed at all.
+placeFixtureAt ∷ CSize → CInt
+placeFixtureAt ceilingNow
+  | ceilingNow > 1200 = 1100
+  | ceilingNow > 16 = fromIntegral ceilingNow - 8
+  | otherwise = 8
+
+-- | Duplicate a descriptor to at least @lowest@, without close-on-exec.
+fcntlDuplicateAbove ∷ Fd → CInt → IO Fd
+fcntlDuplicateAbove source lowest = do
+  raised ← c_fcntl_dupfd (fromIntegral source) fDupfd lowest
+  if raised < 0
+    then throwIO (userError "could not place the inherited-descriptor fixture")
+    else pure (fromIntegral raised)
+
+-- | @F_DUPFD@: duplicates to the lowest free number at or above the argument,
+-- and -- unlike @F_DUPFD_CLOEXEC@ -- leaves the copy inheritable, which is the
+-- whole point of the fixture.
+fDupfd ∷ CInt
+fDupfd = 0
+
+foreign import ccall unsafe "fcntl"
+  c_fcntl_dupfd ∷ CInt → CInt → CInt → IO CInt
+
+-- | @AF_INET@, spelled here for the same reason the child spells it.
+afInet ∷ CInt
+afInet = 2
+
 -- --------------------------------------------------------------------------
 -- Launching
 
@@ -301,6 +364,8 @@ data Launch = Launch
   , launchModule ∷ !String
   , launchMemoryLimit ∷ !Integer
   , launchAllocationStep ∷ !Int
+  , launchInheritedProbe ∷ !Int
+  , launchOutsidePid ∷ !Int
   }
 
 -- | A launch of @mode@ with this run's fixtures, and no memory ceiling.
@@ -315,6 +380,8 @@ launchFor mode root available sentinels endpoint =
     , launchModule = fromMaybe "libc.so.6" (controlModule available)
     , launchMemoryLimit = 0
     , launchAllocationStep = 64 * 1024 * 1024
+    , launchInheritedProbe = controlInheritedDescriptor available
+    , launchOutsidePid = 0
     }
 
 -- | Which prerequisite was missing, and what the kernel said about it.
@@ -374,6 +441,10 @@ withLaunch ledger request = bracket (launch ledger request) release
 
 launch ∷ Ledger → Launch → IO (Either Refusal Confined)
 launch ledger request = do
+  -- This process is a real process on the host, owned by the same user, and
+  -- outside whatever namespace the child ends up in. Whether the child can
+  -- reach it is the adversarial question, so the child is told where to aim.
+  here ← getProcessID
   found ← findExecutable "lua-confine-child"
   program ←
     maybe
@@ -383,10 +454,11 @@ launch ledger request = do
   (outputRead, outputWrite) ← createPipe
   (commandRead, commandWrite) ← createPipe
   nothing ← openFile "/dev/null" ReadMode >>= handleToFd
+  let settled = request {launchOutsidePid = fromIntegral here}
   (pid, layer, failure) ←
     withCString program $ \programPath →
-      withCString (launchRoot request) $ \rootPath →
-        withMany withCString (argumentsFor request) $ \argumentList →
+      withCString (launchRoot settled) $ \rootPath →
+        withMany withCString (argumentsFor settled) $ \argumentList →
           withArray0 nullPtr argumentList $ \argv →
             withMany withCString childEnvironment $ \environmentList →
               withArray0 nullPtr environmentList $ \envp →
@@ -397,7 +469,7 @@ launch ledger request = do
                       argv
                       envp
                       rootPath
-                      (fromIntegral (launchMemoryLimit request))
+                      (fromIntegral (launchMemoryLimit settled))
                       (fromIntegral commandRead)
                       (fromIntegral nothing)
                       (fromIntegral outputWrite)
@@ -437,6 +509,8 @@ launch ledger request = do
         : ("--peer-endpoint=" <> launchPeerEndpoint settings)
         : ("--module=" <> launchModule settings)
         : ("--allocation-step=" <> show (launchAllocationStep settings))
+        : ("--inherited-probe=" <> show (launchInheritedProbe settings))
+        : ("--outside-pid=" <> show (launchOutsidePid settings))
         : ["--outside=" <> path | path ← launchOutside settings]
     -- No home directory, no credentials, no inherited configuration: what the
     -- child gets is what a mod would get, which is a locale and nothing else.
@@ -520,11 +594,16 @@ collect child = bounded (drain [])
 
 -- | Read the child's report up to and including its @READY@ line.
 awaitReady ∷ Confined → IO [String]
-awaitReady child = bounded (drain [])
+awaitReady = awaitLine "READY"
+
+-- | Read the child's report up to and including the first line starting with
+-- @marker@.
+awaitLine ∷ String → Confined → IO [String]
+awaitLine marker child = bounded (drain [])
   where
     drain gathered = do
       line ← hGetLine (confinedReading child)
-      if "READY" `isPrefixOf` line
+      if marker `isPrefixOf` line
         then pure (reverse (line : gathered))
         else drain (line : gathered)
 
@@ -674,11 +753,17 @@ foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_confine_layer_name"
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_read_file"
   hetoimasia_probe_read_file ∷ CString → IO CInt
 
+foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_open_socket"
+  hetoimasia_probe_open_socket ∷ CInt → IO CInt
+
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_load_module"
   hetoimasia_probe_load_module ∷ CString → Ptr CChar → CSize → IO CInt
 
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_module_loaded"
   hetoimasia_probe_module_loaded ∷ CString → IO CInt
+
+foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_raise_descriptor_limit"
+  hetoimasia_raise_descriptor_limit ∷ IO CSize
 
 foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_confine_has_sys_admin"
   hetoimasia_confine_has_sys_admin ∷ IO CInt

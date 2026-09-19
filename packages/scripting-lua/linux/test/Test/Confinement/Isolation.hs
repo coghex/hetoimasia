@@ -5,6 +5,12 @@
 -- same instant and every question either answers is a question about a living
 -- sibling rather than about a name nothing holds.
 --
+-- The pair is held twice, and the first hold is what makes the endpoint
+-- question mean anything. Binding a name and asking whether a sibling's is
+-- reachable are two events in two processes and nothing orders them, so each
+-- child stops once it has bound its own and waits for the parent to say that
+-- its sibling has bound one too.
+--
 -- The endpoint question is the sharp one. Each child binds an abstract
 -- @AF_UNIX@ name and then tries both its own and its sibling's. Abstract names
 -- are scoped to a network namespace, so in a shared namespace both would
@@ -23,6 +29,7 @@ import Test.Confinement.Support
   , Observation
   , admittedOwners
   , announce
+  , awaitLine
   , awaitReady
   , collect
   , fieldIn
@@ -48,8 +55,23 @@ spec ledger available sentinels installed = describe "isolation" $ do
         owners ← admittedOwners ledger
         length owners `shouldBe` 2
 
-        firstReport ← observationsIn <$> awaitReady first
-        secondReport ← observationsIn <$> awaitReady second
+        -- Both bound before either asks about the other. A peer probe that ran
+        -- first would be refused because the name did not exist yet, which is
+        -- a refusal about timing rather than about namespaces.
+        --
+        -- Each child's report arrives in two batches either side of that hold,
+        -- and the controls are in the first: the endpoint a child connects to
+        -- is the one it bound before saying so.
+        firstBound ← awaitLine "BOUND" first
+        secondBound ← awaitLine "BOUND" second
+        -- Each is told where its sibling is on the host. It could not have
+        -- found that out, and being handed it is what turns "cannot reach the
+        -- sibling" from an absence of knowledge into a refusal by the kernel.
+        releaseNaming first second
+        releaseNaming second first
+
+        firstReport ← observationsIn . (firstBound <>) <$> awaitReady first
+        secondReport ← observationsIn . (secondBound <>) <$> awaitReady second
 
         -- Each reaches its own endpoint and not the other's. Both halves
         -- matter: without the first this would be a report about a socket
@@ -59,6 +81,11 @@ spec ledger available sentinels installed = describe "isolation" $ do
         outcomeOf firstReport "native" "connect-peer-endpoint" `shouldBe` Just "denied"
         outcomeOf secondReport "native" "connect-peer-endpoint" `shouldBe` Just "denied"
 
+        -- And neither can reach the other as a process, having been told
+        -- exactly where it is.
+        outcomeOf firstReport "native" "signal-peer-process" `shouldBe` Just "denied"
+        outcomeOf secondReport "native" "signal-peer-process" `shouldBe` Just "denied"
+
         -- And neither reads the other's sentinel, which exists on the host and
         -- which the parent read before either was launched.
         peerSentinelDenied firstReport sentinels
@@ -67,12 +94,17 @@ spec ledger available sentinels installed = describe "isolation" $ do
         announce
           ( "PROVED two-instance-isolation owners="
               <> show (map (\child → toInteger (confinedPid child)) [first, second])
-              <> " peer-endpoint=denied peer-sentinel=denied own-endpoint=allowed"
+              <> " peer-endpoint=denied peer-sentinel=denied peer-process=denied"
+              <> " own-endpoint=allowed"
           )
 
   it "lets the parent end one instance without disturbing the other" $
     whenAvailable installed "independent-termination" $
       withPair ledger available sentinels $ \first second → do
+        _ ← awaitLine "BOUND" first
+        _ ← awaitLine "BOUND" second
+        releaseNaming first second
+        releaseNaming second first
         _ ← awaitReady first
         _ ← awaitReady second
 
@@ -125,6 +157,11 @@ withPair ledger available sentinels body =
   where
     alphaEndpoint = "hetoimasia-confine-alpha"
     betaEndpoint = "hetoimasia-confine-beta"
+
+-- | Release one child, naming its sibling's identity on the host.
+releaseNaming ∷ Confined → Confined → IO ()
+releaseNaming child sibling =
+  instruct child ("probe " <> show (toInteger (confinedPid sibling)))
 
 outcomeOf ∷ [Observation] → String → String → Maybe String
 outcomeOf reported phase name = fieldIn "outcome" <$> observationFor phase name reported

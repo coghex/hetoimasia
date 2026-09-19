@@ -64,7 +64,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   )
 import System.Environment (getArgs)
 import System.Exit (ExitCode (ExitFailure), exitWith)
-import System.IO (BufferMode (LineBuffering), hClose, hGetLine, hSetBuffering, stdout)
+import System.IO (BufferMode (LineBuffering), Handle, hGetLine, hSetBuffering, stdout)
 import System.Posix.IO (fdToHandle)
 import System.Posix.Types (Fd (Fd))
 
@@ -100,6 +100,12 @@ data Settings = Settings
   -- ^ A native module the parent loaded successfully before launching this
   -- child, so a failure here is about this child rather than about the module.
   , settingAllocationStep ∷ !Int
+  , settingOutsidePid ∷ !Int
+  -- ^ A process that exists on the host, belongs to the same user, and is not
+  -- in this child's PID namespace: the parent's own.
+  , settingInheritedProbe ∷ !Int
+  -- ^ A descriptor the parent left open, above any range a guess would have
+  -- swept, and which this child must not be able to see.
   }
 
 -- | The private working area, which is all of the filesystem this child writes.
@@ -145,6 +151,8 @@ settingsFrom arguments = do
   native ← lookup "--module" pairs
   step ← lookup "--allocation-step" pairs
   bytes ← readMaybeInt step
+  inheritedProbe ← lookup "--inherited-probe" pairs >>= readMaybeInt
+  outsidePid ← lookup "--outside-pid" pairs >>= readMaybeInt
   pure
     Settings
       { settingMode = mode
@@ -153,6 +161,8 @@ settingsFrom arguments = do
       , settingPeerEndpoint = peer
       , settingModule = native
       , settingAllocationStep = bytes
+      , settingOutsidePid = outsidePid
+      , settingInheritedProbe = inheritedProbe
       }
   where
     pairs = [splitOnce argument | argument ← arguments, "--" `isPrefixOf` argument]
@@ -172,6 +182,7 @@ settingsFrom arguments = do
 
 run ∷ Settings → IO ()
 run settings = do
+  channel ← openCommandChannel
   -- Started before the filter exists, and asked its questions afterwards.
   --
   -- `TSYNC` claims to reach every thread already running, and a threaded
@@ -183,13 +194,32 @@ run settings = do
   fromExistingThread ← newEmptyMVar
   _ ←
     forkOS $ do
-      own ← takeMVar begin
-      probeNatively "existing-thread" settings own >>= putMVar fromExistingThread
+      (own, peer) ← takeMVar begin
+      probeNatively "existing-thread" settings own peer
+        >>= putMVar fromExistingThread
 
   seal
   own ← control settings
-  attempts ← probeNatively "native" settings own
-  putMVar begin own
+  -- The pair holds here, before either sibling asks anything about the other.
+  --
+  -- Binding an endpoint and asking whether a sibling's is reachable are two
+  -- events in two processes, and nothing orders them: a probe that ran first
+  -- would be refused because the name did not exist yet, which is not the
+  -- refusal the example is about. The parent releases both children only once
+  -- both have said they are bound.
+  peer ←
+    if settingMode settings == Paired
+      then do
+        putStrLn "BOUND mode=paired"
+        instruction ← command channel
+        putStrLn ("PROCEEDING instruction=" <> instruction)
+        -- The sibling's identity on the host, which the parent knows and this
+        -- child could not have. Naming it is what makes the signalling probe
+        -- adversarial rather than a guess.
+        pure (peerPidIn instruction)
+      else pure Nothing
+  attempts ← probeNatively "native" settings own peer
+  putMVar begin (own, peer)
   fromExisting ← takeMVar fromExistingThread
 
   -- And inheritance is the other half. A filter that covered only the threads
@@ -197,7 +227,7 @@ run settings = do
   -- afterwards unconfined, and the runtime starts them whether or not anyone
   -- asked it to.
   afterwards ← newEmptyMVar
-  _ ← forkOS (probeNatively "started-thread" settings own >>= putMVar afterwards)
+  _ ← forkOS (probeNatively "started-thread" settings own peer >>= putMVar afterwards)
   fromNewThread ← takeMVar afterwards
 
   let escaped =
@@ -221,7 +251,7 @@ run settings = do
     Report → putStrLn "DONE mode=report"
     Paired → do
       putStrLn "READY mode=paired"
-      instruction ← command
+      instruction ← command channel
       putStrLn ("DONE mode=paired instruction=" <> instruction)
     Idle → do
       putStrLn "READY mode=idle"
@@ -246,6 +276,7 @@ seal = do
     else do
       held ← hetoimasia_confine_hold_term
       ceilingBytes ← hetoimasia_confine_address_space_limit
+      ownPid ← hetoimasia_probe_own_pid
       putStrLn
         ( "PROFILE sealed=yes layers="
             <> show (fromIntegral layers ∷ Int)
@@ -253,6 +284,8 @@ seal = do
             <> show (fromIntegral ceilingBytes ∷ Integer)
             <> " holds-term="
             <> (if held == 0 then "yes" else "no")
+            <> " pid="
+            <> show (fromIntegral ownPid ∷ Int)
         )
 
 -- | The controls: the same operations, where they are meant to work.
@@ -294,8 +327,8 @@ control settings = do
 -- Answers @(name, forbidden, errno)@ for each, so the caller can ask the one
 -- question that matters without re-deriving it: did anything that should have
 -- been refused succeed.
-probeNatively ∷ String → Settings → FilePath → IO [(String, Bool, CInt)]
-probeNatively phase settings own = do
+probeNatively ∷ String → Settings → FilePath → Maybe Int → IO [(String, Bool, CInt)]
+probeNatively phase settings own peerPid = do
   outside ←
     mapM
       (\path → (,) path <$> withCString path hetoimasia_probe_read_file)
@@ -308,13 +341,20 @@ probeNatively phase settings own = do
       withCString (settingModule settings) $ \path → do
         answered ← hetoimasia_probe_load_module path message (fromIntegral messageLength)
         (,) answered <$> peekCString message
+  inherited ←
+    hetoimasia_probe_descriptor_open (fromIntegral (settingInheritedProbe settings))
+  outsideProcess ← hetoimasia_probe_signal (fromIntegral (settingOutsidePid settings))
+  peerProcess ← traverse (hetoimasia_probe_signal . fromIntegral) peerPid
   -- The control travels with them: a phase whose own sentinel became
   -- unreadable is reporting about something other than confinement.
   ownAgain ← withCString own hetoimasia_probe_read_file
 
   let observations =
         [(readOutside path, True, observed) | (path, observed) ← outside]
-          <> [ ("open-inet-socket", True, inet)
+          <> [ ("signal-outside-process", True, outsideProcess)]
+          <> [("signal-peer-process", True, observed) | Just observed ← [peerProcess]]
+          <> [ ("see-inherited-descriptor", True, inherited)
+             , ("open-inet-socket", True, inet)
              , ("connect-peer-endpoint", True, peer)
              , ("execute-program", True, executed)
              , ("load-native-module", True, loaded)
@@ -401,6 +441,17 @@ bind vm observations name action =
     )
     (pure ())
 
+-- | The sibling's host identity, from the parent's release instruction.
+--
+-- The instruction is @probe \<pid\>@; anything else carries no peer, which is
+-- how a mode with no sibling says so.
+peerPidIn ∷ String → Maybe Int
+peerPidIn instruction = case words instruction of
+  [_, value] → case reads value of
+    [(pid, "")] → Just pid
+    _ → Nothing
+  _ → Nothing
+
 fixtureName ∷ ChunkName
 fixtureName = chunkName "fixture-mod"
 
@@ -420,15 +471,23 @@ fixtureSource =
 
 -- | Read one instruction from the inherited endpoint.
 --
--- The whole protocol: one line, from the one descriptor the parent gave this
--- child. It is not the wire format -- that is LUA-10's -- but it is inherited,
--- private, and framed, which is what these examples need of it.
-command ∷ IO String
-command = do
+-- The whole protocol: one line at a time, from the one descriptor the parent
+-- gave this child. It is not the wire format -- that is LUA-10's -- but it is
+-- inherited, private, and framed, which is what these examples need of it.
+--
+-- The handle is made once, at the start of the run, because a paired child
+-- reads twice: once when its sibling is known to be bound, and once when the
+-- parent is finished with it. Re-deriving it from the descriptor for the second
+-- read would close the first one's buffer and lose whatever had arrived into
+-- it.
+openCommandChannel ∷ IO Handle
+openCommandChannel = do
   handle ← fdToHandle (Fd 3)
-  line ← hGetLine handle
-  hClose handle
-  pure line
+  hSetBuffering handle LineBuffering
+  pure handle
+
+command ∷ Handle → IO String
+command = hGetLine
 
 -- | Wait for something that never comes.
 forever' ∷ IO ()
@@ -515,6 +574,15 @@ foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_load_module"
 
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_executable_mapping"
   hetoimasia_probe_executable_mapping ∷ CString → Ptr CInt → Ptr CInt → IO CInt
+
+foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_probe_descriptor_open"
+  hetoimasia_probe_descriptor_open ∷ CInt → IO CInt
+
+foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_probe_signal"
+  hetoimasia_probe_signal ∷ CInt → IO CInt
+
+foreign import ccall unsafe "hetoimasia_confine.h hetoimasia_probe_own_pid"
+  hetoimasia_probe_own_pid ∷ IO CInt
 
 foreign import ccall safe "hetoimasia_confine.h hetoimasia_probe_allocate"
   hetoimasia_probe_allocate ∷ CSize → IO CInt

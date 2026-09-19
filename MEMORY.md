@@ -135,8 +135,13 @@ owning subsystem's contract/design when continuing its work.
   user namespace must carry the source's locked flags forward or the remount is
   `EPERM`; `RLIMIT_AS` is a whole-process ceiling but counts the runtime's
   address-space reservation, so the child needs `-xr256m` and enough headroom
-  for eight megabytes of stack per runtime thread; and a `dlopen` fixture must
-  be a module the program does not already link. Registering the group needed
+  for eight megabytes of stack per runtime thread; a `dlopen` fixture must be a
+  module the program does not already link; a PID namespace needs a second fork
+  and leaves the caller holding a supervisor rather than the confined process,
+  so that supervisor reproduces the confined exit status and forwards the
+  cooperative stop; and lowering `RLIMIT_NOFILE` closes nothing already open,
+  so every descriptor above the four the child is given must be swept before
+  the exec. Registering the group needed
   the validation planner to accept `buildable` inside an `if os(...)`
   conditional, which it now does without reading the body, so a platform
   component's sources select their group on every platform rather than only the

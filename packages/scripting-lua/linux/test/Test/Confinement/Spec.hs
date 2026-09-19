@@ -15,7 +15,7 @@ module Test.Confinement.Spec (spec) where
 
 import Test.Confinement.Support
   ( Availability
-  , Controls (controlModule, controlSentinels)
+  , Controls (controlInetSocket, controlInheritedDescriptor, controlModule, controlSentinels)
   , Environment (environmentDistribution, environmentKernel, environmentUser)
   , Ledger
   , announce
@@ -48,8 +48,23 @@ spec ledger available sentinels machine installed = describe "Linux confinement"
       -- do the same for the loader denial.
       controlSentinels available `shouldNotBe` []
       mapM_ (\(path, observed) → (path, observed) `shouldBe` (path, 0)) (controlSentinels available)
+      -- An AF_INET socket, here, unconfined. The filter treats that domain
+      -- differently from AF_UNIX, so the child's AF_UNIX control says nothing
+      -- about it: without this line a machine with no network stack would
+      -- refuse the child's attempt for its own reasons and the refusal would
+      -- be read as the filter's work.
+      controlInetSocket available `shouldBe` 0
+      -- And a descriptor left open above any range a sweep might have guessed
+      -- at, which the child must not be able to see.
+      controlInheritedDescriptor available `shouldNotBe` 0
       case controlModule available of
-        Just name → announce ("CONTROLS sentinels=readable native-module=" <> name)
+        Just name →
+          announce
+            ( "CONTROLS sentinels=readable inet-socket=created native-module="
+                <> name
+                <> " inherited-descriptor="
+                <> show (controlInheritedDescriptor available)
+            )
         Nothing →
           expectationFailure
             "no shared library on this machine could be loaded, so the module denial has no control"

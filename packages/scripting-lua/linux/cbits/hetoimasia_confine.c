@@ -111,6 +111,10 @@ const char *hetoimasia_confine_layer_name(int layer) {
     return "seccomp-filter";
   case HETOIMASIA_LAYER_EXEC:
     return "exec";
+  case HETOIMASIA_LAYER_PID_NS:
+    return "pid-namespace";
+  case HETOIMASIA_LAYER_SUPERVISOR:
+    return "supervisor";
   default:
     return "unknown";
   }
@@ -277,6 +281,24 @@ static int hetoimasia_write_whole(const char *path, const char *contents) {
   return 0;
 }
 
+/* The confined process, as the supervisor between it and the caller knows it.
+**
+** Written once before the supervisor's handler can run and read only there. */
+static volatile pid_t hetoimasia_supervised = 0;
+
+/* Pass a cooperative stop through to the confined process.
+**
+** The supervisor is not the process the caller is trying to stop, and a
+** supervisor that simply died of the signal would take the confined process
+** with it through its parent-death signal -- ending it on the cooperative
+** request, which is exactly the escalation the execution-limit experiment
+** exists to observe. So the signal is forwarded and the supervisor stays. */
+static void hetoimasia_forward_stop(int signal_number) {
+  if (hetoimasia_supervised > 0) {
+    kill(hetoimasia_supervised, signal_number);
+  }
+}
+
 /* Report a refusal to the parent and end this pre-exec child.
 **
 ** Nothing here can usefully continue: every path out of this function has
@@ -302,6 +324,19 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
   char identity[64];
   uid_t outer_uid = geteuid();
   gid_t outer_gid = getegid();
+  /* Read before the limits below narrow it: lowering RLIMIT_NOFILE closes
+  ** nothing that is already open, so the range that has to be swept is the one
+  ** the caller could have opened into, not the one the child will be allowed. */
+  rlim_t inherited_ceiling = 1024;
+  {
+    struct rlimit descriptors;
+    if (getrlimit(RLIMIT_NOFILE, &descriptors) == 0 &&
+        descriptors.rlim_max != RLIM_INFINITY) {
+      inherited_ceiling = descriptors.rlim_max;
+    } else {
+      inherited_ceiling = 1048576;
+    }
+  }
 
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     hetoimasia_refuse(report, HETOIMASIA_LAYER_NO_NEW_PRIVS, errno);
@@ -344,6 +379,19 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
   }
   if (unshare(CLONE_NEWUTS) != 0) {
     hetoimasia_refuse(report, HETOIMASIA_LAYER_UTS_NS, errno);
+  }
+  /* A PID namespace is what makes "cannot reach another instance" a property
+  ** of the kernel rather than of the child's ignorance. Without one the child
+  ** shares the host's process numbering and the caller's own user id, so every
+  ** signalling call -- `kill`, down to `kill(-1, ...)` -- can reach a sibling,
+  ** the engine, or anything else that user is running; a filter cannot tell
+  ** those apart from the process signalling itself, because it cannot see who
+  ** is asking. Inside its own namespace there is nothing else to name.
+  **
+  ** `unshare` moves the caller's *children* into the new namespace rather than
+  ** the caller, which is why there is a second fork below. */
+  if (unshare(CLONE_NEWPID) != 0) {
+    hetoimasia_refuse(report, HETOIMASIA_LAYER_PID_NS, errno);
   }
 
   /* Nothing this child mounts may propagate back to the host's tree. */
@@ -435,19 +483,100 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
         dup2(moved_ipc, HETOIMASIA_CONFINE_IPC_FD) < 0) {
       hetoimasia_refuse(report, HETOIMASIA_LAYER_RESOURCE_LIMITS, errno);
     }
+    /* The report pipe moves to a fixed number of its own so that the sweep
+    ** below can be a range rather than a list with a hole in it. `dup2` clears
+    ** close-on-exec, and the exec closing this descriptor is the whole success
+    ** signal, so it is set again explicitly. */
+    if (dup2(report, HETOIMASIA_CONFINE_REPORT_FD) < 0 ||
+        fcntl(HETOIMASIA_CONFINE_REPORT_FD, F_SETFD, FD_CLOEXEC) != 0) {
+      hetoimasia_refuse(report, HETOIMASIA_LAYER_RESOURCE_LIMITS, errno);
+    }
+    report = HETOIMASIA_CONFINE_REPORT_FD;
   }
-  /* Everything above them goes, so no descriptor the parent happened to hold
-  ** becomes an ambient capability of the child. The report pipe closes itself
-  ** at the exec, which is how its silence means success. */
-  for (int descriptor = HETOIMASIA_CONFINE_IPC_FD + 1; descriptor < 1024;
-       descriptor++) {
-    if (descriptor != report) {
-      close(descriptor);
+  /* Everything above them goes, so no descriptor the caller happened to hold
+  ** becomes an ambient capability of the child.
+  **
+  ** The whole range, not a guess at it. A caller's descriptor can sit at any
+  ** number its own limit allows, and one above a swept range survives the exec
+  ** as exactly the ambient capability this is here to prevent. `close_range`
+  ** says "everything from here up" in one call; where the kernel does not have
+  ** it, the ceiling read before the limits narrowed it is what bounds the
+  ** loop. */
+  {
+    int first = HETOIMASIA_CONFINE_REPORT_FD + 1;
+    int swept = -1;
+#ifdef SYS_close_range
+    swept = (int)syscall(SYS_close_range, (unsigned int)first, ~0U, 0);
+#endif
+    if (swept != 0) {
+      for (rlim_t descriptor = (rlim_t)first; descriptor < inherited_ceiling;
+           descriptor++) {
+        close((int)descriptor);
+      }
     }
   }
 
-  execve("/probe", argv, envp);
-  hetoimasia_refuse(report, HETOIMASIA_LAYER_EXEC, errno);
+  /* The second fork, and the reason there is one.
+  **
+  ** `unshare(CLONE_NEWPID)` put this process's *children* in the new namespace,
+  ** not this process, and a namespace's first process is its init -- which must
+  ** have a parent outside it. So the confined program is the child below, and
+  ** what remains here is a supervisor: it holds no Lua, loads no source, and
+  ** exists to make the confined process's own termination visible to a caller
+  ** that cannot wait on a process in a namespace it is not in. */
+  {
+    pid_t confined = fork();
+    if (confined < 0) {
+      hetoimasia_refuse(report, HETOIMASIA_LAYER_SUPERVISOR, errno);
+    }
+    if (confined == 0) {
+      /* A supervisor that dies must not leave the confined process running:
+      ** the caller's handle is the supervisor, so an orphan here would be a
+      ** process nothing is accounting for. */
+      if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) {
+        hetoimasia_refuse(report, HETOIMASIA_LAYER_SUPERVISOR, errno);
+      }
+      execve("/probe", argv, envp);
+      hetoimasia_refuse(report, HETOIMASIA_LAYER_EXEC, errno);
+    }
+
+    hetoimasia_supervised = confined;
+    /* The exec's silence is the success signal, and it is only silence once
+    ** every copy of the write end is gone. This one is the last. */
+    close(report);
+    {
+      struct sigaction forwarding;
+      memset(&forwarding, 0, sizeof(forwarding));
+      forwarding.sa_handler = hetoimasia_forward_stop;
+      sigemptyset(&forwarding.sa_mask);
+      forwarding.sa_flags = SA_RESTART;
+      sigaction(SIGTERM, &forwarding, NULL);
+      sigaction(SIGINT, &forwarding, NULL);
+      sigaction(SIGHUP, &forwarding, NULL);
+    }
+    {
+      int status = 0;
+      while (waitpid(confined, &status, 0) < 0) {
+        if (errno != EINTR) {
+          _exit(126);
+        }
+      }
+      /* Reproduced rather than summarised. A caller reading an exit status is
+      ** reading the confined process's, including the signal that ended it. */
+      if (WIFEXITED(status)) {
+        _exit(WEXITSTATUS(status));
+      }
+      if (WIFSIGNALED(status)) {
+        struct sigaction ending;
+        memset(&ending, 0, sizeof(ending));
+        ending.sa_handler = SIG_DFL;
+        sigemptyset(&ending.sa_mask);
+        sigaction(WTERMSIG(status), &ending, NULL);
+        raise(WTERMSIG(status));
+      }
+      _exit(126);
+    }
+  }
 }
 
 pid_t hetoimasia_confine_spawn(const char *program, char *const argv[],
@@ -626,6 +755,18 @@ int hetoimasia_confine_seal(int allow_executable_file_mappings,
 #endif
 #ifdef __NR_open_by_handle_at
   HETOIMASIA_DENY(__NR_open_by_handle_at, EPERM);
+#endif
+  /* Reaching another process by descriptor rather than by number. The PID
+  ** namespace is what makes the numbers useless; these would be a way around
+  ** it if one ever leaked in. */
+#ifdef __NR_pidfd_open
+  HETOIMASIA_DENY(__NR_pidfd_open, EPERM);
+#endif
+#ifdef __NR_pidfd_getfd
+  HETOIMASIA_DENY(__NR_pidfd_getfd, EPERM);
+#endif
+#ifdef __NR_pidfd_send_signal
+  HETOIMASIA_DENY(__NR_pidfd_send_signal, EPERM);
 #endif
   /* Kernel surfaces with no business inside a mod. */
 #ifdef __NR_bpf
@@ -919,6 +1060,30 @@ int hetoimasia_probe_load_module(const char *path, char *message,
   }
 }
 
+int hetoimasia_probe_signal(int pid) {
+  if (pid <= 0) {
+    /* A caller with no process to name is not asking a question, and the
+    ** negative and zero forms of `kill` address whole groups rather than one
+    ** process. Neither is this probe. */
+    return EINVAL;
+  }
+  errno = 0;
+  if (kill((pid_t)pid, 0) == 0) {
+    return 0;
+  }
+  return errno != 0 ? errno : EPERM;
+}
+
+int hetoimasia_probe_own_pid(void) { return (int)getpid(); }
+
+int hetoimasia_probe_descriptor_open(int descriptor) {
+  errno = 0;
+  if (fcntl(descriptor, F_GETFD) != -1) {
+    return 0;
+  }
+  return errno != 0 ? errno : EBADF;
+}
+
 int hetoimasia_probe_module_loaded(const char *path) {
   void *handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
   if (handle == NULL) {
@@ -996,6 +1161,24 @@ int hetoimasia_confine_hold_term(void) {
   sigemptyset(&action.sa_mask);
   action.sa_flags = SA_RESTART;
   return sigaction(SIGTERM, &action, NULL);
+}
+
+unsigned long hetoimasia_raise_descriptor_limit(void) {
+  struct rlimit descriptors;
+  if (getrlimit(RLIMIT_NOFILE, &descriptors) != 0) {
+    return 0;
+  }
+  if (descriptors.rlim_max != RLIM_INFINITY &&
+      descriptors.rlim_cur < descriptors.rlim_max) {
+    descriptors.rlim_cur = descriptors.rlim_max;
+    (void)setrlimit(RLIMIT_NOFILE, &descriptors);
+  }
+  if (getrlimit(RLIMIT_NOFILE, &descriptors) != 0) {
+    return 0;
+  }
+  return descriptors.rlim_cur == RLIM_INFINITY
+             ? 1048576UL
+             : (unsigned long)descriptors.rlim_cur;
 }
 
 unsigned long hetoimasia_confine_address_space_limit(void) {

@@ -18,7 +18,7 @@ module Test.Confinement.Profile (spec) where
 
 import Test.Confinement.Support
   ( Availability
-  , Controls (controlModule)
+  , Controls (controlInheritedDescriptor, controlModule)
   , Ledger
   , Observation (observationKind)
   , Refusal (refusedErrno, refusedLayer)
@@ -93,13 +93,45 @@ spec ledger available sentinels installed = describe "profile" $ do
     installed
     "reading a host file outside its view"
     ("read-outside-sentinel:" <> firstSentinel)
-    "probe_read_outside_sentinel"
+    (Just "probe_read_outside_sentinel")
 
-  denial installed "opening a network socket" "open-inet-socket" "probe_open_inet_socket"
+  denial installed "opening a network socket" "open-inet-socket" (Just "probe_open_inet_socket")
 
-  denial installed "executing another program" "execute-program" "probe_execute_program"
+  denial installed "executing another program" "execute-program" (Just "probe_execute_program")
 
-  denial installed "loading a native module" "load-native-module" "probe_load_native_module"
+  denial installed "loading a native module" "load-native-module" (Just "probe_load_native_module")
+
+  it "runs as the first process of a namespace that holds nothing else" $
+    whenAvailable installed "pid-namespace" $ do
+      let reported = reportedObservations installed
+      case [entry | entry ← reported, observationKind entry == "PROFILE"] of
+        [] → expectationFailure "the child reported no profile line"
+        (profile : _) → do
+          -- One is what a PID namespace's init is, and nothing else can be:
+          -- a child sharing the host's numbering would report its host pid.
+          fieldIn "pid" profile `shouldBe` "1"
+          announce ("PROVED pid-namespace child-pid=" <> fieldIn "pid" profile)
+
+  denial
+    installed
+    "signalling a process outside its namespace"
+    "signal-outside-process"
+    Nothing
+
+  it "cannot see a descriptor the parent left open above any swept range" $
+    whenAvailable installed "inherited-descriptor" $ do
+      let reported = reportedObservations installed
+      denied reported "native" "see-inherited-descriptor"
+      denied reported "existing-thread" "see-inherited-descriptor"
+      denied reported "started-thread" "see-inherited-descriptor"
+      announce
+        ( "PROVED inherited-descriptor number="
+            <> show (controlInheritedDescriptor available)
+            <> " visible-in-child=no mechanism="
+            <> mechanismFor "see-inherited-descriptor"
+            <> " errno="
+            <> errnoOf reported "native" "see-inherited-descriptor"
+        )
 
   it "refuses a file-backed executable mapping while allowing the same file unmapped" $
     whenAvailable installed "executable-file-mapping" $ do
@@ -124,8 +156,14 @@ spec ledger available sentinels installed = describe "profile" $ do
       (path : _) → path
       [] → ""
 
--- | One forbidden operation, refused in all three places it is attempted.
-denial ∷ Availability → String → String → String → Spec
+-- | One forbidden operation, refused everywhere it is attempted.
+--
+-- The Lua name is optional because not every operation has a binding: the ones
+-- a mod could reach are published to it, and the ones only the launcher can
+-- get wrong -- an inherited descriptor, a process outside the namespace -- are
+-- observed from native code alone. Where there is no binding, saying so is
+-- better than publishing one for the sake of symmetry.
+denial ∷ Availability → String → String → Maybe String → Spec
 denial installed subject nativeName luaName =
   it ("is refused " <> subject <> ", and names what refused it") $
     whenAvailable installed nativeName $ do
@@ -133,11 +171,13 @@ denial installed subject nativeName luaName =
       denied reported "native" nativeName
       denied reported "existing-thread" nativeName
       denied reported "started-thread" nativeName
-      denied reported "lua" luaName
+      mapM_ (denied reported "lua") luaName
       announce
         ( "PROVED "
             <> nativeName
-            <> " denied-in=native,existing-thread,started-thread,lua errno="
+            <> " denied-in=native,existing-thread,started-thread"
+            <> maybe "" (const ",lua") luaName
+            <> " errno="
             <> errnoOf reported "native" nativeName
             <> " mechanism="
             <> mechanismFor nativeName
@@ -158,6 +198,12 @@ mechanismFor name
   | name == "map-own-file-executable" = "seccomp-filter:file-backed PROT_EXEC mapping refused"
   | name == "connect-peer-endpoint" =
       "network-namespace:the peer's abstract name is not in this namespace"
+  | name == "see-inherited-descriptor" =
+      "launcher:every descriptor above the four it is given is closed before the exec"
+  | name == "signal-outside-process" =
+      "pid-namespace:no process outside it has a number in here"
+  | name == "signal-peer-process" =
+      "pid-namespace:the sibling has no number in this namespace"
   | otherwise = "unclassified"
   where
     outsidePrefix = "read-outside-sentinel:"
