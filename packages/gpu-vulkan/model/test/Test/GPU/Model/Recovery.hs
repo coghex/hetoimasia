@@ -39,6 +39,26 @@ spec = describe "recovery" $ do
     (_, exhausted) ← admitted "asking for a fourth attempt" (beginTargetRecovery (atMilliseconds 10000) target thirdFailed)
     exhausted `shouldBe` RecoveryExhausted (OptionalTargetUnavailable target)
 
+  it "refuses the next attempt when its delay cannot be expressed, rather than skipping the delay" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    -- At the very end of the clock's range, adding the 100 ms delay overflows.
+    -- Reading that as no delay would hand the second attempt the instant the
+    -- first failed at, which is precisely the delay the episode enforces.
+    (begun, first) ← admitted "the first attempt" (beginTargetRecovery lastInstant target active)
+    first `shouldBe` RecoveryAttempt 1
+    failed ← admitted_ "failing it" (recordRecoveryFailure lastInstant target begun)
+    fmap viewTargetRecoveryAttempts (targetView target failed) `shouldBe` Just 1
+
+    (unchanged, answer) ← admitted "asking for the second attempt" (beginTargetRecovery lastInstant target failed)
+    answer `shouldBe` RecoveryUnschedulable
+    -- No attempt was spent on it either.
+    fmap viewTargetRecoveryAttempts (targetView target unchanged) `shouldBe` Just 1
+
+    -- The owner is told there is work it cannot be given an instant for, rather
+    -- than told there is nothing to do.
+    nextDeadline lastInstant failed `shouldBe` TurnUnschedulable
+
   it "is not replenished by a nested helper, by another turn, or by an allocation sub-retry" $ do
     model ← freshModel
     (active, target, _) ← activeTarget 2 model

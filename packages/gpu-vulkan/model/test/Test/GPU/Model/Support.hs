@@ -25,6 +25,7 @@ module Test.GPU.Model.Support
   , atMilliseconds
   , afterMilliseconds
   , millisecondsDuration
+  , lastInstant
 
     -- * Common arrangements
   , activeTarget
@@ -40,6 +41,7 @@ import Hetoimasia.Foundation.Time
   , DurationRequirement (AllowZero)
   , Instant
   , durationFromNanoseconds
+  , maximumDuration
   , scriptedInstant
   )
 import Hetoimasia.GPU.Model
@@ -121,6 +123,12 @@ afterMilliseconds = atMilliseconds
 -- | A duration of that many whole milliseconds.
 millisecondsDuration ∷ Natural → Duration
 millisecondsDuration = durationOf
+
+-- | The largest instant the time boundary can represent. Adding any positive
+-- duration to it overflows, which is what an example needs to reach the
+-- arithmetic failures the schedule has to report rather than swallow.
+lastInstant ∷ Instant
+lastInstant = scriptedInstant maximumDuration
 
 durationOf ∷ Natural → Duration
 durationOf value =

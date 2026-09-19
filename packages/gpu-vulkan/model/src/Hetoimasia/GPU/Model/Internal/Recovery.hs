@@ -18,6 +18,7 @@
 module Hetoimasia.GPU.Model.Internal.Recovery
   ( -- * Recovery episodes
     RecoveryEpisode (..)
+  , NextAttempt (..)
   , freshEpisode
   , RecoveryProgress (..)
   , attemptRecovery
@@ -63,9 +64,8 @@ data RecoveryEpisode = RecoveryEpisode
   { episodeAttempts ∷ !Natural
     -- ^ Attempts already begun in this episode. Never decreases except through
     -- a complete reset.
-  , episodeNextAttemptAt ∷ !(Maybe Instant)
-    -- ^ The absolute instant the next attempt may begin, set when the previous
-    -- one failed.
+  , episodeNextAttemptAt ∷ !NextAttempt
+    -- ^ When the next attempt may begin, set when the previous one failed.
   , episodeRetirementCycle ∷ !Bool
     -- ^ Whether a normal presentation-retirement cycle has completed since the
     -- last failure.
@@ -79,12 +79,27 @@ data RecoveryEpisode = RecoveryEpisode
   }
   deriving (Eq, Show)
 
+-- | When an episode's next attempt may begin.
+data NextAttempt
+  = AttemptUnscheduled
+    -- ^ Nothing is waiting on a delay: either no attempt has failed yet, or the
+    -- budget is spent and there is no next attempt to schedule.
+  | AttemptAt !Instant
+  | AttemptUnschedulable
+    -- ^ The delay after this failure does not fit the clock's representation.
+    -- It is kept as its own answer rather than collapsed into
+    -- 'AttemptUnscheduled', because the two mean opposite things: one says no
+    -- delay is owed and the other says a delay is owed that cannot be expressed.
+    -- Treating the second as the first would admit the next attempt immediately,
+    -- which is exactly the delay the episode exists to enforce.
+  deriving (Eq, Show)
+
 -- | An episode with its full budget and no attempt outstanding.
 freshEpisode ∷ RecoveryEpisode
 freshEpisode =
   RecoveryEpisode
     { episodeAttempts = 0
-    , episodeNextAttemptAt = Nothing
+    , episodeNextAttemptAt = AttemptUnscheduled
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
     , episodeOutstanding = False
@@ -100,6 +115,9 @@ data RecoveryProgress
     -- ^ Three attempts have been made in this episode.
   | AttemptStillOutstanding
     -- ^ The previous attempt has neither failed nor succeeded yet.
+  | AttemptDelayUnrepresentable
+    -- ^ The delay this episode owes cannot be expressed on this clock, so the
+    -- attempt cannot be admitted without shortening it.
   deriving (Eq, Show)
 
 -- | Ask to begin the next construction attempt of this episode.
@@ -107,11 +125,16 @@ attemptRecovery ∷ Instant → RecoveryEpisode → (RecoveryEpisode, RecoveryPr
 attemptRecovery now episode
   | episodeOutstanding episode = (episode, AttemptStillOutstanding)
   | episodeAttempts episode >= recoveryAttemptLimit = (episode, AttemptBudgetExhausted)
-  | Just at ← episodeNextAttemptAt episode
+  | AttemptUnschedulable ← episodeNextAttemptAt episode = (episode, AttemptDelayUnrepresentable)
+  | AttemptAt at ← episodeNextAttemptAt episode
   , not (deadlineReached now at) =
       (episode, AttemptDeferredUntil at)
   | otherwise =
-      ( episode {episodeAttempts = attempt, episodeNextAttemptAt = Nothing, episodeOutstanding = True}
+      ( episode
+          { episodeAttempts = attempt
+          , episodeNextAttemptAt = AttemptUnscheduled
+          , episodeOutstanding = True
+          }
       , AttemptAdmitted attempt
       )
   where
@@ -128,7 +151,7 @@ attemptRecovery now episode
 recordAttemptFailure ∷ Instant → RecoveryEpisode → RecoveryEpisode
 recordAttemptFailure now episode =
   episode
-    { episodeNextAttemptAt = delayFor (episodeAttempts episode) >>= schedule
+    { episodeNextAttemptAt = maybe AttemptUnscheduled schedule (delayFor (episodeAttempts episode))
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
     , episodeOutstanding = False
@@ -141,8 +164,10 @@ recordAttemptFailure now episode =
     lookupDelay index (delay : rest)
       | index == 0 = Just delay
       | otherwise = lookupDelay (index - 1) rest
-    schedule ∷ Duration → Maybe Instant
-    schedule delay = either (const Nothing) Just (addDuration now delay)
+    -- An overflowing delay is recorded as one that cannot be scheduled. Reading
+    -- it as no delay would hand the next attempt the instant this one failed at.
+    schedule ∷ Duration → NextAttempt
+    schedule delay = either (const AttemptUnschedulable) AttemptAt (addDuration now delay)
 
 -- | Record that the attempt just made succeeded. It settles the attempt without
 -- returning it: the budget an episode has spent is spent, and only a completed

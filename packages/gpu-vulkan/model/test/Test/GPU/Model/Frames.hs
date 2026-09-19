@@ -225,6 +225,37 @@ spec = describe "frame ownership" $ do
     fmap viewOutstanding (holdView (GenerationSubject otherGeneration) completedLast)
       `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
 
+  it "frees the slot when a presentation is enqueued after its submission already completed" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, generation) ← activeTarget 2 model
+    (framed, frame) ← acquiredFrame target active
+    (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted framed)
+    submission ← submissionOf submitAnswer
+
+    -- The submission completes first. The frame is not settled by that alone:
+    -- it still owns an image that no presentation record has taken over.
+    completed ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) submitted)
+    fmap viewFramePhase (frameView frame completed) `shouldBe` Just FrameSubmitted
+    usageFrames (usage completed) `shouldBe` 1
+
+    -- Enqueuing hands the image to the record, and nothing else is owing, so the
+    -- slot goes back now rather than waiting for a retirement it no longer has
+    -- any part in.
+    (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued completed)
+    presentation ← presentationOf presentAnswer
+    frameView frame presented `shouldBe` Nothing
+    usageFrames (usage presented) `shouldBe` 0
+    presentationImage presentation presented `shouldSatisfy` \case
+      Just image → imageGeneration image == generation
+      Nothing → False
+
+    -- The generation still owes its presentation, which is the record's now.
+    fmap viewOutstanding (holdView (GenerationSubject generation) presented)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed, PresentationObligationOwed]
+    retired ← admitted_ "retiring the presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) presented)
+    fmap viewOutstanding (holdView (GenerationSubject generation) retired)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
+
   it "refuses a transition that is not legal from the frame's current phase" $ do
     model ← freshModel
     (active, target, _) ← activeTarget 2 model

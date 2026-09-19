@@ -81,6 +81,7 @@ module Hetoimasia.GPU.Model.Internal.State
 
     -- * Owner progress
   , TurnReport (..)
+  , NextTurn (..)
   , runProgressTurn
   , nextDeadline
 
@@ -119,7 +120,8 @@ import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Hetoimasia.Foundation.Time (Duration, Instant, addDuration)
+import Data.Either (isLeft)
+import Hetoimasia.Foundation.Time (Duration, Instant, TimeOverflow (TimeOverflow), addDuration)
 import Hetoimasia.GPU.Model.Internal.Budget
   ( BudgetKind
       ( AggregateFrameSlotBudget
@@ -169,6 +171,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       , attemptRetrySpent
       )
   , BackoffState
+  , NextAttempt (AttemptAt, AttemptUnschedulable, AttemptUnscheduled)
   , RecoveryEpisode
       ( episodeAttempts
       , episodeHealthySince
@@ -180,6 +183,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       ( AttemptAdmitted
       , AttemptBudgetExhausted
       , AttemptDeferredUntil
+      , AttemptDelayUnrepresentable
       , AttemptStillOutstanding
       )
   , RetryVerdict (RetryPermitted)
@@ -1600,18 +1604,25 @@ enqueuePresentation identity outcome model =
           PresentationFailedWithoutEnqueue → Admitted (model, PresentationNotEnqueued)
           _ →
             Admitted
-              ( editTarget
-                  number
-                  ( \entry →
-                      entry
-                        { targetPool = Map.adjust (\record → record {poolState = PoolEnqueued}) pool (targetPool entry)
-                        , targetReplacementRequested =
-                            targetReplacementRequested entry + (if replacing then 1 else 0)
-                        , targetRenderDemand = False
-                        }
-                  )
-                  (editFrame number slot (\entry → entry {framePhase = FramePresentationEnqueued}) model)
-                  {gpuBackoff = resetBackoff (gpuBackoff model)}
+              ( -- Enqueuing hands the image to the pool record, which is what
+                -- makes the slot reusable. Usually the frame's own submission is
+                -- still pending and it stays; but a submission that completed
+                -- before this call left nothing else owing, and settling here is
+                -- what keeps the slot from being held until the presentation
+                -- retires.
+                settleFrames [(number, slot)] $
+                  editTarget
+                    number
+                    ( \entry →
+                        entry
+                          { targetPool = Map.adjust (\record → record {poolState = PoolEnqueued}) pool (targetPool entry)
+                          , targetReplacementRequested =
+                              targetReplacementRequested entry + (if replacing then 1 else 0)
+                          , targetRenderDemand = False
+                          }
+                    )
+                    (editFrame number slot (\entry → entry {framePhase = FramePresentationEnqueued}) model)
+                      {gpuBackoff = resetBackoff (gpuBackoff model)}
               , PresentationTracked (PresentationId (frameTarget identity) pool)
               )
   where
@@ -1826,7 +1837,7 @@ data TurnReport = TurnReport
   , turnServed ∷ ![TargetId]
     -- ^ The targets this turn visited, in the order it visited them. The lead
     -- rotates every turn, so no target can starve behind a busy neighbour.
-  , turnNextDeadline ∷ !(Maybe Instant)
+  , turnNextDeadline ∷ !NextTurn
   }
   deriving (Eq, Show)
 
@@ -2038,19 +2049,37 @@ forgetIfRetired model number = case Map.lookup number (gpuTargets model) of
         model {gpuTargets = Map.delete number (gpuTargets model)}
   _ → model
 
--- | The absolute instant of the next owner turn.
+-- | When the next owner turn is due.
+data NextTurn
+  = NoTurnNeeded
+    -- ^ Nothing is pending and nothing is scheduled.
+  | TurnAt !Instant
+    -- ^ The absolute instant of the next turn. One in the past means the owner
+    -- is overdue, and is reported as it stands.
+  | TurnUnschedulable
+    -- ^ There is work, and the instant it is due at does not fit the clock's
+    -- representation. It is its own answer rather than 'NoTurnNeeded', because
+    -- reading an arithmetic failure as an absence would tell the owner that
+    -- nothing needs doing while work is outstanding.
+  deriving (Eq, Show)
+
+-- | When the next owner turn is due.
 --
 -- A target with render demand that is not suspended asks for an immediate
--- opportunity. Otherwise the deadline is the current idle backoff away, and
--- only if something is actually pending: a suspended target keeps its
--- retirement demand here even though it contributes no render deadline. With
--- nothing pending at all there is no deadline to wait for.
-nextDeadline ∷ Instant → GpuModel → Maybe Instant
+-- opportunity. Otherwise it is the earliest of the instants the model is
+-- committed to: one idle backoff away if any obligation is pending — a suspended
+-- target keeps its retirement demand here even though it contributes no render
+-- deadline — and every absolute recovery deadline. With nothing pending and
+-- nothing scheduled there is nothing to wait for.
+nextDeadline ∷ Instant → GpuModel → NextTurn
 nextDeadline now model
-  | renderDemand = Just now
+  | renderDemand = TurnAt now
+  -- An overflow is reported rather than filtered: the work is real and the
+  -- instant is not representable, and those two facts together are not absence.
+  | any isLeft results = TurnUnschedulable
   | otherwise = case scheduled of
-      [] → Nothing
-      entries → Just (minimum entries)
+      [] → NoTurnNeeded
+      entries → TurnAt (minimum entries)
   where
     renderDemand =
       or
@@ -2061,9 +2090,8 @@ nextDeadline now model
     -- absolute instants the model has already committed to. The earliest of them
     -- all is the next time the owner has something to do. A deadline in the past
     -- means the owner is overdue, and is reported as it stands.
-    scheduled =
-      [instant | obligations > 0, Right instant ← [addDuration now interval]]
-        ++ recoveries
+    scheduled = [instant | Right instant ← results]
+    results = [addDuration now interval | obligations > 0] ++ recoveries
     recoveries = recoveryDeadlines model
     obligations = fromIntegral (Map.size (gpuSubmissions model)) + recordObligations model ∷ Natural
     interval ∷ Duration
@@ -2079,7 +2107,7 @@ nextDeadline now model
 -- all; and the episode's reset needs a turn to observe it, so it would never
 -- happen, leaving a later recovery starting from a budget that should have been
 -- returned.
-recoveryDeadlines ∷ GpuModel → [Instant]
+recoveryDeadlines ∷ GpuModel → [Either TimeOverflow Instant]
 recoveryDeadlines model =
   concat
     [ retry episode ++ healthy episode
@@ -2090,15 +2118,17 @@ recoveryDeadlines model =
   where
     retry episode
       | episodeOutstanding episode = []
-      | otherwise = [at | Just at ← [episodeNextAttemptAt episode]]
+      | otherwise = case episodeNextAttemptAt episode of
+          AttemptUnscheduled → []
+          AttemptAt at → [Right at]
+          -- A delay that cannot be expressed is work the owner cannot be given
+          -- an instant for, which is exactly what 'TurnUnschedulable' says.
+          AttemptUnschedulable → [Left TimeOverflow]
     healthy episode
       | episodeOutstanding episode = []
       | not (episodeRetirementCycle episode) = []
-      | otherwise =
-          [ instant
-          | Just since ← [episodeHealthySince episode]
-          , Right instant ← [addDuration since healthyProgressPeriod]
-          ]
+      | otherwise = [addDuration since healthyProgressPeriod | Just since ← [episodeHealthySince episode]]
+
 
 -- | Everything the model is still waiting on: pending submissions, enqueued
 -- presentations, records awaiting settlement, and subjects that are settled but
@@ -2139,6 +2169,10 @@ data RecoveryAnswer
   | RecoveryDeferred !Instant
   | RecoveryClosed
     -- ^ Close takes precedence over retry admission.
+  | RecoveryUnschedulable
+    -- ^ The delay this episode owes does not fit the clock's representation, so
+    -- the attempt cannot be admitted without shortening a delay the episode
+    -- exists to enforce.
   | RecoveryOutstanding
     -- ^ An attempt is already in flight. It must be settled with
     -- 'recordRecoveryFailure' or 'recordRecoverySuccess' first, so one
@@ -2158,6 +2192,7 @@ beginTargetRecovery now identity model =
         TargetUnavailable → Admitted (model, RecoveryClosed)
         _ → case attemptRecovery now (targetRecovery target) of
           (_, AttemptStillOutstanding) → Admitted (model, RecoveryOutstanding)
+          (_, AttemptDelayUnrepresentable) → Admitted (model, RecoveryUnschedulable)
           (_, AttemptBudgetExhausted) → Admitted (exhaust number target)
           (_, AttemptDeferredUntil at) → Admitted (model, RecoveryDeferred at)
           (episode, AttemptAdmitted attempt) →

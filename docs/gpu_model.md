@@ -179,6 +179,11 @@ The distinctions that lose obligations when collapsed:
   can be finished or abandoned normally.
 - **Out of date.** No new acquisition obligation is created and the reservation
   goes back, while every older obligation on the target is untouched.
+- **The slot against the record.** A frame slot owns command storage and
+  acquisition synchronization; the presentation record owns the image once a
+  presentation is enqueued. The slot goes back as soon as its own submission has
+  completed and it holds no unsubmitted recording — in either order, whether the
+  submission completed before the presentation was enqueued or after.
 - **Skipped against closed.** A skipped unsubmitted frame discharges its
   unsubmitted recording and keeps its image and acquisition synchronization; a
   submitted frame closed before presentation keeps *both* its submission
@@ -329,7 +334,18 @@ The turn answers the absolute instant of the next one:
   backoff interval away if any obligation is pending, and every absolute recovery
   deadline — when a target's next construction attempt may begin, and when a
   healthy period that has started would complete and reset its episode;
-- with nothing pending and nothing scheduled there is no deadline.
+- with nothing pending and nothing scheduled there is no turn to schedule.
+
+`nextDeadline` answers `NoTurnNeeded`, `TurnAt` an instant, or
+`TurnUnschedulable`. The third is not a fourth way of saying the second is
+missing: it means there *is* work and the instant it is due at does not fit the
+clock's representation. Reading an arithmetic failure as an absence would tell
+the owner that nothing needs doing while work is outstanding, so the overflow is
+reported instead. A recovery delay that overflows when it is recorded is kept as
+its own state for the same reason — `AttemptUnscheduled` says no delay is owed
+and `AttemptUnschedulable` says one is owed that cannot be expressed, and
+collapsing the second into the first would admit the next attempt immediately,
+skipping exactly the delay the episode exists to enforce.
 
 The recovery deadlines have to be there. A target whose first attempt has just
 failed and that is otherwise idle has no obligation to poll for, so a schedule
@@ -442,6 +458,11 @@ window staying finite under optional-target churn, with what it dropped counted
 and a draining boundary never reaching the bound; every compound identity
 reported by its own kind rather than its parent's; and one target's generation
 offered to another called a wrong parent rather than a foreigner.
+
+And the arithmetic edges at the end of the clock's range: a retry delay that
+overflows refusing the next attempt rather than skipping the delay, and a
+schedule that cannot express its next instant saying so rather than reporting
+that no turn is needed.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

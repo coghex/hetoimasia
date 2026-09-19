@@ -116,6 +116,7 @@ module Hetoimasia.GPU.Model
 
     -- * Owner progress
   , TurnReport (..)
+  , NextTurn (..)
   , runProgressTurn
   , nextDeadline
   , pendingObligations
