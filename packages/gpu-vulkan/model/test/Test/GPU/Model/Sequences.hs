@@ -147,6 +147,22 @@ spec = describe "event sequences" $ do
         admitted_ "retiring the first presentation" (recordCompletion (atMilliseconds 1000) (PresentationRetired (flightPresentation first)) completed)
       cyclesOnTarget target retired `shouldBe` 1
 
+  describe "a half that arrives before its cycle is opened" $
+    -- A submission may complete before its presentation is enqueued, so the
+    -- rendering half can predate the cycle it belongs to. Its epoch is the one
+    -- it arrived in, not the one the enqueue happens in, or an attempt between
+    -- the two would be invisible.
+    forM_ enqueueScenarios $ \(name, before, between, expected) ->
+      it name $ do
+        stage ← freshStage
+        final ←
+          script
+            name
+            (before ++ [acquire, submit, completeSubmission 100] ++ between ++ [present, retirePresentation 1000, turnAt 4000])
+            stage
+        attemptsOf final `shouldBe` expected
+        cyclesOf final `shouldBe` 0
+
   describe "recovery against the two completion orders" $
     forM_ recoveryScenarios $ \(name, recovery, expected) ->
       forM_ completionOrders $ \(orderName, order) ->
@@ -181,6 +197,18 @@ recoveryScenarios =
   [ ("no attempt at all", [], 0)
   , ("an attempt that failed", [beginAttempt 0, failAttempt 0], 1)
   , ("an attempt that succeeded", [beginAttempt 0, succeedAttempt], 0)
+  ]
+
+-- | What a recovery attempt placed between an early rendering half and the
+-- enqueue that opens its cycle leaves the attempt count at.
+--
+-- The attempt separates the two halves just as surely as it would if the cycle
+-- had already been open, so nothing may be credited; with the attempt before
+-- the rendering half instead, both halves are its own and the credit stands.
+enqueueScenarios ∷ [(String, [Step], [Step], Natural)]
+enqueueScenarios =
+  [ ("an attempt between the rendering half and the enqueue credits nothing", [], [beginAttempt 200, succeedAttempt], 1)
+  , ("an attempt before the rendering half credits the cycle", [beginAttempt 0, succeedAttempt], [], 0)
   ]
 
 completionOrders ∷ [(String, [Step])]

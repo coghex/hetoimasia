@@ -117,7 +117,7 @@ module Hetoimasia.GPU.Model.Internal.State
 
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, isNothing, mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Either (isLeft)
@@ -333,6 +333,10 @@ data Frame = Frame
   , framePoolRecord ∷ !(Maybe Natural)
   , frameBatches ∷ !(Set Natural)
   , frameSubmission ∷ !(Maybe Natural)
+  , frameRenderedEpoch ∷ !(Maybe Natural)
+    -- ^ The recovery epoch in which this frame's submission completed, when that
+    -- happened before its presentation was enqueued. The cycle does not exist
+    -- yet at that point, so the epoch is remembered here until it does.
   , frameSubmissionReserved ∷ !Bool
     -- ^ Whether this frame still holds the object capacity its submission record
     -- will need. Reserved with the frame, so committing a submission that the
@@ -379,14 +383,16 @@ data Target = Target
 -- that. The presentation record identifies it, and that record's number is
 -- never reissued, so two cycles can never be confused for one.
 data Cycle = Cycle
-  { cycleEpoch ∷ !Natural
-    -- ^ The target's recovery epoch when this cycle was enqueued. A cycle whose
-    -- epoch is no longer the target's spans a recovery attempt, and an attempt
-    -- is exactly what makes the evidence either side of it incomparable.
+  { cycleRendered ∷ !(Maybe Natural)
+    -- ^ The target's recovery epoch when the rendering half arrived, once it
+    -- has. Each half carries its own epoch rather than the cycle carrying one,
+    -- because a half can arrive before the cycle is even opened — a submission
+    -- may complete before its presentation is enqueued — and a single stamp
+    -- taken at the opening would date that half to the wrong epoch.
+  , cyclePresented ∷ !(Maybe Natural)
+    -- ^ The same for the presentation half.
   , cycleSubmission ∷ !(Maybe Natural)
-    -- ^ The submission whose completion is this cycle's other half, or 'Nothing'
-    -- once that has arrived.
-  , cyclePresented ∷ !Bool
+    -- ^ The submission whose completion is still awaited, if any.
   }
   deriving (Eq, Show)
 
@@ -1345,6 +1351,7 @@ reserveFrame identity model =
                     , framePoolRecord = Just record
                     , frameBatches = Set.empty
                     , frameSubmission = Nothing
+                    , frameRenderedEpoch = Nothing
                     , frameSubmissionReserved = True
                     , frameFenceReset = False
                     }
@@ -1778,9 +1785,15 @@ enqueuePresentation identity outcome model =
                               Map.insert
                                 pool
                                 Cycle
-                                  { cycleEpoch = targetRecoveryEpoch entry
+                                  { -- A submission that completed before this
+                                    -- enqueue brings the epoch it completed in
+                                    -- with it, rather than being dated to now.
+                                    cycleRendered =
+                                      if isJust (pending (frameSubmission frame))
+                                        then Nothing
+                                        else frameRenderedEpoch frame
+                                  , cyclePresented = Nothing
                                   , cycleSubmission = pending (frameSubmission frame)
-                                  , cyclePresented = False
                                   }
                                 (targetCycles entry)
                           }
@@ -1926,12 +1939,24 @@ applySubmission now number submission model = settleFrames (submissionFrames sub
     advanced =
       foldl'
         (\current target → advanceCycles now target (renders number) current)
-        discharged
-        (Map.keys (gpuTargets discharged))
+        remembered
+        (Map.keys (gpuTargets remembered))
+    -- A frame whose presentation has not been enqueued yet has no cycle to put
+    -- this half in, so the epoch it arrived in is remembered on the frame until
+    -- the enqueue that opens one.
+    remembered = foldl' remember discharged (submissionFrames submission)
+    remember current (target, slot) = case Map.lookup target (gpuTargets current) of
+      Nothing → current
+      Just record
+        | Just frame ← Map.lookup slot (targetFrames record)
+        , framePhase frame /= FramePresentationEnqueued →
+            editFrame target slot (\entry → entry {frameRenderedEpoch = Just (targetRecoveryEpoch record)}) current
+        | otherwise → current
     -- Matched by the submission this cycle is waiting on, which is the only
     -- thing that makes it this cycle's half rather than another's.
-    renders wanted _ entry
-      | cycleSubmission entry == Just wanted = Just entry {cycleSubmission = Nothing}
+    renders wanted epoch _ entry
+      | cycleSubmission entry == Just wanted =
+          Just entry {cycleSubmission = Nothing, cycleRendered = Just epoch}
       | otherwise = Nothing
 
 applyPresentation ∷ Instant → Natural → Natural → PoolRecord → GpuModel → GpuModel
@@ -1948,10 +1973,10 @@ applyPresentation now number record entry model = settleFrames [(number, slot) |
     -- matched by. Marking every unpresented cycle would let one frame's
     -- retirement pair with another frame's rendering.
     advanced = advanceCycles now number presents removed
-    presents key waiting
+    presents epoch key waiting
       | key /= record = Nothing
-      | cyclePresented waiting = Nothing
-      | otherwise = Just waiting {cyclePresented = True}
+      | isJust (cyclePresented waiting) = Nothing
+      | otherwise = Just waiting {cyclePresented = Just epoch}
     discharge current = case poolGeneration entry of
       Nothing → current
       Just generation → editHolds (GenerationKey number generation) (dischargePresentation record) current
@@ -1964,24 +1989,28 @@ applyPresentation now number record entry model = settleFrames [(number, slot) |
 -- either side of an attempt says nothing about the other; it is dropped rather
 -- than credited. Dropping it touches no hold and no accounting: what it settles
 -- is whether the target has been healthy, and nothing else.
-advanceCycles ∷ Instant → Natural → (Natural → Cycle → Maybe Cycle) → GpuModel → GpuModel
+advanceCycles ∷ Instant → Natural → (Natural → Natural → Cycle → Maybe Cycle) → GpuModel → GpuModel
 advanceCycles now number half model = case Map.lookup number (gpuTargets model) of
   Nothing → model
-  Just target → foldl' apply model (Map.toList (targetCycles target))
+  Just target → foldl' (apply (targetRecoveryEpoch target)) model (Map.toList (targetCycles target))
   where
-    apply current (record, pending) = case half record pending of
+    apply epoch current (record, pending) = case half epoch record pending of
       Nothing → current
       Just moved
-        | cyclePresented moved && cycleSubmission moved == Nothing → complete current record moved
+        | isJust (cyclePresented moved) && isNothing (cycleSubmission moved) → complete epoch current record moved
         | otherwise → editTarget number (\entry → entry {targetCycles = Map.insert record moved (targetCycles entry)}) current
-    complete current record settled =
+    -- Both halves must belong to the epoch the target is in now. A half that
+    -- arrived in an earlier one is separated from the other by a recovery
+    -- attempt, which is exactly what makes them incomparable — whichever half it
+    -- was, and whether it arrived before this cycle was even opened.
+    complete epoch current record settled =
       editTarget
         number
         ( \entry →
             entry
               { targetCycles = Map.delete record (targetCycles entry)
               , targetRecovery =
-                  if cycleEpoch settled == targetRecoveryEpoch entry
+                  if cycleRendered settled == Just epoch && cyclePresented settled == Just epoch
                     then noteRetirementCycle now (targetRecovery entry)
                     else targetRecovery entry
               }

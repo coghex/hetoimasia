@@ -322,11 +322,20 @@ recycled.
 Every target carries a **recovery epoch**. It rises when a recovery attempt is
 admitted, and at no other time, and it never falls — it lives on the target
 rather than on the episode precisely so that resetting the attempt budget cannot
-reissue one. A cycle is stamped with the epoch it was opened in, and is credited
-only if that is still the target's epoch when it completes. A cycle whose halves
-straddle an attempt therefore counts for nothing, in either order and whether or
-not the frame was recycled in between, because an attempt is exactly what makes
-the evidence on either side of it incomparable.
+reissue one.
+
+**Each half carries its own epoch**, stamped when that half arrives, and a cycle
+is credited only when both belong to the epoch the target is in now. The cycle
+does not carry a single stamp of its own, because a half can arrive before the
+cycle is even opened: a submission may complete before its presentation is
+enqueued, and dating that half to the enqueue would hide an attempt that fell
+between the two. The frame remembers the epoch of such an early half until the
+enqueue that opens the cycle it belongs to.
+
+A cycle whose halves straddle an attempt therefore counts for nothing — in either
+order, whether or not the frame was recycled in between, and whether the early
+half arrived before or after the cycle was opened — because an attempt is
+exactly what makes the evidence on either side of it incomparable.
 
 Dropping a cycle's credit touches no hold, no accounting and no record. What it
 settles is whether the target has been *healthy*; the GPU completion facts that
@@ -585,8 +594,9 @@ life in both completion orders, a slot reused, two frames in flight, an
 unsubmitted frame abandoned, a submitted frame closed before presenting, a close
 arriving in each phase, a recovery attempt before, after and between a cycle's
 halves, three failures in a row, two presentations in flight whose halves must
-pair only with their own cycles, and replacement demand raised after the schedule
-has backed off — and checks the model's invariants after *every* step of *every*
+pair only with their own cycles, a rendering half that arrives before its cycle
+is opened with and without an attempt in the gap, and replacement demand raised
+after the schedule has backed off — and checks the model's invariants after *every* step of *every*
 one of them: nothing disposable owes anything, accounting stays inside its
 configuration, storage stays a function of that configuration, silence about the
 schedule means there is genuinely nothing to do, epochs never repeat, and cycles
