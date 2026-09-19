@@ -129,6 +129,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , noProgressRound
   , advanceRetirements
   , anyRetiring
+  , retirementStanding
 
     -- * Completion notices from other threads
   , CompletionPublisher
@@ -260,8 +261,8 @@ data HostRetirement = HostRetirement
   , retirementDiagnosed ∷ !(IORef Bool)
   }
 
--- | One attachment's registered protocol, and whether it still has a progress
--- path the drain may take.
+-- | One attachment's registered protocol, whether it still has a progress path
+-- the drain may take, and what its own most recent opportunity found.
 data Registration = Registration
   { registrationTarget ∷ !AttachmentId
   , registrationAcknowledgement ∷ !Acknowledgement
@@ -269,7 +270,56 @@ data Registration = Registration
   , registrationProgressing ∷ !Bool
     -- ^ Withdrawn by a stalled or failed step; restored by independent
     -- evidence.
+  , registrationAssessment ∷ !RetirementAssessment
+    -- ^ What this attachment's latest opportunity found, which outlives the
+    -- round that found it so a later round the budget could not reach it still
+    -- knows whether it may be left waiting, and until when.
   }
+
+-- | What one attachment's most recent opportunity found, retained beside its
+-- registration.
+--
+-- It is the distinction a bounded round cannot draw from its own size: an
+-- attachment nobody has offered an opportunity to yet is not the same as one
+-- already inspected and known to be waiting, and only the first of the two may
+-- keep the next turn from waiting at all.
+--
+-- It is the /latest/ assessment rather than a historical minimum: a later
+-- 'RetirementAwaitingUntil' replaces the deadline an earlier one named, a
+-- 'RetirementAwaiting' clears it, and withdrawing the path or retiring the
+-- attachment removes its contribution altogether. It is one small value per
+-- live registration, so the retained state stays bounded by the host's window
+-- limit.
+data RetirementAssessment
+  = NeverAssessed
+    -- ^ No opportunity has been offered since this attachment began retiring,
+    -- or since independent evidence revived its path. It is owed a first
+    -- opportunity, whatever the budget reached this round.
+  | LastAdvanced
+    -- ^ Its latest opportunity made finite progress, so another one is wanted
+    -- at once — and stays wanted while later rounds leave it unserved.
+  | LastWaiting !(Maybe Instant)
+    -- ^ Its latest opportunity kept its path without progressing, naming the
+    -- instant at which progress may next be possible if it named one. This is
+    -- the only assessment that permits the next turn to wait.
+  deriving (Eq, Show)
+
+-- | Whether a progressing attachment's retained assessment demands another
+-- opportunity at once rather than permitting a wait.
+assessmentOwesOpportunity ∷ RetirementAssessment → Bool
+assessmentOwesOpportunity = \case
+  NeverAssessed → True
+  LastAdvanced → True
+  LastWaiting _ → False
+
+-- | The earliest instant any of these registrations is waiting until, whether
+-- or not this round reached it. A registration with no path left contributes
+-- nothing: it is waiting on evidence, not on the clock.
+earliestAwaited ∷ [Registration] → Maybe Instant
+earliestAwaited = foldr (fold' . registrationAssessment) Nothing . filter registrationProgressing
+  where
+    fold' (LastWaiting (Just due)) earliest = Just (maybe due (min due) earliest)
+    fold' _ earliest = earliest
 
 -- | The component the retirement boundary's own diagnostic is written under.
 retirementComponent ∷ Component
@@ -664,6 +714,7 @@ attachRetirement retirement restore window protocol onReserved =
                     (registeredAcknowledgement registered)
                     protocol
                     True
+                    NeverAssessed
                 )
               onReserved (registeredAttachment registered)
               pure (Right registered)
@@ -764,6 +815,25 @@ retiringPending retirement = do
 -- | Whether any attachment has begun retiring and not yet finished.
 anyRetiring ∷ HostRetirement → STM Bool
 anyRetiring = fmap (not . null) . retiringPending
+
+-- | What the registrations say about scheduling right now, read from the
+-- retained assessments alone: whether any attachment is owed an opportunity,
+-- and the earliest instant any of them is waiting until.
+--
+-- A round answers both from its own accounting, and every round republishes
+-- what it found. This answers them without offering an opportunity, for a
+-- transaction that changes the registrations between two rounds — recording a
+-- retirement fact on the owner thread — and would otherwise leave the published
+-- demand describing registrations that have since moved: an attachment owed an
+-- opportunity it has not been offered, or an instant named by one that has since
+-- retired and is waiting on nothing at all.
+retirementStanding ∷ HostRetirement → STM (Bool, Maybe Instant)
+retirementStanding retirement = do
+  progressing ← filter registrationProgressing <$> retiringPending retirement
+  pure
+    ( any (assessmentOwesOpportunity . registrationAssessment) progressing
+    , earliestAwaited progressing
+    )
 
 retiringIn ∷ AttachmentModel Evidence → AttachmentId → Bool
 retiringIn model target = case attachmentStatus target model of
@@ -892,10 +962,18 @@ cancelAttachment retirement target = do
 
 -- | What one running turn's bounded round of opportunities found.
 --
--- It is the retirement side of the scheduling arc: 'roundAdvanced' says another
--- opportunity is wanted now, and 'roundNextPossible' is the earliest instant any
--- awaiting owner named, which a scheduled loop folds into the wait it chooses so
--- a due step is not delayed by the idle bound.
+-- It is the retirement side of the scheduling arc. 'roundAdvanced' and
+-- 'roundOwed' together say whether another opportunity is wanted now, and
+-- 'roundNextPossible' is the earliest instant any waiting attachment is waiting
+-- until — one this round served or one it did not — which a scheduled loop folds
+-- into the wait it chooses so a due step is not delayed by the idle bound.
+--
+-- The budget bounds how many opportunities a round offers; it never decides
+-- whether the next turn may wait. That is 'roundOwed''s question, answered from
+-- each attachment's own retained assessment, so a set of waiting attachments
+-- larger than the budget settles into ordinary idle waits instead of polling
+-- forever, while an attachment that has never been offered one still gets its
+-- first opportunity without delay.
 data ProgressRound = ProgressRound
   { roundOffered ∷ !Int
     -- ^ Opportunities offered, at most the budget.
@@ -904,19 +982,29 @@ data ProgressRound = ProgressRound
   , roundPending ∷ !Int
     -- ^ Attachments still registered and not yet retired, after the round.
   , roundDeferred ∷ !Int
-    -- ^ Pending attachments the budget could not reach this round, which is
-    -- itself a reason to come back at once.
+    -- ^ Pending attachments with a progress path the budget could not reach
+    -- this round. Rotation accounting: the next round starts after the one
+    -- served last, so this is who it will reach first, not by itself a reason
+    -- to come back at once.
+  , roundOwed ∷ !Int
+    -- ^ Pending attachments that want another opportunity at once: the ones
+    -- never offered one since their retirement began or since evidence revived
+    -- their path, and the ones whose latest opportunity advanced. Every other
+    -- progressing attachment has been inspected and is waiting, which is what
+    -- lets the next turn wait.
   , roundStalled ∷ !Int
     -- ^ Pending attachments with no progress path left.
   , roundRefused ∷ !Int
     -- ^ Opportunities refused because their owner declared a blocking step.
   , roundNextPossible ∷ !(Maybe Instant)
-    -- ^ The earliest instant an awaiting owner named, if any did.
+    -- ^ The earliest instant any waiting attachment named, across all of them
+    -- rather than only the ones this round offered, so a budgeted round never
+    -- lengthens the wait past a deadline an earlier round learned.
   }
   deriving (Eq, Show)
 
 noProgressRound ∷ ProgressRound
-noProgressRound = ProgressRound 0 0 0 0 0 0 Nothing
+noProgressRound = ProgressRound 0 0 0 0 0 0 0 Nothing
 
 -- | Offer one bounded, rotating round of retirement opportunities on the owner
 -- thread, for a host that is still running.
@@ -927,7 +1015,9 @@ noProgressRound = ProgressRound 0 0 0 0 0 0 Nothing
 -- another's and never blocks that window's commands, close, or attachment. Each
 -- opportunity either advances finitely, names when progress may next be
 -- possible, keeps its path without naming one, withdraws it, or is refused
--- outright for declaring that it would block.
+-- outright for declaring that it would block. Whichever it is, it is retained
+-- as that attachment's 'registrationAssessment', so the round reports what every
+-- pending attachment is doing rather than only the ones its budget reached.
 --
 -- A recognized failure under an optional disposition leaves the component
 -- unavailable with its evidence, which is never permission to destroy a
@@ -949,15 +1039,24 @@ advanceRetirements retirement cursor budget = do
   -- Deferred work is what the budget did not reach, counted by name rather than
   -- by arithmetic on the round's own size: an offered attachment that stalled or
   -- was refused leaves the progressing count short by one, and subtracting the
-  -- offered count from it would then report an unserved neighbour as no work at
-  -- all, letting the next turn wait before ever offering it.
+  -- offered count from it would then misreport an unserved neighbour.
+  --
+  -- What the next turn may do is a different question, and it is answered from
+  -- the retained assessments rather than from this round's reach: an attachment
+  -- the budget missed may already have been inspected by an earlier round and
+  -- found waiting, and one the budget missed twice is still owed its first
+  -- opportunity. Counting every unserved attachment as owed work is what made
+  -- any set of waiting attachments larger than the budget poll forever.
   let attempted = map registrationTarget offered
-      unserved = filter ((`notElem` attempted) . registrationTarget) (filter registrationProgressing settled)
+      progressing = filter registrationProgressing settled
+      unserved = filter ((`notElem` attempted) . registrationTarget) progressing
   pure
     round'
       { roundPending = length settled
       , roundStalled = length (filter (not . registrationProgressing) settled)
       , roundDeferred = length unserved
+      , roundOwed = length (filter (assessmentOwesOpportunity . registrationAssessment) progressing)
+      , roundNextPossible = earliestAwaited progressing
       }
   where
     foldStep accumulated [] = pure accumulated
@@ -1018,13 +1117,24 @@ offerOne retirement accumulated registration =
     acknowledgement = registrationAcknowledgement registration
     protocol = registrationProtocol registration
     withdraw = atomically (writeProgressing retirement target False)
+    -- Each answer is retained as this attachment's own latest assessment before
+    -- anything else is decided, so a later round that the budget does not reach
+    -- it still knows what it is doing and until when. A later answer replaces
+    -- the earlier one outright: 'RetirementAwaiting' clears a deadline an
+    -- earlier 'RetirementAwaitingUntil' named rather than leaving it standing.
+    assess = atomically . writeAssessment retirement target
     settle = \case
       RetirementAdvanced → do
-        atomically (pruneRegistrations retirement)
+        atomically $ do
+          writeAssessment retirement target LastAdvanced
+          pruneRegistrations retirement
         pure counted {roundAdvanced = roundAdvanced counted + 1}
-      RetirementAwaiting → pure counted
-      RetirementAwaitingUntil due →
-        pure counted {roundNextPossible = Just (maybe due (min due) (roundNextPossible counted))}
+      RetirementAwaiting → do
+        assess (LastWaiting Nothing)
+        pure counted
+      RetirementAwaitingUntil due → do
+        assess (LastWaiting (Just due))
+        pure counted
       RetirementStalled → withdraw >> pure counted
 
 -- | The one recovery policy a retirement step is attempted under, on the owner
@@ -1427,11 +1537,20 @@ addRegistration retirement registration =
 
 writeProgressing ∷ HostRetirement → AttachmentId → Bool → STM ()
 writeProgressing retirement target progressing =
+  adjustRegistration retirement target (\registration → registration {registrationProgressing = progressing})
+
+-- | Retain what this attachment's latest opportunity found.
+writeAssessment ∷ HostRetirement → AttachmentId → RetirementAssessment → STM ()
+writeAssessment retirement target assessment =
+  adjustRegistration retirement target (\registration → registration {registrationAssessment = assessment})
+
+adjustRegistration ∷ HostRetirement → AttachmentId → (Registration → Registration) → STM ()
+adjustRegistration retirement target change =
   readTVar (retirementRegistrations retirement)
     >>= writeTVar (retirementRegistrations retirement) . map adjust
   where
     adjust registration
-      | registrationTarget registration == target = registration {registrationProgressing = progressing}
+      | registrationTarget registration == target = change registration
       | otherwise = registration
 
 -- | Replace a live registration's declared completion policy, for this
@@ -1458,9 +1577,21 @@ faultProtocolMetadata retirement target completion =
             {registrationProtocol = (registrationProtocol registration) {protocolCompletion = completion}}
       | otherwise = registration
 
--- | Independent evidence revives a withdrawn progress path.
+-- | Independent evidence revives a withdrawn progress path, and invalidates
+-- whatever this attachment's last opportunity assessed.
+--
+-- The assessment that made it eligible to be left waiting was made against the
+-- evidence the model held then; new evidence is exactly the thing that
+-- assessment did not account for, so the attachment is owed another opportunity
+-- before any turn may wait on it again — whether or not its path had been
+-- withdrawn. Evidence that establishes nothing never reaches here, so a
+-- duplicate fact and a refusal revive neither the path nor the assessment.
 reviveRegistration ∷ HostRetirement → AttachmentId → STM ()
-reviveRegistration retirement target = writeProgressing retirement target True
+reviveRegistration retirement target =
+  adjustRegistration
+    retirement
+    target
+    (\registration → registration {registrationProgressing = True, registrationAssessment = NeverAssessed})
 
 -- | Forget the registrations of attachments the model has retired, so the
 -- bookkeeping stays bounded by the attachments still live.

@@ -3142,6 +3142,9 @@ Retirement runs while the application runs. Each owner turn offers at most
 that have begun retiring, starting after the one the previous turn served last.
 One window's pending retirement therefore never blocks another window's
 commands, close, attachment, or retirement, and a stalled owner starves nobody.
+Rotation is what guarantees a first opportunity: a round whose single offer
+stalls must not let the next turn wait before the attachment beside it has ever
+been offered one.
 An attachment that has not begun retiring is offered nothing: the model refuses
 every fact before retirement has begun, so a step there could establish nothing.
 
@@ -3165,21 +3168,68 @@ so no failed or interrupted step is ever run again without fresh evidence. A
 fact that completes the retirement frees the window rather than earning another
 opportunity: the registration is forgotten in the same transaction.
 
+Each attachment's own latest answer is retained beside its registration, so the
+boundary can tell an attachment nobody has offered an opportunity to yet from
+one already inspected and known to be waiting. It is the latest answer and not a
+history: a later `RetirementAwaitingUntil` replaces the instant an earlier one
+named, a `RetirementAwaiting` clears that instant, and withdrawing the path or
+retiring the attachment removes its contribution altogether. New evidence
+invalidates it — the assessment was made against what the model held before that
+evidence arrived — so a revived attachment is owed another opportunity before
+any turn waits on it again, exactly as a newly begun retirement is. It is one
+small value per live registration, so the whole of it stays bounded by the
+window limit and needs no thread, timer, or larger budget.
+
+Where that is *said* differs by transport, because the two arrive at different
+moments. A notice is folded by the very round that reads the demand, so that
+round's own accounting already sees the attachment it revived, and the wake the
+notice registered is what ends the wait it was published into. A fact certified
+directly on the owner thread through `certifyGraphicsFact` has neither: it is
+recorded between two rounds, with no wake to ride. So recording one answers both
+of the demand's scheduling questions afresh in the same transaction, from what
+the registrations then say. Evidence that revives an attachment makes the turn
+after it immediate, so the attachment is offered the opportunity that evidence
+earned it rather than waiting the idle bound or an instant the same evidence has
+just outdated; evidence that *completes* a retirement does the opposite, taking
+the retired attachment's own instant and its claim on the next turn away with
+it, because it is waiting on nothing and is owed nothing. Neither answer loses
+anything the last round said: a retirement begun since then has never been
+offered an opportunity and is reported owed on its own, and an attachment a
+round advanced is either still pending and wanting another opportunity or has
+retired and released its window in that same turn. Only evidence the model did
+not already hold answers anything; a duplicate and a refusal establish nothing
+and leave the demand exactly as the last round published it.
+
 `hostRetirementDemand` publishes what the last round left owed: how many
 attachments are pending, how many are stalled, how many opportunities were
 refused, whether another opportunity is wanted at once, and the earliest instant
-an awaiting owner named. A transaction that *begins* a retirement — a close, a
-detach, quiescence, a superseded publication, a retained rollback, an
+any waiting attachment is waiting until — across every one of them, not only the
+ones that round reached, so a budgeted round never lengthens the wait past an
+instant an earlier round learned. Another opportunity is wanted at once when the
+round advanced something, or when some attachment is owed one it has not had: a
+retirement no round has yet offered one to, one whose path fresh evidence has
+just revived, or one whose latest opportunity advanced — and that stays true
+while later rounds leave it unserved. A transaction that *begins* a retirement —
+a close, a detach, quiescence, a superseded publication, a retained rollback, an
 interrupted handoff — says so there too, because that retirement has never been
 offered an opportunity and the turn after it must not wait its idle bound before
 giving it one. A host with nothing retiring, and every ordinary host, leave the
 demand empty.
-[The scheduled owner loop](#the-scheduled-owner-turn) reads it in the same
-inspection that captures demand, so a retirement instant shortens that turn's
-wait exactly as an application deadline does — never lengthens it — and a round
-that advanced, or one the budget could not reach, makes the next turn poll. The
-unscheduled loop reads the same flag and does not wait when a retirement wants
-another opportunity now.
+
+Attachments that have all been inspected and are waiting owe nothing, however
+many of them the budget leaves unserved. That is what keeps a set of waiting
+attachments larger than `hostRetirementBudget` an ordinary idle host rather than
+an unbounded stream of polling turns: the budget bounds how many opportunities a
+round offers, and never by itself decides whether the next turn may wait.
+[The scheduled owner loop](#the-scheduled-owner-turn) reads the demand in the
+same inspection that captures application demand, so a retirement instant
+shortens that turn's wait exactly as an application deadline does — never
+lengthens it — an instant already reached still polls the turn for it, and a
+round that advanced or left an attachment owed an opportunity makes the next
+turn poll. Otherwise the turn waits toward the earliest instant the waiting
+attachments named, bounded by `hostIdleWait`, and a turn with no other work does
+not poll. The unscheduled loop reads the same flag and does not wait when a
+retirement wants another opportunity now.
 
 No opportunity performs a blocking GPU wait. The boundary cannot inspect
 arbitrary backend `IO` to prove it returns — finite, nonblocking progress is the
@@ -3274,8 +3324,10 @@ own close, retirement, and destruction while the other's retirement is pending �
 and admits no use once it has closed, while the pending one admits none at all
 and is advanced by none of it; a stalled owner's neighbour destroyed first and the
 stalled one finished on independent evidence; a budget of one rotating across
-three pending retirements, and a budget of one counting the attachment it never
-reached as deferred work even when the one it served withdrew; a blocking owner
+three pending retirements and no longer asking for an immediate turn once every
+one of them has been offered an opportunity and is awaiting, and a budget of one
+counting the attachment it never reached as deferred work even when the one it
+served withdrew; a blocking owner
 refused without its step running; a declaration that raises when it is demanded,
 answered with nothing reserved, constructed, or rolled back and the slot left
 free for the next owner at the very first incarnation, for both declarations the
@@ -3285,7 +3337,22 @@ retires it; a completion published from another thread
 ending the owner's idle wait and folding into the next round;
 the scheduled loop polling the turn a detach begins,
 shortening the next wait to the instant that owner named, and polling again once
-a round advanced; an attachment whose caller was interrupted in the handoff
+a round advanced; more waiting owners than the budget settling into the
+configured fallback wait once the rotation has offered each of them one
+opportunity; a budgeted round waiting to an instant an earlier round learned,
+polling for that instant when it comes due while its owner is unserved, and
+clearing it when that owner next names none; an owner whose latest opportunity
+advanced keeping later turns immediate while rounds leave it unserved; a stalled
+owner's unserved neighbour keeping the turn immediate until it has been offered
+one, and the turns waiting beside the stalled owner afterwards; a retirement
+begun between two waiting turns, and evidence that outdates a waiting owner's
+assessment, each making a later turn immediate again; a fact certified on the
+owner thread between two waiting turns making the next one immediate while a
+duplicate of it makes nothing immediate; a retirement completed by certification
+on the owner thread taking its own instant and its claim on the next turn with
+it, including where that certification is the only thing between the two turns; a later instant replacing the one its
+owner named before rather than the nearest ever seen, and being dropped when
+that owner withdraws its path or retires; an attachment whose caller was interrupted in the handoff
 before its service arrived, left retiring and retired by ordinary turns with the
 slot freed for a fresh incarnation; a published service thrown away and
 recovered from the host by window, then detached with; a construction that
