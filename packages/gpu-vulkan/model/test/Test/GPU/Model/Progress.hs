@@ -91,6 +91,31 @@ spec = describe "owner progress" $ do
     let (served, _) = runProgressTurn silentEvidence (atMilliseconds 0) demanded
     nextDeadline served `shouldBe` TurnNow
 
+  it "restarts the whole schedule after a turn that made progress, not just its first step" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 4}
+    (active, target, _) ← activeTarget 4 model
+    (loaded, submissions) ← enqueueFrames target 2 active
+
+    -- Back off a long way first, so a reset that only half happened is visible.
+    let backedOff = walk 4 loaded
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 40)
+
+    -- A turn that applies a completion is progress: the schedule starts again at
+    -- its first interval.
+    let observed = silentEvidence {submissionEvidence = (`elem` take 1 submissions)}
+        (progressed, report) = runProgressTurn observed (atMilliseconds 0) backedOff
+    turnFacts report `shouldBe` 1
+    turnNextDeadline report `shouldBe` TurnAt (atMilliseconds 5)
+
+    -- And it really is the whole schedule, not only its first step. A turn that
+    -- announces an interval must store the step after it; announcing five and
+    -- storing the step that announces five again would give 5, 5, 10, 20.
+    let poll (current, announced) at =
+          let (next, polled) = runProgressTurn silentEvidence at current
+           in (next, announced ++ [turnNextDeadline polled])
+        (_, deadlines) = foldl poll (progressed, []) (map atMilliseconds [5, 15, 35, 75])
+    deadlines `shouldBe` map (TurnAt . atMilliseconds) [15, 35, 75, 155]
+
   it "answers the same deadline however long after the model last changed it is read" $ do
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
     (active, target, _) ← activeTarget 2 model

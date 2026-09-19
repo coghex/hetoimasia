@@ -303,9 +303,14 @@ resets nothing.
 A cycle is *both* of its facts. A presentation may retire before its submission
 completes, so retirement on its own is half of one — the frame still owes the
 rendering it submitted — and whichever fact arrives second is what completes the
-cycle. The credit also goes only to an episode that can use it: one with a spent
-attempt and nothing in flight, since a cycle completed during an attempt is a
-cycle that attempt is in the middle of interrupting.
+cycle.
+
+The credit also goes only to an episode that can use it: one with a spent
+attempt, nothing in flight, and a recovery that actually **succeeded**. A cycle
+completed during an attempt is a cycle that attempt is in the middle of
+interrupting. A cycle after a failure is ordinary rendering going on while a
+retry is still scheduled — not the target recovering, and treating it as such
+would erase that retry.
 
 Exhaustion marks an optional target unavailable and leaves the session running;
 for a required target it fails the graphics session. Device loss, a validation
@@ -399,9 +404,12 @@ that should have come back. A deadline in the past means the owner is overdue,
 and is reported as it stands.
 
 The backoff schedule is 5, 10, 20, 40, 80 and then the configured cap of 100 ms.
-The obligation that created the work schedules the first poll five milliseconds
-out; each poll that finds nothing moves one step along, and the last step is the
-steady state it stays at. New demand, a new obligation, an observed completion
+The obligation that created the work asks for a turn now; each poll that finds
+nothing moves one step along, and the last step is the steady state it stays at.
+A turn announces the interval it is at and stores the step after it, so a turn
+that made progress restarts the whole schedule rather than only its first step —
+storing the step it just announced would spend that interval twice and give 5,
+5, 10, 20. New demand, a new obligation, an observed completion
 and a close transition each schedule an immediate opportunity and start the
 schedule over.
 
@@ -517,7 +525,9 @@ schedule asked for, with its capacity reusable afterwards; a replacement nobody
 is building keeping the owner coming back until something is, through the
 generation backpressure that refuses to start it and out the other side once
 capacity returns; a presentation retired before its submission completing no
-cycle until that submission does; and evidence gathered before an attempt
+cycle until that submission does; a cycle after a failed attempt replenishing
+nothing and leaving the scheduled retry intact; the schedule restarting whole
+after a turn that made progress; and evidence gathered before an attempt
 refusing to replenish the episode that attempt belongs to.
 
 `test.workflow` holds the group's registration to the routing it needs: it is

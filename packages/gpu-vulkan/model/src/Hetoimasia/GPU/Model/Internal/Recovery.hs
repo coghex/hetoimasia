@@ -73,6 +73,11 @@ data RecoveryEpisode = RecoveryEpisode
     -- last failure.
   , episodeHealthySince ∷ !(Maybe Instant)
     -- ^ When that cycle completed; the healthy period is measured from here.
+  , episodeSucceeded ∷ !Bool
+    -- ^ Whether the most recent settled attempt succeeded. Replenishment is
+    -- about /successful/ recovery, so an episode that has only ever failed has
+    -- nothing to be healthy after: a cycle completed while its retry is still
+    -- scheduled is ordinary rendering, not evidence that the target recovered.
   , episodeOutstanding ∷ !Bool
     -- ^ Whether an admitted attempt is still in flight. An episode holds at most
     -- one: a second 'attemptRecovery' before the first is settled would spend a
@@ -104,6 +109,7 @@ freshEpisode =
     , episodeNextAttemptAt = AttemptUnscheduled
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
+    , episodeSucceeded = False
     , episodeOutstanding = False
     }
 
@@ -139,9 +145,11 @@ attemptRecovery now episode
           , -- Evidence gathered before this attempt says nothing about a target
             -- that has just had to be reconstructed again. Carrying it forward
             -- would let a cycle that the attempt itself interrupted hand the
-            -- episode its budget back.
+            -- episode its budget back, and an earlier success is not this
+            -- attempt's outcome.
             episodeRetirementCycle = False
           , episodeHealthySince = Nothing
+          , episodeSucceeded = False
           }
       , AttemptAdmitted attempt
       )
@@ -162,6 +170,7 @@ recordAttemptFailure now episode =
     { episodeNextAttemptAt = maybe AttemptUnscheduled schedule (delayFor (episodeAttempts episode))
     , episodeRetirementCycle = False
     , episodeHealthySince = Nothing
+    , episodeSucceeded = False
     , episodeOutstanding = False
     }
   where
@@ -181,21 +190,23 @@ recordAttemptFailure now episode =
 -- returning it: the budget an episode has spent is spent, and only a completed
 -- retirement cycle plus a healthy period gives any of it back.
 recordAttemptSuccess ∷ RecoveryEpisode → RecoveryEpisode
-recordAttemptSuccess episode = episode {episodeOutstanding = False}
+recordAttemptSuccess episode = episode {episodeOutstanding = False, episodeSucceeded = True}
 
 -- | A normal presentation-retirement cycle completed on this target. This is
 -- the first of the two conditions a reset needs; on its own it resets nothing.
 --
--- It is credited only to an episode that has something to give back and nothing
--- in flight. A cycle completed while an attempt is outstanding is a cycle that
--- attempt is in the middle of interrupting, and one credited to an episode with
--- no spent attempts is evidence for a reset nobody is waiting for — which would
--- only put a healthy-period deadline on the schedule of a target that is
--- perfectly well.
+-- It is credited only to an episode that has something to give back, nothing in
+-- flight, and a recovery that actually succeeded. A cycle completed while an
+-- attempt is outstanding is a cycle that attempt is in the middle of
+-- interrupting; one credited to an episode with no spent attempts is evidence
+-- for a reset nobody is waiting for; and one credited to an episode whose last
+-- attempt failed is ordinary rendering happening while a retry is still
+-- scheduled, which is not the target recovering and must not erase that retry.
 noteRetirementCycle ∷ Instant → RecoveryEpisode → RecoveryEpisode
 noteRetirementCycle now episode
   | episodeOutstanding episode = episode
   | episodeAttempts episode == 0 = episode
+  | not (episodeSucceeded episode) = episode
   | episodeRetirementCycle episode = episode
   | otherwise = episode {episodeRetirementCycle = True, episodeHealthySince = Just now}
 
@@ -330,13 +341,17 @@ advanceBackoff budgets state
 -- schedule is currently at; the advance applies to the turn after it, so a turn
 -- that made progress starts again at the first interval rather than carrying the
 -- idle one forward.
+-- A turn that made progress starts the schedule again from its first interval;
+-- one that did not carries on from where it was. Either way the interval it
+-- announces is the one it is at, and the step it stores is the one after it —
+-- storing the step it announced would spend that interval twice and turn the
+-- schedule into 5, 5, 10, 20 rather than 5, 10, 20, 40.
 scheduleNextPoll ∷ Budgets → Instant → Bool → BackoffState → BackoffState
-scheduleNextPoll budgets now progressed state
-  | progressed = BackoffState {backoffStep = 0, backoffDueAt = anchored (currentBackoff budgets freshBackoff)}
-  | otherwise =
-      BackoffState
-        { backoffStep = backoffStep (advanceBackoff budgets state)
-        , backoffDueAt = anchored (currentBackoff budgets state)
-        }
+scheduleNextPoll budgets now progressed state = anchor (if progressed then freshBackoff else state)
   where
+    anchor from =
+      BackoffState
+        { backoffStep = backoffStep (advanceBackoff budgets from)
+        , backoffDueAt = anchored (currentBackoff budgets from)
+        }
     anchored interval = either (const DueUnschedulable) DueAt (addDuration now interval)

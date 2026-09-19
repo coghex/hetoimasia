@@ -95,7 +95,7 @@ spec = describe "recovery" $ do
     (_, afterSubRetry) ← admitted "asking after the sub-retry" (beginTargetRecovery (atMilliseconds 50000) target retried)
     afterSubRetry `shouldSatisfy` isSpent
 
-  it "resets the episode only after a retirement cycle and a full second of healthy progress" $ do
+  it "resets the episode only after a successful recovery, a retirement cycle and a healthy second" $ do
     model ← freshModel
     (active, target, _) ← activeTarget 2 model
     (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target active)
@@ -107,12 +107,28 @@ spec = describe "recovery" $ do
     let (quiet, _) = runProgressTurn silentEvidence (atMilliseconds 3600000) failed
     fmap viewTargetRecoveryAttempts (targetView target quiet) `shouldBe` Just 1
 
-    -- One completed presentation-retirement cycle starts the clock.
-    cycled ← completeRetirementCycle target (atMilliseconds 3600000) quiet
-    fmap viewTargetRecoveryAttempts (targetView target cycled) `shouldBe` Just 1
-    let (tooSoon, _) = runProgressTurn silentEvidence (atMilliseconds 3600999) cycled
-    fmap viewTargetRecoveryAttempts (targetView target tooSoon) `shouldBe` Just 1
-    let (healthy, _) = runProgressTurn silentEvidence (atMilliseconds 3601000) tooSoon
+    -- Neither does a cycle after a failure. Replenishment is about recovery that
+    -- *succeeded*; rendering going on while a retry is still scheduled is not
+    -- the target recovering, and treating it as such would erase that retry.
+    unsuccessful ← completeRetirementCycle target (atMilliseconds 3600000) quiet
+    let (waited, _) = runProgressTurn silentEvidence (atMilliseconds 3602000) unsuccessful
+    fmap viewTargetRecoveryAttempts (targetView target waited) `shouldBe` Just 1
+    -- And the retry the failure scheduled is still there to be taken.
+    (_, deferred) ← admitted "asking before the delay" (beginTargetRecovery (atMilliseconds 50) target waited)
+    deferred `shouldBe` RecoveryDeferred (atMilliseconds 100)
+
+    -- A second attempt that succeeds is what makes a later cycle mean something.
+    (second, attempt) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 3603000) target waited)
+    attempt `shouldBe` RecoveryAttempt 2
+    succeeded ← admitted_ "recording the success" (recordRecoverySuccess target second)
+    fmap viewTargetRecoveryAttempts (targetView target succeeded) `shouldBe` Just 2
+
+    -- Now one completed presentation-retirement cycle starts the clock.
+    cycled ← completeRetirementCycle target (atMilliseconds 3604000) succeeded
+    fmap viewTargetRecoveryAttempts (targetView target cycled) `shouldBe` Just 2
+    let (tooSoon, _) = runProgressTurn silentEvidence (atMilliseconds 3604999) cycled
+    fmap viewTargetRecoveryAttempts (targetView target tooSoon) `shouldBe` Just 2
+    let (healthy, _) = runProgressTurn silentEvidence (atMilliseconds 3605000) tooSoon
     fmap viewTargetRecoveryAttempts (targetView target healthy) `shouldBe` Just 0
 
   it "lets close win over a pending retry and over publishing a completed replacement" $ do
