@@ -7,7 +7,7 @@ module Test.GPU.Model.Progress (spec) where
 
 import Data.List (nub)
 import Hetoimasia.GPU.Model
-import Hetoimasia.GPU.Model.Budget (BudgetKind (TargetRecordBudget), BudgetRequest (..), defaultBudgetRequest)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (GenerationBudget, TargetRecordBudget), BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity
 import Numeric.Natural (Natural)
 import Test.GPU.Model.Support
@@ -267,6 +267,41 @@ spec = describe "owner progress" $ do
     fmap viewTargetRecoveryAttempts (targetView target healthy) `shouldBe` Just 0
     nextDeadline healthy `shouldBe` NoTurnNeeded
 
+  it "completes a retirement cycle only when both of its facts have arrived" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
+    (active, target, _) ← activeTarget 2 model
+    (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target active)
+    failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 0) target begun)
+    (second, _) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 100) target failed)
+    succeeded ← admitted_ "recording the success" (recordRecoverySuccess target second)
+
+    -- Retire the presentation first. Retirement is explicitly allowed before the
+    -- submission completes, so on its own it is half a cycle: the frame still
+    -- owes the rendering it submitted.
+    (framed, frame) ← acquiredFrame target succeeded
+    (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted framed)
+    submission ← submissionOf submitAnswer
+    (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued submitted)
+    presentation ← presentationOf presentAnswer
+    retired ← admitted_ "retiring the presentation" (recordCompletion (atMilliseconds 1000) (PresentationRetired presentation) presented)
+    maybe [] viewOutstanding (holdView (GenerationSubject (generationOf target retired)) retired)
+      `shouldContain` [SubmittedUseOwed]
+
+    -- A second passes. Nothing may reset, because no cycle has completed: the
+    -- episode would otherwise hand its budget back on half a fact.
+    nextDeadline retired `shouldSatisfy` (/= NoTurnNeeded)
+    let (waited, _) = runProgressTurn silentEvidence (atMilliseconds 2000) retired
+    fmap viewTargetRecoveryAttempts (targetView target waited) `shouldBe` Just 2
+
+    -- The submission completing is the other half. Only now does the healthy
+    -- second start, and only after it does the episode reset.
+    completed ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 2000) (SubmissionCompleted submission) waited)
+    nextDeadline completed `shouldBe` TurnAt (atMilliseconds 3000)
+    let (tooSoon, _) = runProgressTurn silentEvidence (atMilliseconds 2999) completed
+    fmap viewTargetRecoveryAttempts (targetView target tooSoon) `shouldBe` Just 2
+    let (reset, _) = runProgressTurn silentEvidence (atMilliseconds 3000) tooSoon
+    fmap viewTargetRecoveryAttempts (targetView target reset) `shouldBe` Just 0
+
   it "does not let evidence gathered before an attempt replenish the episode" $ do
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
     (active, target, _) ← activeTarget 2 model
@@ -374,6 +409,58 @@ spec = describe "owner progress" $ do
     (published, _) ← admitted "publishing it" (publishGeneration replacement 2 constructing)
     fmap viewTargetReplacementRequested (targetView target published) `shouldBe` Just False
 
+  it "keeps a replacement scheduled while generation capacity is exhausted, and after it returns" $ do
+    -- Two live generations per target, so a retired one that cannot yet be
+    -- disposed of is enough to refuse the replacement its own request asked for.
+    model ← freshModelWith defaultBudgetRequest {requestedGenerations = 2}
+    (active, target, first) ← activeTarget 2 model
+
+    -- Settle the first generation's image through the unpresented path, which
+    -- leaves no presentation record and completes no cycle.
+    (framed, frame) ← acquiredFrame target active
+    skipped ← admitted_ "skipping the frame" (skipUnsubmittedFrame frame framed)
+    settled ← admitted_ "settling it" (recordCompletion (atMilliseconds 1) (UnpresentedFrameSettled frame) skipped)
+
+    -- Replace it once, so the target now holds a retired generation beside its
+    -- active one and has no capacity left.
+    (constructing, second) ← admitted "replacing the generation" (beginGeneration target (Just first) settled)
+    (published, _) ← admitted "publishing the replacement" (publishGeneration second 2 constructing)
+    fmap viewTargetGenerations (targetView target published) `shouldBe` Just 2
+    fmap viewTargetReplacementRequested (targetView target published) `shouldBe` Just False
+
+    -- A lost surface asks for another replacement, and the budget refuses to
+    -- start one.
+    (reserved, lost) ← admitted "reserving" (reserveFrame target published)
+    (requested, answer) ← admitted "losing the surface" (acquireImage lost AcquireSurfaceLost reserved)
+    answer `shouldBe` ReplacementRequested
+    fmap viewTargetReplacementRequested (targetView target requested) `shouldBe` Just True
+    backpressured "constructing while at capacity" (beginGeneration target (Just second) requested)
+      >>= (`shouldBe` GenerationBudget)
+
+    -- Backpressure is not a refusal of the demand. It is still owed, and the
+    -- owner is still asked to come back for it — otherwise the request would be
+    -- stranded exactly when the target most needs rebuilding.
+    fmap viewTargetReplacementRequested (targetView target requested) `shouldBe` Just True
+    nextDeadline requested `shouldSatisfy` (/= NoTurnNeeded)
+
+    -- Free the capacity by disposing the generation that was blocking it.
+    ended ← admitted_ "ending the retired generation's CPU use" (endGenerationCpuUse first requested)
+    disposalEligible (GenerationSubject first) ended `shouldBe` True
+    let (freed, report) = runProgressTurn (silentEvidence {disposalEvidence = const DisposalCompleted}) (atMilliseconds 2) ended
+    turnDisposed report `shouldContain` [GenerationSubject first]
+    fmap viewTargetGenerations (targetView target freed) `shouldBe` Just 1
+
+    -- The demand survived the disposal that made room for it, and is still
+    -- scheduled rather than reported as nothing to do.
+    fmap viewTargetReplacementRequested (targetView target freed) `shouldBe` Just True
+    pendingObligations freed `shouldSatisfy` (> 0)
+    nextDeadline freed `shouldSatisfy` (/= NoTurnNeeded)
+
+    -- And now it can be served.
+    (retrying, third) ← admitted "constructing once capacity returned" (beginGeneration target (Just second) freed)
+    (servedModel, _) ← admitted "publishing it" (publishGeneration third 2 retrying)
+    fmap viewTargetReplacementRequested (targetView target servedModel) `shouldBe` Just False
+
   it "has no deadline at all once nothing is pending" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model
@@ -408,6 +495,17 @@ spec = describe "owner progress" $ do
     walk count model = iterate step model !! (count ∷ Int)
       where
         step current = fst (runProgressTurn silentEvidence (atMilliseconds 0) current)
+    submissionOf = \case
+      SubmissionRecorded identity → pure identity
+      other → fail ("expected a submission record, got " ++ show other)
+    presentationOf = \case
+      PresentationTracked identity → pure identity
+      other → fail ("expected a presentation record, got " ++ show other)
+    -- The target's active generation, for an example that needs to name it.
+    generationOf target model =
+      case targetView target model >>= viewTargetActive of
+        Just generation → generation
+        Nothing → error "the fixture's target should have an active generation"
     -- One full acquire / submit / present / retire cycle, which is what a
     -- recovery episode's healthy period is measured from.
     completeCycle target now model = do

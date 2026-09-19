@@ -185,8 +185,17 @@ recordAttemptSuccess episode = episode {episodeOutstanding = False}
 
 -- | A normal presentation-retirement cycle completed on this target. This is
 -- the first of the two conditions a reset needs; on its own it resets nothing.
+--
+-- It is credited only to an episode that has something to give back and nothing
+-- in flight. A cycle completed while an attempt is outstanding is a cycle that
+-- attempt is in the middle of interrupting, and one credited to an episode with
+-- no spent attempts is evidence for a reset nobody is waiting for — which would
+-- only put a healthy-period deadline on the schedule of a target that is
+-- perfectly well.
 noteRetirementCycle ∷ Instant → RecoveryEpisode → RecoveryEpisode
 noteRetirementCycle now episode
+  | episodeOutstanding episode = episode
+  | episodeAttempts episode == 0 = episode
   | episodeRetirementCycle episode = episode
   | otherwise = episode {episodeRetirementCycle = True, episodeHealthySince = Just now}
 

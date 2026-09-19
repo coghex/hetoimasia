@@ -300,6 +300,13 @@ things: a completed presentation-retirement cycle on the target, and then a full
 second of monotonic progress after it without another failure. Elapsed time alone
 resets nothing.
 
+A cycle is *both* of its facts. A presentation may retire before its submission
+completes, so retirement on its own is half of one — the frame still owes the
+rendering it submitted — and whichever fact arrives second is what completes the
+cycle. The credit also goes only to an episode that can use it: one with a spent
+attempt and nothing in flight, since a cycle completed during an attempt is a
+cycle that attempt is in the middle of interrupting.
+
 Exhaustion marks an optional target unavailable and leaves the session running;
 for a required target it fails the graphics session. Device loss, a validation
 error, an unknown submission effect and a failed cleanup escalate to the session
@@ -507,9 +514,11 @@ escalating at the failure that spent it; a target closed while its last attempt
 was in flight settling that attempt without escalating anything, and surviving an
 owner turn so that it can; a closed target's record freed by the turn its own
 schedule asked for, with its capacity reusable afterwards; a replacement nobody
-is building keeping the owner coming back until something is; and evidence
-gathered before an attempt refusing to replenish the episode that attempt
-belongs to.
+is building keeping the owner coming back until something is, through the
+generation backpressure that refuses to start it and out the other side once
+capacity returns; a presentation retired before its submission completing no
+cycle until that submission does; and evidence gathered before an attempt
+refusing to replenish the episode that attempt belongs to.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

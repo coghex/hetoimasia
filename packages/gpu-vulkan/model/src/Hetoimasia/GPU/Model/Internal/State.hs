@@ -333,6 +333,10 @@ data Frame = Frame
   , framePoolRecord ∷ !(Maybe Natural)
   , frameBatches ∷ !(Set Natural)
   , frameSubmission ∷ !(Maybe Natural)
+  , framePresentationRetired ∷ !Bool
+    -- ^ Whether this frame's enqueued presentation has already retired. A
+    -- presentation may retire before its submission completes, so the two facts
+    -- of one cycle arrive in either order and whichever is second completes it.
   , frameSubmissionReserved ∷ !Bool
     -- ^ Whether this frame still holds the object capacity its submission record
     -- will need. Reserved with the frame, so committing a submission that the
@@ -1195,6 +1199,7 @@ reserveFrame identity model =
                     , framePoolRecord = Just record
                     , frameBatches = Set.empty
                     , frameSubmission = Nothing
+                    , framePresentationRetired = False
                     , frameSubmissionReserved = True
                     , frameFenceReset = False
                     }
@@ -1727,7 +1732,7 @@ recordCompletion now fact model = case fact of
     resolved (resolveSubmission model identity) $ \(number, submission) →
       if submissionUncertain submission
         then Rejected (WrongPhase SubmissionIdentity)
-        else Admitted (applySubmission number submission model)
+        else Admitted (applySubmission now number submission model)
   PresentationRetired identity →
     resolved (resolvePresentation model identity) $ \(number, record, entry) →
       if poolState entry /= PoolEnqueued
@@ -1741,37 +1746,59 @@ recordCompletion now fact model = case fact of
           Nothing → Rejected (AlreadyConsumed PresentationIdentity)
           Just pool → Admitted (applySettlement number slot pool frame model)
 
-applySubmission ∷ Natural → Submission → GpuModel → GpuModel
-applySubmission number submission model =
-  settleFrames (submissionFrames submission) $
-    releaseObjects
-      1
-      ( foldl'
-          (\current key → editHolds key (dischargeSubmitted number) current)
-          model
-          (Set.toList (submissionSubjects submission))
-      )
-        { gpuSubmissions = Map.delete number (gpuSubmissions model)
-        , gpuBackoff = resetBackoff (gpuBackoff model)
-        }
+applySubmission ∷ Instant → Natural → Submission → GpuModel → GpuModel
+applySubmission now number submission model = settleFrames (submissionFrames submission) credited
+  where
+    discharged =
+      releaseObjects
+        1
+        ( foldl'
+            (\current key → editHolds key (dischargeSubmitted number) current)
+            model
+            (Set.toList (submissionSubjects submission))
+        )
+          { gpuSubmissions = Map.delete number (gpuSubmissions model)
+          , gpuBackoff = resetBackoff (gpuBackoff model)
+          }
+    -- A frame whose presentation retired first completes its cycle here, this
+    -- being the second of the two facts that cycle is made of.
+    credited = foldl' credit discharged (submissionFrames submission)
+    credit current (target, slot) =
+      case Map.lookup target (gpuTargets model) >>= Map.lookup slot . targetFrames of
+        Just frame | framePresentationRetired frame → creditCycle now target current
+        _ → current
 
 applyPresentation ∷ Instant → Natural → Natural → PoolRecord → GpuModel → GpuModel
-applyPresentation now number record entry model =
-  settleFrames [(number, slot) | slot ← slotsUsing number record model] $
-    editTarget
-      number
-      ( \target →
-          target
-            { targetPool = Map.delete record (targetPool target)
-            , targetRecovery = noteRetirementCycle now (targetRecovery target)
-            }
-      )
-      (releaseObjects 1 (discharge model))
-        {gpuBackoff = resetBackoff (gpuBackoff model)}
+applyPresentation now number record entry model = settleFrames [(number, slot) | slot ← users] marked
   where
+    users = slotsUsing number record model
+    removed =
+      editTarget
+        number
+        (\target → target {targetPool = Map.delete record (targetPool target)})
+        (releaseObjects 1 (discharge model))
+          {gpuBackoff = resetBackoff (gpuBackoff model)}
+    -- A retirement is only half of a cycle. The frame has gone only if it
+    -- settled, which for an enqueued frame means its submission has already
+    -- completed, so the cycle is complete now. Otherwise the frame is still
+    -- waiting on that submission: the fact is remembered on it, and the cycle
+    -- completes when the submission does.
+    marked
+      | null users = creditCycle now number removed
+      | otherwise =
+          foldl'
+            (\current slot → editFrame number slot (\frame → frame {framePresentationRetired = True}) current)
+            removed
+            users
     discharge current = case poolGeneration entry of
       Nothing → current
       Just generation → editHolds (GenerationKey number generation) (dischargePresentation record) current
+
+-- | Note a completed normal presentation-retirement cycle on a target's recovery
+-- episode, at the instant the fact that completed it carried.
+creditCycle ∷ Instant → Natural → GpuModel → GpuModel
+creditCycle now number =
+  editTarget number (\entry → entry {targetRecovery = noteRetirementCycle now (targetRecovery entry)})
 
 applySettlement ∷ Natural → Natural → Natural → Frame → GpuModel → GpuModel
 applySettlement number slot pool frame model =
