@@ -38,18 +38,32 @@ P-13. The concrete obstacle and the alternatives are at the end.
 | `cgroup.subtree_control` writable | no | no |
 | Profile installed | **no** | **no** as shipped; **yes** with the restriction relaxed |
 
+**All three runs are kept verbatim in
+[the retained runs](lua_linux_confinement_evidence.md)**, and every line quoted
+below is from one of them.
+
 Environment 1 is the `haskell-engine` worker of `.github/workflows/validation.yml`,
-running the pinned image with `options: --init` and nothing else. Its containers
-declare no added capability and no relaxed syscall filter, and the container
-runtime's default filter is what refuses `unshare(CLONE_NEWUSER)` there. **No
-change was made to the CI image recipe or to those container options**: its
-pinned descriptor and toolchain identity contract are untouched, and requirement
-11 therefore has nothing to record.
+running the pinned image with `options: --init` and nothing else. The record is
+workflow run
+[35458121191](https://github.com/coghex/hetoimasia/actions/runs/35458121191) at
+commit `d83bb90`, whose plan step resolved the candidate's input identity as
+`821b3d3d…6ade21` and whose `receipt-test.lua-confinement-linux-<identity>`
+artifact is that group's receipt. Later commits on this branch change only
+Markdown, which the catalog classes as non-affecting, so that run stays
+input-equivalent to the head this verdict ships with.
+
+Its containers declare no added capability and no relaxed syscall filter, and
+the container runtime's default filter is what refuses `unshare(CLONE_NEWUSER)`
+there with `EPERM`. **No change was made to the CI image recipe or to those
+container options**: its pinned descriptor and toolchain identity contract are
+untouched, and requirement 11 therefore has nothing to record.
 
 Environment 2 is a plain Ubuntu 24.04 virtual machine, outside any container,
 with the qualified toolchain installed and the probe run as an ordinary user
 from the ordinary command. It is not a CI worker and holds nothing a person's
-own machine would not.
+own machine would not. Its refusal is `EACCES` rather than `EPERM`, and the
+difference is the point: the two environments refuse the same profile at the
+same layer for different reasons, and the section below is about the second.
 
 ### What the restriction actually does
 
@@ -118,18 +132,35 @@ limit allowed would otherwise survive the `execve` as an ambient capability.
 Launch is fail-closed at every step: a layer that cannot be installed reports
 `{layer, errno}` to the parent over a close-on-exec pipe and the pre-exec child
 exits. There is no path on which a child runs unconfined, and the parent reaps
-the failed one itself before returning the refusal. Both environments
-demonstrated that, because both refused:
+the failed one itself before returning the refusal. Both refusing environments
+demonstrated that, each with its own errno — the CI container's `EPERM`:
 
+```text
+PROVED typed-refusal layer=user-namespace errno=1 admitted-owners=0 unconfined-child=never-started
+PROVED lifetime-initialization-failure layer=user-namespace errno=1 admitted-owners-unchanged=yes
 ```
+
+and the unprivileged machine's `EACCES`:
+
+```text
 PROVED typed-refusal layer=user-namespace errno=13 admitted-owners=0 unconfined-child=never-started
 PROVED lifetime-initialization-failure layer=user-namespace errno=13 admitted-owners-unchanged=yes
 ```
 
+A refusal is only an acceptable outcome for the obstacle that machine's own
+environment record independently measured. The record forks a child and attempts
+the namespace, the identity maps, and a mount namespace under it; the launcher
+attempts the whole profile; and an example accepts "blocked" only where the two
+agree on the layer and the errno. A refusal anywhere else, or any refusal at all
+on a machine whose record says the namespace is usable, fails the suite rather
+than reporting itself as unproven.
+
 ## Observed, with the profile installed
 
-Environment 2, `apparmor_restrict_unprivileged_userns=0`, 20 examples, 0
-failures. Each line below is the run's own output.
+Environment 2, `apparmor_restrict_unprivileged_userns=0`, 21 examples, 0
+failures. Each line below is the run's own output; the whole of it, including
+the trial child's own report, is in
+[the retained runs](lua_linux_confinement_evidence.md#3-the-same-machine-with-that-restriction-relaxed).
 
 ```
 ENVIRONMENT kernel="6.8.0-101-generic" distribution="Ubuntu 24.04.4 LTS" uid="501 501 501 501"
@@ -166,6 +197,8 @@ PROVED whole-process-memory ceiling=1073741824 measures=address-space lua=refuse
 PROVED execution-bound reason=deadline-exceeded grace-microseconds=750000 escalated=yes
        confined-process-gone=yes observed=signalled:9
 PROVED lifetime-cancellation owner=cancelled child=reaped admitted-owners=0
+PROVED lifetime-immediate-force observed=signalled:9 confined-process-gone=yes
+       waited-for-readiness=no admitted-owners=0
 PROVED lifetime-forced-exit observed=signalled:9 confined-process-gone=yes
        release-followed-observation=yes admitted-owners=0
 ```
@@ -177,10 +210,10 @@ namespaces, the private root, and the limits went in before it existed.
 
 | Proof | Environment 1 | Environment 2, as shipped | Environment 2, restriction relaxed |
 | --- | --- | --- | --- |
-| Launch and isolation | unproven: refused | unproven: refused | **proven** |
+| Launch and isolation | unproven: refused, `EPERM` | unproven: refused, `EACCES` | **proven** |
 | Whole-process memory | unproven: refused | unproven: refused | **proven** |
 | Lifetime and identity | fail-closed half proven | fail-closed half proven | **proven** |
-| Deployment and CI | recorded | recorded | recorded |
+| Deployment and CI | [recorded](lua_linux_confinement_evidence.md#1-the-linux-ci-worker-container) | [recorded](lua_linux_confinement_evidence.md#2-an-ordinary-unprivileged-linux-launch-as-the-distribution-ships) | [recorded](lua_linux_confinement_evidence.md#3-the-same-machine-with-that-restriction-relaxed) |
 
 ### What each denial is denied by
 

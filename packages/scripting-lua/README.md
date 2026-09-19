@@ -417,4 +417,6 @@ the machine could not install the profile and names the prerequisite that was
 missing. What those lines add up to is
 [the Linux confinement verdict](../../docs/lua_linux_confinement_verdict.md),
 which is where the accounting semantics of the memory limit, the deployment
-baseline, and the residual limits are recorded.
+baseline, and the residual limits are recorded, and the runs it draws on are
+kept verbatim in
+[the retained runs](../../docs/lua_linux_confinement_evidence.md).

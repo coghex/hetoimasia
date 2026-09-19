@@ -108,7 +108,9 @@ owning subsystem's contract/design when continuing its work.
   once.
 - LUA-14 (#147) is the Linux confinement and resource-limit feasibility proof,
   and **its verdict is `inconclusive`** — recorded in
-  [the Linux confinement verdict](docs/lua_linux_confinement_verdict.md). The
+  [the Linux confinement verdict](docs/lua_linux_confinement_verdict.md), whose
+  three runs are kept verbatim in
+  [the retained runs](docs/lua_linux_confinement_evidence.md). The
   candidate profile works: on an ordinary unprivileged Linux machine (Ubuntu
   24.04, kernel 6.8, aarch64, non-root, no capability) every row of Q-5's proof
   matrix was demonstrated. It works only where the distribution gives an
