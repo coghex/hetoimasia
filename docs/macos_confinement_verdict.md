@@ -58,16 +58,16 @@ that argues from it.
     "hetoimasia-scripting-lua:macos-confinement-probe",
     "--test-show-details=direct"
   ],
-  "duration_seconds": 3.908,
-  "ended_at": "2026-09-19T15:56:34.384Z",
-  "executed_commit": "47dfd587de7320c5ab12809af9afc6645583b37e",
-  "executed_tree": "a2260610edfe239e01a78e10fcf70913b08ef4a3",
+  "duration_seconds": 3.879,
+  "ended_at": "2026-09-19T16:20:00.000Z",
+  "executed_commit": "391122638858810866aebd38523cb61a94e5e4d3",
+  "executed_tree": "ca24f0a4d1e8db17b6429bbf604108339bec59f7",
   "exit_status": 0,
   "group": "test.macos-confinement",
-  "head_commit": "47dfd587de7320c5ab12809af9afc6645583b37e",
-  "input_identity": "8be6745a824ec37093e02c6537789ec85b87a821fc8244711cee37b109505d7c",
+  "head_commit": "391122638858810866aebd38523cb61a94e5e4d3",
+  "input_identity": "770a3116bed0448c14e9bfc7cb69e8b394be57e6f4e3460fb4b753fee1a07ef4",
   "outcome": "passed",
-  "plan_identity": "7a28822a58f2d4dc0c305d269b2a044d09c15feb6a40a3fa7623bddf4de09a54",
+  "plan_identity": "a0d257a6c801cd25a5cc27261e2c25c599c42e1a544595ae1118a2fb6f9942e8",
   "policy_version": "dac58ca7cfc567e1fdc5ca84d2314445c36168d6b1f61ead32a4c87108715ee5",
   "runner_arch": "arm64",
   "runner_class": "cpu",
@@ -75,7 +75,7 @@ that argues from it.
   "runner_python": "3.14.6",
   "schema_version": 3,
   "source_run_url": "",
-  "started_at": "2026-09-19T15:56:30.476Z",
+  "started_at": "2026-09-19T16:19:56.121Z",
   "timeout_seconds": 1800,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -92,7 +92,7 @@ Its `executed_commit` is not this pull request's head, and it does not need to
 be. Everything committed after it is Markdown, which is
 [harmless prose](validation.md#harmless-prose) excluded from `input_identity` —
 and the head's `input_identity` is still
-`8be6745a824ec37093e02c6537789ec85b87a821fc8244711cee37b109505d7c`, the value
+`770a3116bed0448c14e9bfc7cb69e8b394be57e6f4e3460fb4b753fee1a07ef4`, the value
 the receipt carries. The receipt answers for the tree this pull request asks to
 merge.
 
