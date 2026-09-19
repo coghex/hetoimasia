@@ -86,6 +86,30 @@ spec = describe "Validation planner" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "conditional or brace-delimited Cabal syntax is not supported"
 
+    it "follows a component's native sources and include directories" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.c" (nativeSource 1)
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.h" "int alpha_native(void);\n"
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ nativeFields)
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/cbits/alpha.c" (nativeSource 2)
+        plan ← planJsonAt fixture base []
+        -- C is compiled into the component as surely as its Haskell is, and it
+        -- is declared relative to the package rather than to a Haskell source
+        -- directory, so nothing else in the derivation would reach it.
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "unaffected" False False)
+
+    it "counts a header under a component's include directory" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.c" (nativeSource 1)
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.h" "int alpha_native(void);\n"
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ nativeFields)
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/cbits/alpha.h" "int alpha_native(int);\n"
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
+
     it "selects a test suite through its executable build-tool dependency" $
       withFixture $ \fixture → do
         change fixture "app/Main.hs" "module Main (main) where\nmain :: IO ()\nmain = putStrLn \"revised\"\n"
@@ -557,6 +581,18 @@ linkConditionals =
     , "            rt"
     , "            m"
     ]
+
+-- | Native sources and their include directory, declared relative to the
+-- package as Cabal declares them.
+nativeFields ∷ String
+nativeFields =
+  unlines
+    [ "    c-sources: cbits/alpha.c"
+    , "    include-dirs: cbits"
+    ]
+
+nativeSource ∷ Int → String
+nativeSource value = "int alpha_native(void) { return " ++ show value ++ "; }\n"
 
 -- | A library stanza that is built on one operating system and not on another.
 --

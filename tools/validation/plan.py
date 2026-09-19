@@ -250,7 +250,8 @@ class WorkTree:
 #
 # Supported syntax is deliberately bounded to what this repository uses:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
-# relative ``hs-source-dirs``, ``main-is``, ``build-depends`` (including a
+# relative ``hs-source-dirs``, ``main-is``, ``c-sources``/``cxx-sources`` and
+# ``include-dirs``, ``build-depends`` (including a
 # ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
 # ``if os(...)``/``else`` block inside a stanza that declares only link fields or
 # ``buildable``. Any other conditional, and brace-delimited syntax, can change
@@ -528,6 +529,16 @@ def component_inputs(packages: dict[str, Package], component: str | None) -> set
             inputs.add(prefix + "/" if prefix else "")
             for main in fields.get("main-is", []):
                 inputs.add(join_path(prefix, main))
+        # Native sources are compiled into the component as surely as its
+        # Haskell is, and they are declared relative to the package rather than
+        # to a Haskell source directory, so neither is reached by the loop
+        # above. A group whose C changed and whose plan said nothing would be
+        # evidence about a component that was not the one built.
+        for source in fields.get("c-sources", []) + fields.get("cxx-sources", []):
+            inputs.add(join_path(package.directory, source))
+        for directory in fields.get("include-dirs", []):
+            prefix = join_path(package.directory, directory)
+            inputs.add(prefix + "/" if prefix else "")
     return inputs
 
 

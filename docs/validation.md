@@ -253,10 +253,17 @@ A group's inputs are the union of:
   base revision's catalog;
 - the catalog's `policy_inputs`, from both revisions;
 - the Cabal closure of its `component`: each component's `hs-source-dirs` (as
-  directory prefixes), its `main-is`, the owning package's `.cabal` file, and
-  `cabal.project`, followed transitively across local `build-depends` and
-  `build-tool-depends`. `"all"` starts from every component of every local
-  package.
+  directory prefixes), its `main-is`, its `c-sources`, `cxx-sources`, and
+  `include-dirs`, the owning package's `.cabal` file, and `cabal.project`,
+  followed transitively across local `build-depends` and `build-tool-depends`.
+  `"all"` starts from every component of every local package.
+
+Native sources are declared relative to the package rather than to a Haskell
+source directory, so nothing in the `hs-source-dirs` walk reaches them. They are
+derived separately for that reason: C compiled into a component is as much a
+determinant of what was built as its Haskell, and a group whose C changed and
+whose plan said nothing would be evidence about a component that was not the one
+built.
 
 `cabal.project.common` is declared by **every** group. The planner derives
 `cabal.project` for every component, but not the file that one imports, and that
@@ -283,13 +290,19 @@ document a group genuinely consumes belongs in that group's `inputs`.
 
 Supported Cabal syntax is bounded to what this repository uses: layout-style
 stanzas, `common`/`import`, multiline fields, package-relative `hs-source-dirs`,
-`main-is`, `build-depends`, and `build-tool-depends`. A `build-depends` entry of
+`main-is`, `c-sources`/`cxx-sources` and `include-dirs`, `build-depends`, and
+`build-tool-depends`. A `build-depends` entry of
 the form `package:library` is followed to that one library, a sublibrary or the
 main library, so a suite depending on a sublibrary consumes that sublibrary's
 own sources; the braced `package:{a,b}` form is rejected. Inside a stanza, an
 `if os(...)` block and the `else` directly after it are accepted when they
-declare only `extra-libraries` and `frameworks`, which choose what a link adds on
-one platform and name no input. Any other conditional, anything else inside one,
+declare only `extra-libraries`, `frameworks`, and `buildable` — the first two
+choose what a link adds on one platform, and the third chooses whether the
+stanza is compiled there at all. None of them names an input, and `buildable` in
+particular is invisible to the derivation above: a component this platform does
+not build still has its sources counted, so a
+[platform-only probe](#the-macos-confinement-probe) reports changed inputs
+wherever the plan is taken. Any other conditional, anything else inside one,
 and brace-delimited syntax can change dependencies, so the planner rejects them
 with a diagnostic rather than silently omitting a dependency. `cabal.project` is
 read for its `packages:` field; a glob entry is rejected for the same reason.
