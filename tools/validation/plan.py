@@ -79,9 +79,12 @@ PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 #
 # `buildable` is deliberately invisible to input derivation. A component that is
 # not built on this platform still has its sources, its package description, and
-# its declared inputs counted, so a change to a macOS-only probe is reported as a
-# changed input on Linux too -- unselected, because the group that owns it is
-# optional, but never silently equivalent.
+# its declared inputs counted, so a change to a platform-only probe is reported
+# as a changed input on every platform. Whether the group that owns it is then
+# selected is the group's own business -- the macOS probe's is optional and the
+# Linux one's is not -- and that is the point: what a candidate's inputs are
+# must not depend on which machine planned it, or the same candidate would mean
+# two things.
 LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
 CONDITIONAL_FIELDS = LINK_ONLY_FIELDS | frozenset({"buildable"})
 

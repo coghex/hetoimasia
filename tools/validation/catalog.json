@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 15,
+  "policy_version": 16,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -163,6 +163,27 @@
       "component": "hetoimasia-scripting-lua:test:lua-host-tests",
       "inputs": [
         "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.lua-confinement-linux",
+      "description": "The Linux confinement and resource-limit feasibility probe (LUA-14). Launches confined children through the candidate namespace, private-root, and seccomp profile; records the machine, the permissions, and whether the profile installed at all; and checks the fail-closed refusal, the denied native and Lua accesses with the mechanism that denied each, two-instance isolation and independent termination, the whole-process memory ceiling, the execution bound's escalation, and the three lifetime cases. Built and run on Linux only; on other platforms the components are not built. A green run is evidence, never a supported-platform verdict.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-scripting-lua:linux-confinement-probe",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-scripting-lua:test:linux-confinement-probe",
+      "inputs": [
+        "cabal.project.common",
+        "packages/scripting-lua/linux/",
+        "tools/ci-image/"
       ],
       "framework": "hspec",
       "runner": "cpu",
