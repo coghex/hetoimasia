@@ -188,6 +188,54 @@ spec = describe "owner progress" $ do
     fmap viewTargetRenderDemand (targetView target resumed) `shouldBe` Just True
     nextDeadline (atMilliseconds 0) resumed `shouldBe` Just (atMilliseconds 0)
 
+  it "advertises a recovery retry deadline on an otherwise idle target" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    -- Nothing is pending at all: no frame, no record, no retired generation.
+    pendingObligations active `shouldBe` 0
+    nextDeadline (atMilliseconds 0) active `shouldBe` Nothing
+
+    (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target active)
+    -- While the attempt is in flight the model is waiting on the boundary, not
+    -- on a clock, so it commits to no instant.
+    nextDeadline (atMilliseconds 0) begun `shouldBe` Nothing
+
+    failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 0) target begun)
+    -- The retry is 100 ms away and there is no obligation to poll for, so a
+    -- schedule built from obligations alone would have advertised nothing and
+    -- the owner would never come back to make the attempt.
+    pendingObligations failed `shouldSatisfy` (> 0)
+    nextDeadline (atMilliseconds 0) failed `shouldBe` Just (atMilliseconds 100)
+    -- It is an absolute instant, not an interval, so reading later does not move it.
+    nextDeadline (atMilliseconds 50) failed `shouldBe` Just (atMilliseconds 100)
+
+    -- Once the attempt is admitted the deadline is gone again.
+    (again, _) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 100) target failed)
+    nextDeadline (atMilliseconds 100) again `shouldBe` Nothing
+
+  it "advertises the healthy-progress deadline that resets a recovery episode" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
+    (active, target, _) ← activeTarget 2 model
+    -- Spend the whole episode, so no retry deadline remains and the healthy
+    -- period is the only instant the model is committed to.
+    spent ← spendEpisode target active 3 0
+    fmap viewTargetRecoveryAttempts (targetView target spent) `shouldBe` Just 3
+    nextDeadline (atMilliseconds 3000) spent `shouldBe` Nothing
+
+    -- A full presentation-retirement cycle starts the healthy second.
+    cycled ← completeCycle target (atMilliseconds 3000) spent
+    pendingObligations cycled `shouldSatisfy` (> 0)
+    -- Without this deadline the owner is never woken to observe the reset, so a
+    -- later recovery would start from a budget that should have come back.
+    nextDeadline (atMilliseconds 3000) cycled `shouldBe` Just (atMilliseconds 4000)
+
+    let (tooSoon, _) = runProgressTurn silentEvidence (atMilliseconds 3999) cycled
+    fmap viewTargetRecoveryAttempts (targetView target tooSoon) `shouldBe` Just 3
+    let (healthy, _) = runProgressTurn silentEvidence (atMilliseconds 4000) tooSoon
+    fmap viewTargetRecoveryAttempts (targetView target healthy) `shouldBe` Just 0
+    -- With the episode reset and nothing else outstanding, the schedule is empty.
+    nextDeadline (atMilliseconds 4000) healthy `shouldBe` Nothing
+
   it "has no deadline at all once nothing is pending" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model
@@ -222,6 +270,27 @@ spec = describe "owner progress" $ do
     walk count model = iterate step model !! (count ∷ Int)
       where
         step current = fst (runProgressTurn silentEvidence (atMilliseconds 0) current)
+    -- Burn `count` of an episode's attempts, each one failing.
+    spendEpisode target model count now
+      | count <= (0 ∷ Int) = pure model
+      | otherwise = do
+          (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds now) target model)
+          failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds now) target begun)
+          spendEpisode target failed (count - 1) (now + 1000)
+    -- One full acquire / submit / present / retire cycle, which is what a
+    -- recovery episode's healthy period is measured from.
+    completeCycle target now model = do
+      (framed, frame) ← acquiredFrame target model
+      (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted framed)
+      submission ← case submitAnswer of
+        SubmissionRecorded value → pure value
+        other → fail ("expected a submission record, got " ++ show other)
+      (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued submitted)
+      presentation ← case presentAnswer of
+        PresentationTracked value → pure value
+        other → fail ("expected a presentation record, got " ++ show other)
+      completed ← admitted_ "completing" (recordCompletion now (SubmissionCompleted submission) presented)
+      admitted_ "retiring the presentation" (recordCompletion now (PresentationRetired presentation) completed)
     -- Drive `count` frames to a submitted state whose records stay pending.
     enqueueFrames target count model = go model (count ∷ Natural) []
       where

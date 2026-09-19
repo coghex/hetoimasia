@@ -61,6 +61,8 @@ module Hetoimasia.GPU.Model
   , Escalation (..)
   , sessionState
   , escalations
+  , escalationsDropped
+  , takeEscalations
   , escalateSession
 
     -- * Targets

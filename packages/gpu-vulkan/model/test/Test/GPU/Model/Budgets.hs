@@ -245,6 +245,23 @@ spec = describe "admission budgets" $ do
       rejected_ "releasing a disposed resource" (releaseResource lastResource final)
         >>= (`shouldBe` StaleIdentity ResourceIdentity)
 
+    it "keeps the escalation window finite under optional-target churn" $ do
+      -- One target record, admitted and lost over and over. Each incarnation is
+      -- a distinct notice, so deduplication alone would let the list grow for
+      -- ever while no record at all is retained.
+      model ← freshModelWith smallRequest {requestedTargetRecords = 1}
+      churned ← churn model (40 ∷ Int)
+      liveRecordCount churned `shouldBe` 0
+      sessionState churned `shouldBe` SessionRunning
+      length (escalations churned) `shouldSatisfy` (<= 2)
+      -- Nothing vanishes unaccounted: what the window dropped is counted.
+      escalationsDropped churned `shouldSatisfy` (> 0)
+      fromIntegral (length (escalations churned)) + escalationsDropped churned `shouldBe` (40 ∷ Natural)
+
+      -- A boundary that drains each turn never reaches the bound at all.
+      drained ← churnDraining model (40 ∷ Int) 0
+      drained `shouldBe` (40 ∷ Int)
+
   describe "storage" $
     it "stays finite when no completion ever arrives" $ do
       model ← freshModelWith smallRequest
@@ -268,6 +285,29 @@ spec = describe "admission budgets" $ do
       sessionState final `shouldBe` SessionRunning
   where
     validated request = either (fail . show) pure (validateBudgets request)
+    -- Admit an optional target, exhaust its recovery, and let the turn forget
+    -- the unavailable record so the number is reissued next time round.
+    loseOne model = do
+      (withTarget, target) ← admitted "admitting an optional target" (admitTarget OptionalTarget model)
+      spent ← spend target withTarget (3 ∷ Int) 0
+      (exhausted, answer) ← admitted "exhausting it" (beginTargetRecovery (atMilliseconds 99999) target spent)
+      answer `shouldBe` RecoveryExhausted (OptionalTargetUnavailable target)
+      pure (fst (runProgressTurn silentEvidence (atMilliseconds 99999) exhausted))
+    spend target model count now
+      | count <= 0 = pure model
+      | otherwise = do
+          (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds now) target model)
+          failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds now) target begun)
+          spend target failed (count - 1) (now + 1000)
+    churn model count
+      | count <= 0 = pure model
+      | otherwise = loseOne model >>= \next → churn next (count - 1)
+    churnDraining model count seen
+      | count <= 0 = pure seen
+      | otherwise = do
+          next ← loseOne model
+          let (emptied, taken) = takeEscalations next
+          churnDraining emptied (count - 1) (seen + length taken)
     -- One create / release / end-CPU-use / dispose cycle, answering the model
     -- and the identity the cycle disposed of.
     oneCycle current = do

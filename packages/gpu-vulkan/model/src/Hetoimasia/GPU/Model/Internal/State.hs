@@ -26,6 +26,8 @@ module Hetoimasia.GPU.Model.Internal.State
   , Escalation (..)
   , sessionState
   , escalations
+  , escalationsDropped
+  , takeEscalations
   , escalateSession
 
     -- * Targets
@@ -133,6 +135,7 @@ import Hetoimasia.GPU.Model.Internal.Budget
   , byteLimit
   , frameSlotLimit
   , generationLimit
+  , healthyProgressPeriod
   , imageTrackingLimit
   , objectLimit
   , presentationPoolCapacity
@@ -166,7 +169,13 @@ import Hetoimasia.GPU.Model.Internal.Recovery
       , attemptRetrySpent
       )
   , BackoffState
-  , RecoveryEpisode (episodeAttempts, episodeOutstanding)
+  , RecoveryEpisode
+      ( episodeAttempts
+      , episodeHealthySince
+      , episodeNextAttemptAt
+      , episodeOutstanding
+      , episodeRetirementCycle
+      )
   , RecoveryProgress
       ( AttemptAdmitted
       , AttemptBudgetExhausted
@@ -405,6 +414,8 @@ data GpuModel = GpuModel
     -- pass examines a bounded window of it, so the cursor is what guarantees a
     -- record beyond one window is reached by a later pass rather than never.
   , gpuEscalations ∷ ![Escalation]
+    -- ^ Newest first, and bounded: see 'note'.
+  , gpuEscalationsDropped ∷ !Natural
   , gpuState ∷ !SessionState
   }
   deriving (Eq, Show)
@@ -439,6 +450,7 @@ newGpuModel session budgets = (model, device)
         , gpuCursor = 0
         , gpuReclaimCursor = 0
         , gpuEscalations = []
+        , gpuEscalationsDropped = 0
         , gpuState = SessionRunning
         }
 
@@ -454,24 +466,52 @@ modelBudgets = gpuBudgets
 sessionState ∷ GpuModel → SessionState
 sessionState = gpuState
 
--- | Escalations in the order they happened, each recorded once.
+-- | The escalations the model is still holding, oldest first. They are notices
+-- for the owning boundary rather than state the model acts on, so a boundary
+-- that reads them without 'takeEscalations' sees the retained window.
 escalations ∷ GpuModel → [Escalation]
 escalations = reverse . gpuEscalations
 
--- | Escalate the session. The first cause is kept: a teardown that then fails
--- cleanup must not overwrite the device loss that started it.
-escalateSession ∷ SessionFailureCause → GpuModel → GpuModel
-escalateSession cause model =
-  (note (SessionEscalated cause) model)
-    { gpuState = case gpuState model of
-        SessionRunning → SessionFailed cause
-        failed → failed
-    }
+-- | How many notices were dropped to keep the retained window finite. A dropped
+-- notice is counted rather than forgotten, on the same rule as every other
+-- accounting here: nothing vanishes unaccounted.
+escalationsDropped ∷ GpuModel → Natural
+escalationsDropped = gpuEscalationsDropped
 
+-- | Take the retained notices, leaving none behind. This is the consuming read;
+-- a boundary that drains each turn never reaches the window's bound.
+takeEscalations ∷ GpuModel → (GpuModel, [Escalation])
+takeEscalations model = (model {gpuEscalations = []}, escalations model)
+
+-- | Escalate the session. The first cause is kept: a teardown that then fails
+-- cleanup must not overwrite the device loss that started it — and only that
+-- first cause is notified, so a session cannot accumulate a notice per later
+-- failure of a session that has already ended.
+escalateSession ∷ SessionFailureCause → GpuModel → GpuModel
+escalateSession cause model = case gpuState model of
+  SessionFailed _ → model
+  SessionRunning → (note (SessionEscalated cause) model) {gpuState = SessionFailed cause}
+
+-- | Retain one notice, keeping the window finite.
+--
+-- Deduplication alone is not a bound: a target number is reissued under a fresh
+-- incarnation, so a session that admits, loses and readmits an optional target
+-- for ever would produce a distinct notice every time. The window therefore
+-- holds at most one notice per target record the configuration allows, plus the
+-- one a failed session can ever raise; beyond that the oldest is dropped and
+-- counted.
 note ∷ Escalation → GpuModel → GpuModel
 note escalation model
   | escalation `elem` gpuEscalations model = model
-  | otherwise = model {gpuEscalations = escalation : gpuEscalations model}
+  | length retained >= capacity =
+      model
+        { gpuEscalations = escalation : take (capacity - 1) retained
+        , gpuEscalationsDropped = gpuEscalationsDropped model + fromIntegral (length retained - (capacity - 1))
+        }
+  | otherwise = model {gpuEscalations = escalation : retained}
+  where
+    retained = gpuEscalations model
+    capacity = fromIntegral (targetRecordLimit (gpuBudgets model)) + 1
 
 -- | Schedule an immediate progress opportunity. Every transition that creates a
 -- retirement or disposal obligation goes through this, because requirement 7's
@@ -504,9 +544,27 @@ resolveTarget model identity
     number = targetNumber identity
     incarnation = targetIncarnation identity
 
+-- | Report a compound identity's parent-resolution failure as being about the
+-- identity the caller actually supplied. The category is preserved — a foreign
+-- parent still means foreign — because it is the category that tells the caller
+-- what went wrong; only the kind is corrected, because naming the parent would
+-- describe a value the caller never passed.
+asKind ∷ IdentityKind → Either Misuse a → Either Misuse a
+asKind kind = either (Left . retarget) Right
+  where
+    retarget = \case
+      ForeignIdentity _ → ForeignIdentity kind
+      UnknownIdentity _ → UnknownIdentity kind
+      StaleIdentity _ → StaleIdentity kind
+      AlreadyConsumed _ → AlreadyConsumed kind
+      WrongPhase _ → WrongPhase kind
+      WrongParent _ → WrongParent kind
+      DuplicateSubject _ → DuplicateSubject kind
+      other → other
+
 resolveGeneration ∷ GpuModel → GenerationId → Either Misuse (Natural, Natural, Generation)
 resolveGeneration model identity = do
-  (number, target) ← resolveTarget model (generationTarget identity)
+  (number, target) ← asKind GenerationIdentity (resolveTarget model (generationTarget identity))
   let generation = generationNumber identity
   case Map.lookup generation (targetGenerations target) of
     Just record → Right (number, generation, record)
@@ -516,7 +574,7 @@ resolveGeneration model identity = do
 
 resolveFrame ∷ GpuModel → FrameSlotId → Either Misuse (Natural, Natural, Frame)
 resolveFrame model identity = do
-  (number, target) ← resolveTarget model (frameTarget identity)
+  (number, target) ← asKind FrameIdentity (resolveTarget model (frameTarget identity))
   let slot = frameSlotNumber identity
       use = frameUse identity
   case Map.lookup slot (targetFrames target) of
@@ -529,7 +587,7 @@ resolveFrame model identity = do
 
 resolveBatch ∷ GpuModel → BatchId → Either Misuse (Natural, Batch)
 resolveBatch model identity = do
-  _ ← resolveTarget model (batchTarget identity)
+  _ ← asKind BatchIdentity (resolveTarget model (batchTarget identity))
   let number = batchNumber identity
   case Map.lookup number (gpuBatches model) of
     Just record → Right (number, record)
@@ -550,7 +608,7 @@ resolveSubmission model identity
 
 resolvePresentation ∷ GpuModel → PresentationId → Either Misuse (Natural, Natural, PoolRecord)
 resolvePresentation model identity = do
-  (number, target) ← resolveTarget model (presentationTarget identity)
+  (number, target) ← asKind PresentationIdentity (resolveTarget model (presentationTarget identity))
   let record = presentationNumber identity
   case Map.lookup record (targetPool target) of
     Just entry → Right (number, record, entry)
@@ -807,8 +865,10 @@ beginGeneration identity replacing model =
     begin number target = case replacing of
       Nothing → bounded target (construct number target model)
       Just old → resolved (resolveGeneration model old) $ \(oldTarget, oldNumber, record) →
+        -- Both identities are this session's, so this is not foreignness: it is a
+        -- generation offered to a target that does not own it.
         if oldTarget /= number
-          then Rejected (ForeignIdentity GenerationIdentity)
+          then Rejected (WrongParent GenerationIdentity)
           else
             if generationPhase record == GenerationRetired
               then Rejected (AlreadyConsumed GenerationIdentity)
@@ -1988,16 +2048,57 @@ forgetIfRetired model number = case Map.lookup number (gpuTargets model) of
 nextDeadline ∷ Instant → GpuModel → Maybe Instant
 nextDeadline now model
   | renderDemand = Just now
-  | pendingObligations model > 0 = either (const Nothing) Just (addDuration now interval)
-  | otherwise = Nothing
+  | otherwise = case scheduled of
+      [] → Nothing
+      entries → Just (minimum entries)
   where
     renderDemand =
       or
         [ targetRenderDemand target && targetPhase target == TargetAdmitted
         | target ← Map.elems (gpuTargets model)
         ]
+    -- The backoff paces the polling of obligations; the recovery deadlines are
+    -- absolute instants the model has already committed to. The earliest of them
+    -- all is the next time the owner has something to do. A deadline in the past
+    -- means the owner is overdue, and is reported as it stands.
+    scheduled =
+      [instant | obligations > 0, Right instant ← [addDuration now interval]]
+        ++ recoveries
+    recoveries = recoveryDeadlines model
+    obligations = fromIntegral (Map.size (gpuSubmissions model)) + recordObligations model ∷ Natural
     interval ∷ Duration
     interval = currentBackoff (gpuBudgets model) (gpuBackoff model)
+
+-- | Every absolute instant a target's recovery accounting has committed to: when
+-- its next construction attempt may begin, and when a healthy period that has
+-- started would complete and reset its episode.
+--
+-- Without these the owner is never woken for either. A target whose first
+-- attempt has just failed and that is otherwise idle has no obligation to poll
+-- for, so a schedule built from obligations alone would advertise no deadline at
+-- all; and the episode's reset needs a turn to observe it, so it would never
+-- happen, leaving a later recovery starting from a budget that should have been
+-- returned.
+recoveryDeadlines ∷ GpuModel → [Instant]
+recoveryDeadlines model =
+  concat
+    [ retry episode ++ healthy episode
+    | target ← Map.elems (gpuTargets model)
+    , targetPhase target `notElem` [TargetRetiring, TargetUnavailable]
+    , let episode = targetRecovery target
+    ]
+  where
+    retry episode
+      | episodeOutstanding episode = []
+      | otherwise = [at | Just at ← [episodeNextAttemptAt episode]]
+    healthy episode
+      | episodeOutstanding episode = []
+      | not (episodeRetirementCycle episode) = []
+      | otherwise =
+          [ instant
+          | Just since ← [episodeHealthySince episode]
+          , Right instant ← [addDuration since healthyProgressPeriod]
+          ]
 
 -- | Everything the model is still waiting on: pending submissions, enqueued
 -- presentations, records awaiting settlement, and subjects that are settled but
@@ -2005,7 +2106,14 @@ nextDeadline now model
 pendingObligations ∷ GpuModel → Natural
 pendingObligations model =
   fromIntegral (Map.size (gpuSubmissions model))
-    + fromIntegral (length [() | target ← targets, entry ← Map.elems (targetPool target), poolState entry /= PoolReserved])
+    + recordObligations model
+    + fromIntegral (length (recoveryDeadlines model))
+
+-- | The obligations that are records rather than schedules: pending submissions
+-- are counted by the caller, and these are the rest.
+recordObligations ∷ GpuModel → Natural
+recordObligations model =
+  fromIntegral (length [() | target ← targets, entry ← Map.elems (targetPool target), poolState entry /= PoolReserved])
     + fromIntegral (length (retiring model))
     + fromIntegral (length (eligibleSubjects model))
   where

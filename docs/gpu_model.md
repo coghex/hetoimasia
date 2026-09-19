@@ -89,10 +89,20 @@ remembering every identity ever issued.
 `Misuse` distinguishes `ForeignIdentity` (another session's), `UnknownIdentity`
 (never issued), `StaleIdentity` (issued, since retired or superseded),
 `AlreadyConsumed` (a one-shot record settled twice), `WrongPhase`,
-`DuplicateSubject` (one call naming the same object twice), `EmptySubmission`,
+`DuplicateSubject` (one call naming the same object twice), `WrongParent` (this
+session's, but not the object it was passed alongside), `EmptySubmission`,
 `EmptyAllocation`, and `SessionAlreadyFailed`. Each names only the *kind* of
 identity, never the value, so a refusal about a foreign value cannot smuggle that
 value back out.
+
+A compound identity is reported as being about *itself*. A generation, frame,
+batch or presentation resolves through its target, but a failure there is
+answered with the kind the caller actually supplied: the category is preserved —
+a foreign parent still means foreign — while naming the parent would describe a
+value the caller never passed. `WrongParent` is kept separate from
+`ForeignIdentity` for the same reason: one target's generation offered to another
+is a mistake about the association between two of this session's own identities,
+not about whose session they came from.
 
 A managed resource is rebuilt only through its *current* generation, and the
 successor is derived from the resource's own counter rather than from the
@@ -315,8 +325,19 @@ The turn answers the absolute instant of the next one:
 
 - a target with render demand that is **not suspended** asks for an immediate
   opportunity;
-- otherwise, if anything is pending, the deadline is one backoff interval away;
-- with nothing pending at all there is no deadline.
+- otherwise it is the earliest of the instants the model is committed to: one
+  backoff interval away if any obligation is pending, and every absolute recovery
+  deadline — when a target's next construction attempt may begin, and when a
+  healthy period that has started would complete and reset its episode;
+- with nothing pending and nothing scheduled there is no deadline.
+
+The recovery deadlines have to be there. A target whose first attempt has just
+failed and that is otherwise idle has no obligation to poll for, so a schedule
+built from obligations alone would advertise nothing and the owner would never
+come back to make the attempt; and the episode's reset needs a turn to observe
+it, so it would never happen, leaving a later recovery starting from a budget
+that should have come back. A deadline in the past means the owner is overdue,
+and is reported as it stands.
 
 The backoff schedule is 5, 10, 20, 40, 80 and then the configured cap of 100 ms.
 The obligation that created the work schedules the first poll five milliseconds
@@ -345,11 +366,20 @@ prove the whole schedule.
 | State             | Owner              | Readers and writers       | Thread | Lifetime     | Reset or disposal                          |
 | ----------------- | ------------------ | ------------------------- | ------ | ------------ | -------------------------------------------- |
 | The `GpuModel`    | The owning boundary| Whoever threads the value | Any    | The session  | A record leaves only when every hold has ended |
+| Escalation notices| The owning boundary| The model raises; `takeEscalations` drains | Any | Until taken | Dropped oldest-first past the window, and counted |
 
 Nothing accumulates as history. A disposed resource's current-generation entry is
 removed, a settled frame gives back the reservations it never used, and a
 disposal that failed is remembered once rather than retried, so the model's record
 count stays a function of the configuration.
+
+Escalations are notices, and they are bounded too. Deduplication alone is not a
+bound — a target number is reissued under a fresh incarnation, so a session that
+admits, loses and readmits an optional target for ever would raise a distinct
+notice every time. The retained window holds at most one notice per target record
+the configuration allows, plus the one a failed session can ever raise; beyond
+that the oldest is dropped and `escalationsDropped` counts it. A boundary that
+drains with `takeEscalations` never reaches the bound.
 
 The model owns no mutable state at all: it is an immutable value, and every
 operation returns the next one. Concurrency, if any, belongs to the boundary that
@@ -405,6 +435,13 @@ already-recorded batch survives; a retry refused in a terminal session for every
 cause that ends one; a reclamation pass reading exactly its window of raw records
 and reaching an eligible one beyond that window on a later pass; and the backoff
 restarting for retirement work whoever created it.
+
+And the scheduling and identity edges: a retry deadline and a healthy-reset
+deadline each advertised on a target with no other work at all; the escalation
+window staying finite under optional-target churn, with what it dropped counted
+and a draining boundary never reaching the bound; every compound identity
+reported by its own kind rather than its parent's; and one target's generation
+offered to another called a wrong parent rather than a foreigner.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

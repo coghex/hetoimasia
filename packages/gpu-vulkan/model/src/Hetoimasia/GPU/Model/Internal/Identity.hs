@@ -321,6 +321,11 @@ data Misuse
   | DuplicateSubject !IdentityKind
     -- ^ One call named the same object twice, such as a multi-frame submission
     -- listing a slot more than once.
+  | WrongParent !IdentityKind
+    -- ^ The value is this session's and names a live object, but not one of the
+    -- object it was passed alongside — a generation of another target offered as
+    -- that target's predecessor, for instance. It is deliberately not
+    -- 'ForeignIdentity', which means another session's model entirely.
   | EmptySubmission
     -- ^ A submission named no frame at all.
   | EmptyAllocation

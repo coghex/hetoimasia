@@ -64,6 +64,43 @@ spec = describe "identities" $ do
     rejected "retrying another session's allocation" (retryAllocation theirAllocation framed)
       `shouldReturn'` ForeignIdentity AllocationIdentity
 
+  it "names the identity it was handed, not the parent it resolved through" $ do
+    mine ← freshModel
+    theirs ← freshModel
+    (active, target, generation) ← activeTarget 2 theirs
+    (framed, frame) ← acquiredFrame target active
+    (resourced, resource) ← aResource 1024 framed
+    (recordedBatch, batch) ← admitted "recording" (recordBatch frame [resource] resourced)
+    (submitted, _) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted recordedBatch)
+    (_, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued submitted)
+    presentation ← presentationOf presentAnswer
+
+    -- Each of these resolves through its target, and each is foreign to this
+    -- model. Reporting the parent's kind would describe a value the caller never
+    -- passed, and would read as though a target had been supplied.
+    rejected "publishing another session's generation" (publishGeneration generation 2 mine)
+      `shouldReturn'` ForeignIdentity GenerationIdentity
+    rejected_ "resetting another session's recorder" (resetRecorder frame mine)
+      `shouldReturn'` ForeignIdentity FrameIdentity
+    rejected_ "discarding another session's batch" (discardBatch batch mine)
+      `shouldReturn'` ForeignIdentity BatchIdentity
+    rejected_ "retiring another session's presentation" (recordCompletion (atMilliseconds 1) (PresentationRetired presentation) mine)
+      `shouldReturn'` ForeignIdentity PresentationIdentity
+
+  it "calls a generation offered to a target that does not own it a wrong parent, not a foreigner" $ do
+    model ← freshModel
+    (first, one, generationOfOne) ← activeTarget 2 model
+    (both, two, _) ← activeTarget 2 first
+
+    -- Both identities are this model's, so nothing here is foreign: the mistake
+    -- is the association between them.
+    rejected "handing one target's generation to another" (beginGeneration two (Just generationOfOne) both)
+      `shouldReturn'` WrongParent GenerationIdentity
+    -- And it changed nothing: the generation is still the first target's active
+    -- one, and the second target has gained no construction.
+    fmap viewTargetActive (targetView one both) `shouldBe` Just (Just generationOfOne)
+    fmap viewTargetGenerations (targetView two both) `shouldBe` Just 1
+
   it "rejects an identity for a target whose number has been reissued" $ do
     model ← freshModel
     (withTarget, first) ← admitted "admitting" (admitTarget OptionalTarget model)
