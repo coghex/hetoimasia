@@ -7,8 +7,13 @@ boundary, and a terminal close. It depends on `hetoimasia-foundation` and the
 Lua binding and on nothing else in the engine: no runtime, GLFW, Vulkan,
 console, or game code.
 
+Beside it, and sharing nothing with it, the package owns the **protocol model**:
+the pure task, admission, request, subscription, epoch, failure, and stop types
+that later slices implement against. See
+[The protocol model](#the-protocol-model).
+
 The public module and capability registration surface, the protected VM owner,
-the task and admission model, and any game binding are later slices of
+and any game binding are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -383,6 +388,119 @@ claiming it here would assert a property this slice has not established. The
 close proof lives in the suite's own private fixture; the protected owner that
 will make that claim is LUA-2's.
 
+
+## The protocol model
+
+The private `model` sublibrary (`model/`) is LUA-4: the vocabulary a scheduler,
+a provider, and a transport implement against, as pure data and pure functions.
+It performs no IO, reads no clock, and creates no interpreter, and its
+`build-depends` names only `base`, `containers`, and `text` — neither the `lua`
+binding nor this package's own `bridge` sublibrary. That last fact is the
+boundary, and it is checked two ways that answer different questions:
+`Test.Lua.Protocol.Fixture` reports that the examples acquired no interpreter,
+and `Test.Lua.Protocol.Boundary` reads the Cabal stanza and every model module's
+imports, because a component can depend on the binding and simply not call it.
+
+Every record is parameterised by one application value type the model never
+inspects. A cursor is one, a settlement carries one, an event delivers one, and
+nothing in the package pattern matches on it.
+
+### Identities
+
+`Hetoimasia.Scripting.Lua.Internal.Protocol.Identity`. An `Owner` is one `ModId`
+in one `ExecutionDomain`; a `SessionKey` adds its `SessionId` and `Epoch`. Every
+`TaskId`, `RequestId`, and `SubscriptionId` carries that scope, so D-8's
+isolation is structural: two mods' first tasks are different values, and so are
+two epochs' or two sessions'. `RequestId` and `SubscriptionId` add a
+`Generation`, so a local number freed by observation or unsubscribe cannot be
+reached by a message already in flight for the identity it replaced. `Ordinal`
+is the one counter that is not an identity: the session issues it on admission
+and on every re-entry into the ready set, which is what puts a yielded task
+behind its ready peers.
+
+### Tasks and transitions
+
+`…Protocol.Task`. A `Task` holds identity, behaviour identity, service class,
+state, cursor, ordinal, readiness, and an optional pending interest. Its
+`TaskState` is `Ready`, `Running`, `Waiting` with its exact `WaitCause`,
+`Paused`, or one of `Completed`, `Cancelled`, and `Failed`. Each transition —
+`startTask`, `applySegment`, `wakeTask`, `pauseTask`, `resumeTask`,
+`cancelTask`, `failTask` — is a pure function answering the next task or a
+`TransitionRejection`: `AlreadyTerminal`, `WrongState`, `StaleScope`,
+`AheadOfScope`, or `ForeignScope`. A rejection returns the task untouched, a
+terminal task refuses everything including another terminal transition, and the
+scope check runs before the state check, so a stale resume reports staleness
+rather than the state it happened to find. `applySegment` is the only function
+that writes a cursor, and it requires `Running`: a `SegmentOutcome` is
+completed, yielded with a new cursor, or waiting on a named cause.
+
+### Caps
+
+`…Protocol.Limits`. `Limits` bounds active tasks, queued admissions,
+subscriptions, one ordered-event backlog, outstanding requests, payload size,
+and retained terminal results, with a finite `Quantum` per `ServiceClass`
+(`ControlClass`, `OrdinaryClass`, `BackgroundClass`). `validateLimits` answers
+every `LimitViolation` it finds, and a `ValidLimits` can be obtained no other
+way, so no session exists over an unchecked configuration. The quanta are
+recorded and enforced by nothing here; choosing what runs next is LUA-6's.
+
+### The session
+
+`…Protocol.Session` composes the rest. Each operation answers
+`(Session v, Either SessionRejection a)`, and a rejection changes no record —
+only `sessionCounters`, which keeps how often something was refused or
+discarded. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
+`PayloadTooLarge`, the four `Duplicate`/`Unknown` identity refusals,
+`NotTaskOwner`, `NoTerminalResult`, `NothingQueued`, `NoDelivery`,
+`SessionAlreadyFailed`, `SessionAlreadyStopped`, and the wrapped refusals of the
+records themselves (`TransitionRefused`, `ReplyRefused`, `ObserveRefused`,
+`ProviderRefused`, `DeliveryRefused`).
+
+Two bounds are worth stating in full.
+
+**Terminal-result storage** is reserved at admission and released when the
+result is observed or discarded, so a completed task whose result nobody reads
+keeps occupying storage its admission already paid for, and the session refuses
+the next admission rather than growing. There is no ticket history.
+
+**A request holds two independent obligations** and its bookkeeping is reclaimed
+only when both are discharged: its result observed or discarded, and its
+provider's work known to have ended. Completing the provider does not release an
+unobserved result; observing a cancellation does not establish that the provider
+stopped. Cancellation, task invalidation, epoch change, failure, and stop all
+revoke delivery authority without establishing provider completion, and the
+accounting for it survives them, keyed by the old identity. A late reply is
+refused and publishes nothing, and still retires that accounting, because an
+answer is evidence the provider finished.
+
+Subscriptions declare their endpoint's `OverloadPolicy`: `OrderedEvents` rejects
+and counts a delivery into a full backlog, `ReplaceableState` coalesces to the
+newest value. There is no universal lossy stream.
+
+`advanceEpoch` invalidates every task, queued admission, subscription, and
+pending request of the previous epoch before the new one exists, retaining only
+provider-work accounting. `reportFailure` with `RecoveryUnsafe` moves the
+session to its terminal failed state: mutation admission closes, live work is
+invalidated, and the record is kept beside the identity of the last good
+snapshot. `Observing` admission stays open, because a failed gameplay session
+that could say nothing about itself would be worse than a stopped one, and
+`advanceEpoch` refuses it — replacing a failed domain means a new `Session`.
+`stopSession` closes admission, aborts queued work, records a task inside a
+segment as outstanding rather than draining it, and answers an `ExitRecord` of
+dispositions and discard counts. There is no operation that waits for every task
+to finish, and the exit record carries no worker cleanup evidence: that is
+supervision's, and mixing the two would let a clean stop here be read as proof a
+worker unwound.
+
+### Who consumes what
+
+| Slice | What it takes from this model |
+| --- | --- |
+| LUA-6, the scheduler | `ServiceClass`, `Quanta`, `Ordinal`, the ready/waiting states, `activateNext` |
+| LUA-7, requests and subscriptions | `RequestId`, `Settlement`, `Reply`, the two obligations, `OverloadPolicy` |
+| LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
+| LUA-5, supervision integration | `FailureRecord`, `RecoverySafety`, `ExitRecord` |
+
 ## Running the suite
 
 ```bash
@@ -392,6 +510,16 @@ cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
+
+The protocol model's examples are the `Protocol` component of that same suite:
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-host-tests \
+  --test-show-details=direct --test-options='--match Protocol'
+```
+
+They need no interpreter, and the group's last example reports that it acquired
+none.
 
 ## The Linux confinement probe
 
