@@ -2842,7 +2842,12 @@ is forced inside the attempt that catches it, so a value that raises only when
 it is demanded is that attempt's failure rather than one escaping it. After a
 successful body the first drain failure becomes primary and later ones are
 retained; beyond a bounded number they are counted rather than kept, so a
-boundary waiting indefinitely cannot grow without bound.
+boundary waiting indefinitely cannot grow without bound. The one stall
+diagnostic a drain claims is kept past that bound rather than counted: the
+identity it carries is what keeps the runtime's reporting and the final flush
+off a sink that has already failed, and a drain with enough failed steps to fill
+the bound is exactly the one whose stall it reports. That is one entry beyond
+the bound, not a growing set.
 
 A cancellation delivered during the drain is deferred. It is counted against
 every pending attachment as that attachment's own evidence, establishes no fact,
@@ -2984,7 +2989,10 @@ that counts its flushes, that same failing diagnostic settling as the run's own
 failure with the diagnostic-failure identity, no second write, and no flush,
 and settling beside an action failure that stays primary and unmarked with the
 diagnostic's retained under `glfw protected retirement`, and a cancellation at
-that sink deferred as a cancellation until retirement is safe; the wake path's
+that sink deferred as a cancellation until retirement is safe, and that same
+failing diagnostic kept rather than elided where ten failed steps have already
+filled the retained bound, so the second write and the flush are still not
+made; the wake path's
 own warning failing at this exit's boundary through the same sink, alone and
 beside an action failure that stays primary, with the window and the session
 live when it was written and released only afterwards; a declaration

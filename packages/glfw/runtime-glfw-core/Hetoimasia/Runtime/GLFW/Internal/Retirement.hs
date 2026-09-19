@@ -69,7 +69,10 @@
 --
 -- Retained evidence is bounded. At most 'retainedFailureLimit' failures are
 -- kept beside the first and the rest are counted, so a boundary waiting
--- indefinitely under the stall policy cannot grow without bound. A native pump
+-- indefinitely under the stall policy cannot grow without bound. The one stall
+-- diagnostic a drain claims is kept past that bound rather than counted, since
+-- its mark is what keeps the runtime's reporting off a failed sink; that is one
+-- entry, not a growing set. A native pump
 -- that fails withdraws itself for the same reason; the drain then waits on the
 -- inbox under a finite timer instead, and completion notices still finish
 -- retirement.
@@ -332,6 +335,10 @@ retirementOperation = operation "retire window attachment"
 
 -- | The most failures retained beside the first before later ones are only
 -- counted.
+--
+-- The stall diagnostic's own failed attempt is kept past this bound, because
+-- the runtime reads its mark; 'absorbDiagnostic' says why. A drain claims that
+-- diagnostic once, so what is retained is this many plus at most one.
 retainedFailureLimit ∷ Int
 retainedFailureLimit = 8
 
@@ -1229,7 +1236,8 @@ data DrainOutcome = DrainOutcome
     -- ^ The first synchronous failure the drain raised, which becomes primary
     -- only if the body succeeded.
   , drainRetained ∷ ![Evidence]
-    -- ^ Later failures, oldest first, bounded by 'retainedFailureLimit'.
+    -- ^ Later failures, oldest first, bounded by 'retainedFailureLimit' plus
+    -- the one stall diagnostic 'absorbDiagnostic' keeps past it.
   , drainElided ∷ !Natural
     -- ^ Failures beyond that bound, counted rather than kept.
   , drainDeferred ∷ !(Maybe Evidence)
@@ -1466,7 +1474,7 @@ declareStall retirement environment restore outcome = do
             -- the stall is retaining, and the failure it raises is the
             -- diagnostic's however late it is demanded.
             >>= evaluate
-      absorb retirement attempted outcome
+      absorbDiagnostic retirement attempted outcome
 
 -- | The round's native step, and the finite wait that ends it.
 --
@@ -1519,6 +1527,27 @@ absorb retirement attempted outcome = case attempted of
         pure (deferCancellation caught outcome)
     | otherwise → pure (retainFailure caught outcome)
 
+-- | 'absorb' for the stall diagnostic's own attempt.
+--
+-- A cancellation is deferred exactly as any other is. A synchronous failure is
+-- kept exactly as any other is — the drain's first after a successful body, or
+-- retained after one — except that the retained-failure bound may not elide it.
+--
+-- What it carries is the 'Hetoimasia.Runtime.Reporting.DiagnosticFailure' mark,
+-- and that mark is the whole of how the protected exit tells the runtime to
+-- keep its terminal report and its final flush off a sink that has already
+-- failed. A drain with enough failed attachment steps to fill the bound is
+-- exactly the drain whose stall this diagnostic reports, so eliding it would
+-- lose that identity precisely where it is owed, and the boundary would write
+-- through the failed sink again.
+--
+-- Retention stays bounded: 'declareStall' claims the diagnostic once per drain,
+-- so this keeps at most one entry beyond 'retainedFailureLimit'.
+absorbDiagnostic ∷ HostRetirement → Either Evidence () → DrainOutcome → IO DrainOutcome
+absorbDiagnostic retirement attempted outcome = case attempted of
+  Left caught | not (isCancellation (exceptionOf caught)) → pure (retainUnelided caught outcome)
+  _ → absorb retirement attempted outcome
+
 exceptionOf ∷ Evidence → SomeException
 exceptionOf (ExceptionWithContext _ failure) = failure
 
@@ -1532,6 +1561,13 @@ retainFailure failure outcome = case drainPrimary outcome of
     | length (drainRetained outcome) < retainedFailureLimit →
         outcome {drainRetained = drainRetained outcome <> [failure]}
     | otherwise → outcome {drainElided = drainElided outcome + 1}
+
+-- | 'retainFailure' without the bound, for the one failure the bound may not
+-- elide.
+retainUnelided ∷ Evidence → DrainOutcome → DrainOutcome
+retainUnelided failure outcome = case drainPrimary outcome of
+  Nothing → outcome {drainPrimary = Just failure}
+  Just _ → outcome {drainRetained = drainRetained outcome <> [failure]}
 
 deferCancellation ∷ Evidence → DrainOutcome → DrainOutcome
 deferCancellation cancellation outcome =

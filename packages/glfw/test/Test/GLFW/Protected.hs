@@ -48,11 +48,13 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Data.Unique (newUnique)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM, forM_, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnException, BlockedOnSTM), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
+import Data.List (sort)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log
   ( Component
   , LogEntry (..)
@@ -108,6 +110,7 @@ import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (retainedFailureLimit)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import qualified Hetoimasia.Runtime.Logging as Logging
 import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..))
@@ -230,6 +233,8 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testStallWarningFailsBesideAPrimary)
     it "defers a cancellation delivered at its sink as a cancellation, unmarked and unflushed"
       (boundedExample testStallWarningCancelledAtItsSink)
+    it "is retained rather than elided when the drain's retained-failure budget is already full"
+      (boundedExample testStallWarningSurvivesAFullBudget)
 
   describe "a failed wake warning at the protected exit" $ do
     it "settles as a diagnostic failure, with no second write and no final flush"
@@ -2064,6 +2069,83 @@ destroyedWindows seam = (\calls → [key | DestroyWindow key ← calls]) <$> sea
 
 -- ---------------------------------------------------------------------------
 -- Failed stall warnings
+
+-- | The drain's retained-failure budget is already full when the stall
+-- diagnostic's sink fails.
+--
+-- Ten attachment steps fail in the first round: one becomes the drain's first
+-- failure, eight fill the retained bound, and the tenth is only counted. The
+-- generic retention would elide the diagnostic's own failure next, and with it
+-- the mark the runtime reads — so the boundary would report through the sink
+-- that had just failed, and the lifetime would flush through it. It is kept
+-- past the bound instead, which is one entry, because a drain claims exactly
+-- one such diagnostic.
+testStallWarningSurvivesAFullBudget ∷ Expectation
+testStallWarningSurvivesAFullBudget = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  established ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  trace ← newSinkTrace
+  declared ← newEmptyMVar
+  helper ← forkIO $ do
+    owners ← awaitHeld established
+    host ← awaitHeld hostHeld
+    -- The diagnostic has reached its sink, so every step in that round has
+    -- already failed and the budget is full. Independent evidence then finishes
+    -- the retirement the failed steps withdrew.
+    takeMVar declared
+    forM_ owners (\owner → publishFacts journal host owner allRetirementFacts)
+  let logger =
+        failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar declared ()) trace
+      faulty = [windowNamed ("faulty " <> Text.pack (show n)) | n ← [1 .. failingChains]]
+  (failure, context) ←
+    raisedWith
+      =<< protectedFailure seam logger (settings faulty)
+        ( \host → do
+            identities ← atomically (hostWindowIdentities host)
+            owners ← forM (zip [1 ..] identities) $ \(n ∷ Int, window) →
+              establishedOwner journal host window $
+                (ownerNamed ("faulty " <> Text.pack (show n)))
+                  {scriptPlan = FailWith "step" : map Certify allRetirementFacts}
+            atomically (writeTVar established (Just owners))
+            atomically (writeTVar hostHeld (Just host))
+        )
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  void (pure helper)
+  -- The body returned, so the drain's first failure is the run's own: a failed
+  -- step, not the diagnostic.
+  failure `shouldBe` Scripted "step"
+  diagnosticMarks context `shouldBe` []
+  -- One attempt through the sink, and no terminal report after it.
+  traced trace `shouldReturn` ["glfw.retirement"]
+  flushed trace `shouldReturn` 0
+  -- The bound really was full: exactly its own number of step failures were
+  -- retained beside the primary, though ten failed, so one did not fit.
+  [step | (Just step, _) ← retainedAs "glfw protected retirement" context]
+    `shouldBe` replicate retainedFailureLimit (Scripted "step")
+  -- Those, the count of the one the bound elided, and the diagnostic kept past
+  -- the bound, and nothing else.
+  let retained = retainedDiagnostics context
+  length retained `shouldBe` retainedFailureLimit + 2
+  -- Exactly one of them was raised by a diagnostic, and it is the sink's own
+  -- exception with the context it raised it with.
+  filter snd retained `shouldBe` [("glfw protected retirement", True)]
+  [kept | kept@(Just _, _) ← retainedAs "glfw protected retirement" context]
+    `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
+  -- Which is what the lifetime was told, so nothing was written or flushed.
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  -- Every window went and the session after them. Which chain's window goes
+  -- first is the ordering examples' claim, not this one's.
+  (sort <$> destroyedWindows seam) `shouldReturn` [1 .. failingChains]
+  (last <$> readTVarIO journal) `shouldReturn` SessionEnded
+
+-- | Enough failing chains to fill the retained bound and overflow it before the
+-- stall diagnostic is claimed: one becomes primary, 'retainedFailureLimit' are
+-- retained, and the rest are counted.
+failingChains ∷ Int
+failingChains = retainedFailureLimit + 2
 
 -- | Run a protected application over a seam host and hand back the failure it
 -- raised, with its context.
