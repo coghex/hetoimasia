@@ -72,10 +72,18 @@ CONDITIONAL_PATTERN = re.compile(r"^(if|elif|else)\b")
 OS_CONDITIONAL_PATTERN = re.compile(r"^if\s+os\(\s*[A-Za-z][A-Za-z0-9_-]*\s*\)$")
 PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 
-# The only fields an operating-system conditional may declare. They choose what
-# an ordinary link adds on one platform and never name a source, a dependency,
-# or anything else a group's inputs are derived from.
+# The only fields an operating-system conditional may declare. None of them
+# names a source, a dependency, or anything else a group's inputs are derived
+# from: the link fields choose what an ordinary link adds on one platform, and
+# `buildable` chooses whether the stanza is compiled there at all.
+#
+# `buildable` is deliberately invisible to input derivation. A component that is
+# not built on this platform still has its sources, its package description, and
+# its declared inputs counted, so a change to a macOS-only probe is reported as a
+# changed input on Linux too -- unselected, because the group that owns it is
+# optional, but never silently equivalent.
 LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
+CONDITIONAL_FIELDS = LINK_ONLY_FIELDS | frozenset({"buildable"})
 
 STANZA_KEYWORDS = {
     "library",
@@ -244,9 +252,9 @@ class WorkTree:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
 # relative ``hs-source-dirs``, ``main-is``, ``build-depends`` (including a
 # ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
-# ``if os(...)``/``else`` block inside a stanza that declares only link fields.
-# Any other conditional, and brace-delimited syntax, can change dependencies, so
-# it is rejected with a diagnostic rather than ignored.
+# ``if os(...)``/``else`` block inside a stanza that declares only link fields or
+# ``buildable``. Any other conditional, and brace-delimited syntax, can change
+# dependencies, so it is rejected with a diagnostic rather than ignored.
 
 
 class Package:
@@ -291,10 +299,10 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
                 if conditional_field_indent is not None and indent > conditional_field_indent:
                     continue
                 body = FIELD_PATTERN.match(content)
-                if not body or body.group(1).lower() not in LINK_ONLY_FIELDS:
+                if not body or body.group(1).lower() not in CONDITIONAL_FIELDS:
                     raise PlannerError(
                         f"{path}:{number}: an operating-system conditional may declare only "
-                        f"{' and '.join(sorted(LINK_ONLY_FIELDS))}; anything else inside it can "
+                        f"{', '.join(sorted(CONDITIONAL_FIELDS))}; anything else inside it can "
                         "change dependencies or inputs silently"
                     )
                 conditional_field_indent = indent

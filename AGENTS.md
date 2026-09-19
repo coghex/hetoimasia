@@ -57,6 +57,14 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
+- On macOS only,
+  `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct`
+  runs LUA-15's confinement probe. It is local evidence, not a routine check:
+  its validation group `test.macos-confinement` is optional, no CI runs it, and
+  its components are not built off Darwin. A pull-request request block must
+  name neither it nor `all-hspec`. Read
+  [its verdict](docs/macos_confinement_verdict.md) before building on it — the
+  answer is `inconclusive`.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
   `Recovery`, `Workers`, `Messaging`, and `Time` components, composed by

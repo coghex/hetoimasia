@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 14,
+  "policy_version": 15,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -243,6 +243,25 @@
       "timeout_seconds": 1800,
       "category": "test",
       "optional": false
+    },
+    {
+      "id": "test.macos-confinement",
+      "description": "LUA-15's local macOS feasibility proof: a confined helper's denied filesystem, network, process, and native-module accesses before and after its mod source loads, two-instance process and storage isolation, the enforced whole-process memory limit and the execution bound, and the three lifetime endings. Optional and Darwin-only; the component is not built elsewhere, so a request for it on Linux fails rather than passing vacuously.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-scripting-lua:macos-confinement-probe",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-scripting-lua:test:macos-confinement-probe",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": true
     }
   ]
 }

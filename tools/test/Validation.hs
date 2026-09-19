@@ -56,13 +56,27 @@ spec = describe "Validation planner" $ do
         plan ← planJson fixture []
         selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
 
-    it "rejects an operating-system conditional that declares anything but link fields" $
+    it "rejects an operating-system conditional that declares anything but link or buildability fields" $
       withFixture $ \fixture → do
         change fixture "packages/alpha/alpha.cabal"
           (alphaPackage ++ unlines ["    if os(linux)", "        build-depends: containers"])
         (result, _, errors) ← planRaw fixture (seeded fixture) []
         result `shouldBe` ExitFailure 2
-        errors `shouldContain` "may declare only extra-libraries and frameworks"
+        errors `shouldContain` "may declare only buildable, extra-libraries, frameworks"
+
+    it "accepts an operating-system conditional that decides whether a component is built" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ platformOnlyLibrary)
+        change fixture "demo.cabal" platformOnlyDemoPackage
+        base ← revision fixture "HEAD"
+        writeFixtureFile (root fixture) "packages/alpha/platform/Platform.hs" (platformModule 1)
+        change fixture "packages/alpha/platform/Platform.hs" (platformModule 2)
+        plan ← planJsonAt fixture base []
+        -- A component that this platform does not build still has its sources
+        -- counted, so the group that owns it is reported as affected wherever
+        -- the plan is taken. Silently dropping them would make a Darwin-only
+        -- probe look identical to a tree that never touched it.
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
 
     it "rejects a conditional on anything but the operating system" $
       withFixture $ \fixture → do
@@ -543,6 +557,36 @@ linkConditionals =
     , "            rt"
     , "            m"
     ]
+
+-- | A library stanza that is built on one operating system and not on another.
+--
+-- The planner reads it for its inputs either way; @buildable@ decides what a
+-- compiler does, not what a change touches.
+platformOnlyLibrary ∷ String
+platformOnlyLibrary =
+  unlines
+    [ ""
+    , "library platform"
+    , "    visibility: public"
+    , "    exposed-modules: Platform"
+    , "    hs-source-dirs: platform"
+    , "    default-language: GHC2024"
+    , "    build-depends: base"
+    , "    if os(darwin)"
+    , "        buildable: True"
+    , "    else"
+    , "        buildable: False"
+    ]
+
+platformModule ∷ Int → String
+platformModule value =
+  "module Platform (platform) where\nplatform :: Int\nplatform = " ++ show value ++ "\n"
+
+-- | The fixture package with the harness suite depending on the platform-only
+-- sublibrary, so only that suite consumes its sources.
+platformOnlyDemoPackage ∷ String
+platformOnlyDemoPackage =
+  unlines (init (lines demoPackage) ++ ["        base,", "        alpha:platform"])
 
 fixtureCatalog ∷ String
 fixtureCatalog =

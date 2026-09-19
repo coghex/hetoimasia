@@ -193,10 +193,57 @@ and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
 part of every Linux candidate's identity.
 
-No optional group is registered yet. Interactive and lengthy desktop probes,
-when they are declared, are optional groups that run only on request; optional
+`test.macos-confinement` is the one registered optional group, and it has a
+section of its own below. Further interactive and lengthy desktop probes, when
+they are declared, are optional groups that run only on request; optional
 handling, including an optional display probe whose inputs changed, is proven
 with fixture catalogs in `workflow-tests`.
+
+### The macOS confinement probe
+
+`test.macos-confinement` runs LUA-15's local feasibility proof: a confined
+helper's denied filesystem, network, process, and native-module accesses before
+and after its mod source loads, two-instance process and storage isolation, the
+enforced whole-process memory limit and the execution bound, and the three
+lifetime endings. Its verdict is
+[docs/macos_confinement_verdict.md](macos_confinement_verdict.md).
+
+```bash
+cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
+```
+
+It is **optional and Darwin-only**, and those are two separate facts that have
+to hold together.
+
+*Optional* means it is never selected automatically: an optional group is
+reached only through an explicit request, so no Linux plan picks it up from a
+changed input. It does not mean it can never be selected. `all-hspec` selects
+every Hspec group *including optional ones*, and a `validation-request` block
+naming the group selects it wherever the plan is taken. So a pull request's own
+request block must name neither `test.macos-confinement` nor `all-hspec`; the
+request that does name it belongs in the local request file below.
+
+*Darwin-only* means the components are not built elsewhere: the sublibrary, the
+helper executable, and the test suite each carry `buildable: False` outside
+Darwin. A Linux worker that is nonetheless asked to run the group fails to build
+the component and reports a failure, which is the point — a group that could not
+run must refuse explicitly rather than report a vacuous pass. The mandatory
+floor is unchanged, no remote macOS CI exists, and none is added.
+
+The default Linux plan therefore **omits** the group while still reporting its
+changed inputs: `selected: false`, `reason: optional-unrequested`,
+`inputs_changed: true` whenever the probe's own sources move. Uncertainty never
+reaches a consumer as equivalence, and a Darwin-only probe never looks like a
+tree that did not touch it.
+
+`buildable` inside an `if os(...)` block is the one non-link field the planner's
+Cabal reader accepts, and it is deliberately invisible to input derivation: a
+component that this platform does not build still has its sources, its package
+description, and its declared inputs counted. Everything else inside such a
+block is still rejected, because it could change dependencies silently.
+
+Its receipt is local evidence only, exactly as the GLFW arc's Cocoa evidence is;
+[the local run](#a-local-run-and-its-receipt) below produces it.
 
 ## How a group's inputs are derived
 
@@ -1332,6 +1379,8 @@ changed pin or recipe — by running
 `build` again. `prepare` refuses a `dist-newstyle` linked against the previous
 manifest; remove it rather than reuse those products.
 
+### A local run and its receipt
+
 A local run records its own identity and never claims the Linux digest. Plan and
 run with the same map:
 
@@ -1371,6 +1420,49 @@ passing receipt. The approval covers this one run; it is never a profile
 setting or part of a script an agent runs on its own. That receipt records
 `Darwin` as its runner OS, and remote CI never runs macOS, so it is local
 evidence only: it can never satisfy a Linux plan.
+
+#### The macOS confinement probe's receipt
+
+[`test.macos-confinement`](#the-macos-confinement-probe) is optional, so it is
+reached only through a request, and the request belongs in a local file rather
+than in the pull-request body — a body that named it would select it on Linux
+too, where the component is not built. Write the request file, then plan with it:
+
+````bash
+cat > request.txt <<'REQUEST'
+```validation-request
+test.macos-confinement
+```
+REQUEST
+python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
+  --request-file request.txt \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --json > plan.json
+python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)"
+````
+
+Two things about that plan command are easy to get wrong, and both make it
+refuse rather than mislead:
+
+- **Every selected group needs a worker.** The plan is routed once, against the
+  groups it selected, and a plan nobody could execute is refused before it
+  exists. Assigning only the probe is not enough: the mandatory floor is always
+  selected, and a change under `tools/validation/` is a policy input, so it
+  selects every non-optional group — `test.workflow` and `test.glfw-native`
+  included. Routing a group is not running it and does not authorize running it;
+  the runner invocation below names the one group it executes.
+- **The request file is a file, not the pull-request body.** `--request-file`
+  reads a body-shaped document from disk. `request.txt` is in `generated_paths`
+  and in `.gitignore`, so it stays out of the candidate's identity and out of a
+  commit.
+
+The receipt records `Darwin` as its runner OS, so like the native GLFW one it is
+local evidence that can never satisfy a Linux plan. The probe needs no display,
+no consent, and no signing identity: it is an ordinary headless command-line
+run.
 
 ### Building without the GLFW SDK
 

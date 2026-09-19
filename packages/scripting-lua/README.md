@@ -392,3 +392,33 @@ cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
+
+## The macOS confinement probe
+
+`macos/` holds LUA-15's feasibility probe: a confined helper
+(`macos-confinement-helper`), the trusted parent side it is launched from
+(`macos-probe`, a private sublibrary), and the Hspec target that drives the
+epic's proof matrix (`macos-confinement-probe`). All three are built only on
+Darwin; elsewhere the components are not built rather than built and passing
+vacuously.
+
+None of it is an engine facility. No production library, executable, or public
+API depends on it, and it admits no untrusted source through any public path —
+the only Lua it loads is the fixture its own parent wrote into the private
+directory it was given. It exists to answer
+[Q-5](../../docs/lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)'s
+macOS row with observations.
+
+The answer is `inconclusive`, and
+[docs/macos_confinement_verdict.md](../../docs/macos_confinement_verdict.md) is
+where it is stated and argued: every proof row was demonstrated, on two
+interfaces Apple does not support. Read it before building anything on this
+code.
+
+```bash
+cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
+```
+
+Each example prints what it proved. The validation group is
+`test.macos-confinement`, optional and local-only; see
+[docs/validation.md](../../docs/validation.md#the-macos-confinement-probe).
