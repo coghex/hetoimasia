@@ -159,36 +159,39 @@ than reporting itself as unproven.
 ## Observed, with the profile installed
 
 Environment 2, `apparmor_restrict_unprivileged_userns=0`, 21 examples, 0
-failures. Each line below is the run's own output; the whole of it, including
+failures. Every line below is copied from that run, with only the run's own
+temporary directory elided as `…/`; the whole of it, including
 the trial child's own report, is in
 [the retained runs](lua_linux_confinement_evidence.md#3-the-same-machine-with-that-restriction-relaxed).
 
 ```text
-ENVIRONMENT kernel="6.8.0-101-generic" distribution="Ubuntu 24.04.4 LTS" uid="501 501 501 501"
-            cap-sys-admin=no user-namespace=available
-            userns-restriction="apparmor_restrict_unprivileged_userns=0"
-            cgroup-controllers="cpuset cpu io memory hugetlb pids rdma misc"
-            cgroup-subtree-writable=no container=no
+ENVIRONMENT kernel="6.8.0-101-generic" distribution="Ubuntu 24.04.4 LTS" uid="501 501 501
+       501" cap-sys-admin=no user-namespace=available
+       userns-restriction="apparmor_restrict_unprivileged_userns=0"
+       cgroup-controllers="cpuset cpu io memory hugetlb pids rdma misc"
+       cgroup-subtree-writable=no container=no
 AVAILABILITY profile=installed
 CONTROLS sentinels=readable inet-socket=created native-module=libbz2.so.1.0
-         inherited-descriptor=1100
+       inherited-descriptor=1100
 PROVED confinement-installed layers=513 before-source=yes controls=allowed
+PROVED read-outside-sentinel:…/alpha-sentinel
+       denied-in=native,existing-thread,started-thread,lua errno=2
+       mechanism=mount-namespace:the path is not in the private root
+PROVED open-inet-socket denied-in=native,existing-thread,started-thread,lua errno=13
+       mechanism=seccomp-filter:socket refused outside AF_UNIX
+PROVED execute-program denied-in=native,existing-thread,started-thread,lua errno=13
+       mechanism=seccomp-filter:execve refused
+PROVED load-native-module denied-in=native,existing-thread,started-thread,lua errno=-1
+       mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
 PROVED pid-namespace child-pid=1
-PROVED read-outside-sentinel:…/alpha-sentinel denied-in=native,existing-thread,started-thread,lua
-       errno=2 mechanism=mount-namespace:the path is not in the private root
-PROVED open-inet-socket denied-in=native,existing-thread,started-thread,lua
-       errno=13 mechanism=seccomp-filter:socket refused outside AF_UNIX
-PROVED execute-program denied-in=native,existing-thread,started-thread,lua
-       errno=13 mechanism=seccomp-filter:execve refused
-PROVED load-native-module denied-in=native,existing-thread,started-thread,lua
-       errno=-1 mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
-PROVED signal-outside-process denied-in=native,existing-thread,started-thread
-       errno=3 mechanism=pid-namespace:no process outside it has a number in here
-PROVED inherited-descriptor number=1100 visible-in-child=no errno=9
-       mechanism=launcher:every descriptor above the four it is given is closed before the exec
-PROVED executable-file-mapping mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
-       control=allowed errno=13
-PROVED two-instance-isolation owners=[82368,82370] peer-endpoint=denied peer-state=denied
+PROVED signal-outside-process denied-in=native,existing-thread,started-thread errno=3
+       mechanism=pid-namespace:no process outside it has a number in here
+PROVED inherited-descriptor number=1100 visible-in-child=no mechanism=launcher:every
+       descriptor above the four it is given is closed before the exec errno=9
+PROVED executable-file-mapping mechanism=seccomp-filter:file-backed PROT_EXEC mapping
+       refused control=allowed errno=13
+CONTROL native-module=libbz2.so.1.0 loaded-by-parent=yes
+PROVED two-instance-isolation owners=[84016,84018] peer-endpoint=denied peer-state=denied
        peer-process=denied own-state=state owned by alpha alone|state owned by beta alone
        own-endpoint=allowed
 PROVED independent-termination ended=Terminated 9 False survivor-finished=Exited ExitSuccess
