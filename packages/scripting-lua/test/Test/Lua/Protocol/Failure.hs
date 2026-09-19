@@ -23,11 +23,12 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( AdmissionState (AdmissionOpen, MutationAdmissionClosed)
   , FailureRecord (FailureRecord, failedLastGoodSnapshot, failedReason, failedRecovery, failedTask)
   , Session (sessionAdmission, sessionFailure, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
-  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TransitionRefused, UnknownTask)
+  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TaskRetired, TransitionRefused, UnknownTask)
   , TerminalResult (ResultCancelled, ResultFailed)
   , acceptRequest
   , activateNext
   , advanceEpoch
+  , applyOutcome
   , cancelTaskIn
   , observeResult
   , registerSubscription
@@ -37,7 +38,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (OrderedEvents))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
-  ( Task (taskState)
+  ( SegmentOutcome (SegmentCompleted)
+  , Task (taskState)
   , TaskFailure (TaskFailure)
   , TaskOutcome (OutcomeCancelled)
   , TaskState (Failed)
@@ -150,6 +152,26 @@ spec = describe "session failure" $ do
     refusal `shouldBe` TransitionRefused (AlreadyTerminal OutcomeCancelled)
     sessionFailure c `shouldBe` Nothing
     sessionAdmission c `shouldBe` AdmissionOpen
+
+  it "ends the session for an unsafe failure whose task has been observed away" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, ()) ← ok (cancelTaskIn owner a)
+    (c, _) ← ok (observeResult owner b)
+    Map.member owner (sessionTasks c) `shouldBe` False
+    (d, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just owner} c)
+    sessionFailure d `shouldBe` Just unsafeAuthoritative {failedTask = Just owner}
+    sessionAdmission d `shouldBe` MutationAdmissionClosed
+
+  it "refuses a safe failure naming a task that has been observed away" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, ()) ← ok (applyOutcome owner (SegmentCompleted "done") a)
+    (c, _) ← ok (observeResult owner b)
+    (d, refusal) ← rejected (reportFailure handled {failedTask = Just owner} c)
+    refusal `shouldBe` TaskRetired owner
+    sessionFailure d `shouldBe` Nothing
+    sessionAdmission d `shouldBe` AdmissionOpen
 
   it "escalates nothing for a task identity this session does not hold" $ do
     session ← openSession

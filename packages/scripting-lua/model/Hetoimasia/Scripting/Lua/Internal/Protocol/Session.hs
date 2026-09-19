@@ -148,7 +148,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , SnapshotId
   , SubscriptionId (SubscriptionId)
   , SubscriptionName
-  , TaskId (TaskId)
+  , TaskId (TaskId, taskName, taskScope)
   , TaskName
   , firstGeneration
   , firstOrdinal
@@ -205,6 +205,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
   , TaskFailure (TaskFailure)
   , TaskOutcome
   , TaskState (Running)
+  , Task
   , TransitionRejection (AlreadyTerminal)
   , WaitCause (WaitingOnRequest, WaitingOnSubscription, WaitingUntil)
   , cancelTask
@@ -356,8 +357,11 @@ data SessionRejection
     CapReached !LimitName !Int
   | -- | A payload's declared size against the cap.
     PayloadTooLarge !Int !Int
-  | -- | No such task in this epoch.
+  | -- | No such task in this epoch: foreign, stale, or never issued.
     UnknownTask !TaskId
+  | -- | A task this session did issue, whose record has been observed and
+    -- forgotten. It is not unknown, and it is not live either.
+    TaskRetired !TaskId
   | -- | No such request. A stale or foreign identity looks like this, which is
     -- the point: it is not a record of ours.
     UnknownRequest !RequestId
@@ -424,6 +428,19 @@ takeOrdinal session =
   ( sessionNextOrdinal session
   , session {sessionNextOrdinal = nextOrdinal (sessionNextOrdinal session)}
   )
+
+-- | Whether this session issued a task identity, whatever became of it.
+--
+-- The names are issued from one counter that is never rewound, so "this scope
+-- issued it" is the comparison below and nothing has to be remembered. It
+-- distinguishes a task whose record has been observed and forgotten from one
+-- that is foreign, of a replaced epoch, or was never issued at all — a
+-- distinction a failure report turns on, and one that a list of retired
+-- identities would otherwise have to grow forever to make.
+issuedHere ∷ TaskId → Session v → Bool
+issuedHere identity session =
+  taskScope identity == sessionKey session
+    && taskName identity < sessionNextTask session
 
 -- | Issue the next task name.
 --
@@ -689,9 +706,7 @@ advanceOrdinalAfterYield _ session = session
 wakeTaskIn ∷ TaskId → Session v → (Session v, Either SessionRejection ())
 wakeTaskIn identity session = case notStopped session of
   Left rejection → refuse session rejection
-  Right () →
-    let (ordinal, taken) = takeOrdinal session
-     in discard (transition identity (wakeTask (sessionKey session) ordinal) taken)
+  Right () → withFreshOrdinal identity wakeTask session
 
 -- | Pause a ready task.
 pauseTaskIn ∷ TaskId → Session v → (Session v, Either SessionRejection ())
@@ -703,9 +718,25 @@ pauseTaskIn identity session = case notStopped session of
 resumeTaskIn ∷ TaskId → Session v → (Session v, Either SessionRejection ())
 resumeTaskIn identity session = case notStopped session of
   Left rejection → refuse session rejection
-  Right () →
-    let (ordinal, taken) = takeOrdinal session
-     in discard (transition identity (resumeTask (sessionKey session) ordinal) taken)
+  Right () → withFreshOrdinal identity resumeTask session
+
+-- | Apply a transition that rejoins the ready set, consuming an ordinal only
+-- if it stands.
+--
+-- A refused wake or resume must leave the session exactly as it was, and the
+-- ordinal counter is part of "as it was": an ordinal spent on a transition
+-- that did not happen would reorder the work that is admitted next against a
+-- sequence of inputs that never included the refusal.
+withFreshOrdinal
+  ∷ TaskId
+  → (SessionKey → Ordinal → Task v → Either TransitionRejection (Task v))
+  → Session v
+  → (Session v, Either SessionRejection ())
+withFreshOrdinal identity step session =
+  let (ordinal, taken) = takeOrdinal session
+   in case transition identity (step (sessionKey session) ordinal) taken of
+        (_, Left rejection) → refuse session rejection
+        (next, Right _) → (next, Right ())
 
 -- | Cancel a live task and invalidate everything it held.
 cancelTaskIn ∷ TaskId → Session v → (Session v, Either SessionRejection ())
@@ -1102,14 +1133,30 @@ data FailureRecord = FailureRecord
 -- the case where it is not. A /safe/ failure naming a finished task is
 -- refused, because there is then nothing to record and nothing to end.
 --
--- Which task is rejected outright is unchanged: an identity this epoch's
--- session does not hold is 'UnknownTask', whether it is foreign, stale, or
--- was never issued, and it escalates nothing.
+-- The same holds once the task's record has been /forgotten/. A terminal
+-- result that has been observed takes its task's record with it, and a failure
+-- naming that identity is neither a live task nor an unknown one:
+-- 'issuedHere' tells the two apart in a comparison, an unsafe failure still
+-- ends the session, and a safe one is refused as 'TaskRetired'.
+--
+-- Which task is rejected outright is unchanged: an identity this session never
+-- issued, or issued under a replaced epoch, is 'UnknownTask' and escalates
+-- nothing.
 reportFailure ∷ FailureRecord → Session v → (Session v, Either SessionRejection ())
 reportFailure record session = case notStopped session >> notFailed session of
   Left rejection → refuse session rejection
   Right () → case failedTask record of
     Nothing → (escalate session, Right ())
+    Just identity
+      | not (Map.member identity (sessionTasks session))
+      , issuedHere identity session →
+          -- The record has been observed and forgotten, so there is no task
+          -- left to fail. The session is a different matter: a report that
+          -- authoritative state may be half-applied does not become false
+          -- because the behaviour that touched it was tidied away first.
+          if unsafe
+            then (escalate session, Right ())
+            else refuse session (TaskRetired identity)
     Just identity →
       let failure = TaskFailure (failedReason record) (failedRecovery record)
        in case transition identity (failTask (sessionKey session) failure) session of

@@ -459,11 +459,13 @@ recorded and enforced by nothing here; choosing what runs next is LUA-6's.
 `(Session v, Either SessionRejection a)`, and a rejection changes no record —
 only `sessionCounters`, which keeps how often something was refused or
 discarded. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
-`PayloadTooLarge`, the four `Duplicate`/`Unknown` identity refusals,
-`NotTaskOwner`, `NoTerminalResult`, `NothingQueued`, `NoDelivery`,
-`SessionAlreadyFailed`, `SessionAlreadyStopped`, and the wrapped refusals of the
-records themselves (`TransitionRefused`, `ReplyRefused`, `ObserveRefused`,
-`ProviderRefused`, `DeliveryRefused`).
+`PayloadTooLarge`, the identity refusals `UnknownTask`, `UnknownRequest`,
+`UnknownSubscription`, and `TaskRetired`, `NotTaskOwner`, `NoTerminalResult`,
+`NothingQueued`, `NoDelivery`, `SessionAlreadyFailed`, `SessionAlreadyStopped`,
+and the wrapped refusals of the records themselves (`TransitionRefused`,
+`ReplyRefused`, `ObserveRefused`, `ProviderRefused`, `DeliveryRefused`). There
+are no `Duplicate*` refusals: the session issues the identities that could have
+collided, so the collision cannot arise.
 
 Two bounds are worth stating in full.
 

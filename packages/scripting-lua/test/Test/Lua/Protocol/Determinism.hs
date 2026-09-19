@@ -12,25 +12,33 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , Ordinal
+  , TaskId (TaskId)
+  , TaskName (TaskName)
   , RequestName (RequestName)
   , SubscriptionName (SubscriptionName)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (Reply (ReplyResult))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( Session (sessionNextOrdinal, sessionTasks)
+  , SessionRejection (TransitionRefused, UnknownTask)
   , acceptRequest
   , applyOutcome
   , applyReplyIn
   , deliverEvent
+  , pauseTaskIn
   , registerSubscription
+  , resumeTaskIn
   , startSegment
   , stopSession
   , wakeTaskIn
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (ReplaceableState))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
-  ( SegmentOutcome (SegmentWaiting, SegmentYielded)
+  ( ExpectedState (ExpectedPaused, ExpectedWaiting)
+  , SegmentOutcome (SegmentWaiting, SegmentYielded)
   , Task (taskOrdinal)
+  , TaskState (Ready)
+  , TransitionRejection (WrongState)
   , WaitCause (WaitingOnRequest)
   )
 import Test.Hspec (Spec, describe, it, shouldBe)
@@ -39,9 +47,15 @@ import Test.Lua.Protocol.Support
   , message
   , ok
   , openSessionWith
+  , gameplay
+  , rejected
   , roomyLimits
   , runningTask
   )
+
+-- | A task identity in this scope that the session has not issued.
+stranger ∷ TaskId
+stranger = TaskId gameplay (TaskName 99)
 
 -- | One scripted run: admissions, segments, a request, an event, and a wake.
 scripted ∷ IO (Session Text)
@@ -71,6 +85,23 @@ spec = describe "determinism" $ do
     once ← scripted
     twice ← scripted
     snd (stopSession once) `shouldBe` snd (stopSession twice)
+
+  it "spends no ordinal on a wake or resume that was refused" $ do
+    session ← openSessionWith roomyLimits
+    (a, ready) ← admitted 1 session
+    let before = sessionNextOrdinal a
+    (b, wakeRefusal) ← rejected (wakeTaskIn ready a)
+    wakeRefusal `shouldBe` TransitionRefused (WrongState ExpectedWaiting Ready)
+    sessionNextOrdinal b `shouldBe` before
+    (c, resumeRefusal) ← rejected (resumeTaskIn ready b)
+    resumeRefusal `shouldBe` TransitionRefused (WrongState ExpectedPaused Ready)
+    sessionNextOrdinal c `shouldBe` before
+    (d, unknownRefusal) ← rejected (wakeTaskIn stranger c)
+    unknownRefusal `shouldBe` UnknownTask stranger
+    sessionNextOrdinal d `shouldBe` before
+    (e, ()) ← ok (pauseTaskIn ready d)
+    (f, ()) ← ok (resumeTaskIn ready e)
+    (sessionNextOrdinal f > before) `shouldBe` True
 
   it "issues ordinals in one monotonic sequence, reused by nothing" $ do
     final ← scripted
