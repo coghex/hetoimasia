@@ -32,7 +32,6 @@ import Hetoimasia.Scripting.Lua.Bridge
   , chunkName
   , closeVm
   , evalChunk
-  , newVm
   )
 import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (NoResult)
@@ -40,7 +39,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (Phase (Closed), vmPhase)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
-import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), runScoped)
+import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), acquireVm, runScoped)
 import Test.Support.Bounded (bounded)
 
 newtype BodyBroke = BodyBroke String
@@ -56,7 +55,7 @@ instance Exception ReleaseBroke
 spec ∷ Spec
 spec = describe "close" $ do
   it "refuses every operation after the close, rather than reaching a freed state" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     closeVm vm
     vmPhase vm >>= (`shouldBe` Closed)
     outcome ← try @VmClosed (evalChunk vm (chunkName "after") "local ignored = 1")
@@ -65,13 +64,13 @@ spec = describe "close" $ do
       Left _ → pure ()
 
   it "treats a second close as a no-op rather than a second free" $ do
-    vm ← newVm []
+    vm ← acquireVm []
     closeVm vm
     closeVm vm
     vmPhase vm >>= (`shouldBe` Closed)
 
   it "releases a callback's borrowed dependency once, and only at the close" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     releases ← newMVar (0 ∷ Int)
     installCallback
       vm
@@ -87,7 +86,7 @@ spec = describe "close" $ do
     readMVar releases >>= (`shouldBe` 1)
 
   it "reports the body's failure ahead of the close's, retaining both" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     installCallback vm "used" (pure NoResult) (throwIO (ReleaseBroke "the release failed"))
     outcome ← runScoped vm $ \scoped → do
       evalChunk scoped (chunkName "use") "used()"
@@ -105,7 +104,7 @@ spec = describe "close" $ do
           Nothing → expectationFailure "the close failure was not retained"
 
   it "reports a close failure on its own when the body succeeded" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     installCallback vm "used" (pure NoResult) (throwIO (ReleaseBroke "the release failed"))
     outcome ← runScoped vm (\scoped → evalChunk scoped (chunkName "use") "used()")
     case outcome of
@@ -116,7 +115,7 @@ spec = describe "close" $ do
         Nothing → expectationFailure "the close raised something else"
 
   it "attempts every release rather than stopping at the first that failed" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     installCallback vm "first" (pure NoResult) (throwIO (ReleaseBroke "first"))
     installCallback vm "second" (pure NoResult) (throwIO (ReleaseBroke "second"))
     outcome ← try @CloseFault (closeVm vm)
@@ -125,7 +124,7 @@ spec = describe "close" $ do
       Left fault → length (closeFailures fault) `shouldBe` 2
 
   it "cannot be cancelled into releasing early or into a retried partial close" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     releases ← newMVar (0 ∷ Int)
     installCallback vm "used" (pure NoResult) (modifyMVar_ releases (pure . succ))
     evalChunk vm (chunkName "use") "used()"
@@ -149,7 +148,7 @@ spec = describe "close" $ do
     readMVar releases >>= (`shouldBe` 1)
 
   it "retains a callback's release even when publishing it was cancelled" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     releases ← newMVar (0 ∷ Int)
     entered ← newEmptyMVar
     released ← newEmptyMVar
@@ -182,7 +181,7 @@ spec = describe "close" $ do
     readMVar releases >>= (`shouldBe` 1)
 
   it "reports a Haskell finalizer that failed while the interpreter closed" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     installCallback vm "boom" (throwIO (ReleaseBroke "the finalizer failed")) (pure ())
     -- Lua marks a value for finalization when its metatable is set, so this
     -- runs during lua_close.
@@ -195,7 +194,7 @@ spec = describe "close" $ do
         other → expectationFailure ("the close reported " <> show (length other) <> " failures")
 
   it "reports every finalizer that failed, not only the first" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     installCallback vm "first_boom" (throwIO (ReleaseBroke "first")) (pure ())
     installCallback vm "second_boom" (throwIO (ReleaseBroke "second")) (pure ())
     -- Two values marked for finalization, so lua_close runs two callbacks that
@@ -217,7 +216,7 @@ spec = describe "close" $ do
         reported `shouldContain` [ReleaseBroke "second"]
 
   it "makes a second close wait for the teardown rather than report it done" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     order ← newMVar ([] ∷ [String])
     let note entry = modifyMVar_ order (pure . (<> [entry]))
     finalizing ← newEmptyMVar
@@ -243,7 +242,7 @@ spec = describe "close" $ do
     entries `shouldContain` ["second-close"]
 
   it "leaves a VM closed even when the chunk that ran last failed" $ do
-    vm ← newVm [LibraryBase] ∷ IO Vm
+    vm ← acquireVm [LibraryBase] ∷ IO Vm
     _ ← try @SomeException (evalChunk vm (chunkName "raise") "error('boom')")
     closeVm vm
     vmPhase vm >>= (`shouldBe` Closed)

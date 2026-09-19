@@ -46,7 +46,6 @@ import Hetoimasia.Scripting.Lua.Bridge
   , chunkName
   , closeVm
   , evalChunk
-  , newVm
   )
 import Hetoimasia.Scripting.Lua.Internal.Call
   ( MessageHandler (HandlerGlobal)
@@ -69,7 +68,8 @@ import Test.Hspec
   , shouldSatisfy
   )
 import Test.Lua.Support
-  ( cancelling
+  ( acquireVm
+  , cancelling
   , newRecorder
   , recorded
   , recordingCallback
@@ -313,7 +313,7 @@ spec = describe "faults" $ do
       evalChunk vm (chunkName "after") "local ignored = 1"
 
   it "retains a cancelled operation's borrowed dependencies until the close" $ do
-    vm ← newVm [LibraryBase]
+    vm ← acquireVm [LibraryBase]
     releases ← newMVar (0 ∷ Int)
     entered ← newEmptyMVar
     released ← newEmptyMVar
