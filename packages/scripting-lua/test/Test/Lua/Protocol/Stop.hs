@@ -18,7 +18,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   , DiscardCounts (discardedAdmissions, discardedEvents, discardedRequestResults, discardedResults)
   , ExitRecord (exitDiscards, exitOutstandingProviderWork, exitOutstandingSegments, exitRequests, exitScope, exitSubscriptions, exitTasks)
   , RequestDisposition (RequestRevokedAt, RequestSettledAs)
-  , Session (sessionAdmission, sessionKey, sessionRequests, sessionTasks)
+  , Counters (countInvalidatedRequests)
+  , Session (sessionAdmission, sessionCounters, sessionKey, sessionRequests, sessionTasks)
   , SessionRejection (SessionAlreadyStopped)
   , TaskDisposition (DispositionAborted, DispositionNotAdmitted, DispositionOutstandingSegment, DispositionTerminal)
   , acceptRequest
@@ -107,6 +108,17 @@ spec = describe "stop" $ do
     discardedRequestResults (exitDiscards record) `shouldBe` 1
     Map.lookup subscription (exitSubscriptions record) `shouldBe` Just 1
     Map.lookup request (exitRequests record) `shouldBe` Just (RequestRevokedAt CancelledByStop)
+
+  it "does not invalidate a stub that was already revoked before the stop" $ do
+    session ← openSessionWith roomyLimits
+    (a, owner) ← runningTask 1 session
+    (b, request) ← ok (acceptRequest owner (RequestName 1) (EndpointId "provider") a)
+    (c, ()) ← ok (cancelTaskIn owner b)
+    let before = countInvalidatedRequests (sessionCounters c)
+        (stopped, record) = stopSession c
+    countInvalidatedRequests (sessionCounters stopped) `shouldBe` before
+    exitOutstandingProviderWork record `shouldBe` [request]
+    Map.member request (sessionRequests stopped) `shouldBe` True
 
   it "rejects new work with a typed reason once admission has closed" $ do
     session ← openSessionWith roomyLimits

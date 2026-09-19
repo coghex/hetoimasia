@@ -29,8 +29,10 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   , advanceEpoch
   , applyReplyIn
   , cancelRequestIn
+  , cancelTaskIn
   , completeProviderWorkIn
   , deliverEvent
+  , observeRequestIn
   , registerSubscription
   , requestAdmission
   , startSegment
@@ -140,6 +142,31 @@ spec = describe "epochs" $ do
     Map.member older (sessionRequests d) `shouldBe` True
     (e, ()) ← ok (completeProviderWorkIn older d)
     Map.member older (sessionRequests e) `shouldBe` False
+
+  it "does not invalidate a stub whose owning task already revoked it" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, request) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, ()) ← ok (cancelTaskIn owner b)
+    countInvalidatedRequests (sessionCounters c) `shouldBe` 1
+    (d, change) ← ok (advanceEpoch c)
+    invalidatedRequests change `shouldBe` 0
+    countInvalidatedRequests (sessionCounters d) `shouldBe` 1
+    Map.member request (sessionRequests d) `shouldBe` True
+    (e, ()) ← ok (completeProviderWorkIn request d)
+    Map.member request (sessionRequests e) `shouldBe` False
+
+  it "does not invalidate a stub an owner already observed away" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, request) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, ()) ← ok (cancelRequestIn request b)
+    (d, _) ← ok (observeRequestIn request c)
+    countInvalidatedRequests (sessionCounters d) `shouldBe` 0
+    (e, change) ← ok (advanceEpoch d)
+    invalidatedRequests change `shouldBe` 0
+    countInvalidatedRequests (sessionCounters e) `shouldBe` 0
+    Map.member request (sessionRequests e) `shouldBe` True
 
   it "treats a task number of the previous epoch as one it never issued" $ do
     session ← openSession

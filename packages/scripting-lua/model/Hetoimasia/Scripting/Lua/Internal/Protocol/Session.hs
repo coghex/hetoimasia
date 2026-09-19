@@ -190,7 +190,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   , ProviderRejection
   , Reply (ReplyFailure, ReplyResult)
   , ReplyRejection
-  , RequestRecord (requestIdentity, requestOwner, requestProviderOutstanding, requestSettlement)
+  , RequestRecord (requestIdentity, requestOwner, requestProviderOutstanding, requestResultHeld, requestSettlement)
   , Revocation (revokedResult)
   , Settlement
   , SettlementKind
@@ -381,6 +381,9 @@ data SessionRejection
   | -- | A task this session did issue, whose record has been observed and
     -- forgotten. It is not unknown, and it is not live either.
     TaskRetired !TaskId
+  | -- | An admission this session accepted that has not been activated. The
+    -- task exists as a queued admission and has never run.
+    TaskNotActivated !TaskId
   | -- | No such request. A stale or foreign identity looks like this, which is
     -- the point: it is not a record of ours.
     UnknownRequest !RequestId
@@ -467,6 +470,14 @@ issuedHere identity session =
   taskScope identity == sessionKey session
     && taskName identity >= sessionEpochFirstTask session
     && taskName identity < sessionNextTask session
+
+-- | Whether an identity names an admission that is accepted but not activated.
+--
+-- A queued admission is a task that has not run rather than one that has
+-- finished, and telling the two apart is what keeps a failure report about
+-- work that never happened from being honoured as one about work that did.
+queuedHere ∷ TaskId → Session v → Bool
+queuedHere identity session = any ((== identity) . queuedTask) (sessionQueued session)
 
 -- | Issue the next task name.
 --
@@ -563,17 +574,29 @@ revokeOne cause identity session = case Map.lookup identity (sessionRequests ses
           )
           session {sessionRequests = kept}
 
--- | The requests this session's current epoch issued.
+-- | The requests a session-wide invalidation still has something to revoke.
 --
--- The map also holds stubs of earlier epochs, kept for provider accounting
--- alone. Their interest was revoked when their epoch was replaced, and
--- revoking it again would count the same invalidation a second time and report
--- an epoch as having invalidated work that was not its.
-currentEpochRequests ∷ Session v → [RequestId]
-currentEpochRequests session =
+-- 'sessionRequests' holds two quite different things. Some entries are live
+-- interest: an owner is still entitled to observe how the request ended.
+-- Others are stubs kept for provider accounting alone, whose interest was
+-- already revoked — by an earlier epoch change, by the invalidation of the
+-- task that owned them, or by an owner that observed its cancellation and
+-- walked away.
+--
+-- Only the first kind is invalidated by an epoch change, a session failure, or
+-- a stop. Revoking a stub again would settle nothing, discard nothing, and
+-- still count an invalidation, so an epoch would report itself as having
+-- invalidated work that had already ended before it began.
+--
+-- A held result reservation is exactly the first kind: it is outstanding while
+-- an owner may still observe the settlement, and released the moment one
+-- does or an invalidation discards it.
+revocableRequests ∷ Session v → [RequestId]
+revocableRequests session =
   [ identity
-  | identity ← Map.keys (sessionRequests session)
+  | (identity, record) ← Map.toList (sessionRequests session)
   , requestScope identity == sessionKey session
+  , requestResultHeld record
   ]
 
 -- | Forget a request once both of its obligations are discharged.
@@ -1089,7 +1112,7 @@ advanceEpoch ∷ Session v → (Session v, Either SessionRejection EpochChange)
 advanceEpoch session = case notStopped session >> notFailed session of
   Left rejection → refuse session rejection
   Right () →
-    let replacing = currentEpochRequests session
+    let replacing = revocableRequests session
         revoked =
           foldl'
             (flip (revokeOne CancelledByEpochChange))
@@ -1180,6 +1203,11 @@ data FailureRecord = FailureRecord
 -- 'issuedHere' tells the two apart in a comparison, an unsafe failure still
 -- ends the session, and a safe one is refused as 'TaskRetired'.
 --
+-- An identity that names a /queued/ admission is refused as
+-- 'TaskNotActivated', safe or unsafe alike, and escalates nothing: that task
+-- has never run, so it cannot have left authoritative state half-applied, and
+-- a report saying it did is wrong rather than urgent.
+--
 -- Which task is rejected outright is unchanged: an identity this session never
 -- issued, or issued under a replaced epoch, is 'UnknownTask' and escalates
 -- nothing.
@@ -1189,12 +1217,20 @@ reportFailure record session = case notStopped session >> notFailed session of
   Right () → case failedTask record of
     Nothing → (escalate session, Right ())
     Just identity
+      | queuedHere identity session →
+          -- A queued admission has never run, so it cannot have touched
+          -- authoritative state, and a report that it did is incoherent
+          -- whatever its recovery marking says. Refusing it is the answer; a
+          -- session terminally failed on an impossible attribution would be a
+          -- worse outcome than a caller told its report was wrong.
+          refuse session (TaskNotActivated identity)
       | not (Map.member identity (sessionTasks session))
       , issuedHere identity session →
           -- The record has been observed and forgotten, so there is no task
           -- left to fail. The session is a different matter: a report that
           -- authoritative state may be half-applied does not become false
-          -- because the behaviour that touched it was tidied away first.
+          -- because the behaviour that touched it was tidied away first, and
+          -- unlike a queued admission this task did run.
           if unsafe
             then (escalate session, Right ())
             else refuse session (TaskRetired identity)
@@ -1248,7 +1284,7 @@ invalidateEverything session =
       foldl'
         (flip (revokeOne CancelledBySessionFailure))
         session
-        (currentEpochRequests session)
+        (revocableRequests session)
     closedAdmission = case sessionAdmission session of
       AdmissionClosed → AdmissionClosed
       _ → MutationAdmissionClosed
@@ -1337,7 +1373,7 @@ stopSession session = case sessionExit session of
       foldl'
         (flip (revokeOne CancelledByStop))
         session
-        (currentEpochRequests session)
+        (revocableRequests session)
     record =
       ExitRecord
         { exitScope = sessionKey session

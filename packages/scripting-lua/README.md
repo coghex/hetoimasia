@@ -469,7 +469,9 @@ and a delivery into a full ordered backlog increments `subscriptionRejected`.
 The payload-cap case is the only rejection that moves a record's protocol
 state. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
 `PayloadTooLarge`, the identity refusals `UnknownTask`, `UnknownRequest`,
-`UnknownSubscription`, and `TaskRetired`, `NotTaskOwner`, `NoTerminalResult`,
+`UnknownSubscription`, `TaskRetired` (a task this epoch issued whose result has
+been observed away) and `TaskNotActivated` (an accepted admission that has
+never run), `NotTaskOwner`, `NoTerminalResult`,
 `NothingQueued`, `NoDelivery`, `SessionAlreadyFailed`, `SessionAlreadyStopped`,
 and the wrapped refusals of the records themselves (`TransitionRefused`,
 `ReplyRefused`, `ObserveRefused`, `ProviderRefused`, `DeliveryRefused`). There
@@ -506,17 +508,24 @@ newest value. There is no universal lossy stream.
 
 `advanceEpoch` invalidates every task, queued admission, subscription, and
 pending request of the previous epoch before the new one exists, retaining only
-provider-work accounting. `reportFailure` with `RecoveryUnsafe` moves the
+provider-work accounting. It invalidates only what still holds a local
+interest: a stub whose owner already revoked it — by having its task
+invalidated, or by observing its cancellation and walking away — is carried for
+provider accounting and is not invalidated, or counted, a second time. Session
+failure and stop follow the same rule. `reportFailure` with `RecoveryUnsafe` moves the
 session to its terminal failed state: mutation admission closes, live work is
 invalidated, and the record is kept beside the identity of the last good
 snapshot. `Observing` admission stays open, because a failed gameplay session
 that could say nothing about itself would be worse than a stopped one, and
 `advanceEpoch` refuses it — replacing a failed domain means a new `Session`. An
 unsafe failure ends the session even when the task it names has already
-finished: the task keeps its one terminal outcome, but "the behaviour that
-touched authoritative state was cancelled a moment ago" is not evidence that the
-state is consistent. A *safe* failure naming a finished task is refused, and a
-task identity this epoch does not hold is `UnknownTask` and escalates nothing.
+finished, or has been observed away entirely: the task keeps its one terminal
+outcome, but "the behaviour that touched authoritative state was cancelled a
+moment ago" is not evidence that the state is consistent. A *safe* failure
+naming such a task is refused. A failure naming a *queued* admission is refused
+either way and escalates nothing — a task that has never run cannot have left
+authoritative state half-applied — and an identity this epoch never issued is
+`UnknownTask`.
 `stopSession` closes admission, aborts queued work, records a task inside a
 segment as outstanding rather than draining it, and answers an `ExitRecord` of
 dispositions and discard counts. There is no operation that waits for every task

@@ -25,7 +25,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( AdmissionState (AdmissionOpen, MutationAdmissionClosed)
   , FailureRecord (FailureRecord, failedLastGoodSnapshot, failedReason, failedRecovery, failedTask)
   , Session (sessionAdmission, sessionFailure, sessionKey, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
-  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TaskRetired, TransitionRefused, UnknownTask)
+  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TaskNotActivated, TaskRetired, TransitionRefused, UnknownTask)
   , TerminalResult (ResultCancelled, ResultFailed)
   , acceptRequest
   , activateNext
@@ -174,6 +174,19 @@ spec = describe "session failure" $ do
     refusal `shouldBe` TaskRetired owner
     sessionFailure d `shouldBe` Nothing
     sessionAdmission d `shouldBe` AdmissionOpen
+
+  it "refuses a failure naming a queued admission, safe or unsafe alike" $ do
+    session ← openSession
+    (a, queuedOnly) ← ok (requestAdmission (admission 1) session)
+    (b, unsafeRefusal) ←
+      rejected (reportFailure unsafeAuthoritative {failedTask = Just queuedOnly} a)
+    unsafeRefusal `shouldBe` TaskNotActivated queuedOnly
+    sessionFailure b `shouldBe` Nothing
+    sessionAdmission b `shouldBe` AdmissionOpen
+    length (sessionQueued b) `shouldBe` 1
+    (c, safeRefusal) ← rejected (reportFailure handled {failedTask = Just queuedOnly} b)
+    safeRefusal `shouldBe` TaskNotActivated queuedOnly
+    sessionFailure c `shouldBe` Nothing
 
   it "escalates nothing for a task identity this session does not hold" $ do
     session ← openSession
