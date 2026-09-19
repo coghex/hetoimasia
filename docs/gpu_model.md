@@ -113,6 +113,10 @@ resource is disposed of, its current-generation entry is forgotten rather than
 kept as permanent history; a retained identity for it is still stale, decided by
 the monotonic resource counter.
 
+`TargetView` reports the target's recovery epoch and how many cycles are still
+waiting for one of their halves, so a caller — or an example — can see the
+distinctions above rather than infer them.
+
 An image belongs to one owner at a time. The presentation record that takes an
 image at acquisition carries that exact image, and that record outlives its frame
 — the slot is reusable as soon as its own submission completes, while the record
@@ -300,17 +304,36 @@ things: a completed presentation-retirement cycle on the target, and then a full
 second of monotonic progress after it without another failure. Elapsed time alone
 resets nothing.
 
+### Cycles, epochs, and what may be compared with what
+
 A cycle is *both* of its facts. A presentation may retire before its submission
 completes, so retirement on its own is half of one — the frame still owes the
-rendering it submitted — and whichever fact arrives second is what completes the
-cycle.
+rendering it submitted — and whichever fact arrives second completes the cycle.
+
+Each cycle is a record of its own, held on the target and keyed by the
+presentation record that identifies it. It is not held on the frame, because a
+frame slot is reusable as soon as its own submission completes and a cycle can
+outlive that; a half remembered on a frame is a half lost when the slot is
+recycled.
+
+Every target carries a **recovery epoch**. It rises when a recovery attempt is
+admitted, and at no other time, and it never falls — it lives on the target
+rather than on the episode precisely so that resetting the attempt budget cannot
+reissue one. A cycle is stamped with the epoch it was opened in, and is credited
+only if that is still the target's epoch when it completes. A cycle whose halves
+straddle an attempt therefore counts for nothing, in either order and whether or
+not the frame was recycled in between, because an attempt is exactly what makes
+the evidence on either side of it incomparable.
+
+Dropping a cycle's credit touches no hold, no accounting and no record. What it
+settles is whether the target has been *healthy*; the GPU completion facts that
+arrived are applied in full regardless, and every ownership obligation they
+discharge is discharged.
 
 The credit also goes only to an episode that can use it: one with a spent
 attempt, nothing in flight, and a recovery that actually **succeeded**. A cycle
-completed during an attempt is a cycle that attempt is in the middle of
-interrupting. A cycle after a failure is ordinary rendering going on while a
-retry is still scheduled — not the target recovering, and treating it as such
-would erase that retry.
+after a failure is ordinary rendering going on while a retry is still scheduled —
+not the target recovering, and treating it as such would erase that retry.
 
 Exhaustion marks an optional target unavailable and leaves the session running;
 for a required target it fails the graphics session. Device loss, a validation
@@ -368,14 +391,35 @@ The turn answers the absolute instant of the next one:
   has started would complete and reset its episode;
 - with nothing pending and nothing scheduled there is no turn to schedule.
 
-What counts as pending is everything only a turn can move on. That includes a
-target that is retiring or unavailable: its record is not removed until a turn
-removes it, so a schedule that stayed silent about one would strand the record
-and the target budget with it. It also includes a replacement nobody is building
-yet — an out-of-date or lost acquisition returns its reservation and creates no
-obligation, so the request it raises would otherwise be the one kind of work the
-owner was never woken for. A construction already in flight covers the request it
-was begun for and no later one.
+### One scheduling rule
+
+Requirement 7 names four things that restart the schedule: new demand, a new
+obligation, an observed completion, and a close. That was once enforced by two
+dozen transitions each resetting the backoff by hand, and the omissions were not
+visible by reading any one of them — a replacement request slipped through
+unscheduled for exactly that reason.
+
+There is now one rule, applied to every transition. The model keeps a single
+**work summary** — render demand, live frames, submissions, presentation records
+in flight, retiring generations, disposable subjects, retiring targets,
+replacements owed, recovery deadlines — and a transition restarts the schedule
+when that summary *grew*. The first two of requirement 7's four are exactly
+"the owner has more to do than before", and fall out of the comparison. The other
+two are not visible in it, since a completion reduces the work and a close can
+too, so those transitions declare themselves.
+
+A transition that only removed work, and an observation that changed nothing,
+both leave the anchored deadline exactly where it was. Releasing a resource that
+still owes the end of its CPU use creates nothing to do, so it does not restart
+the schedule; ending that CPU use settles the last hold and makes the resource
+disposable, so it does.
+
+The same summary answers what is pending, so what the owner is told to wait for
+and what wakes it can never describe different things. The idle poll covers only
+the part of it that can end *without* the owner: a recovery deadline carries its
+own absolute instant and is not polled for, and a frame the owner has reserved
+or acquired ends when the owner submits or abandons it rather than when anyone
+asks.
 
 `nextDeadline` takes **no instant**, and that is the point: the answer is a
 property of the model alone, so reading the same unchanged model twice gives the
@@ -529,6 +573,21 @@ cycle until that submission does; a cycle after a failed attempt replenishing
 nothing and leaving the scheduled retry intact; the schedule restarting whole
 after a turn that made progress; and evidence gathered before an attempt
 refusing to replenish the episode that attempt belongs to.
+
+Beyond the examples above, the suite drives **event orderings systematically**.
+The contracts that proved hardest were never about one transition but about the
+order two of them arrived in, and each was found one ordering at a time. A
+script language now enumerates the bounded legal orderings — a frame's whole
+life in both completion orders, a slot reused, two frames in flight, an
+unsubmitted frame abandoned, a submitted frame closed before presenting, a close
+arriving in each phase, a recovery attempt before, after and between a cycle's
+halves, three failures in a row, and replacement demand raised after the schedule
+has backed off — and checks the model's invariants after *every* step of *every*
+one of them: nothing disposable owes anything, accounting stays inside its
+configuration, storage stays a function of that configuration, silence about the
+schedule means there is genuinely nothing to do, epochs never repeat, and cycles
+never outgrow the pool. A failure names the script and the shortest prefix of
+steps that reached the broken state.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

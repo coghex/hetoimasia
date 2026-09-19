@@ -76,6 +76,7 @@ test-suite gpu-model-tests
         Test.GPU.Model.Identities
         Test.GPU.Model.Progress
         Test.GPU.Model.Recovery
+        Test.GPU.Model.Sequences
         Test.GPU.Model.Spec
         Test.GPU.Model.Support
     build-depends:

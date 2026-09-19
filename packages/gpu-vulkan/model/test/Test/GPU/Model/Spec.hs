@@ -12,6 +12,7 @@ import qualified Test.GPU.Model.Holds as Holds
 import qualified Test.GPU.Model.Identities as Identities
 import qualified Test.GPU.Model.Progress as Progress
 import qualified Test.GPU.Model.Recovery as Recovery
+import qualified Test.GPU.Model.Sequences as Sequences
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -22,3 +23,4 @@ spec = describe "GPU model" $ do
   Budgets.spec
   Recovery.spec
   Progress.spec
+  Sequences.spec

@@ -333,10 +333,6 @@ data Frame = Frame
   , framePoolRecord ∷ !(Maybe Natural)
   , frameBatches ∷ !(Set Natural)
   , frameSubmission ∷ !(Maybe Natural)
-  , framePresentationRetired ∷ !Bool
-    -- ^ Whether this frame's enqueued presentation has already retired. A
-    -- presentation may retire before its submission completes, so the two facts
-    -- of one cycle arrive in either order and whichever is second completes it.
   , frameSubmissionReserved ∷ !Bool
     -- ^ Whether this frame still holds the object capacity its submission record
     -- will need. Reserved with the frame, so committing a submission that the
@@ -356,6 +352,14 @@ data Target = Target
   , targetSlotUse ∷ !(Map Natural Natural)
   , targetPool ∷ !(Map Natural PoolRecord)
   , targetRecovery ∷ !RecoveryEpisode
+  , targetRecoveryEpoch ∷ !Natural
+    -- ^ Rises whenever a recovery attempt is admitted, and never falls. It lives
+    -- on the target rather than on the episode precisely so that resetting the
+    -- attempt budget cannot reissue an epoch: evidence stamped with a spent
+    -- epoch must stay distinguishable for as long as it exists.
+  , targetCycles ∷ !(Map Natural Cycle)
+    -- ^ The presentation-retirement cycles in flight, keyed by the presentation
+    -- record that identifies each one.
   , targetReplacementRequested ∷ !Natural
     -- ^ How many replacement requests this target has raised. Compared against
     -- 'targetReplacementServed' rather than cleared, so a request raised while a
@@ -363,6 +367,26 @@ data Target = Target
   , targetReplacementServed ∷ !Natural
   , targetRenderDemand ∷ !Bool
   , targetSuboptimalSeen ∷ !Bool
+  }
+  deriving (Eq, Show)
+
+-- | One normal presentation-retirement cycle: a frame's rendering completing
+-- and its presentation retiring. It is the unit a recovery episode's health
+-- credit is made of.
+--
+-- It is held on the target rather than on the frame because the frame is
+-- reusable as soon as its own submission completes, and a cycle can outlive
+-- that. The presentation record identifies it, and that record's number is
+-- never reissued, so two cycles can never be confused for one.
+data Cycle = Cycle
+  { cycleEpoch ∷ !Natural
+    -- ^ The target's recovery epoch when this cycle was enqueued. A cycle whose
+    -- epoch is no longer the target's spans a recovery attempt, and an attempt
+    -- is exactly what makes the evidence either side of it incomparable.
+  , cycleSubmission ∷ !(Maybe Natural)
+    -- ^ The submission whose completion is this cycle's other half, or 'Nothing'
+    -- once that has arrived.
+  , cyclePresented ∷ !Bool
   }
   deriving (Eq, Show)
 
@@ -522,13 +546,123 @@ note escalation model
     retained = gpuEscalations model
     capacity = fromIntegral (targetRecordLimit (gpuBudgets model)) + 1
 
--- | Schedule an immediate progress opportunity. Every transition that creates a
--- retirement or disposal obligation goes through this, because requirement 7's
--- reset is about new work existing and not about who made it: a target that
--- retires a generation while the session has backed off to its idle interval
--- must not wait that interval out before the owner looks at it.
+-- | Everything the owner has to act on, counted so that two models can be
+-- compared. Both the schedule and the scheduling policy read this one summary,
+-- so what the owner is told is pending and what resets its backoff can never
+-- describe different things.
+data Work = Work
+  { workRenderDemand ∷ !Natural
+  , workFrames ∷ !Natural
+  , workSubmissions ∷ !Natural
+  , workPresentations ∷ !Natural
+  , workRetiringGenerations ∷ !Natural
+  , workDisposable ∷ !Natural
+  , workRetiringTargets ∷ !Natural
+  , workReplacements ∷ !Natural
+  , workRecoveries ∷ !Natural
+  }
+  deriving (Eq, Show)
+
+work ∷ GpuModel → Work
+work model =
+  Work
+    { workRenderDemand = count [() | target ← targets, targetRenderDemand target, targetPhase target == TargetAdmitted]
+    , workFrames = liveFrames model
+    , workSubmissions = fromIntegral (Map.size (gpuSubmissions model))
+    , workPresentations = count [() | target ← targets, entry ← Map.elems (targetPool target), poolState entry /= PoolReserved]
+    , workRetiringGenerations =
+        count
+          [ ()
+          | target ← targets
+          , record ← Map.elems (targetGenerations target)
+          , generationPhase record == GenerationRetired
+          , not (holdsSettled (generationHolds record))
+          ]
+    , workDisposable = count (eligibleSubjects model)
+    , workRetiringTargets = count [() | target ← targets, targetPhase target `elem` [TargetRetiring, TargetUnavailable]]
+    , workReplacements = count [() | target ← targets, replacementOwed target]
+    , workRecoveries = count (recoveryDeadlines model)
+    }
+  where
+    targets = Map.elems (gpuTargets model)
+    count ∷ [a] → Natural
+    count = fromIntegral . length
+
+-- | Whether a transition left the owner with more to do than it found. Every
+-- field counts here, because anything the owner must eventually act on is work
+-- it has to be woken for.
+workGrew ∷ Work → Work → Bool
+workGrew before after =
+  or
+    [ field after > field before
+    | field ←
+        [ workRenderDemand
+        , workFrames
+        , workSubmissions
+        , workPresentations
+        , workRetiringGenerations
+        , workDisposable
+        , workRetiringTargets
+        , workReplacements
+        , workRecoveries
+        ]
+    ]
+
+-- | The work the idle poll is for: the obligations that can end without the
+-- owner doing anything, so that asking again later is the only way to find out.
+--
+-- A recovery deadline is not one of them — it carries its own absolute instant,
+-- and polling for it would answer "now" when the model has said "at 100 ms".
+-- Neither is a frame the owner has reserved or acquired: it ends when the owner
+-- submits or abandons it, not when anyone asks.
+pollableWork ∷ Work → Natural
+pollableWork summary =
+  sum
+    [ field summary
+    | field ←
+        [ workSubmissions
+        , workPresentations
+        , workRetiringGenerations
+        , workDisposable
+        , workRetiringTargets
+        , workReplacements
+        ]
+    ]
+
+-- | Schedule an immediate progress opportunity.
 roused ∷ GpuModel → GpuModel
 roused model = model {gpuBackoff = resetBackoff (gpuBackoff model)}
+
+-- | The one scheduling rule, applied to every transition.
+--
+-- Requirement 7 names four things that restart the schedule: new demand, a new
+-- obligation, an observed completion, and a close. The first two are exactly
+-- "the owner has more to do than before", which is decided here by comparing
+-- the work summary rather than by remembering to call something at each site —
+-- the previous arrangement, where two dozen transitions each reset the backoff
+-- by hand, is the one that let a replacement request slip through unscheduled.
+-- The other two are not visible in that comparison, since a completion reduces
+-- the work and a close can too, so a transition declares them.
+--
+-- An observation, or a transition that only removed work, leaves the anchored
+-- deadline exactly where it was.
+settleSchedule ∷ Bool → GpuModel → GpuModel → GpuModel
+settleSchedule observed before after
+  | observed || workGrew (work before) (work after) = roused after
+  | otherwise = after
+
+-- | Apply the rule to a transition that answers a model and a value.
+scheduling ∷ GpuModel → Outcome (GpuModel, a) → Outcome (GpuModel, a)
+scheduling before = fmap (\(after, value) → (settleSchedule False before after, value))
+
+-- | The same, for a transition that answers a model alone.
+scheduling_ ∷ GpuModel → Outcome GpuModel → Outcome GpuModel
+scheduling_ before = fmap (settleSchedule False before)
+
+-- | The same, for one of the two transitions requirement 7 names outright: an
+-- observed completion, or a close.
+observing_ ∷ GpuModel → Outcome GpuModel → Outcome GpuModel
+observing_ before = fmap (settleSchedule True before)
 
 running ∷ GpuModel → Either Misuse ()
 running model = case gpuState model of
@@ -753,6 +887,7 @@ releaseBytes count model
 -- stale rather than a handle on its successor.
 admitTarget ∷ TargetClass → GpuModel → Outcome (GpuModel, TargetId)
 admitTarget classification model =
+  scheduling model $
   resolved (running model) $ \() →
     if fromIntegral (Map.size (gpuTargets model)) >= targetRecordLimit (gpuBudgets model)
       then Backpressure TargetRecordBudget
@@ -771,6 +906,8 @@ admitTarget classification model =
                 , targetSlotUse = Map.empty
                 , targetPool = Map.empty
                 , targetRecovery = freshEpisode
+                , targetRecoveryEpoch = 0
+                , targetCycles = Map.empty
                 , targetReplacementRequested = 0
                 , targetReplacementServed = 0
                 , targetRenderDemand = False
@@ -781,7 +918,6 @@ admitTarget classification model =
                   { gpuTargets = Map.insert number target (gpuTargets model)
                   , gpuIncarnations = Map.insert number incarnation (gpuIncarnations model)
                   , gpuNextTarget = max (gpuNextTarget model) (number + 1)
-                  , gpuBackoff = resetBackoff (gpuBackoff model)
                   }
               , TargetId (gpuSession model) number incarnation
               )
@@ -797,6 +933,7 @@ freeTargetNumber model = search 0
 -- stops contributing a render deadline.
 suspendTarget ∷ TargetId → GpuModel → Outcome GpuModel
 suspendTarget identity model =
+  scheduling_ model $
   resolved (running model) $ \() →
     resolved (resolveTarget model identity) $ \(number, target) →
       case targetPhase target of
@@ -807,13 +944,13 @@ suspendTarget identity model =
 
 resumeTarget ∷ TargetId → GpuModel → Outcome GpuModel
 resumeTarget identity model =
+  scheduling_ model $
   resolved (running model) $ \() →
     resolved (resolveTarget model identity) $ \(number, target) →
       case targetPhase target of
         TargetSuspended →
           Admitted
             ( editTarget number (\record → record {targetPhase = TargetAdmitted}) model
-                {gpuBackoff = resetBackoff (gpuBackoff model)}
             )
         TargetAdmitted → Admitted model
         _ → Rejected (WrongPhase TargetIdentity)
@@ -822,6 +959,7 @@ resumeTarget identity model =
 -- restarts the idle backoff.
 requestRender ∷ TargetId → GpuModel → Outcome GpuModel
 requestRender identity model =
+  scheduling_ model $
   resolved (running model) $ \() →
     resolved (resolveTarget model identity) $ \(number, target) →
       case targetPhase target of
@@ -830,20 +968,19 @@ requestRender identity model =
         _ →
           Admitted
             ( editTarget number (\record → record {targetRenderDemand = True}) model
-                {gpuBackoff = resetBackoff (gpuBackoff model)}
             )
 
 -- | Close a target. Close wins: it drops render demand, and from here no
 -- construction may be published back into active rendering.
 closeTarget ∷ TargetId → GpuModel → Outcome GpuModel
 closeTarget identity model =
+  observing_ model $
   resolved (resolveTarget model identity) $ \(number, _) →
     Admitted
       ( editTarget
           number
           (\record → record {targetPhase = TargetRetiring, targetRenderDemand = False})
           model
-          {gpuBackoff = resetBackoff (gpuBackoff model)}
       )
 
 -- ---------------------------------------------------------------------------
@@ -859,6 +996,7 @@ closeTarget identity model =
 -- accounting after the native call already happened.
 beginGeneration ∷ TargetId → Maybe GenerationId → GpuModel → Outcome (GpuModel, GenerationId)
 beginGeneration identity replacing model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveTarget model identity) $ \(number, target) →
       case targetPhase target of
@@ -937,7 +1075,6 @@ beginGeneration identity replacing model =
                           }
                     )
                     charged
-                    {gpuBackoff = resetBackoff (gpuBackoff charged)}
                 , GenerationId (targetIdOf charged number target) generation
                 )
 
@@ -959,6 +1096,7 @@ data PublicationAnswer
 -- engine actually returned.
 publishGeneration ∷ GenerationId → Natural → GpuModel → Outcome (GpuModel, PublicationAnswer)
 publishGeneration identity images model =
+  scheduling model $
   resolved (resolveGeneration model identity) $ \(number, generation, record) →
     if generationPhase record /= GenerationConstructing
       then Rejected (WrongPhase GenerationIdentity)
@@ -1017,12 +1155,13 @@ publishGeneration identity images model =
               , generationHolds = releaseLogically (generationHolds entry)
               }
         )
-        (roused model)
+        model
 
 -- | The construction failed. The candidate is retired; any @oldSwapchain@
 -- retirement it performed stays performed.
 failGenerationConstruction ∷ GenerationId → GpuModel → Outcome GpuModel
 failGenerationConstruction identity model =
+  scheduling_ model $
   resolved (resolveGeneration model identity) $ \(number, generation, record) →
     if generationPhase record /= GenerationConstructing
       then Rejected (WrongPhase GenerationIdentity)
@@ -1037,12 +1176,13 @@ failGenerationConstruction identity model =
                     , generationHolds = releaseLogically (generationHolds entry)
                     }
               )
-              (roused model)
+              model
           )
 
 -- | Retire an active generation without replacing it.
 retireGeneration ∷ GenerationId → GpuModel → Outcome GpuModel
 retireGeneration identity model =
+  scheduling_ model $
   resolved (resolveGeneration model identity) $ \(number, generation, record) →
     case generationPhase record of
       GenerationRetired → Rejected (AlreadyConsumed GenerationIdentity)
@@ -1067,7 +1207,7 @@ retireGeneration identity model =
                         , generationHolds = releaseLogically (generationHolds entry)
                         }
                   )
-                  (roused model)
+                  model
               )
           )
 
@@ -1076,8 +1216,9 @@ retireGeneration identity model =
 -- this says nothing can still reach it.
 endGenerationCpuUse ∷ GenerationId → GpuModel → Outcome GpuModel
 endGenerationCpuUse identity model =
+  scheduling_ model $
   resolved (resolveGeneration model identity) $ \(number, generation, _) →
-    Admitted (editGeneration number generation (\entry → entry {generationHolds = endCpuUse (generationHolds entry)}) (roused model))
+    Admitted (editGeneration number generation (\entry → entry {generationHolds = endCpuUse (generationHolds entry)}) model)
 
 -- ---------------------------------------------------------------------------
 -- Managed resources
@@ -1085,6 +1226,7 @@ endGenerationCpuUse identity model =
 -- | Turn a successful allocation attempt into a managed resource generation.
 createResource ∷ AllocationId → GpuModel → Outcome (GpuModel, ResourceId)
 createResource identity model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveAllocation model identity) $ \(number, attempt) →
       if attemptFailed attempt
@@ -1112,6 +1254,7 @@ createResource identity model =
 -- still names exactly the contents it recorded.
 rebuildResource ∷ ResourceId → AllocationId → GpuModel → Outcome (GpuModel, ResourceId)
 rebuildResource identity allocation model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveResource model identity) $ \((logical, generation), existing) →
       resolved (resolveAllocation model allocation) $ \(number, attempt) →
@@ -1136,7 +1279,7 @@ rebuildResource identity allocation model =
                             , resourceBytes = attemptBytes attempt
                             , resourceObjects = attemptObjects attempt
                             }
-                        released = editHolds (ResourceKey logical generation) releaseLogically (roused model)
+                        released = editHolds (ResourceKey logical generation) releaseLogically model
                      in Admitted
                           ( released
                               { gpuResources = Map.insert (logical, next) built (gpuResources released)
@@ -1148,13 +1291,15 @@ rebuildResource identity allocation model =
 
 releaseResource ∷ ResourceId → GpuModel → Outcome GpuModel
 releaseResource identity model =
+  scheduling_ model $
   resolved (resolveResource model identity) $ \(key, _) →
-    Admitted (editHolds (uncurry ResourceKey key) releaseLogically (roused model))
+    Admitted (editHolds (uncurry ResourceKey key) releaseLogically model)
 
 endResourceCpuUse ∷ ResourceId → GpuModel → Outcome GpuModel
 endResourceCpuUse identity model =
+  scheduling_ model $
   resolved (resolveResource model identity) $ \(key, _) →
-    Admitted (editHolds (uncurry ResourceKey key) endCpuUse (roused model))
+    Admitted (editHolds (uncurry ResourceKey key) endCpuUse model)
 
 -- ---------------------------------------------------------------------------
 -- Frames
@@ -1165,6 +1310,7 @@ endResourceCpuUse identity model =
 -- without the cleanup capacity it needs to be abandoned safely.
 reserveFrame ∷ TargetId → GpuModel → Outcome (GpuModel, FrameSlotId)
 reserveFrame identity model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveTarget model identity) $ \(number, target) →
       case targetPhase target of
@@ -1199,7 +1345,6 @@ reserveFrame identity model =
                     , framePoolRecord = Just record
                     , frameBatches = Set.empty
                     , frameSubmission = Nothing
-                    , framePresentationRetired = False
                     , frameSubmissionReserved = True
                     , frameFenceReset = False
                     }
@@ -1224,7 +1369,6 @@ reserveFrame identity model =
                       )
                       charged
                         { gpuNextPresentation = record + 1
-                        , gpuBackoff = resetBackoff (gpuBackoff charged)
                         }
                   , FrameSlotId (targetIdOf charged number target) slot use
                   )
@@ -1261,6 +1405,7 @@ data AcquireAnswer
 -- | Attempt the acquisition this frame reserved.
 acquireImage ∷ FrameSlotId → AcquireOutcome → GpuModel → Outcome (GpuModel, AcquireAnswer)
 acquireImage identity outcome model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveFrame model identity) $ \(number, slot, frame) →
       if framePhase frame /= FrameReserved
@@ -1325,7 +1470,6 @@ acquireImage identity outcome model =
                               model
                           )
                       )
-                      {gpuBackoff = resetBackoff (gpuBackoff model)}
                   , ImageOwned
                       (ImageId (GenerationId (targetIdOf model number target) generation) index)
                       suboptimal
@@ -1366,6 +1510,7 @@ returnReservation number slot frame model =
 -- resource generations it names and the swapchain generation it renders into.
 recordBatch ∷ FrameSlotId → [ResourceId] → GpuModel → Outcome (GpuModel, BatchId)
 recordBatch identity references model =
+  scheduling model $
   resolved (running model) $ \() →
     resolved (resolveFrame model identity) $ \(number, slot, frame) →
       if framePhase frame /= FrameAcquired
@@ -1410,7 +1555,6 @@ recordBatch identity references model =
                                         }
                                       (gpuBatches retained)
                                 , gpuNextBatch = batch + 1
-                                , gpuBackoff = resetBackoff (gpuBackoff retained)
                                 }
                           , BatchId (frameTarget identity) batch
                           )
@@ -1425,13 +1569,13 @@ sealed model key = case holdsOf model key of
 -- | Discard one recorded batch. It discharges exactly its own references.
 discardBatch ∷ BatchId → GpuModel → Outcome GpuModel
 discardBatch identity model =
+  scheduling_ model $
   resolved (resolveBatch model identity) $ \(number, batch) →
     Admitted (dropBatch number batch model)
 
 dropBatch ∷ Natural → Batch → GpuModel → GpuModel
-dropBatch number batch model' =
-  let model = roused model'
-   in releaseObjects 1 $
+dropBatch number batch model =
+  releaseObjects 1 $
     editFrame
       (batchTargetNumber batch)
       (batchSlot batch)
@@ -1443,6 +1587,7 @@ dropBatch number batch model' =
 -- discarded, and nothing else is.
 resetRecorder ∷ FrameSlotId → GpuModel → Outcome GpuModel
 resetRecorder identity model =
+  scheduling_ model $
   resolved (resolveFrame model identity) $ \(_, _, frame) →
     Admitted (foldl' discard model (Set.toList (frameBatches frame)))
   where
@@ -1454,6 +1599,7 @@ resetRecorder identity model =
 -- never pending work: it adds no obligation here and none is counted for it.
 resetSubmissionFence ∷ FrameSlotId → GpuModel → Outcome GpuModel
 resetSubmissionFence identity model =
+  scheduling_ model $
   resolved (resolveFrame model identity) $ \(number, slot, frame) →
     if framePhase frame /= FrameAcquired
       then Rejected (WrongPhase FrameIdentity)
@@ -1483,6 +1629,7 @@ submitFrames ∷ [FrameSlotId] → SubmitOutcome → GpuModel → Outcome (GpuMo
 submitFrames identities outcome model
   | null identities = Rejected EmptySubmission
   | otherwise =
+      scheduling model $
       resolved (running model) $ \() →
         resolved (traverse (resolveFrame model) identities) $ \frames →
           let keys = [(number, slot) | (number, slot, _) ← frames]
@@ -1568,7 +1715,6 @@ submitFrames identities outcome model
                         }
                       (gpuSubmissions advanced)
                 , gpuNextSubmission = submission + 1
-                , gpuBackoff = resetBackoff (gpuBackoff advanced)
                 }
          in if uncertain
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
@@ -1601,6 +1747,7 @@ data PresentAnswer
 
 enqueuePresentation ∷ FrameSlotId → PresentOutcome → GpuModel → Outcome (GpuModel, PresentAnswer)
 enqueuePresentation identity outcome model =
+  scheduling model $
   resolved (resolveFrame model identity) $ \(number, slot, frame) →
     if framePhase frame /= FrameSubmitted
       then Rejected (WrongPhase FrameIdentity)
@@ -1625,16 +1772,31 @@ enqueuePresentation identity outcome model =
                           , targetReplacementRequested =
                               targetReplacementRequested entry + (if replacing then 1 else 0)
                           , targetRenderDemand = False
+                          , -- The cycle opens here, stamped with the epoch it
+                            -- belongs to and with whichever half is already in.
+                            targetCycles =
+                              Map.insert
+                                pool
+                                Cycle
+                                  { cycleEpoch = targetRecoveryEpoch entry
+                                  , cycleSubmission = pending (frameSubmission frame)
+                                  , cyclePresented = False
+                                  }
+                                (targetCycles entry)
                           }
                     )
                     (editFrame number slot (\entry → entry {framePhase = FramePresentationEnqueued}) model)
-                      {gpuBackoff = resetBackoff (gpuBackoff model)}
               , PresentationTracked (PresentationId (frameTarget identity) pool)
               )
   where
     replacing =
       outcome
         `elem` [PresentationEnqueuedSuboptimal, PresentationEnqueuedOutOfDate, PresentationEnqueuedSurfaceLost]
+    -- A submission that has already completed is not a half this cycle is still
+    -- waiting for.
+    pending = \case
+      Just submission | Map.member submission (gpuSubmissions model) → Just submission
+      _ → Nothing
 
 -- | Safely abandon an acquired, unsubmitted frame. Its unsubmitted recording is
 -- discharged; its image and acquisition synchronization are not. The frame keeps
@@ -1642,6 +1804,7 @@ enqueuePresentation identity outcome model =
 -- evidence, so a skip can never silently recycle a busy record.
 skipUnsubmittedFrame ∷ FrameSlotId → GpuModel → Outcome GpuModel
 skipUnsubmittedFrame identity model =
+  scheduling_ model $
   resolved (resolveFrame model identity) $ \(number, slot, frame) →
     if framePhase frame /= FrameAcquired
       then Rejected (WrongPhase FrameIdentity)
@@ -1658,6 +1821,7 @@ skipUnsubmittedFrame identity model =
 -- not a skip, and nothing here pretends the submission did not happen.
 closeSubmittedFrame ∷ FrameSlotId → GpuModel → Outcome GpuModel
 closeSubmittedFrame identity model =
+  scheduling_ model $
   resolved (resolveFrame model identity) $ \(number, slot, frame) →
     if framePhase frame /= FrameSubmitted
       then Rejected (WrongPhase FrameIdentity)
@@ -1678,7 +1842,6 @@ awaitSettlement number slot pool model =
           }
     )
     (editFrame number slot (\entry → entry {framePhase = FrameRetiring}) model)
-    {gpuBackoff = resetBackoff (gpuBackoff model)}
 
 -- ---------------------------------------------------------------------------
 -- Injected evidence
@@ -1727,7 +1890,7 @@ silentEvidence =
 -- | Apply one fact. The instant is the caller's reading of the injected clock;
 -- it is used only to date the healthy-progress evidence a recovery reset needs.
 recordCompletion ∷ Instant → CompletionFact → GpuModel → Outcome GpuModel
-recordCompletion now fact model = case fact of
+recordCompletion now fact model = observing_ model $ case fact of
   SubmissionCompleted identity →
     resolved (resolveSubmission model identity) $ \(number, submission) →
       if submissionUncertain submission
@@ -1747,7 +1910,7 @@ recordCompletion now fact model = case fact of
           Just pool → Admitted (applySettlement number slot pool frame model)
 
 applySubmission ∷ Instant → Natural → Submission → GpuModel → GpuModel
-applySubmission now number submission model = settleFrames (submissionFrames submission) credited
+applySubmission now number submission model = settleFrames (submissionFrames submission) advanced
   where
     discharged =
       releaseObjects
@@ -1757,19 +1920,20 @@ applySubmission now number submission model = settleFrames (submissionFrames sub
             model
             (Set.toList (submissionSubjects submission))
         )
-          { gpuSubmissions = Map.delete number (gpuSubmissions model)
-          , gpuBackoff = resetBackoff (gpuBackoff model)
-          }
-    -- A frame whose presentation retired first completes its cycle here, this
-    -- being the second of the two facts that cycle is made of.
-    credited = foldl' credit discharged (submissionFrames submission)
-    credit current (target, slot) =
-      case Map.lookup target (gpuTargets model) >>= Map.lookup slot . targetFrames of
-        Just frame | framePresentationRetired frame → creditCycle now target current
-        _ → current
+          {gpuSubmissions = Map.delete number (gpuSubmissions model)}
+    -- The rendering half arrives for every cycle waiting on this submission, on
+    -- whichever targets they belong to.
+    advanced =
+      foldl'
+        (\current target → advanceCycles now target (renders number) current)
+        discharged
+        (Map.keys (gpuTargets discharged))
+    renders wanted entry
+      | cycleSubmission entry == Just wanted = Just entry {cycleSubmission = Nothing}
+      | otherwise = Nothing
 
 applyPresentation ∷ Instant → Natural → Natural → PoolRecord → GpuModel → GpuModel
-applyPresentation now number record entry model = settleFrames [(number, slot) | slot ← users] marked
+applyPresentation now number record entry model = settleFrames [(number, slot) | slot ← users] advanced
   where
     users = slotsUsing number record model
     removed =
@@ -1777,28 +1941,47 @@ applyPresentation now number record entry model = settleFrames [(number, slot) |
         number
         (\target → target {targetPool = Map.delete record (targetPool target)})
         (releaseObjects 1 (discharge model))
-          {gpuBackoff = resetBackoff (gpuBackoff model)}
-    -- A retirement is only half of a cycle. The frame has gone only if it
-    -- settled, which for an enqueued frame means its submission has already
-    -- completed, so the cycle is complete now. Otherwise the frame is still
-    -- waiting on that submission: the fact is remembered on it, and the cycle
-    -- completes when the submission does.
-    marked
-      | null users = creditCycle now number removed
-      | otherwise =
-          foldl'
-            (\current slot → editFrame number slot (\frame → frame {framePresentationRetired = True}) current)
-            removed
-            users
+    -- The presentation half arrives for this record's own entry, and for no
+    -- other: the record identifies it.
+    advanced = advanceCycles now number presents removed
+    presents waiting
+      | cyclePresented waiting = Nothing
+      | otherwise = Just waiting {cyclePresented = True}
     discharge current = case poolGeneration entry of
       Nothing → current
       Just generation → editHolds (GenerationKey number generation) (dischargePresentation record) current
 
--- | Note a completed normal presentation-retirement cycle on a target's recovery
--- episode, at the instant the fact that completed it carried.
-creditCycle ∷ Instant → Natural → GpuModel → GpuModel
-creditCycle now number =
-  editTarget number (\entry → entry {targetRecovery = noteRetirementCycle now (targetRecovery entry)})
+-- | Apply one half to whichever of a target's cycles it belongs to, completing
+-- those that now have both.
+--
+-- Completing a cycle credits it only when its epoch is still the target's. A
+-- cycle stamped with a spent epoch spans a recovery attempt, and evidence from
+-- either side of an attempt says nothing about the other; it is dropped rather
+-- than credited. Dropping it touches no hold and no accounting: what it settles
+-- is whether the target has been healthy, and nothing else.
+advanceCycles ∷ Instant → Natural → (Cycle → Maybe Cycle) → GpuModel → GpuModel
+advanceCycles now number half model = case Map.lookup number (gpuTargets model) of
+  Nothing → model
+  Just target → foldl' apply model (Map.toList (targetCycles target))
+  where
+    apply current (record, pending) = case half pending of
+      Nothing → current
+      Just moved
+        | cyclePresented moved && cycleSubmission moved == Nothing → complete current record moved
+        | otherwise → editTarget number (\entry → entry {targetCycles = Map.insert record moved (targetCycles entry)}) current
+    complete current record settled =
+      editTarget
+        number
+        ( \entry →
+            entry
+              { targetCycles = Map.delete record (targetCycles entry)
+              , targetRecovery =
+                  if cycleEpoch settled == targetRecoveryEpoch entry
+                    then noteRetirementCycle now (targetRecovery entry)
+                    else targetRecovery entry
+              }
+        )
+        current
 
 applySettlement ∷ Natural → Natural → Natural → Frame → GpuModel → GpuModel
 applySettlement number slot pool frame model =
@@ -1808,7 +1991,6 @@ applySettlement number slot pool frame model =
         number
         (\target → target {targetPool = Map.delete pool (targetPool target)})
         (releaseObjects 1 (discharge model))
-          {gpuBackoff = resetBackoff (gpuBackoff model)}
   where
     discharge current = case frameGeneration frame of
       Nothing → current
@@ -2127,21 +2309,19 @@ nextDeadline model
   | any isLeft results = TurnUnschedulable
   | otherwise = NoTurnNeeded
   where
-    renderDemand =
-      or
-        [ targetRenderDemand target && targetPhase target == TargetAdmitted
-        | target ← Map.elems (gpuTargets model)
-        ]
-    immediate = obligations > 0 && backoffDueAt (gpuBackoff model) == DueImmediately
+    renderDemand = workRenderDemand summary > 0
+    summary = work model
+    pollable = pollableWork summary
+    immediate = pollable > 0 && backoffDueAt (gpuBackoff model) == DueImmediately
     scheduled = [instant | Right instant ← results]
     results = poll ++ recoveryDeadlines model
     poll
-      | obligations <= 0 = []
+      | pollable <= 0 = []
       | otherwise = case backoffDueAt (gpuBackoff model) of
           DueImmediately → []
           DueAt at → [Right at]
           DueUnschedulable → [Left TimeOverflow]
-    obligations = fromIntegral (Map.size (gpuSubmissions model)) + recordObligations model ∷ Natural
+
 
 -- | Every absolute instant a target's recovery accounting has committed to: when
 -- its next construction attempt may begin, and when a healthy period that has
@@ -2179,38 +2359,25 @@ recoveryDeadlines model =
 -- | Everything the model is still waiting on: pending submissions, enqueued
 -- presentations, records awaiting settlement, and subjects that are settled but
 -- not yet disposed of.
+-- | Everything the owner is still waiting on, read out of the one work summary
+-- the scheduling policy also reads. Render demand is not an obligation and is
+-- counted separately, by 'nextDeadline'.
 pendingObligations ∷ GpuModel → Natural
 pendingObligations model =
-  fromIntegral (Map.size (gpuSubmissions model))
-    + recordObligations model
-    + fromIntegral (length (recoveryDeadlines model))
-
--- | The obligations that are records rather than schedules: pending submissions
--- are counted by the caller, and these are the rest.
-recordObligations ∷ GpuModel → Natural
-recordObligations model =
-  fromIntegral (length [() | target ← targets, entry ← Map.elems (targetPool target), poolState entry /= PoolReserved])
-    + fromIntegral (length (retiring model))
-    + fromIntegral (length (eligibleSubjects model))
-    -- A target that is retiring is work until it is gone, and only a turn takes
-    -- it away. Leaving it out would let a scheduler that follows the answer stop
-    -- looking while a record it could free still occupies the target budget.
-    + fromIntegral (length [() | target ← targets, targetPhase target `elem` [TargetRetiring, TargetUnavailable]])
-    -- So is a replacement nobody is building yet.
-    + fromIntegral (length [() | target ← targets, replacementOwed target])
+  sum
+    [ field summary
+    | field ←
+        [ workSubmissions
+        , workPresentations
+        , workRetiringGenerations
+        , workDisposable
+        , workRetiringTargets
+        , workReplacements
+        , workRecoveries
+        ]
+    ]
   where
-    targets = Map.elems (gpuTargets model)
-    -- A retired generation that is not yet settled is still work; once it is
-    -- settled it is counted by 'eligibleSubjects' instead, so neither state is
-    -- counted twice and a subject whose disposal already failed is counted by
-    -- neither.
-    retiring current =
-      [ ()
-      | target ← Map.elems (gpuTargets current)
-      , record ← Map.elems (targetGenerations target)
-      , generationPhase record == GenerationRetired
-      , not (holdsSettled (generationHolds record))
-      ]
+    summary = work model
 
 -- | Whether this target is owed a replacement that no construction is already
 -- serving.
@@ -2252,6 +2419,7 @@ data RecoveryAnswer
 -- | Ask to begin this target's next recovery construction attempt.
 beginTargetRecovery ∷ Instant → TargetId → GpuModel → Outcome (GpuModel, RecoveryAnswer)
 beginTargetRecovery now identity model =
+  scheduling model $
   -- A terminal session begins no new recovery work. Device loss and the other
   -- session causes are not conditions a target can construct its way out of.
   resolved (running model) $ \() →
@@ -2271,7 +2439,14 @@ beginTargetRecovery now identity model =
           (_, AttemptDeferredUntil at) → Admitted (model, RecoveryDeferred at)
           (episode, AttemptAdmitted attempt) →
             Admitted
-              ( editTarget number (\entry → entry {targetRecovery = episode}) model
+              ( editTarget
+                  number
+                  -- The epoch rises here and nowhere else. Every piece of health
+                  -- evidence carries the epoch it was gathered in, so this one
+                  -- line is what makes evidence from before this attempt
+                  -- incomparable with evidence from after it.
+                  (\entry → entry {targetRecovery = episode, targetRecoveryEpoch = targetRecoveryEpoch entry + 1})
+                  model
               , RecoveryAttempt attempt
               )
 
@@ -2280,6 +2455,7 @@ beginTargetRecovery now identity model =
 -- except through 'beginTargetRecovery', so none of them can replenish it.
 recordRecoveryFailure ∷ Instant → TargetId → GpuModel → Outcome GpuModel
 recordRecoveryFailure now identity model =
+  scheduling_ model $
   resolved (resolveTarget model identity) $ \(number, target) →
     -- A failure is a report about an attempt this episode admitted. Accepting
     -- one with nothing outstanding would spend an attempt on a construction that
@@ -2317,7 +2493,7 @@ stillRecovering model target =
 -- | Mark a target whose recovery budget is spent: an optional one becomes
 -- unavailable and the session continues; a required one fails the session.
 exhaustTarget ∷ Natural → Target → GpuModel → (GpuModel, Escalation)
-exhaustTarget number target model' = case targetClassOf target of
+exhaustTarget number target model = case targetClassOf target of
   OptionalTarget →
     let escalation = OptionalTargetUnavailable (targetIdOf model number target)
      in ( note
@@ -2335,14 +2511,14 @@ exhaustTarget number target model' = case targetClassOf target of
             )
         , escalation
         )
-  where
-    model = roused model'
+
 
 -- | Record that the attempt just made succeeded. It settles the attempt so the
 -- episode can admit another later; it does not give the spent attempt back,
 -- which only a completed retirement cycle and a healthy second do.
 recordRecoverySuccess ∷ TargetId → GpuModel → Outcome GpuModel
 recordRecoverySuccess identity model =
+  scheduling_ model $
   resolved (resolveTarget model identity) $ \(number, target) →
     if not (episodeOutstanding (targetRecovery target))
       then Rejected (WrongPhase TargetIdentity)
@@ -2356,6 +2532,7 @@ recordRecoverySuccess identity model =
 -- own rather than a report of what it already owns.
 beginAllocation ∷ Natural → Natural → GpuModel → Outcome (GpuModel, AllocationId)
 beginAllocation bytes objects model =
+  scheduling model $
   resolved (running model) $ \() →
     -- An attempt that reserves neither bytes nor objects would be a record
     -- costing nothing and therefore bounding nothing, which is the one way
@@ -2383,6 +2560,7 @@ beginAllocation bytes objects model =
 
 recordAllocationFailure ∷ AllocationId → GpuModel → Outcome GpuModel
 recordAllocationFailure identity model =
+  scheduling_ model $
   resolved (resolveAllocation model identity) $ \(number, attempt) →
     if attemptFailed attempt
       then Rejected (AlreadyConsumed AllocationIdentity)
@@ -2398,6 +2576,7 @@ recordAllocationFailure identity model =
 -- replay its creation arguments.
 noteOldSwapchainRetired ∷ AllocationId → GenerationId → GpuModel → Outcome GpuModel
 noteOldSwapchainRetired identity generation model =
+  scheduling_ model $
   resolved (resolveAllocation model identity) $ \(number, attempt) →
     resolved (resolveGeneration model generation) $ \(_, _, record) →
       if not (generationOldSwapchain record)
@@ -2409,6 +2588,7 @@ noteOldSwapchainRetired identity generation model =
 -- | Whether this attempt may retry, spending its one retry bit if it may.
 retryAllocation ∷ AllocationId → GpuModel → Outcome (GpuModel, RetryVerdict)
 retryAllocation identity model =
+  scheduling model $
   -- A retry is an admission of new native work, so a terminal session refuses
   -- it. Permitting one would invite a native construction whose successful
   -- result 'createResource' then refuses, leaving the boundary holding something
@@ -2432,6 +2612,7 @@ retryAllocation identity model =
 -- | Give up an attempt and release the accounting it reserved.
 abandonAllocation ∷ AllocationId → GpuModel → Outcome GpuModel
 abandonAllocation identity model =
+  scheduling_ model $
   resolved (resolveAllocation model identity) $ \(number, attempt) →
     Admitted
       ( releaseBytes
@@ -2615,6 +2796,12 @@ data TargetView = TargetView
   , viewTargetRetirementDemand ∷ !Bool
   , viewTargetReplacementRequested ∷ !Bool
   , viewTargetRecoveryAttempts ∷ !Natural
+  , viewTargetRecoveryEpoch ∷ !Natural
+    -- ^ Rises with every admitted attempt and never falls, so two pieces of
+    -- health evidence carrying the same epoch were gathered without an attempt
+    -- between them.
+  , viewTargetCycles ∷ !Natural
+    -- ^ Presentation-retirement cycles still waiting for one of their halves.
   }
   deriving (Eq, Show)
 
@@ -2635,6 +2822,8 @@ targetView identity model = case resolveTarget model identity of
         , viewTargetReplacementRequested =
             targetReplacementRequested target > targetReplacementServed target
         , viewTargetRecoveryAttempts = recoveryAttemptsOf target
+        , viewTargetRecoveryEpoch = targetRecoveryEpoch target
+        , viewTargetCycles = fromIntegral (Map.size (targetCycles target))
         }
 
 -- | A target owes retirement while it still holds any record at all, whether or
@@ -2685,6 +2874,7 @@ liveRecordCount model =
     + usageResources use
     + fromIntegral (sum (map (Map.size . targetGenerations) targets))
     + fromIntegral (sum (map (Map.size . targetPool) targets))
+    + fromIntegral (sum (map (Map.size . targetCycles) targets))
     + usageTargets use
   where
     use = usage model

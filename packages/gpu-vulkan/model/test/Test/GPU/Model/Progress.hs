@@ -130,13 +130,14 @@ spec = describe "owner progress" $ do
     nextDeadline polled `shouldBe` TurnAt (atMilliseconds 5)
     replicate 5 (nextDeadline polled) `shouldBe` replicate 5 (TurnAt (atMilliseconds 5))
 
-    -- The same holds with a recovery deadline in play. This model's second idle
-    -- turn anchored its poll ten milliseconds out, which is sooner than the
-    -- hundred-millisecond retry, and repeated reads keep answering that.
+    -- The same holds with a recovery deadline in play. The failure scheduled a
+    -- retry a hundred milliseconds out, which is new work and so restarts the
+    -- schedule; the turn after it anchors a poll five milliseconds out, which is
+    -- sooner than the retry, and repeated reads keep answering that.
     (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target polled)
     failed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 0) target begun)
     let (anchored, _) = runProgressTurn silentEvidence (atMilliseconds 0) failed
-    replicate 3 (nextDeadline anchored) `shouldBe` replicate 3 (TurnAt (atMilliseconds 10))
+    replicate 3 (nextDeadline anchored) `shouldBe` replicate 3 (TurnAt (atMilliseconds 5))
 
   it "restarts the backoff on a new obligation, an observed completion and a close" $ do
     -- Two frames are submitted and only one of them completes, so a pending
@@ -184,21 +185,33 @@ spec = describe "owner progress" $ do
     retired ← admitted_ "retiring a generation" (retireGeneration generation backedOff)
     nextDeadline retired `shouldBe` TurnNow
 
-    -- Certifying that a generation's CPU use has ended can make it disposable,
-    -- which is new work for the same reason.
+    -- Certifying that a generation's CPU use has ended creates nothing to do on
+    -- its own. This one is still named by a submitted use and a presentation
+    -- obligation, so it is no more disposable than it was, and the deadline
+    -- stands. Rousing here would be rousing for a fact rather than for work.
     let backedOffAgain = walk 3 retired
     nextDeadline backedOffAgain `shouldBe` TurnAt (atMilliseconds 20)
     ended ← admitted_ "ending the generation's CPU use" (endGenerationCpuUse generation backedOffAgain)
-    nextDeadline ended `shouldBe` TurnNow
+    nextDeadline ended `shouldBe` TurnAt (atMilliseconds 20)
+    maybe [] viewOutstanding (holdView (GenerationSubject generation) ended)
+      `shouldBe` [SubmittedUseOwed, PresentationObligationOwed]
 
-    -- And so can releasing a managed resource, or ending its CPU use.
+    -- Releasing a managed resource is a step towards disposal rather than work
+    -- in itself: the resource still owes the end of its CPU use, so there is
+    -- nothing new for the owner to do and the anchored deadline stands. This is
+    -- the other half of the rule, and the half that keeps the backoff meaning
+    -- anything at all.
+    -- Three more idle turns, and because nothing roused in between they carry
+    -- on from where the schedule already was rather than starting over: 40, 80,
+    -- then the 100 ms cap it stays at.
     let backedOffOnceMore = walk 3 ended
-    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 20)
+    nextDeadline backedOffOnceMore `shouldBe` TurnAt (atMilliseconds 100)
     released ← admitted_ "releasing a resource" (releaseResource resource backedOffOnceMore)
-    nextDeadline released `shouldBe` TurnNow
-    let backedOffLast = walk 3 released
-    nextDeadline backedOffLast `shouldBe` TurnAt (atMilliseconds 20)
-    settled ← admitted_ "ending the resource's CPU use" (endResourceCpuUse resource backedOffLast)
+    nextDeadline released `shouldBe` TurnAt (atMilliseconds 100)
+
+    -- Ending its CPU use settles the last hold and makes it disposable. That is
+    -- work, and it restarts the schedule.
+    settled ← admitted_ "ending the resource's CPU use" (endResourceCpuUse resource released)
     nextDeadline settled `shouldBe` TurnNow
 
   it "restarts the backoff when a construction fails or is superseded" $ do
