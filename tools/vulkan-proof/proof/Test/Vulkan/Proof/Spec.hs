@@ -12,13 +12,22 @@
 -- than passing the ones it happened to reach first.
 module Test.Vulkan.Proof.Spec (spec) where
 
-import Data.List (nub)
+import Data.List (isInfixOf, nub)
 import qualified Data.Text as Text
 import Test.Hspec
 
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop (Provenance (..))
-import Test.Vulkan.Proof.Matrix (Evidence (..), MatrixRow (..), operationMatrix)
+import Test.Vulkan.Proof.Matrix
+  ( Achieved (..)
+  , Evidence (..)
+  , MatrixRow (..)
+  , Observation (..)
+  , Standing (..)
+  , operationMatrix
+  , standing
+  )
+import Test.Vulkan.Proof.Record (achievedFrom, matrixTable, renderRecord)
 
 spec ∷ Outcome → Spec
 spec outcome = do
@@ -269,9 +278,60 @@ spec outcome = do
       lossRows `shouldSatisfy` (not . null)
       map (.rowEvidence) lossRows `shouldSatisfy` all isSpecified
 
-    it "labels every row it did not observe as specification evidence" $
+    it "labels every row as either a specification citation or an observation to resolve" $
       map (.rowEvidence) operationMatrix
-        `shouldSatisfy` all (\evidence → evidence == Observed || isSpecified evidence)
+        `shouldSatisfy` all (\evidence → isObservable evidence || isSpecified evidence)
+
+    it "actually observed every result it claims to observe" $
+      onFindings outcome $ \_ → do
+        let resolve = standing (achievedFrom outcome)
+            unmet =
+              [ entry.rowOperation <> " " <> entry.rowResult
+              | entry ← operationMatrix
+              , Observable observation ← [entry.rowEvidence]
+              , resolve observation /= Observed
+              ]
+        unmet `shouldBe` []
+
+  describe "The matrix's observation labels" $ do
+    it "claims nothing for a run that stopped" $ do
+      let stopped = Stopped (Failure "a step" "a reason")
+          rendered = renderRecord "title" "invocation" [] stopped False
+      -- The record says "nothing below this line was established"; the table
+      -- below that line must not then say otherwise.
+      Text.unpack rendered `shouldSatisfy` not . isInfixOf "observed in this run"
+      Text.unpack rendered `shouldSatisfy` isInfixOf "not reached: the run stopped first"
+      achievedFrom stopped `shouldBe` Nothing
+
+    it "does not call a VK_SUCCESS row observed when every result was suboptimal" $ do
+      -- A completed run can still fail to produce a particular result.
+      -- VK_SUBOPTIMAL_KHR is a success code the proof accepts, so this is the
+      -- shape a real run could take on a resized surface.
+      let suboptimal =
+            Achieved
+              { achievedAcquireResults = ["SUBOPTIMAL_KHR", "SUBOPTIMAL_KHR"]
+              , achievedPresentResults = ["SUBOPTIMAL_KHR"]
+              , achievedReleaseResults = ["SUCCESS", "SUCCESS"]
+              , achievedSubmissions = 2
+              }
+          resolve = standing (Just suboptimal)
+      resolve AcquireSucceeded `shouldBe` NotObserved
+      resolve PresentSucceeded `shouldBe` NotObserved
+      -- The ones it did produce are unaffected.
+      resolve ImagesReleased `shouldBe` Observed
+      resolve SubmissionAccepted `shouldBe` Observed
+      unlines (map Text.unpack (matrixTable resolve))
+        `shouldSatisfy` isInfixOf "**not observed in this run**"
+
+    it "does not call a release row observed when a release failed" $ do
+      let refused =
+            Achieved
+              { achievedAcquireResults = ["SUCCESS"]
+              , achievedPresentResults = ["SUCCESS"]
+              , achievedReleaseResults = ["SUCCESS", "ERROR_OUT_OF_HOST_MEMORY"]
+              , achievedSubmissions = 1
+              }
+      standing (Just refused) ImagesReleased `shouldBe` NotObserved
 
     it "records the oldSwapchain failure case, which retires the old swapchain anyway" $ do
       let rows = [entry | entry ← operationMatrix, Text.isInfixOf "oldSwapchain" entry.rowOperation]
@@ -280,7 +340,12 @@ spec outcome = do
 isSpecified ∷ Evidence → Bool
 isSpecified = \case
   Specified citation → not (Text.null citation)
-  Observed → False
+  Observable _ → False
+
+isObservable ∷ Evidence → Bool
+isObservable = \case
+  Observable _ → True
+  Specified _ → False
 
 -- | Every example needs the run to have finished. One that did not fails with
 -- the step it stopped at, so the suite names the missing requirement rather

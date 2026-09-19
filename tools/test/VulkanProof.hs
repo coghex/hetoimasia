@@ -23,7 +23,7 @@
 module VulkanProof (spec) where
 
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, nub, stripPrefix)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
 
@@ -33,6 +33,25 @@ retainedRecords = [("macOS", "docs/vulkan/macos.md"), ("Linux", "docs/vulkan/lin
 
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
+
+-- | Every path these examples read out of the checkout.
+--
+-- A test is only a guard if the planner selects it when what it guards moves,
+-- and `*.md` is classified non-affecting, so the evidence documents reach this
+-- suite only because `test.workflow` declares them as inputs. That is easy to
+-- forget when a new file is read, and forgetting it is silent: the suite keeps
+-- passing and simply stops running. So the list is stated once here and checked
+-- against the catalog below.
+readByTheseExamples ∷ [FilePath]
+readByTheseExamples =
+  [ "cabal.project.vulkan"
+  , "tools/toolchain/binding.pin"
+  , "tools/validation/catalog.json"
+  , "tools/vulkan-proof/environment.pin"
+  , "tools/vulkan-proof/run-proof.sh"
+  , compatibilityRecord
+  ]
+    <> map snd retainedRecords
 
 -- | The package directory the proof lives in, as a project file would name it.
 proofPackage ∷ String
@@ -126,6 +145,23 @@ spec = describe "The Vulkan proof boundary" $ do
     -- Computed independently: from a Git checkout on one, from the files the
     -- container recipe copied on the other, with no checkout to consult.
     length (nub (map (fmap trim) digests)) `shouldBe` 1
+
+  it "is selected by the planner whenever anything it reads changes" $ do
+    catalog ← readFile "tools/validation/catalog.json"
+    case parseJson catalog >>= field "groups" >>= asArray of
+      Nothing → expectationFailure "tools/validation/catalog.json is not a JSON object with a groups array"
+      Just groups → do
+        let declared =
+              [ value
+              | group ← groups
+              , (field "id" group >>= asString) == Just "test.workflow"
+              , Just entries ← [field "inputs" group >>= asArray]
+              , Just value ← map asString entries
+              ]
+            covered path =
+              any (\entry → entry == path || ("/" `isSuffixOf` entry && entry `isPrefixOf` path)) declared
+        declared `shouldSatisfy` (not . null)
+        filter (not . covered) readByTheseExamples `shouldBe` []
 
   it "never supplies the native-session consent itself" $ do
     -- AGENTS.md: the human's approval is given on one approved command, never

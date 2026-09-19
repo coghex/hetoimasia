@@ -6,14 +6,22 @@
 -- stopped still says what it had established before it stopped. The verdict
 -- line at the top is the run's own, and it is computed from the same values the
 -- Hspec examples assert over — not narrated separately.
-module Test.Vulkan.Proof.Record (renderRecord) where
+module Test.Vulkan.Proof.Record (renderRecord, achievedFrom, matrixTable) where
 
 import Data.Text (Text)
 import qualified Data.Text as Text
 
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop (describeProvenance)
-import Test.Vulkan.Proof.Matrix (MatrixRow (..), describeEvidence, operationMatrix)
+import Test.Vulkan.Proof.Matrix
+  ( Achieved (..)
+  , MatrixRow (..)
+  , Observation
+  , Standing
+  , describeEvidence
+  , operationMatrix
+  , standing
+  )
 
 -- | The whole record, as Markdown.
 renderRecord ∷ Text → Text → [Text] → Outcome → Bool → Text
@@ -36,12 +44,10 @@ renderRecord title invocation transcript outcome passed =
       <> [ ""
          , "## Operation and result matrix"
          , ""
-         , "Rows marked *observed in this run* were produced by this run. The rest are"
-         , "rare or destructive paths established from the specification and labelled as"
-         , "such; no device loss was induced."
-         , ""
          ]
-      <> matrixTable
+      <> matrixPreamble outcome
+      <> [""]
+      <> matrixTable (standing (achievedFrom outcome))
       <> [ ""
          , "## Transcript"
          , ""
@@ -273,8 +279,40 @@ teardownSection facts =
       , ("releases that failed", listOrNone facts.teardownFailures)
       ]
 
-matrixTable ∷ [Text]
-matrixTable =
+-- | What the run produced, reduced to what the matrix's labels depend on. A
+-- run that stopped produced nothing, which is what 'Nothing' says.
+achievedFrom ∷ Outcome → Maybe Achieved
+achievedFrom = \case
+  Stopped _ → Nothing
+  Proved findings →
+    Just
+      Achieved
+        { achievedAcquireResults = map (.frameAcquireResult) findings.findingsCompletion.completionFrames
+        , achievedPresentResults = map (.framePresentResult) findings.findingsCompletion.completionFrames
+        , achievedReleaseResults =
+            [ findings.findingsAbandonment.abandonUnsubmitted.releaseResult
+            , findings.findingsAbandonment.abandonUnpresented.releaseResult
+            ]
+        , achievedSubmissions = length findings.findingsCompletion.completionFrames
+        }
+
+-- | The sentence above the table, which has to match what the table will say.
+matrixPreamble ∷ Outcome → [Text]
+matrixPreamble = \case
+  Stopped _ →
+    [ "This run stopped, so it observed none of these. Every row below is either"
+    , "specification text or a result this run never reached, and each says which."
+    , "Nothing here is evidence that this platform does what the row describes."
+    ]
+  Proved _ →
+    [ "Rows marked *observed in this run* were produced by this run, and that label"
+    , "is derived from what the run recorded rather than written here. The rest are"
+    , "rare or destructive paths established from the specification and labelled as"
+    , "such; no device loss was induced."
+    ]
+
+matrixTable ∷ (Observation → Standing) → [Text]
+matrixTable resolve =
   [ "| operation | result | actual effects | ownership and retry | evidence |"
   , "| --- | --- | --- | --- | --- |"
   ]
@@ -283,7 +321,7 @@ matrixTable =
            , entry.rowResult
            , entry.rowEffects
            , entry.rowDisposition
-           , describeEvidence entry.rowEvidence
+           , describeEvidence resolve entry.rowEvidence
            ]
        | entry ← operationMatrix
        ]

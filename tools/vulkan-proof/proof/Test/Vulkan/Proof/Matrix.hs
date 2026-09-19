@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Requirement 7's operation and result matrix.
 --
 -- Every row says what the operation's result actually did — which effects
@@ -13,25 +15,82 @@
 module Test.Vulkan.Proof.Matrix
   ( MatrixRow (..)
   , Evidence (..)
+  , Observation (..)
+  , Standing (..)
+  , Achieved (..)
   , operationMatrix
+  , standing
   , describeEvidence
   ) where
 
 import Data.Text (Text)
 
+-- | A result this proof claims to have produced itself.
+--
+-- A row cannot simply be labelled observed, because whether it was depends on
+-- what the run did: a run that stopped before creating a device produced none
+-- of these, and a run whose every acquisition returned @VK_SUBOPTIMAL_KHR@
+-- produced no @VK_SUCCESS@ acquisition however well it otherwise went.
+data Observation
+  = AcquireSucceeded
+  | SubmissionAccepted
+  | PresentSucceeded
+  | ImagesReleased
+  deriving (Eq, Show)
+
+-- | What the run has to say about one of those.
+data Standing
+  = Observed
+    -- ^ The run produced this result and saw the effect.
+  | NotObserved
+    -- ^ The run reached the operation and this particular result did not occur.
+  | NotReached
+    -- ^ The run stopped before it could produce this result at all.
+  deriving (Eq, Show)
+
+-- | The results a finished run actually produced, reduced to what the matrix
+-- needs. Small on purpose: the labelling rules below are then testable without
+-- building a whole set of findings.
+data Achieved = Achieved
+  { achievedAcquireResults ∷ [Text]
+  , achievedPresentResults ∷ [Text]
+  , achievedReleaseResults ∷ [Text]
+  , achievedSubmissions ∷ Int
+  }
+  deriving (Eq, Show)
+
+-- | How a run stands on one observation. 'Nothing' is a run that stopped, and
+-- a run that stopped observed nothing.
+standing ∷ Maybe Achieved → Observation → Standing
+standing Nothing _ = NotReached
+standing (Just achieved) observation = case observation of
+  AcquireSucceeded → fromResults achieved.achievedAcquireResults
+  PresentSucceeded → fromResults achieved.achievedPresentResults
+  ImagesReleased →
+    if not (null achieved.achievedReleaseResults) && all (== "SUCCESS") achieved.achievedReleaseResults
+      then Observed
+      else NotObserved
+  SubmissionAccepted → if achieved.achievedSubmissions > 0 then Observed else NotObserved
+  where
+    fromResults results = if "SUCCESS" `elem` results then Observed else NotObserved
+
 -- | Where a row's claim comes from.
 data Evidence
-  = Observed
-    -- ^ This proof produced the result and saw the effect.
+  = Observable Observation
+    -- ^ A result this proof sets out to produce. Whether it did is the run's to
+    -- say, not this table's.
   | Specified Text
     -- ^ The Vulkan specification establishes it; the text names the section.
     -- No attempt is made to produce the result on a real device.
   deriving (Eq, Show)
 
-describeEvidence ∷ Evidence → Text
-describeEvidence = \case
-  Observed → "observed in this run"
+describeEvidence ∷ (Observation → Standing) → Evidence → Text
+describeEvidence resolve = \case
   Specified citation → "specification: " <> citation
+  Observable observation → case resolve observation of
+    Observed → "observed in this run"
+    NotObserved → "**not observed in this run**"
+    NotReached → "**not reached: the run stopped first**"
 
 data MatrixRow = MatrixRow
   { rowOperation ∷ Text
@@ -54,7 +113,7 @@ operationMatrix =
       , rowResult = "VK_SUCCESS"
       , rowEffects = "An image index is returned and the semaphore or fence given to the call will be signalled. The application now owns that image."
       , rowDisposition = "Record, submit, present, or release it. The acquisition's signal operation exists whether or not the frame is ever rendered, so abandoning the frame must still consume it."
-      , rowEvidence = Observed
+      , rowEvidence = Observable AcquireSucceeded
       }
   , MatrixRow
       { rowOperation = "vkAcquireNextImageKHR"
@@ -82,7 +141,7 @@ operationMatrix =
       , rowResult = "VK_SUCCESS"
       , rowEffects = "The batch is pending; its waits, command buffers, signals, and fence are all in force until it completes."
       , rowDisposition = "The command buffers, semaphores, and every resource they reference stay owned until the fence signals. A returned handle is not completion."
-      , rowEvidence = Observed
+      , rowEvidence = Observable SubmissionAccepted
       }
   , MatrixRow
       { rowOperation = "vkQueueSubmit2"
@@ -96,7 +155,7 @@ operationMatrix =
       , rowResult = "VK_SUCCESS"
       , rowEffects = "Presentation was enqueued for every swapchain in the call. The wait semaphores are consumed by that operation, and a present fence chained through VkSwapchainPresentFenceInfoKHR will signal when the presentation engine has finished with them."
       , rowDisposition = "Retire the presentation semaphore on the present fence and on nothing else. The rendering fence says only that rendering finished."
-      , rowEvidence = Observed
+      , rowEvidence = Observable PresentSucceeded
       }
   , MatrixRow
       { rowOperation = "vkQueuePresentKHR"
@@ -124,7 +183,7 @@ operationMatrix =
       , rowResult = "VK_SUCCESS"
       , rowEffects = "The named images return to the presentation engine without being presented, and become acquirable again. The call is read-only with respect to them: it does not present them, does not modify their contents, does not change their layout, and does not retire or rebuild the swapchain."
       , rowDisposition = "Legal only for images that were acquired and not presented, and only once every semaphore signalled by their acquisition has been waited on. Contents and layout survive the release: acquiring a released image again returns it as it was, which is the one place an acquired image\'s contents are not simply undefined, and is why abandoning a frame this way costs nothing to redo. This is the abandonment path; it is not a substitute for presentation."
-      , rowEvidence = Observed
+      , rowEvidence = Observable ImagesReleased
       }
   , MatrixRow
       { rowOperation = "vkCreateSwapchainKHR with a non-null oldSwapchain"
