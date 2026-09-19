@@ -111,20 +111,27 @@ spec = describe "The Vulkan proof boundary" $ do
     length manifests `shouldBe` 2
     manifests `shouldSatisfy` all ("/" `isPrefixOf`)
 
-  it "keeps the summary's callback totals equal to the records they came from" $ do
+  it "attributes each record's callback total to that record's own platform" $ do
     -- The summary is declared authoritative for later Vulkan slices, and it
     -- restates figures the raw records own. Regenerating a record and not the
-    -- summary is the drift this catches; it already happened once.
+    -- summary is the drift this catches; it already happened once. Checking
+    -- only that a number appears somewhere would let the two platforms' totals
+    -- be swapped, which is a subtler version of the same lie, so the column
+    -- each one sits in is checked against the header.
     summary ← readFile compatibilityRecord
     totals ← mapM (\(platform, path) → (,) platform . recordTotal <$> readFile path) retainedRecords
-    missing ←
-      pure
-        [ platform <> " reports " <> show total <> " callbacks, which the summary does not quote"
-        | (platform, Just total) ← totals
-        , not ((show total <> " deliveries") `isInfixOf` summary)
-        ]
-    missing `shouldBe` []
     map snd totals `shouldSatisfy` all (/= Nothing)
+    case (tableRow "| What |" summary, tableRow "| Callbacks |" summary) of
+      (Nothing, _) → expectationFailure "the summary has no profile table header naming the platforms"
+      (_, Nothing) → expectationFailure "the summary has no Callbacks row"
+      (Just header, Just callbacks) → do
+        let misplaced =
+              [ platform <> " reports " <> show total <> " callbacks, which is not what the summary's " <> platform <> " column says"
+              | (platform, Just total) ← totals
+              , Just column ← [lookup platform (zip header [0 ..])]
+              , not (maybe False ((show total <> " deliveries") `isInfixOf`) (cellAt column callbacks))
+              ]
+        misplaced `shouldBe` []
 
   it "retains a record for each platform, each naming the sources it proved" $
     mapM_
@@ -205,6 +212,27 @@ settingOf text prefix =
   case [rest | line ← map trim (lines text), Just rest ← [stripPrefix prefix line]] of
     (value : _) → Just value
     [] → Nothing
+
+-- | A Markdown table row, as its trimmed cells. The leading and trailing pipes
+-- produce empty edges, which are dropped so a cell index matches the column a
+-- reader counts.
+tableRow ∷ String → String → Maybe [String]
+tableRow prefix text =
+  case [line | line ← map trim (lines text), prefix `isPrefixOf` line] of
+    (row : _) → Just (map trim (dropEdges (splitOn '|' row)))
+    [] → Nothing
+  where
+    dropEdges cells = case cells of
+      (_ : rest) → if null rest then [] else init rest
+      [] → []
+
+cellAt ∷ Int → [String] → Maybe String
+cellAt index cells = if index < length cells then Just (cells !! index) else Nothing
+
+splitOn ∷ Char → String → [String]
+splitOn separator text = case break (== separator) text of
+  (chunk, []) → [chunk]
+  (chunk, _ : rest) → chunk : splitOn separator rest
 
 -- | The total a record reports, read from its own summary line.
 recordTotal ∷ String → Maybe Int

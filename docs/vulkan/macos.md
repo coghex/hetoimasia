@@ -15,8 +15,8 @@ HETOIMASIA_NATIVE_SESSION=desktop \
 
 ## The environment
 
-- source digest: 54a027aa6d6b1c158f6c4f8a7d4dbae0600f065eee3e97811e84d0bc25b40910
-- repository revision: d8e01fbf2cf242d6a0e8454d5437d0b097607be6
+- source digest: f50261a80adbdce4bf175ce51eab66c109c4255cef0bceae444c2150bb0ea038
+- repository revision: fc9dcb7fe34ba035550804a9a104a28d5634c61b
 - platform: darwin/aarch64
 - session authorization: the human user's explicit approval for this one run on the local desktop
 - VK_DRIVER_FILES: /opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
@@ -35,11 +35,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x000000010a51b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x000000010a51b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x000000010a51d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-- GLFW's vkCreateDevice: 0x000000010a51d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-- a device-level entry point: 0x0000000120ed0d78 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis12QueueSubmit2EP9VkQueue_TjPK13VkSubmitInfo2P9VkFence_T
+- the binding's vkGetInstanceProcAddr: 0x000000010a7778f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x000000010a7778f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x000000010a77903c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+- GLFW's vkCreateDevice: 0x000000010a77903c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+- a device-level entry point: 0x000000012232cd78 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis12QueueSubmit2EP9VkQueue_TjPK13VkSubmitInfo2P9VkFence_T
 - device: Apple M3 Max
 - device API version: 1.3.323
 - driver: MoltenVK (DRIVER_ID_MOLTENVK)
@@ -157,7 +157,8 @@ this proof can report a clean result for.
 
 ## Operation and result matrix
 
-Rows marked *observed in this run* were produced by this run. The rest are
+Rows marked *observed in this run* were produced by this run, and that label
+is derived from what the run recorded rather than written here. The rest are
 rare or destructive paths established from the specification and labelled as
 such; no device loss was induced.
 
@@ -185,23 +186,23 @@ such; no device loss was induced.
 ```
 ## The environment
 implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-proving repository revision d8e01fbf2cf242d6a0e8454d5437d0b097607be6
-proving source digest 54a027aa6d6b1c158f6c4f8a7d4dbae0600f065eee3e97811e84d0bc25b40910
+proving repository revision fc9dcb7fe34ba035550804a9a104a28d5634c61b
+proving source digest f50261a80adbdce4bf175ce51eab66c109c4255cef0bceae444c2150bb0ea038
 VK_DRIVER_FILES = /opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
 VK_LAYER_PATH = /usr/local/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x000000010a51b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
-GLFW resolves the same name to 0x000000010a51b8f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+the binding dispatches through 0x000000010a7778f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x000000010a7778f4 in /usr/local/lib/libvulkan.1.3.296.dylib as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_EXT_metal_surface
 ## The instance
 the loader reports instance version 1.3.296
-the binding resolves vkCreateDevice to 0x000000010a51d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x000000010a51d03c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+the binding resolves vkCreateDevice to 0x000000010a77903c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x000000010a77903c in /usr/local/lib/libvulkan.1.3.296.dylib as vkCreateDevice
 ## The window and its surface
 ## The device profile
 Apple M3 Max advertises Vulkan 1.3.323
 selected Apple M3 Max, advertising Vulkan 1.3.323
-the binding dispatches image release through 0x0000000120f05b64 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis25ReleaseSwapchainImagesEXTEP10VkDevice_TPK31VkReleaseSwapchainImagesInfoEXT
+the binding dispatches image release through 0x0000000122361b64 in /usr/local/lib/libVkLayer_khronos_validation.dylib as _ZN20vulkan_layer_chassis25ReleaseSwapchainImagesEXTEP10VkDevice_TPK31VkReleaseSwapchainImagesInfoEXT
 the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 3 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 640, height = 480}
