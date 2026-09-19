@@ -396,9 +396,13 @@ data HostConfig = HostConfig
     -- ^ The most attachment retirement opportunities one turn offers, across
     -- every window with a pending retirement. At least one. Pending retirements
     -- are served in rotating order, so one window's stalled or slow retirement
-    -- can never starve another's, and work the budget could not reach keeps the
-    -- next turn immediate rather than waiting. An ordinary host holds no
-    -- attachment, so nothing spends it.
+    -- can never starve another's, and an attachment no round has yet offered an
+    -- opportunity to keeps the next turn immediate however short the budget
+    -- fell. Once every one of them has been offered and is waiting, the turn
+    -- waits toward the earliest instant they named, bounded by 'hostIdleWait':
+    -- more waiting attachments than this budget is an ordinary idle host, not a
+    -- reason to poll. An ordinary host holds no attachment, so nothing spends
+    -- it.
   , hostIdleWait ∷ !Double
     -- ^ The most seconds an idle turn waits for a native event, and the
     -- scheduled path's fallback bound. Finite, above zero, at most
@@ -1362,10 +1366,13 @@ runOwnerLoop host control hooks =
     turn number idle = do
       checkRuntime control
       (queued, retiring) ← atomically ((,) <$> queuedCommands host <*> hostRetirementDemand host)
-      -- A retirement the last round advanced, or one the budget could not
-      -- reach, is work this turn already has, so the turn polls rather than
-      -- waiting: one window's pending retirement never waits on the idle bound
-      -- and never holds another window's service up.
+      -- A retirement the last round advanced, and one that is owed an
+      -- opportunity no round has offered it yet, are both work this turn
+      -- already has, so the turn polls rather than waiting: a pending
+      -- retirement never waits on the idle bound for its first opportunity and
+      -- never holds another window's service up. Retirements that have all been
+      -- inspected and are waiting are not that work, however many of them the
+      -- budget leaves unserved, so an idle turn beside them is idle.
       let waited = idle && queued == 0 && not (retirementImmediate retiring)
       processEvents host number (if waited then AwaitEventsFor (hostIdleWait settings) else ProcessPending)
       work ← turnWork host control (loopLogger hooks) (loopEvent hooks)
@@ -2437,9 +2444,15 @@ data RetirementDemand = RetirementDemand
     -- blocking step. The step itself was never run.
   , retirementImmediate ∷ !Bool
     -- ^ Whether another opportunity is wanted at once: the last round advanced
-    -- something, or the budget could not reach every pending attachment.
+    -- something, or some pending attachment is owed an opportunity it has not
+    -- had — one whose retirement no round has yet offered one to, one whose
+    -- path fresh evidence has just revived, or one whose latest opportunity
+    -- advanced. Attachments that have all been inspected and are waiting owe
+    -- nothing, however many of them the budget leaves unserved.
   , retirementNextPossible ∷ !(Maybe Instant)
-    -- ^ The earliest instant an awaiting owner named, in 'hostClock'\'s domain.
+    -- ^ The earliest instant any waiting attachment is waiting until, in
+    -- 'hostClock'\'s domain, across every one of them rather than only the ones
+    -- the last round reached.
   }
   deriving (Eq, Show)
 
@@ -2489,7 +2502,7 @@ demandOf round' =
     { retirementPending = roundPending round'
     , retirementStalled = roundStalled round'
     , retirementRefused = roundRefused round'
-    , retirementImmediate = roundAdvanced round' > 0 || roundDeferred round' > 0
+    , retirementImmediate = roundAdvanced round' > 0 || roundOwed round' > 0
     , retirementNextPossible = roundNextPossible round'
     }
 
