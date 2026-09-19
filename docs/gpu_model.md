@@ -283,7 +283,10 @@ an otherwise idle target nobody ever asks.
 Close wins there too. An attempt that was outstanding when its target closed
 still has to be settled, but its outcome decides nothing: a retiring target is
 not one recovery can be exhausted on, and a session that has already failed has
-no room for a target to fail it again.
+no room for a target to fail it again. An attempt in flight also keeps its target
+from being forgotten, even when the target holds nothing else — forgetting it
+would leave the outcome with nothing to be reported against, and the boundary
+settling it would be told its identity was stale.
 
 Admitting an attempt clears any healthy-progress evidence gathered before it. A
 cycle that the attempt itself interrupted says nothing about a target that has
@@ -352,6 +355,15 @@ The turn answers the absolute instant of the next one:
   target's next construction attempt may begin, and when a healthy period that
   has started would complete and reset its episode;
 - with nothing pending and nothing scheduled there is no turn to schedule.
+
+What counts as pending is everything only a turn can move on. That includes a
+target that is retiring or unavailable: its record is not removed until a turn
+removes it, so a schedule that stayed silent about one would strand the record
+and the target budget with it. It also includes a replacement nobody is building
+yet — an out-of-date or lost acquisition returns its reservation and creates no
+obligation, so the request it raises would otherwise be the one kind of work the
+owner was never woken for. A construction already in flight covers the request it
+was begun for and no later one.
 
 `nextDeadline` takes **no instant**, and that is the point: the answer is a
 property of the model alone, so reading the same unchanged model twice gives the
@@ -492,7 +504,10 @@ when one exists.
 And the scheduling contract itself: the same unchanged model read repeatedly
 answering the same deadline; a spent episode marking its target unavailable and
 escalating at the failure that spent it; a target closed while its last attempt
-was in flight settling that attempt without escalating anything; and evidence
+was in flight settling that attempt without escalating anything, and surviving an
+owner turn so that it can; a closed target's record freed by the turn its own
+schedule asked for, with its capacity reusable afterwards; a replacement nobody
+is building keeping the owner coming back until something is; and evidence
 gathered before an attempt refusing to replenish the episode that attempt
 belongs to.
 

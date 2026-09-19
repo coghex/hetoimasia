@@ -7,7 +7,7 @@ module Test.GPU.Model.Progress (spec) where
 
 import Data.List (nub)
 import Hetoimasia.GPU.Model
-import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (TargetRecordBudget), BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity
 import Numeric.Natural (Natural)
 import Test.GPU.Model.Support
@@ -321,6 +321,58 @@ spec = describe "owner progress" $ do
     -- Render demand still answers at once: that answer needs no arithmetic.
     demanded ← admitted_ "requesting a render" (requestRender target overflowed)
     nextDeadline demanded `shouldBe` TurnNow
+
+  it "schedules the turn that frees a closed target's record, so its capacity comes back" $ do
+    -- One target record in the whole configuration, so a record that is never
+    -- freed is a session that can never render again.
+    model ← freshModelWith defaultBudgetRequest {requestedTargetRecords = 1}
+    (withTarget, target) ← admitted "admitting a target" (admitTarget OptionalTarget model)
+    backpressured "admitting a second" (admitTarget OptionalTarget withTarget)
+      >>= (`shouldBe` TargetRecordBudget)
+
+    closed ← admitted_ "closing it" (closeTarget target withTarget)
+    -- Only a turn removes the record, so the schedule has to ask for one. Saying
+    -- no turn was needed would strand the record and the budget with it.
+    pendingObligations closed `shouldSatisfy` (> 0)
+    nextDeadline closed `shouldBe` TurnNow
+
+    let (freed, _) = runProgressTurn silentEvidence (atMilliseconds 1) closed
+    targetView target freed `shouldBe` Nothing
+    nextDeadline freed `shouldBe` NoTurnNeeded
+    (reused, _) ← admitted "admitting again on the freed record" (admitTarget OptionalTarget freed)
+    usageTargets (usage reused) `shouldBe` 1
+
+  it "schedules a replacement nobody is building yet" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedGenerations = 2}
+    (active, target, generation) ← activeTarget 2 model
+    nextDeadline active `shouldBe` NoTurnNeeded
+
+    -- An out-of-date acquisition gives its reservation back and creates no
+    -- obligation, so the request it raises is the only thing left to act on.
+    (reserved, frame) ← admitted "reserving" (reserveFrame target active)
+    (requested, answer) ← admitted "acquiring" (acquireImage frame AcquireOutOfDate reserved)
+    answer `shouldBe` ReplacementRequested
+    frameView frame requested `shouldBe` Nothing
+    fmap viewTargetReplacementRequested (targetView target requested) `shouldBe` Just True
+    pendingObligations requested `shouldSatisfy` (> 0)
+    nextDeadline requested `shouldBe` TurnNow
+
+    -- Turns alone do not satisfy it: the owner has to build something.
+    let (turned, _) = runProgressTurn silentEvidence (atMilliseconds 1) requested
+        (turnedAgain, _) = runProgressTurn silentEvidence (atMilliseconds 2) turned
+    nextDeadline turnedAgain `shouldSatisfy` (/= NoTurnNeeded)
+    fmap viewTargetReplacementRequested (targetView target turnedAgain) `shouldBe` Just True
+
+    -- A construction begun to serve it covers the demand while it is in flight.
+    (constructing, replacement) ← admitted "constructing the replacement" (beginGeneration target (Just generation) turnedAgain)
+    let (constructingTurn, _) = runProgressTurn silentEvidence (atMilliseconds 3) constructing
+        (constructingAgain, _) = runProgressTurn silentEvidence (atMilliseconds 4) constructingTurn
+    -- The retired predecessor is still work, but the replacement demand is not
+    -- double-counted while something is building it.
+    fmap viewTargetReplacementRequested (targetView target constructingAgain) `shouldBe` Just True
+
+    (published, _) ← admitted "publishing it" (publishGeneration replacement 2 constructing)
+    fmap viewTargetReplacementRequested (targetView target published) `shouldBe` Just False
 
   it "has no deadline at all once nothing is pending" $ do
     model ← freshModel

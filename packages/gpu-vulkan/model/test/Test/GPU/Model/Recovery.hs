@@ -42,7 +42,9 @@ spec = describe "recovery" $ do
     fmap viewTargetPhase (targetView target thirdFailed) `shouldBe` Just TargetUnavailable
     escalations thirdFailed `shouldBe` [OptionalTargetUnavailable target]
     fmap viewTargetRenderDemand (targetView target thirdFailed) `shouldBe` Just False
-    nextDeadline thirdFailed `shouldBe` NoTurnNeeded
+    -- The record is work until it is gone, and only a turn takes it away, so the
+    -- owner is asked for one rather than told there is nothing to do.
+    nextDeadline thirdFailed `shouldBe` TurnNow
     (_, exhausted) ← admitted "asking for a fourth attempt" (beginTargetRecovery (atMilliseconds 10000) target thirdFailed)
     exhausted `shouldBe` RecoveryClosed
 
@@ -166,6 +168,32 @@ spec = describe "recovery" $ do
     optionalLate ← admitted_ "the late failure" (recordRecoveryFailure (atMilliseconds 700) optionalTarget optionalClosed)
     escalations optionalLate `shouldBe` []
     fmap viewTargetPhase (targetView optionalTarget optionalLate) `shouldBe` Just TargetRetiring
+
+  it "keeps a closed target while its attempt is still in flight, across an owner turn" $ do
+    model ← freshModel
+    (withTarget, target) ← admitted "admitting a target" (admitTarget OptionalTarget model)
+    (begun, first) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target withTarget)
+    first `shouldBe` RecoveryAttempt 1
+    closed ← admitted_ "closing the target" (closeTarget target begun)
+
+    -- The target holds no frame, generation or pool record, so nothing else
+    -- would keep it. The attempt does: forgetting the target would leave its
+    -- outcome with nothing to be reported against, and the close-wins rule would
+    -- then hold only for as long as no turn happened to run.
+    let (turned, _) = runProgressTurn silentEvidence (atMilliseconds 1) closed
+    fmap viewTargetPhase (targetView target turned) `shouldBe` Just TargetRetiring
+
+    late ← admitted_ "the late failure" (recordRecoveryFailure (atMilliseconds 2) target turned)
+    sessionState late `shouldBe` SessionRunning
+    escalations late `shouldBe` []
+
+    -- Settled at last, so the next turn does forget it and its number comes back.
+    let (forgotten, _) = runProgressTurn silentEvidence (atMilliseconds 3) late
+    targetView target forgotten `shouldBe` Nothing
+    (readmitted, again) ← admitted "readmitting" (admitTarget OptionalTarget forgotten)
+    targetNumber again `shouldBe` targetNumber target
+    targetIncarnation again `shouldBe` targetIncarnation target + 1
+    usageTargets (usage readmitted) `shouldBe` 1
 
   it "retires a generation passed as oldSwapchain even when the replacement construction fails" $ do
     model ← freshModel

@@ -2040,10 +2040,16 @@ dispose key model = case key of
 
 -- | A retiring target whose records have all gone leaves the model, freeing its
 -- number for reuse under a fresh incarnation.
+--
+-- An attempt still in flight is one of those records, even though it is not one
+-- this model holds: forgetting the target would leave the outcome with nothing
+-- to be reported against, and the boundary settling it would be told its
+-- identity is stale rather than being allowed to settle it.
 forgetIfRetired ∷ GpuModel → Natural → GpuModel
 forgetIfRetired model number = case Map.lookup number (gpuTargets model) of
   Just target
     | targetPhase target `elem` [TargetRetiring, TargetUnavailable]
+    , not (episodeOutstanding (targetRecovery target))
     , Map.null (targetFrames target)
     , Map.null (targetGenerations target)
     , Map.null (targetPool target) →
@@ -2159,13 +2165,18 @@ recordObligations model =
   fromIntegral (length [() | target ← targets, entry ← Map.elems (targetPool target), poolState entry /= PoolReserved])
     + fromIntegral (length (retiring model))
     + fromIntegral (length (eligibleSubjects model))
+    -- A target that is retiring is work until it is gone, and only a turn takes
+    -- it away. Leaving it out would let a scheduler that follows the answer stop
+    -- looking while a record it could free still occupies the target budget.
+    + fromIntegral (length [() | target ← targets, targetPhase target `elem` [TargetRetiring, TargetUnavailable]])
+    -- So is a replacement nobody is building yet.
+    + fromIntegral (length [() | target ← targets, replacementOwed target])
   where
     targets = Map.elems (gpuTargets model)
     -- A retired generation that is not yet settled is still work; once it is
     -- settled it is counted by 'eligibleSubjects' instead, so neither state is
     -- counted twice and a subject whose disposal already failed is counted by
-    -- neither. Nothing the owner can act on is left out, and nothing it cannot
-    -- act on is left in.
+    -- neither.
     retiring current =
       [ ()
       | target ← Map.elems (gpuTargets current)
@@ -2173,6 +2184,24 @@ recordObligations model =
       , generationPhase record == GenerationRetired
       , not (holdsSettled (generationHolds record))
       ]
+
+-- | Whether this target is owed a replacement that no construction is already
+-- serving.
+--
+-- A request raised while a construction was in flight is not covered by it —
+-- that construction was begun for an earlier request — so the demand stays, and
+-- with it the reason for the owner to come back. A suspended target is left out
+-- for the same reason its render deadline is: suspension silences rendering,
+-- and a rebuild is rendering work.
+replacementOwed ∷ Target → Bool
+replacementOwed target =
+  targetPhase target == TargetAdmitted
+    && targetReplacementRequested target > targetReplacementServed target
+    && not (any covering (Map.elems (targetGenerations target)))
+  where
+    covering record =
+      generationPhase record == GenerationConstructing
+        && generationServes record >= targetReplacementRequested target
 
 -- ---------------------------------------------------------------------------
 -- Recovery
@@ -2261,7 +2290,7 @@ stillRecovering model target =
 -- | Mark a target whose recovery budget is spent: an optional one becomes
 -- unavailable and the session continues; a required one fails the session.
 exhaustTarget ∷ Natural → Target → GpuModel → (GpuModel, Escalation)
-exhaustTarget number target model = case targetClassOf target of
+exhaustTarget number target model' = case targetClassOf target of
   OptionalTarget →
     let escalation = OptionalTargetUnavailable (targetIdOf model number target)
      in ( note
@@ -2279,6 +2308,8 @@ exhaustTarget number target model = case targetClassOf target of
             )
         , escalation
         )
+  where
+    model = roused model'
 
 -- | Record that the attempt just made succeeded. It settles the attempt so the
 -- episode can admit another later; it does not give the spent attempt back,
