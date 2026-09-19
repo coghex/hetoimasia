@@ -1928,7 +1928,9 @@ applySubmission now number submission model = settleFrames (submissionFrames sub
         (\current target → advanceCycles now target (renders number) current)
         discharged
         (Map.keys (gpuTargets discharged))
-    renders wanted entry
+    -- Matched by the submission this cycle is waiting on, which is the only
+    -- thing that makes it this cycle's half rather than another's.
+    renders wanted _ entry
       | cycleSubmission entry == Just wanted = Just entry {cycleSubmission = Nothing}
       | otherwise = Nothing
 
@@ -1941,10 +1943,13 @@ applyPresentation now number record entry model = settleFrames [(number, slot) |
         number
         (\target → target {targetPool = Map.delete record (targetPool target)})
         (releaseObjects 1 (discharge model))
-    -- The presentation half arrives for this record's own entry, and for no
-    -- other: the record identifies it.
+    -- The presentation half arrives for this record's own cycle, and for no
+    -- other: the record is what identifies a cycle, so it is what the half is
+    -- matched by. Marking every unpresented cycle would let one frame's
+    -- retirement pair with another frame's rendering.
     advanced = advanceCycles now number presents removed
-    presents waiting
+    presents key waiting
+      | key /= record = Nothing
       | cyclePresented waiting = Nothing
       | otherwise = Just waiting {cyclePresented = True}
     discharge current = case poolGeneration entry of
@@ -1959,12 +1964,12 @@ applyPresentation now number record entry model = settleFrames [(number, slot) |
 -- either side of an attempt says nothing about the other; it is dropped rather
 -- than credited. Dropping it touches no hold and no accounting: what it settles
 -- is whether the target has been healthy, and nothing else.
-advanceCycles ∷ Instant → Natural → (Cycle → Maybe Cycle) → GpuModel → GpuModel
+advanceCycles ∷ Instant → Natural → (Natural → Cycle → Maybe Cycle) → GpuModel → GpuModel
 advanceCycles now number half model = case Map.lookup number (gpuTargets model) of
   Nothing → model
   Just target → foldl' apply model (Map.toList (targetCycles target))
   where
-    apply current (record, pending) = case half pending of
+    apply current (record, pending) = case half record pending of
       Nothing → current
       Just moved
         | cyclePresented moved && cycleSubmission moved == Nothing → complete current record moved

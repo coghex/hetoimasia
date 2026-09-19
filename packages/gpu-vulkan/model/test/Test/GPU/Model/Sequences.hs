@@ -106,6 +106,47 @@ spec = describe "event sequences" $ do
       fmap viewTargetReplacementRequested (targetView target requested) `shouldBe` Just True
       nextDeadline requested `shouldBe` TurnNow
 
+  describe "two presentations in flight" $ do
+    it "pairs each half with its own cycle, and credits neither on a mismatch" $ do
+      -- The enumeration below drove two frames at once but only checked the
+      -- model's invariants, which a mismatch does not break — it produces a
+      -- plausible-looking credit instead. So the pairing is asserted here
+      -- directly: a half belongs to the cycle its own presentation record names,
+      -- and to no other.
+      (model, target, first, second) ← twoInFlight
+      cyclesOnTarget target model `shouldBe` 2
+      attemptsOnTarget target model `shouldBe` 1
+
+      -- One frame's retirement and the *other* frame's rendering. Two halves
+      -- have arrived and no cycle has completed, because they are halves of
+      -- different cycles.
+      mismatched ←
+        admitted_ "retiring the first presentation" (recordCompletion (atMilliseconds 1000) (PresentationRetired (flightPresentation first)) model)
+          >>= admitted_ "completing the second submission" . recordCompletion (atMilliseconds 1000) (SubmissionCompleted (flightSubmission second))
+      cyclesOnTarget target mismatched `shouldBe` 2
+      let (waited, _) = runProgressTurn silentEvidence (atMilliseconds 2500) mismatched
+      attemptsOnTarget target waited `shouldBe` 1
+
+      -- The halves that complete the pairs do complete them.
+      matched ←
+        admitted_ "completing the first submission" (recordCompletion (atMilliseconds 2500) (SubmissionCompleted (flightSubmission first)) waited)
+          >>= admitted_ "retiring the second presentation" . recordCompletion (atMilliseconds 2500) (PresentationRetired (flightPresentation second))
+      cyclesOnTarget target matched `shouldBe` 0
+      let (healthy, _) = runProgressTurn silentEvidence (atMilliseconds 3500) matched
+      attemptsOnTarget target healthy `shouldBe` 0
+
+    it "completes only the cycle whose record retired, leaving the other waiting" $ do
+      (model, target, first, second) ← twoInFlight
+      -- Both submissions complete, so each cycle now waits only on its own
+      -- presentation. Retiring one must complete one cycle, not both.
+      completed ←
+        admitted_ "completing the first submission" (recordCompletion (atMilliseconds 1000) (SubmissionCompleted (flightSubmission first)) model)
+          >>= admitted_ "completing the second submission" . recordCompletion (atMilliseconds 1000) (SubmissionCompleted (flightSubmission second))
+      cyclesOnTarget target completed `shouldBe` 2
+      retired ←
+        admitted_ "retiring the first presentation" (recordCompletion (atMilliseconds 1000) (PresentationRetired (flightPresentation first)) completed)
+      cyclesOnTarget target retired `shouldBe` 1
+
   describe "recovery against the two completion orders" $
     forM_ recoveryScenarios $ \(name, recovery, expected) ->
       forM_ completionOrders $ \(orderName, order) ->
@@ -363,3 +404,43 @@ framesOf stage = maybe 0 viewTargetFrames (targetView (stageTarget stage) (stage
 
 epochOf ∷ GpuModel → TargetId → Natural
 epochOf model target = maybe 0 viewTargetRecoveryEpoch (targetView target model)
+
+-- ---------------------------------------------------------------------------
+-- Two frames in flight at once
+
+-- | One frame's records, for an example that needs to tell two apart.
+data Flight = Flight
+  { flightSubmission ∷ SubmissionId
+  , flightPresentation ∷ PresentationId
+  }
+
+-- | A target with a successful recovery behind it and two presentations
+-- enqueued, each waiting on its own submission.
+twoInFlight ∷ HasCallStack ⇒ IO (GpuModel, TargetId, Flight, Flight)
+twoInFlight = do
+  model ← freshModelWith request
+  (active, target, _) ← activeTarget 4 model
+  (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) target active)
+  recovered ← admitted_ "succeeding" (recordRecoverySuccess target begun)
+  (afterFirst, first) ← enqueueOne target recovered
+  (afterSecond, second) ← enqueueOne target afterFirst
+  pure (afterSecond, target, first, second)
+
+enqueueOne ∷ HasCallStack ⇒ TargetId → GpuModel → IO (GpuModel, Flight)
+enqueueOne target model = do
+  (framed, frame) ← acquiredFrame target model
+  (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted framed)
+  submission ← case submitAnswer of
+    SubmissionRecorded identity → pure identity
+    other → fail ("expected a submission record, got " ++ show other)
+  (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame PresentationEnqueued submitted)
+  presentation ← case presentAnswer of
+    PresentationTracked identity → pure identity
+    other → fail ("expected a presentation record, got " ++ show other)
+  pure (presented, Flight {flightSubmission = submission, flightPresentation = presentation})
+
+cyclesOnTarget ∷ TargetId → GpuModel → Natural
+cyclesOnTarget target model = maybe 0 viewTargetCycles (targetView target model)
+
+attemptsOnTarget ∷ TargetId → GpuModel → Natural
+attemptsOnTarget target model = maybe 0 viewTargetRecoveryAttempts (targetView target model)

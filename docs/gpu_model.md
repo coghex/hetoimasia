@@ -311,7 +311,10 @@ completes, so retirement on its own is half of one — the frame still owes the
 rendering it submitted — and whichever fact arrives second completes the cycle.
 
 Each cycle is a record of its own, held on the target and keyed by the
-presentation record that identifies it. It is not held on the frame, because a
+presentation record that identifies it. Both halves are matched to a cycle by
+identity — the presentation by that record, the rendering by the submission the
+cycle is waiting on — so one frame's retirement never pairs with another frame's
+rendering, however many are in flight. It is not held on the frame, because a
 frame slot is reusable as soon as its own submission completes and a cycle can
 outlive that; a half remembered on a frame is a half lost when the slot is
 recycled.
@@ -581,7 +584,8 @@ script language now enumerates the bounded legal orderings — a frame's whole
 life in both completion orders, a slot reused, two frames in flight, an
 unsubmitted frame abandoned, a submitted frame closed before presenting, a close
 arriving in each phase, a recovery attempt before, after and between a cycle's
-halves, three failures in a row, and replacement demand raised after the schedule
+halves, three failures in a row, two presentations in flight whose halves must
+pair only with their own cycles, and replacement demand raised after the schedule
 has backed off — and checks the model's invariants after *every* step of *every*
 one of them: nothing disposable owes anything, accounting stays inside its
 configuration, storage stays a function of that configuration, silence about the
