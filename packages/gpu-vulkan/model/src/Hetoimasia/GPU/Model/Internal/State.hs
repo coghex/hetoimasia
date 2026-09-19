@@ -2237,11 +2237,26 @@ recordRecoveryFailure now identity model =
             -- Leaving that to whoever next asks for an attempt would leave the
             -- target admitted, unescalated and unscheduled — and on an otherwise
             -- idle target nobody ever asks.
+            --
+            -- Unless close already won. An attempt that was outstanding when the
+            -- target closed still has to be settled, but its outcome decides
+            -- nothing: a target that is retiring is not one recovery can be
+            -- exhausted on, and a session that has already failed has no room
+            -- for a target to fail it again.
             if episodeAttempts (targetRecovery target) < recoveryAttemptLimit
+              || not (stillRecovering model target)
               then Admitted recorded
               else case Map.lookup number (gpuTargets recorded) of
                 Nothing → Admitted recorded
                 Just spent → Admitted (fst (exhaustTarget number spent recorded))
+
+-- | Whether a failure reported for this target can still exhaust its recovery.
+-- A target that has closed, one already marked unavailable, and any target of a
+-- session that has already failed have nothing left for recovery to decide.
+stillRecovering ∷ GpuModel → Target → Bool
+stillRecovering model target =
+  gpuState model == SessionRunning
+    && targetPhase target `notElem` [TargetRetiring, TargetUnavailable]
 
 -- | Mark a target whose recovery budget is spent: an optional one becomes
 -- unavailable and the session continues; a required one fails the session.

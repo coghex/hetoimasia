@@ -280,6 +280,11 @@ request for an attempt that no longer exists. Leaving it until someone asked
 would leave the target admitted, unescalated and with nothing scheduled — and on
 an otherwise idle target nobody ever asks.
 
+Close wins there too. An attempt that was outstanding when its target closed
+still has to be settled, but its outcome decides nothing: a retiring target is
+not one recovery can be exhausted on, and a session that has already failed has
+no room for a target to fail it again.
+
 Admitting an attempt clears any healthy-progress evidence gathered before it. A
 cycle that the attempt itself interrupted says nothing about a target that has
 just had to be reconstructed again, and carrying it forward would hand the
@@ -486,8 +491,10 @@ when one exists.
 
 And the scheduling contract itself: the same unchanged model read repeatedly
 answering the same deadline; a spent episode marking its target unavailable and
-escalating at the failure that spent it; and evidence gathered before an attempt
-refusing to replenish the episode that attempt belongs to.
+escalating at the failure that spent it; a target closed while its last attempt
+was in flight settling that attempt without escalating anything; and evidence
+gathered before an attempt refusing to replenish the episode that attempt
+belongs to.
 
 `test.workflow` holds the group's registration to the routing it needs: it is
 assigned to the `haskell-engine` worker, its receipt is published under the name

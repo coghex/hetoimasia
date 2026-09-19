@@ -128,6 +128,45 @@ spec = describe "recovery" $ do
     (_, retry) ← admitted "asking to retry after the close" (beginTargetRecovery (atMilliseconds 1) target published)
     retry `shouldBe` RecoveryClosed
 
+  it "lets close win over the failure of an attempt that was already outstanding" $ do
+    -- A required target, so that exhausting it would fail the whole session —
+    -- the loudest thing a late outcome could wrongly cause.
+    model ← freshModel
+    (active, target, _) ← activeTargetWith RequiredTarget 2 model
+    (firstBegun, _) ← admitted "the first attempt" (beginTargetRecovery (atMilliseconds 0) target active)
+    firstFailed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 0) target firstBegun)
+    (secondBegun, _) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 100) target firstFailed)
+    secondFailed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 100) target secondBegun)
+    (thirdBegun, third) ← admitted "the third attempt" (beginTargetRecovery (atMilliseconds 600) target secondFailed)
+    third `shouldBe` RecoveryAttempt 3
+
+    -- Close arrives while that attempt is still in flight.
+    closed ← admitted_ "closing the target" (closeTarget target thirdBegun)
+    fmap viewTargetPhase (targetView target closed) `shouldBe` Just TargetRetiring
+
+    -- The attempt then fails. It still has to be settled, but its outcome
+    -- decides nothing: a retiring target is not one recovery can be exhausted
+    -- on, and the session it belongs to is not its to fail.
+    late ← admitted_ "the late failure" (recordRecoveryFailure (atMilliseconds 700) target closed)
+    sessionState late `shouldBe` SessionRunning
+    escalations late `shouldBe` []
+    fmap viewTargetPhase (targetView target late) `shouldBe` Just TargetRetiring
+    fmap viewTargetRecoveryAttempts (targetView target late) `shouldBe` Just 3
+    -- And the attempt really was settled, so nothing is left outstanding.
+    (_, afterwards) ← admitted "asking again" (beginTargetRecovery (atMilliseconds 800) target late)
+    afterwards `shouldBe` RecoveryClosed
+
+    -- An optional target closed the same way keeps its close rather than being
+    -- overwritten as unavailable.
+    optionalModel ← freshModel
+    (optionalActive, optionalTarget, _) ← activeTarget 2 optionalModel
+    optionalSpent ← twoFailures optionalTarget optionalActive
+    (optionalThird, _) ← admitted "the third attempt" (beginTargetRecovery (atMilliseconds 600) optionalTarget optionalSpent)
+    optionalClosed ← admitted_ "closing it" (closeTarget optionalTarget optionalThird)
+    optionalLate ← admitted_ "the late failure" (recordRecoveryFailure (atMilliseconds 700) optionalTarget optionalClosed)
+    escalations optionalLate `shouldBe` []
+    fmap viewTargetPhase (targetView optionalTarget optionalLate) `shouldBe` Just TargetRetiring
+
   it "retires a generation passed as oldSwapchain even when the replacement construction fails" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model
@@ -364,6 +403,12 @@ spec = describe "recovery" $ do
     settleResource resource model = do
       released ← admitted_ "releasing" (releaseResource resource model)
       admitted_ "ending CPU use" (endResourceCpuUse resource released)
+    -- Two failed attempts, leaving the third available once its delay elapses.
+    twoFailures target model = do
+      (firstBegun, _) ← admitted "the first attempt" (beginTargetRecovery (atMilliseconds 0) target model)
+      firstFailed ← admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 0) target firstBegun)
+      (secondBegun, _) ← admitted "the second attempt" (beginTargetRecovery (atMilliseconds 100) target firstFailed)
+      admitted_ "failing it" (recordRecoveryFailure (atMilliseconds 100) target secondBegun)
     -- Burn an episode's whole budget: three attempts, each failing.
     spendEpisode target model = go 0 (0 ∷ Natural) model
       where
