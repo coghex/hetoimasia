@@ -56,7 +56,7 @@ spec = describe "Validation planner" $ do
         plan ← planJson fixture []
         selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
 
-    it "rejects an operating-system conditional that declares anything but link fields" $
+    it "rejects an operating-system conditional that declares anything but link or buildability fields" $
       withFixture $ \fixture → do
         change fixture "packages/alpha/alpha.cabal"
           (alphaPackage ++ unlines ["    if os(linux)", "        build-depends: containers"])
@@ -64,25 +64,18 @@ spec = describe "Validation planner" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "may declare only buildable, extra-libraries, frameworks"
 
-    it "accepts an operating-system conditional that chooses whether to build" $
+    it "accepts an operating-system conditional that decides whether a component is built" $
       withFixture $ \fixture → do
-        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ buildableConditional)
-        plan ← planJson fixture []
-        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
-
-    it "covers a platform component's sources on the platform that does not build it" $
-      -- The planner runs on whichever machine plans the candidate, and a
-      -- component excluded there still has sources a change can touch. Its
-      -- consumer must be selected anyway: an input identity that depended on
-      -- the planning machine's operating system would make the same candidate
-      -- mean different things on two of them.
-      withFixture $ \fixture → do
-        writeFixtureFile (root fixture) "packages/alpha/extra/Extra.hs" (extraModule 1)
-        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ excludedSublibrary)
-        change fixture "demo.cabal" sublibraryDemoPackage
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ platformOnlyLibrary)
+        change fixture "demo.cabal" platformOnlyDemoPackage
         base ← revision fixture "HEAD"
-        change fixture "packages/alpha/extra/Extra.hs" (extraModule 2)
+        writeFixtureFile (root fixture) "packages/alpha/platform/Platform.hs" (platformModule 1)
+        change fixture "packages/alpha/platform/Platform.hs" (platformModule 2)
         plan ← planJsonAt fixture base []
+        -- A component that this platform does not build still has its sources
+        -- counted, so the group that owns it is reported as affected wherever
+        -- the plan is taken. Silently dropping them would make a Darwin-only
+        -- probe look identical to a tree that never touched it.
         selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
 
     it "rejects a conditional on anything but the operating system" $
@@ -92,6 +85,30 @@ spec = describe "Validation planner" $ do
         (result, _, errors) ← planRaw fixture (seeded fixture) []
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "conditional or brace-delimited Cabal syntax is not supported"
+
+    it "follows a component's native sources and include directories" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.c" (nativeSource 1)
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.h" "int alpha_native(void);\n"
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ nativeFields)
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/cbits/alpha.c" (nativeSource 2)
+        plan ← planJsonAt fixture base []
+        -- C is compiled into the component as surely as its Haskell is, and it
+        -- is declared relative to the package rather than to a Haskell source
+        -- directory, so nothing else in the derivation would reach it.
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "unaffected" False False)
+
+    it "counts a header under a component's include directory" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.c" (nativeSource 1)
+        writeFixtureFile (root fixture) "packages/alpha/cbits/alpha.h" "int alpha_native(void);\n"
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ nativeFields)
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/cbits/alpha.h" "int alpha_native(int);\n"
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
 
     it "selects a test suite through its executable build-tool dependency" $
       withFixture $ \fixture → do
@@ -544,21 +561,6 @@ extraLibrary =
     , "    build-depends: base"
     ]
 
--- | An operating-system conditional that chooses whether to build, which is how
--- a platform-only component is excluded elsewhere rather than built vacuously.
-buildableConditional ∷ String
-buildableConditional =
-  unlines
-    [ "    if os(linux)"
-    , "        buildable: True"
-    , "    else"
-    , "        buildable: False"
-    ]
-
--- | The fixture sublibrary, built on one platform only.
-excludedSublibrary ∷ String
-excludedSublibrary = extraLibrary ++ buildableConditional
-
 extraModule ∷ Int → String
 extraModule value = "module Extra (extra) where\nextra :: Int\nextra = " ++ show value ++ "\n"
 
@@ -579,6 +581,48 @@ linkConditionals =
     , "            rt"
     , "            m"
     ]
+
+-- | Native sources and their include directory, declared relative to the
+-- package as Cabal declares them.
+nativeFields ∷ String
+nativeFields =
+  unlines
+    [ "    c-sources: cbits/alpha.c"
+    , "    include-dirs: cbits"
+    ]
+
+nativeSource ∷ Int → String
+nativeSource value = "int alpha_native(void) { return " ++ show value ++ "; }\n"
+
+-- | A library stanza that is built on one operating system and not on another.
+--
+-- The planner reads it for its inputs either way; @buildable@ decides what a
+-- compiler does, not what a change touches.
+platformOnlyLibrary ∷ String
+platformOnlyLibrary =
+  unlines
+    [ ""
+    , "library platform"
+    , "    visibility: public"
+    , "    exposed-modules: Platform"
+    , "    hs-source-dirs: platform"
+    , "    default-language: GHC2024"
+    , "    build-depends: base"
+    , "    if os(darwin)"
+    , "        buildable: True"
+    , "    else"
+    , "        buildable: False"
+    ]
+
+platformModule ∷ Int → String
+platformModule value =
+  "module Platform (platform) where\nplatform :: Int\nplatform = " ++ show value ++ "\n"
+
+-- | The fixture package with the harness suite depending on the platform-only
+-- sublibrary, so only that suite consumes its sources.
+platformOnlyDemoPackage ∷ String
+platformOnlyDemoPackage =
+  unlines (init (lines demoPackage) ++ ["        base,", "        alpha:platform"])
 
 fixtureCatalog ∷ String
 fixtureCatalog =

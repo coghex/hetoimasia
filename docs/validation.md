@@ -167,22 +167,26 @@ ceiling, and a seccomp filter installed with `SECCOMP_FILTER_FLAG_TSYNC` -- and
 checks the fail-closed refusal when a prerequisite is missing, each forbidden
 access with the layer that denied it, two-instance isolation and independent
 termination, the whole-process memory ceiling, the execution bound's escalation,
-and the three lifetime cases. Like `test.scripting-lua` it is mandatory but
-outside the floor. Beside its Cabal closure it declares
+and the lifetime cases -- initialization failure, a cancelled owner, a forced
+exit, and a force arriving before the child has said anything at all. Like
+`test.scripting-lua` it is mandatory but outside the floor. Beside its Cabal closure it declares
 `packages/scripting-lua/linux/`, because the probe's native sources are C that
 the Cabal closure's source directories do not reach, and `tools/ci-image/`,
 because what the image permits a child to unshare is part of what the group
 observes.
 
-Two things about it are unlike every other group here. Its components are built
-on Linux alone -- an `if os(linux)`/`else buildable` conditional excludes them
-elsewhere, so the group is not a vacuous pass on a machine that cannot run it --
-and the planner accepts that conditional without reading its body, so the
-probe's sources select this group on every platform rather than only on the one
-that builds them. And a green run of it is evidence, never a verdict: each
-example prints what it proved or, where the machine could not install the
-profile, says so and names the missing prerequisite. What those lines add up to
-is recorded in
+It is one of the two platform-only groups, beside
+[`test.macos-confinement`](#the-macos-confinement-probe), and the only one of
+them CI runs. Its components are built on Linux alone -- an `if os(linux)`/`else
+buildable` conditional excludes them elsewhere, so the group is not a vacuous
+pass on a machine that cannot run it -- and the planner accepts that conditional
+without reading its body, so the probe's sources select this group on every
+platform rather than only on the one that builds them.
+
+What is unlike every other group here is that a green run of it is evidence,
+never a verdict: each example prints what it proved or, where the machine could
+not install the profile, says so and names the missing prerequisite. What those
+lines add up to is recorded in
 [the Linux confinement verdict](lua_linux_confinement_verdict.md), not here.
 
 `test.vulkan` runs the GPU model package's own suite: the typed identities and
@@ -219,10 +223,57 @@ and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
 part of every Linux candidate's identity.
 
-No optional group is registered yet. Interactive and lengthy desktop probes,
-when they are declared, are optional groups that run only on request; optional
+`test.macos-confinement` is the one registered optional group, and it has a
+section of its own below. Further interactive and lengthy desktop probes, when
+they are declared, are optional groups that run only on request; optional
 handling, including an optional display probe whose inputs changed, is proven
 with fixture catalogs in `workflow-tests`.
+
+### The macOS confinement probe
+
+`test.macos-confinement` runs LUA-15's local feasibility proof: a confined
+helper's denied filesystem, network, process, and native-module accesses before
+and after its mod source loads, two-instance process and storage isolation, the
+enforced whole-process memory limit and the execution bound, and the three
+lifetime endings. Its verdict is
+[docs/macos_confinement_verdict.md](macos_confinement_verdict.md).
+
+```bash
+cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
+```
+
+It is **optional and Darwin-only**, and those are two separate facts that have
+to hold together.
+
+*Optional* means it is never selected automatically: an optional group is
+reached only through an explicit request, so no Linux plan picks it up from a
+changed input. It does not mean it can never be selected. `all-hspec` selects
+every Hspec group *including optional ones*, and a `validation-request` block
+naming the group selects it wherever the plan is taken. So a pull request's own
+request block must name neither `test.macos-confinement` nor `all-hspec`; the
+request that does name it belongs in the local request file below.
+
+*Darwin-only* means the components are not built elsewhere: the sublibrary, the
+helper executable, and the test suite each carry `buildable: False` outside
+Darwin. A Linux worker that is nonetheless asked to run the group fails to build
+the component and reports a failure, which is the point — a group that could not
+run must refuse explicitly rather than report a vacuous pass. The mandatory
+floor is unchanged, no remote macOS CI exists, and none is added.
+
+The default Linux plan therefore **omits** the group while still reporting its
+changed inputs: `selected: false`, `reason: optional-unrequested`,
+`inputs_changed: true` whenever the probe's own sources move. Uncertainty never
+reaches a consumer as equivalence, and a Darwin-only probe never looks like a
+tree that did not touch it.
+
+`buildable` inside an `if os(...)` block is the one non-link field the planner's
+Cabal reader accepts, and it is deliberately invisible to input derivation: a
+component that this platform does not build still has its sources, its package
+description, and its declared inputs counted. Everything else inside such a
+block is still rejected, because it could change dependencies silently.
+
+Its receipt is local evidence only, exactly as the GLFW arc's Cocoa evidence is;
+[the local run](#a-local-run-and-its-receipt) below produces it.
 
 ## How a group's inputs are derived
 
@@ -232,10 +283,17 @@ A group's inputs are the union of:
   base revision's catalog;
 - the catalog's `policy_inputs`, from both revisions;
 - the Cabal closure of its `component`: each component's `hs-source-dirs` (as
-  directory prefixes), its `main-is`, the owning package's `.cabal` file, and
-  `cabal.project`, followed transitively across local `build-depends` and
-  `build-tool-depends`. `"all"` starts from every component of every local
-  package.
+  directory prefixes), its `main-is`, its `c-sources`, `cxx-sources`, and
+  `include-dirs`, the owning package's `.cabal` file, and `cabal.project`,
+  followed transitively across local `build-depends` and `build-tool-depends`.
+  `"all"` starts from every component of every local package.
+
+Native sources are declared relative to the package rather than to a Haskell
+source directory, so nothing in the `hs-source-dirs` walk reaches them. They are
+derived separately for that reason: C compiled into a component is as much a
+determinant of what was built as its Haskell, and a group whose C changed and
+whose plan said nothing would be evidence about a component that was not the one
+built.
 
 `cabal.project.common` is declared by **every** group. The planner derives
 `cabal.project` for every component, but not the file that one imports, and that
@@ -262,13 +320,19 @@ document a group genuinely consumes belongs in that group's `inputs`.
 
 Supported Cabal syntax is bounded to what this repository uses: layout-style
 stanzas, `common`/`import`, multiline fields, package-relative `hs-source-dirs`,
-`main-is`, `build-depends`, and `build-tool-depends`. A `build-depends` entry of
+`main-is`, `c-sources`/`cxx-sources` and `include-dirs`, `build-depends`, and
+`build-tool-depends`. A `build-depends` entry of
 the form `package:library` is followed to that one library, a sublibrary or the
 main library, so a suite depending on a sublibrary consumes that sublibrary's
 own sources; the braced `package:{a,b}` form is rejected. Inside a stanza, an
 `if os(...)` block and the `else` directly after it are accepted when they
-declare only `extra-libraries` and `frameworks`, which choose what a link adds on
-one platform and name no input. Any other conditional, anything else inside one,
+declare only `extra-libraries`, `frameworks`, and `buildable` — the first two
+choose what a link adds on one platform, and the third chooses whether the
+stanza is compiled there at all. None of them names an input, and `buildable` in
+particular is invisible to the derivation above: a component this platform does
+not build still has its sources counted, so a
+[platform-only probe](#the-macos-confinement-probe) reports changed inputs
+wherever the plan is taken. Any other conditional, anything else inside one,
 and brace-delimited syntax can change dependencies, so the planner rejects them
 with a diagnostic rather than silently omitting a dependency. `cabal.project` is
 read for its `packages:` field; a glob entry is rejected for the same reason.
@@ -1358,6 +1422,8 @@ changed pin or recipe — by running
 `build` again. `prepare` refuses a `dist-newstyle` linked against the previous
 manifest; remove it rather than reuse those products.
 
+### A local run and its receipt
+
 A local run records its own identity and never claims the Linux digest. Plan and
 run with the same map:
 
@@ -1397,6 +1463,49 @@ passing receipt. The approval covers this one run; it is never a profile
 setting or part of a script an agent runs on its own. That receipt records
 `Darwin` as its runner OS, and remote CI never runs macOS, so it is local
 evidence only: it can never satisfy a Linux plan.
+
+#### The macOS confinement probe's receipt
+
+[`test.macos-confinement`](#the-macos-confinement-probe) is optional, so it is
+reached only through a request, and the request belongs in a local file rather
+than in the pull-request body — a body that named it would select it on Linux
+too, where the component is not built. Write the request file, then plan with it:
+
+````bash
+cat > request.txt <<'REQUEST'
+```validation-request
+test.macos-confinement
+```
+REQUEST
+python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
+  --request-file request.txt \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --json > plan.json
+python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
+  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)"
+````
+
+Two things about that plan command are easy to get wrong, and both make it
+refuse rather than mislead:
+
+- **Every selected group needs a worker.** The plan is routed once, against the
+  groups it selected, and a plan nobody could execute is refused before it
+  exists. Assigning only the probe is not enough: the mandatory floor is always
+  selected, and a change under `tools/validation/` is a policy input, so it
+  selects every non-optional group — `test.workflow` and `test.glfw-native`
+  included. Routing a group is not running it and does not authorize running it;
+  the runner invocation below names the one group it executes.
+- **The request file is a file, not the pull-request body.** `--request-file`
+  reads a body-shaped document from disk. `request.txt` is in `generated_paths`
+  and in `.gitignore`, so it stays out of the candidate's identity and out of a
+  commit.
+
+The receipt records `Darwin` as its runner OS, so like the native GLFW one it is
+local evidence that can never satisfy a Linux plan. The probe needs no display,
+no consent, and no signing identity: it is an ordinary headless command-line
+run.
 
 ### Building without the GLFW SDK
 

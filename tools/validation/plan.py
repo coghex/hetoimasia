@@ -72,22 +72,19 @@ CONDITIONAL_PATTERN = re.compile(r"^(if|elif|else)\b")
 OS_CONDITIONAL_PATTERN = re.compile(r"^if\s+os\(\s*[A-Za-z][A-Za-z0-9_-]*\s*\)$")
 PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 
-# The only fields an operating-system conditional may declare. Two kinds, for
-# one reason: none of them names a source, a dependency, or anything else a
-# group's inputs are derived from.
+# The only fields an operating-system conditional may declare. None of them
+# names a source, a dependency, or anything else a group's inputs are derived
+# from: the link fields choose what an ordinary link adds on one platform, and
+# `buildable` chooses whether the stanza is compiled there at all.
 #
-# The link fields choose what an ordinary link adds on one platform. `buildable`
-# chooses whether a component is built there at all, which is how a platform
-# component -- the Linux confinement probe is the first -- is excluded elsewhere
-# rather than built and passing vacuously.
-#
-# What `buildable` deliberately does not change is this planner's answer. The
-# body of a conditional is not read into the stanza, so a component's inputs are
-# the union of what it declares outside one on every platform: the same files
-# select the same groups whether or not this run's operating system would build
-# them. Narrowing that to the building platform would make a candidate's
-# selection depend on which machine planned it, which is the opposite of what
-# the input identity is for.
+# `buildable` is deliberately invisible to input derivation. A component that is
+# not built on this platform still has its sources, its package description, and
+# its declared inputs counted, so a change to a platform-only probe is reported
+# as a changed input on every platform. Whether the group that owns it is then
+# selected is the group's own business -- the macOS probe's is optional and the
+# Linux one's is not -- and that is the point: what a candidate's inputs are
+# must not depend on which machine planned it, or the same candidate would mean
+# two things.
 LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
 CONDITIONAL_FIELDS = LINK_ONLY_FIELDS | frozenset({"buildable"})
 
@@ -256,7 +253,8 @@ class WorkTree:
 #
 # Supported syntax is deliberately bounded to what this repository uses:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
-# relative ``hs-source-dirs``, ``main-is``, ``build-depends`` (including a
+# relative ``hs-source-dirs``, ``main-is``, ``c-sources``/``cxx-sources`` and
+# ``include-dirs``, ``build-depends`` (including a
 # ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
 # ``if os(...)``/``else`` block inside a stanza that declares only link fields or
 # ``buildable``. Any other conditional, and brace-delimited syntax, can change
@@ -534,6 +532,16 @@ def component_inputs(packages: dict[str, Package], component: str | None) -> set
             inputs.add(prefix + "/" if prefix else "")
             for main in fields.get("main-is", []):
                 inputs.add(join_path(prefix, main))
+        # Native sources are compiled into the component as surely as its
+        # Haskell is, and they are declared relative to the package rather than
+        # to a Haskell source directory, so neither is reached by the loop
+        # above. A group whose C changed and whose plan said nothing would be
+        # evidence about a component that was not the one built.
+        for source in fields.get("c-sources", []) + fields.get("cxx-sources", []):
+            inputs.add(join_path(package.directory, source))
+        for directory in fields.get("include-dirs", []):
+            prefix = join_path(package.directory, directory)
+            inputs.add(prefix + "/" if prefix else "")
     return inputs
 
 

@@ -28,6 +28,7 @@ extra-source-files:
     bridge/cbits/hetoimasia_lua_bridge.h
     hazard/cbits/hetoimasia_lua_probe.h
     linux/cbits/hetoimasia_confine.h
+    macos/cbits/hetoimasia_macos_probe.h
 
 source-repository head
     type: git
@@ -145,6 +146,96 @@ test-suite lua-host-tests
         hetoimasia-test-support ==0.1.0.0,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge
+
+-- The macOS confinement probe's shared side, private to this package and built
+-- only on Darwin. It is LUA-15's feasibility evidence, not an engine facility:
+-- nothing in the library, the console executable, or any public API depends on
+-- it, and it exposes no way to admit untrusted source. On every other platform
+-- the component is not built, rather than built and passing vacuously.
+--
+-- Both of the mechanisms it measures are resolved at run time rather than
+-- linked, because whether they are exported at all is one of the questions.
+-- See docs/macos_confinement_verdict.md for what they turned out to be worth.
+library macos-probe
+    import: language
+    visibility: private
+    hs-source-dirs: macos/lib
+    c-sources: macos/cbits/hetoimasia_macos_probe.c
+    include-dirs: macos/cbits
+    exposed-modules:
+        Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
+        Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
+        Hetoimasia.Scripting.Lua.Internal.MacOS.Report
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5 && <2.6,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9
+    if os(darwin)
+        buildable: True
+    else
+        buildable: False
+
+-- The confined helper itself. The parent spawns this image directly: a
+-- spawn-time memory limit does not survive an exec, so an exec-based wrapper
+-- would quietly drop the only whole-process limit this platform offers.
+executable macos-confinement-helper
+    import: language
+    hs-source-dirs: macos/helper
+    main-is: Main.hs
+    -- -N2 rather than -N: the helper has to be a threaded-RTS child with more
+    -- than one capability, because that is the configuration LUA-1 selected and
+    -- the one whose virtual reservation the memory row is about.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:macos-probe
+    if os(darwin)
+        buildable: True
+    else
+        buildable: False
+
+-- LUA-15's proof matrix, driven from the trusted parent side. Optional and
+-- local-only: it is registered in tools/validation/catalog.json as an optional
+-- cpu group, Linux CI never selects it, and its receipt records Darwin.
+test-suite macos-confinement-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: macos/test
+    other-modules:
+        Test.MacOS.Confinement
+        Test.MacOS.Driver
+        Test.MacOS.Isolation
+        Test.MacOS.Lifetime
+        Test.MacOS.Limits
+        Test.MacOS.Spec
+    -- -N2 rather than -N: the two-instance example needs the parent to watch
+    -- one helper while another is running, on every machine that runs it.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-tool-depends: hetoimasia-scripting-lua:macos-confinement-helper
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5 && <2.6,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-test-support ==0.1.0.0,
+        hetoimasia-scripting-lua:macos-probe
+    if os(darwin)
+        buildable: True
+    else
+        buildable: False
 
 -- The Linux feasibility probe's child (LUA-14). A private platform component:
 -- it is built only on Linux, nothing links it, and the only Lua source it ever

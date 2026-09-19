@@ -56,10 +56,23 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
-  and `cabal test hetoimasia-tests --test-show-details=direct`. On Linux,
+  and `cabal test hetoimasia-tests --test-show-details=direct`.
+- On Linux only,
   `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct`
-  runs the confinement feasibility probe (group `test.lua-confinement-linux`);
-  its components are not built on other platforms.
+  runs LUA-14's confinement probe. Its validation group
+  `test.lua-confinement-linux` is mandatory and CI runs it, but a green run is
+  evidence rather than a verdict: where the machine cannot install the profile
+  every experiment reports itself unproven. Its components are not built off
+  Linux. Read [its verdict](docs/lua_linux_confinement_verdict.md) before
+  building on it — the answer is `inconclusive`.
+- On macOS only,
+  `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct`
+  runs LUA-15's confinement probe. It is local evidence, not a routine check:
+  its validation group `test.macos-confinement` is optional, no CI runs it, and
+  its components are not built off Darwin. A pull-request request block must
+  name neither it nor `all-hspec`. Read
+  [its verdict](docs/macos_confinement_verdict.md) before building on it — the
+  answer is `inconclusive`.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
   `Recovery`, `Workers`, `Messaging`, and `Time` components, composed by
