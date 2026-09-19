@@ -6,6 +6,7 @@ packages:
   packages/runtime
   packages/scripting-lua
   packages/glfw
+  packages/gpu-vulkan/model
   tools/test-support
 
 package hetoimasia-glfw

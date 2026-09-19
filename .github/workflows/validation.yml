@@ -149,7 +149,7 @@ jobs:
           # declared once. The planner refuses a routing no worker could honour —
           # a display group on a CPU-only worker, or a group owned twice or by
           # nobody — and every later step reads the assignment out of the plan.
-          arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,smoke.console")
+          arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console")
           arguments+=(--worker "haskell-workflow=cpu:test.workflow")
           arguments+=(--worker "glfw-native=display:test.glfw-native")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -554,6 +554,21 @@ jobs:
         with:
           name: receipt-test.scripting-lua-${{ needs.plan.outputs.identity }}
           path: receipts/test.scripting-lua.json
+          if-no-files-found: error
+          # A re-run of this same run would otherwise collide with the attempt
+          # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
+      - name: Publish the test.vulkan receipt as reusable evidence
+        # Named by the candidate's input identity, so a later run asks for
+        # evidence about *these* inputs rather than fetching every receipt the
+        # group ever produced. A group that did not execute leaves no file and
+        # therefore publishes nothing.
+        if: always() && hashFiles('receipts/test.vulkan.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.vulkan-${{ needs.plan.outputs.identity }}
+          path: receipts/test.vulkan.json
           if-no-files-found: error
           # A re-run of this same run would otherwise collide with the attempt
           # before it; the newest attempt is the one that should stand.

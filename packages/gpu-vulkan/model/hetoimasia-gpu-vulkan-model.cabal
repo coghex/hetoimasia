@@ -1,0 +1,87 @@
+cabal-version: 3.16
+name: hetoimasia-gpu-vulkan-model
+version: 0.1.0.0
+synopsis: Pure GPU retention and frame-ownership model for Hetoimasia
+description:
+    Backend-private, binding-independent state and accounting for a graphics
+    session: typed unforgeable identities for the session, device, targets,
+    swapchain generations, image records, frame slots, recorded batches,
+    submissions, presentations, managed resource generations and allocation
+    attempts; separately tracked holds keyed by generation, so nothing is
+    disposed of while any of them remains; frame ownership phases with the
+    obligations each retains and the exits legal from it; validated finite
+    admission budgets whose exhaustion is typed backpressure rather than
+    failure; per-episode recovery accounting that nested helpers cannot
+    replenish; and bounded round-robin owner progress against the foundation's
+    injected monotonic clock.
+    .
+    Completion is supplied as abstract facts through an injected interface. This
+    package proves no native completion, makes no Vulkan call and names no
+    native type: it depends on the foundation library alone, and on neither the
+    Vulkan binding, GLFW, the runtime nor a game, so its suite builds and runs
+    without a Vulkan SDK.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/gpu-vulkan/model
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.GPU.Model
+        Hetoimasia.GPU.Model.Budget
+        Hetoimasia.GPU.Model.Identity
+    -- The identity constructors, the hold ledger, the admission arithmetic, the
+    -- recovery accounting and the state machine itself. Hiding them is what
+    -- makes an identity unforgeable: a client cannot build one, so every value
+    -- a model is handed was issued by some model.
+    other-modules:
+        Hetoimasia.GPU.Model.Internal.Budget
+        Hetoimasia.GPU.Model.Internal.Hold
+        Hetoimasia.GPU.Model.Internal.Identity
+        Hetoimasia.GPU.Model.Internal.Recovery
+        Hetoimasia.GPU.Model.Internal.State
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hetoimasia-foundation ==0.1.0.0
+
+-- This package's own contracts. It depends on this library, the foundation, and
+-- third-party packages alone, so it builds and runs with no Vulkan SDK present
+-- and is registered as the CPU validation group `test.vulkan`.
+test-suite gpu-model-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.GPU.Model.Budgets
+        Test.GPU.Model.Frames
+        Test.GPU.Model.Holds
+        Test.GPU.Model.Identities
+        Test.GPU.Model.Progress
+        Test.GPU.Model.Recovery
+        Test.GPU.Model.Sequences
+        Test.GPU.Model.Spec
+        Test.GPU.Model.Support
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0

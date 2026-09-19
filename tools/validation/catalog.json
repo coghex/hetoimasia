@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 13,
+  "policy_version": 14,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -163,6 +163,28 @@
       "component": "hetoimasia-scripting-lua:test:lua-host-tests",
       "inputs": [
         "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.vulkan",
+      "description": "Portable Hspec contracts for the GPU retention and frame-ownership model: typed identities and the misuse they are rejected as, the hold ledger and disposal eligibility, frame ownership phases and their obligations, validated admission budgets and their backpressure, recovery and allocation-retry accounting, and bounded round-robin owner progress under a scripted clock. It runs through the CPU project and needs no Vulkan SDK.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-gpu-vulkan-model:gpu-model-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-gpu-vulkan-model:test:gpu-model-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
       ],
       "framework": "hspec",
       "runner": "cpu",

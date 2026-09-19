@@ -543,6 +543,92 @@ spec = describe "Validation evidence reuse" $ do
           document ← applicability fixture
           recordText document packageGroup "source_run_url" `shouldBe` Just (runUrl 41 1)
 
+  describe "the checked-in routing of the GPU model group" $ do
+    -- `test.vulkan` is the first mandatory group that is neither in the floor
+    -- nor owned by a worker of its own, so the floor examples above cannot
+    -- simply be extended to cover it: they assert a `floor` reason it does not
+    -- have. Routing, selection, required evidence, and reuse are each proved
+    -- here on their own instead, with its non-floor status held to throughout.
+    it "routes it to the engine worker and publishes its receipt, while leaving it out of the floor" $
+      withCheckedInRouting $ \fixture workers → do
+        workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
+        change fixture "README.md" "a prose-only update\n"
+        plan ← planRouted fixture workers "vulkan-prose-plan.json"
+        owned ← workerGroups plan "haskell-engine"
+        owned `shouldContain` [vulkanGroup]
+        -- Routed but never published would be reusable by nobody.
+        workflow `shouldContain` ("name: receipt-" ++ vulkanGroup ++ "-${{ needs.plan.outputs.identity }}")
+        workflow `shouldContain` ("path: receipts/" ++ vulkanGroup ++ ".json")
+        -- And a prose-only candidate does not carry it, which is what being
+        -- outside the mandatory floor means.
+        entryText plan vulkanGroup "reason" `shouldReturn` Just "unaffected"
+        selected ← selectedGroups plan
+        selected `shouldNotContain` [vulkanGroup]
+
+    it "selects it when its own package changes, requires its evidence, and reuses its published receipt" $
+      withCheckedInRouting $ \fixture workers → do
+        change fixture vulkanSource "-- the model suite's own source\n"
+        plan ← planRouted fixture workers "vulkan-affected-plan.json"
+        entryText plan vulkanGroup "reason" `shouldReturn` Just "affected"
+        selected ← selectedGroups plan
+        selected `shouldContain` [vulkanGroup]
+
+        -- Required: every other selected engine group passing does not stand in
+        -- for it, and the aggregate says which group is missing.
+        writeFixtureFile (stubDirectory fixture) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
+        exitOf <$> reuseWith fixture plan (restated workers) `shouldReturn` ExitSuccess
+        owned ← workerGroups plan "haskell-engine"
+        let engine = filter (`elem` selected) owned
+        engine `shouldContain` [vulkanGroup]
+        forM_ (filter (/= vulkanGroup) engine) $ \group →
+          exitOf <$> runGroup fixture plan group engineRoute `shouldReturn` ExitSuccess
+        (missing, output, _) ← aggregate fixture plan (reportedSuccess workers)
+        missing `shouldBe` ExitFailure 1
+        output `shouldContain` vulkanGroup
+        output `shouldContain` "neither an execution nor an applicable earlier receipt"
+        exitOf <$> runGroup fixture plan vulkanGroup engineRoute `shouldReturn` ExitSuccess
+        exitOf <$> aggregate fixture plan (reportedSuccess workers) `shouldReturn` ExitSuccess
+
+        -- Reusable: a later candidate whose only further change is prose still
+        -- selects it, against the same inputs, and takes the published receipt.
+        let earlier = root fixture </> "vulkan-earlier.json"
+        copyFile (receiptPath fixture vulkanGroup) earlier
+        forM_ engine $ \group → removeFile (receiptPath fixture group)
+        change fixture "README.md" "a prose-only update\n"
+        later ← planRouted fixture workers "vulkan-later-plan.json"
+        entryText later vulkanGroup "reason" `shouldReturn` Just "affected"
+        install fixture later vulkanGroup [passing earlier]
+        (looked, lookedUp, _) ← reuseWith fixture later (restated workers)
+        looked `shouldBe` ExitSuccess
+        lookedUp `shouldContain` ("reused=" ++ vulkanGroup)
+        document ← applicability fixture
+        recordText document vulkanGroup "source_run_url" `shouldBe` Just (runUrl 41 1)
+
+    it "selects it when a pull request asks for it by name, without promoting it to the floor" $
+      withCheckedInRouting $ \fixture workers → do
+        change fixture "README.md" "a prose-only update\n"
+        writeFixtureFile (root fixture) "body.txt" ("```validation-request\n" ++ vulkanGroup ++ "\n```\n")
+        plan ←
+          planRoutedWith
+            fixture
+            workers
+            ["--request-file", root fixture </> "body.txt"]
+            "vulkan-requested-plan.json"
+        entryText plan vulkanGroup "reason" `shouldReturn` Just "requested"
+        selectedGroups plan >>= (`shouldContain` [vulkanGroup])
+        -- The request is why it runs; the floor is still what it is not in.
+        entryText plan "test.engine" "reason" `shouldReturn` Just "floor"
+
+-- | The portable GPU model group, its package's suite source directory inside
+-- the routing fixture, and one file in it. The fixture builds a minimal package
+-- per component the checked-in catalog names, so this path is the one that
+-- catalog's `component` produces.
+vulkanGroup ∷ String
+vulkanGroup = "test.vulkan"
+
+vulkanSource ∷ FilePath
+vulkanSource = "hetoimasia-gpu-vulkan-model" </> "gpu-model-tests" </> "Model.hs"
+
 -- ---------------------------------------------------------------------------
 -- Driving the tools
 
@@ -1157,7 +1243,11 @@ reportedSuccess workers =
 
 -- | Resolve a plan routed to the given worker declarations.
 planRouted ∷ Fixture → [String] → FilePath → IO FilePath
-planRouted fixture workers name = do
+planRouted fixture workers = planRoutedWith fixture workers []
+
+-- | The same, with extra planner arguments such as a pull-request body.
+planRoutedWith ∷ Fixture → [String] → [String] → FilePath → IO FilePath
+planRoutedWith fixture workers extra name = do
   (result, output, errors) ←
     run
       (environment fixture)
@@ -1171,6 +1261,7 @@ planRouted fixture workers name = do
         , "--runner-os", "Linux"
         , "--json"
         ]
+          ++ extra
           ++ workers
       )
   (result, errors) `shouldBe` (ExitSuccess, "")

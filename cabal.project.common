@@ -25,6 +25,9 @@ package hetoimasia-test-support
 package hetoimasia-glfw
   ghc-options: -Werror -j
 
+package hetoimasia-gpu-vulkan-model
+  ghc-options: -Werror -j
+
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 
