@@ -117,6 +117,7 @@ identifier lists are sorted.
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no |
+| `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
@@ -157,6 +158,24 @@ the build links, and whether Lua's garbage collection may run under unsafe calls
 example runs the package's `lua-hazard` executable as a child process; the Cabal
 closure reaches that executable through `build-tool-depends`, so its sources
 select the group like any other input.
+
+`test.vulkan` runs the GPU model package's own suite: the typed identities and
+the misuse a stale, foreign, duplicated or already-consumed one is rejected as,
+the hold ledger and the single condition under which anything may be disposed of,
+the frame ownership phases and the obligations each retains, the validated
+admission budgets and the backpressure each exhausted one answers, the recovery
+and allocation-retry accounting, and bounded round-robin owner progress under a
+scripted clock. Like `test.scripting-lua` it is mandatory but outside the floor:
+it is new coverage no floor group ever held, so it is selected when affected or
+requested rather than added to the evidence every candidate must carry.
+
+Its command names `cabal.project.cpu` explicitly, and the group declares that
+file beside `cabal.project.common` as an input. The package exists to stay
+buildable and runnable with no Vulkan SDK present, and running its suite through
+the CPU project is what demonstrates that, rather than merely building that
+project and running the suite through the other one. A change to either project
+file therefore selects the group, because changing either changes what the group
+proves.
 
 `test.workflow` runs only when affected or requested.
 
@@ -398,7 +417,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native
 ```
@@ -512,7 +531,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native` |
 
