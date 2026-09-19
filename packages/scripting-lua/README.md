@@ -456,9 +456,18 @@ recorded and enforced by nothing here; choosing what runs next is LUA-6's.
 ### The session
 
 `…Protocol.Session` composes the rest. Each operation answers
-`(Session v, Either SessionRejection a)`, and a rejection changes no record —
-only `sessionCounters`, which keeps how often something was refused or
-discarded. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
+`(Session v, Either SessionRejection a)`. A rejection never advances the
+protocol: no task changes state, no cursor moves, no settled slot is
+overwritten, no event is delivered, no admission is accepted. It is *not* true
+that a rejection changes nothing, and no later slice should be built on that
+stronger reading. A rejection may record evidence — always on
+`sessionCounters`, and on the record it was about in four places: a reply to an
+already-settled request retires its provider accounting, a reply over the
+payload cap discharges the request (settling an unsettled one as a provider
+failure), a repeated provider completion increments `requestLateCompletions`,
+and a delivery into a full ordered backlog increments `subscriptionRejected`.
+The payload-cap case is the only rejection that moves a record's protocol
+state. `SessionRejection` names `AdmissionIsClosed`, `CapReached`,
 `PayloadTooLarge`, the identity refusals `UnknownTask`, `UnknownRequest`,
 `UnknownSubscription`, and `TaskRetired`, `NotTaskOwner`, `NoTerminalResult`,
 `NothingQueued`, `NoDelivery`, `SessionAlreadyFailed`, `SessionAlreadyStopped`,

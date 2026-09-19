@@ -11,6 +11,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , RequestName (RequestName)
+  , TaskId (TaskId)
+  , taskName
   , SnapshotId (SnapshotId)
   , SubscriptionName (SubscriptionName)
   )
@@ -22,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( AdmissionState (AdmissionOpen, MutationAdmissionClosed)
   , FailureRecord (FailureRecord, failedLastGoodSnapshot, failedReason, failedRecovery, failedTask)
-  , Session (sessionAdmission, sessionFailure, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
+  , Session (sessionAdmission, sessionFailure, sessionKey, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
   , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TaskRetired, TransitionRefused, UnknownTask)
   , TerminalResult (ResultCancelled, ResultFailed)
   , acceptRequest
@@ -179,6 +181,16 @@ spec = describe "session failure" $ do
     (b, _) ← ok (advanceEpoch a)
     (c, refusal) ← rejected (reportFailure unsafeAuthoritative {failedTask = Just owner} b)
     refusal `shouldBe` UnknownTask owner
+    sessionFailure c `shouldBe` Nothing
+    sessionAdmission c `shouldBe` AdmissionOpen
+
+  it "escalates nothing for a name this epoch never issued, however low it is" $ do
+    session ← openSession
+    (a, before) ← runningTask 1 session
+    (b, _) ← ok (advanceEpoch a)
+    let neverIssued = TaskId (sessionKey b) (taskName before)
+    (c, refusal) ← rejected (reportFailure unsafeAuthoritative {failedTask = Just neverIssued} b)
+    refusal `shouldBe` UnknownTask neverIssued
     sessionFailure c `shouldBe` Nothing
     sessionAdmission c `shouldBe` AdmissionOpen
 

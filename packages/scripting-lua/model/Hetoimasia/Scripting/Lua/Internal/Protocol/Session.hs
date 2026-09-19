@@ -12,16 +12,33 @@
 -- = Shape of every operation
 --
 -- Each operation takes the session last and answers
--- @('Session' v, 'Either' 'SessionRejection' a)@. A rejection leaves every
--- task, request, and subscription record exactly as it was; what it may still
--- change is 'sessionCounters', because how often something was refused is
--- evidence the session is the only place to keep.
+-- @('Session' v, 'Either' 'SessionRejection' a)@.
 --
--- There is one deliberate exception, and it is the one P-7 asks for: a reply
--- that arrives for a request that has already settled is rejected, and still
--- retires that request's provider accounting, because an answer is evidence
--- the provider finished whether or not anyone was still waiting for it. See
--- "Hetoimasia.Scripting.Lua.Internal.Protocol.Request".
+-- A rejection never advances the protocol: no task changes state, no cursor
+-- moves, no settled slot is overwritten, no event is delivered, and no
+-- admission is accepted. That is the guarantee downstream slices may build on,
+-- and it is narrower than "a rejection changes nothing", which is not true and
+-- should not be relied upon.
+--
+-- What a rejection may do is record evidence. Always on 'sessionCounters',
+-- because how often something was refused is evidence only the session can
+-- keep, and in four places on the record the rejection was about:
+--
+-- * a reply for a request that has __already settled__ is refused and still
+--   retires that request's provider accounting, because an answer is evidence
+--   the provider finished whether or not anyone was waiting for it (P-7);
+-- * a reply whose payload __exceeds the cap__ is refused, its value never
+--   stored, and the request still discharged — settled as a provider failure
+--   if it was unsettled, counted as a late reply if it was not. A refusal that
+--   left the accounting outstanding would hold capacity nothing could release;
+-- * a repeated provider completion is refused and counted on the request, as
+--   'requestLateCompletions';
+-- * a delivery into a full ordered backlog is refused and counted on the
+--   subscription, as @subscriptionRejected@.
+--
+-- The second of those is the only rejection that settles a request, and it is
+-- the only place in this module where a refused operation moves a record's
+-- protocol state. Everything else above is a counter.
 --
 -- = Reservations
 --
@@ -142,7 +159,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , Epoch
   , Generation
   , Ordinal
-  , RequestId (RequestId)
+  , RequestId (RequestId, requestScope)
   , RequestName
   , SessionKey (keyEpoch)
   , SnapshotId
@@ -318,6 +335,7 @@ data Session v = Session
   , sessionRequests ∷ !(Map RequestId (RequestRecord v))
   , sessionSubscriptions ∷ !(Map SubscriptionId (Subscription v))
   , sessionNextOrdinal ∷ !Ordinal
+  , sessionEpochFirstTask ∷ !TaskName
   , sessionNextTask ∷ !TaskName
   , sessionNextGeneration ∷ !Generation
   , sessionCounters ∷ !Counters
@@ -342,6 +360,7 @@ newSession key limits = do
       , sessionRequests = Map.empty
       , sessionSubscriptions = Map.empty
       , sessionNextOrdinal = firstOrdinal
+      , sessionEpochFirstTask = firstTaskName
       , sessionNextTask = firstTaskName
       , sessionNextGeneration = firstGeneration
       , sessionCounters = noCounters
@@ -429,17 +448,24 @@ takeOrdinal session =
   , session {sessionNextOrdinal = nextOrdinal (sessionNextOrdinal session)}
   )
 
--- | Whether this session issued a task identity, whatever became of it.
+-- | Whether this session issued a task identity /in its current epoch/,
+-- whatever became of it.
 --
--- The names are issued from one counter that is never rewound, so "this scope
--- issued it" is the comparison below and nothing has to be remembered. It
--- distinguishes a task whose record has been observed and forgotten from one
--- that is foreign, of a replaced epoch, or was never issued at all — a
+-- Names come from one counter that is never rewound, and an epoch change
+-- records where the new epoch's range starts, so "this epoch issued it" is two
+-- comparisons and nothing has to be remembered. Both ends matter: without the
+-- lower bound, a name this session issued under a /previous/ epoch would pass
+-- when paired with the current scope, and an identity nothing ever issued
+-- would be treated as one of ours.
+--
+-- It distinguishes a task whose record has been observed and forgotten from
+-- one that is foreign, of a replaced epoch, or was never issued at all — a
 -- distinction a failure report turns on, and one that a list of retired
 -- identities would otherwise have to grow forever to make.
 issuedHere ∷ TaskId → Session v → Bool
 issuedHere identity session =
   taskScope identity == sessionKey session
+    && taskName identity >= sessionEpochFirstTask session
     && taskName identity < sessionNextTask session
 
 -- | Issue the next task name.
@@ -536,6 +562,19 @@ revokeOne cause identity session = case Map.lookup identity (sessionRequests ses
                 }
           )
           session {sessionRequests = kept}
+
+-- | The requests this session's current epoch issued.
+--
+-- The map also holds stubs of earlier epochs, kept for provider accounting
+-- alone. Their interest was revoked when their epoch was replaced, and
+-- revoking it again would count the same invalidation a second time and report
+-- an epoch as having invalidated work that was not its.
+currentEpochRequests ∷ Session v → [RequestId]
+currentEpochRequests session =
+  [ identity
+  | identity ← Map.keys (sessionRequests session)
+  , requestScope identity == sessionKey session
+  ]
 
 -- | Forget a request once both of its obligations are discharged.
 reclaim ∷ RequestId → RequestRecord v → Session v → Session v
@@ -1050,11 +1089,12 @@ advanceEpoch ∷ Session v → (Session v, Either SessionRejection EpochChange)
 advanceEpoch session = case notStopped session >> notFailed session of
   Left rejection → refuse session rejection
   Right () →
-    let revoked =
+    let replacing = currentEpochRequests session
+        revoked =
           foldl'
             (flip (revokeOne CancelledByEpochChange))
             session
-            (Map.keys (sessionRequests session))
+            replacing
         retained = Map.keys (sessionRequests revoked)
         discardedResults = Map.size (sessionResults session)
         discardedQueued = Seq.length (sessionQueued session)
@@ -1075,6 +1115,7 @@ advanceEpoch session = case notStopped session >> notFailed session of
             )
             revoked
               { sessionKey = replacement
+              , sessionEpochFirstTask = sessionNextTask revoked
               , sessionTasks = Map.empty
               , sessionQueued = Seq.empty
               , sessionResults = Map.empty
@@ -1088,7 +1129,7 @@ advanceEpoch session = case notStopped session >> notFailed session of
               , changedTo = keyEpoch replacement
               , invalidatedTasks = Map.size (sessionTasks session)
               , invalidatedAdmissions = discardedQueued
-              , invalidatedRequests = Map.size (sessionRequests session)
+              , invalidatedRequests = length replacing
               , invalidatedSubscriptions = Map.size (sessionSubscriptions session)
               , retainedProviderWork = retained
               }
@@ -1207,7 +1248,7 @@ invalidateEverything session =
       foldl'
         (flip (revokeOne CancelledBySessionFailure))
         session
-        (Map.keys (sessionRequests session))
+        (currentEpochRequests session)
     closedAdmission = case sessionAdmission session of
       AdmissionClosed → AdmissionClosed
       _ → MutationAdmissionClosed
@@ -1296,7 +1337,7 @@ stopSession session = case sessionExit session of
       foldl'
         (flip (revokeOne CancelledByStop))
         session
-        (Map.keys (sessionRequests session))
+        (currentEpochRequests session)
     record =
       ExitRecord
         { exitScope = sessionKey session

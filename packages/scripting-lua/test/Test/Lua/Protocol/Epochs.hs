@@ -7,6 +7,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , RequestName (RequestName)
   , SessionKey (keyEpoch)
+  , TaskId (TaskId)
+  , taskName
   , SubscriptionName (SubscriptionName)
   , nextEpoch
   )
@@ -122,6 +124,30 @@ spec = describe "epochs" $ do
         requestSettlement record `shouldBe` Nothing
         requestResultHeld record `shouldBe` True
         requestProviderOutstanding record `shouldBe` True
+
+  it "invalidates only the epoch it replaces, not stubs it already revoked" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, older) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, first) ← ok (advanceEpoch b)
+    invalidatedRequests first `shouldBe` 1
+    countInvalidatedRequests (sessionCounters c) `shouldBe` 1
+    Map.member older (sessionRequests c) `shouldBe` True
+    (d, second) ← ok (advanceEpoch c)
+    invalidatedRequests second `shouldBe` 0
+    countInvalidatedRequests (sessionCounters d) `shouldBe` 1
+    countDiscardedRequestResults (sessionCounters d) `shouldBe` 1
+    Map.member older (sessionRequests d) `shouldBe` True
+    (e, ()) ← ok (completeProviderWorkIn older d)
+    Map.member older (sessionRequests e) `shouldBe` False
+
+  it "treats a task number of the previous epoch as one it never issued" $ do
+    session ← openSession
+    (a, before) ← runningTask 1 session
+    (b, _) ← ok (advanceEpoch a)
+    let reused = TaskId (sessionKey b) (taskName before)
+    (_, refusal) ← rejected (startSegment reused b)
+    refusal `shouldBe` UnknownTask reused
 
   it "refuses a cancellation addressed to an identity of a replaced epoch" $ do
     session ← openSession
