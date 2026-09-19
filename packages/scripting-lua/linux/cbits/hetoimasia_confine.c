@@ -1271,7 +1271,8 @@ int hetoimasia_confine_user_namespace_available(int *observed_errno) {
     return 0;
   }
   if (child == 0) {
-    /* The whole sequence, not just the `unshare`.
+    /* The whole sequence, not just the `unshare`, and the same sequence the
+    ** launcher performs.
     **
     ** Creating the namespace is the easy half and answers the wrong question.
     ** On a distribution that restricts unprivileged user namespaces -- Ubuntu
@@ -1280,7 +1281,15 @@ int hetoimasia_confine_user_namespace_available(int *observed_errno) {
     ** and the process then holds nothing inside the namespace it just made.
     ** What makes a namespace usable for confinement is writing the identity
     ** maps and unsharing a mount namespace under it, so that is what is
-    ** attempted here and the first failure is what is reported. */
+    ** attempted here and the first failure is what is reported.
+    **
+    ** The identities are read *before* the `unshare`. Inside a namespace with
+    ** no map written yet, the caller's own ids are unmapped and read back as
+    ** the overflow id, and a map naming that instead of the real outer id is
+    ** refused -- which would report every machine as unable to do the thing it
+    ** had just been asked to do wrongly. */
+    uid_t outer_uid = geteuid();
+    gid_t outer_gid = getegid();
     char mapping[64];
     int failure = 0;
     if (unshare(CLONE_NEWUSER) != 0) {
@@ -1289,11 +1298,16 @@ int hetoimasia_confine_user_namespace_available(int *observed_errno) {
                errno != ENOENT) {
       failure = errno;
     } else {
-      snprintf(mapping, sizeof(mapping), "0 %u 1\n", (unsigned)geteuid());
+      snprintf(mapping, sizeof(mapping), "0 %u 1\n", (unsigned)outer_uid);
       if (hetoimasia_write_whole("/proc/self/uid_map", mapping) != 0) {
         failure = errno;
-      } else if (unshare(CLONE_NEWNS) != 0) {
-        failure = errno;
+      } else {
+        snprintf(mapping, sizeof(mapping), "0 %u 1\n", (unsigned)outer_gid);
+        if (hetoimasia_write_whole("/proc/self/gid_map", mapping) != 0) {
+          failure = errno;
+        } else if (unshare(CLONE_NEWNS) != 0) {
+          failure = errno;
+        }
       }
     }
     ssize_t ignored = write(channel[1], &failure, sizeof(failure));

@@ -14,9 +14,15 @@
 module Test.Confinement.Spec (spec) where
 
 import Test.Confinement.Support
-  ( Availability
+  ( Availability (Installs)
   , Controls (controlInetSocket, controlInheritedDescriptor, controlModule, controlSentinels)
-  , Environment (environmentDistribution, environmentKernel, environmentUser)
+  , Environment
+      ( environmentDistribution
+      , environmentKernel
+      , environmentSysAdmin
+      , environmentUser
+      , environmentUserNamespace
+      )
   , Ledger
   , announce
   , describeAvailability
@@ -35,6 +41,21 @@ spec ledger available sentinels machine installed = describe "Linux confinement"
       environmentKernel machine `shouldNotBe` "unknown"
       environmentDistribution machine `shouldNotBe` ""
       environmentUser machine `shouldNotBe` "unknown"
+      -- The record and the launch are two measurements of one machine, and
+      -- they have to agree. A record saying the user namespace is unusable
+      -- beside a profile that installed would mean the record was measuring
+      -- something other than what the launcher does -- and a reader of a
+      -- refusal elsewhere would be reading a number that had never been
+      -- checked against anything.
+      --
+      -- Unless the launcher never needed a user namespace, which is the one
+      -- case they can legitimately differ in: a process that already holds
+      -- CAP_SYS_ADMIN skips that layer entirely.
+      case installed of
+        Installs _
+          | not (environmentSysAdmin machine) →
+              environmentUserNamespace machine `shouldBe` Right ()
+        _ → pure ()
       announce (describeEnvironment machine)
       announce (describeAvailability installed)
       announce
