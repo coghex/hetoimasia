@@ -499,6 +499,27 @@ spec = describe "owner progress" $ do
     (servedModel, _) ← admitted "publishing it" (publishGeneration third 2 retrying)
     fmap viewTargetReplacementRequested (targetView target servedModel) `shouldBe` Just False
 
+  it "does not let a repeated close reset the schedule of the cleanup the first one started" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
+    (active, target, _) ← activeTarget 2 model
+    (loaded, _) ← enqueueFrames target 1 active
+
+    closed ← admitted_ "closing the target" (closeTarget target loaded)
+    nextDeadline closed `shouldBe` TurnNow
+    -- The cleanup that close started backs off like any other pending work.
+    let backedOff = walk 3 closed
+    nextDeadline backedOff `shouldBe` TurnAt (atMilliseconds 20)
+
+    -- A second close transitions nothing. Resetting here would mean a repeated
+    -- close notification could hold the backoff at its first interval for ever,
+    -- which is exactly the unchanged-work case the schedule exists to pace.
+    again ← admitted_ "closing it again" (closeTarget target backedOff)
+    nextDeadline again `shouldBe` TurnAt (atMilliseconds 20)
+    fmap viewTargetPhase (targetView target again) `shouldBe` Just TargetRetiring
+    -- Repeating it changes nothing however often it arrives.
+    let repeated = iterate (\current → either error id (closeOnce target current)) again !! 4
+    nextDeadline repeated `shouldBe` TurnAt (atMilliseconds 20)
+
   it "has no deadline at all once nothing is pending" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model
@@ -530,6 +551,9 @@ spec = describe "owner progress" $ do
     sessionState broken `shouldBe` SessionFailed CleanupFailed
     escalations broken `shouldContain` [SessionEscalated CleanupFailed]
   where
+    closeOnce target current = case closeTarget target current of
+      Admitted next → Right next
+      other → Left ("closing again should have been admitted, got " ++ show (fmap (const ()) other))
     walk count model = iterate step model !! (count ∷ Int)
       where
         step current = fst (runProgressTurn silentEvidence (atMilliseconds 0) current)

@@ -980,14 +980,22 @@ requestRender identity model =
 -- construction may be published back into active rendering.
 closeTarget ∷ TargetId → GpuModel → Outcome GpuModel
 closeTarget identity model =
-  observing_ model $
-  resolved (resolveTarget model identity) $ \(number, _) →
-    Admitted
-      ( editTarget
-          number
-          (\record → record {targetPhase = TargetRetiring, targetRenderDemand = False})
-          model
-      )
+  resolved (resolveTarget model identity) $ \(number, target) →
+    -- Requirement 7 resets the schedule for a close /transition/, not for a
+    -- close /call/. A target that is already retiring transitions nowhere, so a
+    -- repeated close notification must leave the schedule of the cleanup the
+    -- first one started exactly where it is; otherwise repeating it is enough to
+    -- defeat the backoff for ever.
+    if targetPhase target == TargetRetiring
+      then Admitted model
+      else
+        observing_ model $
+          Admitted
+            ( editTarget
+                number
+                (\record → record {targetPhase = TargetRetiring, targetRenderDemand = False})
+                model
+            )
 
 -- ---------------------------------------------------------------------------
 -- Generations
@@ -1192,7 +1200,14 @@ retireGeneration identity model =
   resolved (resolveGeneration model identity) $ \(number, generation, record) →
     case generationPhase record of
       GenerationRetired → Rejected (AlreadyConsumed GenerationIdentity)
-      _ →
+      -- A candidate is not this operation's to retire. Its native construction
+      -- has not reported yet, and retiring it here would let it be disposed of
+      -- before that outcome arrives — leaving the result with no ownership
+      -- record and its own reporting call with nothing but a stale identity.
+      -- 'failGenerationConstruction' and 'publishGeneration' are the two ways a
+      -- construction ends.
+      GenerationConstructing → Rejected (WrongPhase GenerationIdentity)
+      GenerationActive →
         Admitted
           ( editTarget
               number

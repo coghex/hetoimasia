@@ -356,6 +356,13 @@ Close wins. A target that is closing admits no retry, and a construction that
 succeeds after the close was observed is retired rather than published back into
 active rendering.
 
+A generation under construction is not the active generation's operations' to
+touch. `retireGeneration` takes only an active one: retiring a candidate would
+let it be disposed of before its native outcome arrived, leaving that result with
+no ownership record and its own reporting call holding a stale identity. A
+construction ends through `publishGeneration` or `failGenerationConstruction`,
+and through nothing else.
+
 Only the target's current published generation may be handed over as
 `oldSwapchain`. A candidate that is still constructing has nothing to retire and
 is not the active generation, so handing it over would record an irreversible
@@ -419,6 +426,12 @@ when that summary *grew*. The first two of requirement 7's four are exactly
 "the owner has more to do than before", and fall out of the comparison. The other
 two are not visible in it, since a completion reduces the work and a close can
 too, so those transitions declare themselves.
+
+The reset is for a close *transition*, not a close *call*: a target that is
+already retiring transitions nowhere, so repeating the notification leaves the
+schedule of the cleanup the first close started exactly where it is. Without
+that, repeating a close would be enough to hold the backoff at its first
+interval indefinitely.
 
 A transition that only removed work, and an observation that changed nothing,
 both leave the anchored deadline exactly where it was. Releasing a resource that

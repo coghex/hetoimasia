@@ -226,6 +226,29 @@ spec = describe "recovery" $ do
     rejected "handing the retired generation over again" (beginGeneration target (Just generation) failed)
       >>= (`shouldBe` AlreadyConsumed GenerationIdentity)
 
+  it "refuses to retire a candidate whose construction has not reported yet" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedGenerations = 3}
+    (active, target, generation) ← activeTarget 2 model
+    (constructing, candidate) ← admitted "constructing" (beginGeneration target Nothing active)
+
+    -- Retiring it here would let it be disposed of before its native outcome
+    -- arrives, leaving that result with no ownership record and its own
+    -- reporting call holding nothing but a stale identity.
+    rejected_ "retiring a candidate" (retireGeneration candidate constructing)
+      >>= (`shouldBe` WrongPhase GenerationIdentity)
+    -- And the refusal wrote nothing: both ways of ending a construction still
+    -- work.
+    fmap viewTargetGenerations (targetView target constructing) `shouldBe` Just 2
+    (published, answer) ← admitted "publishing it after the refusal" (publishGeneration candidate 2 constructing)
+    answer `shouldSatisfy` \case
+      GenerationPublished _ → True
+      _ → False
+
+    -- The active generation it replaced is retirable, which is what this
+    -- operation is for.
+    admitted_ "retiring the active generation" (retireGeneration generation published) >>= \retired →
+      fmap viewTargetActive (targetView target retired) `shouldBe` Just (Just candidate)
+
   it "hands over only the target's published active generation as oldSwapchain" $ do
     model ← freshModelWith defaultBudgetRequest {requestedGenerations = 3}
     (active, target, generation) ← activeTarget 2 model
