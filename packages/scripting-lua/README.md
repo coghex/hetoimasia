@@ -411,12 +411,21 @@ nothing in the package pattern matches on it.
 in one `ExecutionDomain`; a `SessionKey` adds its `SessionId` and `Epoch`. Every
 `TaskId`, `RequestId`, and `SubscriptionId` carries that scope, so D-8's
 isolation is structural: two mods' first tasks are different values, and so are
-two epochs' or two sessions'. `RequestId` and `SubscriptionId` add a
-`Generation`, so a local number freed by observation or unsubscribe cannot be
-reached by a message already in flight for the identity it replaced. `Ordinal`
-is the one counter that is not an identity: the session issues it on admission
-and on every re-entry into the ready set, which is what puts a yielded task
-behind its ready peers.
+two epochs' or two sessions'.
+
+Local numbers are not the caller's to guarantee. The session issues the
+`TaskName` outright — `requestAdmission` answers the `TaskId` it built — and
+stamps a `Generation` from one counter it never rewinds onto every `RequestId`
+and `SubscriptionId` it hands out. A `RequestName` or `SubscriptionName` the
+caller chooses is only half an identity, so reusing a handle after its record
+was reclaimed is safe: the identity is new, and a reply or event still in flight
+for the record that handle named before cannot reach the one it names now. That
+is the bound the alternative lacks — validating reuse against what has been
+forgotten would need a list of retired identities that grows forever.
+
+`Ordinal` is the one counter that is not an identity: the session issues it on
+admission and on every re-entry into the ready set, which is what puts a yielded
+task behind its ready peers.
 
 ### Tasks and transitions
 
@@ -473,6 +482,13 @@ accounting for it survives them, keyed by the old identity. A late reply is
 refused and publishes nothing, and still retires that accounting, because an
 answer is evidence the provider finished.
 
+A reply whose declared payload exceeds the cap is refused with
+`PayloadTooLarge` and its value is never stored, but it still discharges the
+request: an unsettled one settles as a provider failure naming the overrun, and
+one that had already settled is counted as a late reply. Either way the
+provider's work retires — a provider that overran still answered, and a refusal
+that left its accounting outstanding would hold capacity nothing could release.
+
 Subscriptions declare their endpoint's `OverloadPolicy`: `OrderedEvents` rejects
 and counts a delivery into a full backlog, `ReplaceableState` coalesces to the
 newest value. There is no universal lossy stream.
@@ -484,7 +500,12 @@ session to its terminal failed state: mutation admission closes, live work is
 invalidated, and the record is kept beside the identity of the last good
 snapshot. `Observing` admission stays open, because a failed gameplay session
 that could say nothing about itself would be worse than a stopped one, and
-`advanceEpoch` refuses it — replacing a failed domain means a new `Session`.
+`advanceEpoch` refuses it — replacing a failed domain means a new `Session`. An
+unsafe failure ends the session even when the task it names has already
+finished: the task keeps its one terminal outcome, but "the behaviour that
+touched authoritative state was cancelled a moment ago" is not evidence that the
+state is consistent. A *safe* failure naming a finished task is refused, and a
+task identity this epoch does not hold is `UnknownTask` and escalates nothing.
 `stopSession` closes admission, aborts queued work, records a task inside a
 segment as outstanding rather than draining it, and answers an `ExitRecord` of
 dispositions and discard counts. There is no operation that waits for every task

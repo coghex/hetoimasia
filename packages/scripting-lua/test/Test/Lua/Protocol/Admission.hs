@@ -14,7 +14,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( Session (sessionReservations, sessionTasks)
-  , SessionRejection (CapReached, DuplicateTask)
+  , SessionRejection (CapReached)
   , TerminalResult (ResultCompleted)
   , activateNext
   , applyOutcome
@@ -56,14 +56,16 @@ spec = describe "admission" $ do
       Right _ → pure () ∷ IO ()
       Left violations → expectationFailure ("rejected: " <> show violations)
 
-  it "refuses a second admission of the same task name in this epoch" $ do
+  it "issues a distinct task name for every admission it accepts" $ do
     session ← openSession
-    (queued, identity) ← ok (requestAdmission (admission 1) session)
-    (_, refusal) ← rejected (requestAdmission (admission 1) queued)
-    refusal `shouldBe` DuplicateTask identity
-    (active, _) ← ok (activateNext queued)
-    (_, again) ← rejected (requestAdmission (admission 1) active)
-    again `shouldBe` DuplicateTask identity
+    (queued, first) ← ok (requestAdmission (admission 1) session)
+    (twice, second) ← ok (requestAdmission (admission 1) queued)
+    (first == second) `shouldBe` False
+    (active, activated) ← ok (activateNext twice)
+    activated `shouldBe` first
+    (thrice, third) ← ok (requestAdmission (admission 1) active)
+    length [name | name ← [first, second, third], name == first] `shouldBe` 1
+    Map.size (sessionTasks thrice) `shouldBe` 1
 
   it "refuses an admission beyond the queued-admission cap" $ do
     session ← openSession

@@ -13,7 +13,6 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , RequestName (RequestName)
   , SnapshotId (SnapshotId)
   , SubscriptionName (SubscriptionName)
-  , firstGeneration
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   ( CancelCause (CancelledBySessionFailure, CancelledByTaskInvalidation)
@@ -24,11 +23,12 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( AdmissionState (AdmissionOpen, MutationAdmissionClosed)
   , FailureRecord (FailureRecord, failedLastGoodSnapshot, failedReason, failedRecovery, failedTask)
   , Session (sessionAdmission, sessionFailure, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
-  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed)
-  , TerminalResult (ResultFailed)
+  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TransitionRefused, UnknownTask)
+  , TerminalResult (ResultCancelled, ResultFailed)
   , acceptRequest
   , activateNext
   , advanceEpoch
+  , cancelTaskIn
   , observeResult
   , registerSubscription
   , reportFailure
@@ -39,7 +39,9 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
   ( Task (taskState)
   , TaskFailure (TaskFailure)
+  , TaskOutcome (OutcomeCancelled)
   , TaskState (Failed)
+  , TransitionRejection (AlreadyTerminal)
   )
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.Lua.Protocol.Support
@@ -86,9 +88,9 @@ spec = describe "session failure" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
     (b, bystander) ← runningTask 2 a
-    (c, ownRequest) ← ok (acceptRequest owner (RequestName 1) firstGeneration endpointName b)
-    (d, otherRequest) ← ok (acceptRequest bystander (RequestName 2) firstGeneration endpointName c)
-    (e, subscription) ← ok (registerSubscription bystander (SubscriptionName 1) firstGeneration endpointName OrderedEvents d)
+    (c, ownRequest) ← ok (acceptRequest owner (RequestName 1) endpointName b)
+    (d, otherRequest) ← ok (acceptRequest bystander (RequestName 2) endpointName c)
+    (e, subscription) ← ok (registerSubscription bystander (SubscriptionName 1) endpointName OrderedEvents d)
     (f, _) ← ok (requestAdmission (admission 3) e)
     (g, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just owner} f)
     sessionFailure g `shouldBe` Just unsafeAuthoritative {failedTask = Just owner}
@@ -129,6 +131,34 @@ spec = describe "session failure" $ do
     (e, _) ← ok (activateNext d)
     (_, ()) ← ok (startSegment reporting e)
     pure ()
+
+  it "ends the session for an unsafe failure whose task has already finished" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, ()) ← ok (cancelTaskIn owner a)
+    (c, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just owner} b)
+    sessionFailure c `shouldBe` Just unsafeAuthoritative {failedTask = Just owner}
+    sessionAdmission c `shouldBe` MutationAdmissionClosed
+    (_, result) ← ok (observeResult owner c)
+    result `shouldBe` ResultCancelled
+
+  it "refuses a safe failure naming a task that has already finished" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, ()) ← ok (cancelTaskIn owner a)
+    (c, refusal) ← rejected (reportFailure handled {failedTask = Just owner} b)
+    refusal `shouldBe` TransitionRefused (AlreadyTerminal OutcomeCancelled)
+    sessionFailure c `shouldBe` Nothing
+    sessionAdmission c `shouldBe` AdmissionOpen
+
+  it "escalates nothing for a task identity this session does not hold" $ do
+    session ← openSession
+    (a, owner) ← runningTask 1 session
+    (b, _) ← ok (advanceEpoch a)
+    (c, refusal) ← rejected (reportFailure unsafeAuthoritative {failedTask = Just owner} b)
+    refusal `shouldBe` UnknownTask owner
+    sessionFailure c `shouldBe` Nothing
+    sessionAdmission c `shouldBe` AdmissionOpen
 
   it "offers no retry, restart, or continuation of a failed session" $ do
     session ← openSession

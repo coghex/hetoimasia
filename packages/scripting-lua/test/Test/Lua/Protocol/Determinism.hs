@@ -14,7 +14,6 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , Ordinal
   , RequestName (RequestName)
   , SubscriptionName (SubscriptionName)
-  , firstGeneration
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (Reply (ReplyResult))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
@@ -50,8 +49,8 @@ scripted = do
   session ← openSessionWith roomyLimits
   (a, first) ← runningTask 1 session
   (b, second) ← admitted 2 a
-  (c, request) ← ok (acceptRequest first (RequestName 1) firstGeneration (EndpointId "provider") b)
-  (d, subscription) ← ok (registerSubscription first (SubscriptionName 1) firstGeneration (EndpointId "events") ReplaceableState c)
+  (c, request) ← ok (acceptRequest first (RequestName 1) (EndpointId "provider") b)
+  (d, subscription) ← ok (registerSubscription first (SubscriptionName 1) (EndpointId "events") ReplaceableState c)
   (e, _) ← ok (deliverEvent subscription (message 2 "v1") d)
   (f, _) ← ok (deliverEvent subscription (message 2 "v2") e)
   (g, ()) ← ok (applyOutcome first (SegmentWaiting "held" (WaitingOnRequest request)) f)

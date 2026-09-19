@@ -46,7 +46,6 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , SessionId (SessionId)
   , SessionKey (SessionKey, keyEpoch)
   , TaskId
-  , TaskName (TaskName)
   , firstEpoch
   , nextEpoch
   )
@@ -57,7 +56,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   , ServiceClass (OrdinaryClass)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
-  ( AdmissionRequest (AdmissionRequest, admitAuthority, admitBehavior, admitCursor, admitName, admitReadiness, admitService)
+  ( AdmissionRequest (AdmissionRequest, admitAuthority, admitBehavior, admitCursor, admitReadiness, admitService)
   , Authority (Mutating, Observing)
   , Session
   , SessionRejection
@@ -136,19 +135,21 @@ openSessionAt key limits = case newSession key limits of
     expectationFailure ("limits refused: " <> show violations)
     throwIO (userError "unreachable")
 
--- | A mutating admission for one task number.
+-- | A mutating admission carrying a distinguishable cursor.
+--
+-- The number is the cursor's, not the task's: the session issues task names,
+-- so an example never picks one.
 admission ∷ Word64 → AdmissionRequest Text
 admission number =
   AdmissionRequest
-    { admitName = TaskName number
-    , admitBehavior = BehaviorId "behaviour"
+    { admitBehavior = BehaviorId "behaviour"
     , admitService = OrdinaryClass
     , admitAuthority = Mutating
     , admitCursor = cursor number
     , admitReadiness = Nothing
     }
 
--- | An observing admission for one task number.
+-- | An observing admission.
 observingAdmission ∷ Word64 → AdmissionRequest Text
 observingAdmission number = (admission number) {admitAuthority = Observing}
 

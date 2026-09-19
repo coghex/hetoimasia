@@ -132,7 +132,9 @@ import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
   ( FailureReason
-  , RecoverySafety (RecoverySafe, RecoveryUnsafe)
+  , ReasonCode (ValidationFault)
+  , RecoverySafety (RecoveryUnsafe)
+  , failureReason
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( BehaviorId
@@ -148,9 +150,13 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , SubscriptionName
   , TaskId (TaskId)
   , TaskName
+  , firstGeneration
   , firstOrdinal
+  , firstTaskName
   , nextEpoch
+  , nextGeneration
   , nextOrdinal
+  , nextTaskName
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   ( Limits (maxActiveTasks, maxOutstandingRequests, maxPayloadBytes, maxQueuedAdmissions, maxRetainedResults, maxSubscriptionQueue, maxSubscriptions)
@@ -165,7 +171,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   ( CancelCause (CancelledByEpochChange, CancelledByOwner, CancelledBySessionFailure, CancelledByStop, CancelledByTaskInvalidation)
   , ObserveRejection
   , ProviderRejection
-  , Reply (ReplyResult)
+  , Reply (ReplyFailure, ReplyResult)
   , ReplyRejection
   , RequestRecord (requestIdentity, requestOwner, requestProviderOutstanding, requestSettlement)
   , Revocation (revokedResult)
@@ -177,6 +183,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   , observeSettlement
   , openRequest
   , requestReclaimable
+  , requestSettled
   , revokeInterest
   , settlementKind
   )
@@ -198,7 +205,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
   , TaskFailure (TaskFailure)
   , TaskOutcome
   , TaskState (Running)
-  , TransitionRejection
+  , TransitionRejection (AlreadyTerminal)
   , WaitCause (WaitingOnRequest, WaitingOnSubscription, WaitingUntil)
   , cancelTask
   , failTask
@@ -310,6 +317,8 @@ data Session v = Session
   , sessionRequests ∷ !(Map RequestId (RequestRecord v))
   , sessionSubscriptions ∷ !(Map SubscriptionId (Subscription v))
   , sessionNextOrdinal ∷ !Ordinal
+  , sessionNextTask ∷ !TaskName
+  , sessionNextGeneration ∷ !Generation
   , sessionCounters ∷ !Counters
   , sessionFailure ∷ !(Maybe FailureRecord)
   , sessionExit ∷ !(Maybe ExitRecord)
@@ -332,6 +341,8 @@ newSession key limits = do
       , sessionRequests = Map.empty
       , sessionSubscriptions = Map.empty
       , sessionNextOrdinal = firstOrdinal
+      , sessionNextTask = firstTaskName
+      , sessionNextGeneration = firstGeneration
       , sessionCounters = noCounters
       , sessionFailure = Nothing
       , sessionExit = Nothing
@@ -345,12 +356,6 @@ data SessionRejection
     CapReached !LimitName !Int
   | -- | A payload's declared size against the cap.
     PayloadTooLarge !Int !Int
-  | -- | A task name already in use in this epoch.
-    DuplicateTask !TaskId
-  | -- | A request identity already accepted in this session.
-    DuplicateRequest !RequestId
-  | -- | A subscription identity already registered in this epoch.
-    DuplicateSubscription !SubscriptionId
   | -- | No such task in this epoch.
     UnknownTask !TaskId
   | -- | No such request. A stale or foreign identity looks like this, which is
@@ -418,6 +423,31 @@ takeOrdinal ∷ Session v → (Ordinal, Session v)
 takeOrdinal session =
   ( sessionNextOrdinal session
   , session {sessionNextOrdinal = nextOrdinal (sessionNextOrdinal session)}
+  )
+
+-- | Issue the next task name.
+--
+-- Never rewound, and not reset by an epoch change. A task whose result has
+-- been observed and whose record has been forgotten therefore cannot have its
+-- name handed to another task, which is what keeps a segment outcome
+-- addressed to the old one from landing on the new one.
+takeTaskName ∷ Session v → (TaskName, Session v)
+takeTaskName session =
+  ( sessionNextTask session
+  , session {sessionNextTask = nextTaskName (sessionNextTask session)}
+  )
+
+-- | Issue the next generation, for a request or a subscription identity.
+--
+-- One counter for both, because its job is only to differ from every
+-- generation this session has issued before. A caller may reuse a
+-- 'RequestName' or a 'SubscriptionName' freely: the identity the session
+-- builds from it is new either way, so a reply or an event still in flight for
+-- the record that handle named before cannot reach the record it names now.
+takeGeneration ∷ Session v → (Generation, Session v)
+takeGeneration session =
+  ( sessionNextGeneration session
+  , session {sessionNextGeneration = nextGeneration (sessionNextGeneration session)}
   )
 
 -- | Apply a task transition, reporting a missing task and a refused transition
@@ -501,9 +531,13 @@ reclaim identity record session
 -- Admission ------------------------------------------------------------------
 
 -- | What a caller asks the session to admit.
+--
+-- It does not name the task. The session issues the 'TaskName' and answers the
+-- 'TaskId' it built, because a name a caller chose could be one this session
+-- has already used and forgotten, and an outcome addressed to that earlier
+-- task would land on this one.
 data AdmissionRequest v = AdmissionRequest
-  { admitName ∷ !TaskName
-  , admitBehavior ∷ !BehaviorId
+  { admitBehavior ∷ !BehaviorId
   , admitService ∷ !ServiceClass
   , admitAuthority ∷ !Authority
   , admitCursor ∷ v
@@ -523,7 +557,9 @@ requestAdmission
 requestAdmission wanted session = case admissionCheck of
   Left rejection → (counting rejectedAdmission session, Left rejection)
   Right () →
-    let (ordinal, taken) = takeOrdinal session
+    let (name, named) = takeTaskName session
+        (ordinal, taken) = takeOrdinal named
+        identity = TaskId (sessionKey session) name
         queued =
           QueuedAdmission
             { queuedTask = identity
@@ -541,7 +577,6 @@ requestAdmission wanted session = case admissionCheck of
         , Right identity
         )
   where
-    identity = TaskId (sessionKey session) (admitName wanted)
     limits = limitsIn session
     rejectedAdmission counters =
       counters {countRejectedAdmissions = countRejectedAdmissions counters + 1}
@@ -553,10 +588,6 @@ requestAdmission wanted session = case admissionCheck of
           | admitAuthority wanted == Mutating →
               Left (AdmissionIsClosed MutationAdmissionClosed)
         _ → Right ()
-      if Map.member identity (sessionTasks session)
-        || any ((== identity) . queuedTask) (sessionQueued session)
-        then Left (DuplicateTask identity)
-        else Right ()
       if sessionReservations session >= maxRetainedResults limits
         then Left (CapReached RetainedResults (maxRetainedResults limits))
         else Right ()
@@ -708,24 +739,31 @@ discard (session, answer) = (session, () <$ answer)
 -- Requests -------------------------------------------------------------------
 
 -- | Accept a request for a live task, reserving its bookkeeping.
+--
+-- The caller supplies its own handle; the session stamps the generation, so a
+-- handle reused after its earlier request was reclaimed names a new identity
+-- and a reply still travelling for the old one cannot settle this one.
 acceptRequest
   ∷ TaskId
   → RequestName
-  → Generation
   → EndpointId
   → Session v
   → (Session v, Either SessionRejection RequestId)
-acceptRequest owner name generation endpoint session = case checks of
+acceptRequest owner name endpoint session = case checks of
   Left rejection → refuse session rejection
   Right () →
-    ( session
-        { sessionRequests =
-            Map.insert identity (openRequest identity owner endpoint) (sessionRequests session)
-        }
-    , Right identity
-    )
+    let (generation, stamped) = takeGeneration session
+        identity = RequestId (sessionKey session) name generation
+     in ( stamped
+            { sessionRequests =
+                Map.insert
+                  identity
+                  (openRequest identity owner endpoint)
+                  (sessionRequests stamped)
+            }
+        , Right identity
+        )
   where
-    identity = RequestId (sessionKey session) name generation
     limits = limitsIn session
     checks = do
       notStopped session
@@ -734,9 +772,6 @@ acceptRequest owner name generation endpoint session = case checks of
         Just task
           | isTerminal (taskState task) → Left (UnknownTask owner)
           | otherwise → Right ()
-      if Map.member identity (sessionRequests session)
-        then Left (DuplicateRequest identity)
-        else Right ()
       if Map.size (sessionRequests session) >= maxOutstandingRequests limits
         then Left (CapReached OutstandingRequests (maxOutstandingRequests limits))
         else Right ()
@@ -747,41 +782,67 @@ acceptRequest owner name generation endpoint session = case checks of
 -- of an epoch whose records are gone — is rejected as 'UnknownRequest' and
 -- counted. It cannot reach a record of the current epoch, because the epoch is
 -- part of the identity it was matched on.
+--
+-- A reply whose declared payload exceeds the cap is refused with
+-- 'PayloadTooLarge', and its value is never stored. It still discharges the
+-- request: an unsettled request settles as a provider failure naming the
+-- overrun, and one that had already settled is counted as a late reply. Either
+-- way the provider's work is retired, because a provider that overran still
+-- answered, and a refusal that left its accounting outstanding would hold
+-- capacity nothing could ever release.
 applyReplyIn
   ∷ RequestId
   → Reply v
   → Session v
   → (Session v, Either SessionRejection ())
-applyReplyIn identity reply session
-  | oversize =
-      ( counting
-          (\counters → counters {countOversizePayloads = countOversizePayloads counters + 1})
-          session
-      , Left (PayloadTooLarge declared (maxPayloadBytes (limitsIn session)))
-      )
-  | otherwise = case Map.lookup identity (sessionRequests session) of
-      Nothing →
-        ( counting
-            (\counters → counters {countUnknownReplies = countUnknownReplies counters + 1})
-            session
-        , Left (UnknownRequest identity)
+applyReplyIn identity reply session = case Map.lookup identity (sessionRequests session) of
+  Nothing →
+    ( counting
+        (\counters → counters {countUnknownReplies = countUnknownReplies counters + 1})
+        session
+    , Left (UnknownRequest identity)
+    )
+  Just record →
+    -- The lookup comes first, and the size check applies only to a payload
+    -- that would actually be stored. A reply to a request that has already
+    -- settled publishes nothing whatever its size, so refusing it on size
+    -- would leave its provider's work outstanding for ever and hold the
+    -- capacity that accounting occupies.
+    case applyReply (bounded record) record of
+      (next, Left rejection) →
+        ( counting late (counted (reclaim identity next session))
+        , Left (rejectionFor rejection)
         )
-      Just record → case applyReply reply record of
-        (next, Left rejection) →
-          ( counting
-              (\counters → counters {countLateReplies = countLateReplies counters + 1})
-              (reclaim identity next session)
-          , Left (ReplyRefused rejection)
-          )
-        (next, Right ()) → (reclaim identity next session, Right ())
+      (next, Right ()) → (counted (reclaim identity next session), answer)
   where
+    cap = maxPayloadBytes (limitsIn session)
     declared = case reply of
       ReplyResult message → payloadBytes message
-      _ → 0
+      ReplyFailure _ → 0
     oversize = case reply of
-      ReplyResult message →
-        payloadBytes message < 0 || payloadBytes message > maxPayloadBytes (limitsIn session)
-      _ → False
+      ReplyResult message → payloadBytes message < 0 || payloadBytes message > cap
+      ReplyFailure _ → False
+    -- An oversize result settles the request as a failure rather than being
+    -- turned away. The value is never stored, so the cap still holds; what the
+    -- request must not do is stay unsettled for ever because the one provider
+    -- that was going to answer it overran.
+    bounded record
+      | oversize && not (requestSettled record) =
+          ReplyFailure (failureReason ValidationFault "the provider's result exceeded the payload cap")
+      | otherwise = reply
+    late counters = counters {countLateReplies = countLateReplies counters + 1}
+    counted current
+      | oversize =
+          counting
+            (\counters → counters {countOversizePayloads = countOversizePayloads counters + 1})
+            current
+      | otherwise = current
+    rejectionFor rejection
+      | oversize = PayloadTooLarge declared cap
+      | otherwise = ReplyRefused rejection
+    answer
+      | oversize = Left (PayloadTooLarge declared cap)
+      | otherwise = Right ()
 
 -- | Cancel a request at its owner's request.
 --
@@ -829,25 +890,25 @@ completeProviderWorkIn identity session = case Map.lookup identity (sessionReque
 registerSubscription
   ∷ TaskId
   → SubscriptionName
-  → Generation
   → EndpointId
   → OverloadPolicy
   → Session v
   → (Session v, Either SessionRejection SubscriptionId)
-registerSubscription owner name generation endpoint policy session = case checks of
+registerSubscription owner name endpoint policy session = case checks of
   Left rejection → refuse session rejection
   Right () →
-    ( session
-        { sessionSubscriptions =
-            Map.insert
-              identity
-              (newSubscription identity owner endpoint policy (maxSubscriptionQueue limits))
-              (sessionSubscriptions session)
-        }
-    , Right identity
-    )
+    let (generation, stamped) = takeGeneration session
+        identity = SubscriptionId (sessionKey session) name generation
+     in ( stamped
+            { sessionSubscriptions =
+                Map.insert
+                  identity
+                  (newSubscription identity owner endpoint policy (maxSubscriptionQueue limits))
+                  (sessionSubscriptions stamped)
+            }
+        , Right identity
+        )
   where
-    identity = SubscriptionId (sessionKey session) name generation
     limits = limitsIn session
     checks = do
       notStopped session
@@ -856,9 +917,6 @@ registerSubscription owner name generation endpoint policy session = case checks
         Just task
           | isTerminal (taskState task) → Left (UnknownTask owner)
           | otherwise → Right ()
-      if Map.member identity (sessionSubscriptions session)
-        then Left (DuplicateSubscription identity)
-        else Right ()
       if Map.size (sessionSubscriptions session) >= maxSubscriptions limits
         then Left (CapReached Subscriptions (maxSubscriptions limits))
         else Right ()
@@ -1035,6 +1093,18 @@ data FailureRecord = FailureRecord
 -- terminal failed state: mutation admission closes, every live task, queued
 -- admission, subscription, and pending request is invalidated, and the record
 -- is kept beside the identity of the last good snapshot. Nothing restarts it.
+--
+-- An unsafe failure whose task has /already/ finished still ends the session.
+-- The task keeps the one terminal outcome it reached — nothing here gives it a
+-- second — but the session cannot: "the behaviour that touched authoritative
+-- state was cancelled a moment ago" is not evidence that the state it touched
+-- is consistent, and a failure that arrived after its task settled is exactly
+-- the case where it is not. A /safe/ failure naming a finished task is
+-- refused, because there is then nothing to record and nothing to end.
+--
+-- Which task is rejected outright is unchanged: an identity this epoch's
+-- session does not hold is 'UnknownTask', whether it is foreign, stale, or
+-- was never issued, and it escalates nothing.
 reportFailure ∷ FailureRecord → Session v → (Session v, Either SessionRejection ())
 reportFailure record session = case notStopped session >> notFailed session of
   Left rejection → refuse session rejection
@@ -1043,12 +1113,16 @@ reportFailure record session = case notStopped session >> notFailed session of
     Just identity →
       let failure = TaskFailure (failedReason record) (failedRecovery record)
        in case transition identity (failTask (sessionKey session) failure) session of
+            (next, Left (TransitionRefused (AlreadyTerminal outcome)))
+              | unsafe → (escalate next, Right ())
+              | otherwise → (next, Left (TransitionRefused (AlreadyTerminal outcome)))
             (next, Left rejection) → (next, Left rejection)
             (next, Right _) →
               (escalate (retire identity (ResultFailed failure) next), Right ())
   where
+    unsafe = failedRecovery record == RecoveryUnsafe
     escalate current
-      | failedRecovery record == RecoverySafe = current
+      | not unsafe = current
       | otherwise = invalidateEverything current {sessionFailure = Just record}
 
 -- | Close mutation admission and invalidate every live record.

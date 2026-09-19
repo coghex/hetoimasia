@@ -17,11 +17,20 @@
 --
 -- Epochs and generations are the two monotonic counters that make staleness
 -- visible. An 'Epoch' belongs to a session and advances when its domain is
--- replaced; a 'Generation' belongs to a request name and advances when that
--- name is reused. A reply that names an old epoch or an old generation names a
--- different 'RequestId' than the live one, which is why
--- "Hetoimasia.Scripting.Lua.Internal.Protocol.Session" can reject it at
--- consumption without keeping a separate list of what has gone stale.
+-- replaced. A 'Generation' is stamped by the session on every request and
+-- subscription identity it issues, from one counter it never rewinds, so a
+-- local name freed by observation or unsubscribe yields a /different/ identity
+-- the next time it is used. A reply that names an old epoch or an old
+-- generation therefore names a different 'RequestId' than the live one, which
+-- is why "Hetoimasia.Scripting.Lua.Internal.Protocol.Session" can reject it at
+-- consumption without keeping a list of what has gone stale — a list that
+-- would have to grow forever to be trusted.
+--
+-- Local numbers are not the caller's to guarantee. A 'TaskName' is issued by
+-- the session outright, and a 'RequestName' or 'SubscriptionName' a caller
+-- chooses is only half of an identity the session completes with a generation.
+-- Uniqueness is therefore a property of the issuing session rather than of
+-- every caller's bookkeeping.
 --
 -- 'Ordinal' is the one counter that is not an identity. It records insertion
 -- order for a scheduler this slice does not implement, and it is issued by the
@@ -44,6 +53,8 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
 
     -- * Tasks
   , TaskName (..)
+  , firstTaskName
+  , nextTaskName
   , TaskId (..)
   , BehaviorId (..)
 
@@ -150,10 +161,23 @@ compareScope held offered
   | keyEpoch offered < keyEpoch held = ScopeStale (keyEpoch held) (keyEpoch offered)
   | otherwise = ScopeAhead (keyEpoch held) (keyEpoch offered)
 
--- | A task's local number, unique within one 'SessionKey' and never reissued
--- within it.
+-- | A task's local number.
+--
+-- Issued by the session from a counter it never rewinds, so it is unique
+-- within one 'SessionKey' and is not reissued when a task's record is
+-- forgotten. A caller does not choose one: a name it chose could collide with
+-- a task whose result had already been observed, and an outcome addressed to
+-- the old task would land on the new one.
 newtype TaskName = TaskName {taskNumber ∷ Word64}
   deriving (Eq, Ord, Show)
+
+-- | The first task name a session issues.
+firstTaskName ∷ TaskName
+firstTaskName = TaskName 0
+
+-- | The task name after a given one.
+nextTaskName ∷ TaskName → TaskName
+nextTaskName (TaskName n) = TaskName (n + 1)
 
 -- | A task's identity: its scope and its local number.
 data TaskId = TaskId
@@ -169,15 +193,20 @@ data TaskId = TaskId
 newtype BehaviorId = BehaviorId {behaviorName ∷ Text}
   deriving (Eq, Ord, Show)
 
--- | A request's local number. Reusing one requires a new 'Generation'.
+-- | A request's local handle, chosen by whoever asks for the request.
+--
+-- It is half of an identity. The session stamps the other half, so reusing a
+-- handle is safe without the caller having to know whether the record it named
+-- before has been forgotten.
 newtype RequestName = RequestName {requestNumber ∷ Word64}
   deriving (Eq, Ord, Show)
 
--- | How many times a 'RequestName' has been used within one scope.
+-- | A session's issuance counter, stamped on each request and subscription
+-- identity it hands out and never rewound.
 newtype Generation = Generation {generationNumber ∷ Word64}
   deriving (Eq, Ord, Show)
 
--- | The generation a request name starts on.
+-- | The generation a session starts issuing from.
 firstGeneration ∷ Generation
 firstGeneration = Generation 0
 
@@ -185,7 +214,7 @@ firstGeneration = Generation 0
 nextGeneration ∷ Generation → Generation
 nextGeneration (Generation n) = Generation (n + 1)
 
--- | A request's identity: scope, local number, and generation (P-7).
+-- | A request's identity: scope, local handle, and generation (P-7).
 data RequestId = RequestId
   { requestScope ∷ !SessionKey
   , requestName ∷ !RequestName
@@ -197,13 +226,13 @@ data RequestId = RequestId
 newtype SubscriptionName = SubscriptionName {subscriptionNumber ∷ Word64}
   deriving (Eq, Ord, Show)
 
--- | A subscription's identity: scope, local number, and generation.
+-- | A subscription's identity: scope, local handle, and generation.
 --
 -- It carries a 'Generation' for the same reason a 'RequestId' does. A
--- subscription that ends frees its local number, and a producer's event may
--- still be in flight when the number is registered again; without the
--- generation that event would land in the new subscription's backlog as if it
--- had been meant for it.
+-- subscription that ends frees its handle, and a producer's event may still be
+-- in flight when the handle is registered again; without the generation that
+-- event would land in the new subscription's backlog as if it had been meant
+-- for it.
 data SubscriptionId = SubscriptionId
   { subscriptionScope ∷ !SessionKey
   , subscriptionLocal ∷ !SubscriptionName

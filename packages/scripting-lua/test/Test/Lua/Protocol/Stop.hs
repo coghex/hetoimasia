@@ -7,7 +7,6 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , RequestName (RequestName)
   , SubscriptionName (SubscriptionName)
-  , firstGeneration
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   ( CancelCause (CancelledByStop)
@@ -82,9 +81,9 @@ spec = describe "stop" $ do
   it "records request dispositions and the provider work still outstanding" $ do
     session ← openSessionWith roomyLimits
     (a, owner) ← runningTask 1 session
-    (b, answered) ← ok (acceptRequest owner (RequestName 1) firstGeneration (EndpointId "provider") a)
+    (b, answered) ← ok (acceptRequest owner (RequestName 1) (EndpointId "provider") a)
     (c, ()) ← ok (applyReplyIn answered (ReplyResult (message 1 "value")) b)
-    (d, pending) ← ok (acceptRequest owner (RequestName 2) firstGeneration (EndpointId "provider") c)
+    (d, pending) ← ok (acceptRequest owner (RequestName 2) (EndpointId "provider") c)
     let (stopped, record) = stopSession d
     Map.lookup answered (exitRequests record) `shouldBe` Just (RequestSettledAs KindResult)
     Map.lookup pending (exitRequests record) `shouldBe` Just (RequestRevokedAt CancelledByStop)
@@ -97,9 +96,9 @@ spec = describe "stop" $ do
     (a, owner) ← runningTask 1 session
     (b, ()) ← ok (applyOutcome owner (SegmentCompleted "done") a)
     (c, second) ← runningTask 2 b
-    (d, subscription) ← ok (registerSubscription second (SubscriptionName 1) firstGeneration (EndpointId "events") OrderedEvents c)
+    (d, subscription) ← ok (registerSubscription second (SubscriptionName 1) (EndpointId "events") OrderedEvents c)
     (e, _) ← ok (deliverEvent subscription (message 1 "one") d)
-    (f, request) ← ok (acceptRequest second (RequestName 1) firstGeneration (EndpointId "provider") e)
+    (f, request) ← ok (acceptRequest second (RequestName 1) (EndpointId "provider") e)
     (g, _) ← ok (requestAdmission (admission 3) f)
     let (_, record) = stopSession g
     discardedResults (exitDiscards record) `shouldBe` 1

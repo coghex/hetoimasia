@@ -6,7 +6,6 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , SubscriptionName (SubscriptionName)
-  , firstGeneration
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   ( LimitName (Subscriptions)
@@ -47,7 +46,7 @@ spec = describe "subscriptions" $ do
   it "rejects and counts an ordered-event delivery into a full backlog" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
+    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
     fmap subscriptionCapacity (Map.lookup identity (sessionSubscriptions b))
       `shouldBe` Just (maxSubscriptionQueue sampleLimits)
     (c, first) ← ok (deliverEvent identity (message 1 "one") b)
@@ -67,7 +66,7 @@ spec = describe "subscriptions" $ do
   it "coalesces replaceable state to the newest value and rejects nothing" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint ReplaceableState a)
+    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) endpoint ReplaceableState a)
     fmap subscriptionCapacity (Map.lookup identity (sessionSubscriptions b)) `shouldBe` Just 1
     (c, first) ← ok (deliverEvent identity (message 1 "v1") b)
     first `shouldBe` AcceptedQueued
@@ -85,7 +84,7 @@ spec = describe "subscriptions" $ do
   it "rejects and counts a delivery after unsubscribe" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
+    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
     (c, _) ← ok (deliverEvent identity (message 1 "one") b)
     (d, discarded) ← ok (unsubscribeIn identity c)
     discarded `shouldBe` 1
@@ -97,7 +96,7 @@ spec = describe "subscriptions" $ do
   it "invalidates a subscription with the task that owned it" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
+    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
     (c, _) ← ok (deliverEvent identity (message 1 "one") b)
     (d, ()) ← ok (cancelTaskIn owner c)
     Map.member identity (sessionSubscriptions d) `shouldBe` False
@@ -109,15 +108,15 @@ spec = describe "subscriptions" $ do
   it "bounds registered subscriptions" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, _) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
-    (c, _) ← ok (registerSubscription owner (SubscriptionName 2) firstGeneration endpoint OrderedEvents b)
-    (_, refusal) ← rejected (registerSubscription owner (SubscriptionName 3) firstGeneration endpoint OrderedEvents c)
+    (b, _) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
+    (c, _) ← ok (registerSubscription owner (SubscriptionName 2) endpoint OrderedEvents b)
+    (_, refusal) ← rejected (registerSubscription owner (SubscriptionName 3) endpoint OrderedEvents c)
     refusal `shouldBe` CapReached Subscriptions (maxSubscriptions sampleLimits)
 
   it "refuses an oversize event payload and counts it as rejected" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
+    (b, identity) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
     let tooBig = maxPayloadBytes sampleLimits + 1
     (c, refusal) ← rejected (deliverEvent identity (message tooBig "huge") b)
     refusal `shouldBe` PayloadTooLarge tooBig (maxPayloadBytes sampleLimits)

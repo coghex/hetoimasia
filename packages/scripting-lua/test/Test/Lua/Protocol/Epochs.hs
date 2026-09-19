@@ -8,7 +8,6 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   , RequestName (RequestName)
   , SessionKey (keyEpoch)
   , SubscriptionName (SubscriptionName)
-  , firstGeneration
   , nextEpoch
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
@@ -53,8 +52,8 @@ spec = describe "epochs" $ do
   it "invalidates every record of the previous epoch before the new one publishes" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, request) ← ok (acceptRequest owner (RequestName 1) firstGeneration endpoint a)
-    (c, subscription) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents b)
+    (b, request) ← ok (acceptRequest owner (RequestName 1) endpoint a)
+    (c, subscription) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents b)
     (d, _) ← ok (deliverEvent subscription (message 1 "one") c)
     (e, _) ← ok (requestAdmission (admission 2) d)
     (f, change) ← ok (advanceEpoch e)
@@ -76,7 +75,7 @@ spec = describe "epochs" $ do
   it "rejects work addressed to an identity the previous epoch issued" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, subscription) ← ok (registerSubscription owner (SubscriptionName 1) firstGeneration endpoint OrderedEvents a)
+    (b, subscription) ← ok (registerSubscription owner (SubscriptionName 1) endpoint OrderedEvents a)
     (c, _) ← ok (advanceEpoch b)
     (_, taskRefusal) ← rejected (startSegment owner c)
     taskRefusal `shouldBe` UnknownTask owner
@@ -95,7 +94,7 @@ spec = describe "epochs" $ do
   it "keeps an invalidated request's provider accounting and discards its result" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, request) ← ok (acceptRequest owner (RequestName 1) firstGeneration endpoint a)
+    (b, request) ← ok (acceptRequest owner (RequestName 1) endpoint a)
     (c, _) ← ok (advanceEpoch b)
     case Map.lookup request (sessionRequests c) of
       Nothing → fail "the provider stub was not retained"
@@ -109,10 +108,10 @@ spec = describe "epochs" $ do
   it "retires old provider work with an old-epoch reply without releasing a new request" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, older) ← ok (acceptRequest owner (RequestName 1) firstGeneration endpoint a)
+    (b, older) ← ok (acceptRequest owner (RequestName 1) endpoint a)
     (c, _) ← ok (advanceEpoch b)
     (d, newOwner) ← runningTask 1 c
-    (e, newer) ← ok (acceptRequest newOwner (RequestName 1) firstGeneration endpoint d)
+    (e, newer) ← ok (acceptRequest newOwner (RequestName 1) endpoint d)
     (older == newer) `shouldBe` False
     (f, refusal) ← rejected (applyReplyIn older (ReplyResult (message 1 "stale")) e)
     refusal `shouldBe` ReplyRefused (ReplyAlreadySettled KindCancelled)
@@ -127,7 +126,7 @@ spec = describe "epochs" $ do
   it "refuses a cancellation addressed to an identity of a replaced epoch" $ do
     session ← openSession
     (a, owner) ← runningTask 1 session
-    (b, older) ← ok (acceptRequest owner (RequestName 1) firstGeneration endpoint a)
+    (b, older) ← ok (acceptRequest owner (RequestName 1) endpoint a)
     (c, ()) ← ok (completeProviderWorkIn' older b)
     (d, _) ← ok (advanceEpoch c)
     (_, refusal) ← rejected (cancelRequestIn older d)
