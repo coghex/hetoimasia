@@ -62,7 +62,28 @@ spec = describe "Validation planner" $ do
           (alphaPackage ++ unlines ["    if os(linux)", "        build-depends: containers"])
         (result, _, errors) ← planRaw fixture (seeded fixture) []
         result `shouldBe` ExitFailure 2
-        errors `shouldContain` "may declare only extra-libraries and frameworks"
+        errors `shouldContain` "may declare only buildable, extra-libraries, frameworks"
+
+    it "accepts an operating-system conditional that chooses whether to build" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ buildableConditional)
+        plan ← planJson fixture []
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
+
+    it "covers a platform component's sources on the platform that does not build it" $
+      -- The planner runs on whichever machine plans the candidate, and a
+      -- component excluded there still has sources a change can touch. Its
+      -- consumer must be selected anyway: an input identity that depended on
+      -- the planning machine's operating system would make the same candidate
+      -- mean different things on two of them.
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/extra/Extra.hs" (extraModule 1)
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ excludedSublibrary)
+        change fixture "demo.cabal" sublibraryDemoPackage
+        base ← revision fixture "HEAD"
+        change fixture "packages/alpha/extra/Extra.hs" (extraModule 2)
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
 
     it "rejects a conditional on anything but the operating system" $
       withFixture $ \fixture → do
@@ -522,6 +543,21 @@ extraLibrary =
     , "    default-language: GHC2024"
     , "    build-depends: base"
     ]
+
+-- | An operating-system conditional that chooses whether to build, which is how
+-- a platform-only component is excluded elsewhere rather than built vacuously.
+buildableConditional ∷ String
+buildableConditional =
+  unlines
+    [ "    if os(linux)"
+    , "        buildable: True"
+    , "    else"
+    , "        buildable: False"
+    ]
+
+-- | The fixture sublibrary, built on one platform only.
+excludedSublibrary ∷ String
+excludedSublibrary = extraLibrary ++ buildableConditional
 
 extraModule ∷ Int → String
 extraModule value = "module Extra (extra) where\nextra :: Int\nextra = " ++ show value ++ "\n"

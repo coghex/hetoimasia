@@ -56,7 +56,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
-  and `cabal test hetoimasia-tests --test-show-details=direct`.
+  and `cabal test hetoimasia-tests --test-show-details=direct`. On Linux,
+  `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct`
+  runs the confinement feasibility probe (group `test.lua-confinement-linux`);
+  its components are not built on other platforms.
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
   `Recovery`, `Workers`, `Messaging`, and `Time` components, composed by

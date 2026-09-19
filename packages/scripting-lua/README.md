@@ -392,3 +392,29 @@ cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
+
+## The Linux confinement probe
+
+`linux/` holds a second, private thing this package carries: the Linux
+feasibility probe LUA-14 ([#147](https://github.com/coghex/hetoimasia/issues/147))
+delivers. It is a child program (`lua-confine-child`) launched inside a
+candidate confinement profile, a parent-side driver, and the C that installs the
+profile and attempts the operations it is supposed to refuse.
+
+It is not part of the bridge and nothing above links it. No library, executable,
+or public interface depends on it; the only Lua source it ever loads is a fixture
+chunk compiled into the child; and it is built on Linux alone, excluded
+elsewhere by an `if os(linux)`/`else buildable` conditional rather than built
+and passing vacuously.
+
+```bash
+cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct
+```
+
+The validation group is `test.lua-confinement-linux`. A green run of it is
+evidence and never a verdict: each example prints what it proved, or says that
+the machine could not install the profile and names the prerequisite that was
+missing. What those lines add up to is
+[the Linux confinement verdict](../../docs/lua_linux_confinement_verdict.md),
+which is where the accounting semantics of the memory limit, the deployment
+baseline, and the residual limits are recorded.

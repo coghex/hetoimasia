@@ -117,6 +117,7 @@ identifier lists are sorted.
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no |
+| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | no | no |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
@@ -158,6 +159,31 @@ the build links, and whether Lua's garbage collection may run under unsafe calls
 example runs the package's `lua-hazard` executable as a child process; the Cabal
 closure reaches that executable through `build-tool-depends`, so its sources
 select the group like any other input.
+
+`test.lua-confinement-linux` runs the Linux confinement and resource-limit
+feasibility probe (LUA-14). It launches children inside the candidate profile --
+user, mount, network, IPC, and UTS namespaces, a private root, an address-space
+ceiling, and a seccomp filter installed with `SECCOMP_FILTER_FLAG_TSYNC` -- and
+checks the fail-closed refusal when a prerequisite is missing, each forbidden
+access with the layer that denied it, two-instance isolation and independent
+termination, the whole-process memory ceiling, the execution bound's escalation,
+and the three lifetime cases. Like `test.scripting-lua` it is mandatory but
+outside the floor. Beside its Cabal closure it declares
+`packages/scripting-lua/linux/`, because the probe's native sources are C that
+the Cabal closure's source directories do not reach, and `tools/ci-image/`,
+because what the image permits a child to unshare is part of what the group
+observes.
+
+Two things about it are unlike every other group here. Its components are built
+on Linux alone -- an `if os(linux)`/`else buildable` conditional excludes them
+elsewhere, so the group is not a vacuous pass on a machine that cannot run it --
+and the planner accepts that conditional without reading its body, so the
+probe's sources select this group on every platform rather than only on the one
+that builds them. And a green run of it is evidence, never a verdict: each
+example prints what it proved or, where the machine could not install the
+profile, says so and names the missing prerequisite. What those lines add up to
+is recorded in
+[the Linux confinement verdict](lua_linux_confinement_verdict.md), not here.
 
 `test.vulkan` runs the GPU model package's own suite: the typed identities and
 the misuse a stale, foreign, duplicated or already-consumed one is rejected as,
@@ -417,7 +443,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native
 ```
@@ -531,7 +557,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.lua-confinement-linux`, `test.vulkan`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native` |
 

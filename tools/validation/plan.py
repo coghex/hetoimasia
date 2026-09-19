@@ -72,10 +72,24 @@ CONDITIONAL_PATTERN = re.compile(r"^(if|elif|else)\b")
 OS_CONDITIONAL_PATTERN = re.compile(r"^if\s+os\(\s*[A-Za-z][A-Za-z0-9_-]*\s*\)$")
 PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 
-# The only fields an operating-system conditional may declare. They choose what
-# an ordinary link adds on one platform and never name a source, a dependency,
-# or anything else a group's inputs are derived from.
+# The only fields an operating-system conditional may declare. Two kinds, for
+# one reason: none of them names a source, a dependency, or anything else a
+# group's inputs are derived from.
+#
+# The link fields choose what an ordinary link adds on one platform. `buildable`
+# chooses whether a component is built there at all, which is how a platform
+# component -- the Linux confinement probe is the first -- is excluded elsewhere
+# rather than built and passing vacuously.
+#
+# What `buildable` deliberately does not change is this planner's answer. The
+# body of a conditional is not read into the stanza, so a component's inputs are
+# the union of what it declares outside one on every platform: the same files
+# select the same groups whether or not this run's operating system would build
+# them. Narrowing that to the building platform would make a candidate's
+# selection depend on which machine planned it, which is the opposite of what
+# the input identity is for.
 LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
+CONDITIONAL_FIELDS = LINK_ONLY_FIELDS | frozenset({"buildable"})
 
 STANZA_KEYWORDS = {
     "library",
@@ -244,9 +258,9 @@ class WorkTree:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
 # relative ``hs-source-dirs``, ``main-is``, ``build-depends`` (including a
 # ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
-# ``if os(...)``/``else`` block inside a stanza that declares only link fields.
-# Any other conditional, and brace-delimited syntax, can change dependencies, so
-# it is rejected with a diagnostic rather than ignored.
+# ``if os(...)``/``else`` block inside a stanza that declares only link fields or
+# ``buildable``. Any other conditional, and brace-delimited syntax, can change
+# dependencies, so it is rejected with a diagnostic rather than ignored.
 
 
 class Package:
@@ -291,10 +305,10 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
                 if conditional_field_indent is not None and indent > conditional_field_indent:
                     continue
                 body = FIELD_PATTERN.match(content)
-                if not body or body.group(1).lower() not in LINK_ONLY_FIELDS:
+                if not body or body.group(1).lower() not in CONDITIONAL_FIELDS:
                     raise PlannerError(
                         f"{path}:{number}: an operating-system conditional may declare only "
-                        f"{' and '.join(sorted(LINK_ONLY_FIELDS))}; anything else inside it can "
+                        f"{', '.join(sorted(CONDITIONAL_FIELDS))}; anything else inside it can "
                         "change dependencies or inputs silently"
                     )
                 conditional_field_indent = indent

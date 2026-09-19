@@ -27,6 +27,7 @@ extra-doc-files: README.md
 extra-source-files:
     bridge/cbits/hetoimasia_lua_bridge.h
     hazard/cbits/hetoimasia_lua_probe.h
+    linux/cbits/hetoimasia_confine.h
 
 source-repository head
     type: git
@@ -144,3 +145,69 @@ test-suite lua-host-tests
         hetoimasia-test-support ==0.1.0.0,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge
+
+-- The Linux feasibility probe's child (LUA-14). A private platform component:
+-- it is built only on Linux, nothing links it, and the only Lua source it ever
+-- loads is the fixture chunk compiled into it. On any other platform the
+-- component is not built at all rather than built and passing vacuously.
+--
+-- `-xr256m` is the memory experiment's prerequisite rather than a tuning knob.
+-- The runtime's two-step allocator reserves a terabyte of address space by
+-- default, and the ceiling the experiment installs is an address-space ceiling:
+-- with the default reservation the child would exhaust it before `main` ran and
+-- the experiment would be measuring startup. `-N2` is the threaded
+-- configuration LUA-1 selected, and it is what makes the filter's
+-- whole-process claim a claim about more than one thread.
+executable lua-confine-child
+    import: language
+    hs-source-dirs: linux/child
+    main-is: Main.hs
+    c-sources: linux/cbits/hetoimasia_confine.c
+    include-dirs: linux/cbits
+    includes: hetoimasia_confine.h
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2 -xr256m"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:bridge
+    if os(linux)
+        buildable: True
+    else
+        buildable: False
+
+-- The probe's parent side, and the verdict's evidence. It launches confined
+-- children, reads what they observed, ends them, and records the machine it
+-- ran on; it draws no conclusion about whether the profile is adequate, which
+-- is docs/lua_linux_confinement_verdict.md's.
+test-suite linux-confinement-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: linux/test
+    other-modules:
+        Test.Confinement.Isolation
+        Test.Confinement.Lifetime
+        Test.Confinement.Limits
+        Test.Confinement.Profile
+        Test.Confinement.Spec
+        Test.Confinement.Support
+    c-sources: linux/cbits/hetoimasia_confine.c
+    include-dirs: linux/cbits
+    includes: hetoimasia_confine.h
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-tool-depends: hetoimasia-scripting-lua:lua-confine-child
+    build-depends:
+        base >=4.22 && <4.23,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        temporary >=1.3 && <1.4,
+        unix >=2.8 && <2.9,
+        hetoimasia-test-support ==0.1.0.0
+    if os(linux)
+        buildable: True
+    else
+        buildable: False

@@ -106,6 +106,28 @@ owning subsystem's contract/design when continuing its work.
   allocation on the publication path reports rather than panics, that a failed
   publication leaves the state usable, and that carriers are finalized exactly
   once.
+- LUA-14 (#147) is the Linux confinement and resource-limit feasibility proof,
+  and **its verdict is `inconclusive`** — recorded in
+  [the Linux confinement verdict](docs/lua_linux_confinement_verdict.md). The
+  candidate profile (no-new-privs, a user namespace entered from a freshly
+  forked single-threaded child, mount/network/IPC/UTS namespaces, a `tmpfs`
+  private root reached by `pivot_root`, `RLIMIT_AS`, and a `TSYNC` seccomp
+  filter) was exercised only in the Linux CI worker container. No ordinary
+  unprivileged Linux launch was available to the solver, so the deployment
+  baseline a person's own machine would use is unproven, and under D-11 that
+  returns the Lua design to `exploring` rather than selecting Q-5's Linux half.
+  What would close it is one run of
+  `cabal test hetoimasia-scripting-lua:linux-confinement-probe` on an ordinary
+  unprivileged Linux machine; the probe needs no change to produce that record.
+  The memory ceiling is an address-space limit, so it counts reservations and
+  not resident size, which is why the child is built with `-xr256m` — a
+  prerequisite of the experiment, not a tuning choice. The probe is private to
+  `packages/scripting-lua/linux/`, built on Linux alone, and admits no mod
+  source; its group is `test.lua-confinement-linux`. Registering it needed the
+  validation planner to accept `buildable` inside an `if os(...)` conditional,
+  which it now does without reading the body, so a platform component's sources
+  select their group on every platform rather than only the one that builds
+  them.
 
 ## Contracts to preserve
 
