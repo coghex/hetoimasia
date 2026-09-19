@@ -45,12 +45,13 @@ below is from one of them.
 Environment 1 is the `haskell-engine` worker of `.github/workflows/validation.yml`,
 running the pinned image with `options: --init` and nothing else. The record is
 workflow run
-[35458121191](https://github.com/coghex/hetoimasia/actions/runs/35458121191) at
-commit `d83bb90`, whose plan step resolved the candidate's input identity as
-`821b3d3d…6ade21` and whose `receipt-test.lua-confinement-linux-<identity>`
-artifact is that group's receipt. Later commits on this branch change only
-Markdown, which the catalog classes as non-affecting, so that run stays
-input-equivalent to the head this verdict ships with.
+[35458938753](https://github.com/coghex/hetoimasia/actions/runs/35458938753) at
+commit `87f020b`, whose plan step resolved the candidate's input identity as
+`249c6b60…f5ba04` and whose `receipt-test.lua-confinement-linux-<identity>`
+artifact is that group's receipt. Every later commit on this branch changes
+Markdown alone, which the catalog classes as non-affecting, so that run stays
+input-equivalent to the head this verdict ships with — `plan.py --base 87f020b
+--head HEAD` reports the group `unaffected`.
 
 Its containers declare no added capability and no relaxed syscall filter, and
 the container runtime's default filter is what refuses `unshare(CLONE_NEWUSER)`
@@ -162,7 +163,7 @@ failures. Each line below is the run's own output; the whole of it, including
 the trial child's own report, is in
 [the retained runs](lua_linux_confinement_evidence.md#3-the-same-machine-with-that-restriction-relaxed).
 
-```
+```text
 ENVIRONMENT kernel="6.8.0-101-generic" distribution="Ubuntu 24.04.4 LTS" uid="501 501 501 501"
             cap-sys-admin=no user-namespace=available
             userns-restriction="apparmor_restrict_unprivileged_userns=0"
