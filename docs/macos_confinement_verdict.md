@@ -37,9 +37,55 @@ Run it, on macOS:
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
 ```
 
-Each of the 22 examples prints what it proved. The
-[local validation receipt](validation.md#the-macos-confinement-probe) records
-`Darwin` as its runner OS.
+Each of the 22 examples prints what it proved.
+
+### The retained receipt
+
+The local validation run described in
+[docs/validation.md](validation.md#the-macos-confinement-probes-receipt)
+produced this, and it is kept here rather than as a file of its own: a tracked
+`.json` under `docs/` is an undeclared input, and a run that added one would
+report an unknown input and select every non-optional group. Markdown is
+classified as prose no execution reads, so the evidence lives in the document
+that argues from it.
+
+```json
+{
+  "command": [
+    "cabal",
+    "test",
+    "hetoimasia-scripting-lua:macos-confinement-probe",
+    "--test-show-details=direct"
+  ],
+  "duration_seconds": 3.908,
+  "ended_at": "2026-09-19T15:56:34.384Z",
+  "executed_commit": "47dfd587de7320c5ab12809af9afc6645583b37e",
+  "executed_tree": "a2260610edfe239e01a78e10fcf70913b08ef4a3",
+  "exit_status": 0,
+  "group": "test.macos-confinement",
+  "head_commit": "47dfd587de7320c5ab12809af9afc6645583b37e",
+  "input_identity": "8be6745a824ec37093e02c6537789ec85b87a821fc8244711cee37b109505d7c",
+  "outcome": "passed",
+  "plan_identity": "7a28822a58f2d4dc0c305d269b2a044d09c15feb6a40a3fa7623bddf4de09a54",
+  "policy_version": "dac58ca7cfc567e1fdc5ca84d2314445c36168d6b1f61ead32a4c87108715ee5",
+  "runner_arch": "arm64",
+  "runner_class": "cpu",
+  "runner_os": "Darwin",
+  "runner_python": "3.14.6",
+  "schema_version": 3,
+  "source_run_url": "",
+  "started_at": "2026-09-19T15:56:30.476Z",
+  "timeout_seconds": 1800,
+  "toolchain": {
+    "cabal": "3.18.1.0",
+    "ghc": "9.14.1"
+  },
+  "worker": "local"
+}
+```
+
+`runner_os` is `Darwin`. Remote CI never runs macOS, so this receipt is local
+evidence only: it can never satisfy a Linux plan.
 
 ## The candidate profile
 
