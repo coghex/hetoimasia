@@ -36,6 +36,7 @@ import Test.Confinement.Support
   , forceStop
   , launchFor
   , observeExit
+  , outputClosed
   , releaseAfter
   , stillRunning
   , whenAvailable
@@ -135,9 +136,15 @@ spec ledger available sentinels installed = describe "lifetime" $ do
             afterRelease ← admittedOwners ledger
             afterRelease `shouldBe` []
             status `shouldBe` Terminated sigKILL False
+            -- And the confined process itself is gone, not only the supervisor
+            -- the parent waited on: its output reaches end-of-file, which it
+            -- cannot while anything still holds the far end.
+            drained ← outputClosed child
+            drained `shouldBe` True
             announce
               ( "PROVED lifetime-forced-exit observed="
                   <> describeStatus status
+                  <> " confined-process-gone=yes"
                   <> " release-followed-observation=yes admitted-owners=0"
               )
   where

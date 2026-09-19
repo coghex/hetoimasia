@@ -40,6 +40,7 @@ import Test.Confinement.Support
   , observationsIn
   , observationKind
   , observeExit
+  , outputClosed
   , releaseAfter
   , requestStop
   , stillRunning
@@ -148,6 +149,10 @@ spec ledger available sentinels installed = describe "limits" $ do
             -- leave the path this example exists to exercise unexercised, and
             -- an example that accepted that outcome would pass without it.
             escalated `shouldBe` True
+            -- The confined process, not just the supervisor: its output
+            -- reaches end-of-file only once nothing holds the far end.
+            drained ← outputClosed child
+            drained `shouldBe` True
             -- And termination by the force signal specifically, observed
             -- rather than inferred from a signal having been sent.
             status `shouldBe` Terminated forceSignal False
@@ -156,6 +161,7 @@ spec ledger available sentinels installed = describe "limits" $ do
                   <> show graceMicroseconds
                   <> " escalated="
                   <> (if escalated then "yes" else "no")
+                  <> " confined-process-gone=yes"
                   <> " observed="
                   <> describeStatus status
               )

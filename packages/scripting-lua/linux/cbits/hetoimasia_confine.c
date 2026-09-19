@@ -286,6 +286,19 @@ static int hetoimasia_write_whole(const char *path, const char *contents) {
 ** Written once before the supervisor's handler can run and read only there. */
 static volatile pid_t hetoimasia_supervised = 0;
 
+/* End the confined process, and let the wait below observe it.
+**
+** The supervisor does not exit here. Its `waitpid` is what reaps the confined
+** process, and reproducing that process's termination is what the caller
+** reads; exiting from a handler would hand the caller the supervisor's own
+** death instead, before the process it stands for had finished dying. */
+static void hetoimasia_force_stop(int signal_number) {
+  (void)signal_number;
+  if (hetoimasia_supervised > 0) {
+    kill(hetoimasia_supervised, SIGKILL);
+  }
+}
+
 /* Pass a cooperative stop through to the confined process.
 **
 ** The supervisor is not the process the caller is trying to stop, and a
@@ -317,6 +330,7 @@ static void hetoimasia_refuse(int report, int layer, int error) {
 static void hetoimasia_confine_child(const char *program, char *const argv[],
                                      char *const envp[],
                                      const char *root_directory,
+                                     const char *state_directory,
                                      const char *const *read_only_paths,
                                      long memory_limit_bytes, int ipc_socket,
                                      int input, int output, int report) {
@@ -404,6 +418,21 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
   }
   for (size_t index = 0; read_only_paths[index] != NULL; index++) {
     if (hetoimasia_bind_read_only(root_directory, read_only_paths[index]) != 0) {
+      hetoimasia_refuse(report, HETOIMASIA_LAYER_PRIVATE_ROOT, errno);
+    }
+  }
+  /* This instance's own state, at a fixed name, read-only. Its sibling is
+  ** given the same host path and has no way to reach it: the difference
+  ** between the two is the isolation, and both halves are observable because
+  ** each instance can read its own. */
+  if (state_directory != NULL && state_directory[0] != '\0') {
+    if (hetoimasia_join(path, sizeof(path), root_directory, "/state") != 0 ||
+        hetoimasia_make_directories(path) != 0 ||
+        mount(state_directory, path, NULL, MS_BIND | MS_REC, NULL) != 0 ||
+        mount(NULL, path, NULL,
+              MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV |
+                hetoimasia_locked_flags(path),
+              NULL) != 0) {
       hetoimasia_refuse(report, HETOIMASIA_LAYER_PRIVATE_ROOT, errno);
     }
   }
@@ -553,6 +582,8 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
       sigaction(SIGTERM, &forwarding, NULL);
       sigaction(SIGINT, &forwarding, NULL);
       sigaction(SIGHUP, &forwarding, NULL);
+      forwarding.sa_handler = hetoimasia_force_stop;
+      sigaction(HETOIMASIA_CONFINE_FORCE_SIGNAL, &forwarding, NULL);
     }
     {
       int status = 0;
@@ -581,6 +612,7 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
 
 pid_t hetoimasia_confine_spawn(const char *program, char *const argv[],
                                char *const envp[], const char *root_directory,
+                               const char *state_directory,
                                long memory_limit_bytes, int ipc_socket,
                                int input, int output, int *failed_layer,
                                int *failed_errno) {
@@ -612,8 +644,9 @@ pid_t hetoimasia_confine_spawn(const char *program, char *const argv[],
   if (child == 0) {
     close(channel[0]);
     hetoimasia_confine_child(program, argv, envp, root_directory,
-                             read_only_paths, memory_limit_bytes, ipc_socket,
-                             input, output, channel[1]);
+                             state_directory, read_only_paths,
+                             memory_limit_bytes, ipc_socket, input, output,
+                             channel[1]);
     _exit(127); /* unreachable */
   }
 

@@ -32,6 +32,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf)
 import Data.Text (Text)
@@ -111,6 +112,13 @@ data Settings = Settings
 -- | The private working area, which is all of the filesystem this child writes.
 workingArea ∷ FilePath
 workingArea = "/work"
+
+-- | This instance's own state, read-only, at a name every instance shares.
+--
+-- The path is the same in every child and the bytes behind it are not, which is
+-- what makes "neither can read the other's" a statement with two halves.
+instanceState ∷ FilePath
+instanceState = "/state"
 
 -- | The exit statuses this child uses, and what each one means to the parent.
 --
@@ -311,6 +319,15 @@ control settings = do
           (workingArea <> "/mapping")
           (\path → hetoimasia_probe_executable_mapping path executable ordinary)
       (,,) answered <$> peek executable <*> peek ordinary
+  -- This instance's own state, which its sibling is given the host path of and
+  -- cannot reach. Reading it is the half that makes the sibling's refusal mean
+  -- something: the same bytes are readable here and nowhere else.
+  ownState ←
+    try @SomeException (ByteString.readFile (instanceState <> "/sentinel"))
+  putStrLn
+    ( "STATE token="
+        <> either (const "unreadable") (show . Char8.unpack . Char8.takeWhile (/= '\n')) ownState
+    )
   report "control" "read-own-sentinel" False readable
   report "control" "open-unix-socket" False unix
   report "control" "bind-own-endpoint" False bound

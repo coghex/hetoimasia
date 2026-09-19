@@ -24,7 +24,7 @@ import Test.Confinement.Support
   ( Availability
   , Confined (confinedPid)
   , Controls
-  , Launch (launchEndpoint, launchOutside, launchPeerEndpoint, launchRoot)
+  , Launch (launchEndpoint, launchOutside, launchPeerEndpoint, launchRoot, launchStateDirectory)
   , Ledger
   , Observation
   , admittedOwners
@@ -44,13 +44,19 @@ import Test.Confinement.Support
   , withLaunch
   , withRoot
   )
+import Data.List (isPrefixOf)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldNotBe)
 
 spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
 spec ledger available sentinels installed = describe "isolation" $ do
   it "gives two simultaneous instances distinct owners that cannot reach each other" $
     whenAvailable installed "two-instance-isolation" $
-      withPair ledger available sentinels $ \first second → do
+      withPair ledger available sentinels $ \alpha beta → do
+        let first = instanceChild alpha
+            second = instanceChild beta
         confinedPid first `shouldNotBe` confinedPid second
         owners ← admittedOwners ledger
         length owners `shouldBe` 2
@@ -70,8 +76,23 @@ spec ledger available sentinels installed = describe "isolation" $ do
         releaseNaming first second
         releaseNaming second first
 
-        firstReport ← observationsIn . (firstBound <>) <$> awaitReady first
-        secondReport ← observationsIn . (secondBound <>) <$> awaitReady second
+        firstLines ← (firstBound <>) <$> awaitReady first
+        secondLines ← (secondBound <>) <$> awaitReady second
+        let firstReport = observationsIn firstLines
+            secondReport = observationsIn secondLines
+
+        -- Each read its own state and only its own. The path is the same in
+        -- both children and the bytes are not, so a pair that had somehow
+        -- shared a view would report the same token twice.
+        tokenIn firstLines `shouldBe` Just (instanceToken alpha)
+        tokenIn secondLines `shouldBe` Just (instanceToken beta)
+        tokenIn firstLines `shouldNotBe` tokenIn secondLines
+
+        -- And neither could read the other's, by the host path it really has.
+        outcomeOf firstReport "native" (outsideName (peerStateOf beta))
+          `shouldBe` Just "denied"
+        outcomeOf secondReport "native" (outsideName (peerStateOf alpha))
+          `shouldBe` Just "denied"
 
         -- Each reaches its own endpoint and not the other's. Both halves
         -- matter: without the first this would be a report about a socket
@@ -86,21 +107,26 @@ spec ledger available sentinels installed = describe "isolation" $ do
         outcomeOf firstReport "native" "signal-peer-process" `shouldBe` Just "denied"
         outcomeOf secondReport "native" "signal-peer-process" `shouldBe` Just "denied"
 
-        -- And neither reads the other's sentinel, which exists on the host and
-        -- which the parent read before either was launched.
+        -- And the host fixtures neither of them owns stay unreadable too.
         peerSentinelDenied firstReport sentinels
         peerSentinelDenied secondReport sentinels
 
         announce
           ( "PROVED two-instance-isolation owners="
               <> show (map (\child → toInteger (confinedPid child)) [first, second])
-              <> " peer-endpoint=denied peer-sentinel=denied peer-process=denied"
+              <> " peer-endpoint=denied peer-state=denied peer-process=denied"
+              <> " own-state="
+              <> instanceToken alpha
+              <> "|"
+              <> instanceToken beta
               <> " own-endpoint=allowed"
           )
 
   it "lets the parent end one instance without disturbing the other" $
     whenAvailable installed "independent-termination" $
-      withPair ledger available sentinels $ \first second → do
+      withPair ledger available sentinels $ \alpha beta → do
+        let first = instanceChild alpha
+            second = instanceChild beta
         _ ← awaitLine "BOUND" first
         _ ← awaitLine "BOUND" second
         releaseNaming first second
@@ -136,27 +162,77 @@ spec ledger available sentinels installed = describe "isolation" $ do
 -- Each gets its own private root, its own abstract endpoint, and the other's
 -- endpoint and sentinel as the things it must not reach.
 withPair
-  ∷ Ledger → Controls → [FilePath] → (Confined → Confined → Expectation) → Expectation
+  ∷ Ledger
+  → Controls
+  → [FilePath]
+  → (Instance → Instance → Expectation)
+  → Expectation
 withPair ledger available sentinels body =
-  withRoot $ \firstRoot →
-    withRoot $ \secondRoot → do
-      let pairing root endpoint peer =
-            (launchFor "paired" root available sentinels endpoint)
-              { launchRoot = root
-              , launchEndpoint = endpoint
-              , launchPeerEndpoint = peer
-              , launchOutside = sentinels
-              }
-      withLaunch ledger (pairing firstRoot alphaEndpoint betaEndpoint) $ \startedFirst →
-        withLaunch ledger (pairing secondRoot betaEndpoint alphaEndpoint) $ \startedSecond →
-          case (startedFirst, startedSecond) of
-            (Right first, Right second) → body first second
-            _ →
-              expectationFailure
-                "the profile installed for the trial child but refused one of the pair"
+  withSystemTempDirectory "hetoimasia-confine-state" $ \estate → do
+    alpha ← stateFor estate "alpha"
+    beta ← stateFor estate "beta"
+    -- The parent can read both, which is what makes each child's refusal of
+    -- the other's a statement about the child rather than about the file.
+    alphaHere ← readFile (stateFile alpha)
+    betaHere ← readFile (stateFile beta)
+    alphaHere `shouldNotBe` betaHere
+    withRoot $ \firstRoot →
+      withRoot $ \secondRoot → do
+        let pairing root endpoint peer own peerState =
+              (launchFor "paired" root available sentinels endpoint)
+                { launchRoot = root
+                , launchEndpoint = endpoint
+                , launchPeerEndpoint = peer
+                , launchStateDirectory = own
+                , -- Its sibling's own state, by the host path it really has.
+                  launchOutside = sentinels <> [stateFile peerState]
+                }
+        withLaunch ledger (pairing firstRoot alphaEndpoint betaEndpoint alpha beta) $
+          \startedFirst →
+            withLaunch ledger (pairing secondRoot betaEndpoint alphaEndpoint beta alpha) $
+              \startedSecond → case (startedFirst, startedSecond) of
+                (Right first, Right second) →
+                  body
+                    Instance {instanceChild = first, instanceState = alpha, instanceToken = token alphaHere}
+                    Instance {instanceChild = second, instanceState = beta, instanceToken = token betaHere}
+                _ →
+                  expectationFailure
+                    "the profile installed for the trial child but refused one of the pair"
   where
     alphaEndpoint = "hetoimasia-confine-alpha"
     betaEndpoint = "hetoimasia-confine-beta"
+    token = takeWhile (/= '\n')
+    stateFor directory name = do
+      let own = directory </> name
+      createDirectoryIfMissing True own
+      writeFile (own </> "sentinel") ("state owned by " <> name <> " alone\n")
+      pure own
+    stateFile directory = directory </> "sentinel"
+
+-- | One confined instance, and the state only it can read.
+data Instance = Instance
+  { instanceChild ∷ !Confined
+  , instanceState ∷ !FilePath
+  , instanceToken ∷ !String
+  }
+
+-- | The @STATE@ line's token, which is what that instance read of its own.
+tokenIn ∷ [String] → Maybe String
+tokenIn reported =
+  case [drop (length marker) line | line ← reported, marker `isPrefixOf` line] of
+    (value : _) → Just (filter (/= '"') value)
+    [] → Nothing
+  where
+    marker = "STATE token="
+
+-- | The name a host path is reported under when it is one of the forbidden
+-- reads.
+outsideName ∷ FilePath → String
+outsideName path = "read-outside-sentinel:" <> path
+
+-- | Where an instance's own state lives on the host.
+peerStateOf ∷ Instance → FilePath
+peerStateOf owner = instanceState owner <> "/sentinel"
 
 -- | Release one child, naming its sibling's identity on the host.
 releaseNaming ∷ Confined → Confined → IO ()

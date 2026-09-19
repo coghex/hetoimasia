@@ -96,9 +96,13 @@ order. The order is load-bearing: each layer's prerequisite is the one above it.
    above it is a supervisor holding no Lua, forwarding a cooperative stop
    inwards and reproducing the confined process's own termination as its own.
 4. **A private root**: a fresh `tmpfs`, into which the runtime's own read-only
-   directories and the probe binary are bind-mounted, with `/work` as the
-   child's private disposable working area, reached by `pivot_root`. No host
-   path outside that set is nameable from inside.
+   directories, the probe binary, and this instance's own state are
+   bind-mounted, with `/work` as the child's private disposable working area,
+   reached by `pivot_root`. No host path outside that set is nameable from
+   inside. The instance's state is at `/state`, a name every instance shares
+   and no two of which are the same directory: that one path resolving to
+   different bytes in each child is what makes "neither can read the other's
+   state" a claim with two observable halves rather than a shared absence.
 5. **Resource limits**: descriptors, core size, file size, and — where the caller
    asks for one — an address-space ceiling.
 6. **A seccomp filter**, installed from inside the child before any Lua state
@@ -152,17 +156,18 @@ PROVED inherited-descriptor number=1100 visible-in-child=no errno=9
        mechanism=launcher:every descriptor above the four it is given is closed before the exec
 PROVED executable-file-mapping mechanism=seccomp-filter:file-backed PROT_EXEC mapping refused
        control=allowed errno=13
-PROVED two-instance-isolation owners=[81251,81253] peer-endpoint=denied peer-sentinel=denied
-       peer-process=denied own-endpoint=allowed
+PROVED two-instance-isolation owners=[82368,82370] peer-endpoint=denied peer-state=denied
+       peer-process=denied own-state=state owned by alpha alone|state owned by beta alone
+       own-endpoint=allowed
 PROVED independent-termination ended=Terminated 9 False survivor-finished=Exited ExitSuccess
        admitted-owners=0
 PROVED whole-process-memory ceiling=1073741824 measures=address-space lua=refused
        native-errno=12 surfaced-as=allocation-failure terminal=exited:ExitFailure 20
 PROVED execution-bound reason=deadline-exceeded grace-microseconds=750000 escalated=yes
-       observed=signalled:9
+       confined-process-gone=yes observed=signalled:9
 PROVED lifetime-cancellation owner=cancelled child=reaped admitted-owners=0
-PROVED lifetime-forced-exit observed=signalled:9 release-followed-observation=yes
-       admitted-owners=0
+PROVED lifetime-forced-exit observed=signalled:9 confined-process-gone=yes
+       release-followed-observation=yes admitted-owners=0
 ```
 
 `layers=513` is `NO_NEW_PRIVS | SECCOMP`, the two the child installs itself; the
@@ -187,6 +192,7 @@ namespaces, the private root, and the limits went in before it existed.
 | Executing another program | The seccomp filter: `execve` and `execveat` are refused | `EACCES` |
 | Loading a native module | The seccomp filter: a file-backed `PROT_EXEC` mapping is refused | `dlopen`: *failed to map segment from shared object* |
 | Signalling a process outside the child | The PID namespace: nothing outside it has a number in here | `ESRCH` |
+| Reading another instance's own state | The mount namespace: that instance's directory is bound into its root and no other | `ENOENT` |
 | Seeing a descriptor the caller left open | The launcher: every descriptor above the four it is given is closed before the exec | `EBADF` |
 
 Every one has a control that passes beside it: the child reads its own sentinel,
@@ -264,10 +270,24 @@ The parent owns it. The child holds `SIGTERM` with a handler that only records i
 and then enters a Lua chunk that never yields — which LUA-1 established cannot be
 interrupted from Haskell — so a cooperative stop provably cannot end it and the
 escalation is the path actually exercised rather than a default action that
-happens to be terminal. The parent requested a stop, waited out the configured
-grace period, sent `SIGKILL`, and then **waited for the termination**: the run
-recorded `escalated=yes observed=signalled:9`. A successfully sent signal is
-never treated as an ended child.
+happens to be terminal.
+
+What the escalation must not be is `SIGKILL` aimed at the handle the parent
+holds. That handle is the supervisor outside the child's PID namespace, and
+`SIGKILL` cannot be caught: the supervisor would die without passing anything on
+or waiting for anything, and the parent would reap a supervisor while the process
+it stands for was still being killed asynchronously by its parent-death signal.
+Every claim about observed termination would then be a claim about the wrong
+process. So the escalation is a signal the supervisor *can* catch; the supervisor
+`SIGKILL`s the confined process, waits for it, and only then reproduces its
+termination as its own. A parent whose wait has returned is a parent whose
+confined process was reaped first.
+
+The run recorded `escalated=yes observed=signalled:9`, and beside it
+`confined-process-gone=yes`: after the termination was observed, the child's
+output reached end-of-file, which it cannot while anything still holds the far
+end of that pipe. That is the confined process itself, and not the supervisor,
+being gone.
 
 ## Lifetime and quota
 
@@ -295,10 +315,12 @@ Each is a thing a production profile would have to close rather than inherit.
 - **The caller's handle is the supervisor, not the confined process.** A PID
   namespace's init must have a parent outside it, so what the caller waits on
   and signals is one process further out. It reproduces the confined process's
-  exit status and terminating signal as its own and forwards a cooperative stop
-  inwards, and its parent-death signal ends the confined process if it dies
-  itself, but the two are not the same process and a reader of a status should
-  know which one answered.
+  exit status and terminating signal as its own, forwards a cooperative stop
+  inwards, and on the force signal kills the confined process and waits for it
+  before ending — so an observation is never ahead of what it is about. A
+  caller that sent an uncatchable signal to that handle instead would get the
+  supervisor's own death and no guarantee about the process behind it; the
+  probe's cleanup keeps that as a last resort and no example asserts on it.
 - **The read-only runtime view is coarse.** The child sees the host's runtime
   library directories read-only so that its loader and its locale support work.
   No user data is in that set, but a shipped profile would ship a minimal library

@@ -67,6 +67,7 @@ module Test.Confinement.Support
   , forceStop
   , observeExit
   , stillRunning
+  , outputClosed
   , describeStatus
 
     -- * Reporting
@@ -76,9 +77,10 @@ module Test.Confinement.Support
   , reportedLines
   ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (bracket, catch, throwIO)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf, sort)
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -116,7 +118,7 @@ import System.Posix.Process
   , getProcessID
   , getProcessStatus
   )
-import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess)
+import System.Posix.Signals (Signal, sigKILL, sigTERM, sigUSR1, signalProcess)
 import System.Posix.Types (CPid (CPid), Fd, ProcessID)
 import Test.Hspec (Expectation, shouldNotBe)
 import Test.Support.Bounded (bounded)
@@ -366,6 +368,9 @@ data Launch = Launch
   , launchAllocationStep ∷ !Int
   , launchInheritedProbe ∷ !Int
   , launchOutsidePid ∷ !Int
+  , launchStateDirectory ∷ !FilePath
+  -- ^ This instance's own state on the host, bound read-only at @\/state@.
+  -- Empty binds nothing.
   }
 
 -- | A launch of @mode@ with this run's fixtures, and no memory ceiling.
@@ -382,6 +387,7 @@ launchFor mode root available sentinels endpoint =
     , launchAllocationStep = 64 * 1024 * 1024
     , launchInheritedProbe = controlInheritedDescriptor available
     , launchOutsidePid = 0
+    , launchStateDirectory = ""
     }
 
 -- | Which prerequisite was missing, and what the kernel said about it.
@@ -431,7 +437,10 @@ withLaunch ledger request = bracket (launch ledger request) release
       owners ← admittedOwners ledger
       when (confinedPid child `elem` owners) $ do
         alive ← stillRunning child
-        when alive (forceStop child)
+        when alive $ do
+          forceStop child
+          settled ← waitBriefly child
+          unless settled (abandon child)
         _ ← releaseAfter ledger child
         pure ()
       closeQuietly (confinedReading child)
@@ -458,6 +467,7 @@ launch ledger request = do
   (pid, layer, failure) ←
     withCString program $ \programPath →
       withCString (launchRoot settled) $ \rootPath →
+       withCString (launchStateDirectory settled) $ \statePath →
         withMany withCString (argumentsFor settled) $ \argumentList →
           withArray0 nullPtr argumentList $ \argv →
             withMany withCString childEnvironment $ \environmentList →
@@ -469,6 +479,7 @@ launch ledger request = do
                       argv
                       envp
                       rootPath
+                      statePath
                       (fromIntegral (launchMemoryLimit settled))
                       (fromIntegral commandRead)
                       (fromIntegral nothing)
@@ -619,8 +630,26 @@ instruct child text = do
 requestStop ∷ Confined → IO ()
 requestStop = sendTo sigTERM
 
+-- | Ask for the confined process to be ended, and for its end to be observed.
+--
+-- Not @SIGKILL@ at the handle the caller holds. That handle is the supervisor
+-- standing outside the child's PID namespace, and @SIGKILL@ cannot be caught:
+-- the supervisor would die without passing anything on or waiting for
+-- anything, and this parent would reap it while the process it stands for was
+-- still being killed asynchronously. The supervisor catches this signal
+-- instead, kills the confined process, waits for it, and only then reproduces
+-- its termination -- so an 'observeExit' that has returned is a confined
+-- process that has already been reaped.
 forceStop ∷ Confined → IO ()
-forceStop = sendTo sigKILL
+forceStop = sendTo sigUSR1
+
+-- | The last resort, for a supervisor that did not answer.
+--
+-- Only the cleanup uses it, and only after 'forceStop' has been given a bounded
+-- chance: an example that asserted on this would be asserting about a
+-- supervisor rather than about a confined process.
+abandon ∷ Confined → IO ()
+abandon = sendTo sigKILL
 
 -- | A signal aimed at a child that may already have ended is not a failure:
 -- the question these examples ask is what the parent observed, and a child
@@ -647,6 +676,34 @@ observeExit child = do
         Just status → do
           writeIORef (confinedStatus child) (Just status)
           pure status
+
+-- | That every writer of this child's output has gone.
+--
+-- The confined process and the supervisor both hold the write end of that
+-- pipe, so it reaches end-of-file only when both have closed it. Draining it
+-- after a termination has been observed is therefore an observation about the
+-- confined process itself, and not only about the supervisor the caller waits
+-- on: were the confined process still running, this would block until the
+-- bound and fail rather than pass.
+outputClosed ∷ Confined → IO Bool
+outputClosed child = do
+  _ ← collect child
+  pure True
+
+-- | Give a supervisor a bounded chance to end its confined process.
+--
+-- Answers whether it did. Nothing concludes anything from how long it took:
+-- this is the cleanup deciding whether a last resort is still needed.
+waitBriefly ∷ Confined → IO Bool
+waitBriefly child = attempt (40 ∷ Int)
+  where
+    attempt remaining
+      | remaining <= 0 = not <$> stillRunning child
+      | otherwise = do
+          alive ← stillRunning child
+          if not alive
+            then pure True
+            else threadDelay 25000 >> attempt (remaining - 1)
 
 -- | Whether this child is still running, asked without waiting for it.
 stillRunning ∷ Confined → IO Bool
@@ -738,6 +795,7 @@ foreign import ccall safe "hetoimasia_confine.h hetoimasia_confine_spawn"
     ∷ CString
     → Ptr CString
     → Ptr CString
+    → CString
     → CString
     → CLong
     → CInt

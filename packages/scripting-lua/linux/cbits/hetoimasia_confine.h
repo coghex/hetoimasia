@@ -37,6 +37,7 @@
 #ifndef HETOIMASIA_CONFINE_H
 #define HETOIMASIA_CONFINE_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -74,6 +75,18 @@
 ** the caller reads end-of-file instead of a refusal. */
 #define HETOIMASIA_CONFINE_REPORT_FD 4
 
+/* The signal that asks the supervisor to end the confined process.
+**
+** `SIGKILL` aimed at the supervisor would be the wrong instrument: it cannot
+** be caught, so the supervisor could neither pass it on nor wait for what it
+** ended, and the caller would reap a supervisor while the process it stands
+** for was still being killed asynchronously by its parent-death signal. The
+** caller sends this instead; the supervisor kills the confined process with
+** `SIGKILL`, waits for it, and only then reproduces its termination. So a
+** caller that has observed the supervisor end has observed the confined
+** process end first. */
+#define HETOIMASIA_CONFINE_FORCE_SIGNAL SIGUSR1
+
 /* Launch `program` inside the candidate profile.
 **
 ** `root_directory` is a host path that becomes the child's private root: a
@@ -82,6 +95,10 @@
 ** private disposable working area. Nothing else is reachable from the child
 ** afterwards, which is what makes a host path a valid "outside the view"
 ** sentinel.
+**
+** `state_directory` is this instance's own state: a host directory bound
+** read-only at /state, so that the instance can read its own and a sibling
+** given the same path on the host cannot. Empty binds nothing.
 **
 ** `memory_limit_bytes` installs the whole-process address-space ceiling, or 0
 ** to install none. `ipc_socket` is the parent's end's peer, which becomes the
@@ -99,6 +116,7 @@ pid_t hetoimasia_confine_spawn(
   char *const argv[],
   char *const envp[],
   const char *root_directory,
+  const char *state_directory,
   long memory_limit_bytes,
   int ipc_socket,
   int input,
