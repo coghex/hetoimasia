@@ -129,6 +129,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , noProgressRound
   , advanceRetirements
   , anyRetiring
+  , retirementStanding
 
     -- * Completion notices from other threads
   , CompletionPublisher
@@ -814,6 +815,25 @@ retiringPending retirement = do
 -- | Whether any attachment has begun retiring and not yet finished.
 anyRetiring ∷ HostRetirement → STM Bool
 anyRetiring = fmap (not . null) . retiringPending
+
+-- | What the registrations say about scheduling right now, read from the
+-- retained assessments alone: whether any attachment is owed an opportunity,
+-- and the earliest instant any of them is waiting until.
+--
+-- A round answers both from its own accounting, and every round republishes
+-- what it found. This answers them without offering an opportunity, for a
+-- transaction that changes the registrations between two rounds — recording a
+-- retirement fact on the owner thread — and would otherwise leave the published
+-- demand describing registrations that have since moved: an attachment owed an
+-- opportunity it has not been offered, or an instant named by one that has since
+-- retired and is waiting on nothing at all.
+retirementStanding ∷ HostRetirement → STM (Bool, Maybe Instant)
+retirementStanding retirement = do
+  progressing ← filter registrationProgressing <$> retiringPending retirement
+  pure
+    ( any (assessmentOwesOpportunity . registrationAssessment) progressing
+    , earliestAwaited progressing
+    )
 
 retiringIn ∷ AttachmentModel Evidence → AttachmentId → Bool
 retiringIn model target = case attachmentStatus target model of

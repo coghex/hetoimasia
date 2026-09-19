@@ -333,6 +333,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Retirement
   , recordClosingWindow
   , recordRegisteredWindow
   , retirementIdentity
+  , retirementStanding
   , windowAttachmentState
   , windowRetirementVeto
   )
@@ -2093,17 +2094,19 @@ hostAttachmentView host target = maybe (pure Nothing) (`attachmentViewOf` target
 -- the transport. A duplicate fact and a refusal establish nothing and revive
 -- nothing.
 --
--- A fact recorded here also says so in the demand, in the same transaction that
--- records it. The two transports need that said in different places: a notice
--- is folded by the very round that reads the demand, so that round's own
--- accounting already sees the attachment it revived, and the wake the notice
+-- Evidence recorded here also resettles the published demand, in the same
+-- transaction that records it. The two transports need that said in different
+-- places: a notice is folded by the very round that reads the demand, so that
+-- round's own accounting already sees what it changed, and the wake the notice
 -- registered is what ends the wait it was published into. A fact certified
 -- directly on the owner thread has neither — it is recorded between two rounds,
--- with no wake to ride — so without this the turn after it could wait its idle
--- bound, or an instant this evidence has just outdated, before offering the
--- attachment the opportunity that evidence earned it. Only a recorded fact says
--- it: a duplicate and a refusal establish nothing, and the fact that completes a
--- retirement leaves nothing to offer an opportunity to.
+-- with no wake to ride — so without this the turn after it would still be
+-- pacing itself by registrations that have since moved: waiting its idle bound
+-- before offering the attachment the opportunity this evidence revived, or
+-- waiting for an instant named by an attachment this very fact retired. Only
+-- evidence the model did not already hold resettles anything; a duplicate and a
+-- refusal establish nothing and leave the demand exactly as the last round
+-- published it.
 reportHostRetirementFact
   ∷ HasCallStack ⇒ WindowHost → Acknowledgement → RetirementFact → IO (Maybe FactAnswer)
 reportHostRetirementFact host acknowledgement fact =
@@ -2113,7 +2116,8 @@ reportHostRetirementFact host acknowledgement fact =
       Just retirement → atomically $ do
         answered ← certifyRetirementFact retirement target acknowledgement fact
         case answered of
-          Right (FactRecorded _) → markRetirementImmediate host
+          Right (FactRecorded _) → resettleRetirementDemand host
+          Right AttachmentNowRetired → resettleRetirementDemand host
           _ → pure ()
         pure (either (const Nothing) Just answered)
   where
@@ -2498,6 +2502,34 @@ demandRetirementNow held owed = case held of
   Just retirement → do
     retiring ← anyRetiring retirement
     when retiring (modifyTVar' owed (\demand → demand {retirementImmediate = True}))
+
+-- | Answer the published demand's two scheduling questions from what the
+-- registrations now say, for a transaction that changed them between two
+-- rounds.
+--
+-- Only the two the owner loops actually pace themselves by. The counts stay the
+-- last round's own accounting, which is what they are documented to report, and
+-- a refusal count cannot be recomputed from retained state at all.
+--
+-- Both are replaced rather than widened, because evidence that retires an
+-- attachment withdraws the reasons for hurrying as readily as evidence that
+-- revives one creates them: an attachment that has just retired is waiting on
+-- nothing and is owed nothing, and carrying either answer forward would pace
+-- the next turn by an attachment that no longer exists. Nothing the last round
+-- or this window said is lost by that. A retirement begun since the round is
+-- registered, progressing, and has never been offered an opportunity, so the
+-- standing reports it owed on its own; a round that advanced an attachment
+-- which is still pending left it wanting another opportunity, so the standing
+-- reports that too; and a round that advanced one to completion has nothing
+-- left to offer an opportunity to and released its window in that same turn.
+resettleRetirementDemand ∷ WindowHost → STM ()
+resettleRetirementDemand host = case hostRetirementState host of
+  Nothing → pure ()
+  Just retirement → do
+    (owed, next) ← retirementStanding retirement
+    modifyTVar'
+      (hostRetirementDemandState host)
+      (\demand → demand {retirementImmediate = owed, retirementNextPossible = next})
 
 -- | Offer one bounded, rotating round of retirement opportunities, and publish
 -- what it left owed. An ordinary host has no attachment state and does nothing

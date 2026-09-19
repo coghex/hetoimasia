@@ -3185,12 +3185,20 @@ moments. A notice is folded by the very round that reads the demand, so that
 round's own accounting already sees the attachment it revived, and the wake the
 notice registered is what ends the wait it was published into. A fact certified
 directly on the owner thread through `certifyGraphicsFact` has neither: it is
-recorded between two rounds, with no wake to ride. So recording one says so in
-the demand in the same transaction, exactly as beginning a retirement does, and
-the turn after it offers that attachment its opportunity rather than waiting its
-idle bound or an instant the same evidence has just outdated. Only a recorded
-fact says it: a duplicate and a refusal establish nothing, and the fact that
-completes a retirement leaves nothing to offer an opportunity to.
+recorded between two rounds, with no wake to ride. So recording one answers both
+of the demand's scheduling questions afresh in the same transaction, from what
+the registrations then say. Evidence that revives an attachment makes the turn
+after it immediate, so the attachment is offered the opportunity that evidence
+earned it rather than waiting the idle bound or an instant the same evidence has
+just outdated; evidence that *completes* a retirement does the opposite, taking
+the retired attachment's own instant and its claim on the next turn away with
+it, because it is waiting on nothing and is owed nothing. Neither answer loses
+anything the last round said: a retirement begun since then has never been
+offered an opportunity and is reported owed on its own, and an attachment a
+round advanced is either still pending and wanting another opportunity or has
+retired and released its window in that same turn. Only evidence the model did
+not already hold answers anything; a duplicate and a refusal establish nothing
+and leave the demand exactly as the last round published it.
 
 `hostRetirementDemand` publishes what the last round left owed: how many
 attachments are pending, how many are stalled, how many opportunities were
@@ -3340,7 +3348,9 @@ one, and the turns waiting beside the stalled owner afterwards; a retirement
 begun between two waiting turns, and evidence that outdates a waiting owner's
 assessment, each making a later turn immediate again; a fact certified on the
 owner thread between two waiting turns making the next one immediate while a
-duplicate of it makes nothing immediate; a later instant replacing the one its
+duplicate of it makes nothing immediate; a retirement completed by certification
+on the owner thread taking its own instant and its claim on the next turn with
+it, including where that certification is the only thing between the two turns; a later instant replacing the one its
 owner named before rather than the nearest ever seen, and being dropped when
 that owner withdraws its path or retires; an attachment whose caller was interrupted in the handoff
 before its service arrived, left retiring and retired by ordinary turns with the

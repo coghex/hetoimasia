@@ -206,6 +206,10 @@ spec = describe "GLFW window attachments" $ do
       (boundedExample testLatestInstantReplacesTheRetainedOne)
     it "drops a retained instant when the attachment that named it retires"
       (boundedExample testRetiringRemovesTheRetainedInstant)
+    it "drops it when the retirement is completed by certification on the owner thread between turns"
+      (boundedExample testDirectRetirementRemovesTheRetainedInstant)
+    it "drops that instant even when the completing certification is the only thing between the two turns"
+      (boundedExample testDirectRetirementDropsTheInstantAlone)
 
   describe "the application exit" $
     it "retires every attached owner, then destroys the windows and ends the session"
@@ -2209,7 +2213,7 @@ finishOwners host control seam windows owners = do
 -- | A clock held at one instant, for an example whose pacing turns on what the
 -- owners answered rather than on time passing.
 heldClock ∷ IO MonotonicSource
-heldClock = fst <$> scriptedClock (replicate 16 0)
+heldClock = fst <$> scriptedClock (replicate 32 0)
 
 -- | More waiting owners than the budget is an idle host, not a polling one.
 --
@@ -2592,6 +2596,119 @@ testRetiringRemovesTheRetainedInstant = do
       -- That turn's round folded alpha's remaining facts and retired it, which
       -- takes the instant it had named with it.
       fifthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | A retirement completed by certification on the owner thread takes the
+-- instant it had named with it, so the next turn is not paced by a deadline
+-- nothing is waiting for.
+--
+-- Its neighbour named no instant, so alpha's is the only one the demand carries
+-- when the last fact lands. Nothing else runs between that transaction and the
+-- next turn's pacing choice: no round recomputes the demand, and the notice
+-- transport's wake is not involved, so the transaction that retires the
+-- attachment is the one that has to say its instant is gone.
+testDirectRetirementRemovesTheRetainedInstant ∷ Expectation
+testDirectRetirementRemovesTheRetainedInstant = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  remaining ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    pacings ←
+      pacingsOver host control 4 $ \number →
+        when (number == 3) $
+          forM_ allRetirementFacts $ \fact → do
+            atomically (note journal (Certified (ownerName alphaOwner) fact))
+            void (certifyGraphicsFact host acknowledgement fact)
+    writeIORef observed pacings
+    atomically (hostPendingAttachments host) >>= writeIORef remaining
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  -- Alpha really did retire on the owner thread, leaving one attachment.
+  readIORef remaining >>= \held → length held `shouldBe` 1
+  readIORef observed >>= \case
+    [firstTurn, secondTurn, thirdTurn, fourthTurn] → do
+      firstTurn `shouldBe` PolledForWork
+      secondTurn `shouldBe` PolledForWork
+      -- Alpha names the same instant on every opportunity, and beta names none,
+      -- so it is the only instant the demand carries.
+      thirdTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- Alpha retired at the end of that turn, so the instant goes with it and
+      -- the fourth turn is simply idle beside the owner that is still awaiting.
+      fourthTurn `shouldSatisfy` waitedTheBound
+    other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- | The instant alone: an attachment assessed as waiting until an instant, and
+-- then retired by one certification on the owner thread, leaves no reason to
+-- hurry behind it — only the obsolete instant, which must go with it.
+--
+-- Alpha certifies its first three facts through its own opportunities, so it is
+-- owed nothing by the time it names an instant and owes exactly one fact. The
+-- certification that completes it is therefore the only thing between two
+-- turns, and the turn after it is paced by that instant or by nothing at all.
+testDirectRetirementDropsTheInstantAlone ∷ Expectation
+testDirectRetirementDropsTheInstantAlone = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  observed ← newIORef []
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  protectedRun seam config (\_ → pure ()) $ \host control → do
+    (alpha, beta) ← twoWindows host
+    owed ← case allRetirementFacts of
+      [] → unexpected "the attachment model declares no retirement facts"
+      facts → pure facts
+    let (certified, final') = splitAt (length owed - 1) owed
+    owners ←
+      detachedOwners
+        journal
+        host
+        [ (alpha, "alpha", map Certify certified <> repeat (AwaitUntil (at (millis 40))))
+        , (beta, "beta", repeat Await)
+        ]
+    alphaOwner ← case owners of
+      held : _ → pure held
+      [] → unexpected "no owner was attached"
+    acknowledgement ← heldAcknowledgement alphaOwner
+    -- Alpha is offered an opportunity on every other turn, so the turn on which
+    -- it first names an instant is the one after its last certifying turn.
+    let naming = 2 * length certified + 1
+    pacings ←
+      pacingsOver host control (fromIntegral (naming + 2)) $ \number →
+        when (number == fromIntegral (naming + 1)) $
+          forM_ final' $ \fact → do
+            atomically (note journal (Certified (ownerName alphaOwner) fact))
+            void (certifyGraphicsFact host acknowledgement fact)
+    writeIORef observed (drop (naming - 1) pacings)
+    finishOwners host control seam [alpha, beta] (drop 1 owners)
+  readIORef observed >>= \case
+    [namingTurn, waitingTurn, afterTurn] → do
+      -- Alpha's last certifying opportunity kept the turns immediate.
+      namingTurn `shouldBe` PolledForWork
+      -- Then it named an instant and owed nothing, and beta names none, so that
+      -- instant is the only thing pacing the turn after.
+      waitingTurn `shouldBe` WaitedForDeadline (durationOf (millis 40))
+      -- One certification retired alpha at the end of it. The instant it named
+      -- is nothing's now, so the turn after waits its bound beside beta rather
+      -- than being paced by a deadline nobody is waiting for.
+      afterTurn `shouldSatisfy` waitedTheBound
     other → unexpected ("the scheduled loop paced too few turns: " <> show other)
 
 -- ---------------------------------------------------------------------------
