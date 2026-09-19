@@ -14,9 +14,12 @@
 -- will make that claim is LUA-2's.
 module Test.Lua.Support
   ( -- * Lifetimes
-    withVm
+    acquireVm
+  , withVm
   , ScopeFailure (..)
   , runScoped
+    -- * What the fixture observed
+  , interpreterAcquisitions
     -- * Observing what a VM did
   , Recorder
   , newRecorder
@@ -31,6 +34,7 @@ module Test.Lua.Support
 import Control.Concurrent (ThreadId, forkIO, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (Exception, SomeException, bracket, mask, try)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Foreign.C (CInt)
 import Hetoimasia.Scripting.Lua.Bridge (Library, Vm, closeVm, newVm)
@@ -39,13 +43,36 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (probeReferenceSlot)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Support.Bounded (bounded)
+
+-- | How many interpreters this suite's fixture has constructed.
+--
+-- One counter for the whole process, because the claim it supports is about
+-- the whole process: a group of examples that acquires nothing while it runs
+-- created no VM. It is the fixture's counter rather than the bridge's, so
+-- 'acquireVm' is the only construction site the suite has — every example
+-- below, and every example in the suite, goes through it rather than calling
+-- 'newVm' itself.
+acquisitionCounter ∷ IORef Int
+acquisitionCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE acquisitionCounter #-}
+
+-- | Construct a VM, counting the acquisition.
+acquireVm ∷ [Library] → IO Vm
+acquireVm libraries = do
+  atomicModifyIORef' acquisitionCounter (\count → (count + 1, ()))
+  newVm libraries
+
+-- | How many interpreters have been acquired so far.
+interpreterAcquisitions ∷ IO Int
+interpreterAcquisitions = readIORef acquisitionCounter
 
 -- | Run a body over a VM and close it afterwards.
 --
 -- For the examples whose subject is not the close itself.
 withVm ∷ [Library] → (Vm → IO a) → IO a
-withVm libraries = bracket (newVm libraries) closeVm
+withVm libraries = bracket (acquireVm libraries) closeVm
 
 -- | How a scoped body and its close failed, with the precedence between them
 -- recorded in the shape rather than left to the reader.

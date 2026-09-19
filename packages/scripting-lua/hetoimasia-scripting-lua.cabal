@@ -14,8 +14,11 @@ description:
     a callback is re-raised at the Haskell boundary with its type and context
     rather than becoming an ordinary Lua error that @pcall@ can swallow.
     This library has no runtime, GLFW, Vulkan, console, or game dependency.
-    The public module and capability registration surface, the protected VM
-    owner, and the task model are later slices.
+    Beside the bridge, and sharing no dependency with it, the package owns the
+    pure protocol model: bounded script tasks and their transitions, admission
+    and its caps, single-settlement requests, owned subscriptions, session
+    epochs, failure, and stop. The public module and capability registration
+    surface, the protected VM owner, and the scheduler are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -67,6 +70,36 @@ library bridge
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0
 
+-- The protocol model (LUA-4): bounded script tasks, admission, requests,
+-- subscriptions, epochs, session failure, and stop, as pure data and pure
+-- transitions. It is a separate component from the bridge rather than a module
+-- beside it because the boundary is the point: its `build-depends` names
+-- neither `lua` nor `hetoimasia-scripting-lua:bridge`, so the binding cannot
+-- reach it and its examples cannot need an interpreter. Checking that boundary
+-- is checking this stanza, and `Test.Lua.Protocol.Boundary` checks it here.
+--
+-- It is private because the types are a contract between this package's own
+-- later slices -- the VM owner, the scheduler, the request and subscription
+-- protocol, and the child-process transport -- not a public API. Nothing
+-- outside the package depends on it yet.
+library model
+    import: language
+    visibility: private
+    hs-source-dirs: model
+    exposed-modules:
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Request
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Task
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Value
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        text >=2.1 && <2.2
+
 -- What a client outside this package may say: construct a VM over a chosen set
 -- of libraries, load and run a chunk, call a global the VM already defines, and
 -- close it. Nothing here mentions the binding's types.
@@ -110,7 +143,9 @@ executable lua-hazard
 
 -- The bridge's own contracts: the fault and cancellation transport, stack and
 -- registry discipline, the terminal close, independent execution, and the
--- selectable libraries, plus the export boundary the package promises.
+-- selectable libraries, plus the export boundary the package promises -- and
+-- the protocol model's, under the `Protocol` selector, which construct no
+-- interpreter at all.
 test-suite lua-host-tests
     import: language
     type: exitcode-stdio-1.0
@@ -124,6 +159,19 @@ test-suite lua-host-tests
         Test.Lua.Independence
         Test.Lua.Libraries
         Test.Lua.Opacity
+        Test.Lua.Protocol.Admission
+        Test.Lua.Protocol.Boundary
+        Test.Lua.Protocol.Determinism
+        Test.Lua.Protocol.Epochs
+        Test.Lua.Protocol.Failure
+        Test.Lua.Protocol.Fixture
+        Test.Lua.Protocol.Isolation
+        Test.Lua.Protocol.Requests
+        Test.Lua.Protocol.Spec
+        Test.Lua.Protocol.Stop
+        Test.Lua.Protocol.Subscriptions
+        Test.Lua.Protocol.Support
+        Test.Lua.Protocol.Tasks
         Test.Lua.Spec
         Test.Lua.Support
     -- -N2 rather than -N: the independent-progress example needs Haskell to
@@ -145,7 +193,8 @@ test-suite lua-host-tests
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0,
         hetoimasia-scripting-lua,
-        hetoimasia-scripting-lua:bridge
+        hetoimasia-scripting-lua:bridge,
+        hetoimasia-scripting-lua:model
 
 -- The macOS confinement probe's shared side, private to this package and built
 -- only on Darwin. It is LUA-15's feasibility evidence, not an engine facility:

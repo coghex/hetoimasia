@@ -94,7 +94,15 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   real native session in `glfw-native-tests`; a console example belongs in root
   `Console`;
   in general a new example belongs in the component spec that owns the
-  behaviour it asserts. Run one component with
+  behaviour it asserts. `lua-host-tests`
+  (`packages/scripting-lua/test/`) owns two components: the bridge's own
+  examples, and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
+  admission, request, subscription, epoch, failure, and stop model in the
+  package's private `model` sublibrary. Select the model's examples with
+  `--test-options='--match Protocol'`; they construct no interpreter, and the
+  group's last example reports that they acquired none. Every VM the suite
+  constructs goes through `Test.Lua.Support.acquireVm`, which is what makes
+  that report the suite's whole construction record. Run one component with
   `--test-options='--match <Component>'` on the suite that owns it; a selector
   that matches no example fails the suite rather than reporting a silent pass.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
