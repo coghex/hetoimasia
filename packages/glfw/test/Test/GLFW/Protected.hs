@@ -40,12 +40,16 @@ import Control.Exception
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , annotateIO
   , fromException
+  , someExceptionContext
   , throw
   , throwIO
   , try
   , uninterruptibleMask_
   )
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (getExceptionAnnotations)
 import Data.Unique (newUnique)
 import Control.Monad (forM_, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -57,6 +61,7 @@ import Hetoimasia.Foundation.Log
   , LogEntry (..)
   , Logger
   , callbackSink
+  , callbackSinkWith
   , componentText
   , defaultLogFilter
   , mkLoggerWith
@@ -106,6 +111,8 @@ import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import qualified Hetoimasia.Runtime.Logging as Logging
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..), raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
   , Role (..)
@@ -201,6 +208,14 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testRetainedEvidenceOrder)
     it "catches a stall diagnostic whose sink's result raises only when demanded"
       (boundedExample testLazyStallDiagnosticFails)
+
+  describe "a failed stall warning" $ do
+    it "settles as a diagnostic failure, with no second write and no final flush"
+      (boundedExample testStallWarningFailsIsDiagnostic)
+    it "keeps the body's failure primary, retaining the warning's own failure beside it unreported"
+      (boundedExample testStallWarningFailsBesideAPrimary)
+    it "defers a cancellation delivered at its sink as a cancellation, unmarked and unflushed"
+      (boundedExample testStallWarningCancelledAtItsSink)
 
   describe "failed retirement steps" $ do
     it "keeps a required step's failure and evidence, never marks the attachment safe, and never replays the step"
@@ -2020,6 +2035,177 @@ testEarlyClose = do
 
 destroyedWindows ∷ Seam → IO [Int]
 destroyedWindows seam = (\calls → [key | DestroyWindow key ← calls]) <$> seamCalls seam
+
+-- ---------------------------------------------------------------------------
+-- Failed stall warnings
+
+-- | Rides on the exception the example's sink raises, so an example can tell
+-- that exception, with the context it was raised with, from a copy of it.
+data SinkMark = SinkMark
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation SinkMark where
+  displayExceptionAnnotation _ = "raised by the example's sink"
+
+-- | A logger that records every entry and counts every flush, runs an observer
+-- with one component's entries, and then fails for those entries alone.
+--
+-- The entry is recorded before the failure, because the attempt reached the
+-- sink either way.
+countingSink ∷ Text → (LogEntry → IO ()) → TVar [LogEntry] → TVar Int → Logger
+countingSink component observe entries flushes =
+  mkLoggerWith defaultLogFilter systemMetadata $
+    callbackSinkWith
+      ( \entry → do
+          atomically (modifyTVar' entries (<> [entry]))
+          when (componentText (entryComponent entry) == component) $ do
+            observe entry
+            annotateIO SinkMark (throwIO (Scripted "sink"))
+      )
+      (atomically (modifyTVar' flushes (+ 1)))
+
+-- | The components the sink was given an entry for, in order. A terminal report
+-- the runtime makes through the same sink appears as @runtime@, so an example
+-- that expects none asserts on this whole list.
+written ∷ TVar [LogEntry] → IO [Text]
+written entries = map (componentText . entryComponent) <$> readTVarIO entries
+
+diagnosticMarks ∷ SomeException → [DiagnosticFailure]
+diagnosticMarks = getExceptionAnnotations . someExceptionContext
+
+sinkMarks ∷ SomeException → [SinkMark]
+sinkMarks = getExceptionAnnotations . someExceptionContext
+
+-- | Each cleanup failure a propagating failure retained, as the label it was
+-- retained under beside whether a diagnostic raised it.
+retainedDiagnostics ∷ SomeException → [(Text, Bool)]
+retainedDiagnostics caught =
+  [ (cleanupFailureLabel retained, raisedByDiagnostic carried)
+  | retained ← cleanupFailures caught
+  , ExceptionWithContext carried _ ← [cleanupFailureException retained]
+  ]
+
+-- | The stall diagnostic's sink fails during the protected shutdown, after a
+-- body that returned. The drain retains that failure rather than raising it
+-- through the scopes the stall is holding, independent evidence then finishes
+-- retirement, and the exit settles the warning's failure as the run's own.
+--
+-- It carries the runtime's diagnostic-failure identity, so the runtime attempts
+-- no terminal report through the sink that just failed, and the logging
+-- lifetime attempts no final flush through it.
+testStallWarningFailsIsDiagnostic ∷ Expectation
+testStallWarningFailsIsDiagnostic = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  entries ← newTVarIO []
+  flushes ← newTVarIO 0
+  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
+  let logger = countingSink "glfw.retirement" (\_ → pure ()) entries flushes
+  (failure, caught) ←
+    asProcessMainThread seam . caughtAs $
+      protectedRunHere seam logger (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar hostHeld (Just host))
+        )
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  void (pure helper)
+  failure `shouldBe` Scripted "sink"
+  -- One attempt through the sink and nothing after it: no second write.
+  written entries `shouldReturn` ["glfw.retirement"]
+  readTVarIO flushes `shouldReturn` 0
+  diagnosticMarks caught `shouldBe` [DiagnosticFailure]
+  -- The exception the sink raised, with the context it raised it with.
+  sinkMarks caught `shouldBe` [SinkMark]
+  length (Logging.failedReports caught) `shouldBe` 1
+  -- Nothing the stall was retaining was unwound early: the window and the
+  -- session went only once independent evidence made the attachment safe.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The same warning fails while the action's failure is already primary.
+--
+-- That failure stays primary and is not marked as a diagnostic's, because no
+-- diagnostic raised it; the warning's own failure is retained beside it under
+-- the protected boundary's label, carrying the mark. The runtime still makes no
+-- second write and the lifetime still no flush.
+testStallWarningFailsBesideAPrimary ∷ Expectation
+testStallWarningFailsBesideAPrimary = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  entries ← newTVarIO []
+  flushes ← newTVarIO 0
+  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
+  let logger = countingSink "glfw.retirement" (\_ → pure ()) entries flushes
+  (failure, caught) ←
+    asProcessMainThread seam . caughtAs $
+      protectedRunHere seam logger (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar hostHeld (Just host))
+        )
+        (\host _ → pure host)
+        (\_ _ → throwIO (Scripted "action"))
+  void (pure helper)
+  failure `shouldBe` Scripted "action"
+  written entries `shouldReturn` ["glfw.retirement"]
+  readTVarIO flushes `shouldReturn` 0
+  diagnosticMarks caught `shouldBe` []
+  retainedDiagnostics caught `shouldBe` [("glfw protected retirement", True)]
+  retainedUnder "glfw protected retirement" caught `shouldBe` [Just (Scripted "sink")]
+  length (Logging.failedReports caught) `shouldBe` 1
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | A cancellation delivered while the stall diagnostic's sink is running is
+-- never turned into a synchronous logging failure.
+--
+-- The drain defers it exactly as it defers any other, finishes on the
+-- independent evidence that arrives, and re-raises it only once retirement is
+-- safe: it leaves unmarked, with no report and no flush behind it.
+testStallWarningCancelledAtItsSink ∷ Expectation
+testStallWarningCancelledAtItsSink = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  entries ← newTVarIO []
+  flushes ← newTVarIO 0
+  reached ← newEmptyMVar
+  never ← newEmptyMVar
+  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
+  let logger =
+        countingSink "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) entries flushes
+  (runner, finished) ←
+    onMainThread seam $
+      protectedRunHere seam logger (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar hostHeld (Just host))
+        )
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  -- The drain has declared the stall and is inside the diagnostic's sink.
+  takeMVar reached
+  killThread runner
+  void (pure helper)
+  caught ← takeMVar finished >>= either pure (\_ → unexpected "the cancelled run returned")
+  (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+  diagnosticMarks caught `shouldBe` []
+  -- The attempt was spent and never retried, and nothing was flushed.
+  written entries `shouldReturn` ["glfw.retirement"]
+  readTVarIO flushes `shouldReturn` 0
+  -- The cancellation was re-raised only after retirement was safe.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- ---------------------------------------------------------------------------
 -- Support

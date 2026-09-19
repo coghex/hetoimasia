@@ -808,6 +808,28 @@ failure, and a cancellation each end the attempt and are recorded, and none is
 retried. A sink failure and a cancellation propagate as themselves, as every
 logging attempt does, and neither undoes the degradation.
 
+What a failed attempt means to the runtime is settled in `runtime-glfw-core`,
+which already owns the attempt and already depends on the runtime; the notifier
+itself belongs to the `model` component and gains no runtime dependency for it.
+Every boundary above — each turn's own attempt, the loop-end claim, the runner's
+boundary after quiescence, and `reportHostWakeDegradation` — marks a synchronous
+sink failure with the runtime's `DiagnosticFailure`, keeping the exception's
+type, value, and context and adding nothing else. So a failure that leaves the
+host as the run's own is one the terminal reporting in
+[the runtime design](runtime_foundation_design.md) does not write through the
+sink that just failed, and the logging lifetime does not flush through either. A
+cancellation is left exactly as it arrived, unmarked.
+
+When an application failure is already primary that mark would be a lie, since
+no diagnostic raised it: the primary stays unmarked with the warning's own
+failure retained beside it under the `glfw wake degradation report` label, and
+`runWindowApplication` and `runProtectedWindowApplication` instead record the
+failed attempt on the logging lifetime, as the same `ReportFailed` outcome that
+lifetime already keeps for a runtime-managed report. The terminal report and the
+final flush are then skipped for that reason rather than for a mark, and the
+application's failure propagates unchanged. Runtime policy is untouched by any
+of this: the host only tells the lifetime what it already found.
+
 ## Teardown, poisoning, and controlled blocking
 
 The composite declares its release order:
@@ -2849,9 +2871,18 @@ of the attachments still pending are stalled, how many are pending at all, and
 the finite bound it waits, and keeps waiting. That diagnostic is claimed once
 whatever it records, and its own failure is retained
 rather than raised: a failing diagnostic may not unwind what the stall is
-holding. No retirement timeout is configured; were one added it could only
-annotate that entry, never grant authority to destroy anything. Operator process
-termination is the escape.
+holding. That failure carries the runtime's `DiagnosticFailure` mark, added
+around the whole attempt — the write and the forcing of its result — so whether
+the exit settles it as the run's own failure or retains it beside one the body
+already raised, the runtime makes no further write through the sink that just
+failed and the logging lifetime attempts no final flush through it, exactly as
+[a failed wake warning](#the-degradation-policy) does and by the same two
+mechanisms: the mark when the failure leaves as the run's own, and the
+`ReportFailed` outcome the runner records on the lifetime when an application
+failure stays primary. A cancellation delivered during the attempt is left
+unmarked and deferred as every other one is. No retirement timeout is
+configured; were one added it could only annotate that entry, never grant
+authority to destroy anything. Operator process termination is the escape.
 
 #### The private attachment seam
 
@@ -2948,7 +2979,12 @@ withdrawn rather than run again; a duplicate and a refused notice reviving
 nothing; a cancellation queued while the window's own destruction is in flight,
 which defers until the session and a parent have outlived it; a stalled
 attachment finishing on later independent evidence, with the stall reported
-once; a stall diagnostic that itself fails, unwinding nothing; a declaration
+once; a stall diagnostic that itself fails, unwinding nothing; through a sink
+that counts its flushes, that same failing diagnostic settling as the run's own
+failure with the diagnostic-failure identity, no second write, and no flush,
+and settling beside an action failure that stays primary and unmarked with the
+diagnostic's retained under `glfw protected retirement`, and a cancellation at
+that sink deferred as a cancellation until retirement is safe; a declaration
 that raises while the drain demands it, contained as that attachment's evidence
 with its step never entered, its window and the session retained until
 independent evidence retires it, and the failure settled only afterwards; required and
@@ -3454,6 +3490,21 @@ one
 degradation and one warning shared by sequential hosts borrowing one session,
 whose wake capability neither shutdown closed;
 and a construction that rolls back lending nothing and waking nothing.
+
+A further group runs a sink that records every entry, counts every flush, and
+fails for the warning's own component alone, through the real application and
+logging lifetimes, and asserts the whole sequence of writes rather than the
+warning alone: a warning whose sink fails at the runner's boundary after a
+successful run, and one whose sink fails in a turn's own attempt, each leaving
+as the exception the sink raised, with the mark it raised it with, carrying the
+diagnostic-failure identity and followed by no second write and no flush; the
+same failure beside an application failure that stays primary and unmarked, with
+the warning's own retained under `glfw wake degradation report` and still no
+second write and no flush; a cancellation at the sink propagating as a
+cancellation, unmarked; and a filtered warning and an accepted one each leaving
+the ordinary single write-and-flush path alone. Each also asserts that the
+window and the session were live when the warning was written and released only
+at the ordinary unwind.
 
 The scheduled owner turn's examples (`--match "scheduled"`) run whole
 applications over the same seam with a scripted clock, which a scheduled turn

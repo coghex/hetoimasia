@@ -234,6 +234,7 @@ import Hetoimasia.GLFW.Internal.Attachment
   )
 import Hetoimasia.GLFW.Internal.Notify (Notifier, dischargeNotification, registerNotification)
 import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.Runtime.Reporting (markDiagnostic)
 import Numeric.Natural (Natural)
 
 -- ---------------------------------------------------------------------------
@@ -1423,9 +1424,16 @@ opportunity retirement restore registration outcome =
 -- names how many of the attachments still pending are stalled.
 --
 -- Its own failure is retained rather than raised: a failing diagnostic may not
--- unwind the scopes the stall is retaining. No retirement timeout is configured
--- in this slice; were one added it could only annotate this entry, never grant
--- authority to destroy anything.
+-- unwind the scopes the stall is retaining. It is marked with
+-- 'Hetoimasia.Runtime.Reporting.DiagnosticFailure' first, so whether the
+-- protected exit settles it as the primary failure or retains it beside one the
+-- body already raised, the runtime's terminal reporting makes no further write
+-- through the sink that just failed and the logging lifetime attempts no final
+-- flush through it. The mark adds nothing else: the exception keeps its type,
+-- value, and context, and a cancellation delivered during the attempt is left
+-- exactly as it arrived, to be deferred as one. No retirement timeout is
+-- configured in this slice; were one added it could only annotate this entry,
+-- never grant authority to destroy anything.
 declareStall
   ∷ HasCallStack
   ⇒ HostRetirement
@@ -1444,7 +1452,7 @@ declareStall retirement environment restore outcome = do
     then pure outcome
     else do
       attempted ←
-        tryWithContext . restore $
+        tryWithContext . restore . markDiagnostic $
           logWarning
             (environmentLogger environment)
             retirementComponent
@@ -1453,8 +1461,10 @@ declareStall retirement environment restore outcome = do
             , ("attachments", Text.pack (show (length pending)))
             , ("wait", Text.pack (show (environmentBound environment)))
             ]
-            -- Forced here, inside the attempt: a sink whose result raises when
-            -- demanded may not escape and unwind what the stall is retaining.
+            -- Forced here, inside the attempt, and so inside the mark: a sink
+            -- whose result raises when demanded may not escape and unwind what
+            -- the stall is retaining, and the failure it raises is the
+            -- diagnostic's however late it is demanded.
             >>= evaluate
       absorb retirement attempted outcome
 

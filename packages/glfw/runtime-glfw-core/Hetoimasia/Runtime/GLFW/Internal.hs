@@ -165,6 +165,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot (SnapshotReader, observedValue, 
 import Hetoimasia.Foundation.Resource
   ( Scoped
   , allocResource
+  , cleanupFailureException
   , cleanupFailuresInContext
   , withResourceLabelled
   , withScoped
@@ -242,7 +243,6 @@ import Hetoimasia.GLFW.Internal.Demand
 import Hetoimasia.GLFW.Internal.Notify
   ( DegradationAttempt
   , Notifier
-  , attemptDegradationReport
   , attemptDegradationReportWith
   , awaitNotificationsSettled
   , notificationsInFlight
@@ -365,7 +365,8 @@ import Hetoimasia.GLFW.Window
   , windowObservations
   )
 import Hetoimasia.Runtime.Application (runManagedApplication)
-import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, recordReport)
+import Hetoimasia.Runtime.Reporting (ReportResult (ReportFailed), markDiagnostic, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
 import Numeric.Natural (Natural)
 
@@ -895,7 +896,30 @@ settledAttempt restore logger host =
             (\() → rethrowIO interrupted)
   where
     notifier = hostNotifier host
-    attempt = attemptDegradationReportWith restore logger notifier
+    attempt = markedDegradationAttempt restore logger notifier
+
+-- | One wake degradation warning attempt, carrying the runtime's
+-- diagnostic-failure identity out of the host.
+--
+-- The attempt itself is "Hetoimasia.GLFW.Internal.Notify"'s: the @model@
+-- component owns the claim, the write, and the settlement, and depends on no
+-- runtime module. The identity is added here, where this sublibrary already
+-- owns the attempt and already depends on the runtime, so a sink failure that
+-- leaves the host is one
+-- 'Hetoimasia.Runtime.Reporting.reportTerminalFailureWith' will not write
+-- through again and 'Hetoimasia.Runtime.Logging.withLoggingLifetime' will not
+-- flush through. Nothing else about the attempt changes: its one-attempt rule,
+-- its recorded outcome, and the exception's own type, value, and context are
+-- the notifier's, and a cancellation is left exactly as it arrived.
+--
+-- The mark is what a failure leaving as primary carries. A failure retained
+-- beside an application primary is carried by 'recordingDiagnostics' instead,
+-- which records it on the logging lifetime rather than marking a failure that
+-- no diagnostic raised.
+markedDegradationAttempt
+  ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → Notifier → IO DegradationAttempt
+markedDegradationAttempt restore logger notifier =
+  markDiagnostic (attemptDegradationReportWith restore logger notifier)
 
 -- | The wake path's one guarded reporting attempt, without waiting for
 -- anything.
@@ -905,7 +929,7 @@ settledAttempt restore logger host =
 -- admissions and publications are still being made without ever waiting on a
 -- worker that keeps making them.
 promptAttempt ∷ HasCallStack ⇒ (∀ a. IO a → IO a) → Logger → WindowHost → IO ()
-promptAttempt restore logger host = void (attemptDegradationReportWith restore logger (hostNotifier host))
+promptAttempt restore logger host = void (markedDegradationAttempt restore logger (hostNotifier host))
 
 -- | Run @body@, then make the reporting attempt, whatever @body@ did.
 --
@@ -1418,7 +1442,7 @@ turnWork host control logger event = do
   retirePending host
   closes ← surfaceCloseRequests host
   recoverFeeds logger host
-  void (attemptDegradationReport logger (hostNotifier host))
+  void (mask (\restore → markedDegradationAttempt restore logger (hostNotifier host)))
   checkRuntime control
   commands ← dispatchCommands host (hostCommandBudget settings)
   recoverFeeds logger host
@@ -1803,14 +1827,63 @@ runWindowApplication enterLifetime name dependencies host startup action =
       (\use → use lifetime)
       name
       ( \use →
-          withScoped dependencies $ \built →
-            retainingReport
-              (\restore → reportHostWakeDegradationAtExit restore (lifetimeLogger lifetime) (host built))
-              (use built)
+          recordingDiagnostics lifetime $
+            withScoped dependencies $ \built →
+              retainingReport
+                (\restore → reportHostWakeDegradationAtExit restore (lifetimeLogger lifetime) (host built))
+                (use built)
       )
       (quiesceWindowHost . host)
       startup
       action
+
+-- | Record on the logging lifetime every host lifecycle diagnostic that failed
+-- inside @work@, then let what @work@ raised through unchanged.
+--
+-- A wake degradation warning and a retirement stall diagnostic are both written
+-- through the application's own sink, and both leave 'markDiagnostic''s mark on
+-- the failure a failing sink raises. When that failure is the one leaving the
+-- host, the mark is enough: 'Hetoimasia.Runtime.Reporting.reportTerminalFailure'
+-- and 'Hetoimasia.Runtime.Logging.withLoggingLifetime' both read it off the
+-- context they are handed.
+--
+-- When an application failure is already primary, they do not: the boundaries
+-- that retain a failed warning — 'retainingReport' and the protected exit's
+-- 'settleProtectedOutcome' — keep the application's failure primary, which is
+-- what it is, and carry the warning beside it as labelled cleanup evidence.
+-- Marking that primary would say a diagnostic raised it, which is false. So the
+-- warning is recorded here instead, as the 'ReportFailed' outcome the logging
+-- lifetime already has a place for, exactly as a runtime-managed report records
+-- its own failed attempt. 'Hetoimasia.Runtime.Application.reportOnce' then makes
+-- no further write through that sink, and the lifetime attempts no final flush
+-- through it.
+--
+-- It is the runners' own step, so it wraps everything inside them that can make
+-- or retain one of these attempts, and nothing else: it reports nothing, writes
+-- nothing, changes no outcome, and adds no annotation to the failure it lets
+-- through. A cancellation carries no mark and records nothing. Runtime policy
+-- is unchanged; this only tells the lifetime what the host already found.
+recordingDiagnostics ∷ LoggingLifetime → IO r → IO r
+recordingDiagnostics lifetime work =
+  tryWithContext work >>= \case
+    Right result → pure result
+    Left caught → do
+      mapM_ (recordReport lifetime . ReportFailed) (failedDiagnosticsOf caught)
+      rethrowIO (caught ∷ ExceptionWithContext SomeException)
+
+-- | The failed lifecycle diagnostics one propagating failure carries: the
+-- failure itself when a diagnostic raised it, and every marked failure retained
+-- beside it as cleanup evidence, in the order the boundaries found them.
+--
+-- 'cleanupFailuresInContext' already reports each distinct retained failure
+-- once, however many routes reach it, so a warning retained through several
+-- scopes is recorded once.
+failedDiagnosticsOf ∷ ExceptionWithContext SomeException → [ExceptionWithContext SomeException]
+failedDiagnosticsOf caught@(ExceptionWithContext context _) =
+  [caught | raisedByDiagnostic context] <> filter diagnostic retained
+  where
+    retained = map cleanupFailureException (cleanupFailuresInContext context)
+    diagnostic (ExceptionWithContext carried _) = raisedByDiagnostic carried
 
 -- ---------------------------------------------------------------------------
 -- The protected host lifetime
@@ -1919,7 +1992,13 @@ runProtectedWindowApplication
   → IO a
 runProtectedWindowApplication enterLifetime name manage host startup action =
   enterLifetime $ \lifetime →
-    runManagedApplication (\use → use lifetime) name (manage lifetime) (quiesceWindowHost . host) startup action
+    runManagedApplication
+      (\use → use lifetime)
+      name
+      (\use → recordingDiagnostics lifetime (manage lifetime use))
+      (quiesceWindowHost . host)
+      startup
+      action
 
 -- | What the drain is lent: the owner's own native event processing and the
 -- host's configured finite bound. No application hook, no dispatch, and no
