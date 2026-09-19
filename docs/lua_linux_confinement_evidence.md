@@ -10,19 +10,22 @@ Nothing here draws a conclusion. The verdict does that, and quotes these.
 
 ## 1. The Linux CI worker container
 
-Workflow run [35458938753](https://github.com/coghex/hetoimasia/actions/runs/35458938753),
-job `haskell-engine`, group `test.lua-confinement-linux`, at commit `87f020b`.
-The plan step resolved that candidate's input identity as
-`249c6b6096eaea4e9a7958bddf518c6a605f28ee680bd6676974aa1a5ef5ba04`,
+Workflow run [35462003355](https://github.com/coghex/hetoimasia/actions/runs/35462003355),
+job `haskell-engine`, group `test.lua-confinement-linux`, at commit `6d88ec7` —
+the merge that brought master's own platform probe alongside this one. The plan
+step resolved that candidate's input identity as
+`d37235cb5e1724456e1053779aad56fad18f9cc3168237fe87b9eafdb42987a1`,
 and the group's receipt is published by that run as
 `receipt-test.lua-confinement-linux-<identity>`.
 
-Every later commit on this branch changes Markdown alone, which the catalog
-classes as non-affecting, so this run stays input-equivalent to the head it
-ships with: the probe's sources, its native files, and its build configuration
-are unchanged from the commit above. `plan.py --base 87f020b --head HEAD`
-reports the group `unaffected`, which is that claim checked rather than
-asserted.
+Only Markdown changes after that commit, which the catalog classes as
+non-affecting, so this run stays input-equivalent to the head it ships with.
+That is a checked claim rather than an asserted one:
+`plan.py --base 6d88ec7 --head HEAD` reports the group `unaffected`. It has to
+be rechecked whenever the head moves for any other reason — the merge above is
+exactly the case that invalidated an earlier citation, because a package
+description and a catalog are inputs of this group even when a probe's own
+sources have not moved.
 
 The profile does not install here. `unshare(CLONE_NEWUSER)` is refused with
 `EPERM` by the container runtime's default syscall filter — the job declares
@@ -44,7 +47,7 @@ BLOCKED experiment=confinement-installed unproven-here layer=user-namespace errn
     installs the confinement profile before any mod source is loaded [✔]
 PROVED typed-refusal layer=user-namespace errno=1 admitted-owners=0 unconfined-child=never-started
     refuses the launch with a typed reason when a prerequisite is withheld [✔]
-BLOCKED experiment=read-outside-sentinel:/tmp/hetoimasia-confine-fixtures-a4bd1e970d1038d7/alpha-sentinel unproven-here layer=user-namespace errno=1
+BLOCKED experiment=read-outside-sentinel:/tmp/hetoimasia-confine-fixtures-6e8db1d8a221624f/alpha-sentinel unproven-here layer=user-namespace errno=1
     is refused reading a host file outside its view, and names what refused it [✔]
 BLOCKED experiment=open-inet-socket unproven-here layer=user-namespace errno=1
     is refused opening a network socket, and names what refused it [✔]
@@ -82,7 +85,7 @@ BLOCKED experiment=lifetime-immediate-force unproven-here layer=user-namespace e
 BLOCKED experiment=lifetime-forced-exit unproven-here layer=user-namespace errno=1
     reaps a force-killed child and releases its owner only after observing it [✔]
 
-Finished in 0.0092 seconds
+Finished in 0.0066 seconds
 21 examples, 0 failures
 ```
 
