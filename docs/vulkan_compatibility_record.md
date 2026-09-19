@@ -228,19 +228,20 @@ factor on exactly the platform where nobody tests it first.
 
 The proof reads each present fence's status immediately after
 `vkQueuePresentKHR` returns and before waiting on it. That reading is not
-stable, and the retained records show it three ways at once:
+stable. Across the retained records:
 
-- Every frame in the macOS record reads `VK_NOT_READY`. Retirement is
-  asynchronous there.
-- The Linux record disagrees *with itself*: one frame was already signalled and
-  the rest were not.
-- Successive dispatches of the identical Linux container disagree with each
-  other about which frames those are.
+| Platform | Pre-wait present-fence status |
+| --- | --- |
+| macOS | uniform — every frame reads `VK_NOT_READY` |
+| Linux | mixed — both `signalled` and `not ready` occur within the one record |
 
-No frequency is claimed for any of this, and none should be: the numbers move
-between runs, so a summary that quoted one would be describing a coin toss. The
-records hold whatever the run saw, and `tools/test/VulkanProof.hs` checks that
-the two statements above are still what they hold.
+Successive dispatches of the identical Linux container also disagree with each
+other about which frames are which.
+
+No frequency is claimed here, and none should be: the counts move between runs,
+so a quoted rate would be describing a coin toss. The two words that do carry
+weight — *uniform* and *mixed* — are read back out of the records' own frame
+tables by `tools/test/VulkanProof.hs`, which fails if either stops being true.
 
 That variability is exactly why D-9's rule has to be a rule rather than a
 precaution. A design that retired a presentation semaphore on the rendering

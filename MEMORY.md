@@ -193,11 +193,10 @@ owning subsystem's contract/design when continuing its work.
   a transfer-source capture. Two things that record leaves unproved are easy to
   assume wrongly later: the KHR maintenance spelling is an alias neither
   MoltenVK nor Lavapipe resolves, and no device loss was induced, so those rows
-  are specification evidence. A third is easy to assume from one
-  run: whether a present fence is already signalled when the call returns varies
-  between platforms, between frames of one run, and between runs of the same
-  container, so the fence must be waited for and no frequency should be read
-  into it. Later
+  are specification evidence. A third is a rule rather than an
+  observation: a present fence's status before it is waited on is not a
+  contract on either platform, so the fence is waited for and nothing is read
+  into whether it happened to be signalled already. Later
   native slices stay gated until #158's pull request merges. Host-retirement
   repairs must precede real GPU attachment integration; the current three
   Vulkan issues do not depend on the defective host paths.

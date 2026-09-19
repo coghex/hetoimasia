@@ -153,22 +153,31 @@ spec = describe "The Vulkan proof boundary" $ do
     -- container recipe copied on the other, with no checkout to consult.
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 
-  it "still shows the pre-wait fence status the summary describes" $ do
-    -- The summary makes exactly two claims about this column, and both are
-    -- machine-derived, so both are checked here rather than trusted. It
-    -- deliberately claims no frequency: the numbers move between runs, and a
-    -- quoted one would be describing a coin toss.
+  it "describes each platform's pre-wait fence status as that platform's own record has it" $ do
+    -- The summary carries this as one word per platform, and the word is read
+    -- back out of that platform's own frame table. Checking the two records
+    -- only against each other was not enough: macOS is separately required to
+    -- be uniform, so a Linux record that was uniformly `signalled` would still
+    -- make the pair disagree and pass, while the summary said Linux disagrees
+    -- with itself.
+    summary ← readFile compatibilityRecord
     statuses ← mapM (\(platform, path) → (,) platform . preWaitStatuses <$> readFile path) retainedRecords
-    case lookup "macOS" statuses of
-      Nothing → expectationFailure "no macOS record"
-      Just macOS → do
-        macOS `shouldSatisfy` (not . null)
-        -- "Every frame in the macOS record reads VK_NOT_READY."
-        filter (/= "not ready") macOS `shouldBe` []
-    -- "The Linux record disagrees with itself", and more generally the corpus
-    -- shows both answers. If a future run made this uniform, the summary would
-    -- be overclaiming and this fails rather than going quietly stale.
-    nub (concatMap snd statuses) `shouldSatisfy` (\seen → length seen > 1)
+    let described platform = tableRow ("| " <> platform <> " |") summary >>= cellAt 1
+        mismatches =
+          [ platform
+              <> " is "
+              <> shape observed
+              <> " in its record, and the summary calls it "
+              <> maybe "nothing" (takeWhile (/= ' ')) (described platform)
+          | (platform, observed) ← statuses
+          , Just cell ← [described platform]
+          , not (shape observed `isPrefixOf` cell)
+          ]
+    map snd statuses `shouldSatisfy` all (not . null)
+    mismatches `shouldBe` []
+    -- And the words are the ones the summary actually uses today, so a record
+    -- that changed shape cannot be papered over by rewording the cell.
+    map (shape . snd) statuses `shouldBe` ["uniform", "mixed"]
 
   it "quotes no digest the records disagree with" $ do
     -- The summary names the digest for a reader's benefit, which means it can
@@ -244,6 +253,11 @@ settingOf text prefix =
   case [rest | line ← map trim (lines text), Just rest ← [stripPrefix prefix line]] of
     (value : _) → Just value
     [] → Nothing
+
+-- | How one platform's pre-wait statuses look as a whole: all the same answer,
+-- or more than one. These are the two words the summary is allowed to use.
+shape ∷ [String] → String
+shape observed = if length (nub observed) > 1 then "mixed" else "uniform"
 
 -- | The "present fence before wait" cell of every frame row in a record's
 -- completion table, found through the table's own header so a reordered column
