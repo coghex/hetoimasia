@@ -38,6 +38,23 @@ module Test.GLFW.Support
   , windowNamed
   , quietLogger
   , pumps
+
+    -- * Recording and failing sinks
+  , SinkFailed (..)
+  , SinkMark (..)
+  , SinkTrace
+  , newSinkTrace
+  , traced
+  , flushed
+  , failingSink
+  , sinkFailingOn
+
+    -- * What a failure carries
+  , raisedWith
+  , diagnosticMarks
+  , sinkMarks
+  , retainedDiagnostics
+  , retainedAs
   ) where
 
 import Control.Concurrent (ThreadId)
@@ -45,13 +62,18 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
   ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , annotateIO
   , displayException
   , fromException
   , throwIO
   , try
   )
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
+import Control.Monad (when)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
@@ -62,8 +84,11 @@ import Hetoimasia.Foundation.Failure
   , operationText
   )
 import Hetoimasia.Foundation.Log
-  ( Logger
+  ( LogEntry (entryComponent)
+  , LogFilter
+  , Logger
   , callbackSink
+  , callbackSinkWith
   , componentText
   , defaultLogFilter
   , mkLoggerWith
@@ -71,7 +96,12 @@ import Hetoimasia.Foundation.Log
   )
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
-import Hetoimasia.Foundation.Resource (withScoped)
+import Hetoimasia.Foundation.Resource
+  ( cleanupFailureException
+  , cleanupFailureLabel
+  , cleanupFailuresInContext
+  , withScoped
+  )
 import Hetoimasia.Foundation.Time
   ( Duration
   , DurationRequirement (AllowZero)
@@ -98,6 +128,7 @@ import Hetoimasia.Runtime.GLFW
   , runWindowApplication
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, expectationFailure)
@@ -231,3 +262,101 @@ pumps seam = filter pumped <$> seamCalls seam
       PollEvents → True
       WaitEvents _ → True
       _ → False
+
+-- ---------------------------------------------------------------------------
+-- Recording and failing sinks
+
+-- | The failure a scripted sink raises, distinguishable by type from any
+-- application failure the same example raises.
+newtype SinkFailed = SinkFailed Text
+  deriving (Eq, Show)
+
+instance Exception SinkFailed
+
+-- | Rides on the exception a scripted sink raises, so an example can tell that
+-- exception, with the context it was raised with, from a copy of it.
+data SinkMark = SinkMark
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation SinkMark where
+  displayExceptionAnnotation _ = "raised by the example's sink"
+
+-- | What one example's sink was given: every entry, in order, and how many
+-- times it was flushed.
+data SinkTrace = SinkTrace
+  { traceEntries ∷ IORef [LogEntry]
+  , traceFlushes ∷ IORef Int
+  }
+
+newSinkTrace ∷ IO SinkTrace
+newSinkTrace = SinkTrace <$> newIORef [] <*> newIORef 0
+
+-- | The components the sink was given an entry for, in the order it was given
+-- them. A terminal report the runtime makes through the same sink appears as
+-- @runtime@, so an example that expects none asserts on this whole list rather
+-- than on one component's entries alone.
+traced ∷ SinkTrace → IO [Text]
+traced trace = map (componentText . entryComponent) <$> readIORef (traceEntries trace)
+
+flushed ∷ SinkTrace → IO Int
+flushed = readIORef . traceFlushes
+
+-- | A logger that records every entry and counts every flush, and whose write
+-- then fails for one component's entries alone.
+--
+-- The entry is recorded before the failure, because the attempt reached the
+-- sink either way, and the observer runs there too, so an example can see what
+-- was still live at the moment the entry was written. The exception carries
+-- 'SinkMark', so an example can prove the one that propagated is the one this
+-- sink raised.
+failingSink ∷ LogFilter → Text → (LogEntry → IO ()) → SinkTrace → Logger
+failingSink configuration component observe trace =
+  mkLoggerWith configuration systemMetadata $
+    callbackSinkWith
+      ( \entry → do
+          modifyIORef' (traceEntries trace) (<> [entry])
+          when (componentText (entryComponent entry) == component) $ do
+            observe entry
+            annotateIO SinkMark (throwIO (SinkFailed component))
+      )
+      (modifyIORef' (traceFlushes trace) (+ 1))
+
+-- | 'failingSink' with nothing to observe, over the ordinary filter.
+sinkFailingOn ∷ Text → SinkTrace → Logger
+sinkFailingOn component = failingSink defaultLogFilter component (\_ → pure ())
+
+-- ---------------------------------------------------------------------------
+-- What a failure carries
+
+-- | The typed failure a propagating exception carries, beside its context.
+raisedWith ∷ Exception e ⇒ ExceptionWithContext SomeException → IO (e, ExceptionContext)
+raisedWith (ExceptionWithContext context failure) = case fromException failure of
+  Just typed → pure (typed, context)
+  Nothing → unexpected ("the run failed with " <> displayException failure)
+
+-- | The runtime's diagnostic-failure marks a context carries.
+diagnosticMarks ∷ ExceptionContext → [DiagnosticFailure]
+diagnosticMarks = getExceptionAnnotations
+
+-- | The example sink's own marks, which an exception carried out of the sink.
+sinkMarks ∷ ExceptionContext → [SinkMark]
+sinkMarks = getExceptionAnnotations
+
+-- | Each cleanup failure a context retained, as the label it was retained under
+-- beside whether a diagnostic raised it.
+retainedDiagnostics ∷ ExceptionContext → [(Text, Bool)]
+retainedDiagnostics context =
+  [ (cleanupFailureLabel retained, raisedByDiagnostic carried)
+  | retained ← cleanupFailuresInContext context
+  , ExceptionWithContext carried _ ← [cleanupFailureException retained]
+  ]
+
+-- | The exceptions a context retained under one cleanup label, each read back
+-- at the type the example expects, with the marks the sink raised it with.
+retainedAs ∷ Exception e ⇒ Text → ExceptionContext → [(Maybe e, [SinkMark])]
+retainedAs label context =
+  [ (fromException failure, sinkMarks carried)
+  | retained ← cleanupFailuresInContext context
+  , cleanupFailureLabel retained == label
+  , ExceptionWithContext carried failure ← [cleanupFailureException retained]
+  ]

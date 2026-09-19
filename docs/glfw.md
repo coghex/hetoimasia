@@ -2984,7 +2984,10 @@ that counts its flushes, that same failing diagnostic settling as the run's own
 failure with the diagnostic-failure identity, no second write, and no flush,
 and settling beside an action failure that stays primary and unmarked with the
 diagnostic's retained under `glfw protected retirement`, and a cancellation at
-that sink deferred as a cancellation until retirement is safe; a declaration
+that sink deferred as a cancellation until retirement is safe; the wake path's
+own warning failing at this exit's boundary through the same sink, alone and
+beside an action failure that stays primary, with the window and the session
+live when it was written and released only afterwards; a declaration
 that raises while the drain demands it, contained as that attachment's evidence
 with its step never entered, its window and the session retained until
 independent evidence retires it, and the failure settled only afterwards; required and
@@ -3532,7 +3535,12 @@ bounded wait and offering one update and no more; a publication made during the
 update surviving that turn's consumption of an older revision and being captured
 by the next, after which bounded waiting resumes; the saturated-queue checkpoint
 matrix stopping the scheduled turn at the same three points as the unscheduled
-one, with the same dispositions; the loop returning its update's own result; and
+one, with the same dispositions; the loop returning its update's own result;
+a degradation the loop's own final update caused, after that turn's boundary had
+passed, whose warning the loop-end claim then writes into a failing sink,
+leaving the loop with the diagnostic-failure identity, one `glfw.wake` write, no
+`runtime` write, no flush, and the window and session released only at the
+ordinary unwind; and
 the fallback bound floored to a whole nanosecond rather than rounded up —
 `1e-9`, `1.6e-9`, `2.5e-9`, `0.25`, and `0.1` each waited for exactly, and
 `1e-12`, `0.5e-9`, `0.75e-9`, and `0.9e-9` each refused before anything is

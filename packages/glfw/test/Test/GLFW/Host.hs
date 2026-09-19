@@ -19,17 +19,14 @@ import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVa
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
-  , ExceptionWithContext (ExceptionWithContext)
+  , ExceptionWithContext
   , SomeException
   , displayException
   , fromException
-  , annotateIO
   , throwIO
   , try
   , tryWithContext
   )
-import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
-import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (forM, join, replicateM, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -45,20 +42,13 @@ import Hetoimasia.Foundation.Log
   , LogLevel (Error, Warning)
   , Logger
   , callbackSink
-  , callbackSinkWith
   , componentText
   , defaultLogFilter
   , mkLoggerWith
   , systemMetadata
   , unsafeComponent
   )
-import Hetoimasia.Foundation.Resource
-  ( Scoped
-  , allocResource
-  , cleanupFailureException
-  , cleanupFailureLabel
-  , cleanupFailuresInContext
-  )
+import Hetoimasia.Foundation.Resource (Scoped, allocResource)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
@@ -108,7 +98,7 @@ import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import qualified Hetoimasia.Runtime.Logging as Logging
-import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..), raisedByDiagnostic)
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..))
 import Numeric.Natural (Natural)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
@@ -124,7 +114,27 @@ import Hetoimasia.Runtime.Supervision
   , workerStatus
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Test.GLFW.Support (boundedExample, caughtAs, current, entered, onThread, operationOf, unexpected)
+import Test.GLFW.Support
+  ( SinkFailed (..)
+  , SinkMark (..)
+  , boundedExample
+  , caughtAs
+  , current
+  , diagnosticMarks
+  , entered
+  , failingSink
+  , flushed
+  , newSinkTrace
+  , onThread
+  , operationOf
+  , raisedWith
+  , retainedAs
+  , retainedDiagnostics
+  , sinkFailingOn
+  , sinkMarks
+  , traced
+  , unexpected
+  )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -1684,63 +1694,6 @@ testAbandonedStartup = do
 -- ---------------------------------------------------------------------------
 -- Failed wake warnings
 
--- | The failure a scripted sink raises, distinguishable by type from any
--- application failure the same example raises.
-newtype SinkFailed = SinkFailed Text
-  deriving (Eq, Show)
-
-instance Exception SinkFailed
-
--- | Rides on the exception the example's sink raises, so an example can tell
--- that exception, with the context it was raised with, from a copy of it.
-data SinkMark = SinkMark
-  deriving (Eq, Show)
-
-instance ExceptionAnnotation SinkMark where
-  displayExceptionAnnotation _ = "raised by the example's sink"
-
--- | What one example's sink was given: every entry, in order, and how many
--- times it was flushed.
-data SinkTrace = SinkTrace
-  { traceEntries ∷ IORef [LogEntry]
-  , traceFlushes ∷ IORef Int
-  }
-
-newSinkTrace ∷ IO SinkTrace
-newSinkTrace = SinkTrace <$> newIORef [] <*> newIORef 0
-
--- | The components the sink was given an entry for, in the order it was given
--- them. A terminal report the runtime makes through the same sink appears as
--- @runtime@, so an example that expects none asserts on this whole list rather
--- than on the warning alone.
-traced ∷ SinkTrace → IO [Text]
-traced trace = map (componentText . entryComponent) <$> readIORef (traceEntries trace)
-
-flushed ∷ SinkTrace → IO Int
-flushed = readIORef . traceFlushes
-
--- | A logger that records every entry and counts every flush, and whose write
--- then fails for one component's entries alone.
---
--- The entry is recorded before the failure, because the attempt reached the
--- sink either way, and the observer runs there too, so an example can see what
--- was still live at the moment the warning was written.
-failingSink ∷ LogFilter → Text → (LogEntry → IO ()) → SinkTrace → Logger
-failingSink configuration component observe trace =
-  mkLoggerWith configuration systemMetadata $
-    callbackSinkWith
-      ( \entry → do
-          modifyIORef' (traceEntries trace) (<> [entry])
-          when (componentText (entryComponent entry) == component) $ do
-            observe entry
-            annotateIO SinkMark (throwIO (SinkFailed component))
-      )
-      (modifyIORef' (traceFlushes trace) (+ 1))
-
--- | 'failingSink' with nothing to observe, over the ordinary filter.
-sinkFailingOn ∷ Text → SinkTrace → Logger
-sinkFailingOn component = failingSink defaultLogFilter component (\_ → pure ())
-
 -- | Run an application over a seam host and hand back the failure it raised,
 -- with its context.
 --
@@ -1770,37 +1723,6 @@ onMainThreadKeepingContext seam action = do
   runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
   pure (runner, finished)
 
--- | The typed failure a propagating exception carries, beside its context.
-raised ∷ Exception e ⇒ ExceptionWithContext SomeException → IO (e, ExceptionContext)
-raised (ExceptionWithContext context failure) = case fromException failure of
-  Just typed → pure (typed, context)
-  Nothing → unexpected ("the run failed with " <> displayException failure)
-
--- | The diagnostic-failure marks a context carries.
-diagnosticMarks ∷ ExceptionContext → [DiagnosticFailure]
-diagnosticMarks = getExceptionAnnotations
-
--- | Each cleanup failure a context retained, as the label it was retained under
--- beside whether a diagnostic raised it.
-retainedDiagnostics ∷ ExceptionContext → [(Text, Bool)]
-retainedDiagnostics context =
-  [ (cleanupFailureLabel retained, raisedByDiagnostic carried)
-  | retained ← cleanupFailuresInContext context
-  , ExceptionWithContext carried _ ← [cleanupFailureException retained]
-  ]
-
--- | The example sink's own marks, which the exception carried out of the sink.
-sinkMarks ∷ ExceptionContext → [SinkMark]
-sinkMarks = getExceptionAnnotations
-
--- | The same marks on each cleanup failure a context retained.
-retainedSinkMarks ∷ ExceptionContext → [[SinkMark]]
-retainedSinkMarks context =
-  [ sinkMarks carried
-  | retained ← cleanupFailuresInContext context
-  , ExceptionWithContext carried _ ← [cleanupFailureException retained]
-  ]
-
 -- | Whether a native call released something the wake report must not have
 -- outlived: the host's window, or the session itself.
 releasing ∷ NativeCall → Bool
@@ -1826,7 +1748,7 @@ testWakeWarningFailsAtExit = do
   live ← newIORef ([] ∷ [NativeCall])
   let logger = failingSink defaultLogFilter "glfw.wake" (\_ → released seam >>= writeIORef live) trace
   (failure, context) ←
-    raised
+    raisedWith
       =<< hostedFailure logger seam (settings [windowNamed "warned"]) (\host _ → pure host) (\host _ → degradeWakePath host)
   failure `shouldBe` SinkFailed "glfw.wake"
   -- One attempt through the sink and nothing after it: no second write.
@@ -1857,7 +1779,7 @@ testWakeWarningFailsBesideAPrimary = do
   seam ← newSeam (failingPostScript "scripted wake failure")
   trace ← newSinkTrace
   (failure, context) ←
-    raised
+    raisedWith
       =<< hostedFailure (sinkFailingOn "glfw.wake" trace) seam (settings [windowNamed "primary"])
         (\host _ → pure host)
         (\host _ → degradeWakePath host >> throwIO (Broken "the action failed"))
@@ -1867,7 +1789,8 @@ testWakeWarningFailsBesideAPrimary = do
   diagnosticMarks context `shouldBe` []
   retainedDiagnostics context `shouldBe` [("glfw wake degradation report", True)]
   -- Retained as the sink raised it: the warning's own exception, not a copy.
-  retainedSinkMarks context `shouldBe` [[SinkMark]]
+  retainedAs "glfw wake degradation report" context
+    `shouldBe` [(Just (SinkFailed "glfw.wake"), [SinkMark])]
   length (Logging.failedReportsInContext context) `shouldBe` 1
   released seam `shouldReturn` [DestroyWindow 1, Terminate]
 
@@ -1881,7 +1804,7 @@ testWakeWarningFailsDuringATurn = do
   trace ← newSinkTrace
   let logger = sinkFailingOn "glfw.wake" trace
   (failure, context) ←
-    raised =<< hostedFailure logger seam (settings [windowNamed "turning"]) (\host _ → pure host) (\host control → do
+    raisedWith =<< hostedFailure logger seam (settings [windowNamed "turning"]) (\host _ → pure host) (\host control → do
       window ← onlyWindow host
       -- The admission's failing wake degrades the path before the first turn,
       -- so it is that turn's own attempt that writes and fails.
@@ -1920,7 +1843,7 @@ testWakeWarningCancelledAtItsSink = do
   takeMVar reached
   killThread runner
   cancelled ← takeMVar finished
-  (failure, context) ← either raised (\_ → unexpected "the cancelled run returned") cancelled
+  (failure, context) ← either raisedWith (\_ → unexpected "the cancelled run returned") cancelled
   failure `shouldBe` ThreadKilled
   diagnosticMarks context `shouldBe` []
   null (Logging.failedReportsInContext context) `shouldBe` True

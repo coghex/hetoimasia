@@ -40,16 +40,13 @@ import Control.Exception
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
-  , annotateIO
   , fromException
-  , someExceptionContext
   , throw
   , throwIO
   , try
+  , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
-import Control.Exception.Context (getExceptionAnnotations)
 import Data.Unique (newUnique)
 import Control.Monad (forM_, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -61,7 +58,6 @@ import Hetoimasia.Foundation.Log
   , LogEntry (..)
   , Logger
   , callbackSink
-  , callbackSinkWith
   , componentText
   , defaultLogFilter
   , mkLoggerWith
@@ -95,12 +91,14 @@ import Hetoimasia.GLFW.Internal.Attachment
 import Hetoimasia.GLFW.Internal.Window (windowSessionIdentity)
 import Hetoimasia.GLFW.Internal.Seam
   ( NativeCall (DestroyWindow)
+  , Reporter
   , Seam
   , SeamScript (..)
   , asProcessMainThread
   , defaultScript
   , designateProcessMainThread
   , newSeam
+  , reportError
   , seamCalls
   , seamSession
   )
@@ -112,7 +110,7 @@ import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import qualified Hetoimasia.Runtime.Logging as Logging
-import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..), raisedByDiagnostic)
+import Hetoimasia.Runtime.Reporting (DiagnosticFailure (..))
 import Hetoimasia.Runtime.Supervision
   ( Recognition (..)
   , Role (..)
@@ -124,7 +122,23 @@ import Hetoimasia.Runtime.Supervision
   , startSupervised
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Test.GLFW.Support (boundedExample, caughtAs, unexpected)
+import Test.GLFW.Support
+  ( SinkFailed (..)
+  , SinkMark (..)
+  , boundedExample
+  , caughtAs
+  , diagnosticMarks
+  , failingSink
+  , flushed
+  , newSinkTrace
+  , raisedWith
+  , retainedAs
+  , retainedDiagnostics
+  , sinkFailingOn
+  , sinkMarks
+  , traced
+  , unexpected
+  )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -216,6 +230,12 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testStallWarningFailsBesideAPrimary)
     it "defers a cancellation delivered at its sink as a cancellation, unmarked and unflushed"
       (boundedExample testStallWarningCancelledAtItsSink)
+
+  describe "a failed wake warning at the protected exit" $ do
+    it "settles as a diagnostic failure, with no second write and no final flush"
+      (boundedExample testProtectedWakeWarningFailsAtExit)
+    it "keeps the action's failure primary, retaining the warning's own failure beside it unreported"
+      (boundedExample testProtectedWakeWarningFailsBesideAPrimary)
 
   describe "failed retirement steps" $ do
     it "keeps a required step's failure and evidence, never marks the attachment safe, and never replays the step"
@@ -437,7 +457,13 @@ pollingSeam ∷ TVar [Flag] → IO Seam
 pollingSeam = journallingSeamWaiting False
 
 journallingSeamWaiting ∷ Bool → TVar [Flag] → IO Seam
-journallingSeamWaiting blocking journal = do
+journallingSeamWaiting blocking = journallingSeamPosting blocking (\_ → pure ())
+
+-- | 'journallingSeamWaiting' whose empty-event post runs an extra scripted step
+-- before it is counted, for an example that needs the post itself to report a
+-- platform failure.
+journallingSeamPosting ∷ Bool → (Reporter → IO ()) → TVar [Flag] → IO Seam
+journallingSeamPosting blocking posting journal = do
   posts ← newTVarIO (0 ∷ Int)
   held ← newIORef Nothing
   seam ←
@@ -450,7 +476,7 @@ journallingSeamWaiting blocking journal = do
         , scriptWaitEvents = \_ _ →
             when blocking $
               atomically (readTVar posts >>= \pending → if pending <= 0 then retry else writeTVar posts (pending - 1))
-        , scriptPostEmptyEvent = \_ → atomically (modifyTVar' posts (+ 1))
+        , scriptPostEmptyEvent = \reporter → posting reporter >> atomically (modifyTVar' posts (+ 1))
         }
   writeIORef held (Just seam)
   pure seam
@@ -2039,51 +2065,111 @@ destroyedWindows seam = (\calls → [key | DestroyWindow key ← calls]) <$> sea
 -- ---------------------------------------------------------------------------
 -- Failed stall warnings
 
--- | Rides on the exception the example's sink raises, so an example can tell
--- that exception, with the context it was raised with, from a copy of it.
-data SinkMark = SinkMark
-  deriving (Eq, Show)
-
-instance ExceptionAnnotation SinkMark where
-  displayExceptionAnnotation _ = "raised by the example's sink"
-
--- | A logger that records every entry and counts every flush, runs an observer
--- with one component's entries, and then fails for those entries alone.
+-- | Run a protected application over a seam host and hand back the failure it
+-- raised, with its context.
 --
--- The entry is recorded before the failure, because the attempt reached the
--- sink either way.
-countingSink ∷ Text → (LogEntry → IO ()) → TVar [LogEntry] → TVar Int → Logger
-countingSink component observe entries flushes =
-  mkLoggerWith defaultLogFilter systemMetadata $
-    callbackSinkWith
-      ( \entry → do
-          atomically (modifyTVar' entries (<> [entry]))
-          when (componentText (entryComponent entry) == component) $ do
-            observe entry
-            annotateIO SinkMark (throwIO (Scripted "sink"))
-      )
-      (atomically (modifyTVar' flushes (+ 1)))
+-- The catch is inside the thread the seam designates because
+-- 'Control.Concurrent.runInBoundThread' carries an outcome back out by
+-- rethrowing a plain 'SomeException', which leaves an example nothing to
+-- inspect, and every assertion below is about evidence the exception carries.
+protectedFailure
+  ∷ Seam
+  → Logger
+  → HostConfig
+  → (WindowHost → IO ())
+  → (WindowHost → RuntimeControl → IO s)
+  → (s → RuntimeControl → IO a)
+  → IO (ExceptionWithContext SomeException)
+protectedFailure seam logger config inside startup action = do
+  outcome ←
+    asProcessMainThread seam . tryWithContext $
+      protectedRunHere seam logger config inside startup action
+  either pure (\_ → unexpected "the run returned instead of failing") outcome
 
--- | The components the sink was given an entry for, in order. A terminal report
--- the runtime makes through the same sink appears as @runtime@, so an example
--- that expects none asserts on this whole list.
-written ∷ TVar [LogEntry] → IO [Text]
-written entries = map (componentText . entryComponent) <$> readTVarIO entries
+-- | 'onMainThread' keeping the context of whatever the run raised, for the same
+-- reason.
+onMainThreadKeepingContext
+  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
+onMainThreadKeepingContext seam action = do
+  finished ← newEmptyMVar
+  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+  pure (runner, finished)
 
-diagnosticMarks ∷ SomeException → [DiagnosticFailure]
-diagnosticMarks = getExceptionAnnotations . someExceptionContext
+-- | The wake path's own warning fails at the protected exit's boundary, which
+-- claims it after the drain has retired every attachment.
+--
+-- It is the same policy the [stall diagnostic] follows and the same one the
+-- ordinary runner's boundary follows, reached through the protected lifetime:
+-- the failure leaves carrying the diagnostic-failure identity, the runtime
+-- writes nothing further through the sink that just failed, and the logging
+-- lifetime attempts no final flush through it. Nothing is released early — the
+-- window and the session go only after the report, at the ordinary unwind.
+testProtectedWakeWarningFailsAtExit ∷ Expectation
+testProtectedWakeWarningFailsAtExit = do
+  journal ← newTVarIO []
+  seam ← wakeFailingSeam journal
+  trace ← newSinkTrace
+  live ← newTVarIO []
+  let logger =
+        failingSink defaultLogFilter "glfw.wake" (\_ → readTVarIO journal >>= atomically . writeTVar live) trace
+  (failure, context) ←
+    raisedWith
+      =<< protectedFailure seam logger (settings [windowNamed "alpha"])
+        (\_ → pure ())
+        (\host _ → pure host)
+        -- Admitted with the wake failing, so the degradation is owed and only
+        -- the protected exit's own boundary, after the drain, can claim it.
+        (\host _ → degradeWakePath host)
+  failure `shouldBe` SinkFailed "glfw.wake"
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` [DiagnosticFailure]
+  sinkMarks context `shouldBe` [SinkMark]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  -- The window and the session were still live when the warning was written.
+  readTVarIO live `shouldReturn` []
+  readTVarIO journal `shouldReturn` [WindowGone 1, SessionEnded]
 
-sinkMarks ∷ SomeException → [SinkMark]
-sinkMarks = getExceptionAnnotations . someExceptionContext
+-- | The same warning fails at that boundary while the action's failure is
+-- already primary: the action's failure stays primary and unmarked, and the
+-- warning's own is retained beside it under this boundary's own
+-- @glfw protected retirement@ label, which is where the protected exit retains
+-- everything its drain and its report found. The lifetime is still told, so
+-- nothing further is written or flushed through the sink.
+testProtectedWakeWarningFailsBesideAPrimary ∷ Expectation
+testProtectedWakeWarningFailsBesideAPrimary = do
+  journal ← newTVarIO []
+  seam ← wakeFailingSeam journal
+  trace ← newSinkTrace
+  (failure, context) ←
+    raisedWith
+      =<< protectedFailure seam (sinkFailingOn "glfw.wake" trace) (settings [windowNamed "alpha"])
+        (\_ → pure ())
+        (\host _ → pure host)
+        (\host _ → degradeWakePath host >> throwIO (Scripted "action"))
+  failure `shouldBe` Scripted "action"
+  traced trace `shouldReturn` ["glfw.wake"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` []
+  retainedDiagnostics context `shouldBe` [("glfw protected retirement", True)]
+  retainedAs "glfw protected retirement" context
+    `shouldBe` [(Just (SinkFailed "glfw.wake"), [SinkMark])]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
+  readTVarIO journal `shouldReturn` [WindowGone 1, SessionEnded]
 
--- | Each cleanup failure a propagating failure retained, as the label it was
--- retained under beside whether a diagnostic raised it.
-retainedDiagnostics ∷ SomeException → [(Text, Bool)]
-retainedDiagnostics caught =
-  [ (cleanupFailureLabel retained, raisedByDiagnostic carried)
-  | retained ← cleanupFailures caught
-  , ExceptionWithContext carried _ ← [cleanupFailureException retained]
-  ]
+-- | A journalling seam whose empty-event post reports an expected platform
+-- failure, so the first notification degrades the session's wake path. Its wait
+-- does not block: these examples register no attachment, so the drain has
+-- nothing to be woken for.
+wakeFailingSeam ∷ TVar [Flag] → IO Seam
+wakeFailingSeam =
+  journallingSeamPosting False (\reporter → reportError reporter 0x00010008 "scripted wake failure")
+
+-- | Admit one command, whose wake fails and degrades the session's wake path.
+-- Nothing executes it: the exit's quiescence settles it as unexecuted.
+degradeWakePath ∷ WindowHost → IO ()
+degradeWakePath host =
+  void (submitWindowCommand (hostCommandPort host) [] (createWindowCommand (windowNamed "waker")))
 
 -- | The stall diagnostic's sink fails during the protected shutdown, after a
 -- body that returned. The drain retains that failure rather than raising it
@@ -2099,13 +2185,12 @@ testStallWarningFailsIsDiagnostic = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  entries ← newTVarIO []
-  flushes ← newTVarIO 0
+  trace ← newSinkTrace
   helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = countingSink "glfw.retirement" (\_ → pure ()) entries flushes
-  (failure, caught) ←
-    asProcessMainThread seam . caughtAs $
-      protectedRunHere seam logger (settings [windowNamed "alpha"])
+  let logger = sinkFailingOn "glfw.retirement" trace
+  (failure, context) ←
+    raisedWith
+      =<< protectedFailure seam logger (settings [windowNamed "alpha"])
         ( \host → do
             window ← onlyWindow host
             owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
@@ -2115,14 +2200,14 @@ testStallWarningFailsIsDiagnostic = do
         (\host _ → pure host)
         (\_ _ → pure ())
   void (pure helper)
-  failure `shouldBe` Scripted "sink"
+  failure `shouldBe` SinkFailed "glfw.retirement"
   -- One attempt through the sink and nothing after it: no second write.
-  written entries `shouldReturn` ["glfw.retirement"]
-  readTVarIO flushes `shouldReturn` 0
-  diagnosticMarks caught `shouldBe` [DiagnosticFailure]
+  traced trace `shouldReturn` ["glfw.retirement"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` [DiagnosticFailure]
   -- The exception the sink raised, with the context it raised it with.
-  sinkMarks caught `shouldBe` [SinkMark]
-  length (Logging.failedReports caught) `shouldBe` 1
+  sinkMarks context `shouldBe` [SinkMark]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
   -- Nothing the stall was retaining was unwound early: the window and the
   -- session went only once independent evidence made the attachment safe.
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
@@ -2139,13 +2224,12 @@ testStallWarningFailsBesideAPrimary = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  entries ← newTVarIO []
-  flushes ← newTVarIO 0
+  trace ← newSinkTrace
   helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = countingSink "glfw.retirement" (\_ → pure ()) entries flushes
-  (failure, caught) ←
-    asProcessMainThread seam . caughtAs $
-      protectedRunHere seam logger (settings [windowNamed "alpha"])
+  let logger = sinkFailingOn "glfw.retirement" trace
+  (failure, context) ←
+    raisedWith
+      =<< protectedFailure seam logger (settings [windowNamed "alpha"])
         ( \host → do
             window ← onlyWindow host
             owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
@@ -2156,12 +2240,14 @@ testStallWarningFailsBesideAPrimary = do
         (\_ _ → throwIO (Scripted "action"))
   void (pure helper)
   failure `shouldBe` Scripted "action"
-  written entries `shouldReturn` ["glfw.retirement"]
-  readTVarIO flushes `shouldReturn` 0
-  diagnosticMarks caught `shouldBe` []
-  retainedDiagnostics caught `shouldBe` [("glfw protected retirement", True)]
-  retainedUnder "glfw protected retirement" caught `shouldBe` [Just (Scripted "sink")]
-  length (Logging.failedReports caught) `shouldBe` 1
+  traced trace `shouldReturn` ["glfw.retirement"]
+  flushed trace `shouldReturn` 0
+  diagnosticMarks context `shouldBe` []
+  retainedDiagnostics context `shouldBe` [("glfw protected retirement", True)]
+  -- Retained as the sink raised it: the diagnostic's own exception, not a copy.
+  retainedAs "glfw protected retirement" context
+    `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
+  length (Logging.failedReportsInContext context) `shouldBe` 1
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A cancellation delivered while the stall diagnostic's sink is running is
@@ -2176,15 +2262,14 @@ testStallWarningCancelledAtItsSink = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  entries ← newTVarIO []
-  flushes ← newTVarIO 0
+  trace ← newSinkTrace
   reached ← newEmptyMVar
   never ← newEmptyMVar
   helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
   let logger =
-        countingSink "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) entries flushes
+        failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) trace
   (runner, finished) ←
-    onMainThread seam $
+    onMainThreadKeepingContext seam $
       protectedRunHere seam logger (settings [windowNamed "alpha"])
         ( \host → do
             window ← onlyWindow host
@@ -2198,12 +2283,14 @@ testStallWarningCancelledAtItsSink = do
   takeMVar reached
   killThread runner
   void (pure helper)
-  caught ← takeMVar finished >>= either pure (\_ → unexpected "the cancelled run returned")
-  (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-  diagnosticMarks caught `shouldBe` []
+  (failure, context) ←
+    takeMVar finished >>= either raisedWith (\_ → unexpected "the cancelled run returned")
+  failure `shouldBe` ThreadKilled
+  diagnosticMarks context `shouldBe` []
+  null (Logging.failedReportsInContext context) `shouldBe` True
   -- The attempt was spent and never retried, and nothing was flushed.
-  written entries `shouldReturn` ["glfw.retirement"]
-  readTVarIO flushes `shouldReturn` 0
+  traced trace `shouldReturn` ["glfw.retirement"]
+  flushed trace `shouldReturn` 0
   -- The cancellation was re-raised only after retirement was safe.
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
