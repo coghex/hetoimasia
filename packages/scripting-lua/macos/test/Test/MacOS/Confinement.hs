@@ -19,10 +19,8 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
   )
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   ( Exit (..)
-  , awaitExit
-  , collectReports
-  , launch
   , LaunchRequest (..)
+  , launch
   )
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report
   ( Origin (..)
@@ -49,6 +47,48 @@ spec = describe "confinement" $ do
           <> " fixtures, so a denial below is confinement and not an absent target"
       )
 
+  it "inherits no descriptor across the spawn, so no peer endpoint bypasses the policy" $ \fixture → do
+    let census = [(extra, sockets, detail) | Descriptors extra sockets detail ← fixtureSweep fixture]
+    case census of
+      [] → expectationFailure "the helper reported no descriptor census"
+      ((extra, sockets, detail) : _) → do
+        -- The path rules are only the whole answer if the helper holds no live
+        -- handle the kernel would never consult them about. The parent binds
+        -- both endpoints before this helper is spawned, so an inherited socket
+        -- here would be the peer's.
+        let (parentExtra, parentSockets, parentCensus) = fixtureParentCensus fixture
+        -- The control: the parent really was holding both listening endpoints
+        -- when it spawned. Without it a child with no sockets would prove only
+        -- that there were none to inherit.
+        parentSockets `shouldSatisfy` (>= 2)
+        sockets `shouldBe` 0
+        -- The count alone cannot separate what the runtime opened for itself
+        -- after exec from what the parent leaked into the child, so the census
+        -- is checked by name: nothing the helper holds may live under the
+        -- fixture root, which is where both endpoints and the peer's private
+        -- directory are.
+        let leaked =
+              [ entry
+              | entry ← Text.splitOn "," detail
+              , Text.pack (fixtureRoot fixture) `Text.isInfixOf` entry
+              ]
+        leaked `shouldBe` []
+        announce
+          ( "proved: above stderr the confined helper holds "
+              <> show extra
+              <> " descriptors and "
+              <> show sockets
+              <> " sockets, none of them under the fixture root, while the parent"
+              <> " held "
+              <> show parentSockets
+              <> " sockets of its own among "
+              <> show parentExtra
+              <> " descriptors — parent census "
+              <> Text.unpack parentCensus
+              <> "; helper census "
+              <> Text.unpack detail
+          )
+
   it "installs and verifies confinement before any Lua source is loaded" $ \fixture → do
     let reports = fixtureSweep fixture
         nativeBefore = [index | (index, Access OriginNative _ _ _) ← indexed reports]
@@ -74,8 +114,7 @@ spec = describe "confinement" $ do
             , requestArguments = arguments
             , requestMemoryLimitMiB = 0
             }
-    status ← awaitExit launched
-    reports ← collectReports launched
+    (reports, status) ← observeExit launched
     let refusals = [(refusal, detail) | Refused refusal detail ← reports]
     map fst refusals `shouldBe` [ConfinementUnavailable]
     status `shouldBe` ExitedWith (refusalExitCode ConfinementUnavailable)

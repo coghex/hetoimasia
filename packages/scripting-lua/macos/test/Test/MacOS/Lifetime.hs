@@ -17,10 +17,8 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , Ledger
   , admit
   , admitted
-  , awaitExit
   , awaitReady
   , awaitReport
-  , collectReports
   , newLedger
   , processGone
   , releaseObserved
@@ -46,9 +44,8 @@ spec = describe "lifetime and identity" $ do
     admit ledger owner 64
     ready ← awaitReady launched guardMicroseconds
     ready `shouldBe` True
-    status ← awaitExit launched
+    (reports, status) ← observeExit launched
     releaseObserved ledger owner status
-    reports ← collectReports launched
     status `shouldBe` ExitedWith (refusalExitCode InitializationFailed)
     [refusal | Refused refusal _ ← reports] `shouldBe` [InitializationFailed]
     checkSettled ledger launched reports
@@ -66,9 +63,8 @@ spec = describe "lifetime and identity" $ do
     running `shouldSatisfy` isPresent
     ending ← endWithEscalation launched
     releaseObserved ledger owner (endingExit ending)
-    reports ← collectReports launched
     endingExit ending `shouldSatisfy` isSignal
-    checkSettled ledger launched reports
+    checkSettled ledger launched (endingReports ending)
     announce
       ( "proved: cancelling a running helper ended it as "
           <> show (endingExit ending)
@@ -83,9 +79,8 @@ spec = describe "lifetime and identity" $ do
     running `shouldSatisfy` isPresent
     sent ← sendSignal launched sigKILL
     sent `shouldBe` True
-    status ← awaitExit launched
+    (reports, status) ← observeExit launched
     releaseObserved ledger owner status
-    reports ← collectReports launched
     status `shouldBe` Signalled 9
     checkSettled ledger launched reports
     announce

@@ -105,6 +105,11 @@ data Report
   | -- | An attempted access, where it came from, and the mechanism that
     -- decided it.
     Access Origin Text Outcome Text
+  | -- | Descriptors above stderr the helper holds, how many are sockets, and a
+    -- short census of them. A confined helper's must be none: a peer endpoint
+    -- inherited across the spawn is a handle the sandbox's path policy never
+    -- sees.
+    Descriptors Int Int Text
   | -- | Physical footprint and virtual size, in bytes.
     Footprint Word64 Word64
   | -- | The smallest @RLIMIT_AS@ the helper could install, and the errno that
@@ -129,6 +134,8 @@ renderReport report = Text.unwords (protocolTag : body report)
     Refused refusal detail → ["refusal", refusalName refusal, sanitize detail]
     Access origin name outcome mechanism →
       ["access", originName origin, name, outcomeName outcome, sanitize mechanism]
+    Descriptors extra sockets census →
+      ["descriptors", showText extra, showText sockets, sanitize census]
     Footprint footprint virtualSize →
       ["footprint", showText footprint, showText virtualSize]
     RlimitFloor bytes code → ["rlimit-as-floor", showText bytes, showText code]
@@ -155,6 +162,8 @@ parseReport raw
       | Just parsedOrigin ← lookup origin originsByName
       , Just parsedOutcome ← lookup outcome outcomesByName →
           Access parsedOrigin name parsedOutcome (Text.unwords mechanism)
+    ("descriptors" : extra : sockets : census)
+      | Just a ← number extra, Just b ← number sockets → Descriptors a b (Text.unwords census)
     ["footprint", footprint, virtualSize]
       | Just a ← number footprint, Just b ← number virtualSize → Footprint a b
     ["rlimit-as-floor", bytes, code]

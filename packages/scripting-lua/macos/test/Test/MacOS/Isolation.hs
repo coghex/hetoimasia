@@ -44,6 +44,10 @@ spec = describe "two-instance isolation" $
 
       firstReports ← collectReports first
       secondReports ← collectReports second
+      -- Neither helper may hold a descriptor for the other's endpoint: a
+      -- refused connect() is about a path, and an inherited handle is not.
+      inheritedSockets firstReports `shouldBe` Just 0
+      inheritedSockets secondReports `shouldBe` Just 0
       let firstNative = accessesFrom OriginNative firstReports
           secondNative = accessesFrom OriginNative secondReports
       outcomeOf probePeerSentinel firstNative `shouldBe` Just Denied
@@ -90,6 +94,12 @@ spec = describe "two-instance isolation" $
   isJustFootprint = \case
     Just (Footprint _ _) → True
     _ → False
+
+-- | How many sockets a helper reported holding above stderr.
+inheritedSockets ∷ [Report] → Maybe Int
+inheritedSockets reports = case [sockets | Descriptors _ sockets _ ← reports] of
+  (sockets : _) → Just sockets
+  [] → Nothing
 
 describeExit ∷ Exit → String
 describeExit = \case

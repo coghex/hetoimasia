@@ -204,9 +204,11 @@ owning subsystem's contract/design when continuing its work.
   its probe at `packages/scripting-lua/macos/`. Every proof row was demonstrated
   on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
   no entitlement or privilege) — per-instance SBPL confinement, all four denied
-  accesses natively and from Lua, two-instance isolation, a fatal whole-process
-  footprint cap, the execution bound, and the three lifetime endings. It is not
-  `supported` because both load-bearing mechanisms are unsupported:
+  accesses natively (three of them again from Lua; Lua has no socket API, and
+  that gap is named in the verdict rather than counted as a pass),
+  two-instance isolation including inherited descriptors, a fatal whole-process
+  footprint cap, an enforced execution budget, and the three lifetime endings.
+  It is not `supported` because both load-bearing mechanisms are unsupported:
   `sandbox_init_with_parameters` (undeclared; the family its header does declare
   is marked "No longer supported") and `posix_spawnattr_setjetsam_ext`
   (undeclared SPI). Four measurements worth not rediscovering: a spawn-time
@@ -218,7 +220,10 @@ owning subsystem's contract/design when continuing its work.
   C process) and so cannot express any mod budget; and App Sandbox — the
   supported alternative — permits `exec`, shares one container per bundle
   identifier, and leaves a `~/Library/Containers/<id>` an unprivileged process
-  **cannot delete**. Q-5's macOS row is the owner's: accept the unsupported-SPI
+  **cannot delete**. A fifth, found in review: a confinement profile bounds what
+  a process may reach *by name* and says nothing about descriptors it was
+  *handed* — the parent's listening endpoints were inherited across the spawn
+  until `FD_CLOEXEC` and `POSIX_SPAWN_CLOEXEC_DEFAULT` closed them. Q-5's macOS row is the owner's: accept the unsupported-SPI
   profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
   untrusted-mod targets. Until then the design stays `exploring` and LUA-9
   through LUA-13 stay undrafted, whatever #147 concludes.

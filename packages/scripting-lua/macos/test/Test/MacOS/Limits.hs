@@ -7,7 +7,7 @@
 -- anything.
 module Test.MacOS.Limits (spec) where
 
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Test.Hspec
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
@@ -19,6 +19,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , awaitExitWithin
   , awaitReady
   , awaitReport
+  , awaitStreamEnd
   , collectReports
   , jetsamAvailable
   , jetsamFlags
@@ -67,13 +68,13 @@ spec = describe "enforced limits" $ do
     ready ← awaitReady launched guardMicroseconds
     ready `shouldBe` True
     status ← awaitExitWithin launched memoryGuardMicroseconds
-    reports ← collectReports launched
     case status of
       Nothing → do
         void (sendSignal launched sigKILL)
         void (awaitExit launched)
         expectationFailure "the unlimited control never finished"
       Just observed → do
+        reports ← completeReports launched
         observed `shouldBe` ExitedWith 0
         [mib | Ceiling mib ← reports] `shouldSatisfy` (not . null)
         putStrLn
@@ -89,7 +90,6 @@ spec = describe "enforced limits" $ do
     ready ← awaitReady launched guardMicroseconds
     ready `shouldBe` True
     guarded ← awaitExitWithin launched memoryGuardMicroseconds
-    reports ← collectReports launched
     case guarded of
       Nothing → do
         void (sendSignal launched sigKILL)
@@ -97,6 +97,7 @@ spec = describe "enforced limits" $ do
         expectationFailure
           "the external guard fired: guard-triggered termination is not evidence that the cap worked"
       Just observed → do
+        reports ← completeReports launched
         -- The cap is fatal, so the violation is a kill the parent observes; it
         -- is never reported to the child as a failed allocation it could catch.
         observed `shouldBe` Signalled 9
@@ -137,22 +138,36 @@ spec = describe "enforced limits" $ do
               <> " MiB budget at all"
           )
 
-  it "ends a helper that never yields, within a configured bound, and observes it end" $ \fixture → do
+  it "enforces a granted execution budget on a helper that never yields, within its total bound" $ \fixture → do
     launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
     running ← awaitReport launched guardMicroseconds isFootprint
     running `shouldSatisfy` isJust'
-    ending ← endWithEscalation launched
-    reports ← collectReports launched
-    [() | Done ← reports] `shouldBe` []
+    -- The budget really runs out: the parent waits out the granted time, finds
+    -- the helper still running, and only then escalates. A helper that had
+    -- stopped on its own would be reported as completed and fail this example.
+    enforcement ← enforceExecutionBudget launched
+    enforcementReason enforcement `shouldBe` "execution-budget-exceeded"
+    [() | Done ← enforcementReports enforcement] `shouldBe` []
     gone ← processGone (launchedPid launched)
     gone `shouldBe` True
-    case endingExit ending of
+    let ceilingMicros =
+          executionBudgetMicroseconds + escalationGraceMicroseconds + hardStopMicroseconds
+    enforcementElapsedMicros enforcement `shouldSatisfy` (< ceilingMicros)
+    case enforcementExit enforcement of
       Signalled signal →
         putStrLn
-          ( "      proved: a helper spinning inside Lua never returned cooperatively and was ended by signal "
+          ( "      proved: a helper spinning inside Lua outlived its granted "
+              <> show (executionBudgetMicroseconds `div` 1000)
+              <> " ms, so the parent recorded enforcement reason "
+              <> show (enforcementReason enforcement)
+              <> " and ended it by signal "
               <> show signal
-              <> (if endingEscalated ending then " after escalation from SIGTERM" else " at the first signal")
-              <> "; the parent's enforcement reason is the configured execution bound, and termination was reaped, not assumed"
+              <> (if enforcementEscalated enforcement then " after escalation from SIGTERM" else " at the first signal")
+              <> "; the status was reaped "
+              <> show (enforcementElapsedMicros enforcement `div` 1000)
+              <> " ms in, inside the "
+              <> show (ceilingMicros `div` 1000)
+              <> " ms total bound, and its output was read to end of file"
           )
       other → expectationFailure ("a helper inside Lua should end by signal, got " <> show other)
  where
@@ -165,6 +180,13 @@ spec = describe "enforced limits" $ do
   isJust' = \case
     Just _ → True
     Nothing → False
+
+-- | Everything a finished helper wrote, waited out rather than sampled.
+completeReports ∷ Launched → IO [Report]
+completeReports launched = do
+  complete ← awaitStreamEnd launched guardMicroseconds
+  unless complete (expectationFailure "the helper ended but its output never reached end of file")
+  collectReports launched
 
 lastHeld ∷ [Report] → Int
 lastHeld reports = case reverse [mib | Held mib ← reports] of

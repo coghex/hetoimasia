@@ -37,6 +37,7 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
     -- * Accounting
   , readFootprint
   , addressSpaceFloor
+  , openDescriptors
 
     -- * The approved module source
   , probeModuleSource
@@ -206,6 +207,20 @@ probePeerEndpoint = "peer-endpoint"
 probeExecuteProgram = "execute-program"
 probeNativeModule = "native-module"
 
+-- | Descriptors above stderr, how many are sockets, and a census of them.
+--
+-- What the process actually holds, rather than what its profile says it may
+-- reach: a peer endpoint inherited across the spawn is a live handle no path
+-- rule is ever consulted about.
+openDescriptors ∷ IO (Int, Int, Text)
+openDescriptors =
+  with 0 $ \socketsOut →
+    allocaBytes messageLimit $ \census → do
+      extra ← c_open_descriptors socketsOut census (fromIntegral messageLimit)
+      sockets ← peek socketsOut
+      summary ← peekCString census
+      pure (fromIntegral extra, fromIntegral sockets, Text.pack summary)
+
 -- | The process's physical footprint and virtual size, in bytes.
 --
 -- Both, because the memory row turns on their difference: the threaded RTS
@@ -277,6 +292,9 @@ foreign import ccall safe "hetoimasia_macos_probe.h hetoimasia_macos_probe_exec"
 
 foreign import ccall safe "hetoimasia_macos_probe.h hetoimasia_macos_probe_dlopen"
   c_probe_dlopen ∷ CString → CString → CSize → IO CInt
+
+foreign import ccall safe "hetoimasia_macos_probe.h hetoimasia_macos_open_descriptors"
+  c_open_descriptors ∷ Ptr CInt → CString → CSize → IO CInt
 
 foreign import ccall unsafe "hetoimasia_macos_probe.h hetoimasia_macos_footprint"
   c_footprint ∷ Ptr Word64 → Ptr Word64 → IO CInt

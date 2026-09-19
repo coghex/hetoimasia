@@ -26,8 +26,9 @@ LUA-9 through LUA-13 undraftable, whatever the Linux proof (#147) concludes.
 
 | Proof | Result | Where |
 | --- | --- | --- |
-| Launch and isolation | **Demonstrated.** Two simultaneous helpers, distinct pids, distinct private directories, distinct IPC endpoints; neither could read the other's sentinel or connect to the other's endpoint; ending one left the other running. All four forbidden accesses are refused from native helper code before any mod source is read, and again from Lua after it loads. | `Test.MacOS.Confinement`, `Test.MacOS.Isolation` |
+| Launch and isolation | **Demonstrated, with one gap named below.** Two simultaneous helpers, distinct pids, distinct private directories, distinct IPC endpoints; neither could read the other's sentinel, connect to the other's endpoint, or hold a descriptor for it; ending one left the other running. All four forbidden accesses are refused from native helper code before any mod source is read. **Three** of the four are refused again from Lua after it loads; the network row has no Lua-side attempt at all, and that is [identified missing evidence](#identified-missing-evidence), not a pass. | `Test.MacOS.Confinement`, `Test.MacOS.Isolation` |
 | Whole-process memory | **Demonstrated.** A parent-installed, fatal, whole-process footprint cap terminated a threaded-RTS helper holding Lua strings and native buffers, at 59 MiB of physical footprint against a 64 MiB cap, before the workload's own 256 MiB ceiling and before the parent's external guard. | `Test.MacOS.Limits` |
+| Execution limit | **Demonstrated.** A helper spinning inside Lua outlives its granted 750 ms budget; the parent finds it still running, records `execution-budget-exceeded`, escalates, and reaps the status within the 7.75 s total bound. | `Test.MacOS.Limits` |
 | Lifetime and identity | **Demonstrated.** Initialization failure, parent cancellation, and a forced kill each leave no live process and no admitted owner; the parent's quota is released from the reaped status, never from the signal send; nothing restarts or replays. | `Test.MacOS.Lifetime` |
 | Deployment | **Demonstrated, and this is where the verdict turns.** The whole probe reproduces from an ordinary command-line `cabal test`, headless, with the linker's ad-hoc signature and nothing else. Both load-bearing mechanisms are unsupported interfaces. | this document |
 
@@ -37,7 +38,7 @@ Run it, on macOS:
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
 ```
 
-Each of the 22 examples prints what it proved.
+Each of the 23 examples prints what it proved.
 
 ### The retained receipt
 
@@ -152,7 +153,55 @@ a plain unconfined child.
 Lua's standard library has no socket API, so the network row cannot be attempted
 from Lua at all. It is attempted natively a second time once untrusted source is
 resident, recorded under its own origin, rather than pretending a Lua call made
-it.
+it. That is a gap in the evidence and is named as one below, not folded into the
+row above.
+
+### Identified missing evidence
+
+**There is no Lua-side network attempt.** Requirement 4 asks for each of the
+four denials to be observed again from Lua once mod source has loaded, and three
+are. The fourth cannot be, on the facts: Lua 5.4's standard library exposes no
+socket API, so a mod written in Lua alone has no call to make. The two ways to
+manufacture one were both rejected as worthless:
+
+- routing it through `os.execute` of a network client would be refused by the
+  **exec** rule, not the network rule, and would prove nothing about the network
+  row;
+- adding a socket binding to the probe's VM would test a capability the design
+  has already decided untrusted Lua never gets.
+
+What is there instead: the native attempt is repeated after the load, under its
+own `native-post-load` origin, so the evidence says a confined process with
+untrusted source resident still cannot open a connection. That is weaker than
+what the requirement asks for, and it is recorded as weaker. It does not change
+the verdict, which is `inconclusive` for an unrelated reason.
+
+### Inherited descriptors, and why the path rules were not the whole answer
+
+A first review of this probe caught something the policy could not have shown:
+the parent's two listening endpoints were being **inherited across the spawn**,
+so each helper held a live descriptor for its peer's socket. A refused
+`connect()` is a statement about a path; a descriptor the child already holds is
+never submitted to that rule at all.
+
+Measured, by disabling both protections and rerunning: the helper reports
+**2 inherited sockets** — the two endpoints. With them in place it reports
+**0**, while the parent's own census taken at the same moment shows it holding
+those 2. Both halves are now in force, because either alone would be a single
+point of failure:
+
+- the listening sockets are marked `FD_CLOEXEC` when they are bound;
+- the spawn sets Apple's `POSIX_SPAWN_CLOEXEC_DEFAULT`, so the child receives
+  *only* what the file actions name — standard input by an explicit self-`dup2`,
+  and its output pipe.
+
+The probe now reports a census of every descriptor it holds above stderr, by
+name, and the example asserts no socket among them and nothing under the fixture
+root. The fourteen that remain are the threaded RTS's own, opened after exec.
+
+For a production design the lesson generalises past this probe: a confinement
+profile bounds what a process may *reach by name*, and says nothing about what
+it was *handed*. Both have to be closed.
 
 The Lua-side denials are evidence about the operating system and not about
 `Library`, because the probe's VM opens `io`, `os`, and `package`

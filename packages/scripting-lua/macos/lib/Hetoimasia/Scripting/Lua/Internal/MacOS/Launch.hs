@@ -32,6 +32,7 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , sendSignal
   , awaitExit
   , awaitExitWithin
+  , awaitStreamEnd
   , processGone
 
     -- * The parent's admission ledger
@@ -263,6 +264,25 @@ awaitExit launched = do
 -- of hanging the suite.
 awaitExitWithin ∷ Launched → Int → IO (Maybe Exit)
 awaitExitWithin launched guardMicros = timeout guardMicros (awaitExit launched)
+
+-- | Wait for the helper's output to reach end of file.
+--
+-- Reaping a status and having read everything the helper wrote are two
+-- different events, and the second is the one that makes 'collectReports'
+-- complete. A caller that reads the reports straight after 'awaitExit' can lose
+-- the final refusal, ceiling, or measurement line to a reader thread that has
+-- not been scheduled yet -- nondeterministically, which is the worst way for
+-- retained evidence to be wrong. 'False' means the stream had still not ended
+-- within the bound, which is a failure rather than something to continue past.
+awaitStreamEnd ∷ Launched → Int → IO Bool
+awaitStreamEnd launched guardMicros =
+  maybe False id
+    <$> timeout
+      guardMicros
+      ( atomically $ do
+          done ← readTVar (launchedFinished launched)
+          if done then pure True else retry
+      )
 
 -- | Is the process identity really gone? Asked only after a status was reaped.
 processGone ∷ ProcessID → IO Bool

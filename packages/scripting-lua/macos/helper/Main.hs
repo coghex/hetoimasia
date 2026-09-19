@@ -49,6 +49,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
   , probePeerEndpoint
   , probePeerSentinel
   , probePrelude
+  , openDescriptors
   , readFootprint
   , addressSpaceFloor
   , verifyConfinement
@@ -117,8 +118,20 @@ confined options confinement = do
     Allowed → case verifyConfinement attempts of
       Left (refusal, detail) → refuse refusal detail
       Right () → do
-        emit Ready
-        admitted options confinement
+        -- What the helper actually holds, before it is trusted with anything.
+        -- A peer endpoint inherited across the spawn would be reachable without
+        -- the sandbox ever being asked, so this is checked beside the policy
+        -- rather than inferred from it.
+        (extra, sockets, census) ← openDescriptors
+        emit (Descriptors extra sockets census)
+        if sockets > 0
+          then
+            refuse
+              ConfinementNotEnforced
+              ("the helper inherited " <> showText sockets <> " socket(s) across the spawn: " <> census)
+          else do
+            emit Ready
+            admitted options confinement
 
 -- | The forbidden accesses, attempted natively before any source is loaded.
 nativeSweep ∷ Options → IO [(Text, Attempt)]
@@ -212,6 +225,9 @@ access origin name attempt =
 
 emit ∷ Report → IO ()
 emit = Text.putStrLn . renderReport
+
+showText ∷ Show a ⇒ a → Text
+showText = Text.pack . show
 
 -- | Report a refusal and leave its own exit status behind.
 refuse ∷ Refusal → Text → IO a

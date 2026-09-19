@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #include <spawn.h>
@@ -157,6 +158,66 @@ int hetoimasia_macos_probe_dlopen(const char *path, char *message, size_t messag
   return 1;
 }
 
+int hetoimasia_macos_open_descriptors(int *sockets, char *summary, size_t summary_len)
+{
+  /* What this process actually holds, rather than what its policy says it may
+   * reach. Descriptors 0, 1 and 2 are the ones the parent granted on purpose;
+   * anything above them is something that leaked across the spawn, and a socket
+   * above them is a peer endpoint the sandbox never got a chance to refuse. */
+  int extra = 0;
+  int socket_count = 0;
+  size_t written = 0;
+  if (summary != NULL && summary_len > 0) {
+    summary[0] = '\0';
+  }
+  struct rlimit descriptors;
+  rlim_t ceiling = 4096;
+  if (getrlimit(RLIMIT_NOFILE, &descriptors) == 0 && descriptors.rlim_cur < ceiling) {
+    ceiling = descriptors.rlim_cur;
+  }
+  for (int candidate = STDERR_FILENO + 1; (rlim_t)candidate < ceiling; candidate++) {
+    if (fcntl(candidate, F_GETFD) < 0) {
+      continue;
+    }
+    extra++;
+    int kind = 0;
+    socklen_t kind_len = (socklen_t)sizeof kind;
+    int is_socket = getsockopt(candidate, SOL_SOCKET, SO_TYPE, &kind, &kind_len) == 0;
+    if (is_socket) {
+      socket_count++;
+    }
+    /* Name each one. "How many" cannot distinguish a descriptor the runtime
+     * opened for itself after exec from one the parent leaked into it, and the
+     * second is the only kind that matters. */
+    char path[PATH_MAX];
+    const char *what = "anonymous";
+    if (is_socket) {
+      what = "socket";
+    } else if (fcntl(candidate, F_GETPATH, path) == 0) {
+      what = path;
+    }
+    if (summary != NULL && written + 32 < summary_len) {
+      int printed = snprintf(
+        summary + written,
+        summary_len - written,
+        "%s%d=%s",
+        written == 0 ? "" : ",",
+        candidate,
+        what);
+      if (printed > 0) {
+        written += (size_t)printed;
+      }
+    }
+  }
+  if (sockets != NULL) {
+    *sockets = socket_count;
+  }
+  if (summary != NULL && summary_len > 0 && summary[0] == '\0') {
+    snprintf(summary, summary_len, "none");
+  }
+  return extra;
+}
+
 int hetoimasia_macos_footprint(uint64_t *footprint, uint64_t *virtual_size)
 {
   task_vm_info_data_t info;
@@ -245,6 +306,16 @@ int hetoimasia_macos_listen_unix(const char *path)
   if (endpoint < 0) {
     return -(errno != 0 ? errno : EPERM);
   }
+  /* The endpoint must never reach a helper as an inherited descriptor. A
+   * path-based connect() denial says nothing about a live handle the child
+   * already holds, so the sandbox's answer would not be the whole answer. The
+   * spawn also asks for close-on-exec by default; this is the half that does
+   * not depend on that flag existing. */
+  if (fcntl(endpoint, F_SETFD, FD_CLOEXEC) != 0) {
+    int failure = errno != 0 ? errno : EPERM;
+    close(endpoint);
+    return -failure;
+  }
   unlink(path);
   if (bind(endpoint, (struct sockaddr *)&address, (socklen_t)sizeof address) != 0) {
     int failure = errno != 0 ? errno : EPERM;
@@ -321,6 +392,15 @@ int hetoimasia_macos_spawn_limited(
   /* The child's stdout and stderr share one pipe. The protocol lines and an
    * RTS message about why the process died are both evidence, and interleaving
    * them costs nothing because the parser keeps what it cannot parse. */
+  /* Everything the child does not explicitly receive is closed at exec.
+   * Without it the child inherits whatever the parent happened to hold --
+   * including another instance's listening endpoint, which would make the
+   * isolation proof a statement about path policy rather than about reachable
+   * handles. stdin is re-declared through a self-dup2 because this flag closes
+   * it too, and a process whose descriptor 0 is free is a process whose next
+   * open() becomes its standard input. */
+  posix_spawnattr_setflags(&attributes, (short)POSIX_SPAWN_CLOEXEC_DEFAULT);
+
   posix_spawn_file_actions_t actions;
   int have_actions = 0;
   if (output_fd >= 0) {
@@ -332,6 +412,7 @@ int hetoimasia_macos_spawn_limited(
     if (close_fd >= 0) {
       posix_spawn_file_actions_addclose(&actions, close_fd);
     }
+    posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO, STDIN_FILENO);
     posix_spawn_file_actions_adddup2(&actions, output_fd, STDOUT_FILENO);
     posix_spawn_file_actions_adddup2(&actions, output_fd, STDERR_FILENO);
     if (output_fd != STDOUT_FILENO && output_fd != STDERR_FILENO) {

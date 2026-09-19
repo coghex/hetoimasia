@@ -24,10 +24,15 @@ module Test.MacOS.Driver
   , outcomeOf
   , mechanismOf
   , guardMicroseconds
-  , graceMicroseconds
   , Ending (..)
   , endWithEscalation
   , endQuietly
+  , observeExit
+  , Enforcement (..)
+  , executionBudgetMicroseconds
+  , escalationGraceMicroseconds
+  , hardStopMicroseconds
+  , enforceExecutionBudget
   ) where
 
 import Control.Exception (ErrorCall (ErrorCall), IOException, bracket_, throwIO, try)
@@ -58,6 +63,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
   , attemptLoadModule
   , attemptReadFile
   , helperProfile
+  , openDescriptors
   , probeExecuteProgram
   , probeHomeSentinel
   , probeModuleSource
@@ -72,11 +78,13 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , Launched
   , awaitExit
   , awaitExitWithin
+  , awaitStreamEnd
   , collectReports
   , launch
   , sendSignal
   , withEndpoint
   )
+import GHC.Clock (getMonotonicTimeNSec)
 import System.Posix.Signals (sigKILL, sigTERM)
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report
   ( Origin (..)
@@ -95,7 +103,10 @@ data Instance = Instance
 
 -- | Everything the examples share.
 data Fixture = Fixture
-  { fixtureHelper ∷ FilePath
+  { fixtureRoot ∷ FilePath
+  -- ^ The canonical directory holding both instances, both endpoints, the
+  -- profile, and the native probe module.
+  , fixtureHelper ∷ FilePath
   , fixtureProfile ∷ FilePath
   , fixtureHomeSentinel ∷ FilePath
   , fixtureExecTarget ∷ FilePath
@@ -105,6 +116,11 @@ data Fixture = Fixture
   , fixtureControls ∷ [(Text, Attempt)]
   -- ^ The same accesses the confined helper attempts, made by the unconfined
   -- parent. Every one of them must be 'Allowed'.
+  , fixtureParentCensus ∷ (Int, Int, Text)
+  -- ^ The parent's own descriptors above stderr, taken while both endpoints
+  -- were bound and just before the helper was spawned. It is the control for
+  -- the helper's census: the parent really was holding the sockets that the
+  -- helper turns out not to have.
   , fixtureSweep ∷ [Report]
   -- ^ One confined helper's whole report, in arrival order.
   , fixtureSweepExit ∷ Exit
@@ -138,9 +154,11 @@ withFixture action = do
       withEndpoint (instanceEndpoint first) $ \_ →
         withEndpoint (instanceEndpoint second) $ \_ → do
           controls ← runControls homeSentinel execTarget nativeModule first second
+          parentCensus ← openDescriptors
           let partial =
                 Fixture
-                  { fixtureHelper = helper
+                  { fixtureRoot = root
+                  , fixtureHelper = helper
                   , fixtureProfile = profile
                   , fixtureHomeSentinel = homeSentinel
                   , fixtureExecTarget = execTarget
@@ -148,6 +166,7 @@ withFixture action = do
                   , fixtureFirst = first
                   , fixtureSecond = second
                   , fixtureControls = controls
+                  , fixtureParentCensus = parentCensus
                   , fixtureSweep = []
                   , fixtureSweepExit = ExitedWith (-1)
                   }
@@ -174,9 +193,7 @@ withFixture action = do
 
   sweep fixture = do
     launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "report" 0
-    status ← awaitExit launched
-    reports ← collectReports launched
-    pure (reports, status)
+    observeExit launched
 
 -- | Run one helper, with the arguments its mode needs.
 launchHelper ∷ Fixture → Instance → Instance → Text → Int → IO Launched
@@ -280,13 +297,21 @@ mechanismOf ∷ Text → [(Text, Outcome, Text)] → Maybe Text
 mechanismOf name entries = (\(_, _, mechanism) → mechanism) <$> find (\(found, _, _) → found == name) entries
 
 
--- | How long a helper is given to end politely before the escalation.
+-- | Reap a helper and read everything it wrote, in that order.
 --
--- It bounds the grace period, not the example: a helper that does exit inside
--- it is observed immediately, and one that does not is escalated rather than
--- waited on.
-graceMicroseconds ∷ Int
-graceMicroseconds = 2000000
+-- Both halves, because they are different events: 'awaitExit' says the process
+-- is gone, and only the stream's end says the parent has the whole of what it
+-- said. Collecting between the two silently loses the last line — the refusal,
+-- the ceiling, the final measurement — whenever the reader thread has not been
+-- scheduled yet, so the wait is an error if it does not complete.
+observeExit ∷ Launched → IO ([Report], Exit)
+observeExit launched = do
+  status ← awaitExit launched
+  complete ← awaitStreamEnd launched guardMicroseconds
+  unless complete $
+    throwIO (ErrorCall "the helper was reaped but its output never reached end of file")
+  reports ← collectReports launched
+  pure (reports, status)
 
 -- | What ending a helper took.
 data Ending = Ending
@@ -295,20 +320,98 @@ data Ending = Ending
   , endingExit ∷ Exit
   -- ^ The status the parent reaped. This, and not the successful signal send,
   -- is what releases a quota.
+  , endingReports ∷ [Report]
+  -- ^ Everything the helper wrote, read to end of file.
   }
   deriving (Eq, Show)
 
 -- | End a helper through the platform's escalation path and observe it end.
+--
+-- Every wait is bounded, including the one after the hard signal: a reap that
+-- could block forever is a suite that hangs rather than an example that fails.
 endWithEscalation ∷ Launched → IO Ending
 endWithEscalation launched = do
   _ ← sendSignal launched sigTERM
-  polite ← awaitExitWithin launched graceMicroseconds
+  polite ← awaitExitWithin launched escalationGraceMicroseconds
   case polite of
-    Just status → pure (Ending False status)
+    Just status → finish False status
     Nothing → do
       _ ← sendSignal launched sigKILL
-      status ← awaitExit launched
-      pure (Ending True status)
+      hard ← awaitExitWithin launched hardStopMicroseconds
+      case hard of
+        Just status → finish True status
+        Nothing → throwIO (ErrorCall "the helper outlived SIGKILL and its bound")
+ where
+  finish escalated status = do
+    complete ← awaitStreamEnd launched guardMicroseconds
+    unless complete $
+      throwIO (ErrorCall "the helper ended but its output never reached end of file")
+    reports ← collectReports launched
+    pure (Ending escalated status reports)
+
+-- | The execution budget an admitted helper is granted, in microseconds.
+--
+-- This is the policy under test, not a synchronisation delay: the examples that
+-- use it have already established by handshake that the helper is running, and
+-- what the budget's expiry proves is that the parent ends a helper that will
+-- never stop on its own. Nothing waits on it to observe a state change.
+executionBudgetMicroseconds ∷ Int
+executionBudgetMicroseconds = 750000
+
+-- | How long the polite signal is given before the hard one.
+escalationGraceMicroseconds ∷ Int
+escalationGraceMicroseconds = 2000000
+
+-- | The last bound. Nothing survives a hard signal this long.
+hardStopMicroseconds ∷ Int
+hardStopMicroseconds = 5000000
+
+-- | What enforcing the execution budget did.
+data Enforcement = Enforcement
+  { enforcementReason ∷ Text
+  -- ^ The parent's own enforcement reason, recorded with the exit.
+  , enforcementEscalated ∷ Bool
+  , enforcementExit ∷ Exit
+  , enforcementElapsedMicros ∷ Int
+  -- ^ From the start of the granted budget to the reaped status.
+  , enforcementReports ∷ [Report]
+  }
+  deriving (Eq, Show)
+
+-- | Grant a running helper an execution budget, and enforce it when it expires.
+--
+-- The budget really expires here: the parent waits out the granted time, finds
+-- the helper still running, and only then escalates. A helper that finishes
+-- inside its budget is not a violation and is reported as one that completed,
+-- so the example asserting enforcement cannot be satisfied by a helper that
+-- simply exited.
+enforceExecutionBudget ∷ Launched → IO Enforcement
+enforceExecutionBudget launched = do
+  started ← getMonotonicTimeNSec
+  granted ← awaitExitWithin launched executionBudgetMicroseconds
+  case granted of
+    Just status → do
+      complete ← awaitStreamEnd launched guardMicroseconds
+      unless complete $
+        throwIO (ErrorCall "the helper completed but its output never reached end of file")
+      reports ← collectReports launched
+      elapsed ← sinceMicros started
+      pure (Enforcement "completed-within-budget" False status elapsed reports)
+    Nothing → do
+      ending ← endWithEscalation launched
+      elapsed ← sinceMicros started
+      pure
+        Enforcement
+          { enforcementReason = "execution-budget-exceeded"
+          , enforcementEscalated = endingEscalated ending
+          , enforcementExit = endingExit ending
+          , enforcementElapsedMicros = elapsed
+          , enforcementReports = endingReports ending
+          }
+ where
+  sinceMicros started = do
+    now ← getMonotonicTimeNSec
+    pure (fromIntegral ((now - started) `div` 1000))
 
 -- | End a helper that an example may already have ended.
 --

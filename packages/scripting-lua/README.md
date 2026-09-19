@@ -409,7 +409,8 @@ directory it was given. It exists to answer
 [Q-5](../../docs/lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)'s
 macOS row with observations.
 
-The answer is `inconclusive`, and
+The answer is `inconclusive` — with one row of evidence explicitly identified as
+missing rather than passed — and
 [docs/macos_confinement_verdict.md](../../docs/macos_confinement_verdict.md) is
 where it is stated and argued: every proof row was demonstrated, on two
 interfaces Apple does not support. Read it before building anything on this

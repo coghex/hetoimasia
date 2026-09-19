@@ -43,6 +43,11 @@ int hetoimasia_macos_probe_exec(const char *path);
  * refused. Returns 0 when the module LOADED, 1 when it did not. */
 int hetoimasia_macos_probe_dlopen(const char *path, char *message, size_t message_len);
 
+/* How many descriptors above stderr this process holds, how many of those are
+ * sockets, and a short census of them. The return value is the count above
+ * stderr; a confined helper's must be zero. */
+int hetoimasia_macos_open_descriptors(int *sockets, char *summary, size_t summary_len);
+
 /* The two ledgers the memory row has to distinguish: the physical footprint
  * jetsam accounts against, and the virtual size the threaded RTS inflates. */
 int hetoimasia_macos_footprint(uint64_t *footprint, uint64_t *virtual_size);
