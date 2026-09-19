@@ -23,6 +23,7 @@ import System.Posix.Process (ProcessStatus (Terminated))
 import System.Posix.Signals (sigKILL)
 import Test.Confinement.Support
   ( Availability
+  , Environment
   , Confined (confinedPid)
   , Controls
   , Launch (launchRoot)
@@ -46,8 +47,8 @@ import Test.Confinement.Support
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe)
 import Test.Support.Bounded (bounded)
 
-spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
-spec ledger available sentinels installed = describe "lifetime" $ do
+spec ∷ Ledger → Controls → [FilePath] → Environment → Availability → Spec
+spec ledger available sentinels machine installed = describe "lifetime" $ do
   it "leaves no admitted owner when initialization fails" $ do
     -- The same real withholding requirement 2 uses, asked here as a lifetime
     -- question: a launch that never produced a child must not have produced
@@ -72,7 +73,7 @@ spec ledger available sentinels installed = describe "lifetime" $ do
           )
 
   it "leaves no live child when the parent's owner is cancelled mid-run" $
-    whenAvailable installed "lifetime-cancellation" $ do
+    whenAvailable machine installed "lifetime-cancellation" $ do
       running ← newIORef Nothing
       started ← newEmptyMVar
       finished ← newEmptyMVar
@@ -116,8 +117,38 @@ spec ledger available sentinels installed = describe "lifetime" $ do
                     <> " admitted-owners=0"
                 )
 
+  it "ends a child that has only just started, before it has said anything" $
+    whenAvailable machine installed "lifetime-immediate-force" $
+      withRoot $ \root →
+        withLaunch ledger (idle root) $ \launched → case launched of
+          Left _ →
+            expectationFailure
+              "the profile installed for the trial child but refused the immediate-force case"
+          Right child → do
+            -- No handshake, no wait. The supervisor publishes success by
+            -- closing its end of the report pipe, and a force arriving in the
+            -- instant after that must already find the handlers in place: one
+            -- that had not installed them yet would die of the signal without
+            -- killing or waiting for the confined process, and this parent
+            -- would reap a supervisor and release bookkeeping while the
+            -- process it stands for was still being killed asynchronously.
+            forceStop child
+            status ← observeExit child
+            drained ← outputClosed child
+            drained `shouldBe` True
+            _ ← releaseAfter ledger child
+            owners ← admittedOwners ledger
+            owners `shouldBe` []
+            status `shouldBe` Terminated sigKILL False
+            announce
+              ( "PROVED lifetime-immediate-force observed="
+                  <> describeStatus status
+                  <> " confined-process-gone=yes waited-for-readiness=no"
+                  <> " admitted-owners=0"
+              )
+
   it "reaps a force-killed child and releases its owner only after observing it" $
-    whenAvailable installed "lifetime-forced-exit" $
+    whenAvailable machine installed "lifetime-forced-exit" $
       withRoot $ \root →
         withLaunch ledger (idle root) $ \launched → case launched of
           Left _ →

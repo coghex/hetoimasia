@@ -22,6 +22,7 @@ module Test.Confinement.Isolation (spec) where
 
 import Test.Confinement.Support
   ( Availability
+  , Environment
   , Confined (confinedPid)
   , Controls
   , Launch (launchEndpoint, launchOutside, launchPeerEndpoint, launchRoot, launchStateDirectory)
@@ -50,10 +51,10 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldNotBe)
 
-spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
-spec ledger available sentinels installed = describe "isolation" $ do
+spec ∷ Ledger → Controls → [FilePath] → Environment → Availability → Spec
+spec ledger available sentinels machine installed = describe "isolation" $ do
   it "gives two simultaneous instances distinct owners that cannot reach each other" $
-    whenAvailable installed "two-instance-isolation" $
+    whenAvailable machine installed "two-instance-isolation" $
       withPair ledger available sentinels $ \alpha beta → do
         let first = instanceChild alpha
             second = instanceChild beta
@@ -123,7 +124,7 @@ spec ledger available sentinels installed = describe "isolation" $ do
           )
 
   it "lets the parent end one instance without disturbing the other" $
-    whenAvailable installed "independent-termination" $
+    whenAvailable machine installed "independent-termination" $
       withPair ledger available sentinels $ \alpha beta → do
         let first = instanceChild alpha
             second = instanceChild beta

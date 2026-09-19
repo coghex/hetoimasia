@@ -17,14 +17,16 @@
 module Test.Confinement.Profile (spec) where
 
 import Test.Confinement.Support
-  ( Availability
+  ( Environment
   , Controls (controlInheritedDescriptor, controlModule)
   , Ledger
   , Observation (observationKind)
+  , Availability (Blocked, Installs)
   , Refusal (refusedErrno, refusedLayer)
   , admittedOwners
   , announce
   , describeRefusal
+  , expectedRefusal
   , fieldIn
   , launchFor
   , observationFor
@@ -43,10 +45,10 @@ import Test.Hspec
   , shouldNotBe
   )
 
-spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
-spec ledger available sentinels installed = describe "profile" $ do
+spec ∷ Ledger → Controls → [FilePath] → Environment → Availability → Spec
+spec ledger available sentinels machine installed = describe "profile" $ do
   it "installs the confinement profile before any mod source is loaded" $
-    whenAvailable installed "confinement-installed" $ do
+    whenAvailable machine installed "confinement-installed" $ do
       let reported = reportedObservations installed
       case [entry | entry ← reported, observationKind entry == "PROFILE"] of
         [] → expectationFailure "the child reported no profile line"
@@ -79,8 +81,17 @@ spec ledger available sentinels installed = describe "profile" $ do
           expectationFailure
             "a launch whose private root does not exist started a child anyway"
         Left refusal → do
-          refusedLayer refusal `shouldNotBe` "none"
-          refusedErrno refusal `shouldNotBe` 0
+          -- Which layer refuses depends on how far this machine gets. Where
+          -- the profile installs, a root that does not exist must be refused
+          -- by the private root itself and by nothing earlier; where it does
+          -- not, the refusal is the machine's own obstacle and must still be
+          -- the one its record explains. Either way the layer is asserted
+          -- rather than merely non-empty.
+          case installed of
+            Installs _ → do
+              refusedLayer refusal `shouldBe` "private-root"
+              refusedErrno refusal `shouldBe` noSuchFileErrno
+            Blocked _ → expectedRefusal machine refusal
           owners ← admittedOwners ledger
           owners `shouldBe` []
           announce
@@ -90,19 +101,20 @@ spec ledger available sentinels installed = describe "profile" $ do
             )
 
   denial
+    machine
     installed
     "reading a host file outside its view"
     ("read-outside-sentinel:" <> firstSentinel)
     (Just "probe_read_outside_sentinel")
 
-  denial installed "opening a network socket" "open-inet-socket" (Just "probe_open_inet_socket")
+  denial machine installed "opening a network socket" "open-inet-socket" (Just "probe_open_inet_socket")
 
-  denial installed "executing another program" "execute-program" (Just "probe_execute_program")
+  denial machine installed "executing another program" "execute-program" (Just "probe_execute_program")
 
-  denial installed "loading a native module" "load-native-module" (Just "probe_load_native_module")
+  denial machine installed "loading a native module" "load-native-module" (Just "probe_load_native_module")
 
   it "runs as the first process of a namespace that holds nothing else" $
-    whenAvailable installed "pid-namespace" $ do
+    whenAvailable machine installed "pid-namespace" $ do
       let reported = reportedObservations installed
       case [entry | entry ← reported, observationKind entry == "PROFILE"] of
         [] → expectationFailure "the child reported no profile line"
@@ -113,13 +125,14 @@ spec ledger available sentinels installed = describe "profile" $ do
           announce ("PROVED pid-namespace child-pid=" <> fieldIn "pid" profile)
 
   denial
+    machine
     installed
     "signalling a process outside its namespace"
     "signal-outside-process"
     Nothing
 
   it "cannot see a descriptor the parent left open above any swept range" $
-    whenAvailable installed "inherited-descriptor" $ do
+    whenAvailable machine installed "inherited-descriptor" $ do
       let reported = reportedObservations installed
       denied reported "native" "see-inherited-descriptor"
       denied reported "existing-thread" "see-inherited-descriptor"
@@ -134,7 +147,7 @@ spec ledger available sentinels installed = describe "profile" $ do
         )
 
   it "refuses a file-backed executable mapping while allowing the same file unmapped" $
-    whenAvailable installed "executable-file-mapping" $ do
+    whenAvailable machine installed "executable-file-mapping" $ do
       let reported = reportedObservations installed
       allowed reported "control" "map-own-file"
       denied reported "native" "map-own-file-executable"
@@ -163,10 +176,10 @@ spec ledger available sentinels installed = describe "profile" $ do
 -- get wrong -- an inherited descriptor, a process outside the namespace -- are
 -- observed from native code alone. Where there is no binding, saying so is
 -- better than publishing one for the sake of symmetry.
-denial ∷ Availability → String → String → Maybe String → Spec
-denial installed subject nativeName luaName =
+denial ∷ Environment → Availability → String → String → Maybe String → Spec
+denial machine installed subject nativeName luaName =
   it ("is refused " <> subject <> ", and names what refused it") $
-    whenAvailable installed nativeName $ do
+    whenAvailable machine installed nativeName $ do
       let reported = reportedObservations installed
       denied reported "native" nativeName
       denied reported "existing-thread" nativeName
@@ -182,6 +195,10 @@ denial installed subject nativeName luaName =
             <> " mechanism="
             <> mechanismFor nativeName
         )
+
+-- | @ENOENT@, which is what a path that is not there answers.
+noSuchFileErrno ∷ Int
+noSuchFileErrno = 2
 
 -- | Which layer of the profile is the one that refuses each operation.
 --

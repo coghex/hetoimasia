@@ -25,6 +25,7 @@ module Test.Confinement.Limits (spec) where
 import Control.Concurrent (threadDelay)
 import Test.Confinement.Support
   ( Availability
+  , Environment
   , Confined
   , Controls
   , Launch (launchMemoryLimit, launchRoot)
@@ -77,10 +78,10 @@ graceMicroseconds = 750000
 forceSignal ∷ Signal
 forceSignal = sigKILL
 
-spec ∷ Ledger → Controls → [FilePath] → Availability → Spec
-spec ledger available sentinels installed = describe "limits" $ do
+spec ∷ Ledger → Controls → [FilePath] → Environment → Availability → Spec
+spec ledger available sentinels machine installed = describe "limits" $ do
   it "enforces one whole-process memory ceiling over Lua, native, and runtime allocation" $
-    whenAvailable installed "whole-process-memory" $
+    whenAvailable machine installed "whole-process-memory" $
       withRoot $ \root → do
         let request =
               (launchFor "memory" root available sentinels "hetoimasia-confine-memory")
@@ -129,7 +130,7 @@ spec ledger available sentinels installed = describe "limits" $ do
                   )
 
   it "ends a child that never yields, through the escalation the profile uses" $
-    whenAvailable installed "execution-bound" $
+    whenAvailable machine installed "execution-bound" $
       withRoot $ \root → do
         let request =
               (launchFor "spin" root available sentinels "hetoimasia-confine-spin")

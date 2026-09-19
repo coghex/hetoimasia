@@ -69,7 +69,7 @@ spec ledger available sentinels machine installed = describe "Linux confinement"
           expectationFailure
             "no shared library on this machine could be loaded, so the module denial has no control"
 
-  Test.Confinement.Profile.spec ledger available sentinels installed
-  Test.Confinement.Isolation.spec ledger available sentinels installed
-  Test.Confinement.Limits.spec ledger available sentinels installed
-  Test.Confinement.Lifetime.spec ledger available sentinels installed
+  Test.Confinement.Profile.spec ledger available sentinels machine installed
+  Test.Confinement.Isolation.spec ledger available sentinels machine installed
+  Test.Confinement.Limits.spec ledger available sentinels machine installed
+  Test.Confinement.Lifetime.spec ledger available sentinels machine installed

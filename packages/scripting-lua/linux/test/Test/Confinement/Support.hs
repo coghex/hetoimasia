@@ -73,6 +73,7 @@ module Test.Confinement.Support
     -- * Reporting
   , announce
   , whenAvailable
+  , expectedRefusal
   , reportedObservations
   , reportedLines
   ) where
@@ -120,7 +121,7 @@ import System.Posix.Process
   )
 import System.Posix.Signals (Signal, sigKILL, sigTERM, sigUSR1, signalProcess)
 import System.Posix.Types (CPid (CPid), Fd, ProcessID)
-import Test.Hspec (Expectation, shouldNotBe)
+import Test.Hspec (Expectation, expectationFailure)
 import Test.Support.Bounded (bounded)
 
 -- --------------------------------------------------------------------------
@@ -756,20 +757,49 @@ reportedLines (Blocked _) = []
 reportedObservations ∷ Availability → [Observation]
 reportedObservations = observationsIn . reportedLines
 
--- | Run an example's body where the profile installs; where it does not, assert
--- the blocked contract instead and say so.
+-- | Run an example's body where the profile installs; where it does not, check
+-- that the refusal is the one this machine's own record explains, and say so.
 --
--- This is what keeps a green suite from reading as a supported platform. An
--- environment that cannot install the profile still has something to verify --
--- that the refusal is typed and names a prerequisite, which is requirement 2's
--- fail-closed contract -- and the line it prints is what the verdict quotes
--- when it records the experiment as unproven here.
-whenAvailable ∷ Availability → String → IO () → Expectation
-whenAvailable (Installs _) _ body = body
-whenAvailable (Blocked refusal) subject _ = do
-  refusedLayer refusal `shouldNotBe` ""
-  refusedErrno refusal `shouldNotBe` 0
+-- This is what keeps a green suite from reading as a supported platform, and
+-- what keeps it from reading as an explained one either. "Blocked" is only an
+-- acceptable outcome for the obstacle the environment record independently
+-- measured: a machine whose user namespace the record says is usable, or a
+-- refusal at some later layer -- no-new-privs, the private root, the exec --
+-- is a regression in this code rather than a property of the machine, and an
+-- example that shrugged at it would let every experiment here report
+-- @unproven-here@ while validation stayed green.
+--
+-- The check is an agreement between two measurements of the same thing. The
+-- record forks a child and attempts the namespace, the identity maps, and a
+-- mount namespace under it; the launcher attempts the whole profile. If the
+-- first says the namespace is unusable with some errno, a launch refused at
+-- that layer with that errno is the same finding twice. Anything else is not.
+whenAvailable ∷ Environment → Availability → String → IO () → Expectation
+whenAvailable _ (Installs _) _ body = body
+whenAvailable machine (Blocked refusal) subject _ = do
+  expectedRefusal machine refusal
   announce ("BLOCKED experiment=" <> subject <> " unproven-here " <> describeRefusal refusal)
+
+-- | That a refusal is the one this machine's environment record explains.
+expectedRefusal ∷ Environment → Refusal → Expectation
+expectedRefusal machine refusal = case environmentUserNamespace machine of
+  Left observed
+    | refusedLayer refusal == "user-namespace" && refusedErrno refusal == observed →
+        pure ()
+    | otherwise →
+        expectationFailure
+          ( "this machine cannot create a usable user namespace (errno "
+              <> show observed
+              <> "), but the launch was refused at "
+              <> describeRefusal refusal
+              <> ", which is not that obstacle"
+          )
+  Right () →
+    expectationFailure
+      ( "this machine can create a usable user namespace, so a launch refused at "
+          <> describeRefusal refusal
+          <> " is a regression rather than a property of the machine"
+      )
 
 describeAvailability ∷ Availability → String
 describeAvailability (Installs _) = "AVAILABILITY profile=installed"

@@ -570,21 +570,36 @@ static void hetoimasia_confine_child(const char *program, char *const argv[],
     }
 
     hetoimasia_supervised = confined;
-    /* The exec's silence is the success signal, and it is only silence once
-    ** every copy of the write end is gone. This one is the last. */
-    close(report);
+    /* Handlers first, and the success signal afterwards.
+    **
+    ** Closing the report descriptor is what lets the caller's read return
+    ** end-of-file, and end-of-file is what tells it the launch succeeded and
+    ** it may start signalling. A supervisor that published success before
+    ** installing these would have a window in which the force signal still had
+    ** its default action: it would die of it without killing or waiting for the
+    ** confined process, leaving the caller to reap a supervisor and release
+    ** bookkeeping while the process it stands for was still being killed
+    ** asynchronously by its parent-death signal. So the window is closed by
+    ** ordering rather than by hoping the caller is slow. */
     {
       struct sigaction forwarding;
       memset(&forwarding, 0, sizeof(forwarding));
       forwarding.sa_handler = hetoimasia_forward_stop;
       sigemptyset(&forwarding.sa_mask);
       forwarding.sa_flags = SA_RESTART;
-      sigaction(SIGTERM, &forwarding, NULL);
-      sigaction(SIGINT, &forwarding, NULL);
-      sigaction(SIGHUP, &forwarding, NULL);
+      if (sigaction(SIGTERM, &forwarding, NULL) != 0 ||
+          sigaction(SIGINT, &forwarding, NULL) != 0 ||
+          sigaction(SIGHUP, &forwarding, NULL) != 0) {
+        hetoimasia_refuse(report, HETOIMASIA_LAYER_SUPERVISOR, errno);
+      }
       forwarding.sa_handler = hetoimasia_force_stop;
-      sigaction(HETOIMASIA_CONFINE_FORCE_SIGNAL, &forwarding, NULL);
+      if (sigaction(HETOIMASIA_CONFINE_FORCE_SIGNAL, &forwarding, NULL) != 0) {
+        hetoimasia_refuse(report, HETOIMASIA_LAYER_SUPERVISOR, errno);
+      }
     }
+    /* The exec's silence is the success signal, and it is only silence once
+    ** every copy of the write end is gone. This one is the last. */
+    close(report);
     {
       int status = 0;
       while (waitpid(confined, &status, 0) < 0) {
