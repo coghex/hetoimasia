@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 16,
+  "policy_version": 17,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -189,7 +189,10 @@
       "runner": "cpu",
       "timeout_seconds": 1800,
       "category": "test",
-      "optional": false
+      "optional": false,
+      "platforms": [
+        "Linux"
+      ]
     },
     {
       "id": "test.vulkan",

@@ -222,6 +222,30 @@ def inspect_group(
     identifier = entry["id"]
     reason = entry["reason"]
     if not entry["selected"]:
+        if reason == receipts.PLATFORM_INAPPLICABLE:
+            # The one omission that also refuses evidence. The other two
+            # describe work this platform could have done and did not need to,
+            # so a stray receipt beside them is merely superfluous. This one
+            # describes a command whose components this platform does not
+            # build, so nothing here could have executed it: a document
+            # claiming otherwise is a contradiction, and accepting it silently
+            # is exactly how an omission would be read back as coverage.
+            if os.path.exists(receipts.receipt_path(directory, identifier)):
+                return Finding(
+                    identifier,
+                    reason,
+                    "invalid",
+                    f"a receipt was collected for a group this plan's {plan['runner_os']} workers "
+                    "do not build, so no execution in this run can have produced it",
+                    False,
+                )
+            return Finding(
+                identifier,
+                reason,
+                "omitted",
+                f"not built on {plan['runner_os']}; nothing executed it and no receipt stands for it",
+                True,
+            )
         if reason in receipts.OMITTED_REASONS:
             return Finding(identifier, reason, "omitted", "explained without execution", True)
         return Finding(
@@ -371,7 +395,10 @@ def read_applicability(
 
     A document resolved for another plan or another candidate is stale, and a
     stale record cannot satisfy anything: it is reported as an obstacle so the
-    verdict fails rather than quietly excusing a group nothing ran.
+    verdict fails rather than quietly excusing a group nothing ran. A record
+    for a group this plan's platform does not build is reported the same way,
+    for the same reason from the other direction: it is evidence from a machine
+    this plan is not about.
     """
     if not path:
         return {}, [], []
@@ -382,11 +409,28 @@ def read_applicability(
         # they are dropped rather than reported against this one.
         return {}, [], problems
     selected = set(plan["selected"])
+    # A platform-inapplicable group is unselected, so its records would be
+    # dropped by the filter below like any other unselected group's. They are
+    # named instead: an earlier execution offered for a command this plan's
+    # workers do not build describes another platform's machine, and silently
+    # discarding it would leave the document looking like it vouched for
+    # something. Nothing here can turn the omission into a pass either way.
+    inapplicable = {
+        entry["id"]
+        for entry in plan["groups"]
+        if entry["reason"] == receipts.PLATFORM_INAPPLICABLE
+    }
+    offered = [
+        f"the applicability document offers an earlier execution of {record['group']}, which "
+        f"this plan's {plan['runner_os']} workers do not build"
+        for record in document["reused"]
+        if record["group"] in inapplicable
+    ]
     applicable: dict[str, dict] = {}
     for record in document["reused"]:
         if record["group"] in selected:
             applicable[record["group"]] = record
-    return applicable, list(document["rejected"]), []
+    return applicable, list(document["rejected"]), offered
 
 
 def main(argv: list[str]) -> int:

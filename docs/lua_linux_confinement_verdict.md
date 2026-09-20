@@ -48,10 +48,20 @@ workflow run
 [35462003355](https://github.com/coghex/hetoimasia/actions/runs/35462003355) at
 commit `6d88ec7`, whose plan step resolved the candidate's input identity as
 `d37235cb…2987a1` and whose `receipt-test.lua-confinement-linux-<identity>`
-artifact is that group's receipt. Only Markdown changes after that commit, which
-the catalog classes as non-affecting, so that run stays input-equivalent to the
-head this verdict ships with — `plan.py --base 6d88ec7 --head HEAD` reports the
-group `unaffected`.
+artifact is that group's receipt.
+
+What that run observed is what this verdict rests on, and a later candidate's
+selection neither strengthens nor retracts it. The probe's own package
+description and the validation policy that classifies it have both moved since
+that commit, so `plan.py --base 6d88ec7 --head HEAD --runner-os Linux` now
+reports the group `affected` and CI runs it again on the evidence's own
+platform. The same command with `--runner-os Darwin` reports it
+`platform-inapplicable`: the group declares `"platforms": ["Linux"]`, so a
+Darwin plan omits it rather than requiring an execution no Darwin machine can
+perform. That omission is not a second opinion about confinement. No macOS run
+of this probe exists, none is accepted as evidence for it, and
+[the macOS probe](macos_confinement_verdict.md) is a separate proof with a
+verdict of its own.
 
 Its containers declare no added capability and no relaxed syscall filter, and
 the container runtime's default filter is what refuses `unshare(CLONE_NEWUSER)`

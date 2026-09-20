@@ -85,6 +85,7 @@ Each group declares:
 | `timeout_seconds` | integer | Positive. |
 | `category` | string | `build`, `test`, `smoke`, or `probe`. |
 | `optional` | boolean | Required. An optional group runs only when explicitly requested. |
+| `platforms` | array of strings, optional | The `runner_os` values whose workers build this group's components. Omitting the key declares the group applicable everywhere, which is the ordinary case; a declaration narrows and can never widen. A plan taken on a platform the list does not name omits the group as [`platform-inapplicable`](#reasons-and-inputs_changed). Entries must be non-empty, distinct, and match the plan's `runner_os` exactly (`Linux`, `Darwin`), the way the [image](#the-linux-ci-image) compares it. A `floor` group may not declare it: the mandatory floor is selected on every platform. |
 
 Observed durations and pass/fail history are deliberately absent: the catalog
 declares what a group is, not how it has behaved.
@@ -109,19 +110,26 @@ identifier lists are sorted.
 
 ### The registered groups
 
-| ID | Command | Optional | In the floor |
-| --- | --- | --- | --- |
-| `build.all` | `cabal build all` | no | yes |
-| `test.engine` | `cabal test hetoimasia-tests --test-show-details=direct` | no | yes |
-| `test.foundation` | `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct` | no | yes |
-| `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes |
-| `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes |
-| `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no |
-| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | no | no |
-| `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no |
-| `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes |
-| `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no |
-| `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no |
+| ID | Command | Optional | In the floor | Platforms |
+| --- | --- | --- | --- | --- |
+| `build.all` | `cabal build all` | no | yes | any |
+| `test.engine` | `cabal test hetoimasia-tests --test-show-details=direct` | no | yes | any |
+| `test.foundation` | `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct` | no | yes | any |
+| `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes | any |
+| `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes | any |
+| `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
+| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | no | no | `Linux` |
+| `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
+| `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
+| `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
+| `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
+
+*Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
+which declares nothing and is applicable everywhere. A plan taken on a platform
+a declaration does not name omits that group as
+[`platform-inapplicable`](#reasons-and-inputs_changed) rather than selecting
+work it cannot execute. The optional `test.macos-confinement` below declares
+none, and reaches the same end through optionality instead.
 
 `test.foundation` runs the foundation package's own suite: the `Logging`,
 `Resources`, `Failures`, `Recovery`, `Workers`, `Messaging`, and `Time`
@@ -182,6 +190,32 @@ buildable` conditional excludes them elsewhere, so the group is not a vacuous
 pass on a machine that cannot run it -- and the planner accepts that conditional
 without reading its body, so the probe's sources select this group on every
 platform rather than only on the one that builds them.
+
+Selecting it everywhere and executing it only on Linux are two different
+statements, and the catalog makes the second one itself: the group declares
+`"platforms": ["Linux"]`. On a Linux plan nothing changes -- it is non-optional,
+selected from its own inputs or the unknown-input fallback, and routed to a
+`cpu` worker like any other mandatory group outside the floor. On a plan for
+any other `runner_os` it is omitted as `platform-inapplicable`, while still
+reporting its `inputs_changed` exactly as the Linux plan does.
+
+That omission is what makes a local macOS plan possible at all. Every
+dependency change moves `cabal.project.common`, which this group declares, so
+every such candidate planned on Darwin used to select a non-optional group that
+Darwin could neither route (the plan was refused for a group no worker owned)
+nor execute (Cabal refuses the component as `buildable: False`). Declaring the
+platform resolves that without weakening anything: the group is still
+mandatory, CI still selects it from changed inputs, the probe's components are
+still excluded off Linux, and no Darwin receipt for it is written or accepted
+-- the runner refuses to execute it, and
+[the aggregate](#the-aggregate-and-build-test) refuses a receipt or an earlier
+execution offered for it rather than reading either as coverage.
+
+[`test.macos-confinement`](#the-macos-confinement-probe) declares no
+`platforms`, and that is deliberate: its policy is the one below, built on
+being *optional*, which already keeps every Linux plan from selecting it. A
+request that names it on Linux is meant to fail loudly in Cabal rather than be
+explained away, so nothing here changes it.
 
 What is unlike every other group here is that a green run of it is evidence,
 never a verdict: each example prints what it proved or, where the machine could
@@ -359,16 +393,37 @@ Renames and deletions count both endpoints as changed. Each changed path is then
 ## Reasons and `inputs_changed`
 
 Every group appears in the plan with `selected`, `inputs_changed`, and exactly
-one reason from `floor`, `affected`, `requested`, `unknown-input`, `unaffected`,
-and `optional-unrequested`. When several apply, the first matching rule wins:
+one reason from `platform-inapplicable`, `floor`, `affected`, `requested`,
+`unknown-input`, `unaffected`, and `optional-unrequested`. When several apply,
+the first matching rule wins:
 
-1. an optional group that was requested — `requested`;
-2. any other optional group — `optional-unrequested`;
-3. a non-optional group in the floor — `floor`;
-4. a non-optional group with changed inputs — `affected`;
-5. a non-optional group that was requested — `requested`;
-6. a non-optional group under unknown-input fallback — `unknown-input`;
-7. otherwise — `unaffected`.
+1. a group whose `platforms` do not name this plan's `runner_os` —
+   `platform-inapplicable`;
+2. an optional group that was requested — `requested`;
+3. any other optional group — `optional-unrequested`;
+4. a non-optional group in the floor — `floor`;
+5. a non-optional group with changed inputs — `affected`;
+6. a non-optional group that was requested — `requested`;
+7. a non-optional group under unknown-input fallback — `unknown-input`;
+8. otherwise — `unaffected`.
+
+Platform applicability is asked first, and it is the one answer a request
+cannot argue with: an explicit `validation-request` naming the group, and
+`all-hspec` expanding to it, both leave it omitted on a platform that does not
+build it. That is deliberate rather than convenient. A group whose components
+are excluded by an `if os(...)`/`else buildable` conditional has no command a
+worker could run there, so selecting it produces either a plan
+[no worker can route](#runner-classes-and-workers) or a command that fails in
+Cabal before the group's own code is reached. Neither outcome is a result about
+the candidate. The reason is its own value so a consumer can tell that omission
+apart from `unaffected`, from `optional-unrequested`, and from a pass: the
+first two say this platform did not *need* to run the group, and this one says
+this platform *cannot*.
+
+Nothing else follows from it. The group stays non-optional, the
+[mandatory floor](#the-registered-groups) is unchanged — a floor group may not
+declare `platforms` at all — and the platform that does build the group selects
+it from exactly the inputs it always did.
 
 `inputs_changed` is independent of selection, and describes the *contribution*:
 which groups this change touches relative to the base it is compared against. It
@@ -382,7 +437,19 @@ question is answered by [candidate identity](#candidate-identity) instead.
 - unknown-input fallback marks every non-optional group's inputs changed, so
   uncertainty can never reach a consumer as equivalence;
 - an optional group still reports `true` when its own inputs changed or its own
-  catalog definition moved, even though it stays unselected.
+  catalog definition moved, even though it stays unselected;
+- a `platform-inapplicable` group reports exactly what it reports on the
+  platform that builds it. Input derivation, the unknown-input fallback, and
+  the [identity digests](#candidate-identity) never read `platforms`, so what a
+  candidate touches is the same question wherever it is asked, and only what
+  can be executed changes.
+
+The identity *digests* are a separate matter from input derivation, and they do
+legitimately differ between two real platforms: a Linux plan folds the
+[image digest and native manifest](#the-linux-ci-image) into its toolchain,
+and `runner_os` is itself part of `plan_identity` and of every receipt's
+compatibility. Platform applicability adds nothing to that difference; it reads
+the `runner_os` the plan already records.
 
 ## Candidate identity
 
@@ -488,7 +555,7 @@ planner reads the text from `--request-file`.
 | `request` | The request `source`, its literal `ids`, its `all_hspec` flag, and the `resolved` identifier set. |
 | `changed_paths` | Each path with its Git `status`, its `classification`, and its `consumers`. |
 | `unknown_inputs` | The unclassified paths, sorted. |
-| `groups` | Every catalog group with `selected`, `inputs_changed`, `reason`, and its declared metadata, including `runner`. |
+| `groups` | Every catalog group with `selected`, `inputs_changed`, `reason`, and its declared metadata, including `runner` and `platforms` — the declared list, or `null` for a group applicable everywhere, so a consumer reads the declaration rather than inferring it from the reason. |
 | `selected` | The selected identifiers, in catalog order. |
 | `workers` | The validated worker assignment — each worker's `name`, sorted `runner_classes`, and `groups` in catalog order, workers sorted by name — or `null` for a plan resolved without `--worker`, which no tool will execute, reuse, or aggregate against. |
 
@@ -1097,7 +1164,13 @@ agrees with the candidate on every compatibility field — `input_identity`,
 already held to, and was produced by the worker and runner class the plan routes
 that group to. A group the plan explained away as `unaffected` or
 `optional-unrequested` needs no receipt and is reported as an omission rather
-than a failure. Everything else fails: a missing receipt, a failed or timed-out
+than a failure. A `platform-inapplicable` group is reported as an omission too,
+and is the one omission that also *refuses* evidence: a receipt collected for
+it, or an applicability record offering an earlier execution of it, describes a
+machine this plan is not about, so either fails the verdict instead of being
+ignored. The verdict itself may still pass -- an aggregate succeeds when every
+selected group is satisfied, with that group named as unexecuted -- but the
+group is never reported as having passed. Everything else fails: a missing receipt, a failed or timed-out
 one, a malformed one, one belonging to another plan, head, or candidate, one
 recording inputs or a platform this plan was not resolved for, and **any worker
 that did not conclude `success`, or reported no result at all, while its groups
@@ -1432,13 +1505,25 @@ native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native"
 ```
+
+That declaration names every group a Darwin plan can select, and deliberately
+not `test.lua-confinement-linux`. That group declares `"platforms": ["Linux"]`,
+so a Darwin plan omits it as `platform-inapplicable` however its inputs moved
+-- and its inputs move constantly, since it declares `cabal.project.common`.
+Assigning it to the local worker anyway is harmless and pointless: routing is
+decided against the groups the plan *selected*, so the assignment binds
+nothing, and the runner refuses to execute an omitted group. The plan is
+accepted, `test.lua-confinement-linux` is reported unexecuted rather than
+passed, and the Linux evidence for it stays CI's to produce. Running with
+`--runner-os Linux` on this same candidate still selects the group and still
+refuses a plan that assigns it to no `cpu` worker.
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the
@@ -1966,6 +2051,15 @@ the empty Hspec match, malformed, missing, and non-UTF-8 catalogs and package
 metadata, unresolvable revisions, and the explained omissions in the prose
 output.
 
+Platform applicability has its own examples, all of which plan one candidate
+twice, for a `runner_os` that builds the group and one that does not: an
+affected candidate, a shared `cabal.project.common` change, and the
+unknown-input fallback, each reporting the same `inputs_changed` on both
+platforms while only the selection moves; and the precedence an explicit
+request and an `all-hspec` expansion do not have over it. The catalog check has
+its own: a mandatory floor naming a platform-restricted group, and a
+declaration that is empty, not a list of strings, or names one platform twice.
+
 The same suite drives the real runner, aggregate, timing report, and review
 gate against fixture catalogs, plans, and receipt directories. It covers a
 failing command's non-zero receipt, the enforced catalog timeout and the reaping
@@ -1973,7 +2067,13 @@ of the command's descendants, a plan whose candidate is not its head executing
 from a checkout of that candidate and recording both separately, a selected
 group with no receipt, receipts belonging to another plan or another head,
 malformed receipts and malformed plans, omitted `unaffected`
-and `optional-unrequested` groups passing without receipts, one failing group
+and `optional-unrequested` groups passing without receipts, a
+`platform-inapplicable` group the runner refuses to execute and leaves no
+receipt for, that omission reported explicitly while the selected groups are
+still required, and both ways evidence for it is refused rather than read as
+coverage — a receipt collected under its name, and an applicability record
+offering an earlier execution of it, which the reuse lookup never produces
+because it never looks the group up at all — one failing group
 failing the verdict while others passed, a worker cancelled or unexpectedly
 skipped while its groups were selected, a worker that concluded `failure` while
 every receipt it left behind passed, a worker legitimately skipped because

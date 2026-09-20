@@ -60,9 +60,17 @@ def artifact_name(group: str, identity: str) -> str:
 # from one that ran to completion and disagreed with the code.
 OUTCOMES = ("passed", "failed", "timeout")
 
+# The reason a group is omitted because the plan's platform does not build the
+# components its command targets. It is kept apart from the other omissions
+# because they describe work this platform *could* have done and did not need
+# to, while this one describes work no execution here could have performed: a
+# receipt or an earlier execution offered for it is refused rather than
+# ignored, so an omission can never be read back as coverage.
+PLATFORM_INAPPLICABLE = "platform-inapplicable"
+
 # Selection reasons that explain a group away without any execution. Every
 # other reason names work the aggregate expects a receipt for.
-OMITTED_REASONS = ("unaffected", "optional-unrequested")
+OMITTED_REASONS = ("unaffected", "optional-unrequested", PLATFORM_INAPPLICABLE)
 
 
 class EvidenceError(Exception):

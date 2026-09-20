@@ -337,6 +337,35 @@ spec = describe "Validation evidence reuse" $ do
         output `shouldContain` "test.fail"
         output `shouldContain` "neither an execution nor an applicable earlier receipt"
 
+    it "never looks up or records coverage for a group this platform does not build" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [passing receipt]
+        (result, output, _) ← reuse fixture plan
+        result `shouldBe` ExitSuccess
+        -- Unselected work is not looked up, so the document neither reuses,
+        -- refuses, nor reports an obstacle for it. An omission that arrived
+        -- with a record beside it would read as coverage.
+        output `shouldNotContain` "probe.elsewhere"
+        document ← applicability fixture
+        recordText document "probe.elsewhere" "source_run_url" `shouldBe` Nothing
+        rejectionText document "probe.elsewhere" "source_run_url" `shouldBe` Nothing
+        obstacles fixture >>= \recorded → recorded `shouldNotContain` "probe.elsewhere"
+
+    it "refuses a record that offers an earlier execution of a group this platform does not build" $
+      withReceipt $ \fixture receipt → do
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [passing receipt]
+        looked ← reuse fixture plan
+        exitOf looked `shouldBe` ExitSuccess
+        -- A genuine record reattributed to the inapplicable group: evidence
+        -- from a machine this plan is not about. Dropping it silently would
+        -- leave the document looking like it vouched for something.
+        reattribute fixture (root fixture </> "applicability.json") "probe.elsewhere"
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "workers do not build"
+
     it "refuses a record resolved for another plan" $
       withReceipt $ \fixture receipt → do
         plan ← proseCandidate fixture
@@ -932,6 +961,31 @@ rename fixture path name = do
   (result, errors) `shouldBe` (ExitSuccess, "")
 
 -- | Drop one field from every receipt an applicability document carries.
+-- | Reattribute every record in an applicability document to another group,
+-- moving the three places that name it — the record, the receipt it embeds,
+-- and the artifact it came from — so the document is well formed and claims a
+-- group it should not.
+reattribute ∷ Fixture → FilePath → String → IO ()
+reattribute fixture path group = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json, sys\n\
+        \path, group = sys.argv[1:3]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \for record in document['reused']:\n\
+        \    record['group'] = group\n\
+        \    record['receipt']['group'] = group\n\
+        \    record['artifact']['name'] = 'receipt-' + group + '-' + document['input_identity']\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , path
+      , group
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
 truncate' ∷ Fixture → FilePath → String → IO ()
 truncate' fixture path key = do
   (result, _, errors) ←
@@ -1143,6 +1197,22 @@ fixtureCatalogWith policy inputs =
     , "      \"timeout_seconds\": 60,"
     , "      \"category\": \"test\","
     , "      \"optional\": false"
+    , "    },"
+    -- A group whose command targets components no machine here builds. No real
+    -- platform reports itself as Plan9, so every plan below omits it as
+    -- platform-inapplicable however the host reports itself.
+    , "    {"
+    , "      \"id\": \"probe.elsewhere\","
+    , "      \"description\": \"A group this platform does not build.\","
+    , "      \"command\": [\"true\"],"
+    , "      \"component\": null,"
+    , "      \"inputs\": [\"src/\"],"
+    , "      \"framework\": \"hspec\","
+    , "      \"runner\": \"cpu\","
+    , "      \"timeout_seconds\": 60,"
+    , "      \"category\": \"probe\","
+    , "      \"optional\": false,"
+    , "      \"platforms\": [\"Plan9\"]"
     , "    }"
     , "  ]"
     , "}"
