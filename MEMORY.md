@@ -18,9 +18,12 @@ The [first guide review](docs/guide/2026-09-20T183233Z-d40c387-6e92.md) covers
 seven later merged PRs through `d40c387`, the current issue specifications,
 743 passing headless examples and the remaining amendments/housekeeping.
 The owner accepted legacy coverage through `a89d419`; together these complete
-the guide's historical review queue through `d40c387`. Preserve the five open
-findings and qualification gates. `$guide continue` handles one follow-up at a
-time; it does not repeat the old audit or silently approve the proposed change.
+the guide's historical review queue through `d40c387`. Those five findings are
+now processed; implementation remains tracked in #201, #208, #211 and #212,
+and qualification gates remain in force. The [next guide review](docs/guide/2026-09-20T201612Z-8b2fcfd-ff7e.md)
+extends coverage through `8b2fcfd` (PR #210), verifies the dispositions, and
+records the remaining owner-loop policy decision and a small wording correction.
+`$guide continue` handles one follow-up at a time without repeating old audits.
 
 ## Direction and owner preferences
 
