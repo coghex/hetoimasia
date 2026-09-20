@@ -46,6 +46,7 @@ module Test.Vulkan.Proof.Retention
   , handleEntry
   , isDestruction
   , teardownPlan
+  , capturePlan
   , teardownEntries
 
     -- * The decision
@@ -192,6 +193,11 @@ data Handle
     -- everything whose completion the device-idle boundary does establish.
   | SlotPresentFence SlotName
   | SlotPresentSemaphore SlotName
+  | TheCaptureBuffer
+    -- ^ The readback buffer the capture path creates, owned from the instant
+    -- it exists rather than only at the successful end of that path.
+  | TheCaptureMemory
+    -- ^ The host-visible allocation bound to it, owned the same way.
   | TheSwapchain
   | TheLogicalDevice
   | TheWindowSurface
@@ -208,6 +214,8 @@ describeHandle = \case
   SlotWorkObjects slot → "the command pool, rendering fence and acquisition semaphore of " <> slot
   SlotPresentFence slot → "the present fence of " <> slot
   SlotPresentSemaphore slot → "the presentation semaphore of " <> slot
+  TheCaptureBuffer → "the capture buffer"
+  TheCaptureMemory → "the capture memory"
   TheSwapchain → "the swapchain"
   TheLogicalDevice → "the logical device"
   TheWindowSurface → "the window surface"
@@ -237,6 +245,11 @@ handleEntry = \case
   SlotWorkObjects _ → "the frame slots"
   SlotPresentFence _ → "the frame slots"
   SlotPresentSemaphore _ → "the frame slots"
+  -- One entry each, and neither is among the ten a whole run releases: the
+  -- capture frees both itself and takes their registrations back, so they
+  -- appear only on a run that stopped while it still held them.
+  TheCaptureBuffer → "the capture buffer"
+  TheCaptureMemory → "the capture memory"
   TheSwapchain → "the swapchain"
   TheLogicalDevice → "the logical device"
   TheWindowSurface → "the window surface"
@@ -246,12 +259,20 @@ handleEntry = \case
   TheCallbackTrampoline → "the callback trampoline"
   GlfwTermination → "GLFW"
 
--- | Every handle a whole run registers, in the order teardown reaches them:
--- the reverse of the order the procedure registered their cleanups.
+-- | Every handle a whole run still holds when teardown starts, in the order
+-- teardown reaches them: the reverse of the order the procedure registered
+-- their cleanups.
 --
 -- A run that stopped early registered a prefix of this, so the executor builds
 -- its plan from what was actually registered. This is the whole of it, which
 -- is what the examples and 'teardownEntries' are written against.
+--
+-- 'TheCaptureBuffer' and 'TheCaptureMemory' are deliberately not here. The
+-- capture path owns both from the instant each exists, and a run that reaches
+-- the end of that path frees them itself and takes their registrations back —
+-- so a whole run arrives at teardown holding neither, and the ten entries
+-- below are unchanged. 'capturePlan' is where a run that stopped inside the
+-- capture still holds them.
 teardownPlan ∷ [SlotName] → [Handle]
 teardownPlan slots =
   [TheTeardownBoundary]
@@ -268,6 +289,15 @@ teardownPlan slots =
        , TheCallbackTrampoline
        , GlfwTermination
        ]
+
+-- | Where the capture's own two handles sit in a plan that still carries them,
+-- in the order teardown reaches them: the memory first, which is the order the
+-- successful path frees them in and the one @vkFreeMemory@ permits.
+--
+-- The procedure registers them immediately before the teardown boundary, so a
+-- run that stopped inside the capture reaches them right after it.
+capturePlan ∷ [Handle]
+capturePlan = [TheCaptureMemory, TheCaptureBuffer]
 
 -- | The ten cleanup entries a whole teardown releases, in order. Requirement 7
 -- fixes this list and this order for the successful path; the finer handles
@@ -457,6 +487,14 @@ restsOnBoundary = \case
   SlotWorkObjects _ → True
   SlotPresentFence _ → True
   SlotPresentSemaphore _ → True
+  -- The only device work either of these ever carries is the copy the capture
+  -- submitted to the queue, and the boundary is exactly the evidence that a
+  -- queue has finished. An unretired present does not hold them: a present is
+  -- work the presentation engine does on a swapchain image, and neither the
+  -- readback buffer nor its allocation is an object it touches. Retaining them
+  -- behind one would put a reason in the record that the run never observed.
+  TheCaptureBuffer → True
+  TheCaptureMemory → True
   TheSwapchain → True
   TheLogicalDevice → True
   _ → False
@@ -488,6 +526,8 @@ mustPrecede child parent = case parent of
       SlotWorkObjects _ → True
       SlotPresentFence _ → True
       SlotPresentSemaphore _ → True
+      TheCaptureBuffer → True
+      TheCaptureMemory → True
       TheSwapchain → True
       _ → False
 
