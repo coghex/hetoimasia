@@ -3,10 +3,16 @@
 -- | The verdict.
 --
 -- Every example here is a pure assertion over what the native run observed, so
--- the whole suite runs after the session — including the instance — is gone.
--- That is what makes requirement 8's "compute the verdict only after all
--- callback-producing teardown has completed" true by construction rather than
--- by ordering discipline.
+-- the whole suite runs after teardown — including whatever instance
+-- destruction it performed — has finished. That is what makes requirement 8's
+-- "compute the verdict only after all callback-producing teardown has
+-- completed" true by construction rather than by ordering discipline.
+--
+-- Finished is not the same as complete. Teardown retains a handle whose
+-- completion evidence is missing rather than destroying it, so a stopped run
+-- can reach here with its session partly alive; what has finished by then is
+-- the decision and every release it permitted. A run that proved retains
+-- nothing, which is what the teardown examples below assert.
 --
 -- A run that stopped fails every example with the step it stopped at, rather
 -- than passing the ones it happened to reach first.

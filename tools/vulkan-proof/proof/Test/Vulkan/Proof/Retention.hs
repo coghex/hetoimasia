@@ -44,6 +44,7 @@ module Test.Vulkan.Proof.Retention
   , Handle (..)
   , describeHandle
   , handleEntry
+  , isDestruction
   , teardownPlan
   , teardownEntries
 
@@ -215,6 +216,18 @@ describeHandle = \case
   TheVulkanInstance → "the Vulkan instance"
   TheCallbackTrampoline → "the callback trampoline"
   GlfwTermination → "GLFW"
+
+-- | Whether this handle's release destroys a native object at all.
+--
+-- The teardown boundary is the one that does not: it is the device-idle wait
+-- the releases below it rest on. It is a cleanup entry that runs, and it
+-- belongs in the entry list and in the observations it produces — but calling
+-- it a destroyed handle would put a wait in the one line a reader consults to
+-- learn which native objects this teardown actually freed.
+isDestruction ∷ Handle → Bool
+isDestruction = \case
+  TheTeardownBoundary → False
+  _ → True
 
 -- | The top-level cleanup entry a handle belongs to. These are the names the
 -- record's "released, in order" line has always carried.

@@ -2,11 +2,15 @@
 --
 -- The Hspec examples in "Test.Vulkan.Proof.Spec" assert over these values and
 -- make no native call of their own. That is what lets the verdict be computed
--- after all callback-producing teardown — including instance destruction — has
--- already happened: by the time an example runs, the session is gone and the
--- callback evidence is complete. It also keeps GLFW's main-thread rule intact
--- without a dispatcher, because Hspec's worker threads never reach a native
--- call.
+-- after all callback-producing teardown — including whatever instance
+-- destruction it performed — has already happened: by the time an example
+-- runs, teardown has finished and the callback evidence is complete. It also
+-- keeps GLFW's main-thread rule intact without a dispatcher, because Hspec's
+-- worker threads never reach a native call.
+--
+-- Teardown having finished is not the session having gone: 'TeardownFacts'
+-- below records which handles it retained and why, because a run that stopped
+-- owing a presentation must not destroy through it.
 module Test.Vulkan.Proof.Findings
   ( Findings (..)
   , PlatformFacts (..)

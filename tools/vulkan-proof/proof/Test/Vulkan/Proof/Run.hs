@@ -113,6 +113,7 @@ import Test.Vulkan.Proof.Retention
   , describeHandle
   , describeObservation
   , describeResult
+  , isDestruction
   , releasedEntries
   , standingFrom
   )
@@ -221,7 +222,12 @@ teardownFactsFrom recorded outcomes =
   TeardownFacts
     { teardownReleases = releasedEntries [(handle, released outcome) | (handle, outcome) ← outcomes]
     , teardownFailures = [reason | (_, Failed reason) ← outcomes]
-    , teardownDestroyed = [describeHandle handle | (handle, Released) ← outcomes]
+    , -- The boundary ran, and it is in 'teardownReleases' and in the
+      -- observations it produced, but it destroyed nothing: it is the
+      -- device-idle wait the rest rest on. This line is what a reader consults
+      -- to learn which native objects were freed, so a wait does not belong in
+      -- it.
+      teardownDestroyed = [describeHandle handle | (handle, Released) ← outcomes, isDestruction handle]
     , teardownRetained = [(describeHandle handle, reason) | (handle, Retained reason) ← outcomes]
     , teardownRoute = describeRoute (standingFrom recorded)
     , teardownObservations = map describeObservation recorded
@@ -445,9 +451,15 @@ clearConflictingOverrides =
 -- --------------------------------------------------------------------------
 -- The run
 
--- | Run the whole proof. Returns what it observed, or the step it stopped at;
--- either way the session is fully torn down and the callback evidence is
--- complete before this returns.
+-- | Run the whole proof. Returns what it observed, or the step it stopped at.
+--
+-- Either way teardown has run to completion and the callback evidence is
+-- complete before this returns. Teardown running to completion is not the
+-- session being fully destroyed: a run that stopped owing a presentation, or
+-- whose device-idle boundary failed, deliberately returns with the handles
+-- that presentation outlives still alive — up to and including the device,
+-- the window, the instance, the callback trampoline, and GLFW — and the
+-- outcome says which and why. Those are released by process exit.
 runProof ∷ Journal → Consent → IO Outcome
 runProof journal consent = do
   cleanups ← newCleanups

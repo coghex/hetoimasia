@@ -52,9 +52,18 @@ wholeRun =
   , TeardownBoundaryReached Succeeded
   ]
 
-destroyedIn, retainedIn ∷ [(Handle, Disposition)] → [Handle]
-destroyedIn decisions = [handle | (handle, Destroy) ← decisions]
+-- | The handles a decision destroys, as the record reports them. The boundary
+-- is permitted to proceed and does proceed, but it destroys nothing — it is
+-- the device-idle wait the rest rest on — so it is not one of these.
+destroyedIn ∷ [(Handle, Disposition)] → [Handle]
+destroyedIn decisions = [handle | (handle, Destroy) ← decisions, isDestruction handle]
+
+retainedIn ∷ [(Handle, Disposition)] → [Handle]
 retainedIn decisions = [handle | (handle, Retain _) ← decisions]
+
+-- | The plan's destructions: every handle in it that frees a native object.
+destructionsIn ∷ [Handle] → [Handle]
+destructionsIn = filter isDestruction
 
 reasonFor ∷ Handle → [(Handle, Disposition)] → Text
 reasonFor handle decisions =
@@ -90,7 +99,17 @@ spec = do
     it "retains nothing and destroys every handle in plan order" $ do
       let decisions = decide plan wholeRun
       retainedIn decisions `shouldBe` []
-      destroyedIn decisions `shouldBe` plan
+      destroyedIn decisions `shouldBe` destructionsIn plan
+
+    it "counts the boundary as an entry that ran and not as a handle destroyed" $ do
+      -- The boundary is a device-idle wait. It belongs in the entry list and in
+      -- the observations it produced; putting it in the destroyed-handle list
+      -- would claim a native object was freed that never existed.
+      isDestruction TheTeardownBoundary `shouldBe` False
+      all isDestruction (drop 1 plan) `shouldBe` True
+      destroyedIn (decide plan wholeRun) `shouldSatisfy` notElem TheTeardownBoundary
+      releasedEntries [(handle, wasDestroyed d) | (handle, d) ← decide plan wholeRun]
+        `shouldContain` ["the teardown boundary"]
 
     it "reports the ordinary destruction rules, not device loss" $ do
       let standing = standingFrom wholeRun
@@ -115,8 +134,7 @@ spec = do
 
     it "destroys only what does not depend on the unretired present" $
       destroyedIn decisions
-        `shouldBe` [ TheTeardownBoundary
-                   , SlotWorkObjects first
+        `shouldBe` [ SlotWorkObjects first
                    , SlotWorkObjects second
                    , SlotPresentFence second
                    , SlotPresentSemaphore second
@@ -148,8 +166,12 @@ spec = do
         decisions = decide plan observed
 
     it "prohibits every release whose safety the boundary was to establish" $ do
-      destroyedIn decisions `shouldBe` [TheTeardownBoundary]
+      -- Nothing is destroyed at all. The boundary itself still ran — that is
+      -- how its failure was learned — so it alone is an entry that released.
+      destroyedIn decisions `shouldBe` []
       retainedIn decisions `shouldBe` drop 1 plan
+      releasedEntries [(handle, wasDestroyed d) | (handle, d) ← decisions]
+        `shouldBe` ["the teardown boundary"]
 
     it "reports the boundary failure as the reason rather than a presentation" $ do
       (standingFrom observed).standingBoundary `shouldBe` BoundaryBroken "VK_ERROR_OUT_OF_HOST_MEMORY"
@@ -178,7 +200,7 @@ spec = do
           decisions = decide plan (retained <> [PresentFenceWaited first Succeeded])
       retainedIn (decide plan retained) `shouldBe` heldByAnUnretiredPresent first
       retainedIn decisions `shouldBe` []
-      destroyedIn decisions `shouldBe` plan
+      destroyedIn decisions `shouldBe` destructionsIn plan
       -- In order: the fence before the semaphore it retired, and the swapchain
       -- after both slots' fences.
       positionOf (SlotPresentFence first) plan
@@ -196,7 +218,7 @@ spec = do
           decisions = decide plan observed
       (standingFrom observed).standingRoute `shouldBe` DeviceLossRoute
       retainedIn decisions `shouldBe` []
-      destroyedIn decisions `shouldBe` plan
+      destroyedIn decisions `shouldBe` destructionsIn plan
       releasedEntries [(handle, wasDestroyed d) | (handle, d) ← decisions] `shouldBe` teardownEntries
 
     it "is never reached by promoting a timeout to it" $ do
