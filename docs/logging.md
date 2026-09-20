@@ -280,6 +280,9 @@ newHandleSinkWith ∷ FormatOptions → Handle → IO LogSink
 callbackSink      ∷ (LogEntry → IO ()) → LogSink            -- no-op flush
 callbackSinkWith  ∷ (LogEntry → IO ()) → IO () → LogSink
 flushLogger       ∷ Logger → IO ()
+
+writeEntry        ∷ LogSink → LogEntry → IO ()
+flushSink         ∷ LogSink → IO ()
 ```
 
 A handle sink borrows a caller-supplied handle. It writes each record as one
@@ -308,6 +311,18 @@ not emit to the same sink recursively.
 `flushLogger` flushes a logger's sink on demand whether or not `formatFlush` is
 enabled, and because derived loggers share their root's sink, flushing any one
 of them flushes what all of them wrote.
+
+`writeEntry` and `flushSink` are the whole of what a caller holding a `LogSink`
+rather than a logger over it can do. `writeEntry` forwards an already-prepared
+`LogEntry` exactly as `logEvent` forwards the one it built: no filter is
+applied and no metadata provider runs, so an entry carried across a thread
+boundary keeps the level, component, context, timestamp, thread identity, and
+source attribution it was built with — rebuilding it through `logEvent` would
+replace that attribution with the forwarding call site. `flushSink` is
+`flushLogger` without a logger. Neither exposes the sink's construction or its
+internals, and both keep the sink's own synchronous write, flush, and exception
+semantics. The [asynchronous adapter](#asynchronous-adapter) is what they exist
+for.
 
 ## Ownership and failures
 
@@ -441,6 +456,155 @@ The `Logging lifetime` group in
 [`packages/runtime/test/Test/Runtime/Lifetime.hs`](../packages/runtime/test/Test/Runtime/Lifetime.hs),
 in `hetoimasia-runtime:runtime-tests` and selected by `--match 'Logging lifetime'`, drives each row above with injected sinks,
 release traces, and a temporary borrowed handle.
+
+### Asynchronous adapter
+
+Everything above is synchronous: a write and a flush run on the emitting thread,
+and a blocked handle blocks whatever turn emitted the record. The runtime's
+`Hetoimasia.Runtime.AsyncLog` is an **optional** adapter that takes that I/O off
+the producers. It changes nothing here: every sink, logger, and caller keeps the
+semantics this document describes, and an application opts in by injecting a
+logger built over the adapter's sink instead of over the borrowed one.
+
+It is not the Vulkan native-capture path. That capture is C-only, owned by the
+graphics backend, and never reached through this adapter; see
+[the Vulkan backend design](vulkan_backend_design.md), VK-6.
+
+```haskell
+data AsyncLogConfig = AsyncLogConfig
+  { asyncQueueCapacity   ∷ !Int   -- 1024 by default, at least 1
+  , asyncTextBudget      ∷ !Int   -- 4096 by default, 256 to 65536
+  , asyncControlCapacity ∷ !Int   -- 16 by default, at least 1
+  }
+
+defaultAsyncLogConfig  ∷ AsyncLogConfig
+validateAsyncLogConfig ∷ AsyncLogConfig → Either AsyncLogConfigError AsyncLogConfig
+
+data AsyncLogAdapter
+withAsyncLogAdapter ∷ AsyncLogConfig → LogSink → (AsyncLogAdapter → IO a) → IO a
+adapterSink         ∷ AsyncLogAdapter → LogSink
+
+flushAdapter     ∷ AsyncLogAdapter → IO FlushOutcome
+adapterStatus    ∷ AsyncLogAdapter → IO AsyncLogStatus
+adapterStatusSTM ∷ AsyncLogAdapter → STM AsyncLogStatus
+```
+
+**Opting in.** The adapter lifetime *encloses* the logging lifetime, so it
+outlives every producer, graphics teardown, and terminal report:
+
+```haskell
+sink ← newHandleSink stderr                      -- the caller's, throughout
+withAsyncLogAdapter defaultAsyncLogConfig sink $ \adapter →
+  withLoggingLifetime (mkLogger filters (adapterSink adapter)) $ \lifetime →
+    application (lifetimeLogger lifetime)
+```
+
+`validateAsyncLogConfig` checks every bound without IO, and
+`withAsyncLogAdapter` runs it first: an out-of-range value is raised
+synchronously to this caller, before a writer exists, and is never a latched
+writer failure.
+
+**Admission never waits.** The adapter sink's write prepares a bounded copy of
+the entry on the producer thread and enqueues it in one non-blocking
+transaction. It never waits for queue space and never falls back to writing
+through the borrowed sink itself, so a normal return from `logInfo` over an
+adapter logger proves neither admission nor delivery. `adapterStatus` is the
+only account of what happened to a record.
+
+**What a queued record retains.** Every textual member the adapter keeps —
+message, component, field keys and values, breadcrumbs, thread, and source text
+— is copied at admission, so a short slice cannot hold an oversized producer
+buffer alive, and the copy is completed and forced before the record reaches the
+queue. Their UTF-8 byte lengths, plus the truncation marker when there is one,
+are summed against **one per-record total**, `asyncTextBudget`. That is a bound
+on retained text; it claims nothing about Haskell object overhead. A record also
+keeps at most `maxRetainedFields` (64) field entries and
+`maxRetainedBreadcrumbs` (32) breadcrumbs, counting entries with empty text. On
+a truncated record the adapter's own marker is one of those field entries, so
+one fewer producer field survives there and the total never exceeds the bound.
+
+**Truncation never rejects a record.** A record over a bound is admitted with
+what fits and carries the reserved `truncationField` (`log.truncated`) marker,
+whose value names the affected categories and the dropped counts, for example
+`msg,fields=36`. An oversized component becomes the valid `truncationComponent`
+(`log.truncated`). The marker's own maximum size is reserved inside the budget,
+so even at the 256-byte minimum a record is admitted carrying it. What fits is
+decided in attribution order — component, thread, source, fields, breadcrumbs,
+and last the message, which is reduced as far as empty text rather than costing
+the record its context. A field entry or breadcrumb that does not fit is dropped
+whole and counted rather than half-kept. A producer field named `log.truncated`
+is removed, and its removal is itself counted as a dropped field.
+
+**Loss is counted, never hidden.** A record arriving at a full queue is
+discarded and counted by severity. Records still queued when the writer is gone
+are counted as unattempted-abandoned. A record whose write failed, or was
+interrupted in flight, is counted as exactly that: it is never replayed, and
+never reported as definitely undelivered, because a partial write is permitted.
+
+**The writer.** It dequeues in admission order, formats, and writes through the
+borrowed sink — no formatting and no sink I/O ever runs on a producer. A
+synchronous failure of a write, or of a flush, latches on the adapter and
+terminates the writer: nothing after it is attempted, a later failure never
+replaces the first, and the failure is never reported back through the writer
+itself. A failed or interrupted flush fails its barrier without inventing an
+in-flight record and without reclassifying a completed write.
+
+**Flushing is a precise barrier.** `flushAdapter` reports a typed
+`FlushOutcome`: every record admitted before the request is written before the
+borrowed sink's flush is attempted, and records admitted after it do not extend
+it. A waiter observes writer termination rather than waiting forever, and a
+successful barrier resets no counter. The adapter sink's own flush is that same
+barrier, raising `AsyncLogFlushFailure` for an unsuccessful result — so
+`flushLogger` over an adapter logger fails like a flush of any other sink, and
+the logging lifetime's final flush keeps the precedence the matrix above
+describes. Control requests and their waiter registrations share the
+`asyncControlCapacity` bound, pending requests included: an excess request
+returns `FlushRejected` without waiting for record-queue space, and cancelling a
+waiter releases its registration. The bound covers a request the writer has
+taken and not yet settled as well as one still waiting, so a barrier held inside
+a blocked borrowed flush does not free its slot; `statusControlPending` accounts
+for both.
+
+**Shutdown.** Once the callback returns or throws, admission stops, the writer
+drains what is left, and the adapter joins it before ending its borrow. The
+borrowed sink's resources stay the caller's: the adapter never closes them, and
+step 5 of [the shutdown order](#ownership-and-failures) still belongs to the
+caller. Adapter shutdown adds no second final flush and never retries a failed
+one. A latched writer failure is observable through `adapterStatus` and through
+the barrier; the adapter never raises it on its own account and never replaces
+an application failure.
+
+Under cancellation the adapter requests the writer's cancellation and then
+performs a protected drain with the borrowed sink still live, as
+[the worker contract](workers.md) drains a group: a further asynchronous
+exception does not end that drain and does not release the borrow early, and the
+original outcome propagates unchanged. Cancellation need not flush, and the
+backlog is accounted as unattempted-abandoned. A write blocked in an
+interruptible operation ends promptly once cancellation is delivered; an
+uncancellable sink, such as a foreign call, can hold the lifetime open
+indefinitely. The writer is never detached, no competing write or flush is run
+to force progress, there is no deadline, and no sink I/O runs in an
+uninterruptible release.
+
+**The adapter's state.**
+
+| State | Owner | Writers | Readers | Thread | Lifetime and reset |
+|---|---|---|---|---|---|
+| Record queue and its admission flag | The `withAsyncLogAdapter` call | Admission, atomically, while open; the writer, dequeuing; shutdown, closing admission and abandoning the backlog | The writer; `adapterStatus`, as counters | Any producer thread; the writer's own thread | Created empty per call, never shared or reset. Closed to admission when the callback returns or throws. |
+| Control requests and their waiter cells | The `withAsyncLogAdapter` call | `flushAdapter`, registering or releasing one; the writer, taking and settling one | The waiting caller; `adapterStatus`, as `statusControlPending` | Any thread holding the handle; the writer's own thread | Created empty per call. Bounded by `asyncControlCapacity`, counting a taken-but-unsettled request; every registration is released by its waiter, by the writer settling it, or by writer termination. |
+| The latched writer failure and terminal state | The writer | The writer, once each; a later failure never replaces the first | `adapterStatus`; every flush barrier | The writer's own thread | Created empty per call, never reset. Published however the writer ends. |
+| Counters | The `withAsyncLogAdapter` call | Admission and the writer, atomically; shutdown, for the abandoned backlog | `adapterStatus` | Any thread | Created at zero per call. Cumulative: no barrier or status read resets one. |
+
+The `Asynchronous logging adapter` group in
+[`packages/runtime/test/Test/Runtime/AsyncLog.hs`](../packages/runtime/test/Test/Runtime/AsyncLog.hs),
+in `hetoimasia-runtime:runtime-tests` and selected by
+`--test-options='--match=Asynchronous'`, drives each row above with a probed
+borrowed sink, latch-coordinated blocked writes, and cancellation held in an
+uncancellable region. The forwarding operations have their own examples in the
+`Forwarding to a sink` group of
+[`packages/foundation/test/Test/Foundation/Logging/Sink.hs`](../packages/foundation/test/Test/Foundation/Logging/Sink.hs),
+in `hetoimasia-foundation:foundation-tests` and selected by
+`--test-options='--match=Forwarding'`.
 
 ## Context and precedence
 

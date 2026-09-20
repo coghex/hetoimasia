@@ -33,6 +33,19 @@ paths run inside it; `managedResourceSmoke` is `resourceSmoke` with its report's
 outcome recorded on the lifetime. The contract is
 [Logging lifetime](../../docs/logging.md#logging-lifetime).
 
+`Hetoimasia.Runtime.AsyncLog` is the optional bounded asynchronous adapter over
+a borrowed synchronous sink: `withAsyncLogAdapter` borrows an existing
+`LogSink` and, for the duration of a callback, lends an adapter `LogSink` plus a
+handle for status and flushing. Admission never waits and never writes through
+the borrowed sink itself, a queued record's retained text and collections are
+bounded and counted, and the writer's failure is latched rather than reported
+back through itself. Its lifetime encloses `withLoggingLifetime`, it adds no
+second final flush, and it never closes the caller's sink. Nothing else changes:
+existing sinks, loggers, and callers keep their synchronous semantics, and an
+application opts in by injecting a logger over `adapterSink`. It is not the
+Vulkan native-capture path. The contract is
+[Asynchronous adapter](../../docs/logging.md#asynchronous-adapter).
+
 `Hetoimasia.Runtime.Supervision` supervises an owned worker group on the
 application thread: `withSupervision` lends a narrow `RuntimeControl` for
 managed startup with a per-worker service-or-job role, required-or-optional

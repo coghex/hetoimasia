@@ -1,6 +1,7 @@
 -- | The runtime suite, composed from its component specs.
 --
 -- The thin runner, the application lifecycle, the logging lifetime, the
+-- optional asynchronous logging adapter, the
 -- recovery and terminal-failure reporting adapter, worker supervision, the
 -- supervised inbox adapter and its graceful finish, the supervised and inbox
 -- handles' package boundaries, supervised waits on the foundation's channels
@@ -14,6 +15,7 @@
 module Test.Runtime.Spec (spec) where
 
 import qualified Test.Runtime.Application as Application
+import qualified Test.Runtime.AsyncLog as AsyncLog
 import qualified Test.Runtime.Composition as Composition
 import qualified Test.Runtime.Inbox as Inbox
 import qualified Test.Runtime.InboxFinish as InboxFinish
@@ -29,6 +31,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "Runtime" $ do
   Application.spec
+  AsyncLog.spec
   Composition.spec
   Inbox.spec
   InboxFinish.spec

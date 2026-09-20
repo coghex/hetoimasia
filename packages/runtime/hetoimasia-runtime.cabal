@@ -6,9 +6,10 @@ description:
     A small runtime entry point that invokes a caller-supplied action through
     explicit services without importing any concrete application or renderer,
     supervision of owned workers through checkpoints and supervised waits, a
-    generic scoped application lifecycle composing them, and a caller-owned
-    update policy for demand deadlines, bounded variable steps, and fixed steps
-    with bounded catch-up.
+    generic scoped application lifecycle composing them, an optional bounded
+    asynchronous adapter over a borrowed synchronous log sink, and a
+    caller-owned update policy for demand deadlines, bounded variable steps, and
+    fixed steps with bounded catch-up.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -27,6 +28,7 @@ library
     exposed-modules:
         Hetoimasia.Runtime
         Hetoimasia.Runtime.Application
+        Hetoimasia.Runtime.AsyncLog
         Hetoimasia.Runtime.Inbox
         Hetoimasia.Runtime.Logging
         Hetoimasia.Runtime.Reporting
@@ -39,6 +41,7 @@ library
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
     build-depends:
         base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0
@@ -55,6 +58,7 @@ test-suite runtime-tests
     other-modules:
         Test.Runtime.Spec
         Test.Runtime.Application
+        Test.Runtime.AsyncLog
         Test.Runtime.Composition
         Test.Runtime.Inbox
         Test.Runtime.Inbox.Support

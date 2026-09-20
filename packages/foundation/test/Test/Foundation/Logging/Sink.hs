@@ -25,6 +25,9 @@ import Control.Exception
   )
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.Char (isDigit)
+import Data.Time.Calendar (fromGregorian)
+import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -51,6 +54,7 @@ import System.Process (createPipe)
 import System.Timeout (timeout)
 import Test.Foundation.Logging.Support
   ( fixedMetadata
+  , fixedTime
   , gpuComponent
   , newCollector
   , testComponent
@@ -83,6 +87,12 @@ spec = do
   describe "Callback sink" $ do
     it "defaults to a no-op flush and runs a supplied one" testCallbackFlush
     it "propagates callback and flush failures without disabling the sink" testCallbackFailure
+  describe "Forwarding to a sink" $ do
+    it "emits a prepared entry unchanged, applying no filter and no metadata"
+      testForwardPreparedEntry
+    it "keeps the sink's own synchronous write, flush, and failure behaviour"
+      testForwardSynchronous
+    it "forwards to a handle sink exactly as an emission does" testForwardHandleSink
 
 -- | A temporary log file opened for writing, with the caller's own buffering
 -- established before the sink exists. The handle is the caller's throughout: a
@@ -330,3 +340,86 @@ testCallbackFailure = do
   (reverse <$> readMVar seen) `shouldReturn` ["second", "third"]
   -- A failing flush propagates the same way.
   flushLogger derived `shouldThrow` ((== "flush unavailable") . ioeGetErrorString)
+
+-- | An entry a caller prepared itself, distinguishable from anything 'logEvent'
+-- would build for these arguments: a component and level the logger's own
+-- filter suppresses, a fixed thread, and source attribution naming a call site
+-- that is not in this file.
+preparedEntry ∷ LogEntry
+preparedEntry = LogEntry
+  { entryLevel = Debug
+  , entryComponent = gpuComponent
+  , entryMessage = "prepared elsewhere"
+  , entryFields = Map.fromList [("device", "0")]
+  , entryBreadcrumbs = ["adapter", "writer"]
+  , entryTime = UTCTime (fromGregorian 2026 9 20) (secondsToDiffTime 3600)
+  , entryThread = "17"
+  , entrySource = Just SourceLocation
+      { sourceFile = "Producer.hs"
+      , sourceLine = 42
+      , sourceFunction = "emit"
+      }
+  }
+
+testForwardPreparedEntry ∷ IO ()
+testForwardPreparedEntry = do
+  (sink, collected) ← newCollector
+  -- The sink belongs to a logger whose filter suppresses Debug entirely and
+  -- whose providers would supply a different time and thread.
+  let logger = mkLoggerWith defaultLogFilter fixedMetadata sink
+  logDebug logger gpuComponent "suppressed" []
+  collected `shouldReturn` []
+  writeEntry sink preparedEntry
+  -- Forwarded as it stands: no filter, no clock, no thread lookup, and the
+  -- source attribution the producer built rather than this call site.
+  collected `shouldReturn` [preparedEntry]
+
+testForwardSynchronous ∷ IO ()
+testForwardSynchronous = do
+  order ← newMVar ([] ∷ [Text])
+  flushes ← newMVar (0 ∷ Int)
+  attempts ← newMVar (0 ∷ Int)
+  let write entry = do
+        attempt ← modifyMVar attempts (\count → pure (count + 1, count + 1))
+        when (attempt == 1) (ioError (userError "sink unavailable"))
+        modifyMVar_ order (pure . (<> [entryMessage entry]))
+      sink = callbackSinkWith write $ do
+        modifyMVar_ order (pure . (<> ["flush"]))
+        modifyMVar_ flushes (pure . (+ 1))
+  -- The write is synchronous on this thread and its failure propagates here.
+  writeEntry sink preparedEntry `shouldThrow` ((== "sink unavailable") . ioeGetErrorString)
+  readMVar order `shouldReturn` []
+  writeEntry sink preparedEntry { entryMessage = "second" }
+  flushSink sink
+  writeEntry sink preparedEntry { entryMessage = "third" }
+  readMVar order `shouldReturn` ["second", "flush", "third"]
+  readMVar flushes `shouldReturn` 1
+  -- 'flushLogger' is this same operation on a logger's sink.
+  flushLogger (mkLoggerWith defaultLogFilter fixedMetadata sink)
+  readMVar flushes `shouldReturn` 2
+
+testForwardHandleSink ∷ IO ()
+testForwardHandleSink = withLogHandle LineBuffering $ \path handle → do
+  sink ← newHandleSink handle
+  let quiet = defaultLogFilter { filterSource = False }
+      logger = mkLoggerWith quiet fixedMetadata sink
+  logInfo logger testComponent "emitted" []
+  writeEntry sink preparedEntry
+    { entryLevel = Info
+    , entryComponent = testComponent
+    , entryMessage = "forwarded"
+    , entryFields = Map.empty
+    , entryBreadcrumbs = []
+    , entryTime = fixedTime
+    , entryThread = "3"
+    , entrySource = Nothing
+    }
+  flushSink sink
+  -- The borrowed handle is untouched: the forward wrote one whole line through
+  -- the same serialized sink, and closing it stays the caller's to do.
+  hIsOpen handle `shouldReturn` True
+  hClose handle
+  recordedLines path `shouldReturn`
+    [ "2026-09-10T12:00:00.000Z INFO test thread=3 msg=emitted"
+    , "2026-09-10T12:00:00.000Z INFO test thread=3 msg=forwarded"
+    ]
