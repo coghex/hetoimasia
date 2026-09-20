@@ -372,8 +372,11 @@ spec = describe "frame ownership" $ do
     -- an image awaiting settlement was never handed to the presentation engine.
     closed ← admitted_ "closing before presenting" (closeSubmittedFrame first unenqueued)
     refusesImageZero second closed
-    -- Even with the old submission's completion in hand, which is the fact that
-    -- makes an *enqueued* record's image reacquirable.
+    -- The completion settles the submission, not the image: a record that never
+    -- presented is still awaiting its own explicit settlement. An *enqueued*
+    -- record's image is reacquirable without observing that completion at all,
+    -- through a distinct free frame and pool record, and the new acquisition's
+    -- own synchronization stays mandatory before it touches the image.
     completed ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) closed)
     refusesImageZero second completed
 
