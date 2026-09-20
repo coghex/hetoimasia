@@ -17,6 +17,10 @@ the next invocation instead of being ignored.
 
 | PR | Title | Merged (UTC) | Status | Verified at | Completed (UTC) | Report | Evidence |
 | ---: | --- | --- | --- | --- | --- | --- | --- |
+| #188 | Make a validated GPU budget read-only through the public exports | 2026-09-20T13:13:30Z | ✓ clean | `a89d419aaab9d952d6dc058fb5eec62985010008` | 2026-09-20T13:18:22Z | — | — |
+| #187 | Admit reacquiring an image whose presentation is already enqueued | 2026-09-20T12:58:57Z | findings | `a89d419aaab9d952d6dc058fb5eec62985010008` | 2026-09-20T13:23:36Z | [docs/project_review/187.md](187.md) | — |
+| #186 | Own every Vulkan proof handle before the next fallible construction step | 2026-09-20T06:31:22Z | findings | `a89d419aaab9d952d6dc058fb5eec62985010008` | 2026-09-20T13:30:17Z | [docs/project_review/186.md](186.md) | — |
+| #185 | Retain presentation obligations when the Vulkan proof stops before retirement | 2026-09-20T04:26:41Z | findings | `a89d419aaab9d952d6dc058fb5eec62985010008` | 2026-09-20T13:38:06Z | [docs/project_review/185.md](185.md) | — |
 | #180 | Mark GLFW wake and stall warning failures as diagnostic failures | 2026-09-19T23:09:45Z | ✓ clean | `38388f8c0d6353167c7867bdfa05bf58516b34f4` | 2026-09-19T23:29:05Z | — | — |
 | #179 | Model bounded script tasks and execution protocols | 2026-09-19T21:36:08Z | findings | `38388f8c0d6353167c7867bdfa05bf58516b34f4` | 2026-09-19T23:44:23Z | [docs/project_review/179.md](179.md) | — |
 | #178 | Let inspected waiting retirements permit the idle wait again | 2026-09-19T20:47:16Z | ✓ clean | `38388f8c0d6353167c7867bdfa05bf58516b34f4` | 2026-09-19T23:50:08Z | — | — |
@@ -110,7 +114,9 @@ the next invocation instead of being ignored.
   "repositories": {
     "coghex/hetoimasia": {
       "direct": {
+        "adopted": null,
         "endpoint": null,
+        "reports": [],
         "reviewed": []
       },
       "excluded": {
@@ -964,6 +970,144 @@ the next invocation instead of being ignored.
           "status": "clean",
           "title": "Mark GLFW wake and stall warning failures as diagnostic failures"
         },
+        "185": {
+          "claim": null,
+          "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+          "completed_at": "2026-09-20T13:38:06Z",
+          "evidence": [],
+          "history": [
+            {
+              "at": "2026-09-20T13:36:14.845018Z",
+              "kind": "allocation",
+              "report": "docs/project_review/185.md",
+              "token": "20477b5c228aa8a54dc6390a2d36a498"
+            },
+            {
+              "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+              "completed_at": "2026-09-20T13:38:06Z",
+              "fixes": [
+                {
+                  "key": "PRR-1",
+                  "merge_commit": "ba3c74bcbbd031791cd67b83164be92e57c304aa",
+                  "pr": 185,
+                  "report": "docs/project_review/174.md"
+                }
+              ],
+              "kind": "attempt",
+              "outcome": "findings",
+              "recurrences": [],
+              "repeats": [],
+              "report": "docs/project_review/185.md",
+              "token": "20477b5c228aa8a54dc6390a2d36a498"
+            }
+          ],
+          "merged_at": "2026-09-20T04:26:41Z",
+          "report": "docs/project_review/185.md",
+          "status": "findings",
+          "title": "Retain presentation obligations when the Vulkan proof stops before retirement"
+        },
+        "186": {
+          "claim": null,
+          "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+          "completed_at": "2026-09-20T13:30:17Z",
+          "evidence": [],
+          "history": [
+            {
+              "at": "2026-09-20T13:29:10.967579Z",
+              "kind": "allocation",
+              "report": "docs/project_review/186.md",
+              "token": "d8814d3dac650bcd610b412d5dffd7b9"
+            },
+            {
+              "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+              "completed_at": "2026-09-20T13:30:17Z",
+              "fixes": [
+                {
+                  "key": "PRR-2",
+                  "merge_commit": "b398c08b15c6cb0c93c51aead244cd96252893fd",
+                  "pr": 186,
+                  "report": "docs/project_review/174.md"
+                }
+              ],
+              "kind": "attempt",
+              "outcome": "findings",
+              "recurrences": [],
+              "repeats": [],
+              "report": "docs/project_review/186.md",
+              "token": "d8814d3dac650bcd610b412d5dffd7b9"
+            }
+          ],
+          "merged_at": "2026-09-20T06:31:22Z",
+          "report": "docs/project_review/186.md",
+          "status": "findings",
+          "title": "Own every Vulkan proof handle before the next fallible construction step"
+        },
+        "187": {
+          "claim": null,
+          "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+          "completed_at": "2026-09-20T13:23:36Z",
+          "evidence": [],
+          "history": [
+            {
+              "at": "2026-09-20T13:22:07.915267Z",
+              "kind": "allocation",
+              "report": "docs/project_review/187.md",
+              "token": "535e303753af2fe64a8af8003068abc3"
+            },
+            {
+              "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+              "completed_at": "2026-09-20T13:23:36Z",
+              "fixes": [
+                {
+                  "key": "PRR-1",
+                  "merge_commit": "ee6985a6892f73514264c82fd0a984f0ab93bf6c",
+                  "pr": 187,
+                  "report": "docs/project_review/175.md"
+                }
+              ],
+              "kind": "attempt",
+              "outcome": "findings",
+              "recurrences": [],
+              "repeats": [],
+              "report": "docs/project_review/187.md",
+              "token": "535e303753af2fe64a8af8003068abc3"
+            }
+          ],
+          "merged_at": "2026-09-20T12:58:57Z",
+          "report": "docs/project_review/187.md",
+          "status": "findings",
+          "title": "Admit reacquiring an image whose presentation is already enqueued"
+        },
+        "188": {
+          "claim": null,
+          "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+          "completed_at": "2026-09-20T13:18:22Z",
+          "evidence": [],
+          "history": [
+            {
+              "commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+              "completed_at": "2026-09-20T13:18:22Z",
+              "fixes": [
+                {
+                  "key": "PRR-2",
+                  "merge_commit": "a89d419aaab9d952d6dc058fb5eec62985010008",
+                  "pr": 188,
+                  "report": "docs/project_review/175.md"
+                }
+              ],
+              "kind": "attempt",
+              "outcome": "clean",
+              "recurrences": [],
+              "repeats": [],
+              "report": null,
+              "token": "c7455910bf4c3500797de389cd6fbbd0"
+            }
+          ],
+          "merged_at": "2026-09-20T13:13:30Z",
+          "report": null,
+          "status": "clean",
+          "title": "Make a validated GPU budget read-only through the public exports"
+        },
         "20": {
           "claim": null,
           "commit": null,
@@ -1438,6 +1582,6 @@ the next invocation instead of being ignored.
       }
     }
   },
-  "version": 3
+  "version": 4
 }
 ```

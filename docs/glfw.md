@@ -483,13 +483,14 @@ data HostBookkeeping = HostBookkeeping { bookkeepingWindows, bookkeepingClosing,
 
 data HostConfig = HostConfig { hostSessionConfig ∷ SessionConfig, hostWindowConfigs ∷ [WindowConfig]
                              , hostWindowLimit ∷ Int, hostCommandCapacity, hostInputCapacity ∷ Integer
-                             , hostCommandBudget, hostEventBudget ∷ Int, hostIdleWait ∷ Double
+                             , hostCommandBudget, hostEventBudget, hostRetirementBudget ∷ Int
+                             , hostIdleWait ∷ Double
                              , hostClock ∷ MonotonicSource }   -- Show omits the clock; there is no Eq
-defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, budgets 16, idle wait 0.1 s,
-                                                   -- and the process's monotonicSource
+defaultHostConfig  ∷ [WindowConfig] → HostConfig   -- 16 windows, capacities 64 and 256, command and event budgets 16,
+                                                   -- retirement budget 4, idle wait 0.1 s, and the process's monotonicSource
 validateHostConfig ∷ HostConfig → Either HostConfigRejected ()
-data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | IdleWaitRejected Double
-                        | WindowLimitRejected Int | InputCapacityRejected Integer
+data HostConfigRejected = CommandBudgetRejected Int | EventBudgetRejected Int | RetirementBudgetRejected Int
+                        | IdleWaitRejected Double | WindowLimitRejected Int | InputCapacityRejected Integer
 hostComponent ∷ Component                   -- "glfw.runtime"
 
 runOwnerLoop ∷ WindowHost → RuntimeControl → LoopHooks a → IO a
@@ -2168,7 +2169,8 @@ runner makes the one terminal report.
 
 A `WindowHost` is an application dependency, built by `allocWindowHost` as a
 `Scoped` value before supervision is entered, on the process main thread. It
-validates its `HostConfig` first — both budgets at least one, an idle wait above
+validates its `HostConfig` first — the command, event, and retirement budgets
+each at least one, an idle wait above
 zero and at most 60 seconds, so a NaN or infinite wait is refused, a
 live-window limit of at least one, at least the number of configured windows,
 and at most `maximumWindowLimit`, which is far above what any platform hosts at
@@ -2378,7 +2380,9 @@ through creation, closure, and churn.
 ### Idle waits
 
 A turn is idle when the turn before it attempted no command and dispatched no
-application event, and no command is queued at its entry. Active turns poll.
+application event, no command is queued at its entry, and no attachment
+retirement wants an immediate opportunity (see
+[progress and scheduling](#progress-and-scheduling)). Active turns poll.
 Idle turns wait at most `hostIdleWait` seconds, so a checkpoint follows even when
 no native input arrives. No wait is indefinite, a host with no windows waits on
 each idle turn instead of spinning, and the bound is a latency rather than a
