@@ -14,7 +14,7 @@ module Packaging (spec) where
 
 import Control.Exception (evaluate)
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd, isPrefixOf)
+import Data.List (dropWhileEnd, isPrefixOf, nub, sort, stripPrefix)
 import Sandbox (run, sanitizedEnvironment)
 import System.Directory (copyFile, createDirectoryIfMissing, getCurrentDirectory)
 import System.Exit (ExitCode (..))
@@ -32,6 +32,10 @@ consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
   , ("tools/display/x11.sh", "Display.hs runs it")
+  , ("tools/display/wayland.sh", "Display.hs runs it")
+  , ("tools/ci-image/provision.sh", "Packaging.hs reads the pins it sources")
+  , ("tools/ci-image/compositor.pin", "provision.sh sources it")
+  , ("tools/ci-image/toolchain.pin", "provision.sh sources it")
   , ("tools/validation/plan.py", "Validation.hs, Execution.hs, Reuse.hs, TimingStep.hs, and CiImage.hs run it")
   , ("tools/validation/ci_image.py", "CiImage.hs runs it, and plan.py and run.py load it")
   , ("tools/ci-image/builder.py", "CiImage.hs runs it")
@@ -62,6 +66,11 @@ consumed =
 manifest ∷ FilePath
 manifest = "hetoimasia.cabal"
 
+-- | The image recipe's own provisioning script, which sources pin files the
+-- distribution must therefore carry too.
+provisioning ∷ FilePath
+provisioning = "tools/ci-image/provision.sh"
+
 -- | The entry withdrawn from a throwaway copy to prove the check reacts. Any
 -- consumed path would do; this one is the script Main.hs's own examples run.
 withdrawn ∷ FilePath
@@ -75,6 +84,16 @@ spec = describe "Source distribution" $ do
     case unpackaged inventory of
       [] → pure ()
       absent → expectationFailure (report absent)
+
+  it "carries every pin the provisioning script sources, whatever those come to be" $ do
+    -- Naming the pins in `consumed` would only hold for the pins someone
+    -- remembered to name. This reads the shipped script instead, so a pin
+    -- added to it later is carried or this fails.
+    checkout ← getCurrentDirectory
+    sourced ← sourcedPins checkout
+    sourced `shouldBe` ["tools/ci-image/compositor.pin", "tools/ci-image/toolchain.pin"]
+    inventory ← packagedFiles checkout
+    filter (`notElem` inventory) sourced `shouldBe` []
 
   it "names a consumed file the packaging declaration has stopped carrying" $ do
     checkout ← getCurrentDirectory
@@ -162,6 +181,22 @@ undeclare document path = do
   let remaining = filter ((/= path) . trim) (lines text)
   length remaining `shouldBe` length (lines text) - 1
   writeFile document (unlines remaining)
+
+-- | The recipe-relative files the provisioning script sources, in path order.
+--
+-- The script reaches them through its own `$recipe` root, which is what a
+-- `.` line names; anything else it sources is not a packaged recipe input and
+-- is not this check's business.
+sourcedPins ∷ FilePath → IO [FilePath]
+sourcedPins checkout = do
+  text ← readFile (checkout </> provisioning)
+  _ ← evaluate (length text)
+  pure (sort (nub [path | line ← lines text, Just path ← [sourcedPath line]]))
+
+sourcedPath ∷ String → Maybe FilePath
+sourcedPath line = case words (trim line) of
+  [".", argument] → stripPrefix "$recipe/" (filter (/= '"') argument)
+  _ → Nothing
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace

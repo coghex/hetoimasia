@@ -792,9 +792,10 @@ It starts the image's pinned Weston for that one command and stops it
 afterwards. No validation group runs under it yet: WL-2 registers the group
 that selects a Wayland session and teaches the native suite to accept one, and
 until then the suite refuses the consent this helper supplies as an unknown
-value, which is the correct outcome rather than a gap. What does exercise it
-today is the `ci-image` workflow's own `compositor` job, which runs
-`bash tools/display/wayland.sh -- true` inside the published image with the
+value, which is the correct outcome rather than a gap. What exercises it
+against a real compositor today is the `ci-image` workflow's dispatch-only
+[`route: wayland-probe`](#the-builder), which runs
+`bash tools/display/wayland.sh -- true` inside the described image with the
 candidate tree mounted and shows in the job summary that the runtime directory
 the helper created is gone afterwards.
 
@@ -1377,22 +1378,36 @@ cannot publish.
 | `resolve` | Fingerprints the checked-out commit and looks up the tag `fp-<fingerprint>`. An existing image whose labels name this fingerprint, a native manifest hash, and the pinned GHC and Cabal is a **hit**; a tag the registry confirms absent is a **miss**. |
 | `publish` | Runs only on a miss, serialized by a concurrency group per fingerprint. It looks the tag up **again**, so a builder that published while this one waited is returned rather than rebuilt. On a confirmed miss it builds, validates the candidate inside itself — GHC and Cabal versions, the native prefix check and link check, the store path, the embedded fingerprint, and the labels — pushes once, and reads the published metadata back. |
 | `descriptor` | Writes the descriptor for the hit or the published image, as the `ci-image-descriptor` artifact and in the job summary. |
-| `compositor` | Runs `tools/display/wayland.sh` inside the resolved image, with the candidate tree mounted, and shows in the job summary that it established an isolated headless session and left no runtime directory behind. It publishes nothing. |
 | `anonymous-pull` | Pulls the reference by digest with no credentials and no token grant, and records how long the pull took. |
 
-`ci-image.yml` also carries one job that has nothing to do with publishing an
-image. Dispatching it with `route: vulkan-proof` skips every job above and runs
-the VK-2 native Vulkan compatibility proof instead, inside the throwaway
-container `tools/vulkan-proof/Dockerfile.linux-proof` and on the isolated X11
-display `tools/display/x11.sh` starts. It holds no package grant, publishes
-nothing, and writes no descriptor; it uploads the record as the
-`vulkan-compatibility-linux` artifact and repeats it in the job summary. It is
-lodged here rather than in a workflow of its own because GitHub offers
-`workflow_dispatch` only for a workflow already on the default branch, so a new
-workflow cannot supply pre-merge evidence for the pull request introducing it;
-dispatch a candidate branch with `--ref`. Nothing about it is required, and the
-CI image gains no Vulkan input from it — that is VK-4's deliberate step. See
+`ci-image.yml` also carries two dispatch-only routes that have nothing to do
+with publishing an image. Each skips every job above, holds no package grant,
+publishes nothing, and writes no descriptor, and no push and no pull request
+starts either. Both are lodged here rather than in workflows of their own
+because GitHub offers `workflow_dispatch` only for a workflow already on the
+default branch, so a new workflow cannot supply pre-merge evidence for the pull
+request introducing it; dispatch a candidate branch with `--ref`.
+
+`route: vulkan-proof` runs the VK-2 native Vulkan compatibility proof inside
+the throwaway container `tools/vulkan-proof/Dockerfile.linux-proof` and on the
+isolated X11 display `tools/display/x11.sh` starts. It uploads the record as
+the `vulkan-compatibility-linux` artifact and repeats it in the job summary.
+Nothing about it is required, and the CI image gains no Vulkan input from it —
+that is VK-4's deliberate step. See
 [the compatibility record](vulkan_compatibility_record.md).
+
+`route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
+checked-out descriptor names, with the candidate tree mounted, and shows in the
+job summary that the helper established an isolated headless session and
+removed the runtime directory it created:
+
+```bash
+gh workflow run ci-image --ref <branch> --field route=wayland-probe
+```
+
+It is WL-1's provisioning proof, dispatched deliberately when the recipe's
+compositor inputs change. Registering a validation group that runs the native
+suite under the Wayland helper is WL-2's and WL-3's work, not this route's.
 
 A registry error is never a miss, and an existing tag whose metadata does not
 describe the fingerprint is refused rather than overwritten: both fail without
@@ -2448,5 +2463,11 @@ while the helper is still waiting for it, and by the command once it is
 running, so the moment is coordinated rather than timed — ends the helper with
 the compositor stopped and reaped, the command stopped, and the runtime
 directory removed.
+
+The source distribution has its own examples: that it carries every file these
+suites run out of the checkout, that withdrawing one entry from a throwaway
+copy's declaration is caught, and that it carries every pin the shipped
+provisioning script sources — read from the script itself, so a pin added to it
+later is carried or the example fails.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

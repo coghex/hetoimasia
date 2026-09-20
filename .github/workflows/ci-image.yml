@@ -7,28 +7,39 @@
 # ordinary validation workers only pull the digest the committed descriptor
 # names. See docs/validation.md.
 #
-# It also carries one isolated route that has nothing to do with publishing an
-# image: `route: vulkan-proof` builds the throwaway container
+# It also carries two isolated routes that have nothing to do with publishing
+# an image, and both are here rather than in workflows of their own for one
+# reason: GitHub only offers `workflow_dispatch` for a workflow that already
+# exists on the default branch, so a brand-new workflow cannot supply pre-merge
+# evidence for the pull request that introduces it. Dispatch either against the
+# candidate branch with `--ref`. Neither publishes anything, neither writes a
+# descriptor, neither holds a package grant, the image jobs below are skipped
+# whenever either runs, and both are skipped for every other event — no push and
+# no pull request starts them.
+#
+# `route: vulkan-proof` builds the throwaway container
 # `tools/vulkan-proof/Dockerfile.linux-proof` and runs the VK-2 native Vulkan
-# compatibility proof inside it on an isolated X11 display. That route is here
-# rather than in a workflow of its own for one reason: GitHub only offers
-# `workflow_dispatch` for a workflow that already exists on the default branch,
-# so a brand-new workflow cannot supply pre-merge evidence for the pull request
-# that introduces it. Dispatch it against the candidate branch with `--ref`. It
-# publishes nothing, writes no descriptor, and holds no package grant; the image
-# jobs below are skipped whenever it runs, and it is skipped for every other
-# event. See docs/vulkan_compatibility_record.md.
+# compatibility proof inside it on an isolated X11 display. See
+# docs/vulkan_compatibility_record.md.
+#
+# `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
+# checked-out `tools/ci-image/descriptor.json` names, and shows that the helper
+# established an isolated headless session and removed the runtime directory it
+# created. It is WL-1's one-off provisioning proof, dispatched deliberately;
+# registering a validation group that runs the native suite under the Wayland
+# helper is WL-2's and WL-3's work, not this route's.
 name: ci-image
 
 on:
   workflow_dispatch:
     inputs:
       route:
-        description: 'image: resolve and publish the CI image. vulkan-proof: run the VK-2 native proof and publish nothing.'
+        description: 'image: resolve and publish the CI image. vulkan-proof: run the VK-2 native proof and publish nothing. wayland-probe: run the WL-1 compositor proof in the described image and publish nothing.'
         type: choice
         options:
           - image
           - vulkan-proof
+          - wayland-probe
         default: image
   pull_request:
     types: [opened, reopened, synchronize]
@@ -126,7 +137,7 @@ jobs:
     # A fork's pull request can neither hold a package grant nor be allowed to
     # start publication. The proof route publishes nothing, so it never reaches
     # this job.
-    if: (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.route != 'vulkan-proof'
+    if: (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.route != 'vulkan-proof' && inputs.route != 'wayland-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -307,24 +318,32 @@ jobs:
             echo "Pulled \`$REFERENCE\` with no registry credentials in $((ended - started))s."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  compositor:
-    needs: descriptor
-    # Explicit for the same reason as the anonymous pull: a hit skips `publish`,
-    # and a hit's image has to serve the helper just the same.
-    if: always() && needs.descriptor.result == 'success'
+  wayland-probe:
+    # Only ever on an explicit request for this route, so an ordinary image
+    # dispatch and every pull request skip it.
+    if: github.event_name == 'workflow_dispatch' && inputs.route == 'wayland-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Read-only, and no package grant: this proves what the published image can
-    # do, and publishes nothing itself.
+    # No package grant and no publication: this route proves what the described
+    # image can do and returns a record.
     permissions:
       contents: read
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
 
+      - name: Name the image the candidate's descriptor describes
+        id: image
+        run: |
+          set -euo pipefail
+          reference="$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')"
+          weston="$(python3 -c 'import json; print(json.load(open("tools/ci-image/descriptor.json"))["weston"])')"
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          echo "proving $reference, which describes weston $weston" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Start the isolated headless compositor inside the image
         env:
-          REFERENCE: ${{ needs.descriptor.outputs.reference }}
+          REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # The candidate tree supplies the helper; the image supplies Weston.
@@ -338,7 +357,7 @@ jobs:
           {
             echo '## Isolated headless compositor'
             echo
-            echo 'Inside the published image, with the candidate tree mounted:'
+            echo 'Inside the described image, with the candidate tree mounted:'
             echo
             echo '```'
             echo '$ bash tools/display/wayland.sh -- true'
@@ -348,7 +367,7 @@ jobs:
 
       - name: Show that the compositor left nothing behind
         env:
-          REFERENCE: ${{ needs.descriptor.outputs.reference }}
+          REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # The helper reports the runtime directory it created; after it

@@ -243,9 +243,7 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       runtime ← privateRuntime session
       probed `shouldBe` [socket, runtime]
 
-      compositor ← recordedPid session
-      stopped compositor `shouldReturn` True
-      doesDirectoryExist runtime `shouldReturn` False
+      cleanedUp session
 
   it "refuses to run the command without a compositor" $
     withSession $ \session → do
@@ -257,10 +255,11 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       installStubs session (filter ((/= "wayland-info") . fst) waylandStubs)
       refusedSession session "wayland-info was not found on PATH"
 
-  it "refuses to run the command when the compositor exits before serving the socket" $
+  it "refuses to run the command when the compositor exits before serving the socket, and cleans up after it" $
     withSession $ \session → do
       installStubs session (("weston", exitingCompositor) : filter ((/= "weston") . fst) waylandStubs)
       refusedSession session "the compositor exited before serving"
+      cleanedUp session
 
   it "refuses to run the command when the compositor never serves the socket within the bound" $
     withSession $ \session → do
@@ -269,12 +268,14 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       -- socket file alone would not have satisfied the helper either.
       installStubs session (("wayland-info", refusingClient) : filter ((/= "wayland-info") . fst) waylandStubs)
       refusedSession session "did not serve"
+      cleanedUp session
 
-  it "exits with the command's own status once the compositor serves" $
+  it "exits with the command's own status once the compositor serves, and cleans up after it" $
     withSession $ \session → do
       installStubs session waylandStubs
       (result, _, _) ← sessionHelper session ["--", "sh", "-c", "exit 3"]
       result `shouldBe` ExitFailure 3
+      cleanedUp session
 
   it "rejects a call that names no command" $
     withSession $ \session → do
@@ -299,9 +300,7 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       errors `shouldContain` "terminated by SIGTERM"
       -- The command never ran, so the consent reached nothing.
       doesFileExist (directory session </> "environment.txt") `shouldReturn` False
-      compositor ← recordedPid session
-      stopped compositor `shouldReturn` True
-      privateRuntime session >>= \runtime → doesDirectoryExist runtime `shouldReturn` False
+      cleanedUp session
 
   it "stops the command and the compositor and removes the runtime directory when a signal ends the run" $
     withSession $ \session → do
@@ -315,11 +314,7 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       errors `shouldContain` "terminated by SIGTERM"
       commanded ← pidIn session "command.pid"
       stopped commanded `shouldReturn` True
-      compositor ← recordedPid session
-      stopped compositor `shouldReturn` True
-      runtime ← privateRuntime session
-      runtime `shouldSatisfy` (directory session `isInfixOf`)
-      doesDirectoryExist runtime `shouldReturn` False
+      cleanedUp session
 
 withSession ∷ (Display → IO a) → IO a
 withSession = withHelper "tools/display/wayland.sh"
@@ -416,6 +411,18 @@ refusingClient =
     , "echo \"${WAYLAND_DISPLAY-unset} ${XDG_RUNTIME_DIR-unset}\" > probe.txt"
     , "exit 1"
     ]
+
+-- | What the helper leaves behind once it has returned, for any outcome that
+-- got as far as launching the compositor: nothing running, and nothing on
+-- disk. The compositor is asked for by the process it recorded, so a stub that
+-- outlives the helper would be caught rather than assumed reaped.
+cleanedUp ∷ Display → IO ()
+cleanedUp session = do
+  compositor ← recordedPid session
+  stopped compositor `shouldReturn` True
+  runtime ← privateRuntime session
+  runtime `shouldSatisfy` (directory session `isInfixOf`)
+  doesDirectoryExist runtime `shouldReturn` False
 
 -- | The private runtime directory the compositor was launched into.
 privateRuntime ∷ Display → IO FilePath
