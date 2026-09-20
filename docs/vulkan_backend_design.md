@@ -23,24 +23,25 @@ concrete precondition
 - [x] VK-1. Qualify and pin the shared Haskell toolchain — [#157]
 - [x] VK-2. Prove the native compatibility and completion profile — [#158]
 - [x] VK-3. Model GPU retention and frame ownership — [#160]
-- [ ] VK-4. Provision the pinned native Vulkan environment — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-5. Add the loader-aware GLFW surface bridge — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-6. Capture validation diagnostics with an independent worker — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-7. Own Vulkan instance, device and targets under protected retirement — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-8. Integrate package-native Vulkan fixtures and CI evidence — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-9. Make Template Haskell shaders reproducible — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-10. Manage swapchain generation construction and replacement — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-11. Record through retained managed resources — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-12. Track acquisition, submission and safe frame abandonment — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-13. Track presentation completion and retire generations — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-14. Apply bounded target and allocation recovery — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-15. Complete terminal graphics failure and device-loss teardown — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-16. Compose rendering demand and retirement with TIME and LIFE — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
-- [ ] VK-17. Deliver the multi-window triangle consumer and final evidence — [deferred]: VK-2's linked issue is closed by a merged pull request recording a passing proof on both platforms.
+- [ ] VK-4. Provision the pinned native Vulkan environment
+- [ ] VK-5. Add the loader-aware GLFW surface bridge
+- [ ] VK-6. Capture validation diagnostics with an independent worker
+- [ ] VK-7. Own Vulkan instance, device and targets under protected retirement
+- [ ] VK-8. Integrate package-native Vulkan fixtures and CI evidence
+- [ ] VK-9. Make Template Haskell shaders reproducible
+- [ ] VK-10. Manage swapchain generation construction and replacement
+- [ ] VK-11. Record through retained managed resources
+- [ ] VK-12. Track acquisition, submission and safe frame abandonment
+- [ ] VK-13. Track presentation completion and retire generations
+- [ ] VK-14. Apply bounded target and allocation recovery
+- [ ] VK-15. Complete terminal graphics failure and device-loss teardown
+- [ ] VK-16. Compose rendering demand and retirement with TIME and LIFE
+- [ ] VK-17. Deliver the multi-window triangle consumer and final evidence
 
 Slices are mirrored below in dependency order. The owner signed off the
 reviewed contracts and split on 2026-09-17 under D-27. The native proof gate
-is explicit; it is not permission to guess its result.
+is explicit; it is not permission to guess its result. Its #158 merge
+precondition is now satisfied; unchecked entries above remain unprocessed.
 
 ## Epic contract
 
@@ -56,7 +57,35 @@ is explicit; it is not permission to guess its result.
   consumers; agents implementing and testing its bounded parts.
 - **Arc label:** propose `vulkan`, color `A41E22`, description “Vulkan backend, GPU resource lifetimes, presentation and platform verification”. No label is created by this design.
 
-## Current handoff at `e0c752e` — 2026-09-17
+## Current handoff at `38388f8` — 2026-09-19
+
+VK-1/#157, VK-2/#158 and VK-3/#160 merged through PRs #171, #174 and
+#175. The [qualified toolchain](toolchain.md) and
+[compatibility record](vulkan_compatibility_record.md) supply the previously
+open preliminary evidence. TIME and LIFE's children, package-owned test
+migration, and host repairs #166–#169 are also merged. Consume their current
+contracts; do not redraft those prerequisites.
+
+The [batch review ledger](project_review/ledger.md) records the review of
+PRs #170–#180. The [Vulkan model review](project_review/175.md) identifies
+image-reacquisition and budget-opacity repairs. The
+[proof review](project_review/174.md) identifies unsafe unsuccessful-exit
+cleanup and partial-construction rollback gaps. Repair those contracts before
+dependent native integration relies on them. Successful retained platform runs
+still support the selected compatibility profile; the production backend has
+not been implemented or verified by that experiment.
+
+VK-4 onward remain unprocessed. The original #158 merge gate is satisfied;
+processing a later issue must account for its actual dependencies and these
+review findings, rather than preserving an obsolete merge wait or treating
+merged code as defect-free. Lua's independent platform verdicts are
+inconclusive, so [its design](lua_runtime_design.md) returns to exploring under
+D-11 without making Lua a prerequisite of Vulkan.
+
+## Historical handoff at `e0c752e` — 2026-09-17
+
+The following records the earlier design/processing baseline, not current
+implementation or tracker status.
 
 The CPU runtime, messaging, and independent GLFW implementation are now present.
 Logging, resources, runtime, and messaging arcs are complete. GLFW issues

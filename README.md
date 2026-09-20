@@ -1,14 +1,15 @@
 # Hetoimasia
 
-A modular Haskell/Vulkan game engine with a planned Lua scripting host and
-separate 2D and 3D rendering modules. Synarchy is a potential future client.
+A modular Haskell/Vulkan game engine with Lua scripting and planned separate
+2D and 3D rendering modules. Synarchy is a potential future client.
 
 **Current implementation:** logging, scoped CPU resources, failures and bounded
 recovery, monotonic scheduling, application composition, supervised workers,
 bounded messaging, and GLFW with dynamic windows, controls, monitor-aware modes,
 input feeds, native wake, and protected graphics-owner attachment lifetimes.
-Vulkan, Lua, fonts, and rendering remain planned; their directories contain
-ownership notes and are not in the Cabal package list.
+The Lua binding and pure task/protocol model are buildable, as is the pure GPU
+retention and frame-ownership model. The production Lua scheduler, mod-process
+host, native Vulkan backend, fonts, and rendering modules remain planned.
 
 The original GLFW arc and its completion repairs (#115–#118 and #123) are
 merged and reviewed; epic #86 is complete. Native desktop tests now require
@@ -16,12 +17,17 @@ explicit per-session consent (#124). The children of the
 [package-owned tests](docs/test_architecture_design.md) (#49),
 [scheduling and native wake](docs/runtime_scheduling_design.md) (#131), and
 [window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140)
-arcs have merged. The [latest review](docs/project_review_165-150.md) identifies
-four retirement/reporting follow-ups before real GPU attachments.
-The [Vulkan](docs/vulkan_backend_design.md) (#155) and
-[Lua](docs/lua_runtime_design.md) (#145) designs are ready for staged processing.
-Shared toolchain qualification (#157) precedes their initial implementation;
-native graphics and mod confinement require their separate platform proofs.
+arcs have merged, including retirement/reporting repairs #166–#169. The
+[review ledger](docs/project_review/ledger.md) records audited PR coverage and
+current findings.
+
+Shared toolchain qualification #157 is complete, and the [Vulkan compatibility
+proof](docs/vulkan_compatibility_record.md) #158 records the selected profiles. The
+[Vulkan design](docs/vulkan_backend_design.md) (#155) remains ready for staged
+processing; repair the reviewed model and proof defects before native
+integration depends on those contracts. The
+[Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
+production mod-process work needs the deployment decision required by D-11.
 
 ## Start here
 
@@ -55,6 +61,8 @@ cabal run exe:hetoimasia -- --resource-smoke
 cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
 cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
 cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
+cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
+cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 
@@ -128,13 +136,15 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
 | `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; original arc and repairs complete |
 | `packages/render-api/` | Backend-independent rendering contracts | Planned |
-| `packages/gpu-vulkan/` | Vulkan resource and submission ownership | Planned |
+| `packages/gpu-vulkan/` | GPU retention/frame model and planned native backend | Model buildable without a Vulkan SDK |
 | `packages/render-2d/`, `packages/render-3d/` | Dedicated rendering paths | Planned |
-| `packages/scripting-lua/` | Lua host and registration mechanism | Planned |
+| `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
 | `samples/` | Future independent rendering consumers | Planned |
 | `integrations/` | Game adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
-| `test/` | Root runtime, GLFW and console coverage until #129/#130 finish migration | Buildable |
+| `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |
+| `packages/scripting-lua/test/`, `packages/gpu-vulkan/model/test/` | Package-owned Lua and GPU model contracts | Buildable without GLFW through `cabal.project.cpu` |
+| `test/` | Root console composition only | Buildable |
 | `packages/glfw/native-tests/` | Shared native Hspec fixture and platform verification | Cocoa locally; Linux X11 in CI |
 | `tools/test/` | Workflow, validation and provisioning Hspec examples | Buildable |
 

@@ -39,7 +39,16 @@ concrete precondition
 - **Arc label:** existing `runtime`; crossing slices also use the existing
   `glfw` and `tests` labels as appropriate during issue processing.
 
-## Current state and evidence
+## Current handoff — 2026-09-19
+
+At `master@38388f8`, all six TIME children are merged. The implementation
+contracts are [time.md](time.md) and [scheduling.md](scheduling.md), with native
+wake/host behavior in [glfw.md](glfw.md). The later retirement/reporting
+repairs #166–#169 are also merged; the
+[review ledger](project_review/ledger.md) records current review outcomes.
+The checklist above is a completed processing ledger, not another issue queue.
+
+## Historical state and evidence
 
 Source observations verified at `master@e2d30ea` on 2026-09-16 still describe
 the unimplemented scheduling boundary at `9300962`. Tracker state below was

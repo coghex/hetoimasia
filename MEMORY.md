@@ -1,6 +1,6 @@
 # Hetoimasia project memory
 
-Updated 2026-09-18 against code `master@8e4eb6e`. This is the active handoff,
+Updated 2026-09-19 against code `master@38388f8`. This is the active handoff,
 not an exhaustive changelog. Recheck Git and the tracker before relying on status.
 Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
 [the memory archive](docs/history/memory_before_2026-09-17.md). Read only the
@@ -25,7 +25,10 @@ owning subsystem's contract/design when continuing its work.
   GHC 9.14.1, Cabal 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, GHC2024,
   Unicode type syntax, standard Prelude. `docs/toolchain.md` records that
   qualification, the candidates rejected, and the pinned `vulkan-3.27` /
-  `vulkan-utils-0.5.11.0` pair VK-2 inherits.
+  `vulkan-utils-0.5.11.0` pair VK-2 inherits. The
+  [#171 review](docs/project_review/171.md) records a provenance-documentation
+  correction; preserve the receipts' exact historical revisions rather than
+  claiming all subsequent changes through `HEAD` were documentation-only.
   Preserve `semaphore: False` for the multi-worktree build.
 - Use Kanban skills and `~/work/kanban` for issue/PR workflow. This repository
   is the target. Code and its required documentation/evidence ship in the same
@@ -64,8 +67,10 @@ owning subsystem's contract/design when continuing its work.
   five added headless examples reproduced four follow-ups: completion-policy
   evaluation escaping protected retirement (P1), direct-versus-queued evidence
   revival, retirement budget busy polling, and diagnostic-failure propagation.
-  These are not filed yet. Repair the lifetime escape before attaching native
-  GPU dependents. No desktop session ran. Counts are dated evidence.
+  Those four findings became #166–#169 and merged as PRs #170, #172, #178,
+  and #180. The [review ledger](docs/project_review/ledger.md) records the
+  follow-up batch through #180 and links its current findings. No desktop
+  session ran in either audit. Counts above are historical evidence.
 - Foundation owns `packages/foundation/test/` (`test.foundation`) and runtime
   owns `packages/runtime/test/` (`test.runtime`, 143 examples at #129, with the
   per-example map in docs/runtime_tests_mapping.md). GLFW owns
@@ -211,7 +216,8 @@ owning subsystem's contract/design when continuing its work.
   keeps accepted work, reports once under logging policy and degrades to polling.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
   #141, #142, #143, and #144 are merged. The current review report records
-  follow-up repairs, so merged children do not establish a clean arc. One exclusive
+  follow-up repairs; #166–#169 have now merged. The review ledger records their
+  verification separately from new Lua/GPU findings. One exclusive
   graphics owner per window, attached through `attachWindowGraphics` and held as
   an opaque `GraphicsService`. Protected main-thread retirement follows worker
   drain and precedes dependency release on every exit; in-run retirement
@@ -221,29 +227,32 @@ owning subsystem's contract/design when continuing its work.
   `attachHostWindow` and the rest of the #143 seam stay private to
   `runtime-glfw-core` beneath that contract. Still open: no surface, GPU
   submission, or device wait exists anywhere here — evidence that GPU work has
-  completed is the backend's, and which mechanism proves it is the Vulkan
-  compatibility proof #158.
-- [Lua](docs/lua_runtime_design.md) is ready for staged processing. Independent
-  UI/gameplay execution domains; stop unsafe authoritative gameplay while keeping
-  UI available. Untrusted mods require separate processes per mod/domain,
+  completed is the backend's. Vulkan compatibility proof #158 has qualified
+  present-fence retirement and image release on both selected profiles; its
+  proof harness is separate from the still-planned production backend.
+- [Lua](docs/lua_runtime_design.md) has returned to `exploring` under D-11.
+  Independent UI/gameplay execution domains; stop unsafe authoritative gameplay
+  while keeping UI available. Untrusted mods require separate processes per mod/domain,
   explicit capabilities, and enforced whole-process resource/execution limits.
-  Epic #145 has approved children #146–#149. #146 (LUA-1) consumes the shared
-  toolchain qualification from #157; it must wait for that merge. #147/#148
-  (platform proofs) and #149 (pure protocol model) follow #146 and can then run
-  in parallel. The backlog review identified one amendment for #147: it needs
-  the same bounded Cabal OS/buildable parser support already specified in #148,
-  or must reuse that support if #148 lands first. #148 landed it: `buildable` is
-  now the one non-link field the validation planner accepts inside an
-  `if os(...)` block, and it is invisible to input derivation, so a
-  platform-only component's sources still count as changed inputs everywhere.
-  LUA-14/LUA-15 must prove viable Linux and macOS confinement before dependent
-  process/integration slices are drafted.
+  Epic #145's children #146–#149 are merged: the binding uses #157's qualified
+  toolchain, both platform proofs have retained verdicts, and the pure protocol
+  model exists. The [#179 review](docs/project_review/179.md) records
+  failure-settlement and bounded failure-detail defects; the
+  [#173 review](docs/project_review/173.md) records stale binding comments.
+  Repair them before dependent integration relies on those contracts. #148
+  added bounded OS-conditional `buildable`
+  parser support, reused by #147; conservative source hashing is intentional,
+  but [the #177 review](docs/project_review/177.md) records the separate defect
+  in routing a mandatory Linux-only group on Darwin.
+  Both confinement verdicts remain inconclusive. LUA-9 through LUA-13 and
+  dependent integration slices stay blocked until the owner resolves the
+  deployment constraints and both required profiles have successful evidence.
   Signed bundled macOS helpers may be evaluated while preserving headless CLI
-  operation; no assumed privileged install or paid signing account. A failed or
-  inconclusive proof returns the design to exploring; never weaken isolation.
+  operation; no assumed privileged install or paid signing account. Never weaken
+  isolation to convert an inconclusive proof into support.
 - **LUA-15's macOS verdict (#148) is `inconclusive`**, recorded in
   [docs/macos_confinement_verdict.md](docs/macos_confinement_verdict.md) with
-  its probe at `packages/scripting-lua/macos/`. Every proof row was demonstrated
+  its probe at `packages/scripting-lua/macos/`. The retained experiments ran
   on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
   no entitlement or privilege) — per-instance SBPL confinement, all four denied
   accesses natively (three of them again from Lua; Lua has no socket API, and
@@ -265,16 +274,19 @@ owning subsystem's contract/design when continuing its work.
   **cannot delete**. A fifth, found in review: a confinement profile bounds what
   a process may reach *by name* and says nothing about descriptors it was
   *handed* — the parent's listening endpoints were inherited across the spawn
-  until `FD_CLOEXEC` and `POSIX_SPAWN_CLOEXEC_DEFAULT` closed them. Q-5's macOS row is the owner's: accept the unsupported-SPI
-  profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
+  until `FD_CLOEXEC` and `POSIX_SPAWN_CLOEXEC_DEFAULT` closed them. Q-5's macOS
+  row is the owner's: accept the unsupported-SPI profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
   untrusted-mod targets. Until then the design stays `exploring` and LUA-9
-  through LUA-13 stay undrafted, whatever #147 concludes.
+  through LUA-13 stay undrafted, whatever #147 concludes. The
+  [#176 review](docs/project_review/176.md) additionally found that optimization removes the intended native-buffer
+  growth; repair that experiment and refresh its evidence before relying on
+  its claimed mixed-allocation workload.
 - [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
-  tracked by epic #155. #157 merged and pinned the shared toolchain; native
-  proof #158 and pure ownership model #160 follow it, and Lua #146 can run in
-  parallel. Vulkan 1.3 minimum, a shared loader, managed retention,
-  present-fence retirement, and default two frame slots are accepted design
-  choices. #158 proved the native profile on both platforms and recorded it in
+  tracked by epic #155. Shared toolchain #157, native compatibility proof #158,
+  and pure ownership model #160 have merged. The model is implemented; the
+  production native backend is still planned. Vulkan 1.3 minimum, a shared
+  loader, managed retention, present-fence retirement, and default two frame
+  slots are accepted design choices. #158 proved the native profile on both platforms and recorded it in
   [docs/vulkan_compatibility_record.md](docs/vulkan_compatibility_record.md):
   Vulkan 1.3 with dynamic rendering and synchronization2, one shared standard
   loader, `VK_EXT_swapchain_maintenance1` present fences and image release, and
@@ -285,9 +297,14 @@ owning subsystem's contract/design when continuing its work.
   observation: a present fence's status before it is waited on is not a
   contract on either platform, so the fence is waited for and nothing is read
   into whether it happened to be signalled already. Later
-  native slices stay gated until #158's pull request merges. Host-retirement
-  repairs must precede real GPU attachment integration; the current three
-  Vulkan issues do not depend on the defective host paths.
+  native slices' #158 prerequisite is satisfied by PR #174. Host-retirement
+  repairs #166–#169 are also merged. Address the new model findings recorded
+  in the review ledger before the native backend depends on those contracts.
+  The [#174 review](docs/project_review/174.md) also identifies unsafe proof
+  cleanup after a presentation-fence timeout and missing rollback for partial
+  native construction. Device idle alone is not presentation retirement. Repair
+  these failure paths before reusing the harness as a native-lifetime template;
+  the retained successful profile evidence remains useful.
 - CI-5 (`test`/`autotest` adapter integration) remains explicitly deferred.
   The old foundation umbrella is architectural context, not another queue for
   duplicating completed resources/runtime/GLFW or the newer TIME/LIFE arcs.

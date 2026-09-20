@@ -3,8 +3,8 @@
 Own Hspec tests beside the packages whose contracts they exercise, keep root
 application and tooling tests independently runnable, and retain expensive
 graphics resources only for selected examples that can safely share them.
-The original grouping and native-fixture phases are implemented; the next phase
-moves the remaining central engine tests into package-owned Cabal suites.
+The grouping, native-fixture, and package-owned suite phases are implemented.
+New component tests belong beside the package whose contract they exercise.
 
 Design state: `ready for issue processing`
 
@@ -48,9 +48,9 @@ reviewed ownership, dependency and validation contracts. The tracker edit was
 verified; its title, `epic`/`tests` labels and open state are unchanged.
 All children have since been filed and approved. TEST-3/#125 merged in PR #132
 and TEST-4/#127 in PR #137. Epic #49's checklist was reconciled on 2026-09-17.
-TEST-5/#129 merged in PR #150; TEST-6/#130 is implemented by its own PR. Read each child's canonical approval
-amendments as part of its implementation specification. No processing entry
-remains in this document.
+TEST-5/#129 merged in PR #150; TEST-6/#130 merged in PR #151. Read each
+child's canonical approval amendments as part of its implementation
+specification. No processing entry remains in this document.
 
 ## Epic contract
 
@@ -73,9 +73,12 @@ remains in this document.
 
 ## Current implementation
 
-Rechecked 2026-09-17 against the TEST-6 (#130) branch based on
-`master@0fd66e6`; each item describes the tree once that change lands. These are
-source and tracker observations; the TEST-6 PR records its own test execution:
+The TEST-6 implementation inspected on 2026-09-17 is now merged through
+PR #151. Rechecked against `master@38388f8` on 2026-09-19: foundation, runtime,
+GLFW, and root ownership below describes the current tree. The Lua and GPU
+model packages added since then also own their headless suites. The
+[review ledger](project_review/ledger.md) records subsequent reviews; each PR
+retains its own test evidence.
 
 - Foundation owns `foundation-tests`, runtime owns `runtime-tests`, and GLFW
   owns `glfw-tests`. Root `hetoimasia-tests` retains only console coverage and

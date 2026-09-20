@@ -6,19 +6,33 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `ready for issue processing`
+Design state: `exploring`
 
-Owner: `coghex/hetoimasia`. No tracker artifacts have been created from this
-document. The owner accepted the two-domain direction, required untrusted-mod
-isolation in the first arc, selected isolation per mod and execution domain,
+Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
+created; those children are merged. The owner accepted the two-domain direction,
+required untrusted-mod isolation in the first arc, selected isolation per mod
+and execution domain,
 restricted capabilities and enforced limits, and chose to stop an unsafe failed
 gameplay session while UI reports its state. Signed bundled macOS helpers may
 be evaluated with headless command-line operation preserved (D-10).
 The owner approved readiness on 2026-09-16 with separate Linux and macOS
 feasibility slices (D-11). Q-3 is deliberately owned by LUA-1; Q-5 is deliberately
 owned by LUA-14/LUA-15. Both successful platform proofs gate process-branch
-drafting. Readiness permits processing that plan; it does not claim binding or
-confinement evidence already exists.
+drafting. That initial signoff permitted the preliminary proof/model work; it
+did not pre-approve a confinement deployment policy.
+
+Post-merge reconciliation, 2026-09-19, at code `master@38388f8`: LUA-1/#146
+has established the binding boundary and LUA-4/#149 has delivered the pure
+protocol model. LUA-14/#147 and LUA-15/#148 both delivered **inconclusive**
+confinement verdicts. D-11 therefore returns this document to `exploring`.
+LUA-9 through LUA-13 and their dependent integration slices remain blocked;
+closing the proof issues did not prove supported confinement. Resolve Q-5 and
+renew readiness before resuming issue processing. The
+[review ledger](project_review/ledger.md) also records implementation
+follow-ups; processing completion is not a clean implementation verdict. The
+[binding review](project_review/173.md) records stale source comments, and the
+[protocol review](project_review/179.md) records failure-settlement and bounded
+failure-detail defects to repair before dependent runtime integration.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -30,7 +44,7 @@ concrete precondition
 - [x] LUA-1. Establish the Lua binding and foreign-call boundary — [#146]
 - [x] LUA-14. Prove Linux confinement and resource-limit feasibility — [#147]
 - [x] LUA-15. Prove macOS confinement and resource-limit feasibility — [#148]
-- [ ] LUA-2. Own the VM through a protected IO lifetime — [deferred]: #146 must merge with its package contract recording the Q-3 selection (binding and Lua versions, safe FFI paths, cancellation-delivery points, close and finalizer behavior)
+- [ ] LUA-2. Own the VM through a protected IO lifetime
 - [ ] LUA-3. Add application-owned modules and bounded value bindings
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime
@@ -45,6 +59,8 @@ concrete precondition
 
 The ledger records processing, not implementation. Keep it synchronized with
 the delivery plan; do not infer issue numbers from these local slice IDs.
+LUA-2's former #146 merge prerequisite is satisfied; its unchecked entry still
+means no issue has been processed, and the document-wide D-11 pause applies.
 
 Dependency reconciliation, 2026-09-18: the owner selected the shared-toolchain
 qualification VK-1/#157 before LUA-1/#146. The amended and reapproved #146 and
@@ -73,8 +89,9 @@ source observations below remain historical.
 
 ## Current state and evidence
 
-Inspected Hetoimasia at `master@007c285` on 2026-09-16. These are source
-observations; no Lua implementation or new execution evidence exists yet.
+Historical inspection of Hetoimasia at `master@007c285` on 2026-09-16. These
+observations describe the pre-implementation baseline. The post-merge handoff
+above and the recorded Q-3/Q-5 results describe the current state.
 
 - `packages/scripting-lua/README.md` reserves a host for VM lifetime, calls,
   errors, and registration. It requires one execution owner per VM and keeps
@@ -821,34 +838,63 @@ normal supervision semantics.
 
 ### Q-3. Binding feasibility and exact supported execution boundary
 
-LUA-1 resolves the technical selection using pinned dependency source and
-Linux/macOS evidence: Lua version, HsLua version, safe FFI paths, reentrant
-callbacks, exception/cancellation transport, closing/finalizer behavior, native
-provisioning, and any affinity requirement. Lua 5.4 documentation below is an
-examined baseline, not a declaration that 5.4 is the newest or already selected.
-The owner need not choose ordinary package versions in advance. If the selected
-binding cannot meet P-3/P-4 without changing the design, stop dependent drafting,
-record the alternatives, and return that material choice to the owner.
+Resolved by LUA-1/#146, merged in PR #173, on the shared #157 toolchain:
+`lua-2.3.4` with bundled Lua 5.4.8 and the project's private C/Haskell bridge.
+The [package contract](../packages/scripting-lua/README.md) records safe FFI
+paths, registry/stack ownership, callback transport, close/finalizer behavior,
+and the selected flags. `hslua-core` was evaluated and not selected.
+
+The owner-approved cancellation boundary targets the VM execution owner; an
+internal foreign-export callback thread is not a cancellation endpoint and
+trusted callbacks must not publish its identity. Arbitrary running Lua still
+needs a consulted hook or the later process boundary for enforced limits.
+Carry this qualified contract into LUA-2/LUA-3; do not infer broader callback
+cancellation or confinement guarantees from the binding proof.
 
 ### Q-4. Clock prerequisite and delivery coordination
 
-LUA-6 and LUA-12 require TIME-1 from the scheduling design; at this inspection it
-is still unprocessed. Before drafting either, link its actual prerequisite issue/API or
-wait for that boundary to be available. Do not absorb TIME-1 into this epic or
-make Vulkan, GLFW scheduling, or a completed game loop artificial prerequisites.
+LUA-6 and LUA-12 require TIME-1/#133, which is merged. Use the existing
+[foundation monotonic time boundary](time.md) and link that prerequisite when
+drafting either slice. Do not absorb TIME-1 into this epic or make Vulkan,
+GLFW scheduling, or a completed game loop artificial prerequisites.
 
 ### Q-5. Verified platform confinement and resource-enforcement profile
 
-Deliberately open technical gate owned by LUA-14 (Linux) and LUA-15 (macOS),
-before processing the process branch:
-select the exact Linux and macOS confinement, process launch/signing, memory
+**Current result, 2026-09-19:** both preliminary proofs are merged and
+`inconclusive`; no production deployment profile is selected.
+
+- [Linux verdict](lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
+  the candidate enforces the tested boundary where unprivileged user
+  namespaces are usable. Stock Ubuntu 24.04 restrictions and the current CI
+  container prevent that setup. The successful reference experiment required
+  an administrative restriction change; this is not an approved deployment
+  requirement. [Retained runs](lua_linux_confinement_evidence.md) distinguish
+  all three environments/outcomes.
+- [macOS verdict](macos_confinement_verdict.md), LUA-15/#148, PR #176:
+  the candidate uses unsupported confinement and memory-limit interfaces.
+  Its named residual limits and missing Lua-side network-denial evidence
+  remain part of the result. The [#176 review](project_review/176.md) also
+  identifies an optimization defect in the intended native-buffer growth; that
+  experiment needs repair and refreshed evidence. The owner has not accepted
+  this as the supported deployment baseline.
+
+Return the concrete deployment obstacles to the owner under D-11. Further
+mechanism experiments may preserve the existing requirements; any material
+change to the trust boundary, required privileges, supported platforms, or
+isolation/limit contract needs an explicit design decision. No weaker fallback
+has been selected by this reconciliation.
+
+Q-5 remains an open technical gate after LUA-14 (Linux) and LUA-15 (macOS).
+Before processing the process branch, select the exact Linux and macOS
+confinement, process launch/signing, memory
 enforcement, and parent watchdog mechanisms against the supported deployment
 baseline. Explain how each enforces P-13 and how it runs unprivileged in local
 development and the existing Linux CI environment. A cgroup mechanism requiring
 delegation is not automatically available in hosted/container jobs; a macOS
 entitlement or documented limit is not automatically effective for a standalone
-CLI helper. Deliver the bounded experiments and platform verdicts in
-LUA-14/LUA-15 under D-11.
+CLI helper. Follow-up experiments and verdicts must resolve the concrete
+obstacles above under D-11; merged preliminary proofs are not a reason to
+repeat their completed scope.
 No solver should invent a weakened fallback to make acceptance green. If no
 viable profile meets D-6/D-8/D-9, bring the constraint back to the owner before
 implementation; do not reclassify memory exhaustion as an optional probe.
@@ -918,15 +964,15 @@ profile; the packaging answer alone does not establish those requirements.
 
 #### Readiness and processing gates after D-11
 
-Q-3 is deliberately owned by LUA-1, with dependent drafting stopped if the
-binding cannot meet the contract. Q-4 is an explicit external prerequisite.
-Neither needs another owner preference now. Q-5 is deliberately open under
-D-11: LUA-14/LUA-15 deliver the platform proofs before LUA-9. There are fifteen
-slices. No selected platform profile or native feasibility evidence exists yet.
+Q-3's binding selection and Q-4's external clock prerequisite are recorded
+above. Q-5 remains open under D-11: LUA-14/LUA-15 delivered evidence, but both
+verdicts are inconclusive. There are fifteen slices and no accepted production
+confinement profile. The document is exploring; ordinary issue processing
+cannot resume until the design is made ready again.
 
-Process the epic first, then one child per invocation in ledger order. Draft
-LUA-14/LUA-15 only after LUA-1 establishes the binding/runtime baseline their
-experiments must exercise. Do not draft LUA-9 through LUA-13 or dependent
+Once readiness is renewed, resume the existing ledger one child per invocation.
+Keep the completed preliminary issues linked and scope any follow-up proof to
+its remaining obstacle. Do not draft LUA-9 through LUA-13 or dependent
 integration slices until both platform verdicts are successful and recorded
 here with their evidence references. Completing or closing a feasibility issue
 alone is not a successful verdict. If either proof fails or remains inconclusive,
@@ -1306,7 +1352,7 @@ and verified policy, with adversarial regression coverage.
 
 ## Deferred extensions and next-session handoff
 
-After processing, the implementation order is external VK-1/#157, then LUA-1,
+The dependency order remains external VK-1/#157, then LUA-1,
 then LUA-14/LUA-15 and LUA-2/LUA-4 independently; LUA-3 after LUA-2; LUA-9 after LUA-3/LUA-4 and both
 successful platform proofs; LUA-10,
 LUA-11, and LUA-13 in parallel; LUA-12 after both platform slices and TIME-1;
@@ -1316,15 +1362,14 @@ graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
 
-The next handoff is `process-design-doc`: process the epic first, then exactly
-one child per invocation, with separate approval for every tracker artifact.
-Respect Q-3's binding proof, Q-4's external clock prerequisite, and D-11's two
-successful platform verdicts before dependent drafting. No further preference
-question blocks the approved plan. Q-1/Q-2/Q-6/Q-7 are already
-answered by D-6 through D-9 and must not be reopened without new evidence. It
-should not reopen D-1 as “start with a single scripting worker and add UI later”.
-Technical discovery in LUA-1 can gate dependent drafting without silently
-turning an unfinished design choice into a solver's implementation detail.
+The next handoff is design reconciliation of Q-5 using the two merged verdicts,
+not `process-design-doc`. Resolve the deployment obstacles and record any
+owner decision before renewing readiness. Once ready, resume the existing
+epic/ledger one child per invocation; do not recreate #145 or #146–#149.
+Respect D-11's two successful platform verdicts before dependent process
+drafting. Q-1/Q-2/Q-6/Q-7 are already answered by D-6 through D-9; the current
+evidence does not itself authorize changing them or returning to a single
+scripting worker. Keep required untrusted-mod isolation in this arc.
 
 Further arcs require their own evidence and scope: a sharded authoritative
 simulation; durable saves/hot reload; broader mod permissions/distribution;

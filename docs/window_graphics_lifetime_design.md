@@ -38,7 +38,20 @@ concrete precondition
 - **Arc label:** existing `resources`; crossing slices use `runtime`/`glfw`
   during processing. No new graphics package or label is required yet.
 
-## Current state and evidence
+## Current handoff — 2026-09-19
+
+At `master@38388f8`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
+#166–#169 are merged. The implemented host/attachment contract is in
+[glfw.md](glfw.md); the [review ledger](project_review/ledger.md) records current
+review outcomes. The [#170 review](project_review/170.md) confirms the
+metadata repair but records an older callback-comment contradiction: finite,
+nonblocking native work is permitted; blocking GPU waits are not. The Vulkan
+proof and pure GPU model now exist separately,
+while production surfaces, submissions, and GPU completion still belong to the
+[Vulkan arc](vulkan_backend_design.md). The checklist above records completed
+processing; do not recreate its children as native graphics work.
+
+## Historical state and evidence
 
 Source observations verified at `master@e2d30ea` on 2026-09-16 still describe
 the unimplemented attachment boundary at `9300962`. Tracker state below was
