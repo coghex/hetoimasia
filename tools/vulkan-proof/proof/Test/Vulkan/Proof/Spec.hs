@@ -28,9 +28,17 @@ import Test.Vulkan.Proof.Matrix
   , standing
   )
 import Test.Vulkan.Proof.Record (achievedFrom, matrixTable, renderRecord)
+import Test.Vulkan.Proof.Retention (teardownEntries)
+import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 
 spec ∷ Outcome → Spec
 spec outcome = do
+  -- The release decision teardown obeyed, asserted over its own inputs rather
+  -- than over what this run happened to reach. These are the same examples
+  -- `run-proof.sh --headless` selects on their own, and they make no native
+  -- call here either.
+  Retention.spec
+
   describe "The native run" $
     it "established every step it started" $
       onFindings outcome (\_ → pure ())
@@ -245,11 +253,17 @@ spec outcome = do
         findings.findingsCallbacks.callbackValidationErrors `shouldBe` []
 
   describe "Teardown" $ do
-    it "released everything it acquired, with nothing failing" $
+    it "released everything it acquired, with nothing failing and nothing retained" $
       onFindings outcome $ \findings → do
         let facts = findings.findingsTeardown
-        facts.teardownReleases `shouldSatisfy` (not . null)
+        -- Requirement 7: the successful path is the same ten entries in the
+        -- same order. A run that proved owes no presentation, so it is also
+        -- the path on which the retention rule withholds nothing — a retained
+        -- handle here would mean the run reported a completion it did not have.
+        facts.teardownReleases `shouldBe` teardownEntries
         facts.teardownFailures `shouldBe` []
+        facts.teardownRetained `shouldBe` []
+        facts.teardownRoute `shouldSatisfy` Text.isPrefixOf "ordinary"
 
     it "destroyed the explicit messenger after every resource it should have watched" $
       onFindings outcome $ \findings → do
@@ -295,7 +309,7 @@ spec outcome = do
 
   describe "The matrix's observation labels" $ do
     it "claims nothing for a run that stopped" $ do
-      let stopped = Stopped (Failure "a step" "a reason")
+      let stopped = Stopped (Failure "a step" "a reason") noTeardown
           rendered = renderRecord "title" "invocation" [] stopped False
       -- The record says "nothing below this line was established"; the table
       -- below that line must not then say otherwise.
@@ -352,7 +366,7 @@ isObservable = \case
 -- than reporting an absence as a pass.
 onFindings ∷ Outcome → (Findings → Expectation) → Expectation
 onFindings outcome assertion = case outcome of
-  Stopped failure →
+  Stopped failure _ →
     expectationFailure
       ( "the native run stopped at "
           <> Text.unpack failure.failureStep

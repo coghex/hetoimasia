@@ -21,6 +21,7 @@ module Test.Vulkan.Proof.Findings
   , CaptureFacts (..)
   , CallbackFacts (..)
   , TeardownFacts (..)
+  , noTeardown
   , PhaseCount (..)
   , Diagnostic (..)
   , Outcome (..)
@@ -33,9 +34,15 @@ import Test.Vulkan.Proof.Interop (Provenance)
 
 -- | What the native run produced. A failure carries the step that failed, so a
 -- refused or broken proof still names the requirement it stopped at.
+--
+-- A stop carries its teardown facts too. Teardown is where a stopped run
+-- decides what it may destroy and what it must hold, and a record that dropped
+-- that would be the one place a reader most needs it. It never revises the
+-- stop: teardown may go on to obtain the very completion the run stopped
+-- waiting for, and the step and the failed verdict still stand.
 data Outcome
   = Proved Findings
-  | Stopped Failure
+  | Stopped Failure TeardownFacts
   deriving (Show)
 
 data Failure = Failure
@@ -60,14 +67,50 @@ data Findings = Findings
 --
 -- A release that fails is not a detail: @vkDeviceWaitIdle@ can return device
 -- loss, and a proof that let that pass while still reporting a verdict would be
--- claiming a clean session it never had. Every release still runs — one failure
--- must not hide the ones after it — and the failures are collected here so the
+-- claiming a clean session it never had. The failures are collected here so the
 -- verdict can refuse them.
+--
+-- Not every release runs. "Test.Vulkan.Proof.Retention" decides each one from
+-- the effects and results the run recorded, and a handle whose completion
+-- evidence is missing is retained rather than destroyed. 'teardownReleases' is
+-- the entry-level list the record has always carried and requirement 7 fixes
+-- for the successful path; 'teardownDestroyed' and 'teardownRetained' are the
+-- handle-level truth beneath it, which is where a partly released entry shows.
 data TeardownFacts = TeardownFacts
   { teardownReleases ∷ [Text]
+    -- ^ Cleanup entries every one of whose handles was released, in order. On
+    -- a whole teardown this is the ten entries and nothing else.
   , teardownFailures ∷ [Text]
+  , teardownDestroyed ∷ [Text]
+    -- ^ Individual handles destroyed, in the order teardown reached them.
+  , teardownRetained ∷ [(Text, Text)]
+    -- ^ Individual handles withheld, each with the condition that was unmet.
+    -- Retention plus process exit is the escape for a session that never
+    -- resolves; no native call is made preemptible and no destroy is wrapped
+    -- in a timeout to avoid it.
+  , teardownRoute ∷ Text
+    -- ^ Which destruction rules teardown operated under: the ordinary one,
+    -- where each release needs its own evidence, or the specification's
+    -- device-loss rule, which permits destroying a lost device's objects
+    -- without waiting for work that may never complete.
+  , teardownObservations ∷ [Text]
+    -- ^ The native effects and results the decision was a function of, in the
+    -- order the run recorded them.
   }
   deriving (Show)
+
+-- | A teardown that has not run. The record and the verdict both distinguish
+-- this from one that ran and released nothing.
+noTeardown ∷ TeardownFacts
+noTeardown =
+  TeardownFacts
+    { teardownReleases = []
+    , teardownFailures = []
+    , teardownDestroyed = []
+    , teardownRetained = []
+    , teardownRoute = "not reached"
+    , teardownObservations = []
+    }
 
 -- | Requirement 2: the environment, explicit and recorded.
 data PlatformFacts = PlatformFacts

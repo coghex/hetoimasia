@@ -59,16 +59,21 @@ renderRecord title invocation transcript outcome passed =
 
 body ∷ Outcome → [Text]
 body = \case
-  Stopped failure →
+  Stopped failure facts →
     [ "## The run stopped"
     , ""
     , "Step: **" <> failure.failureStep <> "**"
     , ""
     , failure.failureDetail
     , ""
-    , "Nothing below this line was established. This is not a proof of a narrower"
-    , "profile; it is an absence of the proof the issue asks for."
+    , "No profile fact below was established. This is not a proof of a narrower"
+    , "profile; it is an absence of the proof the issue asks for. The teardown"
+    , "section that follows is the exception, and it is not a retraction: it says"
+    , "what this run was able to release and what it had to hold, which is what a"
+    , "reader of a failed run most needs. Teardown obtaining a completion the run"
+    , "stopped waiting for does not revise the step above or the verdict."
     ]
+      <> teardownSection facts
   Proved findings →
     platformSection findings.findingsPlatform
       <> loaderSection findings.findingsLoader
@@ -268,22 +273,34 @@ teardownSection facts =
   [ ""
   , "## Teardown"
   , ""
-  , "Every release runs in the reverse of the order it was registered, whether"
-  , "the run finished or stopped, and one that fails never stops the rest. A"
-  , "failure here fails the verdict: a session torn down badly is not a session"
-  , "this proof can report a clean result for."
+  , "Releases run in the reverse of the order they were registered, and one that"
+  , "fails never stops the rest. Which of them run at all is decided rather than"
+  , "assumed: a handle whose completion evidence is missing is retained, because"
+  , "queue or device idle alone is not evidence that a presentation has retired."
+  , "The only way back from retained is the present fence itself signalling, or"
+  , "the specification's device-loss rule; a retained handle is otherwise"
+  , "released by process exit and by nothing else, because no native call here is"
+  , "preemptible and no destroy is wrapped in a timeout. A failure fails the"
+  , "verdict, and so does a retention: a session this proof could not finish"
+  , "tearing down is not one it can report a clean result for."
   , ""
   ]
     <> definitions
-      [ ("released, in order", listOrNone facts.teardownReleases)
+      [ ("destruction rules in force", facts.teardownRoute)
+      , ("released, in order", listOrNone facts.teardownReleases)
+      , ("handles destroyed, in order", listOrNone facts.teardownDestroyed)
+      , ( "handles retained, and why"
+        , listOrNone [name <> " — " <> reason | (name, reason) ← facts.teardownRetained]
+        )
       , ("releases that failed", listOrNone facts.teardownFailures)
+      , ("the effects and results this decision was taken from", listOrNone facts.teardownObservations)
       ]
 
 -- | What the run produced, reduced to what the matrix's labels depend on. A
 -- run that stopped produced nothing, which is what 'Nothing' says.
 achievedFrom ∷ Outcome → Maybe Achieved
 achievedFrom = \case
-  Stopped _ → Nothing
+  Stopped _ _ → Nothing
   Proved findings →
     Just
       Achieved
@@ -299,7 +316,7 @@ achievedFrom = \case
 -- | The sentence above the table, which has to match what the table will say.
 matrixPreamble ∷ Outcome → [Text]
 matrixPreamble = \case
-  Stopped _ →
+  Stopped _ _ →
     [ "This run stopped, so it observed none of these. Every row below is either"
     , "specification text or a result this run never reached, and each says which."
     , "Nothing here is evidence that this platform does what the row describes."
