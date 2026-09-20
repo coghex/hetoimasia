@@ -10,6 +10,7 @@ import qualified Test.GPU.Model.Budgets as Budgets
 import qualified Test.GPU.Model.Frames as Frames
 import qualified Test.GPU.Model.Holds as Holds
 import qualified Test.GPU.Model.Identities as Identities
+import qualified Test.GPU.Model.Opacity as Opacity
 import qualified Test.GPU.Model.Progress as Progress
 import qualified Test.GPU.Model.Recovery as Recovery
 import qualified Test.GPU.Model.Sequences as Sequences
@@ -21,6 +22,7 @@ spec = describe "GPU model" $ do
   Holds.spec
   Frames.spec
   Budgets.spec
+  Opacity.spec
   Recovery.spec
   Progress.spec
   Sequences.spec

@@ -61,9 +61,11 @@ library
         containers >=0.8 && <0.9,
         hetoimasia-foundation ==0.1.0.0
 
--- This package's own contracts. It depends on this library, the foundation, and
--- third-party packages alone, so it builds and runs with no Vulkan SDK present
--- and is registered as the CPU validation group `test.vulkan`.
+-- This package's own contracts. It depends on this library, the foundation, the
+-- neutral `hetoimasia-test-support` library its opacity examples compile
+-- external clients with, and third-party packages alone, so it builds and runs
+-- with no Vulkan SDK present and is registered as the CPU validation group
+-- `test.vulkan`.
 test-suite gpu-model-tests
     import: language
     type: exitcode-stdio-1.0
@@ -74,6 +76,7 @@ test-suite gpu-model-tests
         Test.GPU.Model.Frames
         Test.GPU.Model.Holds
         Test.GPU.Model.Identities
+        Test.GPU.Model.Opacity
         Test.GPU.Model.Progress
         Test.GPU.Model.Recovery
         Test.GPU.Model.Sequences
@@ -82,6 +85,9 @@ test-suite gpu-model-tests
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
+        filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
         hetoimasia-foundation ==0.1.0.0,
-        hetoimasia-gpu-vulkan-model ==0.1.0.0
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0

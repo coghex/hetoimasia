@@ -77,11 +77,15 @@ model admits a new acquisition of an image whose presentation is already
 enqueued, against its own free pool record and its own acquisition
 synchronization, exactly as P-2 and VK-13 describe. `38388f8` itself still
 refuses that sequence, so do not read the repair as behaviour of the baseline
-this section names. Budget opacity and the two proof-review gaps remain
-outstanding; repair those contracts before dependent native integration relies
-on them. Successful retained platform runs still support the selected
-compatibility profile; the production backend has not been implemented or
-verified by that experiment.
+this section names. Budget opacity was repaired **after this snapshot** as well,
+by #184: a validated `Budgets` is read-only to clients, so nothing outside the
+model package can replace a limit the validator accepted or set the derived
+presentation pool directly. At `38388f8` a client importing only the exposed
+modules could still do both, so do not read that closure as behaviour of this
+baseline either. The two proof-review gaps remain outstanding; repair those
+contracts before dependent native integration relies on them. Successful
+retained platform runs still support the selected compatibility profile; the
+production backend has not been implemented or verified by that experiment.
 
 VK-4 onward remain unprocessed. The original #158 merge gate is satisfied;
 processing a later issue must account for its actual dependencies and these

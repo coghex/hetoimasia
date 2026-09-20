@@ -262,6 +262,20 @@ capacity raises the pool with it instead of leaving a frozen constant behind. A
 configuration whose derived sum would not fit is rejected as
 `DerivedBudgetOverflows`.
 
+A validated configuration is **read-only to clients**. `BudgetRequest` is an
+ordinary record, so a small configuration is stated by editing one and
+validating it; `Budgets` is not. Its constructor is unexported, its field labels
+are private to the package, and the eleven limits are read through ordinary
+functions, so record construction and record-update syntax reach no label. There
+is no way for a client to replace a validated limit, and in particular no way to
+set the derived presentation pool to anything but the checked sum it is defined
+as. `newGpuModel` stores the configuration it is handed rather than re-checking
+it, so that closure is what keeps every bound a running model enforces the one
+the validator accepted. External-client compilation examples in the model suite
+hold the boundary: one rejected client per protected limit, one that names the
+constructor, and one accepted client that edits a request, validates it, reads
+every limit and builds a model.
+
 Exhaustion answers `Backpressure` naming the budget. It is not a failure: nothing
 changed, the session is still running, and the caller may try again when the
 budget frees. It never consumes a cleanup record already reserved for admitted

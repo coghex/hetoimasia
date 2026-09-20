@@ -9,6 +9,12 @@
 -- rejectable rather than unrepresentable. A validated 'Budgets' holds
 -- 'Numeric.Natural.Natural's, so nothing downstream has to re-check a sign.
 --
+-- A request is an ordinary editable record; a validated configuration is not.
+-- 'Budgets' keeps its field labels private to this module and offers readers of
+-- the same names instead, so a client outside the package can neither build one
+-- nor rewrite a field of one. See the type's own note for why that closure is
+-- what the validator's promise rests on.
+--
 -- The per-target presentation pool is /derived/, not configured: it is the
 -- checked sum of the swapchain-image tracking limit and the frame-slot count,
 -- so raising frame capacity raises the pool with it instead of leaving a frozen
@@ -138,22 +144,100 @@ budgetCeiling = 2 ^ (32 ∷ Int) - 1
 
 -- | A configuration every field of which is positive, representable, and
 -- consistent with the sums derived from it. Only 'validateBudgets' builds one.
+--
+-- The representation is closed to clients: "Hetoimasia.GPU.Model.Budget"
+-- exports the type without its constructor, this module is hidden, and the
+-- field labels below are not exported from it, so no label reaches a client
+-- either. A client of the package cannot build a 'Budgets' of its own and
+-- cannot rewrite a field of one it was handed, because record construction and
+-- record-update syntax both need a field label in scope. What such a client
+-- sees instead are the readers below: ordinary functions of the same names and
+-- types, which read a configuration without also giving it a way to write one.
+--
+-- That boundary is what the validator's promise rests on. 'validateBudgets' is
+-- the only way to obtain a value of this type, and
+-- 'Hetoimasia.GPU.Model.newGpuModel' stores what it is handed rather than
+-- re-checking it, so a replaced field would put a limit the validator rejects
+-- into a running model: a zero presentation pool answers
+-- @Backpressure PresentationPoolBudget@ to the first reservation, and a zero
+-- action limit makes every owner turn do no work. The derived pool is the case
+-- that cannot even be stated as a request, so nothing but this closure keeps it
+-- equal to the sum it is defined as.
+--
+-- The labels are kept rather than dropped for a positional constructor because
+-- eleven adjacent limits, ten of them 'Natural', are exactly the shape a
+-- positional construction transposes silently; 'validateBudgets' names each one
+-- as it builds it. They are private to this module, which is what closes the
+-- boundary, and 'BudgetRequest' above stays an ordinary editable record so a
+-- caller still states a small configuration by editing a request and validating
+-- it.
+--
+-- Nothing here re-checks a budget at run time. The guarantee is the absence of
+-- a way to express the rewrite, checked when the client is compiled.
 data Budgets = Budgets
-  { targetRecordLimit ∷ !Natural
-  , frameSlotLimit ∷ !Natural
-  , aggregateFrameSlotLimit ∷ !Natural
-  , generationLimit ∷ !Natural
-  , imageTrackingLimit ∷ !Natural
-  , presentationPoolCapacity ∷ !Natural
+  { budgetsTargetRecordLimit ∷ !Natural
+  , budgetsFrameSlotLimit ∷ !Natural
+  , budgetsAggregateFrameSlotLimit ∷ !Natural
+  , budgetsGenerationLimit ∷ !Natural
+  , budgetsImageTrackingLimit ∷ !Natural
+  , budgetsPresentationPoolCapacity ∷ !Natural
     -- ^ Derived with overflow checking as @'imageTrackingLimit' +
     -- 'frameSlotLimit'@, never configured directly.
-  , byteLimit ∷ !Natural
-  , objectLimit ∷ !Natural
-  , reclaimExaminationLimit ∷ !Natural
-  , progressActionLimit ∷ !Natural
-  , idleBackoffCap ∷ !Duration
+  , budgetsByteLimit ∷ !Natural
+  , budgetsObjectLimit ∷ !Natural
+  , budgetsReclaimExaminationLimit ∷ !Natural
+  , budgetsProgressActionLimit ∷ !Natural
+  , budgetsIdleBackoffCap ∷ !Duration
   }
   deriving (Eq, Show)
+
+-- | The target-record limit, counting targets that are retiring.
+targetRecordLimit ∷ Budgets → Natural
+targetRecordLimit = budgetsTargetRecordLimit
+
+-- | The frame slots one target may have live at once.
+frameSlotLimit ∷ Budgets → Natural
+frameSlotLimit = budgetsFrameSlotLimit
+
+-- | The frame slots the whole session may have live at once.
+aggregateFrameSlotLimit ∷ Budgets → Natural
+aggregateFrameSlotLimit = budgetsAggregateFrameSlotLimit
+
+-- | The live generations one target may hold, counting active, constructing and
+-- retired generations together.
+generationLimit ∷ Budgets → Natural
+generationLimit = budgetsGenerationLimit
+
+-- | The tracked image records one swapchain generation may hold.
+imageTrackingLimit ∷ Budgets → Natural
+imageTrackingLimit = budgetsImageTrackingLimit
+
+-- | The target's derived presentation-record pool: the overflow-checked sum of
+-- 'imageTrackingLimit' and 'frameSlotLimit', shared by its active and retired
+-- generations.
+presentationPoolCapacity ∷ Budgets → Natural
+presentationPoolCapacity = budgetsPresentationPoolCapacity
+
+-- | The accounted backend bytes, counting recorded-but-unsubmitted and retired
+-- allocations.
+byteLimit ∷ Budgets → Natural
+byteLimit = budgetsByteLimit
+
+-- | The accounted backend object records, on the same counting rule.
+objectLimit ∷ Budgets → Natural
+objectLimit = budgetsObjectLimit
+
+-- | The records one reclamation pass may examine.
+reclaimExaminationLimit ∷ Budgets → Natural
+reclaimExaminationLimit = budgetsReclaimExaminationLimit
+
+-- | The completion or disposal actions one owner turn may perform.
+progressActionLimit ∷ Budgets → Natural
+progressActionLimit = budgetsProgressActionLimit
+
+-- | The configured finite cap of the idle polling backoff.
+idleBackoffCap ∷ Budgets → Duration
+idleBackoffCap = budgetsIdleBackoffCap
 
 -- | Why a requested configuration is not a configuration.
 data BudgetRejected
@@ -190,17 +274,17 @@ validateBudgets request = do
       (durationFromNanoseconds RequirePositive (toInteger backoffMilliseconds * 1000000))
   pure
     Budgets
-      { targetRecordLimit = targets
-      , frameSlotLimit = slots
-      , aggregateFrameSlotLimit = aggregate
-      , generationLimit = generations
-      , imageTrackingLimit = images
-      , presentationPoolCapacity = pool
-      , byteLimit = bytes
-      , objectLimit = objects
-      , reclaimExaminationLimit = reclaim
-      , progressActionLimit = actions
-      , idleBackoffCap = cap
+      { budgetsTargetRecordLimit = targets
+      , budgetsFrameSlotLimit = slots
+      , budgetsAggregateFrameSlotLimit = aggregate
+      , budgetsGenerationLimit = generations
+      , budgetsImageTrackingLimit = images
+      , budgetsPresentationPoolCapacity = pool
+      , budgetsByteLimit = bytes
+      , budgetsObjectLimit = objects
+      , budgetsReclaimExaminationLimit = reclaim
+      , budgetsProgressActionLimit = actions
+      , budgetsIdleBackoffCap = cap
       }
   where
     bounded ∷ BudgetKind → Integer → Either BudgetRejected Natural
