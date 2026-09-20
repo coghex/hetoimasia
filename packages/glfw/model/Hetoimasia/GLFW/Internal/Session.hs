@@ -166,6 +166,13 @@
 -- |                    |                   | OS thread; the call  | take: the   |                    |                       |
 -- |                    |                   | takes them           | wake's      |                    |                       |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Interaction trace  | The session       | An activated probe   | Owner, and  | Stopped unless a   | Emptied by each take; |
+-- |                    | ('Trace')         | starts, takes, and   | callbacks   | probe starts it;   | stopped storage holds |
+-- |                    |                   | stops it; the pump,  | inside its  | never started by   | nothing               |
+-- |                    |                   | the loop, and the    | pump calls; | the session, the   |                       |
+-- |                    |                   | window callbacks     | atomic      | window model, or   |                       |
+-- |                    |                   | offer records        |             | the runtime        |                       |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 --
 -- Nothing here is application state, and nothing is shared between sessions
 -- except the guard.
@@ -220,6 +227,7 @@ module Hetoimasia.GLFW.Internal.Session
   , WindowCallbackStorage (..)
   , sessionNative
   , sessionCapture
+  , sessionTrace
   , sessionIdentity
   , sessionOwner
   , sessionClaims
@@ -299,6 +307,7 @@ import Hetoimasia.GLFW.Internal.Control
   , windowCapabilities
   )
 import Hetoimasia.GLFW.Internal.Mode (MonitorClaims, pruneClaims)
+import Hetoimasia.GLFW.Internal.Trace (Trace, newTrace)
 import Hetoimasia.GLFW.Internal.Monitor
   ( MonitorDescription
   , MonitorId
@@ -519,6 +528,12 @@ data Session = Session
   , sessionOwner ∷ !ThreadId
   , sessionSelected ∷ !Backend
   , sessionCapture ∷ !Capture
+  , sessionTrace ∷ !Trace
+    -- ^ Bounded, record-only measurement storage
+    -- ("Hetoimasia.GLFW.Internal.Trace"), stopped unless an explicitly
+    -- activated probe starts it. Nothing in the session, the window model, or
+    -- the runtime ever starts it, and a stopped trace costs one 'IORef' read
+    -- wherever it is offered a record.
   , sessionLive ∷ !(IORef Bool)
   , sessionIdentity ∷ !Unique
     -- ^ Distinguishes this session's windows from any other session's.
@@ -767,6 +782,7 @@ sessionAssembly native config = do
   windows ← restoredStep (newIORef 1)
   claims ← restoredStep (newIORef Map.empty)
   capture ← restoredStep (newCapture (nativeIsProcessMainThread native) (nativeCurrentWakeMark native))
+  trace ← restoredStep newTrace
   health ← restoredStep (newTVarIO WakePathHealthy)
   notifying ← restoredStep (newTVarIO 0)
   acquirePart
@@ -827,6 +843,7 @@ sessionAssembly native config = do
       , sessionOwner = owner
       , sessionSelected = backend
       , sessionCapture = capture
+      , sessionTrace = trace
       , sessionLive = live
       , sessionIdentity = identity
       , sessionWindows = windows

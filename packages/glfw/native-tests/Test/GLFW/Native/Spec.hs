@@ -7,7 +7,8 @@
 -- a recorded launcher, and need no consent themselves; the
 -- session, session wake, window, window control, window mode, monitor
 -- inventory, and window host examples
--- use that shared session; the
+-- use that shared session; the owner-loop interaction probe uses it too, but
+-- only when its own activation variable asks for it, and is pending otherwise; the
 -- private-session examples run lifecycles no shared session can host in a child
 -- process. Every group that uses the session or starts a child runs under the
 -- run's consent hook, so without consent each of its examples is refused
@@ -20,6 +21,7 @@ import qualified Test.GLFW.Native.Harness as Harness
 import qualified Test.GLFW.Native.Mode as Mode
 import qualified Test.GLFW.Native.Host as Host
 import qualified Test.GLFW.Native.Input as Input
+import qualified Test.GLFW.Native.Interaction as Interaction
 import qualified Test.GLFW.Native.Monitor as Monitor
 import qualified Test.GLFW.Native.Private as Private
 import qualified Test.GLFW.Native.Session as Session
@@ -41,4 +43,5 @@ spec shared = describe "GLFW native" $ do
     Monitor.spec shared
     Host.spec shared
     Input.spec shared
+    Interaction.spec shared
     Private.spec (sharedGate shared)

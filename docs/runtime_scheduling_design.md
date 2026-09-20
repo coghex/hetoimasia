@@ -448,7 +448,12 @@ examples in both a root aggregate and a package suite.
 The [GLFW window reference](https://www.glfw.org/docs/3.4/group__window.html)
 documents timed waits and cross-thread empty events. Timed waits require positive
 finite arguments; native event processing itself may block during platform
-interaction. That limits latency claims, not the scheduler's arithmetic.
+interaction. That limits latency claims, not the scheduler's arithmetic. What
+this platform actually does during a window move, a window resize, and a
+menu-bar interaction is measured, not assumed: see
+[the owner-loop interaction verdict](owner_loop_interaction_verdict.md), which
+records the measurement and states the candidate policies without choosing
+one.
 The [GLFW error reference](https://www.glfw.org/docs/3.4/group__init.html)
 defines calling-thread error retrieval; the existing Capture module's two
 buckets are repository behavior, not a per-call attribution mechanism.

@@ -59,6 +59,7 @@ library model
         Hetoimasia.GLFW.Internal.Mode
         Hetoimasia.GLFW.Internal.Monitor
         Hetoimasia.GLFW.Internal.Session
+        Hetoimasia.GLFW.Internal.Trace
         Hetoimasia.GLFW.Internal.Window
         Hetoimasia.GLFW.Internal.Command
     build-depends:
@@ -226,6 +227,7 @@ test-suite glfw-tests
         Test.GLFW.Session
         Test.GLFW.Spec
         Test.GLFW.Support
+        Test.GLFW.Trace
         Test.GLFW.Wake
         Test.GLFW.Window
     ghc-options: -threaded -rtsopts
@@ -271,6 +273,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Harness
         Test.GLFW.Native.Host
         Test.GLFW.Native.Input
+        Test.GLFW.Native.Interaction
         Test.GLFW.Native.Mode
         Test.GLFW.Native.Monitor
         Test.GLFW.Native.Private
@@ -282,6 +285,7 @@ test-suite glfw-native-tests
     ghc-options: -threaded
     build-depends:
         base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
         hspec >=2.11 && <3,
         hspec-core >=2.11 && <2.12,
         process >=1.6 && <1.7,

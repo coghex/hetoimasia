@@ -261,9 +261,11 @@ import Hetoimasia.GLFW.Internal.Session
   , ownerOperation
   , reconcileMonitorEvents
   , sessionIdentity
+  , sessionTrace
   , sessionWakePath
   , sessionWindowCapabilities
   )
+import Hetoimasia.GLFW.Internal.Trace (TraceEvent (TurnBegan), recordTrace)
 import Hetoimasia.GLFW.Internal.Attachment
   ( Acknowledgement
   , AttachmentId
@@ -1465,8 +1467,14 @@ queuedCommands host = do
   pure (queued + sum windows)
 
 -- | Poll, or wait the chosen finite bound, publishing the activity around it.
+--
+-- The turn number is offered to the session's interaction trace
+-- ("Hetoimasia.GLFW.Internal.Trace") first, so the pump's own entry and exit,
+-- and every callback delivered between them, are attributable to this turn.
+-- The trace is stopped in every ordinary run, which costs one 'IORef' read.
 processEvents ∷ WindowHost → Natural → EventProcessing → IO ()
 processEvents host number processing = do
+  recordTrace (sessionTrace (hostSession host)) (TurnBegan number)
   atomically (writeTVar (hostActivityState host) (HostActivity number waiting))
   processWindowEvents (hostSession host) processing
     `finally` atomically (writeTVar (hostActivityState host) (HostActivity number False))

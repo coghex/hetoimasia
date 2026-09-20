@@ -66,7 +66,12 @@
 -- cursor enter and leave, and scroll callbacks are contained at the trampoline.
 -- Each runs uninterruptibly, copies its fixed payload, records it into the
 -- window's capture latch with one non-blocking 'IORef' update, and returns.
--- None calls application code, waits, polls, logs, or destroys anything.
+-- None calls application code, waits, polls, logs, or destroys anything. Each
+-- also offers one record to the session's interaction trace
+-- ("Hetoimasia.GLFW.Internal.Trace") before it copies its payload, which an
+-- ordinary run, whose trace is stopped, answers with one 'IORef' read. A
+-- callback for an attribute the backend cannot report does not run at all, so
+-- it records nothing; X11 and Cocoa report every attribute.
 -- Anything a callback raises is caught there with its context and latched
 -- instead of unwinding into C; only the first is kept, and later ones are
 -- counted. The focus callback is the one owner of focus: it coalesces the
@@ -568,6 +573,13 @@ import Hetoimasia.GLFW.Internal.Mode
   , windowedPlan
   )
 import Hetoimasia.GLFW.Internal.Monitor (MonitorId, MonitorResult (..), NativeMonitor, inventoryMonitors, monitorIdentity)
+import Hetoimasia.GLFW.Internal.Trace
+  ( PumpMode (..)
+  , Trace
+  , TraceEvent (..)
+  , recordTrace
+  , recordingPump
+  )
 import Hetoimasia.GLFW.Internal.Capture
   ( NativeError (..)
   , Reports (..)
@@ -602,6 +614,7 @@ import Hetoimasia.GLFW.Internal.Session
   , sessionClaims
   , sessionIdentity
   , sessionNative
+  , sessionTrace
   , sessionWindowCapabilities
   )
 import Numeric.Natural (Natural)
@@ -1020,6 +1033,11 @@ windowCallbackOperation = operation "window callback"
 windowIdentifiers ∷ WindowId → [(Text, Text)]
 windowIdentifiers window = [("window", Text.pack (show (windowLocalIdentity window)))]
 
+-- | How a window names itself in the session's interaction trace: the same
+-- local identity 'windowIdentifiers' carries.
+traceLabel ∷ WindowId → Text
+traceLabel = Text.pack . show . windowLocalIdentity
+
 -- | Construct a window in a live session, through the session's native table.
 windowAssembly ∷ Session → WindowConfig → Assembly Window
 windowAssembly session config = do
@@ -1042,7 +1060,10 @@ windowAssembly session config = do
     acquirePart
       "glfw window callback storage"
       (releaseRank 2)
-      (nativeNewWindowCallbacks native (windowCallbacks (sessionWindowCapabilities session) captures))
+      ( nativeNewWindowCallbacks
+          native
+          (windowCallbacks (sessionWindowCapabilities session) (sessionTrace session) (traceLabel identity) captures)
+      )
       (noteFailure failed . freeStorage session certain)
   (handle, created) ←
     acquirePart
@@ -1229,8 +1250,8 @@ closeObservations session local live certain failed ownerState publisher = do
 -- | The contained callbacks recording into one window's capture latch. A
 -- callback for an attribute the platform cannot report records nothing, so no
 -- observation of it is fabricated.
-windowCallbacks ∷ WindowCapabilities → IORef Captures → WindowCallbacks
-windowCallbacks capabilities captures =
+windowCallbacks ∷ WindowCapabilities → Trace → Text → IORef Captures → WindowCallbacks
+windowCallbacks capabilities trace label captures =
   WindowCallbacks
     { onWindowSize = \width height →
         reported LogicalExtentReport . contained "window size" $ do
@@ -1303,6 +1324,10 @@ windowCallbacks capabilities captures =
     -- latch it is dropped for the same reason.
     contained ∷ Text → IO (Captures → Captures) → IO ()
     contained name capture = uninterruptibleMask_ $ do
+      -- Offered before the payload is copied, so a delivery whose own latching
+      -- then faults is still in the order. A stopped trace, which is every
+      -- ordinary run, reads one 'IORef' and returns.
+      recordTrace trace (CallbackDelivered label name)
       outcome ← tryWithContext capture
       case outcome of
         Right change → record change
@@ -2269,7 +2294,7 @@ processWindowEvents ∷ Session → EventProcessing → IO ()
 processWindowEvents session processing =
   ownerOperation session processEventsOperation identifiers $ do
     settleStrayOwnerReports capture
-    case processing of
+    recordingPump (sessionTrace session) mode $ case processing of
       ProcessPending → nativePollEvents native
       AwaitEventsFor seconds → nativeWaitEventsTimeout native seconds
     reports ← takeOwnerReports capture
@@ -2277,6 +2302,9 @@ processWindowEvents session processing =
   where
     native = sessionNative session
     capture = sessionCapture session
+    mode = case processing of
+      ProcessPending → PolledEvents
+      AwaitEventsFor seconds → WaitedForEvents seconds
     identifiers = case processing of
       ProcessPending → [("events", "poll")]
       AwaitEventsFor seconds → [("events", "wait"), ("seconds", Text.pack (show seconds))]

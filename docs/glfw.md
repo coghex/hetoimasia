@@ -3862,6 +3862,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
 | Notification obligations | The session | An admitting or publishing transaction registers one; the notifying thread discharges it in the transaction that records what its wake left; owner boundaries wait for zero | Any; STM | The session | Zero whenever every committed admission and publication has been notified |
 | Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
+| Interaction trace | The session | An activated probe starts, takes, and stops it; the pump, the owner loop, and the window callbacks offer records | Owner, and callbacks inside its pump calls; atomic | Stopped unless a probe starts it | Emptied by each take; stopped storage holds nothing |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
 | Monitor connections and current inventory | The session | Committed refreshes write them; resolution reads them | Owner | The session | Emptied when the inventory closes |
@@ -4323,7 +4324,10 @@ The native examples cover:
   callback GLFW holds, with none held afterwards, before `glfwTerminate`, and its
   storage freed after the error callback's detach, with the closed inventory
   readable after the session; and every identity from a completed real session
-  answered `MonitorDisconnected` in the next.
+  answered `MonitorDisconnected` in the next;
+- the owner-loop interaction probe, which is pending as unexercised unless
+  `HETOIMASIA_INTERACTION_PROBE_SECONDS` asks a person to perform the
+  interactions during the run: see [the interaction probe](#the-interaction-probe).
 
 Without consent, these list the examples and run the ones that never enter a
 session, acquiring nothing and starting no child:
@@ -4364,6 +4368,71 @@ fails before initializing GLFW, with the refusal on stderr and zero
 acquisitions in its report, and `--private-session <scenario>` invoked
 directly refuses the same way. See
 [validation.md](validation.md#the-display-worker).
+
+### The interaction probe
+
+GLFW documents that on some platforms a window move, a window resize, or a menu
+interaction runs a platform modal loop inside `glfwPollEvents` or
+`glfwWaitEventsTimeout`. An owner turn reconciles callbacks, dispatches
+commands, and offers the update hook only after that call returns, so whether
+such a loop exists decides whether anything the application owns progresses
+while a person is interacting. `Test.GLFW.Native.Interaction` measures that
+rather than assuming it, and
+[the verdict](owner_loop_interaction_verdict.md) records what one approved
+macOS session observed.
+
+The probe runs the production owner loop over one ordinary shown window in the
+shared session, with the session's bounded interaction trace started
+(`Hetoimasia.GLFW.Internal.Trace`). Every record — an owner turn beginning, the
+native call's entry and exit with whether it polled or waited and the seconds it
+asked for, each window callback as it is delivered, and the update hook's entry
+and exit — is stamped from one monotonic clock, so a callback delivered from
+inside a blocked pump is ordered between that pump's entry and its exit. The
+trace is record-only and bounded: it keeps the first `defaultTraceCapacity`
+records, numbers the ones it drops so a gap is visible, counts a recording that
+could not be made as a fault rather than raising it inside a C frame, and marks
+evidence with either count above zero as incomplete. Every session owns one and
+it is stopped unless a probe starts it, so an ordinary run costs one `IORef`
+read at each recording point. What an owner turn offers it, and the bound and
+its loss reporting, are asserted headlessly over the test seam in
+`Test.GLFW.Trace`, which needs no desktop and no observed stall.
+
+Two separate gates keep it out of routine runs. The consent gate refuses it
+before its body like every other example that touches the session, so a run
+without `HETOIMASIA_NATIVE_SESSION` never reaches it. Independently of consent,
+it is inactive unless `HETOIMASIA_INTERACTION_PROBE_SECONDS` names the seconds
+each interaction should last, so the mandatory `test.glfw-native` group, which
+runs the whole suite on an isolated X11 display with its own consent, reports it
+pending and opens no window. No validation group names it and no CI runs it.
+What activates it, what a pending run says, and that it is refused before its
+body with or without activation are proven under `the native opt-in`, which
+needs no consent.
+
+An activated run works through an idle baseline, a window move, a window resize,
+and a menu-bar interaction, in that order, each lasting the seconds asked for.
+It prints what to do before each one and marks the phase in the trace; every
+line it prints is between measurement intervals, never inside one. It then
+prints, per phase, the owner turns, the update opportunities, the pumps by kind,
+the longest stretch with no update opportunity, the callbacks delivered and how
+many arrived from inside a pump, the longest pump intervals with what was
+delivered inside each, and whether the evidence is complete. It asserts that
+each phase measured at least one owner turn and one complete pump and that no
+phase lost records; it asserts nothing about whether a stall happened, because
+that is the question. `HETOIMASIA_INTERACTION_PROBE_OUTPUT` names a file every
+record is written to, which is how the timestamped evidence beside a verdict is
+retained.
+
+This disrupts the desktop more than the other native examples do, because it
+asks a person to keep interacting for the whole run. Describe it, ask, and wait
+for acceptance as for any other desktop session, then:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop \
+HETOIMASIA_INTERACTION_PROBE_SECONDS=20 \
+HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/owner-loop-interaction-trace.tsv \
+  cabal test glfw-native-tests --test-show-details=direct \
+  --test-options='--match "/GLFW native/owner-loop progress during window interactions/"'
+```
 
 Record native evidence with the manifest and compiler identities it ran under:
 
