@@ -32,7 +32,9 @@
 # established, with the command never started; 2 for a usage error; 128+N when
 # the helper itself was terminated by signal N. The compositor is stopped and
 # the private runtime directory removed on every exit path the helper can
-# handle. See docs/validation.md.
+# handle, from before that directory exists: cleanup and the signal traps are
+# installed first, so the setup window in which the directory is there and the
+# compositor is not is covered like any other. See docs/validation.md.
 set -uo pipefail
 
 usage() {
@@ -66,12 +68,12 @@ for tool in weston wayland-info; do
   command -v "$tool" >/dev/null 2>&1 || refuse "$tool was not found on PATH"
 done
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/hetoimasia-wayland.XXXXXX")" || refuse "no scratch directory could be created"
-runtime="$scratch/runtime"
-# A Wayland runtime directory is the user's alone; the compositor refuses one
-# any other account can reach.
-mkdir -m 700 "$runtime" || refuse "no private runtime directory could be created"
-socket="hetoimasia-$$"
+# Nothing is created until cleanup owns it. Every one of these is declared and
+# the traps installed before the first directory exists, so a signal or a
+# failure during setup — the window in which the runtime directory exists and
+# the compositor does not — still ends through the same cleanup.
+scratch=""
+socket=""
 compositor=""
 command_pid=""
 
@@ -91,7 +93,9 @@ stop() {
     kill "$compositor" 2>/dev/null
     wait "$compositor" 2>/dev/null
   fi
-  rm -rf "$scratch"
+  if [ -n "$scratch" ]; then
+    rm -rf "$scratch"
+  fi
 }
 trap stop EXIT
 
@@ -112,6 +116,13 @@ terminate() {
 trap 'terminate TERM 143' TERM
 trap 'terminate INT 130' INT
 trap 'terminate HUP 129' HUP
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/hetoimasia-wayland.XXXXXX")" || refuse "no scratch directory could be created"
+runtime="$scratch/runtime"
+# A Wayland runtime directory is the user's alone; the compositor refuses one
+# any other account can reach.
+mkdir -m 700 "$runtime" || refuse "no private runtime directory could be created"
+socket="hetoimasia-$$"
 
 unset WAYLAND_DISPLAY
 unset WAYLAND_SOCKET

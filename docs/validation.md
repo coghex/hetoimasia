@@ -822,7 +822,10 @@ socket within the bound each end the helper with status `1` before the command
 starts; a usage error exits `2`; otherwise the command's own status is
 returned. The compositor is stopped and reaped and the runtime directory
 removed on every exit path the helper can handle, including a failed start and
-a catchable signal, which ends it with `128+N`.
+a catchable signal, which ends it with `128+N`. Cleanup and the signal traps
+are installed **before** the private directories are created, so the setup
+window — the runtime directory exists, the compositor does not — is covered
+like any other; a signal or a failure there leaves nothing behind.
 
 ### Receipts
 
@@ -2462,7 +2465,11 @@ exits, and one that never serves within the bound each stop the run with status
 while the helper is still waiting for it, and by the command once it is
 running, so the moment is coordinated rather than timed — ends the helper with
 the compositor stopped and reaped, the command stopped, and the runtime
-directory removed.
+directory removed. The setup window has its own two: a `mkdir` that terminates
+the helper as it returns, which puts the signal between creating the runtime
+directory and starting the compositor, and a `mkdir` that fails outright. Both
+require the helper's own scratch directory to be gone from its `TMPDIR`
+afterwards, which is what every other cleanup assertion also ends with.
 
 The source distribution has its own examples: that it carries every file these
 suites run out of the checkout, that withdrawing one entry from a throwaway

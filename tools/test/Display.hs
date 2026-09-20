@@ -16,7 +16,7 @@ module Display (spec) where
 
 import Control.Monad (forM_)
 import Sandbox (run, sanitizedEnvironment)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import System.Directory
   ( createDirectory
   , createFileLink
@@ -25,6 +25,8 @@ import System.Directory
   , findExecutable
   , getCurrentDirectory
   , getPermissions
+  , listDirectory
+  , removePathForcibly
   , setOwnerExecutable
   , setPermissions
   )
@@ -177,6 +179,9 @@ installStubs ∷ Display → [(String, String)] → IO ()
 installStubs display stubs =
   forM_ stubs $ \(name, contents) → do
     let path = toolbox display </> name
+    -- A stub may stand in for an ordinary utility the toolbox already links
+    -- to; writing through that link would write the real program.
+    removePathForcibly path
     writeFile path contents
     permissions ← getPermissions path
     setPermissions path (setOwnerExecutable True permissions)
@@ -283,6 +288,33 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       (result, _, errors) ← sessionHelper session ["--summary", directory session </> "summary.md"]
       result `shouldBe` ExitFailure 2
       errors `shouldContain` "usage"
+
+  it "removes the private runtime directory when a signal ends the setup before the compositor starts" $
+    withSession $ \session → do
+      -- The window the helper's cleanup has to cover first: the runtime
+      -- directory exists and the compositor does not. `mkdir` is what creates
+      -- it, so a `mkdir` that signals the helper as it returns puts the signal
+      -- exactly there, with nothing timed.
+      real ← findExecutable "mkdir" >>= maybe (fail "mkdir is not on PATH") pure
+      installStubs session (("mkdir", signallingMkdir real) : waylandStubs)
+      (result, _, errors) ← sessionHelper session ["--", "sh", "-c", recordSession session]
+      result `shouldBe` ExitFailure 143
+      errors `shouldContain` "terminated by SIGTERM"
+      -- The compositor was never reached, so nothing recorded itself, and the
+      -- command never ran.
+      doesFileExist (directory session </> "compositor.pid") `shouldReturn` False
+      doesFileExist (directory session </> "environment.txt") `shouldReturn` False
+      created ← lines <$> readFile (directory session </> "early-mkdir.txt")
+      case reverse created of
+        runtime : _ → doesDirectoryExist runtime `shouldReturn` False
+        [] → expectationFailure "the stub recorded no directory"
+      leftBehind session `shouldReturn` []
+
+  it "leaves nothing behind when the private runtime directory cannot be prepared" $
+    withSession $ \session → do
+      installStubs session (("mkdir", "#!/bin/sh\nexit 1\n") : waylandStubs)
+      refusedSession session "no private runtime directory could be created"
+      leftBehind session `shouldReturn` []
 
   it "stops and reaps the compositor and removes the runtime directory when a signal ends the startup" $
     withSession $ \session → do
@@ -423,6 +455,33 @@ cleanedUp session = do
   runtime ← privateRuntime session
   runtime `shouldSatisfy` (directory session `isInfixOf`)
   doesDirectoryExist runtime `shouldReturn` False
+  leftBehind session `shouldReturn` []
+
+-- | The helper's own scratch directories still sitting in its TMPDIR. The
+-- runtime directory lives inside one, so an empty answer is the whole
+-- statement: nothing the helper created survived it.
+leftBehind ∷ Display → IO [FilePath]
+leftBehind session =
+  filter ("hetoimasia-wayland." `isPrefixOf`) <$> listDirectory (directory session)
+
+-- | A @mkdir@ that does what it was asked and then terminates the helper. The
+-- signal is pending before this returns, so the helper handles it before its
+-- next command rather than at some elapsed time.
+signallingMkdir ∷ FilePath → String
+signallingMkdir real =
+  unlines
+    [ "#!/bin/sh"
+    , "'" ++ real ++ "' \"$@\""
+    , "status=$?"
+    , "for argument in \"$@\"; do"
+    , "  case \"$argument\" in"
+    , "    -*) ;;"
+    , "    *) printf '%s\\n' \"$argument\" >> early-mkdir.txt ;;"
+    , "  esac"
+    , "done"
+    , "kill -TERM \"$PPID\""
+    , "exit $status"
+    ]
 
 -- | The private runtime directory the compositor was launched into.
 privateRuntime ∷ Display → IO FilePath
