@@ -58,6 +58,8 @@ test-suite vulkan-proof
         Test.Vulkan.Proof.Journal
         Test.Vulkan.Proof.Matrix
         Test.Vulkan.Proof.Ownership
+        Test.Vulkan.Proof.Publication
+        Test.Vulkan.Proof.PublicationSpec
         Test.Vulkan.Proof.Record
         Test.Vulkan.Proof.Retention
         Test.Vulkan.Proof.RetentionSpec

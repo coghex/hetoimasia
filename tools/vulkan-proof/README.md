@@ -42,6 +42,8 @@ examples that keep the rest of that boundary honest.
 | `proof/Test/Vulkan/Proof/ConstructionSpec.hs` | Their ownership examples, which `--headless` selects: every step of both constructions failed in turn, with a stand-in native layer. |
 | `proof/Test/Vulkan/Proof/Retention.hs` | The release decision: which of teardown's handles the run's own evidence permits destroying, as a pure function. |
 | `proof/Test/Vulkan/Proof/RetentionSpec.hs` | That decision's own examples, which `--headless` selects. |
+| `proof/Test/Vulkan/Proof/Publication.hs` | How the run stops, and the one masked step between a native call and the ledger entry recording what it did. |
+| `proof/Test/Vulkan/Proof/PublicationSpec.hs` | The present handoff's cancellation examples, which `--headless` selects: a cancellation delivered across the enqueue, on a fresh slot and on a recycled one, with the native call replaced. |
 | `proof/Test/Vulkan/Proof/InvocationSpec.hs` | The invocation policy's examples, selected alongside them. |
 | `proof/Test/Vulkan/Proof/Spec.hs` | The verdict: pure Hspec assertions over those findings. |
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
@@ -119,6 +121,39 @@ recalls their two registrations and teardown arrives where it always arrived.
 and choosing the step to fail at, because a native run cannot be asked to fail
 its fifth `vkCreateSemaphore` or its memory allocation on demand.
 
+## What a call did is owned as a handle is
+
+`vkQueuePresentKHR` has enqueued its semaphore waits and chained its present
+fence the moment it returns, and the ledger entry saying so is the only
+evidence teardown has that the presentation is owed. A cancellation taken
+between the two leaves an obligation that exists on the device and nowhere in
+the run's own record, and teardown then destroys the present fence, the
+presentation semaphore and the swapchain behind it — a use-after-free rather
+than a failed assertion.
+
+So the call and that entry are one masked step, exactly as a create and its
+registration are. `Publication.hs` is that step. The mask covers a native call
+that does not block and a write to an `IORef` and nothing else: no wait moves
+inside it, no native call becomes preemptible, and no destroy is wrapped in a
+timeout. What it withholds from a caller trying to stop the run is not the stop
+but the instant it is taken — a cancellation delivered across the handoff is
+deferred until the entry is in and then stops the run at the presentation step,
+carrying its own failure, rather than escaping as an unexpected exception at no
+step at all. The result recorded is the one the call reported; a cancellation
+that arrived afterwards happened to the run, not to the present.
+
+`PublicationSpec.hs` asserts that headlessly, with `vkQueuePresentKHR` replaced
+by a stand-in and a real `throwTo` delivered at the first point the code under
+test permits one — on a fresh slot and on a recycled slot whose earlier present
+was retired. A native run cannot be asked to be cancelled at a chosen instant,
+and the cancellation is deterministic rather than timed: it is armed by waiting
+for the killing thread to block on the masked target, so there is no sleep and
+no retry.
+
+```bash
+bash tools/vulkan-proof/run-proof.sh --headless --match cancellation
+```
+
 ## Teardown is decided, not promised
 
 A run that finishes owes nothing and releases all ten of its cleanup entries, in
@@ -172,10 +207,11 @@ run that stopped as well as on one that proved.
 
 The decision is a pure function of the effects and results the run recorded, and
 the native cleanup executor calls the same one the examples do. `--headless`
-runs those examples and the construction ones alone: they open no window,
-initialize no GLFW, make no native call, and need no consent, which is what
-lets a fence timeout, a failed boundary, a lost device, and a construction that
-stops at a chosen step be exercised at all.
+runs those examples, the construction ones, and the present handoff's
+cancellation ones alone: they open no window, initialize no GLFW, make no
+native call, and need no consent, which is what lets a fence timeout, a failed
+boundary, a lost device, a construction that stops at a chosen step, and a
+present cancelled between its enqueue and its record be exercised at all.
 
 ```bash
 bash tools/vulkan-proof/run-proof.sh --headless

@@ -161,9 +161,18 @@ type SlotName = Text
 -- carries the old completion forward onto the new present.
 data Observation
   = PresentAttempted SlotName NativeResult
-    -- ^ A @vkQueuePresentKHR@ chaining that slot's present fence. Recorded as
-    -- soon as the call returns or throws, before any status query, event poll,
-    -- or wait that could itself fail and lose the obligation.
+    -- ^ A @vkQueuePresentKHR@ chaining that slot's present fence. The call and
+    -- this entry are one masked step — see "Test.Vulkan.Proof.Publication" —
+    -- so it is recorded as soon as the call returns or throws, before any
+    -- status query, event poll, or wait that could itself fail and lose the
+    -- obligation, and with no point between the enqueue and it at which a
+    -- cancellation can be taken.
+    --
+    -- The result is the one the call itself reported. A cancellation that
+    -- arrived once the call had returned happened to the run rather than to
+    -- the present, and stops it at the presentation step without overwriting
+    -- what the device said; only a call that actually threw is classified by
+    -- 'classifyThrown'.
   | PresentFenceWaited SlotName NativeResult
     -- ^ A wait on that slot's present fence. Only @VK_SUCCESS@ discharges the
     -- obligation; a timeout leaves it exactly where it was.

@@ -30,6 +30,17 @@
 -- process exit is the escape for a session that never resolves: no native call
 -- here is preemptible and no native destroy is wrapped in a timeout.
 --
+-- What a native call did is owned the same way a handle is.
+-- @vkQueuePresentKHR@ has enqueued its semaphore waits and chained its present
+-- fence the moment it returns, and the ledger entry saying so is the only
+-- evidence teardown has of it;
+-- so the call and that entry are one masked step, which
+-- "Test.Vulkan.Proof.Publication" performs and
+-- "Test.Vulkan.Proof.PublicationSpec" exercises headlessly with the call
+-- replaced. A cancellation delivered across it is deferred until the entry is
+-- in and then stops the run at the presentation step, carrying its own
+-- failure, rather than being lost or reported as an unexpected exception.
+--
 -- Teardown can only decide over handles it was given, so every native object
 -- this module creates has a cleanup owner before the next fallible step runs.
 -- For a handle whose whole construction is one call that is 'owning', which
@@ -47,15 +58,7 @@
 module Test.Vulkan.Proof.Run (runProof) where
 
 import Control.Concurrent (isCurrentThreadBound, rtsSupportsBoundThreads)
-import Control.Exception
-  ( Exception
-  , SomeException
-  , displayException
-  , fromException
-  , mask_
-  , throwIO
-  , try
-  )
+import Control.Exception (SomeException, displayException, mask_, throwIO, try)
 import Control.Monad (forM, forM_, unless, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -140,6 +143,13 @@ import Test.Vulkan.Proof.Ownership
   , owning
   , runCleanups
   )
+import Test.Vulkan.Proof.Publication
+  ( catchAll
+  , presentationStep
+  , publishPresent
+  , require
+  , stop
+  )
 import Test.Vulkan.Proof.Retention
   ( Handle (..)
   , NativeResult (..)
@@ -151,22 +161,6 @@ import Test.Vulkan.Proof.Retention
   , describeResult
   , standingFrom
   )
-
--- --------------------------------------------------------------------------
--- Stopping
-
-newtype Stop = Stop Failure
-
-instance Show Stop where
-  show (Stop failure) = Text.unpack (failureStep failure <> ": " <> failureDetail failure)
-
-instance Exception Stop
-
-stop ∷ Text → Text → IO a
-stop step detail = throwIO (Stop (Failure step detail))
-
-require ∷ Text → Text → Bool → IO ()
-require step detail ok = unless ok (stop step detail)
 
 -- --------------------------------------------------------------------------
 -- Callback capture
@@ -438,20 +432,6 @@ afterMessengerPhase = "after the explicit messenger was destroyed"
 
 teardownPhase ∷ Text
 teardownPhase = "teardown"
-
--- | Turn any escaping failure into a named stop, so a proof that breaks says
--- which requirement it broke at rather than only that it broke.
-catchAll ∷ IO a → (Failure → IO a) → IO a
-catchAll action handler = do
-  outcome ← try action
-  case outcome of
-    Right value → pure value
-    Left escaped
-      | Just (Stop failure) ← fromException escaped → handler failure
-      | Just (VulkanException result) ← fromException escaped →
-          handler (Failure "a Vulkan call failed" (Text.pack (show result)))
-      | otherwise →
-          handler (Failure "the proof raised an unexpected exception" (Text.pack (displayException escaped)))
 
 procedure ∷ Journal → Consent → Cleanups → CallbackSink → Ledger → IO Findings
 procedure journal consent cleanups sink ledger = do
@@ -1394,11 +1374,23 @@ awaitPresentFence what device slot = do
 
 -- | Present one acquired image with a present fence, reporting the fence's
 -- status before the wait as well as after it.
+--
+-- The enqueue and the ledger entry that records it are one masked step, which
+-- 'publishPresent' performs. @vkQueuePresentKHR@ chains the slot's present
+-- fence and enqueues its semaphore waits, so the obligation exists on the
+-- device from the instant the call returns; a cancellation taken before the
+-- entry is written would leave teardown with no evidence of it, and teardown
+-- would then destroy the present fence, the presentation semaphore and the
+-- swapchain behind it. The mask covers that handoff alone — a call that does
+-- not block and a write to an 'IORef' — so the waits below are as
+-- interruptible as they always were. The cancellation is deferred rather than
+-- discarded: 'publishPresent' takes it once the entry is in, and it stops the
+-- run here, at the presentation step, carrying its own failure.
 presentWithFence ∷ Device → Queue → Target → Slot → Word32 → IO (Text, Text, Bool)
 presentWithFence device queue target slot index = do
   resetFences device (Vector.singleton slot.slotPresentFence)
-  outcome ←
-    try @SomeException $
+  (outcome, result) ←
+    publishPresent slot.slotLedger slot.slotName slot.slotPresented $
       queuePresentKHR
         queue
         ( PresentInfoKHR
@@ -1410,17 +1402,8 @@ presentWithFence device queue target slot index = do
             }
             ∷ PresentInfoKHR '[SwapchainPresentFenceInfoKHR]
         )
-  let result = either classifyThrown classifyResult outcome
-  -- First, and before anything that can itself fail. A status query, an event
-  -- poll, or a wait that threw between the present and this line would leave
-  -- the obligation unrecorded, and a present's semaphore waits are enqueued
-  -- whether the call reported success, out-of-date, or surface-lost. Marking
-  -- the slot presented here rather than after the wait is the same rule: the
-  -- obligation exists from the enqueue, not from its retirement.
-  observe slot.slotLedger (PresentAttempted slot.slotName result)
-  writeIORef slot.slotPresented True
   require
-    "presentation"
+    presentationStep
     ("vkQueuePresentKHR returned " <> describeResult result)
     (result == Succeeded || result == Suboptimal)
   before ← getFenceStatus device slot.slotPresentFence
