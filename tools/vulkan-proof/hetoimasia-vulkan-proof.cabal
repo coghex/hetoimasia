@@ -51,9 +51,13 @@ test-suite vulkan-proof
         Test.Vulkan.Proof.Consent
         Test.Vulkan.Proof.Findings
         Test.Vulkan.Proof.Interop
+        Test.Vulkan.Proof.Invocation
+        Test.Vulkan.Proof.InvocationSpec
         Test.Vulkan.Proof.Journal
         Test.Vulkan.Proof.Matrix
         Test.Vulkan.Proof.Record
+        Test.Vulkan.Proof.Retention
+        Test.Vulkan.Proof.RetentionSpec
         Test.Vulkan.Proof.Run
         Test.Vulkan.Proof.Spec
     c-sources: cbits/hetoimasia_vulkan_proof.c

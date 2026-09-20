@@ -23,6 +23,13 @@
 #   HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan-proof/run-proof.sh
 #   bash tools/display/x11.sh -- bash tools/vulkan-proof/run-proof.sh   # Linux
 #
+# Every argument is forwarded to the harness as a test option. `--headless`
+# selects the release decision's own examples and nothing else: they are pure,
+# open no window, initialize no GLFW, and read no consent, so that run needs
+# none and starts no session.
+#
+#   bash tools/vulkan-proof/run-proof.sh --headless
+#
 # Exit status: the proof's own; 2 for a configuration diagnostic. See
 # docs/vulkan_compatibility_record.md.
 set -euo pipefail
@@ -210,9 +217,18 @@ echo "run-proof: VK_LAYER_PATH=$VK_LAYER_PATH"
 echo "run-proof: GLFW prefix $glfw_prefix"
 [ -n "$loader_prefix" ] && echo "run-proof: loader prefix $loader_prefix"
 
+# What the caller asked the harness itself to do. The harness owns `--headless`
+# and takes it out of the arguments before Hspec's runner sees them, so an
+# Hspec selector such as `--match` passes through here unchanged.
+options=()
+for argument in "$@"; do
+  options+=("--test-option=$argument")
+done
+
 cd "$root"
 exec cabal test \
   --project-file=cabal.project.vulkan \
   --builddir=dist-vulkan-proof \
   --test-show-details=direct \
-  hetoimasia-vulkan-proof:vulkan-proof
+  hetoimasia-vulkan-proof:vulkan-proof \
+  ${options[@]+"${options[@]}"}

@@ -5,8 +5,8 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 
 -- | The native run: one linear procedure on the process main thread that
--- observes everything issue #158 asks for and then tears the session down
--- completely, including the instance.
+-- observes everything issue #158 asks for and then tears down as much of the
+-- session as its own evidence permits.
 --
 -- Nothing here is an assertion. The procedure records what it saw and returns
 -- it; "Test.Vulkan.Proof.Spec" decides whether that is a pass. Keeping the two
@@ -18,6 +18,17 @@
 -- says which. It never substitutes a weaker fact for a missing one: a driver
 -- that cannot enable Vulkan 1.3, or a maintenance extension that is not there,
 -- ends the run with a named failure rather than a narrowed proof.
+--
+-- Teardown is not promised complete. A run that finished owes nothing and
+-- releases all ten of its cleanup entries in order; a run that stopped with a
+-- presentation still outstanding, or whose device-idle boundary failed, does
+-- not, and destroying on through that would be the device-idle fallback the
+-- accepted design forbids. What may be destroyed is decided by
+-- "Test.Vulkan.Proof.Retention", which is pure and is exercised headlessly by
+-- "Test.Vulkan.Proof.RetentionSpec"; this module supplies that decision with
+-- the native effects and results it recorded, and obeys it. Retention plus
+-- process exit is the escape for a session that never resolves: no native call
+-- here is preemptible and no native destroy is wrapped in a timeout.
 module Test.Vulkan.Proof.Run (runProof) where
 
 import Control.Concurrent (isCurrentThreadBound, rtsSupportsBoundThreads)
@@ -88,6 +99,24 @@ import Test.Vulkan.Proof.Interop
   , vulkanSupported
   )
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
+import Test.Vulkan.Proof.Retention
+  ( BoundaryStanding (..)
+  , Disposition (..)
+  , Handle (..)
+  , NativeResult (..)
+  , Observation (..)
+  , Route (..)
+  , Standing (..)
+  , classifyResult
+  , classifyThrown
+  , decide
+  , describeHandle
+  , describeObservation
+  , describeResult
+  , isDestruction
+  , releasedEntries
+  , standingFrom
+  )
 
 -- --------------------------------------------------------------------------
 -- Stopping
@@ -106,35 +135,118 @@ require ∷ Text → Text → Bool → IO ()
 require step detail ok = unless ok (stop step detail)
 
 -- --------------------------------------------------------------------------
+-- The ledger
+
+-- | The run's own record of the native effects and results the release
+-- decision is a function of, in the order they happened.
+--
+-- It is appended to at the moment a call returns or throws, before anything
+-- that could itself fail runs: an obligation lost between a present and the
+-- line that would have recorded it is a handle that looks free and is not.
+newtype Ledger = Ledger (IORef [Observation])
+
+newLedger ∷ IO Ledger
+newLedger = Ledger <$> newIORef []
+
+observe ∷ Ledger → Observation → IO ()
+observe (Ledger ref) observation = modifyIORef' ref (<> [observation])
+
+observations ∷ Ledger → IO [Observation]
+observations (Ledger ref) = readIORef ref
+
+-- --------------------------------------------------------------------------
 -- Cleanup
 
--- | Teardown actions, newest first. Every one runs, in reverse order, whether
--- the procedure finished or stopped, and a release that itself fails is
--- recorded rather than allowed to hide the ones after it.
-newtype Cleanups = Cleanups (IORef [(Text, IO ())])
+-- | Teardown actions, newest first, each naming the handle it releases. The
+-- handle is what "Test.Vulkan.Proof.Retention" decides over; the entry name
+-- the record reports is derived from it.
+newtype Cleanups = Cleanups (IORef [(Handle, IO ())])
 
 newCleanups ∷ IO Cleanups
 newCleanups = Cleanups <$> newIORef []
 
-onExit ∷ Cleanups → Text → IO () → IO ()
-onExit (Cleanups ref) label action = modifyIORef' ref ((label, action) :)
+onExit ∷ Cleanups → Handle → IO () → IO ()
+onExit (Cleanups ref) handle action = modifyIORef' ref ((handle, action) :)
 
--- | Run every release, in reverse order, and report both what ran and what
--- failed. A failure never stops the remaining releases and is never swallowed:
--- the verdict refuses a run whose teardown failed.
-runCleanups ∷ Journal → Cleanups → IO ([Text], [Text])
-runCleanups journal (Cleanups ref) = do
-  actions ← readIORef ref
+-- | What became of one release.
+data Release
+  = Released
+  | Failed Text
+  | Retained Text
+
+released ∷ Release → Bool
+released = \case
+  Released → True
+  _ → False
+
+-- | Tear down: the boundary first, then every release the recorded evidence
+-- permits, in reverse registration order.
+--
+-- The boundary runs before any decision is taken because it is what produces
+-- the evidence the decisions rest on — the device-idle result, and a bounded
+-- wait on every present fence still owed. After it, one call to the same pure
+-- 'decide' the headless examples exercise says what may go and what must stay.
+--
+-- A release that fails is recorded and never allowed to hide the ones after
+-- it; a release that is withheld is recorded with the condition that was
+-- unmet. Neither is narrated separately from the values the verdict reads.
+runCleanups ∷ Journal → Ledger → Cleanups → IO TeardownFacts
+runCleanups journal ledger (Cleanups ref) = do
+  registered ← readIORef ref
   writeIORef ref []
-  outcomes ← forM actions $ \(label, action) → do
-    outcome ← try @SomeException action
-    case outcome of
-      Right () → pure (label, Nothing)
-      Left failure → do
-        let reason = label <> ": " <> Text.pack (displayException failure)
-        note journal ("teardown of " <> reason)
-        pure (label, Just reason)
-  pure (map fst outcomes, [reason | (_, Just reason) ← outcomes])
+  boundary ← forM [entry | entry@(TheTeardownBoundary, _) ← registered] (attempt journal)
+  recorded ← observations ledger
+  let plan = map fst registered
+      decisions = decide plan recorded
+  later ← forM [entry | entry@(handle, _) ← registered, handle /= TheTeardownBoundary] $ \entry@(handle, _) →
+    case lookup handle decisions of
+      Just (Retain reason) → do
+        note journal ("teardown retained " <> describeHandle handle <> ": " <> reason)
+        pure (handle, Retained reason)
+      _ → attempt journal entry
+  settled ← observations ledger
+  pure (teardownFactsFrom settled (boundary <> later))
+
+attempt ∷ Journal → (Handle, IO ()) → IO (Handle, Release)
+attempt journal (handle, action) = do
+  outcome ← try @SomeException action
+  case outcome of
+    Right () → pure (handle, Released)
+    Left failure → do
+      let reason = describeHandle handle <> ": " <> Text.pack (displayException failure)
+      note journal ("teardown of " <> reason)
+      pure (handle, Failed reason)
+
+teardownFactsFrom ∷ [Observation] → [(Handle, Release)] → TeardownFacts
+teardownFactsFrom recorded outcomes =
+  TeardownFacts
+    { teardownReleases = releasedEntries [(handle, released outcome) | (handle, outcome) ← outcomes]
+    , teardownFailures = [reason | (_, Failed reason) ← outcomes]
+    , -- The boundary ran, and it is in 'teardownReleases' and in the
+      -- observations it produced, but it destroyed nothing: it is the
+      -- device-idle wait the rest rest on. This line is what a reader consults
+      -- to learn which native objects were freed, so a wait does not belong in
+      -- it.
+      teardownDestroyed = [describeHandle handle | (handle, Released) ← outcomes, isDestruction handle]
+    , teardownRetained = [(describeHandle handle, reason) | (handle, Retained reason) ← outcomes]
+    , teardownRoute = describeRoute (standingFrom recorded)
+    , teardownObservations = map describeObservation recorded
+    }
+
+-- | Which destruction rules teardown operated under, and why. A timeout is
+-- never reported here as device loss: it is the case where completion is still
+-- owed, and saying otherwise would turn a retained handle into a destroyed one.
+describeRoute ∷ Standing → Text
+describeRoute standing = case standing.standingRoute of
+  DeviceLossRoute →
+    "the specification's device-loss rule, which permits destroying a lost device's objects without waiting for work that may never complete"
+  OrdinaryRoute → case standing.standingBoundary of
+    BoundaryHeld →
+      "ordinary: each release needed its own completion evidence, and the device-idle boundary held"
+    BoundaryNotReached →
+      "ordinary: each release needed its own completion evidence, and the device-idle boundary was never reached"
+    BoundaryBroken detail →
+      "ordinary: each release needed its own completion evidence, and the device-idle boundary failed with " <> detail
 
 -- --------------------------------------------------------------------------
 -- Callback capture
@@ -339,35 +451,45 @@ clearConflictingOverrides =
 -- --------------------------------------------------------------------------
 -- The run
 
--- | Run the whole proof. Returns what it observed, or the step it stopped at;
--- either way the session is fully torn down and the callback evidence is
--- complete before this returns.
+-- | Run the whole proof. Returns what it observed, or the step it stopped at.
+--
+-- Either way teardown has run to completion and the callback evidence is
+-- complete before this returns. Teardown running to completion is not the
+-- session being fully destroyed: a run that stopped owing a presentation, or
+-- whose device-idle boundary failed, deliberately returns with the handles
+-- that presentation outlives still alive — up to and including the device,
+-- the window, the instance, the callback trampoline, and GLFW — and the
+-- outcome says which and why. Those are released by process exit.
 runProof ∷ Journal → Consent → IO Outcome
 runProof journal consent = do
   cleanups ← newCleanups
   sink ← newCallbackSink
-  outcome ← catchAll (Proved <$> procedure journal consent cleanups sink) (pure . Stopped)
-  -- Teardown, including the instance, happens here: after the procedure, and
-  -- before the callback evidence is read. That ordering is the requirement.
-  (releases, teardownFailed) ← runCleanups journal cleanups
+  ledger ← newLedger
+  outcome ← catchAll (Proved <$> procedure journal consent cleanups sink ledger) (pure . (`Stopped` noTeardown))
+  -- Teardown happens here: after the procedure, and before the callback
+  -- evidence is read. That ordering is the requirement. What it destroys is
+  -- not fixed — a stop can leave a presentation outstanding, and a handle it
+  -- outlives is retained rather than freed.
+  facts ← runCleanups journal ledger cleanups
   diagnostics ← reverse <$> readIORef sink.sinkDiagnostics
   failures ← reverse <$> readIORef sink.sinkFailures
   for_ failures $ \failure → note journal ("a callback reported a failure: " <> failure)
-  pure (completeAfterTeardown releases teardownFailed diagnostics failures outcome)
+  pure (completeAfterTeardown facts diagnostics failures outcome)
 
--- | Fill in the facts that only exist once the session is gone: the callback
+-- | Fill in the facts that only exist once teardown has run: the callback
 -- evidence, and what teardown itself did.
-completeAfterTeardown ∷ [Text] → [Text] → [Diagnostic] → [Text] → Outcome → Outcome
-completeAfterTeardown releases teardownFailed diagnostics failures = \case
-  Stopped failure → Stopped failure
+--
+-- A stopped run keeps its step and its failed verdict and gains the teardown
+-- facts. Teardown can obtain the very completion the run stopped waiting for,
+-- and that still does not make the run a proof; what it changes is what the
+-- record can say about which handles survived it.
+completeAfterTeardown ∷ TeardownFacts → [Diagnostic] → [Text] → Outcome → Outcome
+completeAfterTeardown facts diagnostics failures = \case
+  Stopped failure _ → Stopped failure facts
   Proved findings →
     Proved
       findings
-        { findingsTeardown =
-            TeardownFacts
-              { teardownReleases = releases
-              , teardownFailures = teardownFailed
-              }
+        { findingsTeardown = facts
         , findingsCallbacks =
             (findingsCallbacks findings)
               { callbackPhases = summarizePhases diagnostics
@@ -411,8 +533,8 @@ catchAll action handler = do
       | otherwise →
           handler (Failure "the proof raised an unexpected exception" (Text.pack (displayException escaped)))
 
-procedure ∷ Journal → Consent → Cleanups → CallbackSink → IO Findings
-procedure journal consent cleanups sink = do
+procedure ∷ Journal → Consent → Cleanups → CallbackSink → Ledger → IO Findings
+procedure journal consent cleanups sink ledger = do
   heading journal "The environment"
   cleared ← clearConflictingOverrides
   for_ cleared $ \name → note journal ("cleared a conflicting discovery override: " <> name)
@@ -450,7 +572,7 @@ procedure journal consent cleanups sink = do
   unless started $ do
     reason ← lastGlfwError
     stop "GLFW initialization" ("glfwInit failed: " <> reason)
-  onExit cleanups "GLFW" glfwTerminate
+  onExit cleanups GlfwTermination glfwTerminate
   supported ← vulkanSupported
   require "GLFW's loader" "glfwVulkanSupported reported no Vulkan loader after being handed the binding's own" supported
   glfwEntry ← instanceProcAddress nullPtr "vkGetInstanceProcAddr" >>= provenanceOf
@@ -500,7 +622,7 @@ procedure journal consent cleanups sink = do
   callback ← wrapDebugCallback (debugCallback sink)
   -- Registered before the instance, so it is released after it: the trampoline
   -- has to still be callable while vkDestroyInstance runs.
-  onExit cleanups "the callback trampoline" (freeHaskellFunPtr callback)
+  onExit cleanups TheCallbackTrampoline (freeHaskellFunPtr callback)
   let createInfo = messengerCreateInfo callback
 
   enterPhase sink "instance creation"
@@ -527,7 +649,7 @@ procedure journal consent cleanups sink = do
   -- The create-info messenger is still live while the instance is destroyed.
   -- That is deliberate: requirement 8 asks what reaches Haskell during
   -- instance destruction, after the explicit messenger is already gone.
-  onExit cleanups "the Vulkan instance" $ do
+  onExit cleanups TheVulkanInstance $ do
     enterPhase sink destructionPhase
     destroyInstance handle Nothing
   enterPhase sink "after instance creation"
@@ -546,7 +668,7 @@ procedure journal consent cleanups sink = do
   -- go, while the record still said zero validation errors. The create-info
   -- messenger cannot stand in: the extension uses it for instance creation and
   -- destruction alone.
-  onExit cleanups "the explicit debug messenger" $ do
+  onExit cleanups TheExplicitMessenger $ do
     enterPhase sink afterMessengerPhase
     destroyDebugUtilsMessengerEXT handle messenger Nothing
   inject sink handle "creation"
@@ -558,14 +680,14 @@ procedure journal consent cleanups sink = do
         reason ← lastGlfwError
         stop "the proof window" ("glfwCreateWindow failed: " <> reason)
       Just value → pure value
-  onExit cleanups "the proof window" (destroyProofWindow window)
+  onExit cleanups TheProofWindow (destroyProofWindow window)
   (surfaceResult, surfaceHandle) ← createWindowSurface (castPtr (instanceHandle handle)) window
   require
     "the window surface"
     ("glfwCreateWindowSurface returned " <> Text.pack (show (Result (fromIntegral surfaceResult))))
     (surfaceResult == 0)
   let surface = SurfaceKHR surfaceHandle
-  onExit cleanups "the window surface" (destroySurfaceKHR handle surface Nothing)
+  onExit cleanups TheWindowSurface (destroySurfaceKHR handle surface Nothing)
   pollEvents
 
   heading journal "The device profile"
@@ -602,7 +724,7 @@ procedure journal consent cleanups sink = do
           ∷ DeviceCreateInfo '[PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR]
       )
       Nothing
-  onExit cleanups "the logical device" (destroyDevice device Nothing)
+  onExit cleanups TheLogicalDevice (destroyDevice device Nothing)
   enterPhase sink "after device creation"
 
   -- Which spelling of the release entry point this device actually answered
@@ -635,16 +757,28 @@ procedure journal consent cleanups sink = do
 
   heading journal "The presentation profile"
   target ← buildTarget journal device selection surface
-  onExit cleanups "the swapchain" (destroySwapchainKHR device target.targetSwapchain Nothing)
+  onExit cleanups TheSwapchain (destroySwapchainKHR device target.targetSwapchain Nothing)
 
-  slots ← newSlots device selection.selectedQueueFamily
-  onExit cleanups "the frame slots" (destroySlots device slots)
-  -- Registered last, so it runs first: every destruction below happens with the
-  -- device idle, whether the procedure finished or stopped, and every
-  -- diagnostic any of them emits is attributed to teardown.
-  onExit cleanups "the teardown boundary" $ do
+  slots ← newSlots device selection.selectedQueueFamily ledger
+  -- Registered in reverse of the order teardown reaches them, because a
+  -- registration is a push. A slot's own three releases are separable so that
+  -- an outstanding present can withhold its fence and its presentation
+  -- semaphore while its command pool, rendering fence and acquisition
+  -- semaphore — whose completion the boundary below does establish — still go.
+  for_ (reverse (concatMap (slotReleases device) (eachSlot slots))) $ \(what, action) →
+    onExit cleanups what action
+  -- Registered last, so it runs first: every destruction below rests on what
+  -- this establishes, and every diagnostic any of them emits is attributed to
+  -- teardown. It is not itself a destruction. Its device-idle result and the
+  -- bounded present-fence waits it then takes are the whole of the evidence
+  -- the releases below are judged against; device idle alone is not that
+  -- evidence, which is why the waits are here at all.
+  onExit cleanups TheTeardownBoundary $ do
     enterPhase sink teardownPhase
-    deviceWaitIdle device
+    idled ← try @SomeException (deviceWaitIdle device)
+    observe ledger (TeardownBoundaryReached (either classifyThrown (const Succeeded) idled))
+    probePresentFences device ledger slots
+    either throwIO pure idled
 
   heading journal "Presentation completion"
   enterPhase sink "submission"
@@ -770,7 +904,7 @@ procedure journal consent cleanups sink = do
             }
       , -- Both filled in by 'completeAfterTeardown', because neither exists
         -- until the cleanup stack has run.
-        findingsTeardown = TeardownFacts {teardownReleases = [], teardownFailures = []}
+        findingsTeardown = noTeardown
       }
 
 -- --------------------------------------------------------------------------
@@ -980,6 +1114,9 @@ data Slot = Slot
   , slotPool ∷ CommandPool
   , slotCommands ∷ CommandBuffer
   , slotPresented ∷ IORef Bool
+  , slotLedger ∷ Ledger
+    -- ^ The run's shared ledger, reached through the slot because the slot is
+    -- what creates a presentation obligation and what later discharges one.
   }
 
 -- | The pool: two slots, named rather than indexed, so choosing one is total.
@@ -999,15 +1136,15 @@ slotFor slots index = if even index then slots.firstSlot else slots.secondSlot
 eachSlot ∷ Slots → [Slot]
 eachSlot slots = [slots.firstSlot, slots.secondSlot]
 
-newSlots ∷ Device → Word32 → IO Slots
-newSlots device family = do
-  built ← forM [0 .. slotCount - 1] (newSlot device family)
+newSlots ∷ Device → Word32 → Ledger → IO Slots
+newSlots device family ledger = do
+  built ← forM [0 .. slotCount - 1] (newSlot device family ledger)
   case built of
     [a, b] → pure (Slots a b)
     _ → stop "the frame slots" "the slot pool was not built as a pair"
 
-newSlot ∷ Device → Word32 → Int → IO Slot
-newSlot device family index = do
+newSlot ∷ Device → Word32 → Ledger → Int → IO Slot
+newSlot device family ledger index = do
   acquire ← createSemaphore device (SemaphoreCreateInfo {next = (), flags = zero} ∷ SemaphoreCreateInfo '[]) Nothing
   present ← createSemaphore device (SemaphoreCreateInfo {next = (), flags = zero} ∷ SemaphoreCreateInfo '[]) Nothing
   renderFence ← createFence device (FenceCreateInfo {next = (), flags = zero} ∷ FenceCreateInfo '[]) Nothing
@@ -1040,17 +1177,48 @@ newSlot device family index = do
       , slotPool = pool
       , slotCommands = Vector.head buffers
       , slotPresented = presented
+      , slotLedger = ledger
       }
 
-destroySlots ∷ Device → Slots → IO ()
-destroySlots device = mapM_ release . eachSlot
-  where
-    release slot = do
-      destroyCommandPool device slot.slotPool Nothing
-      destroyFence device slot.slotPresentFence Nothing
-      destroyFence device slot.slotRenderFence Nothing
-      destroySemaphore device slot.slotPresent Nothing
-      destroySemaphore device slot.slotAcquire Nothing
+-- | One slot's releases, in the order teardown reaches them.
+--
+-- Three rather than one, because they are owed different evidence. The command
+-- pool, the rendering fence and the acquisition semaphore are queue objects,
+-- and the device-idle boundary does establish that the device has finished
+-- with them. The present fence and the presentation semaphore are not: a
+-- present is work for the presentation engine, and only that fence says it is
+-- done. The semaphore comes after its fence, which is the order
+-- @VK_EXT_swapchain_maintenance1@ names.
+slotReleases ∷ Device → Slot → [(Handle, IO ())]
+slotReleases device slot =
+  [
+    ( SlotWorkObjects slot.slotName
+    , do
+        destroyCommandPool device slot.slotPool Nothing
+        destroyFence device slot.slotRenderFence Nothing
+        destroySemaphore device slot.slotAcquire Nothing
+    )
+  , (SlotPresentFence slot.slotName, destroyFence device slot.slotPresentFence Nothing)
+  , (SlotPresentSemaphore slot.slotName, destroySemaphore device slot.slotPresent Nothing)
+  ]
+
+-- | The one route from retained to destroyed that is not device loss: during
+-- teardown, a bounded wait on every present fence the run still owes.
+--
+-- The bound is the fence wait's own timeout, which is a native parameter. No
+-- native call is made preemptible and no destroy is wrapped in a Haskell
+-- timeout: a wait that expires here leaves the obligation exactly where it
+-- was, and the handles behind it are retained until the process exits.
+probePresentFences ∷ Device → Ledger → Slots → IO ()
+probePresentFences device ledger slots = do
+  recorded ← observations ledger
+  let owed = map fst (standingFrom recorded).standingPending
+  for_ (eachSlot slots) $ \slot →
+    when (slot.slotName `elem` owed) $ do
+      outcome ←
+        try @SomeException
+          (waitForFences device (Vector.singleton slot.slotPresentFence) True (5 * oneSecond))
+      observe ledger (PresentFenceWaited slot.slotName (either classifyThrown classifyResult outcome))
 
 -- --------------------------------------------------------------------------
 -- Frames
@@ -1219,6 +1387,9 @@ submitWith queue waits commands signals fence =
         , deviceIndex = 0
         }
 
+-- | Wait on a rendering or cleanup fence. These are queue fences: the device
+-- has no presentation obligation riding on them, so nothing here is recorded
+-- for the release decision.
 awaitFence ∷ Text → Device → Fence → IO Bool
 awaitFence what device fence = do
   result ← waitForFences device (Vector.singleton fence) True (5 * oneSecond)
@@ -1226,32 +1397,63 @@ awaitFence what device fence = do
   status ← getFenceStatus device fence
   pure (status == SUCCESS)
 
+-- | Wait on a slot's present fence, recording what the wait returned before
+-- deciding anything about it.
+--
+-- A timeout still stops the run at the step a timeout has always stopped it
+-- at. What changes is that the obligation it leaves outstanding is now on the
+-- ledger teardown reads, so the slot's present fence and presentation
+-- semaphore are retained rather than destroyed behind it. A timeout is never
+-- promoted to device loss: only @VK_ERROR_DEVICE_LOST@ is that.
+awaitPresentFence ∷ Text → Device → Slot → IO Bool
+awaitPresentFence what device slot = do
+  outcome ←
+    try @SomeException
+      (waitForFences device (Vector.singleton slot.slotPresentFence) True (5 * oneSecond))
+  let result = either classifyThrown classifyResult outcome
+  observe slot.slotLedger (PresentFenceWaited slot.slotName result)
+  require
+    "completion"
+    (what <> " did not signal within five seconds: " <> describeResult result)
+    (result == Succeeded)
+  status ← getFenceStatus device slot.slotPresentFence
+  pure (status == SUCCESS)
+
 -- | Present one acquired image with a present fence, reporting the fence's
 -- status before the wait as well as after it.
 presentWithFence ∷ Device → Queue → Target → Slot → Word32 → IO (Text, Text, Bool)
 presentWithFence device queue target slot index = do
   resetFences device (Vector.singleton slot.slotPresentFence)
-  result ←
-    queuePresentKHR
-      queue
-      ( PresentInfoKHR
-          { next = (SwapchainPresentFenceInfoKHR {fences = Vector.singleton slot.slotPresentFence}, ())
-          , waitSemaphores = Vector.singleton slot.slotPresent
-          , swapchains = Vector.singleton target.targetSwapchain
-          , imageIndices = Vector.singleton index
-          , results = nullPtr
-          }
-          ∷ PresentInfoKHR '[SwapchainPresentFenceInfoKHR]
-      )
+  outcome ←
+    try @SomeException $
+      queuePresentKHR
+        queue
+        ( PresentInfoKHR
+            { next = (SwapchainPresentFenceInfoKHR {fences = Vector.singleton slot.slotPresentFence}, ())
+            , waitSemaphores = Vector.singleton slot.slotPresent
+            , swapchains = Vector.singleton target.targetSwapchain
+            , imageIndices = Vector.singleton index
+            , results = nullPtr
+            }
+            ∷ PresentInfoKHR '[SwapchainPresentFenceInfoKHR]
+        )
+  let result = either classifyThrown classifyResult outcome
+  -- First, and before anything that can itself fail. A status query, an event
+  -- poll, or a wait that threw between the present and this line would leave
+  -- the obligation unrecorded, and a present's semaphore waits are enqueued
+  -- whether the call reported success, out-of-date, or surface-lost. Marking
+  -- the slot presented here rather than after the wait is the same rule: the
+  -- obligation exists from the enqueue, not from its retirement.
+  observe slot.slotLedger (PresentAttempted slot.slotName result)
+  writeIORef slot.slotPresented True
   require
     "presentation"
-    ("vkQueuePresentKHR returned " <> Text.pack (show result))
-    (result == SUCCESS || result == SUBOPTIMAL_KHR)
+    ("vkQueuePresentKHR returned " <> describeResult result)
+    (result == Succeeded || result == Suboptimal)
   before ← getFenceStatus device slot.slotPresentFence
   pollEvents
-  signalled ← awaitFence "the present fence" device slot.slotPresentFence
-  writeIORef slot.slotPresented True
-  pure (Text.pack (show result), if before == SUCCESS then "signalled" else "not ready", signalled)
+  signalled ← awaitPresentFence "the present fence" device slot
+  pure (either (Text.pack . displayException) (Text.pack . show) outcome, if before == SUCCESS then "signalled" else "not ready", signalled)
 
 -- | Make a slot reusable. Requirement 5 is about what the presentation
 -- semaphore waits for, so the evidence this returns names the present fence
@@ -1263,7 +1465,7 @@ reclaim device slot = do
   if not presented
     then pure "never presented"
     else do
-      _ ← awaitFence ("the present fence of " <> slot.slotName) device slot.slotPresentFence
+      _ ← awaitPresentFence ("the present fence of " <> slot.slotName) device slot
       pure "present fence"
 
 -- | One ordinary frame: acquire, render, submit, present with a fence, and

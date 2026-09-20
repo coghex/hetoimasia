@@ -211,6 +211,15 @@ spec = describe "The Vulkan proof boundary" $ do
         declared `shouldSatisfy` (not . null)
         filter (not . covered) readByTheseExamples `shouldBe` []
 
+  it "forwards its own arguments to the harness rather than dropping them" $ do
+    -- `--headless` selects the release decision's pure examples, and the
+    -- harness is what owns that flag. A runner that forwarded nothing would
+    -- read consent and start the native proof instead — the opposite of what
+    -- the caller asked for, and a session this mode has no approval for.
+    runner ← lines <$> readFile "tools/vulkan-proof/run-proof.sh"
+    runner `shouldSatisfy` any ("--test-option=$argument" `isInfixOf`)
+    runner `shouldSatisfy` any ("${options[@]+\"${options[@]}\"}" `isInfixOf`)
+
   it "never supplies the native-session consent itself" $ do
     -- AGENTS.md: the human's approval is given on one approved command, never
     -- by a script an agent runs on its own, and `tools/display/x11.sh` is the
