@@ -16,6 +16,13 @@
 -- across the loggers sharing it. The handle stays the caller's: the sink never
 -- closes it and never changes its buffering.
 --
+-- 'writeEntry' and 'flushSink' forward an already-prepared entry, and a flush,
+-- to a sink an adapter has borrowed. They are the whole of what a caller
+-- holding a 'LogSink' can do to it: neither exposes the sink's construction or
+-- its internals, and both keep the sink's own synchronous write, flush, and
+-- exception semantics. Rebuilding an entry through 'logEvent' instead would
+-- replace its source attribution and re-apply a filter it has already passed.
+--
 -- 'parseLogLevel', 'parseComponentLevels', and 'parseDebugSelection' validate
 -- the three configurable parts of a 'LogFilter' without performing IO and
 -- without knowing where the text came from. 'resolveLogFilter' assembles them
@@ -61,6 +68,10 @@ module Hetoimasia.Foundation.Log
   , newHandleSinkWith
   , callbackSink
   , callbackSinkWith
+
+    -- * Forwarding to a sink
+  , writeEntry
+  , flushSink
 
     -- * Metadata providers
   , MetadataProviders (..)
@@ -573,6 +584,23 @@ callbackSink callback = callbackSinkWith callback (pure ())
 callbackSinkWith ∷ (LogEntry → IO ()) → IO () → LogSink
 callbackSinkWith callback flush = LogSink { sinkWrite = callback, sinkFlush = flush }
 
+-- | Forward an already-prepared entry to a sink, exactly as 'logEvent' forwards
+-- the one it built.
+--
+-- The write is synchronous on the calling thread and its exceptions propagate
+-- to that caller, like every other sink write. No filter is applied and no
+-- metadata is obtained: the entry is emitted as it stands, so an entry carried
+-- across a thread boundary keeps the level, component, context, timestamp,
+-- thread identity, and source attribution it was built with.
+writeEntry ∷ LogSink → LogEntry → IO ()
+writeEntry = sinkWrite
+
+-- | Flush a sink directly, for a caller that holds the sink rather than a
+-- logger over it. 'flushLogger' is this operation on a logger's own sink, and
+-- both fail the same way.
+flushSink ∷ LogSink → IO ()
+flushSink = sinkFlush
+
 -- | The metadata an entry cannot derive from its call. Injected so tests can
 -- supply fixed values and observe that a suppressed entry calls neither.
 data MetadataProviders = MetadataProviders
@@ -644,7 +672,7 @@ withBreadcrumb breadcrumb logger =
 -- Derived loggers share their root's sink, so flushing any one of them flushes
 -- what all of them wrote. Failures propagate like any other sink failure.
 flushLogger ∷ Logger → IO ()
-flushLogger = sinkFlush . loggerSink
+flushLogger = flushSink . loggerSink
 
 -- | The single emission path. The filter decides before @message@ or @fields@
 -- are forced and before either metadata provider runs. Event fields override
@@ -667,7 +695,7 @@ logEvent logger level component message fields =
           , entrySource =
               if filterSource (loggerFilter logger) then callSite callStack else Nothing
           }
-    sinkWrite (loggerSink logger) entry
+    writeEntry (loggerSink logger) entry
 
 -- | Emit at 'Debug' through 'logEvent'.
 logDebug ∷ HasCallStack ⇒ Logger → Component → Text → [(Text, Text)] → IO ()
