@@ -23,7 +23,7 @@ concrete precondition
 - [x] VK-1. Qualify and pin the shared Haskell toolchain — [#157]
 - [x] VK-2. Prove the native compatibility and completion profile — [#158]
 - [x] VK-3. Model GPU retention and frame ownership — [#160]
-- [ ] VK-4. Provision the pinned native Vulkan environment
+- [x] VK-4. Provision the pinned native Vulkan environment — [#208]
 - [ ] VK-5. Add the loader-aware GLFW surface bridge
 - [ ] VK-6. Capture validation diagnostics with an independent worker
 - [ ] VK-7. Own Vulkan instance, device and targets under protected retirement

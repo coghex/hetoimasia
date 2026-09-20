@@ -3,6 +3,9 @@
 Hetoimasia is a modular Haskell game-engine project. Read [MEMORY.md](MEMORY.md)
 for continuity, [the foundation design](docs/engine_foundation_design.md) for
 boundaries, and [workflow.md](docs/workflow.md) for Kanban delivery.
+The durable owner direction is [vision.md](docs/vision.md); `$guide` checks
+issues and merged work against it and records snapshot-scoped coverage in
+`docs/guide/` while development continues. It does not grant issue/PR approval.
 These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Architecture

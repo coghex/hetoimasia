@@ -1,10 +1,26 @@
 # Hetoimasia project memory
 
-Updated 2026-09-19 against code `master@38388f8`. This is the active handoff,
-not an exhaustive changelog. Recheck Git and the tracker before relying on status.
+Implementation notes below were last reconciled on 2026-09-19 against code
+`master@38388f8`; they are dated context, not the latest tracker inventory.
+The architectural review entry point was added on 2026-09-20. Recheck Git and
+the tracker before relying on status.
 Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
 [the memory archive](docs/history/memory_before_2026-09-17.md). Read only the
 owning subsystem's contract/design when continuing its work.
+
+For a fresh architectural review, start with [the vision guide](docs/vision.md)
+and run `$guide`. Its reports in `docs/guide/` record the exact code and tracker
+versions checked, findings and pending concurrent work. The skill is installed
+at `~/.codex/skills/guide/SKILL.md`; it is advisory and does not replace Kanban
+approval or project-review records.
+
+The [first guide review](docs/guide/2026-09-20T183233Z-d40c387-6e92.md) covers
+seven later merged PRs through `d40c387`, the current issue specifications,
+743 passing headless examples and the remaining amendments/housekeeping.
+The owner accepted legacy coverage through `a89d419`; together these complete
+the guide's historical review queue through `d40c387`. Preserve the five open
+findings and qualification gates. `$guide continue` handles one follow-up at a
+time; it does not repeat the old audit or silently approve the proposed change.
 
 ## Direction and owner preferences
 
