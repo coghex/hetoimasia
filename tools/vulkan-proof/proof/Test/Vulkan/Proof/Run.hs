@@ -713,8 +713,9 @@ procedure journal consent cleanups sink ledger = do
   -- frees both itself and recalls these two registrations, so a whole run
   -- still arrives at teardown holding the same ten entries it always did.
   capturePlaces ← newCapturePlaces
+  let captureOperations = captureOps device selection.selectedDevice queue target slots.firstSlot
   recallCapture ←
-    forM (reverse (capturePlaceReleases (captureOps device selection.selectedDevice queue target slots.firstSlot) capturePlaces)) $
+    forM (reverse (capturePlaceReleases captureOperations capturePlaces)) $
       \(what, action) → onExitRecallable cleanups what action
 
   -- Registered last, so it runs first: every destruction below rests on what
@@ -741,7 +742,7 @@ procedure journal consent cleanups sink ledger = do
 
   heading journal "Transfer-source capture"
   enterPhase sink "capture"
-  capture ← proveCapture journal device selection.selectedDevice queue target slots capturePlaces
+  capture ← proveCapture journal device target slots captureOperations capturePlaces
   -- Reached only when the capture freed both of its handles itself, which is
   -- the one path on which taking the registrations back is right.
   sequence_ recallCapture
@@ -1768,12 +1769,23 @@ captureOps device physical queue target slot =
 -- after the boundary has established that the copy completed — or retains them
 -- and says why, if it has not. The path that reaches the end frees both
 -- itself, exactly once, as it always did.
-proveCapture ∷ Journal → Device → PhysicalDevice → Queue → Target → Slots → CapturePlaces Buffer (DeviceMemory, DeviceSize) → IO CaptureFacts
-proveCapture journal device physical queue target slots places = do
+proveCapture
+  ∷ Journal
+  → Device
+  → Target
+  → Slots
+  → CaptureOps Buffer (DeviceMemory, DeviceSize) Word32
+  → CapturePlaces Buffer (DeviceMemory, DeviceSize)
+  → IO CaptureFacts
+proveCapture journal device target slots operations places = do
   let slot = slots.firstSlot
       extent = target.targetExtent
   _ ← reclaim device slot
-  observed ← runCapture (captureOps device physical queue target slot) places
+  -- The same operations the procedure registered these places' releases
+  -- against, rather than a second value built the same way: whichever of the
+  -- two reaches a place first is the only one that destroys what is in it, and
+  -- there is no question of which destructor that was.
+  observed ← runCapture operations places
   note journal ("captured " <> Text.pack (show observed) <> " through TRANSFER_SRC from the presented format")
   pure
     CaptureFacts
