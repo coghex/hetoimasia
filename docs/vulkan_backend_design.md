@@ -391,9 +391,11 @@ compatibility. Verify the selected combination on Linux and local macOS, retain
 the existing runtime failure/cancellation contracts, and pin versions, source
 identities and the dependency index once proved. If a candidate fails, record
 the blocker and choose a working version or a reviewed repair explicitly.
-Recheck release availability when implementing the upgrade; the previously
-observed GHC 9.14.2-rc2 is now eligible. This resolves Q-10's policy, without
-claiming an upgrade or a successful compatibility proof has already happened.
+Recheck release availability when implementing an upgrade. GHC 9.14.2-rc2 was
+eligible under this policy and was then excluded by the compatibility blocker
+[the toolchain record](toolchain.md) documents; the qualified baseline is GHC
+9.14.1. This resolves Q-10's policy, without making any later candidate's
+compatibility proof a foregone conclusion.
 
 ### D-14. Use the standard Vulkan loader on both platforms
 
