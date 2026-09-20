@@ -8,10 +8,23 @@ Design state: `ready for issue processing`
 Owner: `coghex/hetoimasia`; publication target: `master`.
 Started 2026-09-12; the owner marked it ready for issue processing on
 2026-09-17 under D-27. It specifies tracker work, not an implementation. The owner accepted separate GLFW/Vulkan components
-and a first main-thread window/render loop. Infrastructure comes first: establish
+and, originally, a main-thread window/render loop; D-29 now assigns rendering
+to a separate graphics owner. Infrastructure comes first: establish
 messaging, runtime initialization/lifecycle, threading, and independent GLFW
 windowing before Vulkan work. The triangle is the eventual first graphics
 result, not a reason to accelerate past these foundations. See D-6.
+
+On 2026-09-20 the owner revised the thread model under D-29 after RR-4's
+[measured Cocoa stalls](owner_loop_interaction_verdict.md): rendering moves to
+one supervised graphics owner while GLFW stays on the main thread. That is a
+material design change temporarily returned the document to `exploring`.
+The owner's requested final review on 2026-09-20 signs off VK-18 and the
+reconciled VK-7/VK-8/VK-10/VK-16/VK-17 boundaries for processing. The same
+day the owner resolved Q-14–Q-16 under D-30–D-32
+and settled the graphics owner's shutdown under D-33, which the
+[lifetime design](window_graphics_lifetime_design.md) mirrors as its D-6.
+Merged slices VK-1–VK-3 and the approved VK-4 (#208) are unaffected and may
+continue.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -26,6 +39,7 @@ concrete precondition
 - [x] VK-4. Provision the pinned native Vulkan environment — [#208]
 - [ ] VK-5. Add the loader-aware GLFW surface bridge
 - [ ] VK-6. Capture validation diagnostics with an independent worker
+- [ ] VK-18. Settle the supervised graphics owner's cross-thread contract
 - [ ] VK-7. Own Vulkan instance, device and targets under protected retirement
 - [ ] VK-8. Integrate package-native Vulkan fixtures and CI evidence
 - [ ] VK-9. Make Template Haskell shaders reproducible
@@ -57,7 +71,29 @@ precondition is now satisfied; unchecked entries above remain unprocessed.
   consumers; agents implementing and testing its bounded parts.
 - **Arc label:** propose `vulkan`, color `A41E22`, description “Vulkan backend, GPU resource lifetimes, presentation and platform verification”. No label is created by this design.
 
-## Current handoff at `38388f8` — 2026-09-19
+## Current handoff at `3a8abdc` — 2026-09-20
+
+VK-1–VK-3 and their repairs #181–#184 are merged. VK-4/#208 is filed and
+approved, not merged. TIME #139 and LIFE #144 and their prerequisites have
+merged; they no longer block the new owner contract. The production native
+backend remains planned. D-29–D-33 and LIFE D-6 are approved design, not a
+claim that the current host already implements a surviving graphics owner.
+
+Before filing more children, reconcile existing epic #155's old main-thread
+rendering policy, seventeen-child count and dependency table with this
+eighteen-slice plan through the processor's epic-update step. Keep closed LIFE
+epic #140 and its completed children closed: VK-18/VK-7 own its additive
+extension. No replacement epic is needed. VK-18 can be implemented alongside
+VK-5/VK-6 once its own prerequisites are satisfied; it precedes VK-7.
+
+Open documentation repairs #211/#212 still own the proof's nonblocking-present
+wording and this design's obsolete no-platform-selector claims. Consume the
+delivered `platforms` selector in `docs/validation.md` when drafting VK-8;
+#212 reconciles those older paragraphs, not a new selector implementation.
+The historical handoffs below do not reopen merged repairs or supersede this
+processing state.
+
+## Historical handoff at `38388f8` — 2026-09-19
 
 VK-1/#157, VK-2/#158 and VK-3/#160 merged through PRs #171, #174 and
 #175. The [qualified toolchain](toolchain.md) and
@@ -289,6 +325,8 @@ events and rendering on the process main thread, adhering to Synarchy's flow.
 The first sample does not require a render worker. This settles Q-1's high-level
 choice; concrete APIs and package placement still follow the agreed boundaries.
 It does not approve every detail of Synarchy's existing worker implementation.
+Rendering placement and the absence of a render worker are superseded by D-29;
+main-thread GLFW ownership and the component split remain accepted.
 
 ### D-6. Establish the infrastructure methodically before Vulkan
 
@@ -306,9 +344,9 @@ consumers before it is needed by rendering. Do not postpone threading solely
 because a triangle could run without it.
 
 The runtime, worker, messaging, and GLFW slices subsequently landed, followed by
-the four GLFW repairs and follow-up #123. The agreed main-thread
-GLFW/render ownership still holds:
-reusable worker support does not move GLFW operations to a worker. Remote
+the four GLFW repairs and follow-up #123. Main-thread GLFW ownership still
+holds; D-29 separately revises rendering placement. Reusable worker support
+does not move GLFW operations to a worker. Remote
 Linux/local macOS validation and deliberate reuse of Synarchy remain accepted.
 
 ### D-7. Render multiple windows using one compatible shared device
@@ -319,8 +357,8 @@ allows. Each target owns its surface and swapchain generations; the shared
 device outlives all of its targets. Demonstrate independent resize and closure,
 including closing the first-created window while another continues rendering.
 
-This extends the consumer scope without changing D-5's main-thread owner or
-adding multi-device rendering. Check subsequent surfaces against the selected
+This extends the consumer scope without adding multi-device rendering; D-29
+subsequently moves the shared graphics owner off the main thread. Check subsequent surfaces against the selected
 device and available queues. The exact unsupported-target outcome remains part
 of Q-2/Q-3's policy rather than an implicit device migration.
 
@@ -722,11 +760,187 @@ does not change Lua's FFI settings, rewrite the foundation logger, tune the RTS
 broadly, add a render thread or expand platform support. It originates from
 [runtime_review_findings.md](runtime_review_findings.md) RR-5.
 
+### D-29. Render from one supervised graphics owner; keep GLFW on the main thread
+
+Owner accepted on 2026-09-20, from guide finding GUIDE-1 in
+[the guide report](guide/2026-09-20T201612Z-8b2fcfd-ff7e.md) and RR-4's
+[verdict](owner_loop_interaction_verdict.md) (#200). The exact decision:
+
+> Keep GLFW operations and record-only callbacks on the process main thread.
+> Before VK-16, specify a separate supervised graphics owner with explicit data
+> and lifetime handoffs; do not infer that this permits off-thread GLFW calls or
+> guarantees window-command progress during a platform modal loop. VK-4 and
+> other independent prerequisite work may continue while this design is settled.
+
+The measured premise: on macOS a live resize blocked the owner turn's native
+event call for 68.92 s and a menu-bar interaction for 13.30 s, with no owner
+turn and no update opportunity in either, while Cocoa kept requesting a redraw
+about 111 times a second during the resize and delivered nothing during the
+menu. A window move did not block. Shortening the idle wait does not help: the
+call asked for 100 ms. Under D-5's owner-loop rendering this means a stale or
+stretched surface for the whole interaction, and the menu case cannot be
+served from a callback because no callback arrives.
+
+The owner's constraints on the revision:
+
+1. **Sequencing.** Settle the cross-thread ownership contract (VK-18) before
+   implementing VK-7. The shared device, queues and targets are then created
+   and owned by the graphics owner rather than by the main-thread host.
+2. **Reconciliation.** Every main-thread assumption this document and its
+   companions carry is reconciled explicitly rather than left to contradict
+   D-29: P-1's responsibility table, P-6's former main-thread queue/target
+   placement, P-7's ownership graph, VK-8's main-thread
+   shared fixture roots, VK-16's owner-loop rendering and its render-worker
+   exclusion, and the fixtures' thread demonstrations. The project's GLFW
+   ownership rule is unchanged: session, window, surface creation, event processing and window
+   commands stay on the main thread, and a modal loop still stalls them.
+3. **One owner.** Start with one supervised graphics owner for the shared
+   device. It is LIFE D-1's exclusive graphics owner for every window it
+   attaches; per-window or per-target owners are not part of this arc.
+4. **Explicit handoffs.** Design observation publication during platform modal
+   loops, bounded communication, cancellation and retirement explicitly. The
+   main thread hands the owner geometry and render-eligibility observations,
+   render demand and attachment lifetime through bounded ports and
+   latest-value snapshots; the owner hands back progress, next-deadline and
+   retirement facts the same way. Callbacks remain record-only and are
+   reconciled on the owner turn, so during a stall the graphics owner sees no
+   new GLFW observation (D-30 settles what it renders against).
+5. **Evidence.** A progress claim during a resize or menu interaction is a
+   native measurement, never an inference: extend RR-4's interaction probe
+   with the rendering owner and retain its records with the same identity and
+   consent rules. Headless scripted evidence proves the contract, not the
+   stall behaviour.
+6. **Independence.** VK-4 (#208) and other provisioning work continue.
+
+Consequences: D-5's "rendering on the process main thread" is superseded for
+rendering only; its component split, main-thread GLFW ownership and first
+sample scope stand. D-15's flexible scheduling and D-19's diagnostic worker are
+unchanged. A second engine loop is still not introduced: the graphics owner is
+a supervised worker under the existing foundation worker and failure
+contracts, and it outlives ordinary worker drain so that it, not the main
+thread, destroys its Vulkan resources inside LIFE's protected retirement
+(D-33). Simulation stays application-owned and thread-agnostic (D-31).
+Rejected: a callback-driven redraw (the verdict's policy 2), because it runs
+inside a C callback frame the record-only contract forbids and cannot serve
+the menu case; and temporary acceptance of the stall (policy 1), because the
+worker boundary would otherwise be retrofitted onto delivered attachment and
+target contracts.
+
+### D-30. Take the extent from Vulkan when supplied, else from the last published framebuffer observation
+
+Owner accepted on 2026-09-20, resolving Q-14. The graphics owner keeps the
+last coherent GLFW observation and independently queries surface capabilities
+on its own thread. When the capabilities supply a concrete current extent, the
+owner uses it; MoltenVK 1.4.0 derives that extent from the Metal layer, which
+supports this on the macOS profile. Vulkan also permits the
+"application chooses" result and does not universally report the window's
+current dimensions, so that case is explicit: choose a valid extent from the
+last published framebuffer observation, clamped to the reported bounds.
+Check zero-area/render-suspension eligibility before clamping an application-
+chosen extent: clamping a zero framebuffer to the minimum must not resume it.
+Unusable dimensions (a zero or otherwise invalid extent) suspend acquisition
+for that target rather than rebuilding, and replacement attempts are bounded
+under D-18 so stale geometry cannot drive a rebuild loop; exhausting the bound
+is a target failure under D-22, not a retry.
+
+Callbacks stay record-only. The alternative, a small geometry record published
+from the callback, can itself remain record-only, since it requires neither
+rendering nor an application callback inside the C frame, but it needs its own
+publication semantics against the owner-turn reconciliation of the same
+attributes. It is kept in reserve, not selected: if native qualification under
+VK-16 shows the capabilities path insufficient on a supported platform, that
+record is the designed fallback and is added as an explicit revision rather
+than an implementation detail.
+
+### D-31. Defer a simulation driver; the renderer consumes scene snapshots from any application thread
+
+Owner accepted on 2026-09-20, resolving Q-15. This arc builds no simulation
+scheduler, and it does not require simulation to run on the main thread. The
+graphics owner consumes coherent scene snapshots regardless of which
+application thread produced them. A sample that updates through `loopUpdate`
+pauses its simulation during a Cocoa stall and the owner keeps rendering the
+latest snapshot; a separately supervised simulation or Lua domain remains
+possible without redesigning the renderer. Rendering the latest scene during a
+stall does not by itself mean gameplay or input continue, and the companion
+documentation says so. This preserves the vision's goal that gameplay, UI
+execution and rendering do not block one another unnecessarily.
+
+### D-32. VK-18 implements the reusable owner machinery; VK-7 supplies its Vulkan operations
+
+Owner accepted on 2026-09-20, resolving Q-16. VK-18 implements the actual,
+reusable ownership and communication machinery of the supervised graphics
+owner, with the backend operations injected and tested through fakes. VK-7
+then supplies the Vulkan operations to that same implementation. No disposable
+fake owner is built and then replaced by a native one. The abstraction stays
+narrow: worker ownership, handoffs, cancellation and retirement, not a
+universal rendering API; D-26's recording interface and D-15's scheduling
+remain where they are.
+
+VK-18 must also prove that the owner's deadlines and progress do not depend on
+the main loop waking it. Publishing its earliest deadline back to the main
+thread is coordination, useful for the main loop's own idle bound, but the
+owner schedules its own waits from its own deadlines and demand, so a stalled
+main thread neither wakes nor starves it.
+
+### D-33. Keep the graphics owner alive through protected retirement
+
+Owner accepted on 2026-09-20. D-29 requires Vulkan objects to be destroyed on
+the graphics owner's thread, which contradicts LIFE's ordering in which the
+main thread retires graphics after every worker has drained. The reconciled
+lifetime, which explicitly revises LIFE's assumption that graphics retirement
+needs no surviving worker (its P-3 said such a backend needs "a different
+explicitly designed lifetime"; this is that lifetime):
+
+1. Quiescence closes admission; ordinary application workers stop and drain.
+2. The graphics owner stays alive to finish GPU retirement and destroy its
+   Vulkan resources, under the completion policy P-5 and D-15 fix.
+3. The main-thread protected boundary services whatever native housekeeping
+   retirement needs (surface-related GLFW work, event processing needed for
+   retirement) and awaits verified retirement, bounded per turn as LIFE D-5
+   requires; it performs no GPU work itself.
+4. After verified retirement and destruction, join the graphics owner before
+   final host disposal releases its remaining windows and dependencies. The
+   main thread validates each exact attachment's terminal evidence; a worker
+   completion alone is never that evidence.
+
+This is the whole-session exit order. An individual window close/detach instead
+retires only that target, publishes its exact terminal evidence, and lets the
+main thread acknowledge and dispose that window while the shared graphics
+owner and other targets remain live. It neither joins the shared worker nor
+destroys shared device/instance roots.
+
+The graphics owner has a component-owned worker/supervision lifetime separate
+from the application's ordinary worker group and from D-19's diagnostics
+group. Install its protected IO retirement inside its run action before any
+dependent construction; do not put driver cleanup in `Scoped` startup releases.
+Expected stop, startup/run failure and cancellation all enter that same drain.
+Latch a terminal graphics failure as soon as it is known, close affected
+admission and expose it to application checkpoints without waiting for GPU
+retirement to finish. Preserve the established required/optional target policy
+and original-failure/cleanup evidence rules; a blocked main thread still cannot
+observe a checkpoint until it returns.
+
+VK-18 owns the additive managed composition of this lifetime with the protected
+host. Merely nesting `withWorkerGroup` inside today's host is insufficient:
+its automatic join could prevent the main thread from servicing retirement.
+The protected main-thread path must service bounded housekeeping and observe
+retirement/worker completion together before any blocking final join. Existing
+window-only constructors keep their behavior. Unexpected owner termination
+without verified retirement retains dependencies; it never becomes permission
+to dispose them or to restart/replay the failed native work.
+
+Cancellation follows the same dependency ordering: repeated cancellation
+cannot release the owner's borrowed parents early, and no timeout, cancellation
+or cleanup error supplies permission to destroy a resource whose GPU use is
+unverified (LIFE D-4). Failed retirement retains its evidence and never
+manufactures an acknowledgement. The lifetime design records this as its D-6;
+VK-18 delivers the machinery and VK-7 the Vulkan destruction under it.
+
 ## Design
 
-### P-1. Separate owners; use one main-thread loop for multiple targets
+### P-1. Separate the main-thread window host from one graphics owner
 
-High-level direction accepted by D-5; the following responsibility sketch
+High-level direction accepted by D-5 and revised by D-29–D-33; the following responsibility sketch
 guides the concrete interface design.
 
 Proposed component responsibilities, not final package or API declarations:
@@ -735,7 +949,7 @@ Proposed component responsibilities, not final package or API declarations:
 |---|---|---|
 | Application composition | Configuration, connected services, exit request | Assembles scopes and runs the first loop; no game state is required. |
 | GLFW component | Process GLFW session, windows, callbacks, observed geometry/events | Windows borrow the session. Callback storage lives until callbacks are detached and window use has ended. Session/window/event operations remain on the process main thread. |
-| Vulkan component | Instance/device resources, submission state, swapchain generations | Surface integration borrows the window and instance. A generation owns its dependent images/views and synchronization resources; completion constrains destruction. |
+| Vulkan component | Instance/device resources, submission state, swapchain generations, on one graphics-owner worker | Main-thread surface creation hands ownership to this worker under a retained attachment and instance. A generation owns its dependent images/views and synchronization resources; completion constrains destruction. |
 | Triangle consumer | Triangle-specific shaders/pipeline choices, draw commands and supported scheduling requests | Borrows the backend's scoped capabilities; never bypasses its lifetime/submission accounting. Later rendering modules can replace this consumer. |
 
 Use one explicit interop boundary for GLFW surface creation; the core GLFW
@@ -765,7 +979,8 @@ then TIME-driven progress. The application depends on that integration and its
 renderer. The GPU backend never imports the integration back again.
 
 VK-3 establishes the pure/backend package split; VK-5 adds the GLFW-owned
-boundary; VK-7 introduces the integration owner, and VK-16 completes its loop
+boundary; VK-18 implements the reusable owner machinery without Vulkan, VK-7
+supplies its Vulkan operations, and VK-16 completes its loop
 adapter. Component names may follow the existing Cabal conventions, but these
 dependency directions and independent CPU/window-only build checks are part of
 acceptance. Avoid another generic environment that hides both owners.
@@ -875,14 +1090,22 @@ Recording, batching or delaying presentation must retain the exact resource
 generations involved; flexibility does not transfer destruction responsibility
 to each renderer. Keep native effects on the accepted owning thread.
 
-The first GLFW loop will process events and consume window-state changes on
-the process main thread. Drawing joins that loop only after the infrastructure
-phase. Reusable workers developed in that phase retain their own explicit
-ownership and communication contracts.
+The GLFW loop processes events and window-state changes on the process main
+thread. One graphics-owner worker performs native recording, submission,
+presentation and destruction. Renderer recording actions execute once on that
+owner; scene publishers on other application threads send prepared coherent
+data, not authority to call native recording from arbitrary threads. Reusable
+workers retain their own explicit ownership and communication contracts.
 GLFW's [thread contract](https://www.glfw.org/docs/latest/intro_guide.html#thread_safety)
 requires initialization, termination, window creation/destruction, and event
 processing on the thread that calls `main`. A Haskell bound worker is not proof
 of that identity. The eventual graphics test runner must preserve it too.
+
+Surface creation is a main-thread GLFW call whose result is handed to the
+graphics owner under the attachment; the owner destroys that surface through
+Vulkan after its dependents retire and never calls GLFW. VK-18 specifies the
+handoffs. Graphics-worker identity means one serialized Haskell owner, not a
+new promise of OS-thread affinity from the existing worker API.
 
 ## Design proposals
 
@@ -1039,15 +1262,22 @@ Every exit follows the same ordering constraints:
 
 1. Quiescence closes admission and settles pending commands under LIFE's finite
    STM hook; it performs no native wait.
-2. Application workers stop and drain while their borrowed dependencies remain
-   live. They cannot depend on a stopped event loop to finish a new command.
-3. The owner performs protected IO graphics retirement: invalidate unsubmitted
-   work safely, settle actual GPU/presentation uses, and destroy dependents.
-   The controller progresses directly; it does not enqueue work to its ended loop.
-4. Dispose each target's swapchains before its surface and acknowledge its exact
-   attachment only after all window-dependent objects are gone. Shared device
-   resources precede the device; surfaces and device precede the instance.
-   Other live targets continue when just one target closes.
+2. Ordinary application workers stop and drain while their borrowed
+   dependencies remain live. They cannot depend on a stopped event loop to
+   finish a new command. The graphics owner is not one of them: under D-33 it
+   stays alive through the next step.
+3. The graphics owner performs GPU retirement on its own thread: invalidate
+   unsubmitted work safely, settle actual GPU/presentation uses, dispose each
+   target's swapchains before its surface, then shared device resources before
+   the device, and surfaces/device before the instance. The main-thread protected boundary services
+   the native housekeeping that retirement needs and awaits verified
+   retirement, bounded per turn; it enqueues no work to its ended loop and
+   performs no GPU work. Verify retirement and join the owner before step 4.
+4. Acknowledge remaining exact attachments only from verified evidence that
+   their window-dependent objects are gone, then permit final native-window
+   disposal. During ordinary independent close, this same per-target evidence
+   permits that window's release without joining the shared owner or disposing
+   shared roots; other live targets continue.
 5. Keep diagnostic capture live through the last possible Vulkan callback,
    including instance destruction. Native windows/session may release only
    after their attachments retire. Reset persistent borrowed loader configuration
@@ -1065,7 +1295,7 @@ Later texture streaming can reuse this GPU ownership model, but assets becoming
 unwanted, ended CPU references and completed GPU uses remain distinct events.
 No asset manager or new concurrent foundation Collection is part of this arc.
 
-### P-6. Consume TIME scheduling without adding another loop
+### P-6. Reuse TIME scheduling across the window and graphics owners
 
 Use TIME #133/#134/#135/#136/#138/#139 from
 [runtime_scheduling_design.md](runtime_scheduling_design.md): its injected
@@ -1081,11 +1311,25 @@ immediate work that justifies spinning. Use round-robin bounded progress across
 targets, and retain command/event fairness. Work duration counts against the
 next deadline rather than being followed by an unconditional sleep.
 
-All native queue and target effects stay on the accepted main-thread owner.
-Worker publications use existing channels and the production wake capability;
-notifications are hints and authoritative pending state survives a lost wake.
-The bounded-poll fallback belongs to TIME. Do not copy its clocks, native-wake
-lifetime or fixed-step driver into the backend.
+Under D-29, native queue and target effects belong to the supervised graphics
+owner, not the main-thread owner loop; the main thread still owns GLFW events,
+window commands and the TIME wake. The main thread publishes render demand and
+observations to the graphics owner, and the owner publishes its earliest
+absolute progress deadline back, so the main loop's idle wait still accounts
+for pending GPU obligations without performing them. Worker publications use
+existing channels and the production wake capability; notifications are hints
+and authoritative pending state survives a lost wake. The bounded-poll fallback
+belongs to TIME. Do not copy its clocks, native-wake lifetime or fixed-step
+driver into the backend. A main-thread stall inside a platform modal loop
+delays demand and observation publication, not the owner's rendering of what
+it already holds. The published deadline is coordination only: the graphics
+owner schedules its own waits from its own deadlines and demand and never
+depends on the main loop to wake it (D-32). Owner publications must not wait
+for a main-thread consumer to free a full queue: coalesce replaceable status,
+retain terminal facts in bounded persistent cells, and report explicit
+backpressure for commands. Close/stop and retirement evidence remain observable
+independently of a saturated ordinary command port. Use the same monotonic
+clock domain; no second simulation/fixed-step driver is introduced.
 
 ### P-7. Establish one loader and a narrow surface bridge
 
@@ -1135,8 +1379,13 @@ No redundant GLFW instance-proc wrapper is required.
 
 Copy extension names while the session is live. Create a surface only under the
 protected window attachment, with its native pointer borrowed synchronously
-inside the bridge. Preserve typed ownership across partial construction and
-cancellation. Destroy the surface before its attachment acknowledgement and
+inside the bridge. Reserve the handoff/rollback record before construction;
+retain both the exact attachment and the instance across the main-thread call
+and ownership transfer. Cancellation, close or a full ordinary command queue
+cannot abandon a created surface: the graphics owner receives either the live
+target or an owned cleanup obligation before those holds can end. Serialize
+instance teardown against in-flight construction. Destroy the surface on the
+graphics owner before its attachment acknowledgement and
 instance release. VK-2 still proves handle representation/calling convention;
 the need for headers is no longer an unresolved question. Extend only the small
 GLFW seam operations this lifecycle actually needs.
@@ -1145,7 +1394,10 @@ Device selection may query a real surface without making a shared device's
 lifetime a child of the first window. Record the final ownership graph and how
 subsequent windows validate presentation support before multi-window rendering.
 Closing the bootstrap window must not accidentally release another window's
-device. This is distinct from the already accepted first main-thread owner.
+device. Under D-29 the session/controller that owns the shared device is the
+supervised graphics owner; the main thread creates each surface through GLFW
+and hands it over under LIFE's attachment. It receives terminal retirement
+evidence, not the surface handle back for destruction.
 
 ### P-8. Retire GPU generations beneath the window attachment
 
@@ -1665,16 +1917,18 @@ require that optional surface usage. Q-2 proves the chosen capture profile.
 
 ### Q-1. Accept P-1's component ownership and first thread model?
 
-Resolved by D-5. Separate components and the first main-thread loop are accepted.
-Frame work can delay event handling; a future render worker requires its own
-handoff and lifetime contract. Exact package names follow the agreed boundaries.
+Resolved by D-5; the thread model revised by D-29. Separate components and
+main-thread GLFW ownership are accepted. RR-4 measured that the main-thread
+pump itself stalls inside Cocoa modal loops, so rendering moves to one
+supervised graphics owner whose handoff and lifetime contract VK-18 settles.
+Exact package names follow the agreed boundaries.
 
 ### Q-2. What compatibility and completion contract should the backend require?
 
 Policy resolved by D-8/D-9/D-11–D-18/D-22–D-26. P-1/P-2/P-7/P-8/P-12/P-14/P-15
-specify the ownership, retry and admission contracts. **Deliberately open
-technical proof gate: VK-2**, after VK-1 qualifies the compiler/dependency set.
-It must record an exact profile for both selected platforms:
+specify the ownership, retry and admission contracts. **Technical proof gate:
+fulfilled by merged VK-2/#158**, following VK-1 qualification. Its required
+profile covered both selected platforms:
 
 - Binding version/flags, ABI and callback reentry; one shared standard loader
   and its actual driver/layer discovery, without ambient MoltenVK/loader mixing.
@@ -1712,9 +1966,10 @@ Unresolved safety retains ownership under P-12 rather than releasing parents.
 the profile, the loader identity evidence, the completion and abandonment
 results, the cited operation matrix, and the unknowns it deliberately leaves —
 the KHR maintenance alias, every rare result, and any real device loss. The
-compatibility profile table above now states what was proved. This gate is
-cleared for downstream slices only once that pull request merges; the deferred
-entries in the processing status say so in their own words.
+compatibility profile table above states what was proved. PR #174 merged, so
+that gate is satisfied; #181/#182 subsequently repaired its exceptional cleanup.
+Changed native inputs still need requalification under VK-4, and production
+operations need their own slice-specific evidence.
 
 ### Q-3. Accept P-2's window scope, and where will Linux graphics execute?
 
@@ -1827,6 +2082,65 @@ selected because completeness could not be enforced. P-1 develops the API
 under D-15's central ownership and flexible scheduling; concrete signatures and
 retention transitions remain engineering work, not an undecided ownership model.
 
+### Q-14. What does the graphics owner render against while the main thread is stalled?
+
+Resolved by D-30: a concrete Vulkan-supplied extent when available, otherwise
+a valid extent chosen from the last published framebuffer observation, with
+acquisition suspended for unusable dimensions and bounded replacement; the
+callback geometry record is kept in reserve. The options as they were weighed:
+
+Affects VK-18, VK-10 and VK-16. During a Cocoa resize or menu the main
+thread reconciles nothing, so the graphics owner's latest `WindowObservation`
+is stale for the whole interaction, while during a resize Cocoa keeps asking
+for redraws at a rate the callbacks record but do not publish. Options:
+
+1. **Render against the last reconciled observation**, use a concrete Vulkan
+   extent when supplied, and otherwise use D-30's explicit fallback. Out-of-date
+   or suboptimal results request reconsideration; they contain no dimensions.
+   Replacement is bounded and coalesced rather than forced by every query or
+   suboptimal result. During a menu, the worker can render the latest scene;
+   whether scene state advances depends on its application's publisher.
+2. **Publish geometry from the callback** into a latest-value snapshot the
+   graphics owner reads. This can remain record-only but needs an explicit
+   publication/ordering contract with owner-turn reconciliation. No callback
+   arrives during the measured menu stall, so it cannot itself drive that case.
+3. **Accept stale frames** and do nothing until the pump returns, which is
+   policy 1 restricted to geometry and forfeits the reason for D-29.
+
+Option 1 was selected with the explicit fallback and bounds D-30 records;
+VK-10 accepts the resulting replacement without a fresh GLFW observation.
+
+### Q-15. Does simulation stay on the main-thread owner loop?
+
+Resolved by D-31: no simulation driver in this arc, and no requirement that
+simulation run on the main thread; the renderer consumes coherent scene
+snapshots from whichever application thread produces them. As weighed:
+
+Affects VK-16 and the epic's non-goals. D-29 moves rendering only. TIME
+leaves simulation policy to the application and drives `loopUpdate` from the
+main-thread owner turn, so simulation pauses during a stall and the graphics
+owner re-presents the last published scene state. Proposal: keep that in this
+arc and record "a simulation driver off the main thread" as an explicit
+non-goal. The owner kept the non-goal but rejected mandating the main thread:
+a separately supervised simulation or Lua domain must remain possible without
+redesigning the renderer, which is why the renderer's input is a scene
+snapshot rather than a thread.
+
+### Q-16. Is VK-18 a scripted headless contract or part of VK-7?
+
+Resolved by D-32: VK-18 is separate and implements the real reusable owner
+machinery with injected, fake-tested backend operations; VK-7 supplies the
+Vulkan operations to it. The proposal as weighed asked for VK-18 to deliver
+backend-neutral code, a scripted supervised graphics owner over fakes under the
+existing worker, LIFE attachment and TIME demand contracts, with headless Hspec
+proving handoff ordering, cancellation, retirement order and stall isolation
+(a blocked fake main thread does not block the owner, and vice versa), plus the
+documentation reconciliation D-29 requires. The owner refined this so that
+no disposable fake owner is built and later replaced: the machinery VK-18
+ships is the production one. The alternative, settling the contract inside
+VK-7, produces one oversized PR and no headless proof of the threading rules
+before native code depends on them.
+
 ## Verification strategy
 
 Use Hspec for pure capability/queue/extent decisions, state transitions, and
@@ -1926,13 +2240,32 @@ Both planner and worker use coherent declared identities, and the worker
 verifies its actual environment. Local macOS evidence identifies its own native
 manifest; package changes invalidate affected evidence under existing rules.
 
-TEST-2/#93 delivered the GLFW fixture; #118 repairs its repeated-cancellation
+TEST-2/#93 delivered the GLFW fixture; #118 repaired its repeated-cancellation
 drain. Build any Vulkan fixture on the existing ownership and main-thread
 dispatch lessons, with GPU-specific completion proof in this arc's own slice.
 Selected compatible examples share expensive roots; example state stays private;
 destructive lifecycle tests use private roots. Discovery and dry runs must not
 initialize graphics. Demonstrate thread ownership independently of Hspec hook
-names; introduce no second generic fixture framework.
+names; introduce no second generic fixture framework. Under D-29 the shared
+Vulkan roots belong to the graphics owner's thread, and only surface creation
+and window commands run through the GLFW fixture's main-thread dispatch; a
+fixture must show both identities, not assume the main thread for either.
+
+**Progress claims need native evidence.** Any statement that rendering, frame
+presentation or retirement progresses while the main thread is inside a
+platform modal loop is measured, never inferred: extend RR-4's selectable
+interaction probe ([docs/glfw.md](glfw.md#the-interaction-probe)) with the
+graphics owner, record owner turns, callbacks, frame identities, present requests
+and independently observed completion in one monotonic time domain, and retain
+the records under the same identity, loss
+and consent rules as the [verdict](owner_loop_interaction_verdict.md). It is a
+Cocoa measurement performed with per-run desktop consent; no Linux run, no
+headless scripted example and no timing inference substitutes for it, and it
+never joins routine or mandatory groups. Successful `vkQueuePresentKHR` return
+proves request admission, not display or completion during the stall. Report
+request, completion and visible-progress evidence separately; present fences
+prove their specified retirement condition, not physical scanout time. Retain
+visual evidence if the verdict claims visibly advancing frames.
 
 Before hardware tests, use scripted completion and clock sources to verify:
 
@@ -2006,7 +2339,11 @@ Required contracts and evidence belong in each implementation PR.
 The owner-approved policies D-1–D-26 are preserved. This review supplies concrete
 contracts and the following proposed one-PR delivery boundaries. The owner
 signed off readiness on 2026-09-17 under D-27; the document itself creates no
-tracker artifacts.
+tracker artifacts. D-29–D-33 (2026-09-20) insert VK-18 before VK-7 and revise
+the VK-7, VK-8, VK-10, VK-16 and VK-17 boundaries. The owner's requested
+2026-09-20 review signs off those revisions. VK-5, VK-6 and VK-18 are parallel
+prerequisite branches converging at VK-7, followed by VK-8 → VK-10 → VK-11 →
+VK-12 → VK-13 → VK-14/VK-15 → VK-16 → VK-17; VK-9 also gates VK-11.
 
 VK-1 and VK-2 qualify the shared toolchain and native profile; VK-3 can progress
 beside VK-2. Downstream native slices are deliberately deferred until VK-2
@@ -2044,12 +2381,10 @@ fixture and affected group, preserves their assertions, and removes temporary
 duplicate routing. Platform-aware Hspec selection and the existing display
 runner suffice; no new catalog platform field is assumed.
 
-**Parallel runway.** Independent of unfinished TIME/LIFE, the available chain
-is VK-1, then VK-2 beside VK-3, followed by VK-4, then VK-6 and VK-9. These still
-obey their own proof/dependency gates. VK-5 and the later integrated backend
-wait for #144, whose chain includes #143 → #136 and #138 plus their prerequisites.
-#133 and #135 have landed; there is no basis for estimating this barrier as “weeks”.
-Progress the independent work while those owners finish.
+**Parallel runway at the current handoff.** TIME/LIFE and VK-1–VK-3 are merged.
+VK-18 can proceed independently of native provisioning. VK-4/#208 enables
+VK-5, VK-6 and VK-9; VK-7 waits for VK-5, VK-6 and VK-18. Preserve each slice's
+native evidence obligations even when its implementation can run in parallel.
 
 ### VK-1. Qualify and pin the shared Haskell toolchain
 
@@ -2106,7 +2441,7 @@ Progress the independent work while those owners finish.
 - **Phase:** Native foundations.
 - **Depends on:** `VK-4`. External prerequisite: LIFE #144 (and its #141–#143 chain).
 - **Ordering:** critical path.
-- **Relevant decisions:** D-5, D-7, D-14.
+- **Relevant decisions:** D-5, D-7, D-14, D-29, D-33.
 - **Acceptance signals:** Scripted admission/cancellation/failure tests and focused VK-2-harness native cases prove shared-loader use and preserved SDK-free window-only behavior. Surface ownership cannot escape its registered attachment; retained evidence covers both platforms before VK-8 takes over routing. The pre-init loader capability is an additive constructor beside `sessionAssembly`, and seam examples cover its ordering between hints and `glfwInit`, failure before any native effect, and the reset on both termination and failed initialization; the ordinary native library keeps `GLFW_INCLUDE_NONE` (from RR-10 in `runtime_review_findings.md`).
 - **Out of scope:** Device selection, swapchains or another GLFW native API mirror.
 - **Open questions:** None; use VK-2's proven ABI profile.
@@ -2123,26 +2458,39 @@ Progress the independent work while those owners finish.
 - **Out of scope:** Foundation logger rewrite or permanent RTS performance tuning.
 - **Open questions:** None; native callback proof is a VK-2 gate.
 
+### VK-18. Settle the supervised graphics owner's cross-thread contract
+
+- **Outcome:** The production supervised graphics owner's ownership and communication machinery, with backend operations injected and proven through fakes, whose handoffs with the main-thread host are explicit, bounded, cancellable and self-scheduled, and whose lifetime runs through protected retirement under D-33; the documents' main-thread assumptions reconciled to D-29.
+- **Scope:** The owner as a foundation worker under the existing supervision and failure contracts, outliving ordinary worker drain (D-33); a narrow injected operation set covering worker ownership, handoffs, cancellation and retirement and nothing resembling a rendering API (D-32); main-thread-to-owner handoff of `WindowObservation` and render-eligibility snapshots, render demand, scene snapshots from any application thread (D-31) and attachment lifetime through bounded ports and latest-value snapshots; owner-to-main-thread publication of progress, earliest absolute next deadline and retirement facts through the TIME wake, with the owner's own waits driven by its own deadlines and demand; cancellation at every wait in dependency order; the D-33 retirement sequence including the main-thread housekeeping-and-await boundary and the final join before window release; the extent policy seam D-30 needs; the documented behaviour during a main-thread stall; and the reconciliation of P-1, P-5, P-6, P-7, VK-8, VK-16, [glfw.md](glfw.md), [the lifetime design](window_graphics_lifetime_design.md) (its D-6 and P-3) and the fixture thread demonstrations.
+- **Phase:** Native foundations.
+- **Depends on:** `VK-3`. External prerequisite: TIME #139 and LIFE #144 merged.
+- **Ordering:** critical path; precedes VK-7 and can land beside VK-5/VK-6.
+- **Relevant decisions:** D-5, D-15, D-19, D-29–D-33.
+- **Acceptance signals:** Headless Hspec over injected fake operations proves handoff ordering and revision monotonicity; that a blocked fake main thread does not block the owner's rendering of what it already holds and a blocked owner does not block the main thread's commands; that the owner meets its own deadlines and makes progress with the main loop's wake withheld entirely, so a published deadline is never its only scheduling mechanism; cancellation at each wait in dependency order; bounded-port refusal reported rather than lost; the D-33 retirement sequence under close, exit and repeated cancellation, including that the owner is joined after its resources are destroyed and before window release, and that no cancellation or cleanup error releases an unverified resource; and that the owner performs no GLFW call. No GPU, surface or desktop is required, and the same machinery, not a stand-in, is what VK-7 later drives. Companion documentation lands in the same PR and names the modal-loop limit explicitly: window commands and observations still wait for the pump, and a rendered latest snapshot does not mean gameplay or input continued.
+- **Required boundary cases:** Full ordinary ports cannot prevent stop, terminal evidence or owner progress; individual close acknowledges one retired attachment while the shared owner and second target remain live. Whole-host exit alone requires the final owner join. Cover failed owner startup, failure before application supervision exists, early fatal publication while retirement remains pending, main-thread housekeeping during drain, and unexpected worker completion without retirement evidence. Native resources and OS-thread affinity are not simulated by a passing headless example.
+- **Out of scope:** Vulkan handles, a real surface, native progress measurement (VK-16), a simulation driver (D-31), the reserve callback geometry record (D-30), or more than one graphics owner.
+- **Open questions:** None; D-30–D-33 settle the extent policy, simulation, the slice boundary and shutdown.
+
 ### VK-7. Own Vulkan instance, device and targets under protected retirement
 
-- **Outcome:** A session controller with shared device roots and independently attached surfaces whose every exit respects P-5.
-- **Scope:** Capability/queue plans, portability features, initial and later surface admission, controller construction/rollback and dependency graph. Device loss stops admission immediately; no work is yet submitted.
+- **Outcome:** A session controller, run by the VK-18 graphics owner, with shared device roots and independently attached surfaces whose every exit respects P-5.
+- **Scope:** The Vulkan operations injected into VK-18's owner machinery (D-32): capability/queue plans, portability features, initial and later surface admission, controller construction/rollback, dependency graph and root destruction inside D-33's retirement, all on the graphics owner's thread; main-thread surface creation handed over under the attachment. Device loss stops admission immediately; no work is yet submitted.
 - **Phase:** Native foundations.
-- **Depends on:** `VK-3`, `VK-5`, `VK-6`. External prerequisite: LIFE #142/#143/#144.
+- **Depends on:** `VK-3`, `VK-5`, `VK-6`, `VK-18`. External prerequisite: LIFE #142/#143/#144.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-7, D-9, D-14, D-15, D-17, D-22.
-- **Acceptance signals:** Partial startup, close and repeated cancellation preserve child-before-parent retirement; incompatible targets are rejected without replacing the device; the first target never owns shared roots. Native cases run through VK-2's proof infrastructure until VK-8 migrates them.
+- **Relevant decisions:** D-7, D-9, D-14, D-15, D-17, D-22, D-29, D-32, D-33.
+- **Acceptance signals:** Partial startup, close and repeated cancellation preserve child-before-parent retirement, with the owner joined before final host disposal and independently retiring targets needing no join; incompatible targets are rejected without replacing the device; the first target never owns shared roots. Instance/device roots are created and destroyed on the graphics owner; surfaces are created through GLFW on the main thread and destroyed through Vulkan on the graphics owner, shown independently of Hspec hook names. Construction/transfer cancellation retains attachment and instance through either acceptance or verified rollback. Native cases run through VK-2's proof infrastructure until VK-8 migrates them.
 - **Out of scope:** Frame submissions or prematurely acknowledging an attachment.
-- **Open questions:** None after VK-2; consume settled LIFE interfaces.
+- **Open questions:** None after VK-2 and VK-18; consume settled LIFE interfaces.
 
 ### VK-8. Integrate package-native Vulkan fixtures and CI evidence
 
 - **Outcome:** The package-native fixture and affected `test.vulkan-native` group alongside VK-3's portable group, isolated Linux execution and enforceable local pre-PR evidence.
-- **Scope:** P-10/Q-3 verification contract, main-thread shared roots, private destructive fixtures, platform-aware nonempty selection, prebuild versus timed native execution and final-after-teardown diagnostics. Migrate the VK-2/VK-5–VK-7 evidence cases and replace temporary proof routing without dropping assertions.
+- **Scope:** P-10/Q-3 verification contract, shared roots and surface destruction owned by the graphics owner's thread with surface creation and window commands through main-thread dispatch (D-29/D-33), private destructive fixtures, platform-aware nonempty selection, prebuild versus timed native execution and final-after-teardown diagnostics. Migrate the VK-2/VK-5–VK-7 evidence cases and replace temporary proof routing without dropping assertions.
 - **Phase:** Verification infrastructure.
 - **Depends on:** `VK-7`.
 - **Ordering:** critical path for production native operations.
-- **Relevant decisions:** D-2, D-3, D-20, D-21.
+- **Relevant decisions:** D-2, D-3, D-20, D-21, D-29.
 - **Acceptance signals:** Tiny initial native profile runs on both platforms under 30 seconds; selected missing environments fail; records identify real inputs and local consent. Later slices add their cases to the same bounded profile.
 - **Out of scope:** Claiming initial instance/device checks prove the final two-window milestone; full coverage is VK-17.
 - **Open questions:** Q-3 deliberately open until both the initial and completed profile are measured. Report infeasible budget/environment choices rather than weakening required status.
@@ -2162,12 +2510,12 @@ Progress the independent work while those owners finish.
 ### VK-10. Manage swapchain generation construction and replacement
 
 - **Outcome:** Bounded generation ownership with capability-driven format/extent/image planning and safe partial construction.
-- **Scope:** P-15 small presentation profile, zero-area suspension, coalesced resize, generation reservations, the irreversible oldSwapchain transition and exact target identity.
+- **Scope:** P-15 small presentation profile, D-30 concrete-capabilities versus cached-framebuffer extent selection, zero-area suspension before clamping, coalesced resize, generation reservations, the irreversible oldSwapchain transition and exact target identity. Reconciliation may replace a generation without a fresh GLFW observation; it cannot invent geometry or bypass render eligibility.
 - **Phase:** Rendering lifecycle.
 - **Depends on:** `VK-8`.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-7, D-16, D-18, D-22.
-- **Acceptance signals:** Injected failed replacement cannot reacquire/pass a retired old handle; oversized returned image counts safely reject; newer resize survives earlier work and no target steals another's reservations.
+- **Relevant decisions:** D-7, D-16, D-18, D-22, D-30.
+- **Acceptance signals:** Injected failed replacement cannot reacquire/pass a retired old handle; oversized returned image counts safely reject; newer resize survives earlier work and no target steals another's reservations. Concrete and application-chosen extents, stale observations, zero-area before clamping, and repeated out-of-date/suboptimal results preserve suspension and bounded replacement without a hot retry loop.
 - **Out of scope:** Surface-loss retries or ordinary consumer rendering.
 - **Open questions:** None; legal native construction follows VK-2.
 
@@ -2233,15 +2581,15 @@ Progress the independent work while those owners finish.
 
 ### VK-16. Compose rendering demand and retirement with TIME and LIFE
 
-- **Outcome:** The existing owner loop drives rendering, finite GPU progress and all-exit retirement without a second engine loop.
-- **Scope:** P-5/P-6 deadline combination, fair target progress, render suspension, idle retirement-poll backoff with prompt resumption, stop/quiescence order and status delivery to application services.
+- **Outcome:** The main-thread owner loop publishes demand and observations and the VK-18 graphics owner drives rendering, finite GPU progress and all-exit retirement, without a second engine loop.
+- **Scope:** P-5/P-6 deadline combination across the two threads, fair target progress, render suspension, idle retirement-poll backoff with prompt resumption, stop/quiescence order and status delivery to application services; the D-30 extent policy under a main-thread stall, including suspended acquisition for unusable dimensions and the bounded replacement budget; and the native interaction-probe measurement D-29 requires.
 - **Phase:** Runtime integration.
-- **Depends on:** `VK-14`, `VK-15`. External prerequisite: TIME #138/#139 (and dependencies); LIFE #144.
+- **Depends on:** `VK-14`, `VK-15`, `VK-18`. External prerequisite: TIME #138/#139 (and dependencies); LIFE #144.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-5, D-15, D-18, D-22.
-- **Acceptance signals:** Quiet continuous scenes avoid idle waits; suspended targets retain needed progress without spinning; other targets/commands remain serviceable; workers cannot await commands from an ended loop.
-- **Out of scope:** A new simulation driver, game EngineEnv or render-worker architecture.
-- **Open questions:** None; consume delivered TIME/LIFE contracts.
+- **Relevant decisions:** D-5, D-15, D-18, D-22, D-29–D-31, D-33.
+- **Acceptance signals:** Quiet continuous scenes avoid idle waits; suspended targets retain needed progress without spinning; other targets remain serviceable, and commands are serviced when the main-thread pump returns; workers cannot await commands from an ended loop. Retained native records from RR-4's probe extended with the graphics owner distinguish frame requests, completion and any claimed visible progress during both a Cocoa live resize and a menu-bar interaction while the owner turn is blocked. A successful present return alone cannot satisfy the progress claim. Include the measured revision, consent and loss reporting the verdict requires; companion docs state plainly that window commands and observations still wait for the pump. If only queued requests progress, record the unmet completion/visible claim and return it to the owner rather than declaring D-29 proved.
+- **Out of scope:** A new simulation driver (D-31), game EngineEnv, a second graphics owner, the reserve callback geometry record unless the measurement shows D-30's capabilities path insufficient, or any Linux substitute for the Cocoa measurement.
+- **Open questions:** None; consume delivered TIME/LIFE contracts and D-30–D-33. If the measurement shows the capabilities path insufficient on a supported platform, stop and revise D-30 explicitly rather than improvising the reserve record.
 
 ### VK-17. Deliver the multi-window triangle consumer and final evidence
 
@@ -2250,7 +2598,7 @@ Progress the independent work while those owners finish.
 - **Phase:** Milestone.
 - **Depends on:** `VK-8`, `VK-16`.
 - **Ordering:** last on critical path.
-- **Relevant decisions:** D-1–D-4, D-7, D-16, D-20, D-21, D-26.
-- **Acceptance signals:** Full required native profile including test-owned setup and teardown measures under 30 seconds on each platform; second window renders after first closes; no missing validation detail; component docs/evidence land before final review.
+- **Relevant decisions:** D-1–D-4, D-7, D-16, D-20, D-21, D-26, D-29.
+- **Acceptance signals:** Full required native profile including test-owned setup and teardown measures under 30 seconds on each platform; second window renders after first closes; no missing validation detail; component docs/evidence land before final review; the triangle consumer never calls GLFW or Vulkan from a thread other than the one D-29 assigns, and VK-16's retained stall evidence is linked from the final verdict rather than re-measured.
 - **Out of scope:** Scene graphs, camera/assets, optional stress runs becoming mandatory, or performance tuning without measurements.
 - **Open questions:** Q-3 final timing/coverage gate; stop for an explicit scope decision if it cannot fit rather than reducing coverage silently.

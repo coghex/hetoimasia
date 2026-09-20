@@ -9,8 +9,13 @@ Owner: `coghex/hetoimasia`. Started 2026-09-16. The owner accepted one exclusive
 graphics owner per window and protected retirement after worker drain, before
 dependency release. The owner's requested final review completed on 2026-09-16
 against `master@e2d30ea`; D-5 records its clarifications. Epic #140 and all four
-children (#141–#144) are now filed and approved. The ledger records processing,
+children (#141–#144) are merged. The ledger records processing,
 not implementation; canonical approval amendments are part of each issue's spec.
+On 2026-09-20 the owner added D-6, the surviving graphics-owner lifetime that
+the Vulkan arc's D-29/D-33 require; it revises D-4's ordering and is delivered
+by Vulkan VK-18/VK-7, so this arc's ledger is unchanged and complete. The
+owner's requested 2026-09-20 review signs off that revision with the Vulkan
+design; it does not claim that today's implementation already supports it.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -38,9 +43,9 @@ concrete precondition
 - **Arc label:** existing `resources`; crossing slices use `runtime`/`glfw`
   during processing. No new graphics package or label is required yet.
 
-## Current handoff — 2026-09-19
+## Current handoff — 2026-09-20
 
-At `master@38388f8`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
+At `master@3a8abdc`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
 #166–#169 are merged. The implemented host/attachment contract is in
 [glfw.md](glfw.md); the [review ledger](project_review/ledger.md) records current
 review outcomes. The [#170 review](project_review/170.md) confirms the
@@ -134,6 +139,51 @@ slices are ready for issue processing, with cancellation handoff, construction
 ownership, and retirement progression clarified below. Actual Vulkan completion
 remains deliberately gated in Q-3, outside every LIFE slice.
 
+### D-6. The graphics owner survives worker drain and retires on its own thread
+
+Owner accepted 2026-09-20, mirroring Vulkan
+[D-33](vulkan_backend_design.md#d-33-keep-the-graphics-owner-alive-through-protected-retirement)
+after [D-29](vulkan_backend_design.md#d-29-render-from-one-supervised-graphics-owner-keep-glfw-on-the-main-thread)
+moved rendering to one supervised graphics owner. This is the "different
+explicitly designed lifetime" P-3 reserved for a backend that needs a live
+retirement worker, and it revises D-4's assumption that the main thread
+retires graphics after every worker has drained:
+
+1. Quiescence closes admission; ordinary application workers stop and drain.
+2. The graphics owner stays alive to finish GPU retirement and destroy its
+   own resources on its own thread.
+3. The main-thread protected boundary services the native housekeeping that
+   retirement needs and awaits verified retirement, bounded per turn as D-5
+   requires; it performs no GPU work.
+4. After verified retirement and destruction, join the graphics owner before
+   final host disposal releases the remaining windows and dependencies. The
+   main thread validates exact attachment evidence; worker completion alone
+   is not retirement evidence.
+
+This is whole-session exit. Ordinary close/detach of one window retires only
+its dependents and publishes evidence for that exact attachment. The main
+thread can acknowledge it and release that window while the shared graphics
+owner and other targets remain live; it neither joins the shared owner nor
+releases shared device/instance roots.
+
+The graphics owner uses a component-owned worker/supervision lifetime separate
+from the ordinary application group. Its run action installs protected IO
+retirement before dependent construction, covering startup failure, run
+failure, stop and repeated cancellation. GPU destruction does not belong in
+its `Scoped` startup finalizers. Terminal failure is latched and made available
+to application checkpoints immediately, even if retirement must continue.
+The main-thread boundary services housekeeping while observing retirement and
+worker completion; it cannot first block in a generic group join that prevents
+that housekeeping. Unexpected completion without safe retirement retains the
+dependencies and evidence. Vulkan D-33 specifies this additive composition;
+the existing worker primitives and window-only entry points keep their rules.
+
+Cancellation follows the same dependency ordering. D-4's retention rule is
+unchanged: no timeout, cancellation or cleanup error supplies permission to
+destroy a resource whose GPU use is unverified. The delivered LIFE-1–LIFE-4
+contracts stand; the surviving-owner lifetime is delivered by the Vulkan arc's
+VK-18 and VK-7, not by a new LIFE slice, and this ledger stays complete.
+
 ## Design
 
 ### P-1. Attachment ownership and state
@@ -169,9 +219,11 @@ was handed to the application. Keep state bounded by the host's window limit
 and live/retiring attachments; old identities must not require an ever-growing
 tombstone registry.
 
-Retirement authority is owner-thread-only. Other threads may observe status or
-publish bounded completion notifications, but cannot directly dispose native
-dependents or remove an attachment. Validate the identity and owner thread before
+Host attachment authority is main-thread-only. Under D-6 the graphics owner
+disposes its own backend dependents on its worker and publishes exact terminal
+evidence; only the main thread validates it and removes the attachment or
+destroys the GLFW window. Other threads may observe status or publish bounded
+notifications but gain no disposal authority. Validate identity and ownership before
 construction/retirement effects, just as for current window operations.
 Dependents must stay owned by this controller until retirement: do not return
 handles from an already ended `withScoped` callback, or install their only
@@ -197,10 +249,14 @@ allow native destruction, also respecting ordinary CPU borrows. One window's
 pending retirement does not block servicing another window: progress is bounded
 per turn and follows the scheduling arc's deadline/wake model.
 
-Retirement progress executes on the main thread outside foundation finalizers.
-It is a trusted, narrow component operation, not an arbitrary game callback.
+In the delivered LIFE protocol, attachment progress executes on the main thread
+outside foundation finalizers. Under D-6 that callback requests/observes
+progress from the surviving graphics owner; backend GPU effects and disposal
+execute on that worker. Both paths are trusted, narrow component operations,
+not arbitrary game callbacks.
 Each progress opportunity either advances finitely or declares when progress
-may next be possible. No blocking GPU wait is allowed in a normal owner turn.
+may next be possible. No blocking GPU wait is allowed in a normal main-thread
+owner turn.
 If the platform itself blocks inside a native call, no hard latency guarantee
 is claimed. The backend must document that limit.
 
@@ -241,7 +297,10 @@ that rule. Neither worker finalizers nor graphics retirement may await a command
 handled only by the departed normal loop. Initial graphics retirement work is
 owner-thread-owned and must remain progressable after worker drain. A backend
 that needs a live retirement worker requires a different explicitly designed
-lifetime; this arc does not silently add one.
+lifetime; this arc does not silently add one. D-6 is that lifetime: under it
+step 2 drains ordinary workers only, step 3's GPU retirement runs on the
+surviving graphics owner while the main thread services housekeeping and
+awaits verified retirement, and the owner is joined before step 4.
 
 The protected boundary covers failed dependency construction after host setup,
 failed startup, action failure, owner-loop failure, normal return, and repeated
@@ -361,10 +420,13 @@ do not replace it with a generic uninterruptible finalizer hook.
 
 ### Q-3. Which Vulkan mechanism proves completion?
 
-Deliberately deferred to Vulkan Q-2; no LIFE slice creates GPU work or a surface.
-The CPU attachment protocol and fake completion tests can be processed without
-selecting Vulkan compatibility. The first actual backend/surface issue must
-stop for that decision and must not treat this document as GPU proof.
+Delegated to Vulkan Q-2, whose native compatibility gate was fulfilled by
+merged #158/PR #174 and whose exceptional cleanup was repaired by #181/#182.
+That arc selects maintenance present fences and unused-image release. No LIFE
+slice itself creates GPU work or a surface: its CPU flags and fake completion
+tests remain no proof of native retirement. Native implementation consumes the
+[compatibility record](vulkan_compatibility_record.md) and still owes its own
+production evidence and any changed-input requalification.
 
 ## Verification strategy
 
@@ -480,7 +542,8 @@ CPU flags into real GPU completion evidence.
 The [scheduling design](runtime_scheduling_design.md) owns TIME dependencies.
 The Vulkan design owns the later surface bridge, concrete completion strategy,
 and real graphics fixture. Do not draft duplicate CPU lifetime issues there.
-Both prerequisite designs are ready for issue processing. The Vulkan design
-remains exploring. Process the scheduling epic first; each invocation handles
-one approved tracker artifact, with LIFE-3/LIFE-4's external gates checked before
-drafting those children.
+Both prerequisite arcs are already processed and implemented. This document
+and the revised Vulkan design are ready for issue processing; the remaining
+work belongs to Vulkan's existing epic #155. Continue that design, reconciling
+the epic first and then handling one child per invocation. Do not redraft
+LIFE-1–LIFE-4: D-6's additive surviving-owner lifetime belongs to VK-18/VK-7.
