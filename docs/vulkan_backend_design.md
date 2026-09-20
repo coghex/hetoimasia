@@ -67,17 +67,21 @@ migration, and host repairs #166–#169 are also merged. Consume their current
 contracts; do not redraft those prerequisites.
 
 The [batch review ledger](project_review/ledger.md) records the review of
-PRs #170–#180. The [Vulkan model review](project_review/175.md) identifies
-image-reacquisition and budget-opacity repairs; #183 landed the first, so the
-pure model now admits a new acquisition of an image whose presentation is
-already enqueued, against its own free pool record and its own acquisition
-synchronization, exactly as P-2 and VK-13 describe. The budget-opacity repair
-remains outstanding. The
-[proof review](project_review/174.md) identifies unsafe unsuccessful-exit
-cleanup and partial-construction rollback gaps. Repair the contracts that
-remain before dependent native integration relies on them. Successful retained platform runs
-still support the selected compatibility profile; the production backend has
-not been implemented or verified by that experiment.
+PRs #170–#180. The [Vulkan model review](project_review/175.md) identified
+image-reacquisition and budget-opacity repairs, and the
+[proof review](project_review/174.md) identified unsafe unsuccessful-exit
+cleanup and partial-construction rollback gaps.
+
+Image reacquisition was repaired **after this snapshot**, by #183: the pure
+model admits a new acquisition of an image whose presentation is already
+enqueued, against its own free pool record and its own acquisition
+synchronization, exactly as P-2 and VK-13 describe. `38388f8` itself still
+refuses that sequence, so do not read the repair as behaviour of the baseline
+this section names. Budget opacity and the two proof-review gaps remain
+outstanding; repair those contracts before dependent native integration relies
+on them. Successful retained platform runs still support the selected
+compatibility profile; the production backend has not been implemented or
+verified by that experiment.
 
 VK-4 onward remain unprocessed. The original #158 merge gate is satisfied;
 processing a later issue must account for its actual dependencies and these
