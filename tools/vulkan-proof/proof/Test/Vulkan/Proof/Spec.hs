@@ -34,6 +34,7 @@ import Test.Vulkan.Proof.Matrix
   , standing
   )
 import Test.Vulkan.Proof.Record (achievedFrom, matrixTable, renderRecord)
+import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import Test.Vulkan.Proof.Retention (teardownEntries)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 
@@ -44,6 +45,7 @@ spec outcome = do
   -- `run-proof.sh --headless` selects on their own, and they make no native
   -- call here either.
   Retention.spec
+  Invocation.spec
 
   describe "The native run" $
     it "established every step it started" $

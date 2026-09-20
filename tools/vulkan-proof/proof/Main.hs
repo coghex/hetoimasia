@@ -34,22 +34,21 @@ import Test.Hspec (Spec)
 import Test.Hspec.Runner
   ( Config (configFailOnEmpty)
   , defaultConfig
+  , evalSpec
   , hspecWithResult
   , isSuccess
+  , runSpecForest
+  , specResultSuccess
   )
 
 import Test.Vulkan.Proof.Consent (consentVariable, readConsent, refusalMessage)
+import Test.Vulkan.Proof.Invocation (Mode (..), selectMode)
+import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import Test.Vulkan.Proof.Journal (entries, newJournal)
 import Test.Vulkan.Proof.Record (renderRecord)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 import Test.Vulkan.Proof.Run (runProof)
 import qualified Test.Vulkan.Proof.Spec as Proof
-
--- | The flag that selects the headless examples and nothing else. It is this
--- harness's own, so it is taken out of the arguments before Hspec's runner
--- sees them rather than left for it to reject.
-headlessFlag ∷ String
-headlessFlag = "--headless"
 
 -- | Where the record is written, when the caller asks for one. The Linux job
 -- uploads this file; the macOS invocation keeps it beside the PR's evidence.
@@ -59,23 +58,35 @@ recordVariable = "HETOIMASIA_VULKAN_PROOF_RECORD"
 main ∷ IO ()
 main = do
   arguments ← getArgs
-  if headlessFlag `elem` arguments
-    then headless (filter (/= headlessFlag) arguments)
-    else native arguments
+  case selectMode arguments of
+    Refused reason → do
+      hPutStrLn stderr ("vulkan-proof: " <> Text.unpack reason)
+      exitFailure
+    Headless selectors → headless selectors
+    Native → native
 
--- | The release decision's own examples, and nothing else: no consent is read,
--- no native procedure runs, and no record is written, because none of those is
--- what this mode establishes. An empty selection fails rather than passing
--- silently, so this cannot become a run that proved nothing and said so
--- quietly.
+-- | The pure examples, and nothing else: no consent is read, no native
+-- procedure runs, and no record is written, because none of those is what this
+-- mode establishes. Selecting among them is fine precisely because nothing
+-- here writes a verdict anywhere; an empty selection still fails rather than
+-- passing silently.
 headless ∷ [String] → IO ()
-headless arguments = do
+headless selectors = do
   putStrLn "vulkan-proof: headless; the release decision only, with no native session"
-  passed ← runExamples arguments Retention.spec
-  unless passed exitFailure
+  result ←
+    withArgs selectors $
+      hspecWithResult defaultConfig {configFailOnEmpty = True} headlessExamples
+  unless (isSuccess result) exitFailure
 
-native ∷ [String] → IO ()
-native arguments = do
+-- | Everything @--headless@ selects. The native run asserts these too, through
+-- "Test.Vulkan.Proof.Spec".
+headlessExamples ∷ Spec
+headlessExamples = do
+  Retention.spec
+  Invocation.spec
+
+native ∷ IO ()
+native = do
   consent ←
     readConsent >>= \case
       Left refusal → do
@@ -87,7 +98,7 @@ native arguments = do
   outcome ← runProof journal consent
   transcript ← entries journal
 
-  passed ← runExamples arguments (Proof.spec outcome)
+  passed ← runCompleteSpec (Proof.spec outcome)
 
   invocation ← describeInvocation
   let record = renderRecord "The VK-2 native Vulkan compatibility record" invocation transcript outcome passed
@@ -100,9 +111,23 @@ native arguments = do
 
   unless passed exitFailure
 
-runExamples ∷ [String] → Spec → IO Bool
-runExamples arguments examples =
-  isSuccess <$> withArgs arguments (hspecWithResult defaultConfig {configFailOnEmpty = True} examples)
+-- | Run the whole spec, and only ever the whole spec.
+--
+-- Deliberately not `hspecWithResult`. That resolves its configuration through
+-- Hspec's @readConfig@, which reads the command line, @~/.hspec@, @./.hspec@,
+-- and @HSPEC_*@ in the environment — any of which can select a subset. The
+-- result returned here is written into the compatibility record as that
+-- record's own verdict on the whole contract, so a subset must not be able to
+-- produce it: an ambient @HSPEC_MATCH@ that happened to select only the pure
+-- examples would otherwise turn a native run that stopped into a record
+-- saying @Verdict: pass@.
+--
+-- These are Hspec's own documented primitives with the configuration-reading
+-- step left out, so the configuration is exactly the one written here.
+runCompleteSpec ∷ Spec → IO Bool
+runCompleteSpec examples = do
+  (config, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} examples
+  specResultSuccess <$> runSpecForest forest config
 
 -- | The command a reader would have to run to reproduce this, including the
 -- environment that decides which loader, driver, and layers it used. A record

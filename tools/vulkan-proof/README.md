@@ -34,10 +34,12 @@ examples that keep the rest of that boundary honest.
 | --- | --- |
 | `proof/Main.hs` | Reads consent, runs the native procedure, then lets Hspec decide, then writes the record. That order is the contract. |
 | `proof/Test/Vulkan/Proof/Consent.hs` | The per-run authorization guard, with the same rules as the GLFW native suite's. |
+| `proof/Test/Vulkan/Proof/Invocation.hs` | Which mode an argument list asks for, and why the native one accepts no test options. |
 | `proof/Test/Vulkan/Proof/Run.hs` | The whole native run, on the process main thread: environment, loader identity, instance, device, swapchain, completion, abandonment, capture, callbacks, and teardown. |
 | `proof/Test/Vulkan/Proof/Findings.hs` | What the run observed, as data. |
 | `proof/Test/Vulkan/Proof/Retention.hs` | The release decision: which of teardown's handles the run's own evidence permits destroying, as a pure function. |
 | `proof/Test/Vulkan/Proof/RetentionSpec.hs` | That decision's own examples, which `--headless` selects. |
+| `proof/Test/Vulkan/Proof/InvocationSpec.hs` | The invocation policy's examples, selected alongside them. |
 | `proof/Test/Vulkan/Proof/Spec.hs` | The verdict: pure Hspec assertions over those findings. |
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
 | `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record. |
@@ -109,7 +111,17 @@ bash tools/vulkan-proof/run-proof.sh --headless
 ```
 
 Every other argument is forwarded to the harness as a test option, so an Hspec
-selector such as `--match` passes through unchanged.
+selector such as `--match` reaches the headless examples unchanged.
+
+The native run accepts no test options, and refuses rather than ignoring one.
+Its record carries `Verdict: pass` or `Verdict: fail` as a claim about the whole
+contract, and a selector that ran a subset of the examples would still have its
+result written as that claim — a run that stopped could be recorded as a pass
+because the examples that assert over the native outcome were never selected.
+For the same reason the native verdict is computed through Hspec's own
+primitives with the configuration-reading step left out, so neither `./.hspec`,
+`~/.hspec`, nor an ambient `HSPEC_*` can narrow what the record speaks for.
+Selecting among the pure examples is free of that, because they write no record.
 
 ## Running it
 
@@ -145,7 +157,8 @@ standard output. `HETOIMASIA_VULKAN_DRIVER_MANIFEST` and
 `tools/toolchain/binding.pin` names.
 
 A run refused for lack of consent exits non-zero with one line saying what is
-missing and how a human authorizes it. It initializes nothing first. `--headless`
-is decided before consent is read, so that mode is refused for nothing and
+missing and how a human authorizes it. It initializes nothing first. The mode is
+decided before consent is read, so `--headless` is refused for nothing and
 starts no session; it never falls through to the native procedure and never runs
-an empty selection.
+an empty selection. A native invocation carrying a test option is refused there
+too, in the same way and just as early.
