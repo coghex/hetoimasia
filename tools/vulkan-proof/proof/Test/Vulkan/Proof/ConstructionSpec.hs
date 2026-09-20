@@ -23,7 +23,16 @@
 -- retained and why.
 module Test.Vulkan.Proof.ConstructionSpec (spec) where
 
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, throwTo)
+import Control.Concurrent
+  ( ThreadId
+  , forkOn
+  , myThreadId
+  , newEmptyMVar
+  , putMVar
+  , takeMVar
+  , throwTo
+  , yield
+  )
 import Control.Exception (Exception, SomeException, displayException, throwIO, try)
 import Control.Monad (forM, forM_, when)
 import Data.Foldable (for_)
@@ -32,6 +41,7 @@ import Data.List (isInfixOf)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Test.Hspec
 
 import Test.Vulkan.Proof.Construction
@@ -342,6 +352,57 @@ positionIn name = length . takeWhile (/= name)
 ownedCreations ∷ [Text] → [Text]
 ownedCreations = filter (not . Text.isSuffixOf "command buffer")
 
+-- | The one object the cancellation example gets as far as creating: the first
+-- child of the first slot, made inside the handoff under test.
+firstSemaphore ∷ Text
+firstSemaphore = "the acquisition semaphore of slot 0"
+
+-- | The capability the cancellation example's worker and its killer both run
+-- on.
+--
+-- 'throwTo' between two threads on one capability is settled where it is made:
+-- the target is masked, so the exception is on its queue before the caller is
+-- recorded as waiting for it. Across capabilities it is a message instead, and
+-- the caller is recorded as waiting from the moment it sends one — a state
+-- 'awaitPendingThrow' would mistake for "the cancellation is pending against
+-- the target". Pinning both removes that distinction rather than racing with
+-- it, so the example reads the same under @-N1@ and under any other @-N@.
+theCapability ∷ Int
+theCapability = 0
+
+-- | Make a cancellation of this thread certainly pending, without delivering
+-- it and without waiting anywhere it could be delivered.
+--
+-- 'throwTo' does not return until its exception has been raised in the target,
+-- and it blocks while the target is masked. So a killer sitting in
+-- 'BlockedOnException' is exactly the state this needs to establish, and
+-- waiting for that state is what makes the example deterministic instead of
+-- timed: no sleep, no timeout, no repeated attempt, and no window in which the
+-- two threads could race to a different answer. 'yield' is the only thing the
+-- wait does, and it is not interruptible, so it cannot itself become the place
+-- the cancellation lands.
+--
+-- Where it does land is the code under test's decision. Under 'holding''s mask
+-- the killer blocks, this returns, the handle is written, and the exception is
+-- taken when that mask is restored. Without the mask the killer never blocks:
+-- 'throwTo' raises immediately, here, before the created handle has an owner.
+armCancellation ∷ Text → IO ()
+armCancellation reason = do
+  target ← myThreadId
+  killer ← forkOn theCapability (throwTo target (Injected reason))
+  awaitPendingThrow killer
+
+-- | Wait until a thread is blocked delivering an exception, or has finished.
+awaitPendingThrow ∷ ThreadId → IO ()
+awaitPendingThrow target =
+  threadStatus target >>= \case
+    ThreadBlocked BlockedOnException → pure ()
+    -- A killer that is already done raised its exception before returning, so
+    -- there is nothing left to wait for either way.
+    ThreadFinished → pure ()
+    ThreadDied → pure ()
+    _ → yield *> awaitPendingThrow target
+
 -- | The ownership invariant this issue exists to establish, asserted over one
 -- run: every object that was created was released exactly once, and every one
 -- of them was released before the device that owns it.
@@ -570,6 +631,14 @@ spec = do
     -- handle is lost: an asynchronous exception delivered between the call
     -- that made it and the write that hands it to its owner orphans it just as
     -- completely, and no verdict computed afterwards can see that.
+    --
+    -- That interval is a few instructions long and contains no interruptible
+    -- point, so an example cannot wait for a cancellation to be taken inside
+    -- it. What it can do is make one certainly pending from inside it and then
+    -- let the code under test choose where it lands: 'holding''s mask defers it
+    -- past the write, and without that mask it is taken before the write, on an
+    -- object the stand-in has already created. The two are told apart by what
+    -- teardown released, which is what this asserts.
     it "leaves the handle owned rather than orphaned" $ do
       fake ← newFake
       cleanups ← newCleanups
@@ -577,10 +646,8 @@ spec = do
       journal ← newJournal
       registerParents fake [] cleanups
       places ← newSlotPlaces "slot 0"
-      reached ← newEmptyMVar
-      proceed ← newEmptyMVar
       done ← newEmptyMVar
-      semaphores ← newIORef ["the acquisition semaphore of slot 0", "the presentation semaphore of slot 0"]
+      semaphores ← newIORef [firstSemaphore, "the presentation semaphore of slot 0"]
       let operations =
             SlotOps
               { createSlotSemaphore = do
@@ -588,21 +655,18 @@ spec = do
                     atomicModifyIORef' semaphores $ \case
                       (next : rest) → (rest, next)
                       [] → ([], "unexpected")
-                  -- The first acquisition announces, the instant its object
-                  -- exists and before 'holding' has handed it over, that the
-                  -- cancellation may be thrown; the second blocks before
-                  -- creating anything. Blocking on an empty MVar is
-                  -- interruptible even under a mask, so that is where the
-                  -- throw lands — one step past the handoff under test, with
-                  -- the first object owned and no second object to lose.
-                  if role == "the acquisition semaphore of slot 0"
-                    then do
-                      name ← acquire fake Nothing role
-                      putMVar reached ()
-                      pure name
-                    else do
-                      takeMVar proceed
-                      acquire fake Nothing role
+                  name ← acquire fake Nothing role
+                  -- Here, and only on the first: the object exists and
+                  -- 'holding' has not been handed it yet. 'armCancellation'
+                  -- does not deliver the cancellation and must not — it
+                  -- returns once one is certainly pending against this
+                  -- thread, and nothing it does blocks, yields to that
+                  -- cancellation, or masks anything. So the instant the
+                  -- cancellation is taken at is decided by 'holding' and by
+                  -- nothing this example arranges.
+                  when (role == firstSemaphore) $
+                    armCancellation "the run was cancelled at the handoff"
+                  pure name
               , destroySlotSemaphore = release fake []
               , createSlotFence = acquire fake Nothing "an unreached fence of slot 0"
               , destroySlotFence = release fake []
@@ -612,18 +676,28 @@ spec = do
               }
       for_ (reverse (slotPlaceReleases operations "slot 0" places)) $ \(what, cleanup) →
         onExitHolding cleanups what cleanup
-      worker ← forkIO (try @SomeException (fillSlot operations places) >>= putMVar done)
-      takeMVar reached
-      throwTo worker (Injected "the run was cancelled at the handoff")
+      -- The worker runs on 'theCapability', which is where its killer runs
+      -- too, so a throw between them is settled where it is made rather than
+      -- sent as a message. Nothing here waits on the worker except for its
+      -- result, so a cancellation that never arrived would fail an assertion
+      -- rather than hang the example.
+      _ ← forkOn theCapability (try @SomeException (fillSlot operations places) >>= putMVar done)
       outcome ← takeMVar done
       facts ← runCleanups journal ledger cleanups
       let session = Session fake facts (either (Just . stopReason) (const Nothing) outcome)
       session.sessionStopped `shouldSatisfy` maybe False (Text.isInfixOf "cancelled")
+      -- Restoring the caller's masking state is where a deferred cancellation
+      -- is taken, so the construction stops at the end of that first handoff
+      -- and reaches no later step.
+      created fake `shouldReturn` [firstSemaphore]
       -- The object that existed when the cancellation arrived is released, and
-      -- released before the device, which is the whole claim.
+      -- released before the device, which is the whole claim. An unprotected
+      -- handoff fails exactly here: the object was created and the place it
+      -- belongs in is still empty, so teardown releases nothing and this
+      -- reports the count it found.
       everyChildOwnedAndFreedBeforeTheDevice session
       gone ← releasedBy fake
-      occurrences "the acquisition semaphore of slot 0" gone `shouldBe` 1
+      (firstSemaphore, occurrences firstSemaphore gone) `shouldBe` (firstSemaphore, 1)
       facts.teardownFailures `shouldBe` []
 
   describe "A release that fails while a construction failure is being handled" $ do
