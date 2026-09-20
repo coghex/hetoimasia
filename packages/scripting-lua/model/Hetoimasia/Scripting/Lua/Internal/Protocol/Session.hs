@@ -1218,8 +1218,25 @@ data FailureRecord = FailureRecord
 -- Which task is rejected outright is unchanged: an identity this session never
 -- issued, or issued under a replaced epoch, is 'UnknownTask' and escalates
 -- nothing.
+--
+-- Once the session itself has failed unsafely, one report still lands: a
+-- 'RecoverySafe' failure naming an /active/ task of the current epoch. Only
+-- 'Observing' work can be active there — the failure invalidated every live
+-- task it found and closed mutation admission — so this is the failure of the
+-- reporting work D-7 kept the session alive to run, and refusing it would
+-- strand that task 'Running' with its reserved terminal-result storage held
+-- until a cancellation or a stop. It settles exactly as it would in an
+-- unfailed session, and it settles once: the task is terminal afterwards, so a
+-- repeat is refused as 'SessionAlreadyFailed' like every other report a failed
+-- session receives.
+--
+-- Nothing else gets through. A second 'RecoveryUnsafe' report, a safe report
+-- naming no task, a queued admission, a task that already finished, one whose
+-- result has been observed away, and an identity this session never issued are
+-- all still 'SessionAlreadyFailed', and the session's own 'FailureRecord' is
+-- never overwritten — 'escalate' does nothing for a safe report.
 reportFailure ∷ FailureRecord → Session v → (Session v, Either SessionRejection ())
-reportFailure record session = case notStopped session >> notFailed session of
+reportFailure record session = case notStopped session >> reportable of
   Left rejection → refuse session rejection
   Right () → case failedTask record of
     Nothing → (escalate session, Right ())
@@ -1252,6 +1269,25 @@ reportFailure record session = case notStopped session >> notFailed session of
               (escalate (retire identity (ResultFailed failure) next), Right ())
   where
     unsafe = failedRecovery record == RecoveryUnsafe
+    -- | 'notFailed', less the one report a failed session still settles.
+    reportable = case notFailed session of
+      Right () → Right ()
+      Left rejection
+        | settlesActiveWork → Right ()
+        | otherwise → Left rejection
+    -- | Whether this report is a safe failure of a task that is still live.
+    --
+    -- Liveness is read off the task map rather than the authority the
+    -- admission carried, which activation does not keep: on a failed session
+    -- an active task /is/ observing work, because the failure invalidated
+    -- every live task of that moment and nothing mutating has been admitted
+    -- since. Being live also excludes the queued, finished, observed, and
+    -- never-issued identities, whose refusals stand.
+    settlesActiveWork = case failedTask record of
+      Just identity
+        | not unsafe →
+            maybe False (not . isTerminal . taskState) (Map.lookup identity (sessionTasks session))
+      _ → False
     escalate current
       | not unsafe = current
       | otherwise = invalidateEverything current {sessionFailure = Just record}

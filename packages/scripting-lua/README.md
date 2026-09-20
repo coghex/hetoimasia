@@ -526,7 +526,14 @@ moment ago" is not evidence that the state is consistent. A *safe* failure
 naming such a task is refused. A failure naming a *queued* admission is refused
 either way and escalates nothing — a task that has never run cannot have left
 authoritative state half-applied — and an identity this epoch never issued is
-`UnknownTask`.
+`UnknownTask`. The reporting work a failed session admits settles like any
+other task: a `RecoverySafe` failure naming one that is active fails it once,
+retires its holdings, and leaves its `ResultFailed` to be observed, so a report
+about the failure cannot strand the terminal-result capacity its own admission
+reserved. It settles once and overwrites nothing — the session keeps the first
+`FailureRecord` and its last-good snapshot, mutation admission stays closed, no
+epoch advances, and every other report a failed session receives, a repeat of
+that settlement included, is still `SessionAlreadyFailed`.
 `stopSession` closes admission, aborts queued work, records a task inside a
 segment as outstanding rather than draining it, and answers an `ExitRecord` of
 dispositions and discard counts. There is no operation that waits for every task
