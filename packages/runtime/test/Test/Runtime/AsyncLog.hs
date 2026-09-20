@@ -665,8 +665,12 @@ testControlCancellationChurn = do
     offer adapter (sample "held")
     takeMVar entered
     -- Registering and cancelling with the writer blocked accumulates nothing:
-    -- were a registration orphaned, the bound of one would reject the next.
-    replicateM_ 50 $ do
+    -- were a registration orphaned, the bound of one would reject the next and
+    -- this example would wait on a slot that never comes back. The rounds are
+    -- many because the window an orphan needs is the narrow one between
+    -- registering and installing the release that undoes it, and how often a
+    -- cancellation lands inside it is the platform's business.
+    replicateM_ 100000 $ do
       waiter ← forkIO (void (flushAdapter adapter))
       awaitPending adapter 1
       killThread waiter

@@ -693,13 +693,17 @@ terminalOutcome = maybe FlushWriterStopped FlushWriterFailed
 flushAdapter ∷ AsyncLogAdapter → IO FlushOutcome
 flushAdapter = requestFlush . adapterCore
 
+-- | Registration and the release that undoes it are masked together: an
+-- asynchronous exception delivered between them would orphan the registration,
+-- and an orphan holds a bounded slot for the rest of the adapter's life.
+-- Registration itself never retries, so masking it blocks nothing.
 requestFlush ∷ Adapter → IO FlushOutcome
-requestFlush adapter = do
+requestFlush adapter = mask $ \restore → do
   registered ← atomically (register (asyncControlCapacity (adapterSettings adapter)) cell)
   case registered of
     Left outcome → pure outcome
     Right waiter →
-      atomically (readTVar (waiterOutcome waiter) >>= maybe retry pure)
+      restore (atomically (readTVar (waiterOutcome waiter) >>= maybe retry pure))
         `onException` uninterruptibleMask_ (atomically (release waiter cell))
   where
     cell = adapterCell adapter
