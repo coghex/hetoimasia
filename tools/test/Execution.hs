@@ -858,6 +858,70 @@ spec = describe "Validation execution" $ do
             ]
         result `shouldBe` ExitSuccess
 
+  describe "platform applicability" $ do
+    it "refuses to execute a group this platform does not build and writes no receipt" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        plan ← planAgainst fixture (seeded fixture)
+        -- The same changed input that makes the group's inputs changed leaves
+        -- it unselected, so the runner has nothing to record even though a
+        -- worker was pointed straight at it.
+        selectionOf plan "probe.elsewhere" `shouldReturn` Just (Selection "platform-inapplicable" False True)
+        (refused, _, errors) ← runGroup fixture "probe.elsewhere" plan []
+        refused `shouldBe` ExitFailure 2
+        errors `shouldContain` "platform-inapplicable"
+        errors `shouldContain` "this platform does not build its components"
+        doesFileExist (receiptPath fixture "probe.elsewhere") `shouldReturn` False
+
+    it "reports the omission explicitly and still requires every selected group" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        plan ← planAgainst fixture (seeded fixture)
+        -- Nothing ran yet, so the omission is reported while the verdict still
+        -- fails on the selected groups that produced no receipt.
+        (unsatisfied, pending, _) ← aggregate fixture plan []
+        unsatisfied `shouldBe` ExitFailure 1
+        pending `shouldContain` "platform-inapplicable"
+        pending `shouldContain` "not built on"
+        pending `shouldContain` "test.fail"
+        (passed, _, _) ← runGroup fixture "build.pass" plan []
+        passed `shouldBe` ExitSuccess
+        (failed, _, _) ← runGroup fixture "test.fail" plan []
+        failed `shouldBe` ExitFailure 1
+        (verdict, output, _) ← aggregate fixture plan []
+        verdict `shouldBe` ExitFailure 1
+        output `shouldContain` "platform-inapplicable"
+
+    it "passes a verdict whose only omission is the inapplicable group, without claiming it as coverage" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        selectionOf plan "probe.elsewhere" `shouldReturn` Just (Selection "platform-inapplicable" False False)
+        (executed, _, _) ← runGroup fixture "build.pass" plan []
+        executed `shouldBe` ExitSuccess
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitSuccess
+        output `shouldContain` "verdict: passed"
+        -- An aggregate may succeed while the group is reported unexecuted, but
+        -- it must never be reported as having passed.
+        output `shouldContain` "platform-inapplicable  omitted"
+        output `shouldNotContain` "probe.elsewhere  platform-inapplicable  passed"
+
+    it "refuses a receipt supplied for a group this platform does not build" $
+      withFixture $ \fixture → do
+        change fixture "README.md" "revised prose\n"
+        plan ← planAgainst fixture (seeded fixture)
+        (executed, _, _) ← runGroup fixture "build.pass" plan []
+        executed `shouldBe` ExitSuccess
+        -- A genuine receipt for a group that did run, renamed onto the one
+        -- that cannot. Without this refusal the omission would be read back as
+        -- a pass by whoever dropped the file there.
+        copyFile (receiptPath fixture "build.pass") (receiptPath fixture "probe.elsewhere")
+        patchReceipt fixture "probe.elsewhere" "group" "probe.elsewhere"
+        (result, output, _) ← aggregate fixture plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "no execution in this run can have produced it"
+
   describe "runner classes and worker routing" $ do
     it "refuses at planning a display group routed to a CPU-only worker" $
       withFixture $ \fixture → do
@@ -1597,7 +1661,8 @@ fixtureCatalogWith nonAffecting =
     , groupDocument "smoke.stubborn" stubbornCommand "[\"stubborn/\"]" "none" "smoke" "1" "false" ++ ","
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true" ++ ","
     , displayGroupDocument "test.native" "test" "false" ++ ","
-    , displayGroupDocument "probe.desktop" "probe" "true"
+    , displayGroupDocument "probe.desktop" "probe" "true" ++ ","
+    , elsewhereGroupDocument
     , "  ]"
     , "}"
     ]
@@ -1657,6 +1722,30 @@ groupDocumentFor = groupDocumentWith "cpu"
 displayGroupDocument ∷ String → String → String → String
 displayGroupDocument identifier category optional =
   groupDocumentWith "display" identifier "null" "[\"true\"]" "[\"native/\"]" "hspec" category "60" optional
+
+-- | A non-optional group whose command targets components no machine here
+-- builds, declared through the catalog's @platforms@ key. No real platform
+-- reports itself as @Plan9@, so every plan in this module omits it as
+-- @platform-inapplicable@ whether the host is Linux or Darwin, and the runner
+-- and the aggregate can be held to that omission deterministically.
+elsewhereGroupDocument ∷ String
+elsewhereGroupDocument =
+  init $
+    unlines
+      [ "    {"
+      , "      \"id\": \"probe.elsewhere\","
+      , "      \"description\": \"Fixture group probe.elsewhere.\","
+      , "      \"command\": [\"true\"],"
+      , "      \"component\": null,"
+      , "      \"inputs\": [\"src/\"],"
+      , "      \"framework\": \"hspec\","
+      , "      \"runner\": \"cpu\","
+      , "      \"timeout_seconds\": 60,"
+      , "      \"category\": \"probe\","
+      , "      \"optional\": false,"
+      , "      \"platforms\": [\"Plan9\"]"
+      , "    }"
+      ]
 
 groupDocumentWith ∷ String → String → String → String → String → String → String → String → String → String
 groupDocumentWith runner identifier component command inputs framework category timeout optional =

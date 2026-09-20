@@ -602,6 +602,17 @@ GROUP_KEYS = {
     "optional": bool,
 }
 
+# The platforms a group's command can actually be executed on, named by the
+# plan's own ``runner_os`` values. Optional because the ordinary group runs
+# everywhere, and declaring nothing is what says so; a declaration narrows and
+# can never widen. It is a statement about what the machine builds, not about
+# what a change touches: input derivation, the unknown-input fallback, and the
+# identity digests never read it, so the same candidate means the same thing
+# wherever it is planned.
+OPTIONAL_GROUP_KEYS = {
+    "platforms": list,
+}
+
 
 def validate_catalog(document: dict, path: str, packages: dict[str, Package] | None) -> list[str]:
     """Return every structural or referential problem in a catalog document."""
@@ -667,9 +678,30 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             if not isinstance(value, expected):
                 names = expected.__name__ if isinstance(expected, type) else "string or null"
                 problems.append(f"{where} key {key!r} must be a {names}")
+        for key, expected in OPTIONAL_GROUP_KEYS.items():
+            if key in group and not isinstance(group[key], expected):
+                problems.append(f"{where} key {key!r} must be a {expected.__name__}")
         for key in group:
-            if key not in GROUP_KEYS:
+            if key not in GROUP_KEYS and key not in OPTIONAL_GROUP_KEYS:
                 problems.append(f"{where} has unknown key {key!r}")
+
+        # An empty declaration would name a group nothing may ever execute,
+        # which is a retired group rather than a platform-only one.
+        platforms = group.get("platforms")
+        if isinstance(platforms, list):
+            if not platforms:
+                problems.append(
+                    f"{where} key 'platforms' must name at least one platform, or be omitted "
+                    "to declare the group applicable everywhere"
+                )
+            named = [entry for entry in platforms if isinstance(entry, str) and entry]
+            if len(named) != len(platforms):
+                problems.append(f"{where} has a non-string platforms entry")
+            # Asked of the entries that are names, because a catalog is
+            # arbitrary JSON: an array or object entry is unhashable, and
+            # counting it would raise where a diagnostic is owed.
+            elif len(set(named)) != len(named):
+                problems.append(f"{where} names a platform more than once")
 
         if not isinstance(identifier, str) or not ID_PATTERN.match(identifier or ""):
             problems.append(f"{where} has an invalid id; expected dotted lowercase, e.g. 'test.engine'")
@@ -719,6 +751,16 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             problems.append(f"{path}: floor names unregistered group {identifier!r}")
         elif groups_by_id[identifier].get("optional") is True:
             problems.append(f"{path}: floor names optional group {identifier!r}; the floor contains no optional group")
+        elif "platforms" in groups_by_id[identifier]:
+            # The floor is the evidence every candidate carries on every
+            # machine. A floor group that some platform omits would make the
+            # floor mean one thing on Linux and another on Darwin, so the
+            # catalog refuses the declaration rather than the plan refusing it
+            # later on one platform only.
+            problems.append(
+                f"{path}: floor names platform-restricted group {identifier!r}; "
+                "the mandatory floor is selected on every platform"
+            )
     return problems
 
 
@@ -1025,15 +1067,34 @@ def build_plan(
     floor = set(catalog["floor"])
     fallback = bool(unknown_inputs)
 
+    runner_os = identity["runner_os"]
+
     entries: list[dict] = []
     for group in groups:
         identifier = group["id"]
         optional = group["optional"]
+        platforms = group.get("platforms")
         changed = identifier in affected
         if not optional and fallback:
             # Uncertainty must never reach a downstream consumer as equivalence.
             changed = True
-        if optional:
+        # Platform eligibility is asked first, and it is the one answer a
+        # request cannot argue with. A group whose command targets components
+        # this platform does not build has no execution available to it, so
+        # selecting it would produce either a plan no worker can route or a
+        # command that fails before any probe runs. Naming it here, with a
+        # reason of its own, is what keeps that omission distinguishable from
+        # one this platform merely did not need — and from a pass.
+        #
+        # `changed` is decided above and deliberately left alone: what a
+        # candidate touches is a property of the candidate, so an inapplicable
+        # group still reports its changed inputs, and the unknown-input
+        # fallback still marks it, exactly as it does on the platform that
+        # builds it.
+        if platforms is not None and runner_os not in platforms:
+            selected = False
+            reason = receipts.PLATFORM_INAPPLICABLE
+        elif optional:
             selected = identifier in requested
             reason = "requested" if selected else "optional-unrequested"
         else:
@@ -1057,6 +1118,9 @@ def build_plan(
                 "inputs_changed": changed,
                 "reason": reason,
                 "optional": optional,
+                # `null` for a group applicable everywhere, so a consumer reads
+                # the declaration rather than inferring it from the reason.
+                "platforms": list(platforms) if platforms is not None else None,
                 "framework": group["framework"],
                 "category": group["category"],
                 "runner": group["runner"],
@@ -1178,6 +1242,10 @@ def render_prose(plan: dict) -> str:
     lines.append("")
     lines.append("Groups")
     width = max(len(entry["id"]) for entry in plan["groups"])
+    # Widened from the reasons actually present rather than pinned to the
+    # longest one the policy can produce, so adding a reason cannot silently
+    # ragged the column.
+    reason_width = max(len(entry["reason"]) for entry in plan["groups"])
     owners = {
         identifier: worker["name"]
         for worker in plan["workers"] or []
@@ -1187,7 +1255,7 @@ def render_prose(plan: dict) -> str:
     for entry in plan["groups"]:
         mark = "run " if entry["selected"] else "skip"
         lines.append(
-            f"  [{mark}] {entry['id']:<{width}}  {entry['reason']:<19} "
+            f"  [{mark}] {entry['id']:<{width}}  {entry['reason']:<{reason_width}} "
             f"inputs changed: {'yes' if entry['inputs_changed'] else 'no':<3}  "
             f"runner: {entry['runner']:<7}  worker: {owners.get(entry['id'], '-'):<{owner_width}}  "
             f"{' '.join(entry['command'])}"

@@ -795,9 +795,14 @@ def main(argv: list[str]) -> int:
     except EvidenceError as failure:
         raise ProvenanceError(str(failure)) from failure
     if not group["selected"]:
+        detail = (
+            "; this platform does not build its components, so there is no command here to run"
+            if group["reason"] == receipts.PLATFORM_INAPPLICABLE
+            else ""
+        )
         raise ProvenanceError(
             f"the plan did not select {arguments.group!r} ({group['reason']}); "
-            "an omitted group has no execution to record"
+            f"an omitted group has no execution to record{detail}"
         )
     # The executing worker's own declaration against the plan's routing: a
     # group runs only on the worker the plan assigned it to, and only where

@@ -283,12 +283,104 @@ spec = describe "Validation planner" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "all-hspec"
 
+  describe "platform applicability" $ do
+    it "selects a platform-only group where it builds and omits it elsewhere, for one candidate" $
+      withFixture $ \fixture → do
+        change fixture "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        linux ← planFor fixture "Linux" []
+        selectionOf linux "probe.linux" `shouldBe` Just (Selection "affected" True True)
+        selectionOf linux "test.harness" `shouldBe` Just (Selection "affected" True True)
+        darwin ← planFor fixture "Darwin" []
+        -- The omission is its own reason, distinguishable from the unaffected
+        -- and optional-unrequested groups beside it and from any execution.
+        selectionOf darwin "probe.linux" `shouldBe` Just (Selection "platform-inapplicable" False True)
+        -- Nothing else moves: the rest of the plan is the same candidate's
+        -- selection, asked on another machine.
+        selectionOf darwin "test.harness" `shouldBe` Just (Selection "affected" True True)
+        selectionOf darwin "test.demo" `shouldBe` Just (Selection "unaffected" False False)
+        selectionOf darwin "build.all" `shouldBe` Just (Selection "floor" True False)
+        selectionOf darwin "probe.slow" `shouldBe` Just (Selection "optional-unrequested" False True)
+        -- The plan states the declaration a consumer would otherwise have to
+        -- infer from the reason, and says nothing where none was declared.
+        platformsOf darwin "probe.linux" `shouldBe` Just ["Linux"]
+        platformsOf darwin "test.harness" `shouldBe` Nothing
+
+    it "reports a shared dependency change on both platforms and selects it only where it builds" $
+      withFixture $ \fixture → do
+        change fixture "cabal.project.common" "-- revised shared build settings\n"
+        linux ← planFor fixture "Linux" []
+        classificationOf linux "cabal.project.common" `shouldBe` Just "consumed"
+        selectionOf linux "probe.linux" `shouldBe` Just (Selection "affected" True True)
+        darwin ← planFor fixture "Darwin" []
+        -- Every dependency change moves this file, so this is the case a
+        -- Darwin plan meets constantly: the group's inputs changed, and the
+        -- platform still has no execution to offer for it.
+        classificationOf darwin "cabal.project.common" `shouldBe` Just "consumed"
+        selectionOf darwin "probe.linux" `shouldBe` Just (Selection "platform-inapplicable" False True)
+        selectionOf darwin "test.demo" `shouldBe` Just (Selection "affected" True True)
+
+    it "keeps the unknown-input fallback marking a platform-only group on both platforms" $
+      withFixture $ \fixture → do
+        change fixture "assets/table.bin" "0\n"
+        linux ← planFor fixture "Linux" []
+        unknownInputs linux `shouldBe` Just ["assets/table.bin"]
+        selectionOf linux "probe.linux" `shouldBe` Just (Selection "unknown-input" True True)
+        darwin ← planFor fixture "Darwin" []
+        unknownInputs darwin `shouldBe` Just ["assets/table.bin"]
+        -- Uncertainty still reaches the group's inputs. What the platform
+        -- decides is only whether anything here could execute it.
+        selectionOf darwin "probe.linux" `shouldBe` Just (Selection "platform-inapplicable" False True)
+
+    it "lets neither an explicit request nor all-hspec override platform inapplicability" $
+      withFixture $ \fixture → do
+        let request = ["--request-file", root fixture </> "request.md"]
+        writeFixtureFile (root fixture) "request.md" (requestBlock ["probe.linux"])
+        linux ← planFor fixture "Linux" request
+        selectionOf linux "probe.linux" `shouldBe` Just (Selection "requested" True False)
+        darwin ← planFor fixture "Darwin" request
+        selectionOf darwin "probe.linux" `shouldBe` Just (Selection "platform-inapplicable" False False)
+        writeFixtureFile (root fixture) "request.md" (requestBlock ["all-hspec"])
+        expanded ← planFor fixture "Darwin" request
+        selectionOf expanded "probe.linux" `shouldBe` Just (Selection "platform-inapplicable" False False)
+        -- The expansion still reaches every Hspec group the platform builds,
+        -- so the precedence is over that one group rather than over requests.
+        selectionOf expanded "probe.slow" `shouldBe` Just (Selection "requested" True False)
+        selectionOf expanded "test.harness" `shouldBe` Just (Selection "requested" True False)
+
   describe "catalog validation" $ do
     it "accepts the fixture catalog through --catalog-check" $
       withFixture $ \fixture → do
         (result, output, _) ← planner' fixture ["--catalog-check"]
         result `shouldBe` ExitSuccess
         output `shouldContain` "is valid"
+
+    it "refuses a mandatory floor that names a platform-restricted group" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "fixtures/floor-platform.json" floorPlatformCatalog
+        (result, _, errors) ← planner' fixture
+          ["--catalog-check", "--catalog", root fixture </> "fixtures/floor-platform.json"]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "floor names platform-restricted group 'probe.linux'"
+
+    it "refuses an empty, non-string, or repeated platform declaration" $
+      withFixture $ \fixture → do
+        let refusal name document expected = do
+              writeFixtureFile (root fixture) ("fixtures/" ++ name) document
+              (result, _, errors) ← planner' fixture
+                ["--catalog-check", "--catalog", root fixture </> "fixtures" </> name]
+              result `shouldBe` ExitFailure 2
+              errors `shouldContain` expected
+        -- Declaring nothing is how a group says it runs everywhere, so an
+        -- empty list would name a group nothing may ever execute.
+        refusal "empty-platforms.json" (platformsCatalog "[]") "must name at least one platform"
+        refusal "odd-platforms.json" (platformsCatalog "[\"Linux\", 7]") "non-string platforms entry"
+        -- A catalog is arbitrary JSON, so an entry can be a value that cannot
+        -- be counted at all. Each is owed the same diagnostic rather than an
+        -- interpreter traceback.
+        refusal "nested-platforms.json" (platformsCatalog "[[\"Linux\"]]") "non-string platforms entry"
+        refusal "mapped-platforms.json" (platformsCatalog "[{\"os\": \"Linux\"}]") "non-string platforms entry"
+        refusal "blank-platforms.json" (platformsCatalog "[\"\"]") "non-string platforms entry"
+        refusal "twice-platforms.json" (platformsCatalog "[\"Linux\", \"Linux\"]") "names a platform more than once"
 
     it "names a group that is missing its optional classification" $
       withFixture $ \fixture → do
@@ -385,6 +477,11 @@ planJsonAt fixture base args = do
 planJson ∷ Fixture → [String] → IO String
 planJson fixture args = planJsonAt fixture (seeded fixture) args
 
+-- | The same plan resolved for a named platform rather than this machine's, so
+-- an example can ask one candidate what it means on two operating systems.
+planFor ∷ Fixture → String → [String] → IO String
+planFor fixture runnerOs args = planJson fixture (["--runner-os", runnerOs] ++ args)
+
 -- ---------------------------------------------------------------------------
 -- Reading a plan
 
@@ -396,6 +493,15 @@ selectionOf output identifier = do
   selected ← field "selected" entry >>= asBool
   changed ← field "inputs_changed" entry >>= asBool
   pure (Selection reason selected changed)
+
+-- | The platforms a group declares, or 'Nothing' for one the plan reports as
+-- applicable everywhere.
+platformsOf ∷ String → String → Maybe [String]
+platformsOf output identifier = do
+  document ← parseJson output
+  entry ← field "groups" document >>= entryFor "id" identifier
+  elements ← field "platforms" entry >>= asArray
+  traverse asString elements
 
 classificationOf ∷ String → String → Maybe String
 classificationOf output path = do
@@ -474,6 +580,7 @@ nestedExample =
 fixtureFiles ∷ [(FilePath, String)]
 fixtureFiles =
   [ ("cabal.project", projectFile)
+  , ("cabal.project.common", "-- shared build settings every package inherits\n")
   , ("demo.cabal", demoPackage)
   , ("packages/alpha/alpha.cabal", alphaPackage)
   , ("packages/alpha/src/Alpha.hs", "module Alpha (alpha) where\nalpha :: Int\nalpha = 1\n")
@@ -628,10 +735,11 @@ fixtureCatalog ∷ String
 fixtureCatalog =
   catalogDocument
     [ "    \"build.all\"" ]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
-    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
-    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" ["cabal.project.common"] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["cabal.project.common", "tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
     , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/"] "hspec" "probe" True
+    , linuxOnlyGroup
     ]
 
 -- | The fixture catalog with the optional group's command redefined.
@@ -639,10 +747,11 @@ revisedOptionalCatalog ∷ String
 revisedOptionalCatalog =
   catalogDocument
     ["    \"build.all\""]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
-    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
-    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" ["cabal.project.common"] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["cabal.project.common", "tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
     , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/", "probe/extra/"] "hspec" "probe" True
+    , linuxOnlyGroup
     ]
 
 -- | The fixture catalog with a declared input retired from @test.harness@.
@@ -650,23 +759,24 @@ retiredInputCatalog ∷ String
 retiredInputCatalog =
   catalogDocument
     ["    \"build.all\""]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
-    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
-    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["tools/shared.sh"] "hspec" "test" False
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" ["cabal.project.common"] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["cabal.project.common", "tools/shared.sh"] "hspec" "test" False
     , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/"] "hspec" "probe" True
+    , linuxOnlyGroup
     ]
 
 noHspecCatalog ∷ String
 noHspecCatalog =
   catalogDocument
     [ "    \"build.all\"" ]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False ]
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False ]
 
 missingOptionalCatalog ∷ String
 missingOptionalCatalog =
   catalogDocument
     [ "    \"build.all\"" ]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
     , unlines
         [ "    {"
         , "      \"id\": \"probe.slow\","
@@ -686,8 +796,8 @@ brokenCatalog ∷ String
 brokenCatalog =
   catalogDocument
     [ "    \"build.all\"" ]
-    [ groupDocument "build.all" "\"all\"" [] "none" "build" False
-    , groupDocument "test.demo" "\"demo:test:demo-tests\"" [] "hspec" "test" False
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" ["cabal.project.common"] "hspec" "test" False
     , groupDocument "test.demo" "\"demo:test:absent-tests\"" [] "hspec" "test" False
     ]
 
@@ -725,6 +835,50 @@ groupDocument identifier component inputs framework category optional =
     , "      \"timeout_seconds\": 60,"
     , "      \"category\": \"" ++ category ++ "\","
     , "      \"optional\": " ++ (if optional then "true" else "false")
+    , "    }"
+    ]
+
+-- | A non-optional Hspec group declaring the platforms that build its
+-- components, sharing @cabal.project.common@ with the Cabal groups beside it
+-- and @tools/shared.sh@ with the optional probe, so one candidate can be
+-- planned for a platform that builds it and one that does not.
+linuxOnlyGroup ∷ String
+linuxOnlyGroup =
+  platformGroupDocument "probe.linux" ["cabal.project.common", "tools/shared.sh"] "[\"Linux\"]"
+
+-- | A catalog whose mandatory floor names a platform-restricted group.
+floorPlatformCatalog ∷ String
+floorPlatformCatalog =
+  catalogDocument
+    ["    \"build.all\"", "    \"probe.linux\""]
+    [groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False, linuxOnlyGroup]
+
+-- | Catalogs whose platform declaration is empty, not a list of strings, or
+-- names one platform twice. The declaration is written out verbatim so a
+-- malformed one can be offered at all.
+platformsCatalog ∷ String → String
+platformsCatalog platforms =
+  catalogDocument
+    ["    \"build.all\""]
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , platformGroupDocument "probe.linux" ["tools/shared.sh"] platforms
+    ]
+
+platformGroupDocument ∷ String → [String] → String → String
+platformGroupDocument identifier inputs platforms =
+  unlines
+    [ "    {"
+    , "      \"id\": \"" ++ identifier ++ "\","
+    , "      \"description\": \"Fixture group " ++ identifier ++ ".\","
+    , "      \"command\": [\"true\", \"" ++ identifier ++ "\"],"
+    , "      \"component\": null,"
+    , "      \"inputs\": [" ++ jsonStrings inputs ++ "],"
+    , "      \"framework\": \"hspec\","
+    , "      \"runner\": \"cpu\","
+    , "      \"timeout_seconds\": 60,"
+    , "      \"category\": \"probe\","
+    , "      \"optional\": false,"
+    , "      \"platforms\": " ++ platforms
     , "    }"
     ]
 
