@@ -17,8 +17,9 @@ must say and of how the planner, the builder, and each worker check it:
   disagree with the candidate, naming the builder as the fix;
 - each **worker**, running in a container bound to the descriptor's digest,
   checks the fingerprint the image embeds, the native manifest it actually
-  carries, the compilers it actually runs, and the Cabal store it resolves,
-  then declares the toolchain map it verified, which must equal the plan's.
+  carries, the compilers it actually runs, the compositor package it actually
+  has installed, and the Cabal store it resolves, then declares the toolchain
+  map it verified, which must equal the plan's.
 
 See ``docs/validation.md`` for the image, the descriptor, and the builder.
 """
@@ -59,6 +60,12 @@ RECIPE_ROOTS = (
 IMAGE_ENTRY = "ci-image"
 MANIFEST_ENTRY = "native-manifest"
 
+# The headless compositor the display helper starts, identified by the exact
+# package revision the image installed. It is part of the environment identity
+# because a different compositor is a different display environment, however
+# identical everything else is.
+COMPOSITOR_ENTRY = "weston"
+
 # The operating system whose workers run in the image. A plan for any other
 # platform describes a machine that never ran it.
 IMAGE_RUNNER_OS = "Linux"
@@ -75,6 +82,7 @@ LABELS = {
     "native_manifest": "org.hetoimasia.ci-image.native-manifest",
     "ghc": "org.hetoimasia.ci-image.ghc",
     "cabal": "org.hetoimasia.ci-image.cabal",
+    "weston": "org.hetoimasia.ci-image.weston",
 }
 
 BUILDER_INSTRUCTION = (
@@ -87,6 +95,9 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 REFERENCE = re.compile(r"^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
+# A Debian package revision, such as ``13.0.0-4build3``: an upstream version and
+# the distribution's own revision, which a bare dotted version cannot express.
+PACKAGE_VERSION = re.compile(r"^[0-9][A-Za-z0-9.+~]*(?:-[A-Za-z0-9.+~]+)*$")
 
 DESCRIPTOR_FIELDS = {
     "schema_version": int,
@@ -98,6 +109,7 @@ DESCRIPTOR_FIELDS = {
     "architecture": str,
     "ghc": str,
     "cabal": str,
+    "weston": str,
 }
 
 
@@ -201,6 +213,8 @@ def validate_descriptor(document, source: str) -> dict:
         for key in ("ghc", "cabal"):
             if not VERSION.match(document[key]):
                 problems.append(f"{key} {document[key]!r} is not a version")
+        if not PACKAGE_VERSION.match(document["weston"]):
+            problems.append(f"weston {document['weston']!r} is not a package version")
     if problems:
         raise ImageError(f"{source} is malformed: " + "; ".join(problems) + f"; {BUILDER_INSTRUCTION}")
     return document
@@ -248,6 +262,7 @@ def plan_image(read, entries, toolchain: dict[str, str], runner_os: str, label: 
         "cabal": descriptor["cabal"],
         IMAGE_ENTRY: descriptor["digest"],
         MANIFEST_ENTRY: descriptor["native_manifest"],
+        COMPOSITOR_ENTRY: descriptor["weston"],
     }
     for name, value in expected.items():
         if name in toolchain and toolchain[name] != value:
@@ -298,9 +313,9 @@ def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]
     The container runtime's digest-addressed launch establishes which image
     runs; this establishes that it is the image the descriptor describes, and
     that what it actually carries — the embedded fingerprint, the native
-    manifest, the compilers, and the Cabal store — agrees with the plan. The
-    declared map is built from those actual values and must equal the plan's
-    in its entirety.
+    manifest, the compilers, the installed compositor package, and the Cabal
+    store — agrees with the plan. The declared map is built from those actual
+    values and must equal the plan's in its entirety.
     """
     image = plan.get("ci_image")
     if not isinstance(image, dict):
@@ -320,6 +335,33 @@ def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]
         problems.append(
             f"this container embeds recipe fingerprint {str(found)[:12]}, not the descriptor's "
             f"{image['recipe_fingerprint'][:12]}"
+        )
+        rebuild = True
+
+    # The compositor is established twice over: what the image recorded when it
+    # was built, and what dpkg says is installed now. Neither is taken from the
+    # descriptor, so a descriptor that names a compositor the image does not
+    # carry is a refusal rather than a value copied forward.
+    embedded_compositor = embedded.get("weston") if isinstance(embedded, dict) else None
+    if not isinstance(embedded_compositor, str) or not PACKAGE_VERSION.match(embedded_compositor):
+        problems.append(
+            f"this container embeds compositor version {embedded_compositor!r}, which is not a package version"
+        )
+        rebuild = True
+    try:
+        installed_compositor = command_output(["dpkg-query", "--show", "--showformat=${Version}", "weston"])
+    except ImageError as failure:
+        installed_compositor = None
+        problems.append(f"this container has no installed weston package ({failure})")
+        rebuild = True
+    if (
+        isinstance(embedded_compositor, str)
+        and installed_compositor is not None
+        and embedded_compositor != installed_compositor
+    ):
+        problems.append(
+            f"this container embeds compositor version {embedded_compositor}, but has weston "
+            f"{installed_compositor} installed"
         )
         rebuild = True
 
@@ -359,6 +401,8 @@ def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]
         IMAGE_ENTRY: image["digest"],
         MANIFEST_ENTRY: actual_manifest,
     }
+    if installed_compositor is not None:
+        declared[COMPOSITOR_ENTRY] = installed_compositor
     planned = plan.get("toolchain") or {}
     for name in sorted(set(declared) | set(planned)):
         if declared.get(name) != planned.get(name):

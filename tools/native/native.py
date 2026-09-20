@@ -10,7 +10,8 @@ directory is ``lib``.
 A prefix is only as good as the configuration that produced it, so the build
 writes a *native manifest* beside it: the GLFW version and source checksum, the
 recipe fingerprint, the native identity (platform, architecture, C compiler,
-SDK, deployment target, and effective build options), and the link requirements
+SDK, deployment target, and effective build options), the platform backends the
+archive actually compiles, and the link requirements
 ``pkg-config --libs --static glfw3`` derives from the generated ``glfw3.pc``.
 ``check`` accepts a prefix only when all of that still holds for this machine,
 and never falls back to a GLFW a package manager happens to supply.
@@ -49,7 +50,17 @@ PIN_FILE = os.path.join(RECIPE_DIRECTORY, "glfw.pin")
 RECIPE_FILES = ("glfw.pin", "native.py")
 
 MANIFEST_NAME = "hetoimasia-native-manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+
+# The platform backends GLFW can compile, by the connect function each one
+# defines. A backend's function is in the archive only when that backend was
+# built, so the manifest reports what the options actually produced rather
+# than restating the options. Mach-O prefixes a C symbol with an underscore.
+BACKEND_SYMBOLS = {
+    "Cocoa": "_glfwConnectCocoa",
+    "Wayland": "_glfwConnectWayland",
+    "X11": "_glfwConnectX11",
+}
 
 # The stamp a build directory carries once products in it have been linked
 # against one manifest. Products linked against another native configuration are
@@ -203,7 +214,9 @@ def build_options(target: str, architecture: str, deployment_target: str, sysroo
             "GLFW_BUILD_COCOA=ON",
         ]
     elif target == "Linux":
-        options += ["GLFW_BUILD_WAYLAND=OFF", "GLFW_BUILD_X11=ON"]
+        # Both Linux backends are compiled into the one archive; which of them a
+        # process selects is a session decision, not a build decision.
+        options += ["GLFW_BUILD_WAYLAND=ON", "GLFW_BUILD_X11=ON"]
     else:
         raise NativeError(f"the native recipe supports Darwin and Linux, not {target!r}")
     return sorted(options)
@@ -335,6 +348,7 @@ def record(prefix: str, target: str) -> str:
         "identity": native_identity(target, pin),
         "prefix": prefix,
         "archive_sha256": sha256_file(archive),
+        "backends": compiled_backends(archive, target),
         "pkg_config": metadata,
     }
     target_path = manifest_path(prefix)
@@ -342,6 +356,22 @@ def record(prefix: str, target: str) -> str:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
     return target_path
+
+
+def compiled_backends(archive: str, target: str) -> list[str]:
+    """The platform backends the archive actually carries.
+
+    Read from the archive's own defined symbols rather than from the options
+    that were asked for, so a build whose backend silently did not compile is
+    visible in the manifest instead of being described as present.
+    """
+    prefix = "_" if target == "Darwin" else ""
+    defined = set()
+    for line in defined_symbols(archive).splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[-2] == "T":
+            defined.add(fields[-1])
+    return sorted(name for name, symbol in BACKEND_SYMBOLS.items() if prefix + symbol in defined)
 
 
 def shared_libraries(prefix: str) -> list[str]:
@@ -409,6 +439,13 @@ def check(prefix: str, target: str, build_directory: str | None) -> dict:
     archive = archive_path(prefix)
     if not os.path.isfile(archive) or sha256_file(archive) != manifest.get("archive_sha256"):
         raise NativeError(f"the static archive in {prefix} is missing or is not the recorded one; {rebuild}", status=1)
+    backends = compiled_backends(archive, target)
+    if manifest.get("backends") != backends:
+        raise NativeError(
+            f"the manifest records backends {manifest.get('backends')!r}, but the archive in {prefix} "
+            f"compiles {backends!r}; {rebuild}",
+            status=1,
+        )
     shared = shared_libraries(prefix)
     if shared:
         raise NativeError(f"{prefix} carries shared GLFW libraries ({', '.join(shared)}); the recipe installs only the static archive; {rebuild}", status=1)

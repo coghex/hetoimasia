@@ -779,6 +779,50 @@ still selects the group against the merge base, as described under
 [Reasons and `inputs_changed`](#reasons-and-inputs_changed), and the job is
 skipped through valid receipt reuse instead.
 
+#### The isolated headless Wayland session
+
+`tools/display/wayland.sh` is the second display helper, shaped like the first
+and used the same way:
+
+```bash
+bash tools/display/wayland.sh --summary "$GITHUB_STEP_SUMMARY" -- <command>
+```
+
+It starts the image's pinned Weston for that one command and stops it
+afterwards. No validation group runs under it yet: WL-2 registers the group
+that selects a Wayland session and teaches the native suite to accept one, and
+until then the suite refuses the consent this helper supplies as an unknown
+value, which is the correct outcome rather than a gap. What does exercise it
+today is the `ci-image` workflow's own `compositor` job, which runs
+`bash tools/display/wayland.sh -- true` inside the published image with the
+candidate tree mounted and shows in the job summary that the runtime directory
+the helper created is gone afterwards.
+
+The isolation is the point, and it does not depend on how the machine is
+configured:
+
+- a private `XDG_RUNTIME_DIR`, created for the run, holding the only socket,
+  which is named by the helper;
+- `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, and `DISPLAY` removed before the
+  compositor starts, and `XDG_SESSION_TYPE=wayland`; `DISPLAY` and
+  `WAYLAND_SOCKET` stay removed for the command too;
+- the headless backend named explicitly and `--no-config` passed, so no
+  personal `weston.ini` and no ambient variable can select another backend or
+  turn XWayland on;
+- readiness established by **connecting**, bounded: a socket file appears
+  before the compositor serves it, so the helper connects to the socket it
+  named with `wayland-info` until that succeeds, within ten seconds of ticks
+  shared by the attempts and the waits between them.
+
+Then, and only then, the command runs with `WAYLAND_DISPLAY` naming that socket
+and `HETOIMASIA_NATIVE_SESSION=isolated-wayland:<socket>`. A missing `weston`
+or `wayland-info`, a compositor that exits, and one that never serves the
+socket within the bound each end the helper with status `1` before the command
+starts; a usage error exits `2`; otherwise the command's own status is
+returned. The compositor is stopped and reaped and the runtime directory
+removed on every exit path the helper can handle, including a failed start and
+a catchable signal, which ends it with `128+N`.
+
 ### Receipts
 
 `tools/validation/run.py` executes one group and writes `<group-id>.json` into
@@ -1252,8 +1296,10 @@ Linux workers install nothing. They run inside one published image,
   `/opt/hetoimasia/cabal/store`, and a Hackage index snapshot that
   `cabal.project`'s `index-state` selects from;
 - the C build prerequisites, CMake, `pkg-config`, the tools the workflow tests'
-  shipped steps call (`git`, `jq`, `procps`), and the X11 development and
-  runtime libraries GLFW builds against, over an `ubuntu:24.04` base pinned by
+  shipped steps call (`git`, `jq`, `procps`), and the X11 and Wayland
+  development libraries GLFW builds its two Linux backends against —
+  `libwayland-dev` also supplies the `wayland-scanner` the Wayland backend's
+  protocol files are generated with — over an `ubuntu:24.04` base pinned by
   digest, with the resolved package list retained at
   `/opt/hetoimasia/packages.txt`;
 - the private GLFW prefix at `/opt/hetoimasia/native/glfw`, built by the
@@ -1261,12 +1307,19 @@ Linux workers install nothing. They run inside one published image,
   `PKG_CONFIG_PATH`.
 
 It also carries the `xvfb`, `openbox`, and `x11-utils` packages the
-[display worker](#the-display-worker)'s helper uses. Nothing in the image starts
-them: only that helper does, inside the display worker, for one group at a
-time. It carries no project source, project build output, captures, or Vulkan
-SDK. It embeds its recipe fingerprint and native
-manifest hash in `/opt/hetoimasia/image.json` and in its labels, and never its
-own digest, which does not exist until it is pushed.
+[display worker](#the-display-worker)'s X11 helper uses, and — for its Wayland
+helper — Weston at the exact Ubuntu 24.04 revision
+`tools/ci-image/compositor.pin` names, with the `wayland-utils` client that
+helper proves readiness by connecting with. The package step installs Weston
+with an `=` constraint, so an archive that no longer offers that revision fails
+the layer rather than quietly supplying a newer compositor, and the installed
+revision is read back from `dpkg` rather than assumed. Nothing in the image
+starts a display or a compositor: only those helpers do, inside the display
+worker, for one group at a time. It carries no project source, project build
+output, captures, or Vulkan SDK. It embeds its recipe fingerprint, native
+manifest hash, and installed compositor revision in
+`/opt/hetoimasia/image.json` and in its labels, and never its own digest, which
+does not exist until it is pushed.
 
 Input hashes cannot promise a byte-identical rebuild: the Ubuntu archive and the
 Hackage index move. That is why an image is published once per fingerprint and
@@ -1276,8 +1329,9 @@ then only ever addressed by digest.
 
 Every file under `tools/ci-image/` and `tools/native/`, plus
 `.github/workflows/ci-image.yml` and `tools/validation/ci_image.py`, is a recipe
-input — the Dockerfile, the provisioning script, both pin files, the builder and
-its registry transport, the image contract they load, and the native recipe —
+input — the Dockerfile, the provisioning script, the toolchain, compositor, and
+GLFW pin files, the builder and its registry transport, the image contract they
+load, and the native recipe —
 **except** `tools/ci-image/descriptor.json`.
 `tools/validation/ci_image.py` fingerprints each input's path, mode, type, and
 content id from one commit's tree:
@@ -1303,6 +1357,7 @@ anything its fingerprint does not cover, and the descriptor never reaches it.
 | `native_manifest` | The SHA-256 of the native manifest inside the image. |
 | `platform`, `architecture` | `linux` and `amd64`. |
 | `ghc`, `cabal` | The compiler versions the image runs. |
+| `weston` | The compositor package revision the image installed, such as `13.0.0-4build3`. |
 
 The author commits the descriptor the builder returns, in the same pull request
 as the recipe change, through an ordinary push. Because the descriptor is
@@ -1322,6 +1377,7 @@ cannot publish.
 | `resolve` | Fingerprints the checked-out commit and looks up the tag `fp-<fingerprint>`. An existing image whose labels name this fingerprint, a native manifest hash, and the pinned GHC and Cabal is a **hit**; a tag the registry confirms absent is a **miss**. |
 | `publish` | Runs only on a miss, serialized by a concurrency group per fingerprint. It looks the tag up **again**, so a builder that published while this one waited is returned rather than rebuilt. On a confirmed miss it builds, validates the candidate inside itself — GHC and Cabal versions, the native prefix check and link check, the store path, the embedded fingerprint, and the labels — pushes once, and reads the published metadata back. |
 | `descriptor` | Writes the descriptor for the hit or the published image, as the `ci-image-descriptor` artifact and in the job summary. |
+| `compositor` | Runs `tools/display/wayland.sh` inside the resolved image, with the candidate tree mounted, and shows in the job summary that it established an isolated headless session and left no runtime directory behind. It publishes nothing. |
 | `anonymous-pull` | Pulls the reference by digest with no credentials and no token grant, and records how long the pull took. |
 
 `ci-image.yml` also carries one job that has nothing to do with publishing an
@@ -1377,8 +1433,9 @@ and refuses it before execution — naming the builder as the fix — when:
 - its `recipe_fingerprint` is not the candidate's recomputed fingerprint;
 - its `ghc` or `cabal` disagrees with the `--toolchain` pins the workflow passes.
 
-Otherwise `ghc`, `cabal`, `ci-image` (the digest), and `native-manifest` (the
-hash) form the plan's `toolchain` map, the descriptor is recorded as the plan's
+Otherwise `ghc`, `cabal`, `ci-image` (the digest), `native-manifest` (the
+hash), and `weston` (the compositor revision) form the plan's `toolchain` map,
+the descriptor is recorded as the plan's
 `ci_image`, and the prose output names the image. That map describes the planned
 worker environment, not the host that planned it. A candidate with no recipe
 keeps the toolchain its caller declares, and a plan for any other platform may
@@ -1398,8 +1455,10 @@ python3 tools/validation/ci_image.py verify-worker --plan plan.json --toolchain-
 
 which checks the recipe fingerprint the image embeds, the hash of the native
 manifest it actually carries, the prefix check, the compilers it actually runs,
-`CABAL_DIR`, and the store Cabal resolves, then builds a map from those actual
-values. That map must equal the plan's in its entirety, and it is what every
+the compositor revision `dpkg` reports installed against the one the image
+embeds, `CABAL_DIR`, and the store Cabal resolves, then builds a map from those
+actual values. The compositor is never taken from the descriptor: an image
+stamped with one revision and carrying another is refused rather than believed. That map must equal the plan's in its entirety, and it is what every
 receipt the worker writes records. A second step links and runs a native
 consumer against the image's GLFW. Receipts written before these entries existed
 record a different toolchain and are invalidated once.
@@ -1438,15 +1497,20 @@ pulls no image.
 same GLFW for a local macOS prefix and for the image. It fetches the pinned
 upstream archive, refuses it unless its SHA-256 matches, and builds only a
 static, position-independent `libglfw3.a`, with upstream examples, tests, and
-documentation disabled, X11 on and Wayland off on Linux, and Cocoa on macOS,
-into a private prefix whose library directory is `lib`. Fetched source, build
+documentation disabled, both X11 and Wayland on Linux, and Cocoa on macOS, into
+a private prefix whose library directory is `lib`. The two Linux backends are
+compiled into the one archive; which of them a process selects is a session
+decision, not a build decision, and the Darwin build options are untouched by
+that. Fetched source, build
 products, and the prefix all stay outside the checkout.
 
 Beside the prefix it writes `hetoimasia-native-manifest.json`: the GLFW version,
 source URL and checksum, the recipe fingerprint, the archive's checksum, the
 `pkg-config` metadata — including `pkg-config --libs --static glfw3`, which on
-macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — and the native
-identity: platform, architecture, C compiler, SDK, deployment target, the
+macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — the `backends`
+the archive actually compiles, read from its own defined symbols rather than
+restated from the options, so a Linux prefix records `["Wayland", "X11"]` and a
+macOS one `["Cocoa"]` — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
 effective CMake options, and the exact value or absence of every variable CMake
 or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
 `CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
@@ -1466,8 +1530,9 @@ SHA-256.
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe
 fingerprint, or native identity differs from this configuration, an archive that
-is not the recorded one, any shared GLFW library in the prefix, a `glfw3.pc`
-that resolves to another prefix, a version other than the pin, and **manifest
+is not the recorded one, an archive whose compiled backends are not the
+recorded ones, any shared GLFW library in the prefix, a `glfw3.pc` that
+resolves to another prefix, a version other than the pin, and **manifest
 drift**, where the generated link requirements no longer match the recorded
 ones. With `--build-dir`, it also refuses a build directory whose products were
 stamped with another manifest.
@@ -2311,14 +2376,20 @@ digest. The cache examples assert that the environment key moves with a new
 digest and a new native manifest and not with a re-committed descriptor.
 
 The worker examples assert that a verified worker declares exactly the planned
-map, and that another GHC, another Cabal, an actual native manifest other than
-the planned one, a different `ci-image` entry, another embedded fingerprint, and
+map, and that the descriptor's compositor revision joins it while a Darwin plan
+declares none, a descriptor that names no compositor or a malformed one being
+refused; and that another GHC, another Cabal, an actual native manifest other
+than the planned one, a different `ci-image` entry, a different `weston` entry,
+an image embedding no compositor revision, a malformed one, or one the
+installed package contradicts, a container with no installed compositor at all,
+another embedded fingerprint, and
 a store outside the fixed location are each refused. The builder examples assert
 that a validated hit builds and pushes nothing, that a confirmed miss is
 rechecked and then built, validated, pushed, and read back once, that a tag a
 concurrent builder published while this one waited is returned rather than
-overwritten, and that a lookup error, invalid existing metadata, and a candidate
-that fails validation each publish nothing. The seeding examples run the shipped
+overwritten, and that a lookup error, invalid existing metadata, an existing
+image whose compositor label is not the pinned revision, and a candidate that
+fails validation each publish nothing. The seeding examples run the shipped
 decision step and assert that a default-branch push whose tests were all reused
 seeds a missing cache, that an existing cache, a running engine worker, and a
 pull request do not, that a lookup that did not answer seeds, and that the
@@ -2328,7 +2399,8 @@ build options, `SDKROOT`, or compiler flags, that the old prefix and a build dir
 refused and the manifest identity changes, and that restoring the configuration
 restores the identity; and that an absent prefix beside a visible system GLFW, a
 prefix whose metadata was replaced by a system GLFW, generated link requirement
-drift, and a missing `pkg-config` are each refused.
+drift, a manifest claiming a backend the archive does not compile, and a
+missing `pkg-config` are each refused.
 
 Runner classes and worker routing have their own examples, driven through the
 real planner, runner, reuse lookup, and aggregate against fixture catalogs that
@@ -2354,11 +2426,27 @@ or another worker; changing the native manifest in the toolchain or the display
 setup moves the candidate's identity, so earlier display evidence cannot cross
 either.
 
-The display helper is driven with a `PATH` holding only ordinary utilities and
-stub display programs: the command runs inside the display the helper
-established, with `WAYLAND_DISPLAY` removed and the server stopped afterwards;
-a missing X server, one that exits before reporting a display, and a window
-manager that exits each stop the run with status `1` before the command
-starts; and the command's own status is returned once it ran.
+Both display helpers are driven with a `PATH` holding only ordinary utilities
+and stub display programs. For the X11 helper: the command runs inside the
+display the helper established, with `WAYLAND_DISPLAY` removed and the server
+stopped afterwards; a missing X server, one that exits before reporting a
+display, and a window manager that exits each stop the run with status `1`
+before the command starts; and the command's own status is returned once it
+ran.
+
+The Wayland helper's examples assert the same shape and the isolation on top of
+it: the command runs on the socket the helper named, in the private runtime
+directory, with `DISPLAY` and `WAYLAND_SOCKET` still removed and the consent
+naming that socket; the compositor was launched into that runtime directory
+with no session of anyone else's to join, with the headless backend named, with
+`--no-config`, and with no XWayland; readiness was a connection to that socket
+rather than a file appearing, so a compositor that records its launch but never
+serves is refused; a missing `weston` or `wayland-info`, a compositor that
+exits, and one that never serves within the bound each stop the run with status
+`1`; a call naming no command exits `2`; and a signal — sent by the compositor
+while the helper is still waiting for it, and by the command once it is
+running, so the moment is coordinated rather than timed — ends the helper with
+the compositor stopped and reaped, the command stopped, and the runtime
+directory removed.
 
 Run them with `cabal test workflow-tests --test-show-details=direct`.

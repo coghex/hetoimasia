@@ -177,6 +177,7 @@ def build(context: str, local: str, fingerprint: str) -> int:
         contract.LABELS["native_manifest"]: embedded["native_manifest"],
         contract.LABELS["ghc"]: embedded["ghc"],
         contract.LABELS["cabal"]: embedded["cabal"],
+        contract.LABELS["weston"]: embedded["weston"],
     }
     # The manifest hash exists only once the image does, so the labels are
     # applied by a second build that every layer of the first satisfies.
@@ -198,11 +199,15 @@ echo "store=$(cabal path --store-dir)"
 echo "cabal_dir=$CABAL_DIR"
 echo "manifest=$(sha256sum "$HETOIMASIA_NATIVE_PREFIX/hetoimasia-native-manifest.json" | cut -d' ' -f1)"
 echo "embedded=$(python3 -c 'import json; print(json.load(open("{IMAGE_ROOT}/image.json"))["recipe_fingerprint"])')"
+echo "embedded_weston=$(python3 -c 'import json; print(json.load(open("{IMAGE_ROOT}/image.json"))["weston"])')"
+echo "weston=$(dpkg-query --show --showformat='${{Version}}' weston)"
+echo "compositor=$(command -v weston)"
+echo "wayland_info=$(command -v wayland-info)"
 test ! -e {IMAGE_ROOT}/descriptor.json
 """
 
 
-def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal: str) -> int:
+def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal: str, weston: str) -> int:
     contract = load_contract()
     output = docker("run", "--rm", "--platform", PLATFORM, local, "bash", "-c", VALIDATION_SCRIPT, capture=True)
     values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
@@ -213,6 +218,13 @@ def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal
         "cabal_dir": f"{IMAGE_ROOT}/cabal",
         "manifest": native_manifest,
         "embedded": fingerprint,
+        # The installed package revision is the authority; the embedded value is
+        # checked against it so a stamped image cannot claim a compositor it
+        # does not have.
+        "weston": weston,
+        "embedded_weston": weston,
+        "compositor": "/usr/bin/weston",
+        "wayland_info": "/usr/bin/wayland-info",
     }
     problems = [f"{name} is {values.get(name)!r}, expected {value!r}" for name, value in expected.items() if values.get(name) != value]
     labels = json.loads(docker("image", "inspect", "--format", "{{json .Config.Labels}}", local, capture=True)) or {}
@@ -221,6 +233,7 @@ def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal
         ("native_manifest", native_manifest),
         ("ghc", ghc),
         ("cabal", cabal),
+        ("weston", weston),
     ):
         if labels.get(contract.LABELS[name]) != value:
             problems.append(f"label {contract.LABELS[name]} is {labels.get(contract.LABELS[name])!r}, expected {value!r}")
@@ -240,7 +253,7 @@ def main(argv: list[str]) -> int:
     if not argv:
         raise TransportError("usage: registry.py lookup|build|validate|push ...")
     command, arguments = argv[0], argv[1:]
-    handlers = {"lookup": (lookup, 1), "build": (build, 3), "validate": (validate, 5), "push": (push, 2)}
+    handlers = {"lookup": (lookup, 1), "build": (build, 3), "validate": (validate, 6), "push": (push, 2)}
     if command not in handlers or len(arguments) != handlers[command][1]:
         raise TransportError(f"unknown or malformed registry request: {' '.join(argv)}")
     return handlers[command][0](*arguments)

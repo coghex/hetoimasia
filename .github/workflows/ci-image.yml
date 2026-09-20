@@ -43,10 +43,14 @@ on:
 permissions:
   contents: read
 
-# The image must install exactly the toolchain the validation workflow pins.
+# The image must install exactly the toolchain the validation workflow pins,
+# and exactly the compositor revision tools/ci-image/compositor.pin names. The
+# builder refuses to publish or accept an image whose installed compositor
+# disagrees with this value, which is what catches a drift between the two.
 env:
   GHC_VERSION: '9.14.1'
   CABAL_VERSION: '3.18.1.0'
+  WESTON_VERSION: '13.0.0-4build3'
 
 defaults:
   run:
@@ -163,7 +167,7 @@ jobs:
           set -euo pipefail
           python3 tools/ci-image/builder.py resolve \
             --image "$IMAGE" --fingerprint "$FINGERPRINT" \
-            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" --weston "$WESTON_VERSION" \
             --registry tools/ci-image/registry.py \
             --github-output "$GITHUB_OUTPUT"
 
@@ -220,7 +224,7 @@ jobs:
           set -euo pipefail
           python3 tools/ci-image/builder.py publish \
             --image "$IMAGE" --fingerprint "$FINGERPRINT" \
-            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" --weston "$WESTON_VERSION" \
             --registry tools/ci-image/registry.py \
             --context "$RUNNER_TEMP/context" \
             --github-output "$GITHUB_OUTPUT"
@@ -256,6 +260,7 @@ jobs:
           python3 tools/ci-image/builder.py descriptor \
             --image "$IMAGE" --digest "$digest" --fingerprint "$FINGERPRINT" \
             --native-manifest "$manifest" --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --weston "$WESTON_VERSION" \
             --output descriptor.json
           echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
           {
@@ -300,4 +305,73 @@ jobs:
             echo "## Anonymous pull"
             echo
             echo "Pulled \`$REFERENCE\` with no registry credentials in $((ended - started))s."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  compositor:
+    needs: descriptor
+    # Explicit for the same reason as the anonymous pull: a hit skips `publish`,
+    # and a hit's image has to serve the helper just the same.
+    if: always() && needs.descriptor.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Read-only, and no package grant: this proves what the published image can
+    # do, and publishes nothing itself.
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Start the isolated headless compositor inside the image
+        env:
+          REFERENCE: ${{ needs.descriptor.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # The candidate tree supplies the helper; the image supplies Weston.
+          # `true` is the whole command: what is under proof is that the helper
+          # establishes a private compositor in this image and tears it down,
+          # not anything the command does.
+          output="$(docker run --rm \
+            --volume "$PWD:/candidate:ro" --workdir /candidate \
+            "$REFERENCE" bash tools/display/wayland.sh -- true 2>&1)"
+          printf '%s\n' "$output"
+          {
+            echo '## Isolated headless compositor'
+            echo
+            echo 'Inside the published image, with the candidate tree mounted:'
+            echo
+            echo '```'
+            echo '$ bash tools/display/wayland.sh -- true'
+            printf '%s\n' "$output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show that the compositor left nothing behind
+        env:
+          REFERENCE: ${{ needs.descriptor.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # The helper reports the runtime directory it created; after it
+          # returns, that directory must be gone.
+          docker run --rm \
+            --volume "$PWD:/candidate:ro" --workdir /candidate \
+            "$REFERENCE" bash -c '
+              set -euo pipefail
+              report="$(bash tools/display/wayland.sh --summary /tmp/summary.md -- true)"
+              printf "%s\n" "$report"
+              runtime="${report##*runtime directory }"
+              runtime="${runtime%%,*}"
+              if [ -e "$runtime" ]; then
+                echo "the helper left $runtime behind" >&2
+                exit 1
+              fi
+              echo "the runtime directory $runtime no longer exists"
+              cat /tmp/summary.md
+            ' | tee "$RUNNER_TEMP/cleanup.txt"
+          {
+            echo '## The compositor'\''s runtime directory'
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/cleanup.txt"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

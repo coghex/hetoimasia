@@ -1,0 +1,7 @@
+# The headless Wayland compositor the Linux CI image installs, pinned to the
+# exact Ubuntu 24.04 package revision. The package step installs this revision
+# or fails: apt takes no newer candidate, so a silent compositor upgrade cannot
+# reach a published image. The version must equal the WESTON_VERSION the
+# ci-image workflow pins; the builder refuses to publish an image whose
+# installed compositor disagrees with it. See docs/validation.md.
+WESTON_VERSION=13.0.0-4build3
