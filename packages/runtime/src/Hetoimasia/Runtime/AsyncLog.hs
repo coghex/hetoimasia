@@ -28,7 +28,9 @@
 -- 'asyncTextBudget', which defaults to 4,096 bytes and accepts 256 through
 -- 65,536. That bound is on retained text; it claims nothing about Haskell
 -- object overhead. A record keeps at most 'maxRetainedFields' field entries and
--- 'maxRetainedBreadcrumbs' breadcrumbs, counting empty ones.
+-- 'maxRetainedBreadcrumbs' breadcrumbs, counting empty ones; on a truncated
+-- record the marker is one of those field entries, so the total never exceeds
+-- the bound.
 --
 -- __Truncation.__ An entry over a bound is never rejected. What does not fit is
 -- shortened or omitted and the record carries the reserved 'truncationField'
@@ -62,7 +64,9 @@
 -- their waiter registrations have their own bound, 'asyncControlCapacity',
 -- covering pending requests as well: an excess request fails with
 -- 'FlushRejected' without waiting for record-queue space, and cancelling a
--- waiter releases its registration, which 'statusControlPending' accounts for.
+-- waiter releases its registration. That bound covers a request the writer has
+-- taken and not yet settled as well as a registration still waiting, and
+-- 'statusControlPending' accounts for both.
 --
 -- __Lifetime.__ 'withAsyncLogAdapter' must enclose
 -- 'Hetoimasia.Runtime.Logging.withLoggingLifetime', so it outlives every
@@ -211,6 +215,8 @@ maximumTextBudget ∷ Int
 maximumTextBudget = 65536
 
 -- | Field entries one queued record retains, counting entries with empty text.
+-- On a truncated record the adapter's own 'truncationField' marker is one of
+-- them, so at most one fewer producer field survives there.
 maxRetainedFields ∷ Int
 maxRetainedFields = 64
 
@@ -320,8 +326,9 @@ data AsyncLogStatus = AsyncLogStatus
   , statusAbandoned ∷ !Int
     -- ^ Records still queued when the writer was gone, never attempted.
   , statusControlPending ∷ !Int
-    -- ^ Control requests registered and not yet taken, cancelled, or woken.
-    -- Never above 'asyncControlCapacity'.
+    -- ^ Control requests the adapter still retains: those waiting, and one the
+    -- writer has taken and not yet settled. Never above
+    -- 'asyncControlCapacity'.
   , statusWriterFailure ∷ !(Maybe Text)
     -- ^ The latched synchronous failure of a write or a flush, if one
     -- happened, rendered with 'displayException'.
@@ -388,6 +395,9 @@ data AdapterState = AdapterState
   , stateAdmittedSeq ∷ !Int
   , stateDequeuedSeq ∷ !Int
   , stateControl ∷ !(Seq Waiter)
+  , stateInFlight ∷ !(Maybe Waiter)
+    -- ^ The request the writer has taken and not yet settled. It is still
+    -- retained, so it still counts against 'stateControlCount'.
   , stateControlCount ∷ !Int
   , stateNextRequest ∷ !Int
   , stateWriter ∷ !WriterState
@@ -417,6 +427,7 @@ initialState = AdapterState
   , stateAdmittedSeq = 0
   , stateDequeuedSeq = 0
   , stateControl = Seq.empty
+  , stateInFlight = Nothing
   , stateControlCount = 0
   , stateNextRequest = 0
   , stateWriter = WriterRunning
@@ -540,10 +551,9 @@ nextWork cell = do
   case Seq.viewl (stateControl state) of
     waiter :< rest
       | waiterBarrier waiter <= stateDequeuedSeq state → do
-          writeTVar cell state
-            { stateControl = rest
-            , stateControlCount = stateControlCount state - 1
-            }
+          -- Taken, not released: the request is retained until it settles, so
+          -- a barrier the borrowed flush is still inside keeps its slot.
+          writeTVar cell state { stateControl = rest, stateInFlight = Just waiter }
           pure (RunBarrier waiter)
     _ → case Seq.viewl (stateQueue state) of
       entry :< rest → do
@@ -610,16 +620,16 @@ writerLoop adapter = loop
             -- A flush outcome is not a record outcome: it invents no in-flight
             -- record and reclassifies no completed write.
             Right () → do
-              atomically (settle waiter FlushCompleted)
+              atomically (finishBarrier waiter FlushCompleted cell)
               pure True
             Left failure@(ExceptionWithContext _ raised)
               | isCancellation raised → do
-                  uninterruptibleMask_ (atomically (settle waiter FlushWriterStopped))
+                  uninterruptibleMask_ (atomically (finishBarrier waiter FlushWriterStopped cell))
                   rethrowIO failure
               | otherwise → do
                   uninterruptibleMask_ . atomically $ do
                     let reason = render raised
-                    settle waiter (FlushWriterFailed reason)
+                    finishBarrier waiter (FlushWriterFailed reason) cell
                     latch reason cell
                   pure False
 
@@ -646,15 +656,29 @@ latch reason cell = do
 settle ∷ Waiter → FlushOutcome → STM ()
 settle waiter outcome = writeTVar (waiterOutcome waiter) (Just outcome)
 
+-- | Settle the request the writer took and give its slot back, which is the
+-- only thing that releases an in-flight barrier's hold on the control bound.
+finishBarrier ∷ Waiter → FlushOutcome → TVar AdapterState → STM ()
+finishBarrier waiter outcome cell = do
+  settle waiter outcome
+  state ← readTVar cell
+  writeTVar cell state
+    { stateInFlight = Nothing
+    , stateControlCount = stateControlCount state - 1
+    }
+
 -- | Publish the writer's terminal state and wake every waiter still registered,
 -- so none of them waits for a barrier that can no longer complete.
 finalizeWriter ∷ TVar AdapterState → STM ()
 finalizeWriter cell = do
   state ← readTVar cell
-  for_ (stateControl state) (\waiter → settle waiter (terminalOutcome (stateLatched state)))
+  let outcome = terminalOutcome (stateLatched state)
+  for_ (stateControl state) (\waiter → settle waiter outcome)
+  for_ (stateInFlight state) (\waiter → settle waiter outcome)
   writeTVar cell state
     { stateWriter = WriterTerminal
     , stateControl = Seq.empty
+    , stateInFlight = Nothing
     , stateControlCount = 0
     }
 
@@ -704,7 +728,9 @@ register capacity cell = do
           pure (Right waiter)
 
 -- | Give a cancelled waiter's registration back, so repeated registration and
--- cancellation cannot accumulate orphaned requests.
+-- cancellation cannot accumulate orphaned requests. A waiter the writer has
+-- already taken is not released here: the writer still holds it, and settling
+-- it is what gives its slot back.
 release ∷ Waiter → TVar AdapterState → STM ()
 release waiter cell = do
   state ← readTVar cell
@@ -847,7 +873,9 @@ boundEntry budget entry
             (Just (detachSource location), False, afterThread - sourceBytes location)
         | otherwise → (Nothing, True, afterThread)
 
-    (keptFields, afterFields) = fitPairs afterSource (take maxRetainedFields suppliedFields)
+    -- One of the retained entries is the marker this record is about to carry.
+    (keptFields, afterFields) =
+      fitPairs afterSource (take (maxRetainedFields - 1) suppliedFields)
     (keptCrumbs, afterCrumbs) =
       fitTexts afterFields (take maxRetainedBreadcrumbs (entryBreadcrumbs entry))
 

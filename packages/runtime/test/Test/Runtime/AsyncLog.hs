@@ -125,6 +125,8 @@ spec = describe "Asynchronous logging adapter" $ do
       (bounded testFlushOrdering)
     it "reports a failed underlying flush without inventing a record outcome"
       (bounded testFlushFailureAccounting)
+    it "reports an interrupted underlying flush without inventing a record outcome"
+      (bounded testInterruptedFlushAccounting)
     it "raises an unsuccessful barrier from the adapter sink's own flush"
       (bounded testSinkFlushRaises)
     it "wakes a waiting flush when the writer fails" (bounded testWriterFailureWakesWaiter)
@@ -134,6 +136,8 @@ spec = describe "Asynchronous logging adapter" $ do
       (bounded testControlBound)
     it "releases a cancelled waiter's registration, and does not accumulate them"
       (bounded testControlCancellationChurn)
+    it "keeps a request the writer is still flushing inside the bound"
+      (bounded testControlBoundCoversInFlight)
 
   describe "Accounting" $ do
     it "separates successful, failed, and unattempted-abandoned records"
@@ -474,11 +478,13 @@ testFieldCollectionBound = do
   entries ← probeEntries probe
   case entries of
     [only] → do
-      -- The marker is the adapter's own field, beside the retained ones.
-      Map.size (Map.delete truncationField (entryFields only)) `shouldBe` maxRetainedFields
-      marker only `shouldBe` Just (Text.pack ("fields=" <> show (supplied - maxRetainedFields)))
-      Map.keys (Map.delete truncationField (entryFields only))
-        `shouldBe` take maxRetainedFields (Map.keys fields)
+      -- The marker is one of the retained entries, so the bound covers it.
+      Map.size (entryFields only) `shouldBe` maxRetainedFields
+      let retained = Map.keys (Map.delete truncationField (entryFields only))
+      length retained `shouldBe` maxRetainedFields - 1
+      retained `shouldBe` take (maxRetainedFields - 1) (Map.keys fields)
+      marker only
+        `shouldBe` Just (Text.pack ("fields=" <> show (supplied - (maxRetainedFields - 1))))
     _ → expectationFailure "expected one record"
 
 testBreadcrumbCollectionBound ∷ IO ()
@@ -673,6 +679,26 @@ testControlCancellationChurn = do
     takeMVar slot `shouldReturn` FlushCompleted
   pure ()
 
+testControlBoundCoversInFlight ∷ IO ()
+testControlBoundCoversInFlight = do
+  entered ← newEmptyMVar
+  held ← newEmptyMVar
+  let hooks = quiet { hookFlush = putMVar entered () >> takeMVar held }
+      config = defaultAsyncLogConfig { asyncControlCapacity = 1 }
+  (rejected, _, _) ← runAdapter config hooks $ \_ adapter → do
+    first ← newEmptyMVar
+    void (forkIO (flushAdapter adapter >>= putMVar first))
+    -- The writer has taken the request and is inside the borrowed flush. It is
+    -- still retained, so the single slot is still occupied.
+    takeMVar entered
+    awaitPending adapter 1
+    outcome ← flushAdapter adapter
+    putMVar held ()
+    takeMVar first `shouldReturn` FlushCompleted
+    awaitPending adapter 0
+    pure outcome
+  rejected `shouldBe` FlushRejected
+
 -- Accounting ------------------------------------------------------------------------------
 
 testTerminalAccounting ∷ IO ()
@@ -705,6 +731,43 @@ testTerminalAccounting = do
   trace ← probeTrace probe
   -- Nothing after the failed record was attempted.
   trace `shouldBe` ["write held", "write second", "write boom"]
+
+testInterruptedFlushAccounting ∷ IO ()
+testInterruptedFlushAccounting = do
+  entered ← newEmptyMVar
+  held ← newEmptyMVar
+  flushed ← newEmptyMVar
+  parked ← newEmptyMVar
+  let hooks = quiet { hookFlush = putMVar entered () >> takeMVar held }
+  probe ← newProbe hooks
+  handle ← newEmptyMVar
+  outcome ← newEmptyMVar
+  runner ← forkIO $ do
+    result ← try . withAsyncLogAdapter defaultAsyncLogConfig (probeSink probe) $ \adapter → do
+      putMVar handle adapter
+      offer adapter (sample "written")
+      void (forkIO (flushAdapter adapter >>= putMVar flushed))
+      -- Never filled: the owner waits here to be cancelled, so the writer is
+      -- interrupted inside the borrowed flush rather than inside a write.
+      takeMVar parked
+    putMVar outcome result
+  takeMVar entered
+  adapter ← readMVar handle
+  killThread runner
+  result ← bounded (takeMVar outcome)
+  either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
+  bounded (takeMVar flushed) `shouldReturn` FlushWriterStopped
+  status ← adapterStatus adapter
+  -- The interrupted flush fails its barrier and terminates the writer. It
+  -- invents no in-flight record and reclassifies no completed write.
+  statusWritten status `shouldBe` 1
+  statusFailedWrites status `shouldBe` 0
+  statusInterruptedWrites status `shouldBe` 0
+  statusAbandoned status `shouldBe` 0
+  statusWriterTerminated status `shouldBe` True
+  statusWriterFailure status `shouldBe` Nothing
+  messages probe `shouldReturn` ["written"]
+  probeTrace probe `shouldReturn` ["write written", "flush"]
 
 -- Cancellation ---------------------------------------------------------------------------
 

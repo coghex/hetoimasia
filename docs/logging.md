@@ -519,7 +519,9 @@ queue. Their UTF-8 byte lengths, plus the truncation marker when there is one,
 are summed against **one per-record total**, `asyncTextBudget`. That is a bound
 on retained text; it claims nothing about Haskell object overhead. A record also
 keeps at most `maxRetainedFields` (64) field entries and
-`maxRetainedBreadcrumbs` (32) breadcrumbs, counting entries with empty text.
+`maxRetainedBreadcrumbs` (32) breadcrumbs, counting entries with empty text. On
+a truncated record the adapter's own marker is one of those field entries, so
+one fewer producer field survives there and the total never exceeds the bound.
 
 **Truncation never rejects a record.** A record over a bound is admitted with
 what fits and carries the reserved `truncationField` (`log.truncated`) marker,
@@ -558,7 +560,10 @@ the logging lifetime's final flush keeps the precedence the matrix above
 describes. Control requests and their waiter registrations share the
 `asyncControlCapacity` bound, pending requests included: an excess request
 returns `FlushRejected` without waiting for record-queue space, and cancelling a
-waiter releases its registration, which `statusControlPending` accounts for.
+waiter releases its registration. The bound covers a request the writer has
+taken and not yet settled as well as one still waiting, so a barrier held inside
+a blocked borrowed flush does not free its slot; `statusControlPending` accounts
+for both.
 
 **Shutdown.** Once the callback returns or throws, admission stops, the writer
 drains what is left, and the adapter joins it before ending its borrow. The
@@ -586,7 +591,7 @@ uninterruptible release.
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
 |---|---|---|---|---|---|
 | Record queue and its admission flag | The `withAsyncLogAdapter` call | Admission, atomically, while open; the writer, dequeuing; shutdown, closing admission and abandoning the backlog | The writer; `adapterStatus`, as counters | Any producer thread; the writer's own thread | Created empty per call, never shared or reset. Closed to admission when the callback returns or throws. |
-| Control requests and their waiter cells | The `withAsyncLogAdapter` call | `flushAdapter`, registering or releasing one; the writer, taking and settling one | The waiting caller; `adapterStatus`, as `statusControlPending` | Any thread holding the handle; the writer's own thread | Created empty per call. Bounded by `asyncControlCapacity`; every registration is released by its waiter, the writer, or writer termination. |
+| Control requests and their waiter cells | The `withAsyncLogAdapter` call | `flushAdapter`, registering or releasing one; the writer, taking and settling one | The waiting caller; `adapterStatus`, as `statusControlPending` | Any thread holding the handle; the writer's own thread | Created empty per call. Bounded by `asyncControlCapacity`, counting a taken-but-unsettled request; every registration is released by its waiter, by the writer settling it, or by writer termination. |
 | The latched writer failure and terminal state | The writer | The writer, once each; a later failure never replaces the first | `adapterStatus`; every flush barrier | The writer's own thread | Created empty per call, never reset. Published however the writer ends. |
 | Counters | The `withAsyncLogAdapter` call | Admission and the writer, atomically; shutdown, for the abandoned backlog | `adapterStatus` | Any thread | Created at zero per call. Cumulative: no barrier or status read resets one. |
 
