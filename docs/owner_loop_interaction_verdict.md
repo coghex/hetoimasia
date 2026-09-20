@@ -54,7 +54,8 @@ HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/owner-loop-interaction-trace-3.tsv \
 ```
 
 The second produced the move and resize numbers below; the third produced the
-menu-bar numbers and corroborates the other two. A first session, at 20 s,
+menu-bar numbers and corroborates the other two. Both are retained record by
+record in [the records](owner_loop_interaction_evidence.md). A first session, at 20 s,
 preceded both and is reported separately under [the first
 session](#the-first-session-attribution-unreliable) because its phases cannot be
 attributed.
@@ -88,6 +89,13 @@ could not make as a fault, and marks evidence with either count above zero as
 incomplete. **Every phase of every session reported 0 lost and 0 faults**, so no
 number below is read from truncated evidence, and no absence below is a missing
 record.
+
+Every record of both cited sessions is retained in
+[the records](owner_loop_interaction_evidence.md), complete and in order, so
+each duration, callback count, and absent owner turn below is checkable against
+what the probe actually emitted rather than against this document's arithmetic.
+That page also shows how to read each headline number straight out of the
+records.
 
 ## What was measured
 
@@ -231,7 +239,9 @@ the terminal was full-screen, the person could not see the banners and was
 pacing from memory, and the trace shows the interactions landing one phase late
 — nothing at all during the phase labelled "window move", a window move during
 the phase labelled "window resize", and a live resize during the phase labelled
-"menu-bar interaction". It is recorded here only because its one unambiguous
+"menu-bar interaction". Its records are not retained; its report is, at
+[the unattributable session](owner_loop_interaction_evidence.md#the-unattributable-session).
+It is recorded here only because its one unambiguous
 measurement corroborates the resize finding: a single `glfwWaitEventsTimeout`
 of 100 ms that did not return for **29 591.9 ms**, with **10 173** callbacks
 delivered from inside it — 3390 each of `window size`, `framebuffer size`, and

@@ -4377,9 +4377,10 @@ interaction runs a platform modal loop inside `glfwPollEvents` or
 commands, and offers the update hook only after that call returns, so whether
 such a loop exists decides whether anything the application owns progresses
 while a person is interacting. `Test.GLFW.Native.Interaction` measures that
-rather than assuming it, and
-[the verdict](owner_loop_interaction_verdict.md) records what one approved
-macOS session observed.
+rather than assuming it; [the verdict](owner_loop_interaction_verdict.md)
+records what the approved macOS sessions observed, and
+[the records](owner_loop_interaction_evidence.md) retain every timestamped
+record those sessions produced.
 
 The probe runs the production owner loop over one ordinary shown window in the
 shared session, with the session's bounded interaction trace started
