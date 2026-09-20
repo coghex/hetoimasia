@@ -29,6 +29,21 @@
 -- the native effects and results it recorded, and obeys it. Retention plus
 -- process exit is the escape for a session that never resolves: no native call
 -- here is preemptible and no native destroy is wrapped in a timeout.
+--
+-- Teardown can only decide over handles it was given, so every native object
+-- this module creates has a cleanup owner before the next fallible step runs.
+-- For a handle whose whole construction is one call that is 'owning', which
+-- puts the create and the registration in one masked step. For the two
+-- composites built from several fallible calls — a frame slot, and the capture
+-- buffer with its memory — it is "Test.Vulkan.Proof.Construction": every one
+-- of their releases is registered before the first of their native calls runs,
+-- against places that are empty until each child exists, so a failure partway
+-- releases exactly what exists, in dependency order, before the device is
+-- destroyed. The successful path is unchanged by that — the same ten entries
+-- in the same order — because the capture frees its own two handles at the end
+-- as it always did and then recalls their registrations. Both constructions
+-- are exercised headlessly, with the native layer replaced and the step to
+-- fail at chosen, by "Test.Vulkan.Proof.ConstructionSpec".
 module Test.Vulkan.Proof.Run (runProof) where
 
 import Control.Concurrent (isCurrentThreadBound, rtsSupportsBoundThreads)
@@ -37,6 +52,7 @@ import Control.Exception
   , SomeException
   , displayException
   , fromException
+  , mask_
   , throwIO
   , try
   )
@@ -98,23 +114,41 @@ import Test.Vulkan.Proof.Interop
   , requiredInstanceExtensions
   , vulkanSupported
   )
+import Test.Vulkan.Proof.Construction
+  ( CaptureOps (..)
+  , CapturePlaces
+  , SlotOps (..)
+  , SlotParts (..)
+  , capturePlaceReleases
+  , fillSlot
+  , newCapturePlaces
+  , newSlotPlaces
+  , runCapture
+  , slotPlaceReleases
+  )
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
+import Test.Vulkan.Proof.Ownership
+  ( Cleanups
+  , Ledger
+  , newCleanups
+  , newLedger
+  , observe
+  , observations
+  , onExit
+  , onExitHolding
+  , onExitRecallable
+  , owning
+  , runCleanups
+  )
 import Test.Vulkan.Proof.Retention
-  ( BoundaryStanding (..)
-  , Disposition (..)
-  , Handle (..)
+  ( Handle (..)
   , NativeResult (..)
   , Observation (..)
-  , Route (..)
+  , SlotName
   , Standing (..)
   , classifyResult
   , classifyThrown
-  , decide
-  , describeHandle
-  , describeObservation
   , describeResult
-  , isDestruction
-  , releasedEntries
   , standingFrom
   )
 
@@ -133,120 +167,6 @@ stop step detail = throwIO (Stop (Failure step detail))
 
 require ∷ Text → Text → Bool → IO ()
 require step detail ok = unless ok (stop step detail)
-
--- --------------------------------------------------------------------------
--- The ledger
-
--- | The run's own record of the native effects and results the release
--- decision is a function of, in the order they happened.
---
--- It is appended to at the moment a call returns or throws, before anything
--- that could itself fail runs: an obligation lost between a present and the
--- line that would have recorded it is a handle that looks free and is not.
-newtype Ledger = Ledger (IORef [Observation])
-
-newLedger ∷ IO Ledger
-newLedger = Ledger <$> newIORef []
-
-observe ∷ Ledger → Observation → IO ()
-observe (Ledger ref) observation = modifyIORef' ref (<> [observation])
-
-observations ∷ Ledger → IO [Observation]
-observations (Ledger ref) = readIORef ref
-
--- --------------------------------------------------------------------------
--- Cleanup
-
--- | Teardown actions, newest first, each naming the handle it releases. The
--- handle is what "Test.Vulkan.Proof.Retention" decides over; the entry name
--- the record reports is derived from it.
-newtype Cleanups = Cleanups (IORef [(Handle, IO ())])
-
-newCleanups ∷ IO Cleanups
-newCleanups = Cleanups <$> newIORef []
-
-onExit ∷ Cleanups → Handle → IO () → IO ()
-onExit (Cleanups ref) handle action = modifyIORef' ref ((handle, action) :)
-
--- | What became of one release.
-data Release
-  = Released
-  | Failed Text
-  | Retained Text
-
-released ∷ Release → Bool
-released = \case
-  Released → True
-  _ → False
-
--- | Tear down: the boundary first, then every release the recorded evidence
--- permits, in reverse registration order.
---
--- The boundary runs before any decision is taken because it is what produces
--- the evidence the decisions rest on — the device-idle result, and a bounded
--- wait on every present fence still owed. After it, one call to the same pure
--- 'decide' the headless examples exercise says what may go and what must stay.
---
--- A release that fails is recorded and never allowed to hide the ones after
--- it; a release that is withheld is recorded with the condition that was
--- unmet. Neither is narrated separately from the values the verdict reads.
-runCleanups ∷ Journal → Ledger → Cleanups → IO TeardownFacts
-runCleanups journal ledger (Cleanups ref) = do
-  registered ← readIORef ref
-  writeIORef ref []
-  boundary ← forM [entry | entry@(TheTeardownBoundary, _) ← registered] (attempt journal)
-  recorded ← observations ledger
-  let plan = map fst registered
-      decisions = decide plan recorded
-  later ← forM [entry | entry@(handle, _) ← registered, handle /= TheTeardownBoundary] $ \entry@(handle, _) →
-    case lookup handle decisions of
-      Just (Retain reason) → do
-        note journal ("teardown retained " <> describeHandle handle <> ": " <> reason)
-        pure (handle, Retained reason)
-      _ → attempt journal entry
-  settled ← observations ledger
-  pure (teardownFactsFrom settled (boundary <> later))
-
-attempt ∷ Journal → (Handle, IO ()) → IO (Handle, Release)
-attempt journal (handle, action) = do
-  outcome ← try @SomeException action
-  case outcome of
-    Right () → pure (handle, Released)
-    Left failure → do
-      let reason = describeHandle handle <> ": " <> Text.pack (displayException failure)
-      note journal ("teardown of " <> reason)
-      pure (handle, Failed reason)
-
-teardownFactsFrom ∷ [Observation] → [(Handle, Release)] → TeardownFacts
-teardownFactsFrom recorded outcomes =
-  TeardownFacts
-    { teardownReleases = releasedEntries [(handle, released outcome) | (handle, outcome) ← outcomes]
-    , teardownFailures = [reason | (_, Failed reason) ← outcomes]
-    , -- The boundary ran, and it is in 'teardownReleases' and in the
-      -- observations it produced, but it destroyed nothing: it is the
-      -- device-idle wait the rest rest on. This line is what a reader consults
-      -- to learn which native objects were freed, so a wait does not belong in
-      -- it.
-      teardownDestroyed = [describeHandle handle | (handle, Released) ← outcomes, isDestruction handle]
-    , teardownRetained = [(describeHandle handle, reason) | (handle, Retained reason) ← outcomes]
-    , teardownRoute = describeRoute (standingFrom recorded)
-    , teardownObservations = map describeObservation recorded
-    }
-
--- | Which destruction rules teardown operated under, and why. A timeout is
--- never reported here as device loss: it is the case where completion is still
--- owed, and saying otherwise would turn a retained handle into a destroyed one.
-describeRoute ∷ Standing → Text
-describeRoute standing = case standing.standingRoute of
-  DeviceLossRoute →
-    "the specification's device-loss rule, which permits destroying a lost device's objects without waiting for work that may never complete"
-  OrdinaryRoute → case standing.standingBoundary of
-    BoundaryHeld →
-      "ordinary: each release needed its own completion evidence, and the device-idle boundary held"
-    BoundaryNotReached →
-      "ordinary: each release needed its own completion evidence, and the device-idle boundary was never reached"
-    BoundaryBroken detail →
-      "ordinary: each release needed its own completion evidence, and the device-idle boundary failed with " <> detail
 
 -- --------------------------------------------------------------------------
 -- Callback capture
@@ -568,11 +488,18 @@ procedure journal consent cleanups sink ledger = do
     "the Haskell binding's own vkGetInstanceProcAddr resolved to nothing, so there is no loader to share"
     (provenanceAddress bindingEntry /= nullPtr)
   initVulkanLoader entry
-  started ← glfwInit
+  -- The registration is inside the mask with the call that earns it, so a
+  -- cancellation delivered here cannot leave GLFW initialized with nothing to
+  -- terminate it. Everything below that acquires a handle does the same, either
+  -- through 'owning' or through a mask of its own where the call reports
+  -- success some other way than by returning the handle.
+  started ← mask_ $ do
+    ok ← glfwInit
+    when ok (onExit cleanups GlfwTermination glfwTerminate)
+    pure ok
   unless started $ do
     reason ← lastGlfwError
     stop "GLFW initialization" ("glfwInit failed: " <> reason)
-  onExit cleanups GlfwTermination glfwTerminate
   supported ← vulkanSupported
   require "GLFW's loader" "glfwVulkanSupported reported no Vulkan loader after being handed the binding's own" supported
   glfwEntry ← instanceProcAddress nullPtr "vkGetInstanceProcAddr" >>= provenanceOf
@@ -619,15 +546,16 @@ procedure journal consent cleanups sink ledger = do
     "the pinned layer path supplies no VK_LAYER_KHRONOS_validation, so a clean run would prove nothing"
     (not (null enabledLayers))
 
-  callback ← wrapDebugCallback (debugCallback sink)
   -- Registered before the instance, so it is released after it: the trampoline
   -- has to still be callable while vkDestroyInstance runs.
-  onExit cleanups TheCallbackTrampoline (freeHaskellFunPtr callback)
+  callback ←
+    owning cleanups TheCallbackTrampoline (wrapDebugCallback (debugCallback sink)) freeHaskellFunPtr
   let createInfo = messengerCreateInfo callback
 
   enterPhase sink "instance creation"
   handle ←
-    createInstance
+    owning cleanups TheVulkanInstance
+    ( createInstance
       ( InstanceCreateInfo
           { next = (createInfo, ())
           , flags = if portabilityEnumeration then INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR else zero
@@ -646,12 +574,14 @@ procedure journal consent cleanups sink ledger = do
           ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT]
       )
       Nothing
-  -- The create-info messenger is still live while the instance is destroyed.
-  -- That is deliberate: requirement 8 asks what reaches Haskell during
-  -- instance destruction, after the explicit messenger is already gone.
-  onExit cleanups TheVulkanInstance $ do
-    enterPhase sink destructionPhase
-    destroyInstance handle Nothing
+    )
+    -- The create-info messenger is still live while the instance is destroyed.
+    -- That is deliberate: requirement 8 asks what reaches Haskell during
+    -- instance destruction, after the explicit messenger is already gone.
+    ( \created → do
+        enterPhase sink destructionPhase
+        destroyInstance created Nothing
+    )
   enterPhase sink "after instance creation"
 
   bindingSample ← provenanceOf (castFunPtrToPtr (pVkCreateDevice handle.instanceCmds))
@@ -660,7 +590,6 @@ procedure journal consent cleanups sink ledger = do
   note journal ("GLFW resolves vkCreateDevice to " <> describeProvenance glfwSample)
 
   enterPhase sink "messenger creation"
-  messenger ← createDebugUtilsMessengerEXT handle createInfo Nothing
   -- Registered immediately after the instance, so it is destroyed immediately
   -- before it — and therefore after the swapchain, the device, the surface and
   -- the window. A messenger torn down before them would leave every diagnostic
@@ -668,26 +597,40 @@ procedure journal consent cleanups sink ledger = do
   -- go, while the record still said zero validation errors. The create-info
   -- messenger cannot stand in: the extension uses it for instance creation and
   -- destruction alone.
-  onExit cleanups TheExplicitMessenger $ do
-    enterPhase sink afterMessengerPhase
-    destroyDebugUtilsMessengerEXT handle messenger Nothing
+  _ ←
+    owning
+      cleanups
+      TheExplicitMessenger
+      (createDebugUtilsMessengerEXT handle createInfo Nothing)
+      ( \created → do
+          enterPhase sink afterMessengerPhase
+          destroyDebugUtilsMessengerEXT handle created Nothing
+      )
   inject sink handle "creation"
 
   heading journal "The window and its surface"
-  window ←
-    createProofWindow 320 240 "hetoimasia Vulkan proof" >>= \case
-      Nothing → do
-        reason ← lastGlfwError
-        stop "the proof window" ("glfwCreateWindow failed: " <> reason)
-      Just value → pure value
-  onExit cleanups TheProofWindow (destroyProofWindow window)
-  (surfaceResult, surfaceHandle) ← createWindowSurface (castPtr (instanceHandle handle)) window
+  -- Both of these report failure by something other than throwing, so neither
+  -- can go through 'owning': the registration has to be conditional on the
+  -- result, inside the same mask as the call that produced it.
+  opened ← mask_ $ do
+    outcome ← createProofWindow 320 240 "hetoimasia Vulkan proof"
+    for_ outcome $ \shown → onExit cleanups TheProofWindow (destroyProofWindow shown)
+    pure outcome
+  window ← case opened of
+    Nothing → do
+      reason ← lastGlfwError
+      stop "the proof window" ("glfwCreateWindow failed: " <> reason)
+    Just value → pure value
+  (surfaceResult, surfaceHandle) ← mask_ $ do
+    outcome@(result, raw) ← createWindowSurface (castPtr (instanceHandle handle)) window
+    when (result == 0) $
+      onExit cleanups TheWindowSurface (destroySurfaceKHR handle (SurfaceKHR raw) Nothing)
+    pure outcome
   require
     "the window surface"
     ("glfwCreateWindowSurface returned " <> Text.pack (show (Result (fromIntegral surfaceResult))))
     (surfaceResult == 0)
   let surface = SurfaceKHR surfaceHandle
-  onExit cleanups TheWindowSurface (destroySurfaceKHR handle surface Nothing)
   pollEvents
 
   heading journal "The device profile"
@@ -697,7 +640,8 @@ procedure journal consent cleanups sink ledger = do
 
   enterPhase sink "device creation"
   device ←
-    createDevice
+    owning cleanups TheLogicalDevice
+    ( createDevice
       selection.selectedDevice
       ( DeviceCreateInfo
           { next =
@@ -724,7 +668,8 @@ procedure journal consent cleanups sink ledger = do
           ∷ DeviceCreateInfo '[PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR]
       )
       Nothing
-  onExit cleanups TheLogicalDevice (destroyDevice device Nothing)
+    )
+    (\created → destroyDevice created Nothing)
   enterPhase sink "after device creation"
 
   -- Which spelling of the release entry point this device actually answered
@@ -756,17 +701,24 @@ procedure journal consent cleanups sink ledger = do
   queue ← getDeviceQueue device selection.selectedQueueFamily 0
 
   heading journal "The presentation profile"
-  target ← buildTarget journal device selection surface
-  onExit cleanups TheSwapchain (destroySwapchainKHR device target.targetSwapchain Nothing)
+  target ← buildTarget journal cleanups device selection surface
 
-  slots ← newSlots device selection.selectedQueueFamily ledger
-  -- Registered in reverse of the order teardown reaches them, because a
-  -- registration is a push. A slot's own three releases are separable so that
-  -- an outstanding present can withhold its fence and its presentation
-  -- semaphore while its command pool, rendering fence and acquisition
-  -- semaphore — whose completion the boundary below does establish — still go.
-  for_ (reverse (concatMap (slotReleases device) (eachSlot slots))) $ \(what, action) →
-    onExit cleanups what action
+  slots ← newSlots cleanups device selection.selectedQueueFamily ledger
+
+  -- The capture path's buffer and its memory, owned from here rather than from
+  -- inside that path, for two reasons. Its releases have to be registered
+  -- before the teardown boundary below, so teardown reaches them after the
+  -- boundary that establishes its copy has completed; and a place that exists
+  -- before the first native call is what lets every step of the capture fail
+  -- without orphaning what already exists. A capture that reaches the end
+  -- frees both itself and recalls these two registrations, so a whole run
+  -- still arrives at teardown holding the same ten entries it always did.
+  capturePlaces ← newCapturePlaces
+  let captureOperations = captureOps device selection.selectedDevice queue target slots.firstSlot
+  recallCapture ←
+    forM (reverse (capturePlaceReleases captureOperations capturePlaces)) $
+      \(what, cleanup) → onExitRecallable cleanups what cleanup
+
   -- Registered last, so it runs first: every destruction below rests on what
   -- this establishes, and every diagnostic any of them emits is attributed to
   -- teardown. It is not itself a destruction. Its device-idle result and the
@@ -791,7 +743,10 @@ procedure journal consent cleanups sink ledger = do
 
   heading journal "Transfer-source capture"
   enterPhase sink "capture"
-  capture ← proveCapture journal device selection.selectedDevice queue target slots
+  capture ← proveCapture journal device target slots captureOperations capturePlaces
+  -- Reached only when the capture freed both of its handles itself, which is
+  -- the one path on which taking the registrations back is right.
+  sequence_ recallCapture
 
   heading journal "Teardown"
   -- Teardown itself is the cleanup stack, which runs after this procedure
@@ -1011,8 +966,13 @@ data Target = Target
   , targetRequestedUsage ∷ ImageUsageFlags
   }
 
-buildTarget ∷ Journal → Device → Selection → SurfaceKHR → IO Target
-buildTarget journal device selection surface = do
+-- | The swapchain is registered inside this function rather than by its
+-- caller, because two fallible steps follow its creation — reading its images
+-- back, and allocating the counter the abandonment paths check — and a failure
+-- at either used to leave a created swapchain with no owner while the device
+-- release registered above it still ran.
+buildTarget ∷ Journal → Cleanups → Device → Selection → SurfaceKHR → IO Target
+buildTarget journal cleanups device selection surface = do
   let physical = selection.selectedDevice
   capabilities ← getPhysicalDeviceSurfaceCapabilitiesKHR physical surface
   (_, formats) ← getPhysicalDeviceSurfaceFormatsKHR physical surface
@@ -1060,7 +1020,8 @@ buildTarget journal device selection surface = do
         <> Text.pack (show extent)
     )
   swapchain ←
-    createSwapchainKHR
+    owning cleanups TheSwapchain
+    ( createSwapchainKHR
       device
       ( SwapchainCreateInfoKHR
           { next = ()
@@ -1083,6 +1044,8 @@ buildTarget journal device selection surface = do
           ∷ SwapchainCreateInfoKHR '[]
       )
       Nothing
+    )
+    (\created → destroySwapchainKHR device created Nothing)
   (_, images) ← getSwapchainImagesKHR device swapchain
   creations ← newIORef 1
   pure
@@ -1136,71 +1099,81 @@ slotFor slots index = if even index then slots.firstSlot else slots.secondSlot
 eachSlot ∷ Slots → [Slot]
 eachSlot slots = [slots.firstSlot, slots.secondSlot]
 
-newSlots ∷ Device → Word32 → Ledger → IO Slots
-newSlots device family ledger = do
-  built ← forM [0 .. slotCount - 1] (newSlot device family ledger)
+-- | The name a slot is known by, in the record and on the ledger.
+slotNameAt ∷ Int → SlotName
+slotNameAt index = "slot " <> Text.pack (show index)
+
+-- | The native layer a frame slot is built from.
+slotOps ∷ Device → Word32 → SlotOps Semaphore Fence CommandPool CommandBuffer
+slotOps device family =
+  SlotOps
+    { createSlotSemaphore =
+        createSemaphore device (SemaphoreCreateInfo {next = (), flags = zero} ∷ SemaphoreCreateInfo '[]) Nothing
+    , destroySlotSemaphore = \semaphore → destroySemaphore device semaphore Nothing
+    , createSlotFence =
+        createFence device (FenceCreateInfo {next = (), flags = zero} ∷ FenceCreateInfo '[]) Nothing
+    , destroySlotFence = \fence → destroyFence device fence Nothing
+    , createSlotPool =
+        createCommandPool
+          device
+          CommandPoolCreateInfo
+            { next = ()
+            , flags = COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+            , queueFamilyIndex = family
+            }
+          Nothing
+    , destroySlotPool = \pool → destroyCommandPool device pool Nothing
+    , allocateSlotCommands = \pool →
+        Vector.head
+          <$> allocateCommandBuffers
+            device
+            CommandBufferAllocateInfo
+              { commandPool = pool
+              , level = COMMAND_BUFFER_LEVEL_PRIMARY
+              , commandBufferCount = 1
+              }
+    }
+
+-- | Build the pool of slots, with every release registered before the first
+-- native object of either exists.
+--
+-- Both slots' places and all six of their releases come first, in reverse of
+-- the order teardown reaches them because a registration is a push. Only then
+-- does anything get created. That is the whole of the repair for this
+-- composite: a failure at any step of either slot — the second semaphore of
+-- the first, or any step of the second while the first is already whole —
+-- now releases exactly the children that exist, in dependency order, before
+-- the device registered above them is destroyed.
+--
+-- A slot's own three releases stay separable so that an outstanding present
+-- can withhold its fence and its presentation semaphore while its command
+-- pool, rendering fence and acquisition semaphore — whose completion the
+-- teardown boundary does establish — still go.
+newSlots ∷ Cleanups → Device → Word32 → Ledger → IO Slots
+newSlots cleanups device family ledger = do
+  let ops = slotOps device family
+      names = map slotNameAt [0 .. slotCount - 1]
+  places ← forM names newSlotPlaces
+  for_ (reverse (concat (zipWith (slotPlaceReleases ops) names places))) $ \(what, cleanup) →
+    onExitHolding cleanups what cleanup
+  built ← forM (zip names places) $ \(name, place) → do
+    parts ← fillSlot ops place
+    presented ← newIORef False
+    pure
+      Slot
+        { slotName = name
+        , slotAcquire = parts.partAcquireSemaphore
+        , slotPresent = parts.partPresentSemaphore
+        , slotRenderFence = parts.partRenderFence
+        , slotPresentFence = parts.partPresentFence
+        , slotPool = parts.partPool
+        , slotCommands = parts.partCommands
+        , slotPresented = presented
+        , slotLedger = ledger
+        }
   case built of
     [a, b] → pure (Slots a b)
     _ → stop "the frame slots" "the slot pool was not built as a pair"
-
-newSlot ∷ Device → Word32 → Ledger → Int → IO Slot
-newSlot device family ledger index = do
-  acquire ← createSemaphore device (SemaphoreCreateInfo {next = (), flags = zero} ∷ SemaphoreCreateInfo '[]) Nothing
-  present ← createSemaphore device (SemaphoreCreateInfo {next = (), flags = zero} ∷ SemaphoreCreateInfo '[]) Nothing
-  renderFence ← createFence device (FenceCreateInfo {next = (), flags = zero} ∷ FenceCreateInfo '[]) Nothing
-  presentFence ← createFence device (FenceCreateInfo {next = (), flags = zero} ∷ FenceCreateInfo '[]) Nothing
-  pool ←
-    createCommandPool
-      device
-      CommandPoolCreateInfo
-        { next = ()
-        , flags = COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
-        , queueFamilyIndex = family
-        }
-      Nothing
-  buffers ←
-    allocateCommandBuffers
-      device
-      CommandBufferAllocateInfo
-        { commandPool = pool
-        , level = COMMAND_BUFFER_LEVEL_PRIMARY
-        , commandBufferCount = 1
-        }
-  presented ← newIORef False
-  pure
-    Slot
-      { slotName = "slot " <> Text.pack (show index)
-      , slotAcquire = acquire
-      , slotPresent = present
-      , slotRenderFence = renderFence
-      , slotPresentFence = presentFence
-      , slotPool = pool
-      , slotCommands = Vector.head buffers
-      , slotPresented = presented
-      , slotLedger = ledger
-      }
-
--- | One slot's releases, in the order teardown reaches them.
---
--- Three rather than one, because they are owed different evidence. The command
--- pool, the rendering fence and the acquisition semaphore are queue objects,
--- and the device-idle boundary does establish that the device has finished
--- with them. The present fence and the presentation semaphore are not: a
--- present is work for the presentation engine, and only that fence says it is
--- done. The semaphore comes after its fence, which is the order
--- @VK_EXT_swapchain_maintenance1@ names.
-slotReleases ∷ Device → Slot → [(Handle, IO ())]
-slotReleases device slot =
-  [
-    ( SlotWorkObjects slot.slotName
-    , do
-        destroyCommandPool device slot.slotPool Nothing
-        destroyFence device slot.slotRenderFence Nothing
-        destroySemaphore device slot.slotAcquire Nothing
-    )
-  , (SlotPresentFence slot.slotName, destroyFence device slot.slotPresentFence Nothing)
-  , (SlotPresentSemaphore slot.slotName, destroySemaphore device slot.slotPresent Nothing)
-  ]
 
 -- | The one route from retained to destroyed that is not device loss: during
 -- teardown, a bounded wait on every present fence the run still owes.
@@ -1666,114 +1639,163 @@ abandonUnpresentedFrame journal device queue target slot = do
 -- --------------------------------------------------------------------------
 -- The capture path
 
-proveCapture ∷ Journal → Device → PhysicalDevice → Queue → Target → Slots → IO CaptureFacts
-proveCapture journal device physical queue target slots = do
+-- | How large a readback of the whole presented image is.
+captureSize ∷ Target → Word64
+captureSize target =
+  let extent = target.targetExtent
+   in fromIntegral extent.width * fromIntegral extent.height * 4
+
+-- | The native layer the capture path is built from.
+--
+-- The allocation is carried as a pair with the size it was made at, because
+-- the readback needs that size and the size is a property of the allocation
+-- rather than of the buffer the caller asked for. Nothing else about either
+-- handle leaves this function: the construction above them is written once,
+-- against open types, so the headless examples run the same sequence.
+captureOps
+  ∷ Device
+  → PhysicalDevice
+  → Queue
+  → Target
+  → Slot
+  → CaptureOps Buffer (DeviceMemory, DeviceSize) Word32
+captureOps device physical queue target slot =
+  CaptureOps
+    { captureCreateBuffer =
+        createBuffer
+          device
+          ( BufferCreateInfo
+              { next = ()
+              , flags = zero
+              , size = captureSize target
+              , usage = BUFFER_USAGE_TRANSFER_DST_BIT
+              , sharingMode = SHARING_MODE_EXCLUSIVE
+              , queueFamilyIndices = Vector.empty
+              }
+              ∷ BufferCreateInfo '[]
+          )
+          Nothing
+    , captureDestroyBuffer = \buffer → destroyBuffer device buffer Nothing
+    , captureAllocateMemory = \buffer → do
+        requirements ← getBufferMemoryRequirements device buffer
+        memoryProperties ← getPhysicalDeviceMemoryProperties physical
+        let wanted = MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. MEMORY_PROPERTY_HOST_COHERENT_BIT
+            suitable =
+              [ fromIntegral index
+              | (index, memoryType) ← zip [0 ∷ Int ..] (Vector.toList memoryProperties.memoryTypes)
+              , requirements.memoryTypeBits .&. (1 `shiftL` index) /= 0
+              , memoryType.propertyFlags .&. wanted == wanted
+              ]
+        typeIndex ← case suitable of
+          (value : _) → pure value
+          [] → stop "the capture path" "no host-visible, host-coherent memory type can hold a readback buffer"
+        memory ←
+          allocateMemory
+            device
+            ( MemoryAllocateInfo
+                { next = ()
+                , allocationSize = requirements.size
+                , memoryTypeIndex = typeIndex
+                }
+                ∷ MemoryAllocateInfo '[]
+            )
+            Nothing
+        pure (memory, requirements.size)
+    , captureFreeMemory = \(memory, _) → freeMemory device memory Nothing
+    , captureBindMemory = \buffer (memory, _) → bindBufferMemory device buffer memory 0
+    , captureAcquireImage = snd <$> acquireInto device target slot
+    , captureRecordAndSubmit = \buffer image → do
+        let extent = target.targetExtent
+        resetCommandBuffer slot.slotCommands zero
+        useCommandBuffer slot.slotCommands beginOnce $ do
+          transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_UNDEFINED IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+          cmdClearColorImage slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL proofColor (Vector.singleton wholeImage)
+          transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+          cmdCopyImageToBuffer2
+            slot.slotCommands
+            CopyImageToBufferInfo2
+              { srcImage = imageAt target image
+              , srcImageLayout = IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+              , dstBuffer = buffer
+              , regions =
+                  Vector.singleton
+                    ( SomeStruct
+                        ( BufferImageCopy2
+                            { next = ()
+                            , bufferOffset = 0
+                            , bufferRowLength = 0
+                            , bufferImageHeight = 0
+                            , imageSubresource =
+                                ImageSubresourceLayers
+                                  { aspectMask = IMAGE_ASPECT_COLOR_BIT
+                                  , mipLevel = 0
+                                  , baseArrayLayer = 0
+                                  , layerCount = 1
+                                  }
+                            , imageOffset = Offset3D 0 0 0
+                            , imageExtent = Extent3D extent.width extent.height 1
+                            }
+                            ∷ BufferImageCopy2 '[]
+                        )
+                    )
+              }
+          transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL IMAGE_LAYOUT_PRESENT_SRC_KHR
+          -- The copy has to be made available to the host domain before the
+          -- host may read it. Waiting on the submission fence does not do
+          -- that: a fence's access scope covers device accesses only.
+          -- Host-coherent memory removes the need to invalidate a mapped
+          -- range; it does not remove the need for this barrier, and without
+          -- one the bytes that come back are the implementation's habit rather
+          -- than a guarantee.
+          hostReadBarrier slot.slotCommands buffer
+        resetFences device (Vector.singleton slot.slotRenderFence)
+        submitWith queue [slot.slotAcquire] [slot.slotCommands] [slot.slotPresent] slot.slotRenderFence
+    , captureAwaitSubmission =
+        () <$ awaitFence "the capture submission" device slot.slotRenderFence
+    , captureReadBack = \(memory, size) → do
+        mapped ← mapMemory device memory 0 size zero
+        observed ← forM [0 .. 3 ∷ Int] $ \offset → do
+          byte ← peekByteOff mapped offset ∷ IO Word8
+          pure (fromIntegral byte ∷ Word32)
+        unmapMemory device memory
+        pure observed
+    , capturePresent = \image → () <$ presentWithFence device queue target slot image
+    }
+
+-- | The transfer-source capture, whose buffer and memory are owned from the
+-- instant each exists.
+--
+-- The places are the procedure's, registered before the teardown boundary, so
+-- a failure anywhere in this path leaves both to a teardown that destroys them
+-- after the boundary has established that the copy completed — or retains them
+-- and says why, if it has not. The path that reaches the end frees both
+-- itself, exactly once, as it always did.
+proveCapture
+  ∷ Journal
+  → Device
+  → Target
+  → Slots
+  → CaptureOps Buffer (DeviceMemory, DeviceSize) Word32
+  → CapturePlaces Buffer (DeviceMemory, DeviceSize)
+  → IO CaptureFacts
+proveCapture journal device target slots operations places = do
   let slot = slots.firstSlot
       extent = target.targetExtent
-      width = extent.width
-      height = extent.height
-      size = fromIntegral width * fromIntegral height * 4 ∷ Word64
   _ ← reclaim device slot
-  buffer ←
-    createBuffer
-      device
-      ( BufferCreateInfo
-          { next = ()
-          , flags = zero
-          , size = size
-          , usage = BUFFER_USAGE_TRANSFER_DST_BIT
-          , sharingMode = SHARING_MODE_EXCLUSIVE
-          , queueFamilyIndices = Vector.empty
-          }
-          ∷ BufferCreateInfo '[]
-      )
-      Nothing
-  requirements ← getBufferMemoryRequirements device buffer
-  memoryProperties ← getPhysicalDeviceMemoryProperties physical
-  let wanted = MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. MEMORY_PROPERTY_HOST_COHERENT_BIT
-      suitable =
-        [ fromIntegral index
-        | (index, memoryType) ← zip [0 ∷ Int ..] (Vector.toList memoryProperties.memoryTypes)
-        , requirements.memoryTypeBits .&. (1 `shiftL` index) /= 0
-        , memoryType.propertyFlags .&. wanted == wanted
-        ]
-  typeIndex ← case suitable of
-    (value : _) → pure value
-    [] → stop "the capture path" "no host-visible, host-coherent memory type can hold a readback buffer"
-  memory ←
-    allocateMemory
-      device
-      ( MemoryAllocateInfo
-          { next = ()
-          , allocationSize = requirements.size
-          , memoryTypeIndex = typeIndex
-          }
-          ∷ MemoryAllocateInfo '[]
-      )
-      Nothing
-  bindBufferMemory device buffer memory 0
-  (_, image) ← acquireInto device target slot
-  resetCommandBuffer slot.slotCommands zero
-  useCommandBuffer slot.slotCommands beginOnce $ do
-    transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_UNDEFINED IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-    cmdClearColorImage slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL proofColor (Vector.singleton wholeImage)
-    transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-    cmdCopyImageToBuffer2
-      slot.slotCommands
-      CopyImageToBufferInfo2
-        { srcImage = imageAt target image
-        , srcImageLayout = IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-        , dstBuffer = buffer
-        , regions =
-            Vector.singleton
-              ( SomeStruct
-                  ( BufferImageCopy2
-                      { next = ()
-                      , bufferOffset = 0
-                      , bufferRowLength = 0
-                      , bufferImageHeight = 0
-                      , imageSubresource =
-                          ImageSubresourceLayers
-                            { aspectMask = IMAGE_ASPECT_COLOR_BIT
-                            , mipLevel = 0
-                            , baseArrayLayer = 0
-                            , layerCount = 1
-                            }
-                      , imageOffset = Offset3D 0 0 0
-                      , imageExtent = Extent3D width height 1
-                      }
-                      ∷ BufferImageCopy2 '[]
-                  )
-              )
-        }
-    transition slot.slotCommands (imageAt target image) IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL IMAGE_LAYOUT_PRESENT_SRC_KHR
-    -- The copy has to be made available to the host domain before the host may
-    -- read it. Waiting on the submission fence does not do that: a fence's
-    -- access scope covers device accesses only. Host-coherent memory removes
-    -- the need to invalidate a mapped range; it does not remove the need for
-    -- this barrier, and without one the bytes that come back are the
-    -- implementation's habit rather than a guarantee.
-    hostReadBarrier slot.slotCommands buffer
-  resetFences device (Vector.singleton slot.slotRenderFence)
-  submitWith queue [slot.slotAcquire] [slot.slotCommands] [slot.slotPresent] slot.slotRenderFence
-  _ ← awaitFence "the capture submission" device slot.slotRenderFence
-  mapped ← mapMemory device memory 0 requirements.size zero
-  observed ← forM [0 .. 3 ∷ Int] $ \offset → do
-    byte ← peekByteOff mapped offset ∷ IO Word8
-    pure (fromIntegral byte ∷ Word32)
-  unmapMemory device memory
-  _ ← presentWithFence device queue target slot image
-  freeMemory device memory Nothing
-  destroyBuffer device buffer Nothing
+  -- The same operations the procedure registered these places' releases
+  -- against, rather than a second value built the same way: whichever of the
+  -- two reaches a place first is the only one that destroys what is in it, and
+  -- there is no question of which destructor that was.
+  observed ← runCapture operations places
   note journal ("captured " <> Text.pack (show observed) <> " through TRANSFER_SRC from the presented format")
   pure
     CaptureFacts
       { captureFormat = Text.pack (show target.targetFormat)
-      , captureExtent = (width, height)
+      , captureExtent = (extent.width, extent.height)
       , captureExpected = Text.pack (show proofColorBytes)
       , captureObserved = Text.pack (show observed)
       , captureMatched = observed == proofColorBytes
-      , captureBytes = size
+      , captureBytes = captureSize target
       }
 
 -- --------------------------------------------------------------------------

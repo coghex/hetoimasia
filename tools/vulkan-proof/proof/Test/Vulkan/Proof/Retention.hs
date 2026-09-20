@@ -23,7 +23,10 @@
 --   escape for a session that never resolves is retention plus process exit,
 --   never a preemptible native call or a destroy wrapped in a timeout;
 -- * the device is lost, and the specification's own device-loss rule permits
---   destruction without waiting for work that may never complete.
+--   destruction without waiting for work that may never complete. That waiver
+--   is about completion and about nothing else: a lost device's children are
+--   still objects that must be destroyed before it, so a child that was not
+--   released still withholds every parent that has to outlive it.
 --
 -- A timeout is never promoted to device loss. It is the case where completion
 -- is still owed, which is precisely the case retention exists for.
@@ -46,6 +49,7 @@ module Test.Vulkan.Proof.Retention
   , handleEntry
   , isDestruction
   , teardownPlan
+  , capturePlan
   , teardownEntries
 
     -- * The decision
@@ -55,6 +59,8 @@ module Test.Vulkan.Proof.Retention
   , standingFrom
   , Disposition (..)
   , wasDestroyed
+  , boundaryRequired
+  , dispositionOf
   , decide
   , releasedEntries
   , retainedHandles
@@ -192,6 +198,11 @@ data Handle
     -- everything whose completion the device-idle boundary does establish.
   | SlotPresentFence SlotName
   | SlotPresentSemaphore SlotName
+  | TheCaptureBuffer
+    -- ^ The readback buffer the capture path creates, owned from the instant
+    -- it exists rather than only at the successful end of that path.
+  | TheCaptureMemory
+    -- ^ The host-visible allocation bound to it, owned the same way.
   | TheSwapchain
   | TheLogicalDevice
   | TheWindowSurface
@@ -208,6 +219,8 @@ describeHandle = \case
   SlotWorkObjects slot → "the command pool, rendering fence and acquisition semaphore of " <> slot
   SlotPresentFence slot → "the present fence of " <> slot
   SlotPresentSemaphore slot → "the presentation semaphore of " <> slot
+  TheCaptureBuffer → "the capture buffer"
+  TheCaptureMemory → "the capture memory"
   TheSwapchain → "the swapchain"
   TheLogicalDevice → "the logical device"
   TheWindowSurface → "the window surface"
@@ -237,6 +250,11 @@ handleEntry = \case
   SlotWorkObjects _ → "the frame slots"
   SlotPresentFence _ → "the frame slots"
   SlotPresentSemaphore _ → "the frame slots"
+  -- One entry each, and neither is among the ten a whole run releases: the
+  -- capture frees both itself and takes their registrations back, so they
+  -- appear only on a run that stopped while it still held them.
+  TheCaptureBuffer → "the capture buffer"
+  TheCaptureMemory → "the capture memory"
   TheSwapchain → "the swapchain"
   TheLogicalDevice → "the logical device"
   TheWindowSurface → "the window surface"
@@ -246,12 +264,20 @@ handleEntry = \case
   TheCallbackTrampoline → "the callback trampoline"
   GlfwTermination → "GLFW"
 
--- | Every handle a whole run registers, in the order teardown reaches them:
--- the reverse of the order the procedure registered their cleanups.
+-- | Every handle a whole run still holds when teardown starts, in the order
+-- teardown reaches them: the reverse of the order the procedure registered
+-- their cleanups.
 --
 -- A run that stopped early registered a prefix of this, so the executor builds
 -- its plan from what was actually registered. This is the whole of it, which
 -- is what the examples and 'teardownEntries' are written against.
+--
+-- 'TheCaptureBuffer' and 'TheCaptureMemory' are deliberately not here. The
+-- capture path owns both from the instant each exists, and a run that reaches
+-- the end of that path frees them itself and takes their registrations back —
+-- so a whole run arrives at teardown holding neither, and the ten entries
+-- below are unchanged. 'capturePlan' is where a run that stopped inside the
+-- capture still holds them.
 teardownPlan ∷ [SlotName] → [Handle]
 teardownPlan slots =
   [TheTeardownBoundary]
@@ -268,6 +294,15 @@ teardownPlan slots =
        , TheCallbackTrampoline
        , GlfwTermination
        ]
+
+-- | Where the capture's own two handles sit in a plan that still carries them,
+-- in the order teardown reaches them: the memory first, which is the order the
+-- successful path frees them in and the one @vkFreeMemory@ permits.
+--
+-- The procedure registers them immediately before the teardown boundary, so a
+-- run that stopped inside the capture reaches them right after it.
+capturePlan ∷ [Handle]
+capturePlan = [TheCaptureMemory, TheCaptureBuffer]
 
 -- | The ten cleanup entries a whole teardown releases, in order. Requirement 7
 -- fixes this list and this order for the successful path; the finer handles
@@ -382,45 +417,69 @@ wasDestroyed = \case
   Destroy → True
   Retain _ → False
 
+-- | Whether anything in this plan is owed what a device-idle boundary
+-- supplies.
+--
+-- A plan without one is a run that stopped before the procedure registered it,
+-- and the procedure registers it immediately after the frame slots and submits
+-- nothing until afterwards — so such a plan holds no object with queue work
+-- outstanding, and the absence withholds nothing. A plan that does hold one
+-- has already run it, because it is first in teardown order; a plan that holds
+-- one and reached no result for it is a teardown that lost its own evidence,
+-- and withholding is the only safe answer to that.
+boundaryRequired ∷ [Handle] → Bool
+boundaryRequired plan = TheTeardownBoundary `elem` plan
+
 -- | The disposition of every handle in a plan, in teardown order.
 --
 -- Retention propagates upward: a handle whose child is withheld is withheld
 -- too, so the plan's own child-before-parent order is what carries a retained
 -- present fence all the way up to the window and to @glfwTerminate@.
+--
+-- This decides the whole plan in advance, which is what the headless examples
+-- assert over. The native executor walks the same 'dispositionOf' one handle
+-- at a time instead, because it learns something this cannot know in advance:
+-- whether a release it already ran actually succeeded.
 decide ∷ [Handle] → [Observation] → [(Handle, Disposition)]
 decide plan observations = walk [] plan
   where
     standing = standingFrom observations
-
-    -- Whether anything in this plan is owed what a device-idle boundary
-    -- supplies. A plan without one is a run that stopped before the procedure
-    -- registered it, and the procedure registers it immediately after the
-    -- frame slots and submits nothing until afterwards — so such a plan holds
-    -- no object with queue work outstanding, and the absence withholds
-    -- nothing. A plan that does hold one has already run it, because it is
-    -- first in teardown order; a plan that holds one and reached no result for
-    -- it is a teardown that lost its own evidence, and withholding is the only
-    -- safe answer to that.
-    required = TheTeardownBoundary `elem` plan
+    required = boundaryRequired plan
 
     walk _ [] = []
     walk withheld (handle : rest) =
       let disposition = dispositionOf standing required withheld handle
           withheld' = case disposition of
-            Retain _ → withheld <> [handle]
+            Retain _ → withheld <> [(handle, "is retained")]
             Destroy → withheld
        in (handle, disposition) : walk withheld' rest
 
-dispositionOf ∷ Standing → Bool → [Handle] → Handle → Disposition
+-- | What may become of one handle, given what the run recorded and which
+-- handles below it are known not to have gone.
+--
+-- A withheld child carries the phrase that says why it did not go, because
+-- there are two ways for that to happen and they are not the same fact: it was
+-- retained, or its own release was attempted and failed. Either way its parent
+-- must not be destroyed over it, and the reason a reader sees has to say which
+-- it was.
+dispositionOf ∷ Standing → Bool → [(Handle, Text)] → Handle → Disposition
 dispositionOf standing required withheld handle
   -- The boundary is a wait, not a destruction. It is what produces the
   -- evidence the releases below it are judged against, so it always runs.
   | handle == TheTeardownBoundary = Destroy
-  | standing.standingRoute == DeviceLossRoute = Destroy
-  | otherwise = case boundaryReasons <> presentReasons <> dependencyReasons of
+  -- Device loss waives the completion evidence and nothing else. The
+  -- specification permits destroying a lost device's objects without waiting
+  -- for work that may never complete; it does not permit destroying a parent
+  -- while a child of it is still there, and a lost device's children are still
+  -- objects that must be destroyed before it. So the boundary and presentation
+  -- conditions fall away here and the dependency one does not.
+  | standing.standingRoute == DeviceLossRoute = withhold dependencyReasons
+  | otherwise = withhold (boundaryReasons <> presentReasons <> dependencyReasons)
+  where
+    withhold = \case
       [] → Destroy
       reasons → Retain (Text.intercalate "; " reasons)
-  where
+
     boundaryReasons
       | not (required && restsOnBoundary handle) = []
       | otherwise = case standing.standingBoundary of
@@ -444,8 +503,8 @@ dispositionOf standing required withheld handle
     pendingOf slot = [why | (held, why) ← standing.standingPending, held == slot]
 
     dependencyReasons =
-      [ describeHandle child <> " is retained, and " <> describeHandle handle <> " must outlive it"
-      | child ← withheld
+      [ describeHandle child <> " " <> phrase <> ", and " <> describeHandle handle <> " must outlive it"
+      | (child, phrase) ← withheld
       , child `mustPrecede` handle
       ]
 
@@ -457,6 +516,14 @@ restsOnBoundary = \case
   SlotWorkObjects _ → True
   SlotPresentFence _ → True
   SlotPresentSemaphore _ → True
+  -- The only device work either of these ever carries is the copy the capture
+  -- submitted to the queue, and the boundary is exactly the evidence that a
+  -- queue has finished. An unretired present does not hold them: a present is
+  -- work the presentation engine does on a swapchain image, and neither the
+  -- readback buffer nor its allocation is an object it touches. Retaining them
+  -- behind one would put a reason in the record that the run never observed.
+  TheCaptureBuffer → True
+  TheCaptureMemory → True
   TheSwapchain → True
   TheLogicalDevice → True
   _ → False
@@ -488,6 +555,8 @@ mustPrecede child parent = case parent of
       SlotWorkObjects _ → True
       SlotPresentFence _ → True
       SlotPresentSemaphore _ → True
+      TheCaptureBuffer → True
+      TheCaptureMemory → True
       TheSwapchain → True
       _ → False
 

@@ -37,6 +37,9 @@ examples that keep the rest of that boundary honest.
 | `proof/Test/Vulkan/Proof/Invocation.hs` | Which mode an argument list asks for, and why the native one accepts no test options. |
 | `proof/Test/Vulkan/Proof/Run.hs` | The whole native run, on the process main thread: environment, loader identity, instance, device, swapchain, completion, abandonment, capture, callbacks, and teardown. |
 | `proof/Test/Vulkan/Proof/Findings.hs` | What the run observed, as data. |
+| `proof/Test/Vulkan/Proof/Ownership.hs` | Who owns a handle between the call that created it and the teardown that releases it: the cleanup stack, the ledger, and the teardown executor. |
+| `proof/Test/Vulkan/Proof/Construction.hs` | The two composites built from several fallible calls — a frame slot, and the capture buffer with its memory — written once against an open native layer. |
+| `proof/Test/Vulkan/Proof/ConstructionSpec.hs` | Their ownership examples, which `--headless` selects: every step of both constructions failed in turn, with a stand-in native layer. |
 | `proof/Test/Vulkan/Proof/Retention.hs` | The release decision: which of teardown's handles the run's own evidence permits destroying, as a pure function. |
 | `proof/Test/Vulkan/Proof/RetentionSpec.hs` | That decision's own examples, which `--headless` selects. |
 | `proof/Test/Vulkan/Proof/InvocationSpec.hs` | The invocation policy's examples, selected alongside them. |
@@ -52,6 +55,69 @@ The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
 verdict is computed after every callback-producing teardown has finished, and so
 no Hspec worker thread can ever reach a GLFW call.
+
+## Every handle is owned before the next fallible step
+
+Teardown can only decide over handles it was given, so nothing this harness
+creates is allowed to exist without a cleanup owner — not even for the one
+native call that follows it.
+
+A handle whose whole construction is a single call is registered inside the
+same masked step that creates it, so neither a synchronous failure nor a
+cancellation delivered at the handoff can leave it orphaned.
+
+Two of the harness's resources are not single calls. A frame slot is two
+semaphores, two fences, a command pool and a command buffer; the capture is a
+buffer, an allocation bound to it, a submission, a readback and a present. For
+those, `Construction.hs` registers every release *before* the first native call
+of the construction runs, against places that are empty until each child
+exists. So:
+
+- a failure at any step of either slot — the second semaphore of the first, or
+  any step of the second while the first is already whole — releases exactly
+  the children that exist, in dependency order, before the device registered
+  above them is destroyed. Without that, `vkDestroyDevice` ran over live device
+  children, which `VUID-vkDestroyDevice-device-05137` forbids;
+- a failure anywhere in the capture path — creating the buffer, allocating or
+  binding its memory, acquiring, submitting, waiting, mapping or presenting —
+  leaves both the buffer and its allocation to a teardown that frees them after
+  the boundary has established that the copy completed, or retains them and
+  says why if it has not. An unretired present does not hold them: a present is
+  work the presentation engine does on a swapchain image, and neither is an
+  object it touches;
+- a command buffer is owned through the command pool that allocated it, which
+  is what `vkDestroyCommandPool` says, rather than freed a second time on its
+  own;
+- an object is taken out of its place before it is destroyed, so nothing is
+  released twice and a handle that was never created is never destroyed. A
+  place records three states, not two: empty, holding, and *not released* — the
+  destroy was attempted and did not complete. A failed destroy is never
+  retried, and the place keeps the reason instead of the object, so a release
+  the capture path performs itself at the end of its own path is as visible to
+  teardown as one teardown performed;
+- teardown reports what it actually did. A cleanup entry whose construction
+  never reached it holds no native object, so it is neither counted as a
+  destruction nor retained — retaining nothing would hold every parent above it
+  for a handle that does not exist — and a release names the objects it
+  emptied, so a partial construction's record lists the children that went
+  rather than the entry that owns them;
+- a release that fails is recorded beside the primary failure that stopped the
+  run rather than replacing it. An entry that owns several children reports all
+  of their failures and all of their destructions, so one child's failure
+  neither hides a second nor denies the siblings that did go. Its object may
+  still be alive, so every parent that must outlive it is withheld exactly as a
+  retained child's parents are: destroying a device over a command pool whose
+  destruction failed is the same invalid teardown as destroying it over one
+  that was never registered. The releases that do not depend on it still run.
+
+The successful path is unchanged by all of this: the same ten cleanup entries
+in the same order. The capture is the one construction that frees its own two
+handles at the end of the path, exactly once, as it always did — so it then
+recalls their two registrations and teardown arrives where it always arrived.
+
+`ConstructionSpec.hs` asserts that headlessly, by replacing the native layer
+and choosing the step to fail at, because a native run cannot be asked to fail
+its fifth `vkCreateSemaphore` or its memory allocation on demand.
 
 ## Teardown is decided, not promised
 
@@ -91,7 +157,11 @@ So teardown asks `Retention.hs`, and obeys it:
   unresolved boundary failure still holds;
 - device loss is its own disposition. The specification permits destroying a
   lost device's objects without waiting for work that may never complete, and
-  the record says that path was taken. A timeout is never promoted to it.
+  the record says that path was taken. A timeout is never promoted to it. The
+  waiver is about completion and about nothing else: a lost device's children
+  are still objects that must be destroyed before it, so a child that was not
+  released still withholds every parent that has to outlive it, on this route
+  as on the ordinary one.
 
 Anything still retained is released by process exit and by nothing else. No
 native call here is made preemptible and no native destroy is wrapped in a
@@ -102,9 +172,10 @@ run that stopped as well as on one that proved.
 
 The decision is a pure function of the effects and results the run recorded, and
 the native cleanup executor calls the same one the examples do. `--headless`
-runs those examples alone: they open no window, initialize no GLFW, make no
-native call, and need no consent, which is what lets a fence timeout, a failed
-boundary, and a lost device be exercised at all.
+runs those examples and the construction ones alone: they open no window,
+initialize no GLFW, make no native call, and need no consent, which is what
+lets a fence timeout, a failed boundary, a lost device, and a construction that
+stops at a chosen step be exercised at all.
 
 ```bash
 bash tools/vulkan-proof/run-proof.sh --headless
