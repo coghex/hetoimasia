@@ -694,10 +694,13 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
                     f"{where} key 'platforms' must name at least one platform, or be omitted "
                     "to declare the group applicable everywhere"
                 )
-            for entry in platforms:
-                if not isinstance(entry, str) or not entry:
-                    problems.append(f"{where} has a non-string platforms entry")
-            if len(set(platforms)) != len(platforms):
+            named = [entry for entry in platforms if isinstance(entry, str) and entry]
+            if len(named) != len(platforms):
+                problems.append(f"{where} has a non-string platforms entry")
+            # Asked of the entries that are names, because a catalog is
+            # arbitrary JSON: an array or object entry is unhashable, and
+            # counting it would raise where a diagnostic is owed.
+            elif len(set(named)) != len(named):
                 problems.append(f"{where} names a platform more than once")
 
         if not isinstance(identifier, str) or not ID_PATTERN.match(identifier or ""):

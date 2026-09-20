@@ -374,6 +374,12 @@ spec = describe "Validation planner" $ do
         -- empty list would name a group nothing may ever execute.
         refusal "empty-platforms.json" (platformsCatalog "[]") "must name at least one platform"
         refusal "odd-platforms.json" (platformsCatalog "[\"Linux\", 7]") "non-string platforms entry"
+        -- A catalog is arbitrary JSON, so an entry can be a value that cannot
+        -- be counted at all. Each is owed the same diagnostic rather than an
+        -- interpreter traceback.
+        refusal "nested-platforms.json" (platformsCatalog "[[\"Linux\"]]") "non-string platforms entry"
+        refusal "mapped-platforms.json" (platformsCatalog "[{\"os\": \"Linux\"}]") "non-string platforms entry"
+        refusal "blank-platforms.json" (platformsCatalog "[\"\"]") "non-string platforms entry"
         refusal "twice-platforms.json" (platformsCatalog "[\"Linux\", \"Linux\"]") "names a platform more than once"
 
     it "names a group that is missing its optional classification" $

@@ -188,16 +188,18 @@ It is one of the two platform-only groups, beside
 them CI runs. Its components are built on Linux alone -- an `if os(linux)`/`else
 buildable` conditional excludes them elsewhere, so the group is not a vacuous
 pass on a machine that cannot run it -- and the planner accepts that conditional
-without reading its body, so the probe's sources select this group on every
-platform rather than only on the one that builds them.
+without reading its body, so the probe's sources count as this group's inputs on
+every platform rather than only on the one that builds them. A change to them
+therefore reports `inputs_changed: true` wherever the candidate is planned.
 
-Selecting it everywhere and executing it only on Linux are two different
-statements, and the catalog makes the second one itself: the group declares
-`"platforms": ["Linux"]`. On a Linux plan nothing changes -- it is non-optional,
-selected from its own inputs or the unknown-input fallback, and routed to a
-`cpu` worker like any other mandatory group outside the floor. On a plan for
-any other `runner_os` it is omitted as `platform-inapplicable`, while still
-reporting its `inputs_changed` exactly as the Linux plan does.
+*What a change touches* and *what this machine can run* are two different
+questions, and `inputs_changed` answers only the first. The catalog answers the
+second itself: the group declares `"platforms": ["Linux"]`. On a Linux plan
+nothing changes -- it is non-optional, selected from its own inputs or the
+unknown-input fallback, and routed to a `cpu` worker like any other mandatory
+group outside the floor. On a plan for any other `runner_os` it is **not
+selected**: it is omitted as `platform-inapplicable`, while still reporting the
+same `inputs_changed` the Linux plan does.
 
 That omission is what makes a local macOS plan possible at all. Every
 dependency change moves `cabal.project.common`, which this group declares, so
