@@ -12,10 +12,11 @@
 -- one and why. See "Test.Vulkan.Proof.Retention", and the README beside this
 -- file.
 --
--- @--headless@ selects only that decision's own examples and the composite
--- constructions' ownership examples. They open no window, initialize no GLFW,
--- make no native call, and read no consent, so the branch is taken here before
--- consent and before any native procedure would run:
+-- @--headless@ selects only that decision's own examples, the composite
+-- constructions' ownership examples, and the present handoff's cancellation
+-- examples. They open no window, initialize no GLFW, make no native call, and
+-- read no consent, so the branch is taken here before consent and before any
+-- native procedure would run:
 --
 -- > bash tools/vulkan-proof/run-proof.sh --headless
 --
@@ -47,6 +48,7 @@ import qualified Test.Vulkan.Proof.ConstructionSpec as Construction
 import Test.Vulkan.Proof.Invocation (Mode (..), selectMode)
 import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import Test.Vulkan.Proof.Journal (entries, newJournal)
+import qualified Test.Vulkan.Proof.PublicationSpec as Publication
 import Test.Vulkan.Proof.Record (renderRecord)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 import Test.Vulkan.Proof.Run (runProof)
@@ -81,13 +83,14 @@ headless selectors = do
   unless (isSuccess result) exitFailure
 
 -- | Everything @--headless@ selects: the release decision's own examples, the
--- composite constructions' ownership examples, and the invocation policy's.
--- The native run asserts what it can of these too, through
--- "Test.Vulkan.Proof.Spec".
+-- composite constructions' ownership examples, the present handoff's
+-- cancellation examples, and the invocation policy's. The native run asserts
+-- what it can of these too, through "Test.Vulkan.Proof.Spec".
 headlessExamples ∷ Spec
 headlessExamples = do
   Retention.spec
   Construction.spec
+  Publication.spec
   Invocation.spec
 
 native ∷ IO ()
