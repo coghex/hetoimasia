@@ -68,10 +68,14 @@ contracts; do not redraft those prerequisites.
 
 The [batch review ledger](project_review/ledger.md) records the review of
 PRs #170–#180. The [Vulkan model review](project_review/175.md) identifies
-image-reacquisition and budget-opacity repairs. The
+image-reacquisition and budget-opacity repairs; #183 landed the first, so the
+pure model now admits a new acquisition of an image whose presentation is
+already enqueued, against its own free pool record and its own acquisition
+synchronization, exactly as P-2 and VK-13 describe. The budget-opacity repair
+remains outstanding. The
 [proof review](project_review/174.md) identifies unsafe unsuccessful-exit
-cleanup and partial-construction rollback gaps. Repair those contracts before
-dependent native integration relies on them. Successful retained platform runs
+cleanup and partial-construction rollback gaps. Repair the contracts that
+remain before dependent native integration relies on them. Successful retained platform runs
 still support the selected compatibility profile; the production backend has
 not been implemented or verified by that experiment.
 

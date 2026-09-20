@@ -101,7 +101,8 @@ spec = describe "admission budgets" $ do
       -- Three tracked images and two frame slots give a pool of five. A new
       -- generation consumes the target's existing pool, including the records a
       -- retired generation still owes retirements on, rather than receiving one
-      -- of its own — which is the only way the derived pool binds at all.
+      -- of its own. That sharing is one way the derived pool binds; the example
+      -- below reaches the same bound within a single generation.
       model ← freshModelWith smallRequest {requestedFrameSlots = 2, requestedAggregateFrameSlots = 4, requestedImageTracking = 3}
       (active, target, first) ← activeTarget 3 model
       retiring ← leaveEnqueued target 3 active
@@ -127,6 +128,22 @@ spec = describe "admission budgets" $ do
       skipped ← admitted_ "skipping the admitted frame" (skipUnsubmittedFrame frame acquired)
       settled ← admitted_ "settling it" (recordCompletion (atMilliseconds 1) (UnpresentedFrameSettled frame) skipped)
       fmap viewTargetPoolRecords (targetView target settled) `shouldBe` Just 4
+
+    it "answers backpressure for a pool one generation exhausted by repeated acquisition" $ do
+      -- One tracked image and two frame slots give a pool of three. A new
+      -- acquisition of that image is admitted while each older record is still
+      -- presenting it, so one generation reaches the pool bound on its own and
+      -- the reacquisition that finds no free record is ordinary backpressure.
+      model ← freshModelWith smallRequest {requestedFrameSlots = 2, requestedAggregateFrameSlots = 4, requestedImageTracking = 1}
+      (active, target, _) ← activeTarget 1 model
+      exhausted ← leaveEnqueued target 3 active
+      fmap viewTargetPoolRecords (targetView target exhausted) `shouldBe` Just 3
+      -- One generation, and every record of it took the target's only image.
+      fmap viewTargetGenerations (targetView target exhausted) `shouldBe` Just 1
+      -- No slot is in use either, so this is the pool answering and nothing else.
+      fmap viewTargetFrames (targetView target exhausted) `shouldBe` Just 0
+      backpressured "reserving a record for a fourth acquisition" (reserveFrame target exhausted)
+        >>= (`shouldBe` PresentationPoolBudget)
 
     it "answers backpressure for the byte and object budgets" $ do
       model ← freshModelWith smallRequest {requestedBytes = 2048, requestedObjects = 8}

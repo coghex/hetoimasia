@@ -1447,10 +1447,13 @@ acquireImage identity outcome model =
         Nothing → Rejected (WrongPhase GenerationIdentity)
         Just (generation, record)
           | index >= generationImages record → Rejected (UnknownIdentity ImageIdentity)
-          -- One image, one owner. A record that took an image keeps it until its
-          -- presentation retires or its unpresented frame is settled, and that
-          -- record can outlive the frame, so the check is against the pool rather
-          -- than against the frames.
+          -- One image, one *unpresented* owner. A record that took an image keeps
+          -- it until its presentation is enqueued, and that record can outlive
+          -- the frame, so the check is against the pool rather than against the
+          -- frames. Enqueuing hands the image to the presentation engine, after
+          -- which P-2 admits a fresh acquisition of it against a separate free
+          -- pool record while the older present fence is still pending; the older
+          -- record keeps its own image and its own retirement regardless.
           | imageOwned target generation index → Rejected (AlreadyConsumed ImageIdentity)
           | otherwise → case framePoolRecord frame of
               Nothing → Rejected (WrongPhase PresentationIdentity)
@@ -1497,13 +1500,23 @@ acquireImage identity outcome model =
                       suboptimal
                   )
 
--- | Whether a live pool record of this target already owns that image of that
--- generation.
+-- | Whether a live pool record of this target still owns that image of that
+-- generation against a frame that has not presented it.
+--
+-- A reserved record — an acquired frame, a submitted one, one whose submission
+-- failed without enqueuing a presentation, and one whose effect is uncertain —
+-- owns its image outright, and so does one awaiting the explicit settlement of a
+-- frame that was never presented. An enqueued record does not: the image is the
+-- presentation engine's now, and P-2 permits reacquiring it against separate
+-- acquisition synchronization rather than stalling the host on the older present
+-- fence. That record is still tracked, still names its own image, and still owes
+-- its own retirement.
 imageOwned ∷ Target → Natural → Natural → Bool
 imageOwned target generation index =
   or
     [ poolGeneration entry == Just generation && poolImage entry == Just index
     | entry ← Map.elems (targetPool target)
+    , poolState entry /= PoolEnqueued
     ]
 
 -- | The object capacity a frame is still holding for a submission record it has
