@@ -117,12 +117,26 @@ the monotonic resource counter.
 waiting for one of their halves, so a caller — or an example — can see the
 distinctions above rather than infer them.
 
-An image belongs to one owner at a time. The presentation record that takes an
-image at acquisition carries that exact image, and that record outlives its frame
-— the slot is reusable as soon as its own submission completes, while the record
-still owes a retirement. Reacquiring the same image of the same generation is
-refused until that retirement, or until the explicit settlement of an unpresented
-frame, releases it.
+An image belongs to one *unpresented* owner at a time. The presentation record
+that takes an image at acquisition carries that exact image, and that record
+outlives its frame — the slot is reusable as soon as its own submission
+completes, while the record still owes a retirement. While the frame that took
+the image has not enqueued a presentation for it, a second acquisition of that
+image of that generation is refused: the frame is the only owner, and the refusal
+holds whether the frame is acquired, submitted, failed without enqueuing a
+presentation, in an uncertain-effect state, or retiring while it awaits explicit
+settlement.
+
+Enqueuing the presentation ends that exclusivity. The image is the presentation
+engine's then, and P-2 acquisition synchronization — not a host wait on the older
+present fence — is what makes the next use of it safe, so a second acquisition is
+admitted as soon as a free pool record is available for it. Nothing about the
+older record moves: it still names its own image, it still owes its own
+retirement, and it is discharged by evidence for itself alone. Two live records
+of one generation may therefore name one image, and each settles independently in
+either order. An image the owner never presented is released only by the explicit
+settlement of its unpresented frame, and a reacquisition that finds no free pool
+record is ordinary backpressure rather than a refusal about ownership.
 
 A target is classified `RequiredTarget` or `OptionalTarget` when it is admitted.
 The classification decides only what exhausted recovery escalates to; it never
@@ -188,6 +202,11 @@ The distinctions that lose obligations when collapsed:
   presentation is enqueued. The slot goes back as soon as its own submission has
   completed and it holds no unsubmitted recording — in either order, whether the
   submission completed before the presentation was enqueued or after.
+- **Owned against presented.** Before the enqueue, the frame is the image's only
+  owner and a second acquisition is refused. After it, the image may be acquired
+  again against a separate free pool record, whether or not the older frame's
+  submission has completed yet; the older record is neither retired, recycled,
+  nor discharged by that acquisition.
 - **Skipped against closed.** A skipped unsubmitted frame discharges its
   unsubmitted recording and keeps its image and acquisition synchronization; a
   submitted frame closed before presentation keeps *both* its submission
@@ -214,7 +233,8 @@ that really was submitted. Frames of one shared submission give back the
 reservations the single record does not need. A reservation that creates no
 obligation returns everything it took; a record that ever covered an acquired
 image is recycled only by retirement evidence for an enqueued presentation, or by
-explicit settlement evidence for a frame that was never presented.
+explicit settlement evidence for a frame that was never presented — and never by
+a later acquisition of the image it named.
 
 ## Admission budgets
 
@@ -560,7 +580,11 @@ reserves nothing refused outright; one recovery attempt at a time and none at al
 in a failed session; a construction that finished after device loss retired
 rather than published; a replacement request cleared by the publication that
 served it while a newer one stays pending; an image still named by the record
-that outlived its frame, in either completion order, and not acquirable twice;
+that outlived its frame, in either completion order, acquirable again by a second
+frame with its own pool record once its presentation is enqueued — before as well
+as after the older submission completes — and refused to a second frame in every
+phase before that enqueue; two records of one image settling independently in
+either retirement order; a pool one generation exhausted by repeated acquisition;
 and a logical resource forgotten after its last generation is disposed of while a
 retained identity for it is still called stale.
 

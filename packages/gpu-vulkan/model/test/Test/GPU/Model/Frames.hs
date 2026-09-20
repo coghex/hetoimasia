@@ -11,6 +11,7 @@ module Test.GPU.Model.Frames (spec) where
 import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (requestedImageTracking), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity
+import Numeric.Natural (Natural)
 import Test.GPU.Model.Support
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
@@ -196,21 +197,18 @@ spec = describe "frame ownership" $ do
     frameView frame slotFree `shouldBe` Nothing
     presentationImage presentation slotFree `shouldBe` Just image
 
-    -- While that record owns the image, no second owner is admitted.
+    -- A second frame may take the image while that record is still presenting
+    -- it, and the record keeps naming it regardless.
     (reserved, other) ← admitted "reserving another frame" (reserveFrame target slotFree)
-    outcomeModel (acquireImage other (AcquiredImage 1) reserved)
-      `shouldBe` Rejected (AlreadyConsumed ImageIdentity)
-    -- The generation's other image is free, so this is about the image rather
-    -- than about the generation.
-    (elsewhere, _) ← admitted "acquiring the other image" (acquireImage other (AcquiredImage 0) reserved)
+    (elsewhere, _) ← admitted "reacquiring the enqueued image" (acquireImage other (AcquiredImage 1) reserved)
     fmap viewFramePhase (frameView other elsewhere) `shouldBe` Just FrameAcquired
+    fmap viewFrameImage (frameView other elsewhere) `shouldBe` Just (Just image)
+    presentationImage presentation elsewhere `shouldBe` Just image
 
-    -- Retirement is what releases it, and then it can be acquired again.
-    retired ← admitted_ "retiring the presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) slotFree)
+    -- Retirement is what ends the record, and it ends that record alone.
+    retired ← admitted_ "retiring the presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) elsewhere)
     presentationImage presentation retired `shouldBe` Nothing
-    (reacquiring, again) ← admitted "reserving once more" (reserveFrame target retired)
-    (reacquired, _) ← admitted "reacquiring the released image" (acquireImage again (AcquiredImage 1) reacquiring)
-    fmap viewFrameImage (frameView again reacquired) `shouldBe` Just (Just image)
+    fmap viewFrameImage (frameView other retired) `shouldBe` Just (Just image)
 
     -- The other order: the presentation retires while the submission is still
     -- pending. The record goes, and the frame stays until its own work ends.
@@ -224,6 +222,201 @@ spec = describe "frame ownership" $ do
     frameView otherFrame completedLast `shouldBe` Nothing
     fmap viewOutstanding (holdView (GenerationSubject otherGeneration) completedLast)
       `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
+
+  it "admits a reacquisition of an image whose presentation is already enqueued" $ do
+    -- The reported reproduction: publish two images, take image zero through an
+    -- enqueued presentation, record only the submission's completion, and ask
+    -- for image zero again from a second frame with its own pool record. P-2
+    -- makes that legal — the second acquisition has its own synchronization, so
+    -- nothing about it needs the older present fence to have retired.
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, generation) ← activeTarget 2 model
+    (enqueued, first, image, submission, presentation) ← imageEnqueued target 0 PresentationEnqueued active
+    completed ← admitted_ "completing the first submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) enqueued)
+    frameView first completed `shouldBe` Nothing
+
+    (reserved, second) ← admitted "reserving a second frame" (reserveFrame target completed)
+    (reacquired, answer) ← admitted "reacquiring the enqueued image" (acquireImage second (AcquiredImage 0) reserved)
+    answer `shouldBe` ImageOwned image False
+    fmap viewFrameImage (frameView second reacquired) `shouldBe` Just (Just image)
+
+    -- The older record is untouched: it still names the image, it is still one
+    -- of the target's two live pool records, and the generation now owes two
+    -- separate presentation obligations rather than one shared one.
+    presentationImage presentation reacquired `shouldBe` Just image
+    poolRecords target reacquired `shouldBe` 2
+    fmap (length . viewPresentations) (holdView (GenerationSubject generation) reacquired) `shouldBe` Just 2
+    fmap (elem presentation . viewPresentations) (holdView (GenerationSubject generation) reacquired) `shouldBe` Just True
+
+  it "admits the reacquisition before the earlier submission's completion is recorded" $ do
+    -- The completed submission above is a regression example, not a prerequisite:
+    -- a free frame slot and a free pool record are the whole admission condition.
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, _) ← activeTarget 2 model
+    (enqueued, first, image, submission, presentation) ← imageEnqueued target 0 PresentationEnqueued active
+    fmap viewFramePhase (frameView first enqueued) `shouldBe` Just FramePresentationEnqueued
+
+    (reserved, second) ← admitted "reserving a second frame" (reserveFrame target enqueued)
+    (reacquired, answer) ← admitted "reacquiring before the old submission completed" (acquireImage second (AcquiredImage 0) reserved)
+    answer `shouldBe` ImageOwned image False
+
+    -- Neither older obligation was discharged by the acquisition.
+    usageSubmissions (usage reacquired) `shouldBe` 1
+    fmap viewFramePhase (frameView first reacquired) `shouldBe` Just FramePresentationEnqueued
+    presentationImage presentation reacquired `shouldBe` Just image
+
+    -- And each still settles on its own fact, in the order the owner observes it.
+    completed ← admitted_ "completing the old submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) reacquired)
+    frameView first completed `shouldBe` Nothing
+    fmap viewFrameImage (frameView second completed) `shouldBe` Just (Just image)
+    retired ← admitted_ "retiring the old presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) completed)
+    presentationImage presentation retired `shouldBe` Nothing
+    fmap viewFramePhase (frameView second retired) `shouldBe` Just FrameAcquired
+
+  it "settles the two uses of one image independently, in either retirement order" $ do
+    let bothOwners = do
+          model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+          (active, target, generation) ← activeTarget 2 model
+          (enqueued, _, image, submission, presentation) ← imageEnqueued target 0 PresentationEnqueued active
+          completed ← admitted_ "completing the first submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) enqueued)
+          (second, newer, _, newerSubmission, newerPresentation) ← imageEnqueued target 0 PresentationEnqueued completed
+          pure (second, target, generation, newer, image, presentation, newerSubmission, newerPresentation)
+
+    -- The older record retires first. That discharges its obligation alone: the
+    -- newer one is still owed, so the generation is not disposable yet.
+    (older, target, generation, newer, image, presentation, newerSubmission, newerPresentation) ← bothOwners
+    presentationImage newerPresentation older `shouldBe` Just image
+    olderGone ← admitted_ "retiring the older presentation" (recordCompletion (atMilliseconds 2) (PresentationRetired presentation) older)
+    presentationImage presentation olderGone `shouldBe` Nothing
+    presentationImage newerPresentation olderGone `shouldBe` Just image
+    poolRecords target olderGone `shouldBe` 1
+    fmap viewOutstanding (holdView (GenerationSubject generation) olderGone)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed, SubmittedUseOwed, PresentationObligationOwed]
+    -- The newer frame is still its own frame, and its own submission is its own.
+    fmap viewFramePhase (frameView newer olderGone) `shouldBe` Just FramePresentationEnqueued
+    newerDone ←
+      admitted_ "completing the newer submission" (recordCompletion (atMilliseconds 3) (SubmissionCompleted newerSubmission) olderGone)
+        >>= \completedNewer →
+          admitted_ "retiring the newer presentation" (recordCompletion (atMilliseconds 4) (PresentationRetired newerPresentation) completedNewer)
+    frameView newer newerDone `shouldBe` Nothing
+    poolRecords target newerDone `shouldBe` 0
+    fmap viewOutstanding (holdView (GenerationSubject generation) newerDone)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
+
+    -- The other order: the newer record retires while the older one is still
+    -- owed, and the older one is exactly as owed as it was.
+    (also, otherTarget, otherGeneration, _, otherImage, olderPresentation, otherSubmission, otherPresentation) ← bothOwners
+    newerFirst ←
+      admitted_ "completing the newer submission" (recordCompletion (atMilliseconds 2) (SubmissionCompleted otherSubmission) also)
+        >>= \completedNewer →
+          admitted_ "retiring the newer presentation" (recordCompletion (atMilliseconds 3) (PresentationRetired otherPresentation) completedNewer)
+    presentationImage otherPresentation newerFirst `shouldBe` Nothing
+    presentationImage olderPresentation newerFirst `shouldBe` Just otherImage
+    poolRecords otherTarget newerFirst `shouldBe` 1
+    fmap viewOutstanding (holdView (GenerationSubject otherGeneration) newerFirst)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed, PresentationObligationOwed]
+    settled ←
+      admitted_ "retiring the older presentation last" (recordCompletion (atMilliseconds 4) (PresentationRetired olderPresentation) newerFirst)
+    poolRecords otherTarget settled `shouldBe` 0
+    fmap viewOutstanding (holdView (GenerationSubject otherGeneration) settled)
+      `shouldBe` Just [LogicalReleaseOwed, CpuUseOwed]
+
+  it "frees the image on every enqueued result, and admits a suboptimal reacquisition of it" $ do
+    let freed outcome = do
+          model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+          (active, target, _) ← activeTarget 2 model
+          (enqueued, _, image, _, presentation) ← imageEnqueued target 0 outcome active
+          (reserved, second) ← admitted "reserving a second frame" (reserveFrame target enqueued)
+          (reacquired, answer) ← admitted "reacquiring the enqueued image" (acquireImage second (AcquiredImage 0) reserved)
+          answer `shouldBe` ImageOwned image False
+          -- Whatever the presentation engine said about the surface, the record
+          -- it established still owes its own retirement on its own image.
+          presentationImage presentation reacquired `shouldBe` Just image
+          -- And the replacement the result asked for is still asked for.
+          fmap viewTargetReplacementRequested (targetView target reacquired) `shouldBe` Just True
+
+    mapM_ freed [PresentationEnqueuedSuboptimal, PresentationEnqueuedOutOfDate, PresentationEnqueuedSurfaceLost]
+
+    -- A suboptimal acquisition takes the same path, so it reacquires the same
+    -- way and keeps asking for a replacement beside the image it owns.
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, _) ← activeTarget 2 model
+    (enqueued, _, image, _, presentation) ← imageEnqueued target 0 PresentationEnqueued active
+    fmap viewTargetReplacementRequested (targetView target enqueued) `shouldBe` Just False
+    (reserved, second) ← admitted "reserving a second frame" (reserveFrame target enqueued)
+    (reacquired, answer) ← admitted "reacquiring suboptimally" (acquireImage second (AcquiredSuboptimalImage 0) reserved)
+    answer `shouldBe` ImageOwned image True
+    fmap viewFrameSuboptimal (frameView second reacquired) `shouldBe` Just True
+    fmap viewTargetReplacementRequested (targetView target reacquired) `shouldBe` Just True
+    presentationImage presentation reacquired `shouldBe` Just image
+
+  it "refuses a second acquisition in every phase before the presentation is enqueued" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, _) ← activeTarget 2 model
+    (reserved, first) ← admitted "reserving the first frame" (reserveFrame target active)
+    (acquired, _) ← admitted "acquiring image zero" (acquireImage first (AcquiredImage 0) reserved)
+    (waiting, second) ← admitted "reserving a second frame" (reserveFrame target acquired)
+
+    -- Acquired, and nothing has been submitted: the frame owns the image outright.
+    refusesImageZero second waiting
+    -- Submitted, and still unpresented.
+    (submitted, submitAnswer) ← admitted "submitting" (submitFrames [first] SubmissionAccepted waiting)
+    submission ← submissionOf submitAnswer
+    refusesImageZero second submitted
+    -- A presentation call that enqueued nothing leaves the image exactly where
+    -- it was, so the refusal has to survive it.
+    (unenqueued, presentAnswer) ← admitted "failing to enqueue" (enqueuePresentation first PresentationFailedWithoutEnqueue submitted)
+    presentAnswer `shouldBe` PresentationNotEnqueued
+    refusesImageZero second unenqueued
+    -- Closed before presenting: the record is awaiting explicit settlement, and
+    -- an image awaiting settlement was never handed to the presentation engine.
+    closed ← admitted_ "closing before presenting" (closeSubmittedFrame first unenqueued)
+    refusesImageZero second closed
+    -- Even with the old submission's completion in hand, which is the fact that
+    -- makes an *enqueued* record's image reacquirable.
+    completed ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) closed)
+    refusesImageZero second completed
+
+    -- Explicit settlement is what releases it.
+    settled ← admitted_ "settling the unpresented frame" (recordCompletion (atMilliseconds 2) (UnpresentedFrameSettled first) completed)
+    (released, _) ← admitted "acquiring the released image" (acquireImage second (AcquiredImage 0) settled)
+    fmap viewFrameImage (frameView second released) `shouldSatisfy` \case
+      Just (Just image) → imageIndex image == 0
+      _ → False
+
+  it "refuses a second acquisition of a skipped frame's image until it is settled" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, _) ← activeTarget 2 model
+    (reserved, first) ← admitted "reserving the first frame" (reserveFrame target active)
+    (acquired, _) ← admitted "acquiring image zero" (acquireImage first (AcquiredImage 0) reserved)
+    (waiting, second) ← admitted "reserving a second frame" (reserveFrame target acquired)
+
+    skipped ← admitted_ "skipping the unsubmitted frame" (skipUnsubmittedFrame first waiting)
+    fmap viewFramePhase (frameView first skipped) `shouldBe` Just FrameRetiring
+    refusesImageZero second skipped
+
+    settled ← admitted_ "settling the skipped frame" (recordCompletion (atMilliseconds 1) (UnpresentedFrameSettled first) skipped)
+    (released, answer) ← admitted "acquiring the released image" (acquireImage second (AcquiredImage 0) settled)
+    answer `shouldSatisfy` \case
+      ImageOwned image _ → imageIndex image == 0
+      _ → False
+    fmap viewFramePhase (frameView second released) `shouldBe` Just FrameAcquired
+
+  it "answers session failure rather than image ownership once an uncertain effect stopped admission" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
+    (active, target, _) ← activeTarget 2 model
+    (reserved, first) ← admitted "reserving the first frame" (reserveFrame target active)
+    (acquired, _) ← admitted "acquiring image zero" (acquireImage first (AcquiredImage 0) reserved)
+    -- Reserved before the failure, because reservation is refused after it.
+    (waiting, second) ← admitted "reserving a second frame" (reserveFrame target acquired)
+
+    (uncertain, answer) ← admitted "submitting" (submitFrames [first] SubmissionEffectUncertain waiting)
+    answer `shouldBe` EffectUncertain
+    sessionState uncertain `shouldBe` SessionFailed UnknownSubmissionEffect
+    -- The first frame does still own image zero, which is exactly why the order
+    -- of the two checks matters: the session's failure is the answer, and the
+    -- image's owner is never consulted.
+    rejectedAs (acquireImage second (AcquiredImage 0) uncertain) SessionAlreadyFailed
 
   it "frees the slot when a presentation is enqueued after its submission already completed" $ do
     model ← freshModelWith defaultBudgetRequest {requestedImageTracking = 2}
@@ -286,6 +479,31 @@ spec = describe "frame ownership" $ do
     fmap viewFramePhase (frameView frame closed) `shouldBe` Just FrameRetiring
   where
     poolRecords target model = maybe (-1) (fromIntegral . viewTargetPoolRecords) (targetView target model) ∷ Integer
+    -- One frame of that target taken all the way to an enqueued presentation on
+    -- the image it names, answering everything a later example needs to talk
+    -- about the record it left behind.
+    imageEnqueued
+      ∷ TargetId
+      → Natural
+      → PresentOutcome
+      → GpuModel
+      → IO (GpuModel, FrameSlotId, ImageId, SubmissionId, PresentationId)
+    imageEnqueued target index outcome model = do
+      (reserved, frame) ← admitted "reserving a frame" (reserveFrame target model)
+      (acquired, acquireAnswer) ← admitted "acquiring" (acquireImage frame (AcquiredImage index) reserved)
+      image ← case acquireAnswer of
+        ImageOwned owned _ → pure owned
+        other → fail ("the arrangement should own an image, got " ++ show other)
+      (submitted, submitAnswer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted acquired)
+      submission ← submissionOf submitAnswer
+      (presented, presentAnswer) ← admitted "presenting" (enqueuePresentation frame outcome submitted)
+      presentation ← presentationOf presentAnswer
+      pure (presented, frame, image, submission, presentation)
+    -- Image zero of the active generation is owned by an unpresented frame, so
+    -- this acquisition is refused and changes nothing.
+    refusesImageZero slot model =
+      outcomeModel (acquireImage slot (AcquiredImage 0) model)
+        `shouldBe` Rejected (AlreadyConsumed ImageIdentity)
     submissionOf = \case
       SubmissionRecorded identity → pure identity
       other → fail ("expected a submission record, got " ++ show other)

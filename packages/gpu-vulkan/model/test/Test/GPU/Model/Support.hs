@@ -154,13 +154,18 @@ activeTargetWith classification images model = do
     other → fail ("the fixture's generation should have published, but the answer was " ++ show other)
 
 -- | A frame of that target holding the lowest image of its active generation
--- that no live presentation record already owns.
+-- that no unpresented frame's pool record already owns.
 --
--- The index is searched rather than fixed, because an image belongs to one owner
--- at a time and a record can outlive its frame: a fixture that always asked for
--- image zero would be asking for an image the previous frame's record still owes
--- a retirement on. A presentation engine does not hand the same image out twice
--- either, so this is the realistic fixture as well as the admissible one.
+-- The index is searched rather than fixed, because an image belongs to one
+-- /unpresented/ owner at a time and a record can outlive its frame: a fixture
+-- that always asked for image zero would be asking for an image the previous
+-- frame has acquired but not yet handed to the presentation engine.
+--
+-- Once a presentation is enqueued the image is admissible again, so this search
+-- can stop on an index an older record is still presenting and hand the same
+-- index out twice. That is the model's rule rather than an accident of the
+-- fixture; an example that means to exercise reacquisition names its index
+-- itself rather than relying on what the search happens to find.
 acquiredFrame ∷ HasCallStack ⇒ TargetId → GpuModel → IO (GpuModel, FrameSlotId)
 acquiredFrame target model = do
   (reserved, frame) ← admitted "reserving a frame" (reserveFrame target model)
