@@ -230,6 +230,16 @@ time; it does not repeat the old audit or silently approve the proposed change.
   with bounded catch-up; render suspension per window while simulation remains application-
   owned; committed demand retained across cancellation; expected wake failure
   keeps accepted work, reports once under logging policy and degrades to polling.
+  RR-4 (#200) is measured, not assumed: on macOS 26.6 with the pinned Cocoa
+  GLFW 3.4, a live resize and a menu-bar interaction each block the owner turn's
+  native event call for as long as the person interacts — 68.92 s and 13.30 s
+  observed, with no owner turn and no update opportunity in either — while a
+  window move does not block it at all. Cocoa keeps requesting a redraw about
+  111 times a second throughout a resize; a menu tracking loop delivers nothing.
+  Open decision, owned before VK-16: accept the stall, add a narrowly controlled
+  redraw path, or introduce a separate rendering owner. The
+  [verdict](docs/owner_loop_interaction_verdict.md) states what each implies and
+  chooses none. The probe behind it is selectable and never routine.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
   #141, #142, #143, and #144 are merged. The current review report records
   follow-up repairs; #166–#169 have now merged. The review ledger records their

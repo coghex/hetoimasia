@@ -8,9 +8,11 @@
 -- waits on an operation never starts, and that a refusal reaching the real
 -- owner fails its acquisition before any native step; that a dry run and an
 -- empty selection still acquire nothing with consent absent; that an approved
--- run is served; and that the private-session parent starts no child without
--- consent while a directly invoked child refuses before its scenario is even
--- looked up.
+-- run is served; that the interaction probe is inactive without its own
+-- activation variable and is refused before its body either way when the run
+-- carries no consent; and that the private-session parent starts no child
+-- without consent while a directly invoked child refuses before its scenario is
+-- even looked up.
 module Test.GLFW.Native.Guard (spec) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
@@ -30,6 +32,14 @@ import Test.GLFW.Native.Consent
   , refusalMessage
   )
 import Test.GLFW.Native.Fixture (Owner (..), OwnerReport (..), dispatch, runOwned)
+import Test.GLFW.Native.Interaction
+  ( Phase (phaseName)
+  , ProbeInactive (..)
+  , inactiveMessage
+  , probeActivation
+  , probePhases
+  , probeVariable
+  )
 import qualified Test.GLFW.Native.Private as Private
 import Test.GLFW.Native.Support
   ( ThreadCheck (..)
@@ -192,6 +202,48 @@ spec = describe "the native opt-in" $ do
       reportServed report `shouldBe` 0
       (fromException =<< reportFailure report) `shouldBe` Just (NativeSessionRefused NoConsent)
       threadChecks evidence >>= (`shouldSatisfy` (SetupCheck `notElem`) . map fst)
+
+  describe "before the interaction probe" $ do
+    it "is inactive unless its own variable asks for a positive number of seconds" $ do
+      probeActivation [] `shouldBe` Left ProbeNotRequested
+      probeActivation [(probeVariable, "")] `shouldBe` Left ProbeNotRequested
+      probeActivation [(consentVariable, desktopValue)] `shouldBe` Left ProbeNotRequested
+      probeActivation [(probeVariable, "yes")] `shouldBe` Left (ProbeNotSeconds "yes")
+      probeActivation [(probeVariable, "0")] `shouldBe` Left (ProbeNotSeconds "0")
+      probeActivation [(probeVariable, "-5")] `shouldBe` Left (ProbeNotSeconds "-5")
+      probeActivation [(probeVariable, "Infinity")] `shouldBe` Left (ProbeNotSeconds "Infinity")
+      probeActivation [(probeVariable, "20")] `shouldBe` Right 20
+      probeActivation [(probeVariable, "2.5"), (consentVariable, desktopValue)] `shouldBe` Right 2.5
+
+    it "says why it is pending, what it would do to the desktop, and what activates it" $
+      mapM_
+        ( \inactive → do
+            let message = inactiveMessage inactive
+            message `shouldContain` probeVariable
+            message `shouldContain` "menu bar"
+            message `shouldContain` "no routine or CI run"
+        )
+        [ProbeNotRequested, ProbeNotSeconds "yes"]
+
+    it "asks for an idle baseline first and then the three interactions, in order" $
+      map phaseName probePhases
+        `shouldBe` ["idle baseline", "window move", "window resize", "menu-bar interaction"]
+
+    it "is refused before its body on an unapproved run, activated or not, so no window is opened" $
+      mapM_
+        ( \activated → do
+            gate ← newGate (Left NoConsent)
+            ran ← newIORef False
+            result ←
+              runNested id . consented gate . it "would run the interaction probe" $ do
+                writeIORef ran True
+                -- What the real body reads first; it never gets this far.
+                probeActivation activated `shouldSatisfy` either (const False) (> 0)
+            length (filter resultItemIsFailure (specResultItems result)) `shouldBe` 1
+            readIORef ran `shouldReturn` False
+            refusals gate `shouldReturn` 1
+        )
+        [[], [(probeVariable, "20")]]
 
   describe "before a private-session child" $ do
     it "refuses an unapproved run's scenario before starting a child" $ do
