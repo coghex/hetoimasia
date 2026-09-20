@@ -478,7 +478,7 @@ and the wrapped refusals of the records themselves (`TransitionRefused`,
 are no `Duplicate*` refusals: the session issues the identities that could have
 collided, so the collision cannot arise.
 
-Two bounds are worth stating in full.
+Three bounds are worth stating in full.
 
 **Terminal-result storage** is reserved at admission and released when the
 result is observed or discarded, so a completed task whose result nobody reads
@@ -501,6 +501,19 @@ request: an unsettled one settles as a provider failure naming the overrun, and
 one that had already settled is counted as a late reply. Either way the
 provider's work retires — a provider that overran still answered, and a refusal
 that left its accounting outstanding would hold capacity nothing could release.
+
+**A `FailureReason`'s detail is bounded and copied.** It may quote a script's
+own error text, so `failureReason` truncates it to `reasonDetailBound`
+characters -- counted as characters, so a multibyte detail is never cut inside
+one -- and copies what survives into an array of its own. Truncation alone
+would bound the characters and not the memory: a `Text` is a window onto a
+shared array, so a 512-character prefix of a megabyte of script output would
+keep the megabyte alive, and a detail already within the bound is just as
+likely to be a small window onto a large allocation. The copy is made either
+way. `failureReason` is also the only way to build one -- `reasonCode` and
+`reasonDetail` read a reason but are not its record fields, and the constructor
+is not exported -- so the count limits on stored failures bound retained memory
+rather than only the number of reasons held.
 
 Subscriptions declare their endpoint's `OverloadPolicy`: `OrderedEvents` rejects
 and counts a delivery into a full backlog, `ReplaceableState` coalesces to the

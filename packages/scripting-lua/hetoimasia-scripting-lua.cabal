@@ -166,6 +166,7 @@ test-suite lua-host-tests
         Test.Lua.Protocol.Failure
         Test.Lua.Protocol.Fixture
         Test.Lua.Protocol.Isolation
+        Test.Lua.Protocol.Reason
         Test.Lua.Protocol.Requests
         Test.Lua.Protocol.Spec
         Test.Lua.Protocol.Stop
