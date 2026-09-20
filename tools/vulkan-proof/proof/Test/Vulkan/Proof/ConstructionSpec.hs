@@ -55,7 +55,9 @@ import Test.Vulkan.Proof.Ownership
   , newLedger
   , observe
   , onExit
+  , onExitHolding
   , onExitRecallable
+  , owning
   , runCleanups
   )
 import Test.Vulkan.Proof.Retention
@@ -192,34 +194,29 @@ capturedBytes = [255, 0, 255, 255]
 -- The device is the one that matters: it is registered above every child, so a
 -- child released after it in the log would be the very use-after-free this
 -- issue is about, visible rather than inferred.
-sessionParents ∷ [Text]
+sessionParents ∷ [(Text, Handle)]
 sessionParents =
-  [ "GLFW"
-  , "the callback trampoline"
-  , "the Vulkan instance"
-  , "the explicit debug messenger"
-  , "the proof window"
-  , "the window surface"
-  , "the logical device"
-  , "the swapchain"
+  [ ("GLFW", GlfwTermination)
+  , ("the callback trampoline", TheCallbackTrampoline)
+  , ("the Vulkan instance", TheVulkanInstance)
+  , ("the explicit debug messenger", TheExplicitMessenger)
+  , ("the proof window", TheProofWindow)
+  , ("the window surface", TheWindowSurface)
+  , ("the logical device", TheLogicalDevice)
+  , ("the swapchain", TheSwapchain)
   ]
 
+-- | Everything below the swapchain, for the one example that builds the
+-- swapchain itself through the handoff the procedure uses.
+parentsBelowTheSwapchain ∷ [(Text, Handle)]
+parentsBelowTheSwapchain = [entry | entry@(_, handle) ← sessionParents, handle /= TheSwapchain]
+
+registerSome ∷ [(Text, Handle)] → Fake → [Text] → Cleanups → IO ()
+registerSome which fake failing cleanups =
+  forM_ which (\(name, handle) → onExit cleanups handle (release fake failing name))
+
 registerParents ∷ Fake → [Text] → Cleanups → IO ()
-registerParents fake failing cleanups =
-  forM_
-    (zip sessionParents parentHandles)
-    (\(name, handle) → onExit cleanups handle (release fake failing name))
-  where
-    parentHandles =
-      [ GlfwTermination
-      , TheCallbackTrampoline
-      , TheVulkanInstance
-      , TheExplicitMessenger
-      , TheProofWindow
-      , TheWindowSurface
-      , TheLogicalDevice
-      , TheSwapchain
-      ]
+registerParents = registerSome sessionParents
 
 -- | The teardown boundary, registered as the procedure registers it and
 -- reporting what this run's boundary reported.
@@ -252,9 +249,9 @@ slotSession failAt failing = do
   outcome ← try @SomeException $ do
     let names = ["slot 0", "slot 1"]
     operations ← forM names (slotOpsFor fake failAt failing)
-    places ← forM names (const newSlotPlaces)
-    for_ (reverse (concat (zipWith3 slotPlaceReleases operations names places))) $ \(what, action) →
-      onExit cleanups what action
+    places ← forM names newSlotPlaces
+    for_ (reverse (concat (zipWith3 slotPlaceReleases operations names places))) $ \(what, cleanup) →
+      onExitHolding cleanups what cleanup
     built ← forM (zip operations places) (uncurry fillSlot)
     -- Exactly where the procedure registers it: after both slots exist and
     -- before anything is submitted. A construction that stops never reaches
@@ -277,8 +274,8 @@ captureSession failAt failing boundary = do
     places ← newCapturePlaces ∷ IO (CapturePlaces Text Text)
     let operations = captureOpsFor fake ledger failAt failing
     recall ←
-      forM (reverse (capturePlaceReleases operations places)) $ \(what, action) →
-        onExitRecallable cleanups what action
+      forM (reverse (capturePlaceReleases operations places)) $ \(what, cleanup) →
+        onExitRecallable cleanups what cleanup
     registerBoundary ledger boundary cleanups
     observed ← runCapture operations places
     sequence_ recall
@@ -307,15 +304,15 @@ wholeSession = do
   outcome ← try @SomeException $ do
     let names = ["slot 0", "slot 1"]
     operations ← forM names (slotOpsFor fake Nothing [])
-    places ← forM names (const newSlotPlaces)
-    for_ (reverse (concat (zipWith3 slotPlaceReleases operations names places))) $ \(what, action) →
-      onExit cleanups what action
+    places ← forM names newSlotPlaces
+    for_ (reverse (concat (zipWith3 slotPlaceReleases operations names places))) $ \(what, cleanup) →
+      onExitHolding cleanups what cleanup
     _ ← forM (zip operations places) (uncurry fillSlot)
     capturePlaces ← newCapturePlaces ∷ IO (CapturePlaces Text Text)
     let captureOperations = captureOpsFor fake ledger Nothing []
     recall ←
-      forM (reverse (capturePlaceReleases captureOperations capturePlaces)) $ \(what, action) →
-        onExitRecallable cleanups what action
+      forM (reverse (capturePlaceReleases captureOperations capturePlaces)) $ \(what, cleanup) →
+        onExitRecallable cleanups what cleanup
     registerBoundary ledger Succeeded cleanups
     observed ← runCapture captureOperations capturePlaces
     sequence_ recall
@@ -411,6 +408,89 @@ spec = do
       occurrences "slot 0 command pool" gone `shouldBe` 0
       occurrences "slot 1 acquisition semaphore" gone `shouldBe` 0
 
+  describe "A cleanup entry that holds nothing" $ do
+    -- A place-backed entry whose construction never reached it owns no native
+    -- object. Reporting it destroyed would put a destruction in the record of
+    -- a stopped run that never happened; retaining it would hold every parent
+    -- above it for a handle that does not exist.
+    it "is neither destroyed nor retained when the construction created nothing" $ do
+      session ← slotSession (Just 0) []
+      built ← created session.sessionFake
+      built `shouldBe` []
+      session.sessionFacts.teardownDestroyed `shouldSatisfy` all (not . Text.isInfixOf "slot ")
+      map fst session.sessionFacts.teardownRetained
+        `shouldSatisfy` all (not . Text.isInfixOf "slot ")
+      -- Nothing it does not hold may hold up what is above it.
+      session.sessionFacts.teardownRetained `shouldBe` []
+
+    it "names only the children a partial construction actually created" $ do
+      -- Step 4 is the first slot's command pool, so that slot holds its two
+      -- semaphores and its two fences and nothing else, and the second slot
+      -- holds nothing at all.
+      session ← slotSession (Just 4) []
+      filter (Text.isInfixOf "slot ") session.sessionFacts.teardownDestroyed
+        `shouldBe` [ "the rendering fence of slot 0"
+                   , "the acquisition semaphore of slot 0"
+                   , "the present fence of slot 0"
+                   , "the presentation semaphore of slot 0"
+                   ]
+      -- The command pool of slot 0 is what step 4 was creating, and the whole
+      -- of slot 1 is behind it. Neither is named, and neither holds anything
+      -- above it up.
+      session.sessionFacts.teardownDestroyed
+        `shouldSatisfy` notElem "the command pool of slot 0"
+      session.sessionFacts.teardownRetained `shouldBe` []
+
+    it "does not claim a capture handle a stopped capture never created" $ do
+      -- The buffer's own creation failed, so neither place holds anything.
+      session ← captureSession (Just 0) [] Succeeded
+      session.sessionFacts.teardownDestroyed `shouldSatisfy` notElem captureBufferName
+      session.sessionFacts.teardownDestroyed `shouldSatisfy` notElem captureMemoryName
+      session.sessionFacts.teardownReleases `shouldSatisfy` notElem captureBufferName
+      session.sessionFacts.teardownRetained `shouldBe` []
+
+    it "does not retain an empty place when the boundary failed" $ do
+      -- The trap this accounting exists for: a broken boundary retains every
+      -- handle whose safety it was to establish, and an empty place must not
+      -- be one of them, because it would then hold the device and everything
+      -- above it for a buffer that was never allocated.
+      session ← captureSession (Just 1) [] OutOfHostMemory
+      map fst session.sessionFacts.teardownRetained `shouldContain` [captureBufferName]
+      map fst session.sessionFacts.teardownRetained
+        `shouldSatisfy` notElem captureMemoryName
+      session.sessionFacts.teardownDestroyed `shouldSatisfy` notElem captureMemoryName
+
+  describe "A swapchain whose construction stops after it exists" $
+    -- The review's correction on this issue. `buildTarget` creates the
+    -- swapchain and then reads its images back and allocates the counter the
+    -- abandonment paths check, both of which can fail; its caller used to
+    -- register the release only after all three had returned.
+    it "releases it before the device when the step after its creation fails" $ do
+      fake ← newFake
+      cleanups ← newCleanups
+      ledger ← newLedger
+      journal ← newJournal
+      registerSome parentsBelowTheSwapchain fake [] cleanups
+      outcome ← try @SomeException $ do
+        _ ←
+          owning
+            cleanups
+            TheSwapchain
+            (acquire fake Nothing "the swapchain")
+            (release fake [])
+        -- What buildTarget does next, and what used to strand it.
+        step fake (Just 1) "reading the swapchain images back"
+      facts ← runCleanups journal ledger cleanups
+      gone ← releasedBy fake
+      let session = Session fake facts (either (Just . stopReason) (const Nothing) outcome)
+      session.sessionStopped
+        `shouldSatisfy` maybe False (Text.isInfixOf "reading the swapchain images back")
+      occurrences "the swapchain" gone `shouldBe` 1
+      positionIn "the swapchain" gone `shouldSatisfy` (< positionIn "the logical device" gone)
+      facts.teardownDestroyed `shouldContain` ["the swapchain"]
+      facts.teardownRetained `shouldBe` []
+      facts.teardownFailures `shouldBe` []
+
   describe "A cancellation at the acquisition-to-registration handoff" $
     -- Requirement 5. A synchronous failure is not the only way a created
     -- handle is lost: an asynchronous exception delivered between the call
@@ -422,7 +502,7 @@ spec = do
       ledger ← newLedger
       journal ← newJournal
       registerParents fake [] cleanups
-      places ← newSlotPlaces
+      places ← newSlotPlaces "slot 0"
       reached ← newEmptyMVar
       proceed ← newEmptyMVar
       done ← newEmptyMVar
@@ -456,8 +536,8 @@ spec = do
               , destroySlotPool = release fake []
               , allocateSlotCommands = \pool → acquire fake Nothing (pool <> "'s command buffer")
               }
-      for_ (reverse (slotPlaceReleases operations "slot 0" places)) $ \(what, action) →
-        onExit cleanups what action
+      for_ (reverse (slotPlaceReleases operations "slot 0" places)) $ \(what, cleanup) →
+        onExitHolding cleanups what cleanup
       worker ← forkIO (try @SomeException (fillSlot operations places) >>= putMVar done)
       takeMVar reached
       throwTo worker (Injected "the run was cancelled at the handoff")
@@ -489,11 +569,25 @@ spec = do
       session ← slotSession (Just 7) [failingRelease]
       gone ← releasedBy session.sessionFake
       built ← created session.sessionFake
-      -- Its two siblings in the same cleanup entry still go, and so does
-      -- everything registered beneath it.
+      -- Its two siblings in the same cleanup entry still go, and so does every
+      -- other child of both slots. Each is attempted exactly once, the failing
+      -- one included: a destroy that threw is never retried.
       forM_ (ownedCreations built) $ \child → occurrences child gone `shouldBe` 1
-      occurrences "the logical device" gone `shouldBe` 1
       occurrences failingRelease gone `shouldBe` 1
+
+    it "withholds the parents that must outlive what may have survived" $ do
+      -- A release that threw leaves its object possibly alive, so destroying
+      -- the device over it is the same invalid teardown as destroying it over
+      -- a handle that was never registered. The failure is recorded, and the
+      -- device is withheld with the reason naming what did not go.
+      session ← slotSession (Just 7) [failingRelease]
+      gone ← releasedBy session.sessionFake
+      occurrences "the logical device" gone `shouldBe` 0
+      map fst session.sessionFacts.teardownRetained `shouldContain` ["the logical device"]
+      lookup "the logical device" session.sessionFacts.teardownRetained
+        `shouldSatisfy` maybe False (Text.isInfixOf "its own release failed")
+      -- And the entry that failed is neither released nor retained.
+      session.sessionFacts.teardownReleases `shouldSatisfy` notElem "the frame slots"
 
     it "renders both failures in the record a stopped run writes" $ do
       session ← slotSession (Just 7) [failingRelease]

@@ -56,6 +56,8 @@ module Test.Vulkan.Proof.Retention
   , standingFrom
   , Disposition (..)
   , wasDestroyed
+  , boundaryRequired
+  , dispositionOf
   , decide
   , releasedEntries
   , retainedHandles
@@ -412,36 +414,52 @@ wasDestroyed = \case
   Destroy → True
   Retain _ → False
 
+-- | Whether anything in this plan is owed what a device-idle boundary
+-- supplies.
+--
+-- A plan without one is a run that stopped before the procedure registered it,
+-- and the procedure registers it immediately after the frame slots and submits
+-- nothing until afterwards — so such a plan holds no object with queue work
+-- outstanding, and the absence withholds nothing. A plan that does hold one
+-- has already run it, because it is first in teardown order; a plan that holds
+-- one and reached no result for it is a teardown that lost its own evidence,
+-- and withholding is the only safe answer to that.
+boundaryRequired ∷ [Handle] → Bool
+boundaryRequired plan = TheTeardownBoundary `elem` plan
+
 -- | The disposition of every handle in a plan, in teardown order.
 --
 -- Retention propagates upward: a handle whose child is withheld is withheld
 -- too, so the plan's own child-before-parent order is what carries a retained
 -- present fence all the way up to the window and to @glfwTerminate@.
+--
+-- This decides the whole plan in advance, which is what the headless examples
+-- assert over. The native executor walks the same 'dispositionOf' one handle
+-- at a time instead, because it learns something this cannot know in advance:
+-- whether a release it already ran actually succeeded.
 decide ∷ [Handle] → [Observation] → [(Handle, Disposition)]
 decide plan observations = walk [] plan
   where
     standing = standingFrom observations
-
-    -- Whether anything in this plan is owed what a device-idle boundary
-    -- supplies. A plan without one is a run that stopped before the procedure
-    -- registered it, and the procedure registers it immediately after the
-    -- frame slots and submits nothing until afterwards — so such a plan holds
-    -- no object with queue work outstanding, and the absence withholds
-    -- nothing. A plan that does hold one has already run it, because it is
-    -- first in teardown order; a plan that holds one and reached no result for
-    -- it is a teardown that lost its own evidence, and withholding is the only
-    -- safe answer to that.
-    required = TheTeardownBoundary `elem` plan
+    required = boundaryRequired plan
 
     walk _ [] = []
     walk withheld (handle : rest) =
       let disposition = dispositionOf standing required withheld handle
           withheld' = case disposition of
-            Retain _ → withheld <> [handle]
+            Retain _ → withheld <> [(handle, "is retained")]
             Destroy → withheld
        in (handle, disposition) : walk withheld' rest
 
-dispositionOf ∷ Standing → Bool → [Handle] → Handle → Disposition
+-- | What may become of one handle, given what the run recorded and which
+-- handles below it are known not to have gone.
+--
+-- A withheld child carries the phrase that says why it did not go, because
+-- there are two ways for that to happen and they are not the same fact: it was
+-- retained, or its own release was attempted and failed. Either way its parent
+-- must not be destroyed over it, and the reason a reader sees has to say which
+-- it was.
+dispositionOf ∷ Standing → Bool → [(Handle, Text)] → Handle → Disposition
 dispositionOf standing required withheld handle
   -- The boundary is a wait, not a destruction. It is what produces the
   -- evidence the releases below it are judged against, so it always runs.
@@ -474,8 +492,8 @@ dispositionOf standing required withheld handle
     pendingOf slot = [why | (held, why) ← standing.standingPending, held == slot]
 
     dependencyReasons =
-      [ describeHandle child <> " is retained, and " <> describeHandle handle <> " must outlive it"
-      | child ← withheld
+      [ describeHandle child <> " " <> phrase <> ", and " <> describeHandle handle <> " must outlive it"
+      | (child, phrase) ← withheld
       , child `mustPrecede` handle
       ]
 

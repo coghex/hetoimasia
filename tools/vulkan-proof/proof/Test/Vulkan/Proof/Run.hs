@@ -135,6 +135,7 @@ import Test.Vulkan.Proof.Ownership
   , observe
   , observations
   , onExit
+  , onExitHolding
   , onExitRecallable
   , owning
   , runCleanups
@@ -716,7 +717,7 @@ procedure journal consent cleanups sink ledger = do
   let captureOperations = captureOps device selection.selectedDevice queue target slots.firstSlot
   recallCapture ←
     forM (reverse (capturePlaceReleases captureOperations capturePlaces)) $
-      \(what, action) → onExitRecallable cleanups what action
+      \(what, cleanup) → onExitRecallable cleanups what cleanup
 
   -- Registered last, so it runs first: every destruction below rests on what
   -- this establishes, and every diagnostic any of them emits is attributed to
@@ -1152,9 +1153,9 @@ newSlots ∷ Cleanups → Device → Word32 → Ledger → IO Slots
 newSlots cleanups device family ledger = do
   let ops = slotOps device family
       names = map slotNameAt [0 .. slotCount - 1]
-  places ← forM names (const newSlotPlaces)
-  for_ (reverse (concat (zipWith (slotPlaceReleases ops) names places))) $ \(what, action) →
-    onExit cleanups what action
+  places ← forM names newSlotPlaces
+  for_ (reverse (concat (zipWith (slotPlaceReleases ops) names places))) $ \(what, cleanup) →
+    onExitHolding cleanups what cleanup
   built ← forM (zip names places) $ \(name, place) → do
     parts ← fillSlot ops place
     presented ← newIORef False

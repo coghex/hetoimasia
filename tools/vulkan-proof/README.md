@@ -90,9 +90,19 @@ exists. So:
   own;
 - an object is taken out of its place before it is destroyed, so nothing is
   released twice, a handle that was never created is never destroyed, and no
-  failed destroy is retried. A release that fails is recorded beside the
-  primary failure that stopped the run rather than replacing it, and the
-  releases independent of it still run.
+  failed destroy is retried;
+- teardown reports what it actually did. A cleanup entry whose construction
+  never reached it holds no native object, so it is neither counted as a
+  destruction nor retained — retaining nothing would hold every parent above it
+  for a handle that does not exist — and a release names the objects it
+  emptied, so a partial construction's record lists the children that went
+  rather than the entry that owns them;
+- a release that fails is recorded beside the primary failure that stopped the
+  run rather than replacing it. Its object may still be alive, so every parent
+  that must outlive it is withheld exactly as a retained child's parents are:
+  destroying a device over a command pool whose destruction failed is the same
+  invalid teardown as destroying it over one that was never registered. The
+  releases that do not depend on it still run.
 
 The successful path is unchanged by all of this: the same ten cleanup entries
 in the same order. The capture is the one construction that frees its own two

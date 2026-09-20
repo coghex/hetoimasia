@@ -38,7 +38,15 @@ module Test.Vulkan.Proof.Construction
 
 import Data.Word (Word32)
 
-import Test.Vulkan.Proof.Ownership (Held, holding, newHeld, releaseAll, releasing)
+import Test.Vulkan.Proof.Ownership
+  ( Cleanup (..)
+  , Held
+  , holding
+  , newHeld
+  , occupied
+  , releaseAll
+  , releasing
+  )
 import Test.Vulkan.Proof.Retention (Handle (..), SlotName)
 
 -- --------------------------------------------------------------------------
@@ -83,9 +91,17 @@ data SlotParts semaphore fence pool commands = SlotParts
   , partCommands ∷ commands
   }
 
-newSlotPlaces ∷ IO (SlotPlaces semaphore fence pool)
-newSlotPlaces =
-  SlotPlaces <$> newHeld <*> newHeld <*> newHeld <*> newHeld <*> newHeld
+-- | Empty places for one slot's children, each named for the child it will
+-- hold so that a release reports the object it actually destroyed rather than
+-- the entry that owns it.
+newSlotPlaces ∷ SlotName → IO (SlotPlaces semaphore fence pool)
+newSlotPlaces name =
+  SlotPlaces
+    <$> newHeld ("the acquisition semaphore of " <> name)
+    <*> newHeld ("the presentation semaphore of " <> name)
+    <*> newHeld ("the rendering fence of " <> name)
+    <*> newHeld ("the present fence of " <> name)
+    <*> newHeld ("the command pool of " <> name)
 
 -- | One slot's releases, in the order teardown reaches them.
 --
@@ -106,18 +122,27 @@ slotPlaceReleases
   ∷ SlotOps semaphore fence pool commands
   → SlotName
   → SlotPlaces semaphore fence pool
-  → [(Handle, IO ())]
+  → [(Handle, Cleanup)]
 slotPlaceReleases ops name places =
   [
     ( SlotWorkObjects name
-    , releaseAll
-        [ releasing places.placePool ops.destroySlotPool
-        , releasing places.placeRenderFence ops.destroySlotFence
-        , releasing places.placeAcquireSemaphore ops.destroySlotSemaphore
-        ]
+    , Cleanup
+        { cleanupHolds =
+            holdsAny
+              [ occupied places.placePool
+              , occupied places.placeRenderFence
+              , occupied places.placeAcquireSemaphore
+              ]
+        , cleanupRelease =
+            releaseAll
+              [ releasing places.placePool ops.destroySlotPool
+              , releasing places.placeRenderFence ops.destroySlotFence
+              , releasing places.placeAcquireSemaphore ops.destroySlotSemaphore
+              ]
+        }
     )
-  , (SlotPresentFence name, releasing places.placePresentFence ops.destroySlotFence)
-  , (SlotPresentSemaphore name, releasing places.placePresentSemaphore ops.destroySlotSemaphore)
+  , (SlotPresentFence name, onlyPlace places.placePresentFence ops.destroySlotFence)
+  , (SlotPresentSemaphore name, onlyPlace places.placePresentSemaphore ops.destroySlotSemaphore)
   ]
 
 -- | Build one slot into its places, in the order the native path builds it.
@@ -179,7 +204,7 @@ data CapturePlaces buffer memory = CapturePlaces
   }
 
 newCapturePlaces ∷ IO (CapturePlaces buffer memory)
-newCapturePlaces = CapturePlaces <$> newHeld <*> newHeld
+newCapturePlaces = CapturePlaces <$> newHeld "the capture buffer" <*> newHeld "the capture memory"
 
 -- | The capture's two releases, in the order teardown reaches them.
 --
@@ -190,11 +215,23 @@ newCapturePlaces = CapturePlaces <$> newHeld <*> newHeld
 capturePlaceReleases
   ∷ CaptureOps buffer memory image
   → CapturePlaces buffer memory
-  → [(Handle, IO ())]
+  → [(Handle, Cleanup)]
 capturePlaceReleases ops places =
-  [ (TheCaptureMemory, releasing places.placeCaptureMemory ops.captureFreeMemory)
-  , (TheCaptureBuffer, releasing places.placeCaptureBuffer ops.captureDestroyBuffer)
+  [ (TheCaptureMemory, onlyPlace places.placeCaptureMemory ops.captureFreeMemory)
+  , (TheCaptureBuffer, onlyPlace places.placeCaptureBuffer ops.captureDestroyBuffer)
   ]
+
+-- | A cleanup entry that owns exactly one place: it holds what that place
+-- holds, and releases it.
+onlyPlace ∷ Held a → (a → IO ()) → Cleanup
+onlyPlace place release =
+  Cleanup {cleanupHolds = occupied place, cleanupRelease = releasing place release}
+
+-- | Whether any of an entry's places still holds a child. An entry that holds
+-- none of them was never reached by the construction, and teardown neither
+-- destroys nor retains it.
+holdsAny ∷ [IO Bool] → IO Bool
+holdsAny = fmap or . sequence
 
 -- | Run the whole capture, and on the path that reaches the end free its two
 -- handles exactly once, as it always did.
@@ -216,6 +253,6 @@ runCapture ops places = do
   ops.captureAwaitSubmission
   observed ← ops.captureReadBack memory
   ops.capturePresent image
-  releasing places.placeCaptureMemory ops.captureFreeMemory
-  releasing places.placeCaptureBuffer ops.captureDestroyBuffer
+  _ ← releasing places.placeCaptureMemory ops.captureFreeMemory
+  _ ← releasing places.placeCaptureBuffer ops.captureDestroyBuffer
   pure observed
