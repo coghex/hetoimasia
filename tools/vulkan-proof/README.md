@@ -89,8 +89,12 @@ exists. So:
   is what `vkDestroyCommandPool` says, rather than freed a second time on its
   own;
 - an object is taken out of its place before it is destroyed, so nothing is
-  released twice, a handle that was never created is never destroyed, and no
-  failed destroy is retried;
+  released twice and a handle that was never created is never destroyed. A
+  place records three states, not two: empty, holding, and *not released* — the
+  destroy was attempted and did not complete. A failed destroy is never
+  retried, and the place keeps the reason instead of the object, so a release
+  the capture path performs itself at the end of its own path is as visible to
+  teardown as one teardown performed;
 - teardown reports what it actually did. A cleanup entry whose construction
   never reached it holds no native object, so it is neither counted as a
   destruction nor retained — retaining nothing would hold every parent above it
@@ -98,11 +102,13 @@ exists. So:
   emptied, so a partial construction's record lists the children that went
   rather than the entry that owns them;
 - a release that fails is recorded beside the primary failure that stopped the
-  run rather than replacing it. Its object may still be alive, so every parent
-  that must outlive it is withheld exactly as a retained child's parents are:
-  destroying a device over a command pool whose destruction failed is the same
-  invalid teardown as destroying it over one that was never registered. The
-  releases that do not depend on it still run.
+  run rather than replacing it. An entry that owns several children reports all
+  of their failures and all of their destructions, so one child's failure
+  neither hides a second nor denies the siblings that did go. Its object may
+  still be alive, so every parent that must outlive it is withheld exactly as a
+  retained child's parents are: destroying a device over a command pool whose
+  destruction failed is the same invalid teardown as destroying it over one
+  that was never registered. The releases that do not depend on it still run.
 
 The successful path is unchanged by all of this: the same ten cleanup entries
 in the same order. The capture is the one construction that frees its own two
@@ -151,7 +157,11 @@ So teardown asks `Retention.hs`, and obeys it:
   unresolved boundary failure still holds;
 - device loss is its own disposition. The specification permits destroying a
   lost device's objects without waiting for work that may never complete, and
-  the record says that path was taken. A timeout is never promoted to it.
+  the record says that path was taken. A timeout is never promoted to it. The
+  waiver is about completion and about nothing else: a lost device's children
+  are still objects that must be destroyed before it, so a child that was not
+  released still withholds every parent that has to outlive it, on this route
+  as on the ordinary one.
 
 Anything still retained is released by process exit and by nothing else. No
 native call here is made preemptible and no native destroy is wrapped in a

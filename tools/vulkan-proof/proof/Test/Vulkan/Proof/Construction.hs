@@ -225,7 +225,7 @@ capturePlaceReleases ops places =
 -- holds, and releases it.
 onlyPlace ∷ Held a → (a → IO ()) → Cleanup
 onlyPlace place release =
-  Cleanup {cleanupHolds = occupied place, cleanupRelease = releasing place release}
+  Cleanup {cleanupHolds = occupied place, cleanupRelease = releaseAll [releasing place release]}
 
 -- | Whether any of an entry's places still holds a child. An entry that holds
 -- none of them was never reached by the construction, and teardown neither
@@ -253,6 +253,11 @@ runCapture ops places = do
   ops.captureAwaitSubmission
   observed ← ops.captureReadBack memory
   ops.capturePresent image
+  -- Through the same places the registered releases read. A destroy that fails
+  -- here leaves its place saying so rather than empty, so teardown records the
+  -- failure and withholds the parents that must outlive what may have
+  -- survived — and the buffer, whose place this never reached, is destroyed by
+  -- teardown as any unreleased child is.
   _ ← releasing places.placeCaptureMemory ops.captureFreeMemory
   _ ← releasing places.placeCaptureBuffer ops.captureDestroyBuffer
   pure observed

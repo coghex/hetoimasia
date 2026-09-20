@@ -23,7 +23,10 @@
 --   escape for a session that never resolves is retention plus process exit,
 --   never a preemptible native call or a destroy wrapped in a timeout;
 -- * the device is lost, and the specification's own device-loss rule permits
---   destruction without waiting for work that may never complete.
+--   destruction without waiting for work that may never complete. That waiver
+--   is about completion and about nothing else: a lost device's children are
+--   still objects that must be destroyed before it, so a child that was not
+--   released still withholds every parent that has to outlive it.
 --
 -- A timeout is never promoted to device loss. It is the case where completion
 -- is still owed, which is precisely the case retention exists for.
@@ -464,11 +467,19 @@ dispositionOf standing required withheld handle
   -- The boundary is a wait, not a destruction. It is what produces the
   -- evidence the releases below it are judged against, so it always runs.
   | handle == TheTeardownBoundary = Destroy
-  | standing.standingRoute == DeviceLossRoute = Destroy
-  | otherwise = case boundaryReasons <> presentReasons <> dependencyReasons of
+  -- Device loss waives the completion evidence and nothing else. The
+  -- specification permits destroying a lost device's objects without waiting
+  -- for work that may never complete; it does not permit destroying a parent
+  -- while a child of it is still there, and a lost device's children are still
+  -- objects that must be destroyed before it. So the boundary and presentation
+  -- conditions fall away here and the dependency one does not.
+  | standing.standingRoute == DeviceLossRoute = withhold dependencyReasons
+  | otherwise = withhold (boundaryReasons <> presentReasons <> dependencyReasons)
+  where
+    withhold = \case
       [] → Destroy
       reasons → Retain (Text.intercalate "; " reasons)
-  where
+
     boundaryReasons
       | not (required && restsOnBoundary handle) = []
       | otherwise = case standing.standingBoundary of

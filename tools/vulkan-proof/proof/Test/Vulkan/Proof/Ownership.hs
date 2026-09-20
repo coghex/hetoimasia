@@ -34,7 +34,9 @@ module Test.Vulkan.Proof.Ownership
   , releasing
   , heldValue
   , occupied
+  , Disposal (..)
   , releaseAll
+  , UnreleasedHandle (..)
 
     -- * The ledger
   , Ledger
@@ -53,8 +55,9 @@ module Test.Vulkan.Proof.Ownership
   , runCleanups
   ) where
 
-import Control.Exception (SomeException, displayException, mask_, throwIO, try)
+import Control.Exception (Exception, SomeException, displayException, mask_, throwIO, try)
 import Control.Monad (filterM, forM)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -92,10 +95,34 @@ import Test.Vulkan.Proof.Retention
 -- it actually destroyed. A cleanup entry can own several children and reach
 -- teardown holding some of them, and a record that named the whole entry would
 -- claim destructions that never happened.
-data Held a = Held Text (IORef (Maybe a))
+data Held a = Held Text (IORef (Contents a))
+
+-- | What a place holds.
+--
+-- Three states rather than two, because "there is nothing here" and "the
+-- object that was here was not released" are opposite facts and a teardown
+-- that confused them would destroy a parent over a live child. A release is
+-- attempted exactly once: it takes the object out before destroying it, and if
+-- that destroy fails or never completes the place keeps the reason instead of
+-- the object, so a later release reports the failure rather than retrying it.
+data Contents a
+  = Empty
+  | Holding a
+  | Unreleased Text
+
+-- | A release that was attempted, did not complete, and must not be retried.
+--
+-- The cleanup executor turns this into the entry's recorded failure, which is
+-- what withholds the parents that must outlive whatever may have survived.
+newtype UnreleasedHandle = UnreleasedHandle Text
+
+instance Show UnreleasedHandle where
+  show (UnreleasedHandle reason) = Text.unpack reason
+
+instance Exception UnreleasedHandle
 
 newHeld ∷ Text → IO (Held a)
-newHeld name = Held name <$> newIORef Nothing
+newHeld name = Held name <$> newIORef Empty
 
 -- | Create one object and put it in its place before anything else can run.
 --
@@ -109,7 +136,7 @@ newHeld name = Held name <$> newIORef Nothing
 holding ∷ Held a → IO a → IO a
 holding (Held _ ref) acquire = mask_ $ do
   value ← acquire
-  writeIORef ref (Just value)
+  writeIORef ref (Holding value)
   pure value
 
 -- | Destroy whatever the place holds, exactly once, and name what was
@@ -121,37 +148,77 @@ holding (Held _ ref) acquire = mask_ $ do
 -- record of a stopped run from claiming a destruction that did not happen. The
 -- failure itself is not swallowed: it escapes to the cleanup executor, which
 -- records it beside whatever primary failure stopped the run.
+-- Everything from the take to the mark is masked, for the same reason the
+-- handoff is: a cancellation between a destroy that succeeded and the write
+-- that records it would leave the place claiming a failure that did not
+-- happen, and one between the take and the destroy would lose the object
+-- outright. No native destroy blocks, so nothing is withheld from a caller
+-- that wants to stop.
 releasing ∷ Held a → (a → IO ()) → IO [Text]
-releasing (Held name ref) release = do
-  taken ← mask_ (atomicModifyIORef' ref (\held → (Nothing, held)))
+releasing (Held name ref) release = mask_ $ do
+  taken ← atomicModifyIORef' ref $ \contents → case contents of
+    -- Marked before the destroy, not after it: a destroy that never returns a
+    -- result must leave the place saying so.
+    Holding value → (Unreleased (name <> " was taken out to be destroyed and the destroy did not complete"), Just (Right value))
+    Unreleased reason → (Unreleased reason, Just (Left reason))
+    Empty → (Empty, Nothing)
   case taken of
     Nothing → pure []
-    Just value → do
-      release value
-      pure [name]
+    Just (Left reason) → throwIO (UnreleasedHandle reason)
+    Just (Right value) → do
+      outcome ← try @SomeException (release value)
+      case outcome of
+        Right () → do
+          writeIORef ref Empty
+          pure [name]
+        Left failure → do
+          writeIORef ref (Unreleased (name <> ": " <> Text.pack (displayException failure)))
+          throwIO failure
 
 -- | What the place holds, for a caller that needs to look without taking.
 heldValue ∷ Held a → IO (Maybe a)
-heldValue (Held _ ref) = readIORef ref
+heldValue (Held _ ref) =
+  readIORef ref >>= \case
+    Holding value → pure (Just value)
+    _ → pure Nothing
 
--- | Whether the place holds anything at all.
-occupied ∷ Held a → IO Bool
-occupied held = maybe False (const True) <$> heldValue held
-
--- | Run every release, name everything they destroyed, then re-raise the first
--- failure.
+-- | Whether the place still stands between teardown and a native object.
 --
--- One cleanup entry can own several children — a slot's command pool, its
--- rendering fence and its acquisition semaphore are one entry — and a failure
--- destroying the first of them must not quietly leave the other two alive. The
--- failure still escapes, so the executor above still records it, and it still
--- withholds the parents that must outlive whatever may have survived.
-releaseAll ∷ [IO [Text]] → IO [Text]
+-- A place whose release failed counts: its object may be alive, so the entry
+-- must stay in the plan and say so rather than vanish from the record.
+occupied ∷ Held a → IO Bool
+occupied (Held _ ref) =
+  readIORef ref >>= \case
+    Empty → pure False
+    _ → pure True
+
+-- | What one registered release did: every object it destroyed, and every
+-- failure it had.
+--
+-- Both lists, and all of both. One cleanup entry can own several children — a
+-- slot's command pool, its rendering fence and its acquisition semaphore are
+-- one entry — so reporting only the first failure would drop the later ones
+-- from the record, and reporting no destructions because one child failed
+-- would deny the ones that went.
+data Disposal = Disposal
+  { disposalDestroyed ∷ [Text]
+  , disposalFailures ∷ [Text]
+  }
+
+-- | Run every release, and report all of them.
+--
+-- A failure destroying one child must not leave its siblings alive, so none of
+-- these is allowed to stop the others; and none is swallowed, because the
+-- executor above turns each into a recorded failure that withholds the parents
+-- which must outlive whatever may have survived.
+releaseAll ∷ [IO [Text]] → IO Disposal
 releaseAll actions = do
   outcomes ← forM actions (try @SomeException)
-  case [failure | Left failure ← outcomes] of
-    (failure : _) → throwIO failure
-    [] → pure (concat [names | Right names ← outcomes])
+  pure
+    Disposal
+      { disposalDestroyed = concat [names | Right names ← outcomes]
+      , disposalFailures = [Text.pack (displayException failure) | Left failure ← outcomes]
+      }
 
 -- --------------------------------------------------------------------------
 -- The ledger
@@ -187,7 +254,7 @@ observations (Ledger ref) = readIORef ref
 -- construction says what went rather than what the entry is called.
 data Cleanup = Cleanup
   { cleanupHolds ∷ IO Bool
-  , cleanupRelease ∷ IO [Text]
+  , cleanupRelease ∷ IO Disposal
   }
 
 -- | Teardown actions, newest first, each naming the handle it releases and
@@ -209,7 +276,10 @@ newCleanups = Cleanups <$> newIORef 0 <*> newIORef []
 -- the handle is named for.
 onExit ∷ Cleanups → Handle → IO () → IO ()
 onExit cleanups handle action =
-  onExitHolding cleanups handle (Cleanup (pure True) (action >> pure [describeHandle handle]))
+  onExitHolding
+    cleanups
+    handle
+    (Cleanup (pure True) (releaseAll [action >> pure [describeHandle handle]]))
 
 -- | Register a release whose presence is a question: a composite's entry,
 -- which holds whichever of its children the construction reached.
@@ -243,18 +313,19 @@ owning cleanups handle acquire release = mask_ $ do
   onExit cleanups handle (release value)
   pure value
 
--- | What became of one release.
+-- | What became of one registered release.
 data Release
-  = Released [Text]
-    -- ^ The objects it destroyed, by name. Empty for the teardown boundary,
-    -- which releases nothing.
-  | Failed Text
+  = Ran Disposal
+    -- ^ It ran: what it destroyed, and what failed. The teardown boundary runs
+    -- and destroys nothing, which is this with both lists empty.
   | Retained Text
 
+-- | Whether the entry may be reported as released. An entry that had any
+-- failure may not, however many of its children went.
 released ∷ Release → Bool
 released = \case
-  Released _ → True
-  _ → False
+  Ran disposal → null disposal.disposalFailures
+  Retained _ → False
 
 -- | Tear down: the boundary first, then every release the recorded evidence
 -- permits, in reverse registration order.
@@ -300,35 +371,40 @@ runCleanups journal ledger cleanups = do
           Destroy → do
             outcome ← attempt journal entry
             let withheld' = case outcome of
-                  (_, Failed _) → withheld <> [(handle, "was not released, because its own release failed")]
+                  (_, Ran disposal)
+                    | not (null disposal.disposalFailures) →
+                        withheld <> [(handle, "was not released, because its own release failed")]
                   _ → withheld
             (outcome :) <$> walk withheld' rest
   later ← walk [] [entry | entry@(handle, _) ← entries, handle /= TheTeardownBoundary]
   settled ← observations ledger
   pure (teardownFactsFrom settled (boundary <> later))
 
-attempt ∷ Journal → (Handle, IO [Text]) → IO (Handle, Release)
+attempt ∷ Journal → (Handle, IO Disposal) → IO (Handle, Release)
 attempt journal (handle, action) = do
   outcome ← try @SomeException action
-  case outcome of
-    Right destroyed → pure (handle, Released destroyed)
-    Left failure → do
-      let reason = describeHandle handle <> ": " <> Text.pack (displayException failure)
-      note journal ("teardown of " <> reason)
-      pure (handle, Failed reason)
+  -- A release that escaped its own aggregate is this entry's failure too,
+  -- rather than one the record loses.
+  let disposal = case outcome of
+        Right ran → ran
+        Left escaped → Disposal {disposalDestroyed = [], disposalFailures = [Text.pack (displayException escaped)]}
+      named = [describeHandle handle <> ": " <> reason | reason ← disposal.disposalFailures]
+  for_ named $ \reason → note journal ("teardown of " <> reason)
+  pure (handle, Ran disposal {disposalFailures = named})
 
 teardownFactsFrom ∷ [Observation] → [(Handle, Release)] → TeardownFacts
 teardownFactsFrom recorded outcomes =
   TeardownFacts
     { teardownReleases = releasedEntries [(handle, released outcome) | (handle, outcome) ← outcomes]
-    , teardownFailures = [reason | (_, Failed reason) ← outcomes]
+    , teardownFailures = concat [disposal.disposalFailures | (_, Ran disposal) ← outcomes]
     , -- Exactly what was destroyed, named by the places the releases emptied.
       -- The boundary ran, and it is in 'teardownReleases' and in the
       -- observations it produced, but it destroyed nothing: it is the
       -- device-idle wait the rest rest on. This line is what a reader consults
       -- to learn which native objects were freed, so neither a wait nor a
       -- child a stopped construction never created belongs in it.
-      teardownDestroyed = concat [destroyed | (handle, Released destroyed) ← outcomes, isDestruction handle]
+      teardownDestroyed =
+        concat [disposal.disposalDestroyed | (handle, Ran disposal) ← outcomes, isDestruction handle]
     , teardownRetained = [(describeHandle handle, reason) | (handle, Retained reason) ← outcomes]
     , teardownRoute = describeRoute (standingFrom recorded)
     , teardownObservations = map describeObservation recorded

@@ -131,8 +131,8 @@ release fake failing name = do
 -- its own role names.
 slotOpsFor ∷ Fake → Maybe Int → [Text] → SlotName → IO (SlotOps Text Text Text Text)
 slotOpsFor fake failAt failing name = do
-  semaphores ← newIORef [name <> " acquisition semaphore", name <> " presentation semaphore"]
-  fences ← newIORef [name <> " rendering fence", name <> " present fence"]
+  semaphores ← newIORef ["the acquisition semaphore of " <> name, "the presentation semaphore of " <> name]
+  fences ← newIORef ["the rendering fence of " <> name, "the present fence of " <> name]
   let nextRole ref =
         atomicModifyIORef' ref $ \case
           (role : rest) → (rest, role)
@@ -143,7 +143,7 @@ slotOpsFor fake failAt failing name = do
       , destroySlotSemaphore = release fake failing
       , createSlotFence = nextRole fences >>= acquire fake failAt
       , destroySlotFence = release fake failing
-      , createSlotPool = acquire fake failAt (name <> " command pool")
+      , createSlotPool = acquire fake failAt ("the command pool of " <> name)
       , destroySlotPool = release fake failing
       , allocateSlotCommands = \pool → acquire fake failAt (pool <> "'s command buffer")
       }
@@ -240,7 +240,12 @@ data Session = Session
 -- of both slots' releases before either slot's first native object exists, then
 -- the boundary.
 slotSession ∷ Maybe Int → [Text] → IO Session
-slotSession failAt failing = do
+slotSession failAt failing = slotSessionUnder failAt failing Succeeded
+
+-- | The same, with the teardown boundary reporting what this run's boundary
+-- reported — which is how device loss is put to the executor.
+slotSessionUnder ∷ Maybe Int → [Text] → NativeResult → IO Session
+slotSessionUnder failAt failing boundary = do
   fake ← newFake
   cleanups ← newCleanups
   ledger ← newLedger
@@ -257,7 +262,7 @@ slotSession failAt failing = do
     -- before anything is submitted. A construction that stops never reaches
     -- it, which is the plan "Test.Vulkan.Proof.RetentionSpec" calls a run that
     -- stopped before the boundary was registered.
-    registerBoundary ledger Succeeded cleanups
+    registerBoundary ledger boundary cleanups
     pure built
   facts ← runCleanups journal ledger cleanups
   pure (Session fake facts (either (Just . stopReason) (const Nothing) outcome))
@@ -385,10 +390,10 @@ spec = do
       -- is grouped with, and the present fence before the presentation
       -- semaphore it retired, which is the order
       -- VK_EXT_swapchain_maintenance1 names.
-      positionIn "slot 1 command pool" gone
-        `shouldSatisfy` (< positionIn "slot 1 rendering fence" gone)
-      positionIn "slot 0 present fence" gone
-        `shouldSatisfy` (< positionIn "slot 0 presentation semaphore" gone)
+      positionIn "the command pool of slot 1" gone
+        `shouldSatisfy` (< positionIn "the rendering fence of slot 1" gone)
+      positionIn "the present fence of slot 0" gone
+        `shouldSatisfy` (< positionIn "the presentation semaphore of slot 0" gone)
 
     it "owns a command buffer through its command pool rather than separately" $ do
       session ← slotSession Nothing []
@@ -397,16 +402,16 @@ spec = do
       let buffers = filter (Text.isSuffixOf "command buffer") built
       length buffers `shouldBe` 2
       forM_ buffers $ \buffer → occurrences buffer gone `shouldBe` 0
-      forM_ ["slot 0 command pool", "slot 1 command pool"] $ \pool →
+      forM_ ["the command pool of slot 0", "the command pool of slot 1"] $ \pool →
         occurrences pool gone `shouldBe` 1
 
     it "never destroys a handle the failing step never created" $ do
       session ← slotSession (Just 3) []
       gone ← releasedBy session.sessionFake
       -- The present fence of slot 0 is what step 3 was creating.
-      occurrences "slot 0 present fence" gone `shouldBe` 0
-      occurrences "slot 0 command pool" gone `shouldBe` 0
-      occurrences "slot 1 acquisition semaphore" gone `shouldBe` 0
+      occurrences "the present fence of slot 0" gone `shouldBe` 0
+      occurrences "the command pool of slot 0" gone `shouldBe` 0
+      occurrences "the acquisition semaphore of slot 1" gone `shouldBe` 0
 
   describe "A cleanup entry that holds nothing" $ do
     -- A place-backed entry whose construction never reached it owns no native
@@ -460,6 +465,75 @@ spec = do
         `shouldSatisfy` notElem captureMemoryName
       session.sessionFacts.teardownDestroyed `shouldSatisfy` notElem captureMemoryName
 
+  describe "A release that fails under device loss" $
+    -- Device loss waives the completion evidence and nothing else. A lost
+    -- device's children are still objects that must be destroyed before it,
+    -- so a child whose destroy failed still withholds the device over it.
+    it "still withholds the parents that must outlive what may have survived" $ do
+      session ← slotSessionUnder Nothing ["the command pool of slot 0"] DeviceLost
+      gone ← releasedBy session.sessionFake
+      session.sessionFacts.teardownRoute `shouldSatisfy` Text.isInfixOf "device-loss"
+      occurrences "the logical device" gone `shouldBe` 0
+      map fst session.sessionFacts.teardownRetained `shouldContain` ["the logical device"]
+      lookup "the logical device" session.sessionFacts.teardownRetained
+        `shouldSatisfy` maybe False (Text.isInfixOf "its own release failed")
+      -- And nothing else is withheld: device loss is still what waives the
+      -- completion conditions, so the second slot goes.
+      map fst session.sessionFacts.teardownRetained
+        `shouldSatisfy` notElem "the command pool, rendering fence and acquisition semaphore of slot 1"
+      session.sessionFacts.teardownDestroyed `shouldContain` ["the command pool of slot 1"]
+
+  describe "A cleanup entry that owns several children" $ do
+    -- One entry owns a slot's command pool, its rendering fence and its
+    -- acquisition semaphore. A failure destroying one of them must neither
+    -- stop the others nor erase them from the record, and a second failure
+    -- must not be dropped behind the first.
+    let bothFail = ["the command pool of slot 0", "the acquisition semaphore of slot 0"]
+
+    it "records every failure, not only the first" $ do
+      session ← slotSession Nothing bothFail
+      length session.sessionFacts.teardownFailures `shouldBe` 2
+      forM_ bothFail $ \child →
+        session.sessionFacts.teardownFailures `shouldSatisfy` any (Text.isInfixOf child)
+
+    it "still names the sibling that was destroyed" $ do
+      session ← slotSession Nothing bothFail
+      gone ← releasedBy session.sessionFake
+      session.sessionFacts.teardownDestroyed `shouldContain` ["the rendering fence of slot 0"]
+      -- Every one of the three was attempted, exactly once.
+      forM_ ("the rendering fence of slot 0" : bothFail) $ \child →
+        occurrences child gone `shouldBe` 1
+
+    it "is not reported as an entry that released" $ do
+      session ← slotSession Nothing bothFail
+      session.sessionFacts.teardownReleases `shouldSatisfy` notElem "the frame slots"
+
+  describe "The capture freeing its own handles" $ do
+    -- The capture releases its buffer and its memory itself at the end of the
+    -- path, outside the cleanup executor. A destroy that fails there must not
+    -- look to a later teardown like a place that was never filled.
+    it "leaves a failed self-release visible to teardown" $ do
+      session ← captureSession Nothing [captureMemoryName] Succeeded
+      session.sessionStopped `shouldSatisfy` maybe False (Text.isInfixOf captureMemoryName)
+      session.sessionFacts.teardownFailures `shouldSatisfy` any (Text.isInfixOf captureMemoryName)
+      session.sessionFacts.teardownReleases `shouldSatisfy` notElem captureMemoryName
+
+    it "withholds the device over what may have survived" $ do
+      session ← captureSession Nothing [captureMemoryName] Succeeded
+      gone ← releasedBy session.sessionFake
+      occurrences "the logical device" gone `shouldBe` 0
+      map fst session.sessionFacts.teardownRetained `shouldContain` ["the logical device"]
+
+    it "does not retry the destroy that failed, and finishes the buffer" $ do
+      session ← captureSession Nothing [captureMemoryName] Succeeded
+      gone ← releasedBy session.sessionFake
+      -- Attempted once by the capture itself, and never again by teardown.
+      occurrences captureMemoryName gone `shouldBe` 1
+      -- The buffer's place was never reached by the capture, so teardown is
+      -- what destroys it.
+      occurrences captureBufferName gone `shouldBe` 1
+      session.sessionFacts.teardownDestroyed `shouldContain` [captureBufferName]
+
   describe "A swapchain whose construction stops after it exists" $
     -- The review's correction on this issue. `buildTarget` creates the
     -- swapchain and then reads its images back and allocates the counter the
@@ -506,7 +580,7 @@ spec = do
       reached ← newEmptyMVar
       proceed ← newEmptyMVar
       done ← newEmptyMVar
-      semaphores ← newIORef ["slot 0 acquisition semaphore", "slot 0 presentation semaphore"]
+      semaphores ← newIORef ["the acquisition semaphore of slot 0", "the presentation semaphore of slot 0"]
       let operations =
             SlotOps
               { createSlotSemaphore = do
@@ -521,7 +595,7 @@ spec = do
                   -- interruptible even under a mask, so that is where the
                   -- throw lands — one step past the handoff under test, with
                   -- the first object owned and no second object to lose.
-                  if role == "slot 0 acquisition semaphore"
+                  if role == "the acquisition semaphore of slot 0"
                     then do
                       name ← acquire fake Nothing role
                       putMVar reached ()
@@ -530,9 +604,9 @@ spec = do
                       takeMVar proceed
                       acquire fake Nothing role
               , destroySlotSemaphore = release fake []
-              , createSlotFence = acquire fake Nothing "slot 0 unreached fence"
+              , createSlotFence = acquire fake Nothing "an unreached fence of slot 0"
               , destroySlotFence = release fake []
-              , createSlotPool = acquire fake Nothing "slot 0 unreached pool"
+              , createSlotPool = acquire fake Nothing "an unreached pool of slot 0"
               , destroySlotPool = release fake []
               , allocateSlotCommands = \pool → acquire fake Nothing (pool <> "'s command buffer")
               }
@@ -549,7 +623,7 @@ spec = do
       -- released before the device, which is the whole claim.
       everyChildOwnedAndFreedBeforeTheDevice session
       gone ← releasedBy fake
-      occurrences "slot 0 acquisition semaphore" gone `shouldBe` 1
+      occurrences "the acquisition semaphore of slot 0" gone `shouldBe` 1
       facts.teardownFailures `shouldBe` []
 
   describe "A release that fails while a construction failure is being handled" $ do
@@ -557,7 +631,7 @@ spec = do
     -- what stopped the run and must survive teardown, and a release that fails
     -- must be recorded beside it rather than replacing it or hiding the
     -- releases after it.
-    let failingRelease = "slot 0 rendering fence"
+    let failingRelease = "the rendering fence of slot 0"
 
     it "keeps the primary failure and records the release failure beside it" $ do
       session ← slotSession (Just 7) [failingRelease]
