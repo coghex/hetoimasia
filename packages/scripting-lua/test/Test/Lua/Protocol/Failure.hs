@@ -3,6 +3,9 @@
 module Test.Lua.Protocol.Failure (spec) where
 
 import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import Data.Word (Word64)
+import GHC.Stack (HasCallStack)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
   ( ReasonCode (AuthoritativeFault, ScriptFault)
   , RecoverySafety (RecoverySafe, RecoveryUnsafe)
@@ -12,9 +15,14 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId (EndpointId)
   , RequestName (RequestName)
   , TaskId (TaskId)
+  , firstTaskName
   , taskName
   , SnapshotId (SnapshotId)
   , SubscriptionName (SubscriptionName)
+  )
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
+  ( Limits (maxRetainedResults)
+  , LimitName (RetainedResults)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   ( CancelCause (CancelledBySessionFailure, CancelledByTaskInvalidation)
@@ -24,8 +32,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   ( AdmissionState (AdmissionOpen, MutationAdmissionClosed)
   , FailureRecord (FailureRecord, failedLastGoodSnapshot, failedReason, failedRecovery, failedTask)
-  , Session (sessionAdmission, sessionFailure, sessionKey, sessionQueued, sessionRequests, sessionSubscriptions, sessionTasks)
-  , SessionRejection (AdmissionIsClosed, SessionAlreadyFailed, TaskNotActivated, TaskRetired, TransitionRefused, UnknownTask)
+  , Session (sessionAdmission, sessionFailure, sessionKey, sessionQueued, sessionRequests, sessionReservations, sessionSubscriptions, sessionTasks)
+  , SessionRejection (AdmissionIsClosed, CapReached, SessionAlreadyFailed, SessionAlreadyStopped, TaskNotActivated, TaskRetired, TransitionRefused, UnknownTask)
   , TerminalResult (ResultCancelled, ResultFailed)
   , acceptRequest
   , activateNext
@@ -37,6 +45,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session
   , reportFailure
   , requestAdmission
   , startSegment
+  , stopSession
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (OrderedEvents))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
@@ -44,7 +53,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Task
   , Task (taskState)
   , TaskFailure (TaskFailure)
   , TaskOutcome (OutcomeCancelled)
-  , TaskState (Failed)
+  , TaskState (Failed, Ready, Running)
   , TransitionRejection (AlreadyTerminal)
   )
 import Test.Hspec (Spec, describe, it, shouldBe)
@@ -53,8 +62,12 @@ import Test.Lua.Protocol.Support
   , observingAdmission
   , ok
   , openSession
+  , openSessionWith
+  , otherSession
   , rejected
+  , roomyLimits
   , runningTask
+  , sampleLimits
   )
 
 handled ∷ FailureRecord
@@ -207,6 +220,98 @@ spec = describe "session failure" $ do
     sessionFailure c `shouldBe` Nothing
     sessionAdmission c `shouldBe` AdmissionOpen
 
+  it "settles a safe failure of observing work admitted after the session failed" $ do
+    session ← openSessionWith sampleLimits {maxRetainedResults = 2}
+    (a, doomed) ← runningTask 1 session
+    (b, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just doomed} a)
+    (c, reporting) ← reportingTask 6 b
+    (d, ()) ← ok (reportFailure handled {failedTask = Just reporting} c)
+    sessionFailure d `shouldBe` Just unsafeAuthoritative {failedTask = Just doomed}
+    sessionKey d `shouldBe` sessionKey c
+    sessionAdmission d `shouldBe` MutationAdmissionClosed
+    fmap taskState (Map.lookup reporting (sessionTasks d))
+      `shouldBe` Just (Failed (TaskFailure (failedReason handled) RecoverySafe))
+    sessionReservations d `shouldBe` 2
+    (e, stillHeld) ← rejected (requestAdmission (observingAdmission 7) d)
+    stillHeld `shouldBe` CapReached RetainedResults 2
+    (f, result) ← ok (observeResult reporting e)
+    result `shouldBe` ResultFailed (TaskFailure (failedReason handled) RecoverySafe)
+    Map.member reporting (sessionTasks f) `shouldBe` False
+    sessionReservations f `shouldBe` 1
+    (g, _) ← ok (requestAdmission (observingAdmission 7) f)
+    (_, stillClosed) ← rejected (requestAdmission (admission 8) g)
+    stillClosed `shouldBe` AdmissionIsClosed MutationAdmissionClosed
+
+  it "settles a safe failure of observing work activated but not yet started" $ do
+    session ← openSession
+    (a, doomed) ← runningTask 1 session
+    (b, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just doomed} a)
+    (c, reporting) ← ok (requestAdmission (observingAdmission 6) b)
+    (d, _) ← ok (activateNext c)
+    fmap taskState (Map.lookup reporting (sessionTasks d)) `shouldBe` Just Ready
+    (e, ()) ← ok (reportFailure handled {failedTask = Just reporting} d)
+    sessionFailure e `shouldBe` Just unsafeAuthoritative {failedTask = Just doomed}
+    sessionAdmission e `shouldBe` MutationAdmissionClosed
+    (f, result) ← ok (observeResult reporting e)
+    result `shouldBe` ResultFailed (TaskFailure (failedReason handled) RecoverySafe)
+    Map.member reporting (sessionTasks f) `shouldBe` False
+    Map.size (sessionTasks f) `shouldBe` 1
+
+  it "invalidates only the settled task's own holdings after the session failed" $ do
+    session ← openSessionWith roomyLimits
+    (a, doomed) ← runningTask 1 session
+    (b, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just doomed} a)
+    (c, reporting) ← reportingTask 6 b
+    (d, bystander) ← reportingTask 7 c
+    (e, ownRequest) ← ok (acceptRequest reporting (RequestName 3) endpointName d)
+    (f, ownSubscription) ←
+      ok (registerSubscription reporting (SubscriptionName 2) endpointName OrderedEvents e)
+    (g, otherSubscription) ←
+      ok (registerSubscription bystander (SubscriptionName 3) endpointName OrderedEvents f)
+    (h, ()) ← ok (reportFailure handled {failedTask = Just reporting} g)
+    revoked h ownRequest `shouldBe` Just (SettledCancelled CancelledByTaskInvalidation)
+    case Map.lookup ownRequest (sessionRequests h) of
+      Nothing → fail "the settled task's request lost its provider accounting"
+      Just record → do
+        requestResultHeld record `shouldBe` False
+        requestProviderOutstanding record `shouldBe` True
+    Map.member ownSubscription (sessionSubscriptions h) `shouldBe` False
+    Map.member otherSubscription (sessionSubscriptions h) `shouldBe` True
+    fmap taskState (Map.lookup bystander (sessionTasks h)) `shouldBe` Just Running
+
+  it "retains every refusal a failed session makes around that settlement" $ do
+    session ← openSessionWith roomyLimits
+    (a, doomed) ← runningTask 1 session
+    (b, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just doomed} a)
+    (c, reporting) ← reportingTask 6 b
+    (d, ()) ← ok (reportFailure handled {failedTask = Just reporting} c)
+    refusesUnchanged d (reportFailure handled {failedTask = Just reporting})
+    (e, _) ← ok (observeResult reporting d)
+    refusesUnchanged e (reportFailure handled {failedTask = Just reporting})
+    (f, finished) ← reportingTask 7 e
+    (g, ()) ← ok (applyOutcome finished (SegmentCompleted "done") f)
+    refusesUnchanged g (reportFailure handled {failedTask = Just finished})
+    refusesUnchanged g (reportFailure unsafeAuthoritative {failedTask = Just finished})
+    (h, queuedOnly) ← ok (requestAdmission (observingAdmission 8) g)
+    refusesUnchanged h (reportFailure handled {failedTask = Just queuedOnly})
+    refusesUnchanged h (reportFailure unsafeAuthoritative {failedTask = Just queuedOnly})
+    refusesUnchanged h (reportFailure handled)
+    refusesUnchanged h (reportFailure unsafeAuthoritative)
+    refusesUnchanged h (reportFailure handled {failedTask = Just elsewhere})
+    refusesUnchanged h advanceEpoch
+    sessionFailure h `shouldBe` Just unsafeAuthoritative {failedTask = Just doomed}
+    sessionAdmission h `shouldBe` MutationAdmissionClosed
+
+  it "keeps a stop ahead of the settlement a failed session still allows" $ do
+    session ← openSession
+    (a, doomed) ← runningTask 1 session
+    (b, ()) ← ok (reportFailure unsafeAuthoritative {failedTask = Just doomed} a)
+    (c, reporting) ← reportingTask 6 b
+    let (stopped, _) = stopSession c
+    (d, refusal) ← rejected (reportFailure handled {failedTask = Just reporting} stopped)
+    refusal `shouldBe` SessionAlreadyStopped
+    d `shouldBe` stopped
+
   it "offers no retry, restart, or continuation of a failed session" $ do
     session ← openSession
     (a, _) ← runningTask 1 session
@@ -219,3 +324,22 @@ spec = describe "session failure" $ do
     endpointName = EndpointId "provider.sample"
     revoked session identity =
       Map.lookup identity (sessionRequests session) >>= requestSettlement
+    elsewhere = TaskId otherSession firstTaskName
+    -- | Admit, activate, and start one 'Observing' task, which is the only
+    -- work a failed session accepts.
+    reportingTask ∷ HasCallStack ⇒ Word64 → Session Text → IO (Session Text, TaskId)
+    reportingTask number current = do
+      (queued, identity) ← ok (requestAdmission (observingAdmission number) current)
+      (active, _) ← ok (activateNext queued)
+      (started, ()) ← ok (startSegment identity active)
+      pure (started, identity)
+    -- | An operation a failed session refuses outright, leaving it as it was.
+    refusesUnchanged
+      ∷ (HasCallStack, Show a)
+      ⇒ Session Text
+      → (Session Text → (Session Text, Either SessionRejection a))
+      → IO ()
+    refusesUnchanged before operation = do
+      (after, refusal) ← rejected (operation before)
+      refusal `shouldBe` SessionAlreadyFailed
+      after `shouldBe` before
