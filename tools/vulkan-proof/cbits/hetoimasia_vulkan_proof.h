@@ -21,12 +21,14 @@
 typedef struct hetoimasia_proof_window hetoimasia_proof_window;
 
 /* Hand GLFW the loader the Haskell binding already dispatches through, before
- * `glfwInit`. `entry` is that binding's own `vkGetInstanceProcAddr`. Returns 0
- * when GLFW was already initialized, which would make the call a no-op. */
+ * `glfwInit`. `entry` is that binding's own `vkGetInstanceProcAddr`. Checks no
+ * initialization state and returns 1 unconditionally, so the return value
+ * reports neither success nor whether GLFW was already initialized. */
 int hetoimasia_proof_init_vulkan_loader(void *entry);
 
-/* Initialize GLFW with no client API and, when `visible` is zero, a hidden
- * window hint. Returns GLFW's own success value. */
+/* Clear the stored error description, install the shim's error callback, and
+ * initialize GLFW. Returns `glfwInit`'s own result. Window hints, the client
+ * API among them, belong to `hetoimasia_proof_create_window`. */
 int hetoimasia_proof_glfw_init(void);
 
 void hetoimasia_proof_glfw_terminate(void);
