@@ -687,6 +687,41 @@ VK-4 through VK-17 stay deferred until VK-2's merged proof passes on both
 platforms. A failed proof returns to this document rather than authorizing a
 silent policy change.
 
+### D-28. Mix audited unsafe recording imports with safe blocking calls behind C-only capture
+
+Owner accepted this production FFI policy on 2026-09-20, replacing P-9's
+deferral of native-only capture. The proof's binding-wide `+safe-foreign-calls`
+selection with a Haskell validation callback is the correct proof configuration
+and stays as historical evidence; it is not the backend's configuration.
+
+| Call category | Policy |
+|---|---|
+| Audited short draw, state and command-recording operations with no Haskell re-entry | Genuine `unsafe` foreign imports. Audit the supported subset operation by operation; do not assume every `vkCmd*` has the same host cost. |
+| GPU waits, acquisition that may wait, and potentially lengthy operations such as pipeline compilation | `safe` imports, preserving finite-wait and stop/checkpoint contracts. |
+| Queue submission and presentation | Start `safe`; their frequency does not rule out substantial driver work or blocking. |
+| Any operation that can call back into Haskell | `safe`. It cannot join the unsafe subset while that re-entry remains possible. |
+
+Validation capture on the unsafe path is C-only: the native callback copies
+capped data into owned bounded storage and D-19's Haskell diagnostic worker
+drains it afterward. No Haskell trampoline, exception, logger or allocation
+callback may be reachable from an unsafe import. Validation stays enabled on the
+same recording path production uses, and P-11's limits, prompt capture, no
+waiting for space, no sink I/O or Vulkan calls in the callback, error latching
+before detail admission and the normal non-aborting result all still hold. Use
+the pinned binding's types and dispatch machinery where possible with a narrow
+private set of genuine unsafe imports or an equivalent audited generation
+mechanism; a Haskell wrapper around an existing safe import does not change its
+calling convention. Record the production FFI configuration in build and
+evidence identity.
+
+Safe/unsafe comparisons for representative recording on both platforms,
+including runtime progress under driver waits, are optional reproducible
+measurements recorded with toolchain, layer and driver identity; no speedup is
+asserted unmeasured and no timing threshold enters required CI. This decision
+does not change Lua's FFI settings, rewrite the foundation logger, tune the RTS
+broadly, add a render thread or expand platform support. It originates from
+[runtime_review_findings.md](runtime_review_findings.md) RR-5.
+
 ## Design
 
 ### P-1. Separate owners; use one main-thread loop for multiple targets
@@ -1221,9 +1256,11 @@ The candidate also enables `darwin-lib-dirs` by default, injecting
 `/usr/local/lib`. Disable that ambient-search flag and supply the project-managed
 loader prefix explicitly, including executable runtime resolution. Linux
 pkg-config discovery and macOS linking must select the same loader used by
-P-7. Record binding flags in build inputs and evidence. A later native-only
-capture shim could avoid Haskell reentry, but disabling safe calls is not an
-unmeasured optimization allowed by this design.
+P-7. Record binding flags in build inputs and evidence. D-28 selects the
+production split: a C-only capture shim with audited `unsafe` imports for short
+recording operations, and `safe` imports for everything that may wait, block or
+re-enter Haskell. Binding-wide safe calls remain the proof's configuration, not
+the backend's.
 
 These findings were checked in the locally cached `vulkan-3.27` source
 (`vulkan.cabal`, `Vulkan.Dynamic`, generated device/queue/debug-utils imports).
@@ -1340,8 +1377,10 @@ per-entry flush, but writes can still block; buffering that handle alone does
 not make the render path nonblocking. Avoid changing the foundation logger's
 semantics to accommodate a future consumer.
 
-Before enabling validation, provide component-owned bounded diagnostic capture
-using P-9's callback-safe binding configuration.
+Before enabling validation, provide component-owned bounded diagnostic capture.
+Under D-28 the production callback is C-only, because it may be reached from
+unsafe imports; the proof's Haskell callback under P-9's safe configuration is
+not the production shape.
 The native callback copies capped data into owned storage, contains every
 exception, and never formats to a user sink, waits for queue space or calls back
 into Vulkan. Preserve a latched error/overflow indication independently of
@@ -2056,7 +2095,7 @@ Progress the independent work while those owners finish.
 - **Depends on:** `VK-2`.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-3, D-10, D-11, D-13, D-14, D-21.
-- **Acceptance signals:** Cold provisioning and warm reuse identify the same inputs; planner/worker identities agree; ordinary runs do not rebuild native libraries. Validation-layer versions and manifest/binary identities participate in evidence compatibility on both platforms, and a changed layer invalidates affected evidence. Published-image digest and recipe evidence land in this code PR.
+- **Acceptance signals:** Cold provisioning and warm reuse identify the same inputs; planner/worker identities agree; ordinary runs do not rebuild native libraries. Validation-layer versions and manifest/binary identities participate in evidence compatibility on both platforms, and a changed layer invalidates affected evidence. Published-image digest and recipe evidence land in this code PR. Missing or unreadable inputs refuse with a diagnosis naming what the machine holds and never fall back to another loader, driver or layer. A substituted driver manifest or binary, like a changed layer, invalidates affected evidence; an upgrade is an explicit requalification. Explicit path overrides locate inputs without waiving identity qualification, so a moving symlink such as Homebrew `opt` is acceptable only when its resolved identity is checked against the pin. The VK-2 proof records are preserved as historical evidence of the inputs they name.
 - **Out of scope:** Hosted macOS CI, changes to Synarchy, or a new parallel cache/receipt system.
 - **Open questions:** None once VK-2 passes.
 
@@ -2068,19 +2107,19 @@ Progress the independent work while those owners finish.
 - **Depends on:** `VK-4`. External prerequisite: LIFE #144 (and its #141–#143 chain).
 - **Ordering:** critical path.
 - **Relevant decisions:** D-5, D-7, D-14.
-- **Acceptance signals:** Scripted admission/cancellation/failure tests and focused VK-2-harness native cases prove shared-loader use and preserved SDK-free window-only behavior. Surface ownership cannot escape its registered attachment; retained evidence covers both platforms before VK-8 takes over routing.
+- **Acceptance signals:** Scripted admission/cancellation/failure tests and focused VK-2-harness native cases prove shared-loader use and preserved SDK-free window-only behavior. Surface ownership cannot escape its registered attachment; retained evidence covers both platforms before VK-8 takes over routing. The pre-init loader capability is an additive constructor beside `sessionAssembly`, and seam examples cover its ordering between hints and `glfwInit`, failure before any native effect, and the reset on both termination and failed initialization; the ordinary native library keeps `GLFW_INCLUDE_NONE` (from RR-10 in `runtime_review_findings.md`).
 - **Out of scope:** Device selection, swapchains or another GLFW native API mirror.
 - **Open questions:** None; use VK-2's proven ABI profile.
 
 ### VK-6. Capture validation diagnostics with an independent worker
 
 - **Outcome:** Bounded callback capture and a backend-owned logging consumer with independently observable failure state.
-- **Scope:** P-9/P-11 safe-call configuration, bounded copies, error/drop/truncation latches, a separately owned foundation worker group, callback storage lifetime and final drain/join.
+- **Scope:** P-11/D-28 C-only native capture reachable from unsafe imports, bounded copies, error/drop/truncation latches, a separately owned foundation worker group, callback storage lifetime and final drain/join.
 - **Phase:** Native foundations.
 - **Depends on:** `VK-3`, `VK-4`.
 - **Ordering:** parallel with VK-5.
-- **Relevant decisions:** D-19–D-21.
-- **Acceptance signals:** Hspec saturation, callback exception and sink-failure paths preserve the primary; focused VK-2-harness cases prove native reentry; final callbacks cannot access freed storage or be excluded from the verdict.
+- **Relevant decisions:** D-19–D-21, D-28.
+- **Acceptance signals:** Hspec saturation and sink-failure paths preserve the primary; final callbacks cannot access freed storage or be excluded from the verdict. Hspec cases exercise concurrent capture, bounded copying, saturation, error latching, sink failure and teardown ordering. Native cases show the C-only production callback receiving diagnostics inside an unsafe-import operation, with no Haskell re-entry from any unsafe call, and surviving the final callback-producing destruction; synthetic seam coverage alone is insufficient. VK-2's Haskell-callback re-entry and callback-exception evidence is historical proof coverage under the binding-wide safe configuration, not this slice's acceptance; the safe imports retained for waits, submission, presentation and any re-entrant operation coexist with the private audited unsafe recording imports under D-28.
 - **Out of scope:** Foundation logger rewrite or permanent RTS performance tuning.
 - **Open questions:** None; native callback proof is a VK-2 gate.
 
@@ -2135,12 +2174,12 @@ Progress the independent work while those owners finish.
 ### VK-11. Record through retained managed resources
 
 - **Outcome:** Minimal managed graphics resources and scoped recording with exact transitive retention for triangle and capture operations.
-- **Scope:** P-1 pipelines, command storage, draws, necessary barriers and readback resources; logical release, sealed single-use batches and safe discard/reset. Keep Vulkan-specific choices visible to consumers.
+- **Scope:** P-1 pipelines, command storage, draws, necessary barriers and readback resources; logical release, sealed single-use batches and safe discard/reset. Keep Vulkan-specific choices visible to consumers. D-28's audited unsafe recording subset through a narrow private import set, with safe imports for waits, submission and presentation.
 - **Phase:** Rendering lifecycle.
 - **Depends on:** `VK-3`, `VK-7`, `VK-9`, `VK-10`.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-15, D-26.
-- **Acceptance signals:** Foreign/stale/duplicate use fails before effects; partial recording cannot free captured resources; replacement cannot redirect earlier commands; noncoherent capture memory is handled correctly.
+- **Relevant decisions:** D-15, D-26, D-28.
+- **Acceptance signals:** Foreign/stale/duplicate use fails before effects; partial recording cannot free captured resources; replacement cannot redirect earlier commands; noncoherent capture memory is handled correctly. An operation-by-operation FFI/callback audit is retained and the compiled import selection is inspected; masking, native-effect accounting, retention and completion evidence hold across the mixed calls; optional safe/unsafe measurements are recorded with identities and none is asserted as a speedup.
 - **Out of scope:** Raw escape callbacks, asset streaming, bindless/device-address features, reusable command lists or an implicit render graph.
 - **Open questions:** None.
 
