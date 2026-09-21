@@ -725,6 +725,7 @@ module Hetoimasia.Runtime.GLFW
   , readTargetStanding
   , readOwnerFailure
   , readOwnerFailures
+  , retainedFailureBound
   , ownerTargetAcknowledgement
 
     -- ** The extent seam

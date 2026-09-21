@@ -125,7 +125,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , readOwnerGeometry
   , readOwnerFailure
   , readOwnerFailures
-  , retainedOwnerFailures
+  , retainedFailureBound
   , readOwnerTargets
   , readOwnerAcknowledged
   , Stage (..)
@@ -754,6 +754,11 @@ data GraphicsOwner scene = GraphicsOwner
     -- learns it by looking rather than by being told, which is idempotent by
     -- construction and puts no obligation on the application.
   , ownerStarted ∷ !(TVar Bool)
+  , ownerRetainedLimit ∷ !Int
+    -- ^ How many failures the owner keeps, derived from the host's own window
+    -- limit rather than chosen: a round can fail one construction and one
+    -- retirement for every window the host may hold live, and the owner's own
+    -- startup, retirement and destruction can each fail once beside them.
   , ownerReservations ∷ !(TVar Natural)
   , ownerNotifier ∷ !Notifier
   , ownerPublisher ∷ !CompletionPublisher
@@ -809,10 +814,16 @@ readOwnerFailure = readTVar . ownerLatch
 readOwnerFailures ∷ GraphicsOwner scene → STM [ExceptionWithContext SomeException]
 readOwnerFailures = readTVar . ownerRetained
 
--- | The most failures the owner keeps beside the first. Bounded so a backend
--- that fails every round cannot grow the state it reports through.
-retainedOwnerFailures ∷ Int
-retainedOwnerFailures = 8
+-- | The most failures an owner over a host of this many windows keeps.
+--
+-- It is derived rather than chosen, because a chosen number silently discards
+-- evidence the contract promises is readable: one retirement round can offer
+-- 'graphicsRetireTarget' for every window the host may hold live, and every
+-- one of them can fail. Two per window covers a construction and a retirement
+-- each; the four beside them cover the owner's own startup, whole-owner
+-- retirement, destruction, and one more.
+retainedFailureBound ∷ Int → Int
+retainedFailureBound limit = 2 * max 1 limit + 4
 
 -- | The acknowledgement the host gave one attachment's protocol, which is what
 -- the owner publishes that attachment's certified facts under.
@@ -939,6 +950,7 @@ startGraphicsOwner group host config publish = do
           (hostPendingAttachments host)
           (retiringAttachments host)
           started
+          (retainedFailureBound (hostWindowLimit (hostConfiguration host)))
           reservations
           (hostWakeNotifier host)
           publisher
@@ -1544,7 +1556,7 @@ retainFailure owner failure@(ExceptionWithContext _ exception)
         -- report and a latch would keep one.
         held ← readTVar (ownerLatch owner)
         when (isNothing held) (writeTVar (ownerLatch owner) (Just failure))
-        modifyTVar' (ownerRetained owner) (\kept → take retainedOwnerFailures (kept <> [failure]))
+        modifyTVar' (ownerRetained owner) (\kept → take (ownerRetainedLimit owner) (kept <> [failure]))
         -- Terminal for a required owner, so the admission it affects closes
         -- here rather than at the exit: no further target may be handed to an
         -- owner that is about to retire, and none may be constructed by the
@@ -1761,6 +1773,12 @@ finishOwnerExit restore logger host owner = do
 -- 'closeWorkerGroup' is idempotent and answers the same report once the group
 -- has drained, so a cancellation delivered during the wait is kept and the
 -- join is entered again rather than abandoned.
+-- | The most interruptions a join keeps while it waits for its report. It is
+-- not evidence the contract promises to report in full — each is the same
+-- interruption arriving again — so a small bound is honest here.
+joinFailureBound ∷ Int
+joinFailureBound = 8
+
 joinAbsorbing
   ∷ WorkerGroup
   → [ExceptionWithContext SomeException]
@@ -1776,7 +1794,7 @@ joinAbsorbing group found =
     -- again — it is documented idempotent, and re-entering it replays no
     -- backend disposal, which the owner's own drain owns — and the failure
     -- is kept for the caller to raise once a report really exists.
-    Left caught → joinAbsorbing group (take retainedOwnerFailures (found <> [caught]))
+    Left caught → joinAbsorbing group (take joinFailureBound (found <> [caught]))
 
 -- | What the joined owner's own run and drain failed with.
 --
@@ -1964,9 +1982,13 @@ handOverGraphicsTarget host owner window =
   -- window's slot and telling the owner about it.
   mask $ \restore → do
     reserved ← atomically (reserveEvent owner)
-    if not reserved
-      then pure HandoverPortFull
-      else
+    case reserved of
+      ReservationFull → pure HandoverPortFull
+      -- Nothing is attached at all: an owner whose admission has ended will
+      -- never hear of anything, so there is nothing to be gained by
+      -- reserving a window's slot and settling it again afterwards.
+      ReservationClosed → pure HandoverOwnerClosed
+      ReservationHeld →
         tryWithContext (restore (attachWindowGraphics host window (graphicsTargetProtocol host owner))) >>= \case
           Left (failure ∷ ExceptionWithContext SomeException) → do
             -- A cancellation delivered inside that call can leave the window's
@@ -2041,7 +2063,10 @@ handOverGraphicsTarget host owner window =
 announceGraphicsTarget ∷ GraphicsOwner scene → GraphicsService → IO EventAdmission
 announceGraphicsTarget owner service = mask_ $ do
   reserved ← atomically (reserveEvent owner)
-  if not reserved then pure EventRefusedFull else announceReserved owner (graphicsAttachment service)
+  case reserved of
+    ReservationFull → pure EventRefusedFull
+    ReservationClosed → pure EventPortClosed
+    ReservationHeld → announceReserved owner (graphicsAttachment service)
 
 -- | Install the target's observation slot, queue its announcement, and spend
 -- the held reservation — all in one transaction.
@@ -2110,6 +2135,13 @@ retireStranded host owner target =
     Nothing → pure False
     Just acknowledgement → do
       forM_ allRetirementFacts (void . certifyGraphicsFact host acknowledgement)
+      -- Forgotten here rather than at some later owner round. Certifying
+      -- every fact retires the attachment, so the host no longer has it
+      -- pending and the entry is owed to nobody; and the owner whose round
+      -- would otherwise prune it may be one that will never take another.
+      atomically $ do
+        pending ← ownerPending owner
+        unless (target `elem` pending) (modifyTVar' (ownerCustody owner) (Map.delete target))
       pure True
 
 -- | Forget every ledger entry this window left behind that names no
@@ -2201,19 +2233,19 @@ releaseGraphicsTarget host owner service = mask_ $ do
       -- full is not an obstacle to a release that needs no event, and
       -- answering 'ReleasePortFull' here would leave the caller retrying
       -- something it never needed.
-      tryWithContext (detachWindowGraphics host service) >>= \case
-        Left (failure ∷ ExceptionWithContext SomeException) → rethrowIO failure
-        Right DetachAbsent → pure (ReleaseNoOp DetachAbsent)
-        Right _ → do
-          -- An announcement can still have won the race between the stage
-          -- read above and this claim; the claim is what decides.
-          settled ← retireStranded host owner target
-          pure (if settled then ReleaseSettled else ReleaseOwnerRetires)
+      detachWithoutEvent host owner service
     else do
       reserved ← atomically (reserveEvent owner)
-      if not reserved
-        then pure ReleasePortFull
-        else
+      case reserved of
+        ReservationFull → pure ReleasePortFull
+        -- The owner's admission has ended, so no event can reach it. The
+        -- detach still happens: an attachment's retirement has to begin
+        -- before any evidence for it can be recorded at all, and the owner's
+        -- own drain — or this attachment's protocol step — is what produces
+        -- it. Withholding the detach would leave the caller's release
+        -- unperformed.
+        ReservationClosed → detachWithoutEvent host owner service
+        ReservationHeld →
           -- A detach that raises gives the held room back rather than
           -- spending it on an event there is now nothing to send.
           tryWithContext (detachWindowGraphics host service) >>= \case
@@ -2239,19 +2271,59 @@ releaseGraphicsTarget host owner service = mask_ $ do
   where
     target = graphicsAttachment service
 
+-- | Begin one attachment's retirement with no event to carry it, and settle
+-- it here if the owner was never told about it.
+--
+-- It is the shape both eventless releases take: the one nobody was told
+-- about, and the one whose owner's admission has already ended. The claim is
+-- what decides between them, because an announcement can win the race
+-- against any stage read that preceded it.
+detachWithoutEvent
+  ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → GraphicsService → IO ReleaseAnswer
+detachWithoutEvent host owner service =
+  tryWithContext (detachWindowGraphics host service) >>= \case
+    Left (failure ∷ ExceptionWithContext SomeException) → rethrowIO failure
+    Right DetachAbsent → pure (ReleaseNoOp DetachAbsent)
+    Right _ → do
+      settled ← retireStranded host owner (graphicsAttachment service)
+      pure (if settled then ReleaseSettled else ReleaseOwnerRetires)
+
 -- ---------------------------------------------------------------------------
 -- Port reservations
 
 -- | Hold room for one lifetime event, so a handover that cannot be announced
 -- is refused before it reserves a window's slot.
-reserveEvent ∷ GraphicsOwner scene → STM Bool
+-- | What a reservation attempt found.
+data Reservation
+  = ReservationHeld
+  | ReservationFull
+    -- ^ The port is open and every place in it is spoken for.
+  | ReservationClosed
+    -- ^ Admission has ended. Nothing the port carries can be delivered again,
+    -- so a caller must not go on to attach something the owner will never
+    -- hear of.
+  deriving (Eq, Show)
+
+-- | Hold room for one lifetime event, so a handover that cannot be announced
+-- is refused before it reserves a window's slot.
+--
+-- Closure is checked here rather than at the send, because the two answers
+-- mean different things to a caller: a full port may have room in a moment
+-- and is worth retrying, while a closed one never will. Discovering closure
+-- only at the send would mean attaching first and settling afterwards, once
+-- per attempt, on an owner that will take no further round.
+reserveEvent ∷ GraphicsOwner scene → STM Reservation
 reserveEvent owner = do
+  open ← targetEventsOpen (ownerHandoff' owner)
   capacity ← handoffEventCapacity (ownerHandoff' owner)
   queued ← pendingTargetEvents (ownerHandoff' owner)
   held ← readTVar (ownerReservations owner)
-  if queued + held >= capacity
-    then pure False
-    else True <$ writeTVar (ownerReservations owner) (held + 1)
+  if not open
+    then pure ReservationClosed
+    else
+      if queued + held >= capacity
+        then pure ReservationFull
+        else ReservationHeld <$ writeTVar (ownerReservations owner) (held + 1)
 
 -- | Give back a reservation the caller did not spend.
 releaseEvent ∷ GraphicsOwner scene → STM ()
@@ -2327,13 +2399,25 @@ ownerAwaitStep host owner target acknowledgement = do
         when (isJust answered) (atomically (recordPublishedFact (ownerHandoff' owner) target fact))
         pure answered
       pure (if any recorded answers then RetirementAdvanced else RetirementAwaiting)
-    Nothing → atomically $ do
-      terminal ← ownerTerminal (ownerHandoff' owner)
-      status ← readOwnerStatus (ownerHandoff' owner)
-      pure $
-        if ownerRunEnded terminal
-          then RetirementStalled
-          else maybe RetirementAwaiting RetirementAwaitingUntil (statusNextDeadline status)
+    Nothing → do
+      -- No record, so the owner has established nothing for this target. If
+      -- the ledger still says nobody was ever told about it — an
+      -- announcement refused, or a close that won before one was made — then
+      -- nothing of the owner's exists for it and this step settles it. It is
+      -- the same claim every other path makes and under the same condition,
+      -- and having it here is what makes it a backstop: a retirement the
+      -- main thread began without a release of its own arrives here and
+      -- nowhere else.
+      settled ← retireStranded host owner target
+      if settled
+        then pure RetirementAdvanced
+        else atomically $ do
+          terminal ← ownerTerminal (ownerHandoff' owner)
+          status ← readOwnerStatus (ownerHandoff' owner)
+          pure $
+            if ownerRunEnded terminal
+              then RetirementStalled
+              else maybe RetirementAwaiting RetirementAwaitingUntil (statusNextDeadline status)
   where
     recorded = \case
       Just (FactRecorded _) → True

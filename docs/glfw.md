@@ -3665,12 +3665,17 @@ none of them again. `targetEventsOpen` reports whether the lifetime port still
 admits, which is a read and takes nothing; spending the port's room is the
 reservation's, and no caller is given a way to spend it without one.
 
-A release whose event could not be delivered says so rather than reporting
-success: `ReleaseOwnerClosed` names whether the owner still holds the target,
-and so whether its own drain will produce that target's evidence or the facts
-were certified on the spot because there was nothing of the owner's to retire.
-A detach that raises gives the held room back instead of spending it on an
-event there is now nothing to send.
+A release says which of those happened rather than reporting success either
+way. `ReleaseBegun` is the ordinary case: the attachment is retiring and the
+owner has been told. `ReleaseSettled` means the owner was never told about
+this incarnation, so nothing of its own exists for it and the facts were
+certified on the spot. `ReleaseOwnerRetires` means the owner owes it — it was
+announced, or it holds the target — and the event could not be delivered, so
+the owner's own drain produces the evidence. `ReleaseNoOp` carries the
+host's own answer for an attachment there was nothing to release, and
+`ReleasePortFull` means nothing was detached at all and the caller may try
+again. A detach that raises gives the held room back instead of spending it
+on an event there is now nothing to send.
 
 Every snapshot holds one value, so a publisher never waits and a slow reader
 grows nothing. A target's observations carry their own revision, which must
@@ -3752,7 +3757,24 @@ at `CustodyRegistered` needs no event — there is nobody to tell — so it is
 detached and certified on the spot and answers `ReleaseSettled`, and a full
 port is no obstacle to a release that needs no room. One the owner owes
 answers `ReleaseBegun` when its event is delivered and `ReleaseOwnerRetires`
-when it is not, because then the owner's own drain produces the evidence.
+when it is not, because then the owner's own drain produces the evidence. A
+release whose owner has already closed its admission still detaches: an
+attachment's retirement has to begin before any evidence for it can be
+recorded, and withholding the detach would leave the release unperformed.
+
+Reserving room checks admission as well as capacity, and the two answers
+differ for a caller: a full port may have room in a moment, a closed one
+never will. So a handover to an owner whose admission has ended attaches
+nothing at all, rather than reserving a window's slot and settling it again
+on every attempt against an owner that will take no further round.
+
+The attachment protocol's own retirement step is the backstop. A retirement
+the main thread began without a release of its own — a window's close, the
+host's quiescence — reaches that step and nowhere else, so a still-registered
+incarnation is claimed and certified there. Settlement on the main thread
+forgets the entry in the same breath, because certifying every fact retires
+the attachment and the owner whose round would otherwise prune it may be one
+that never takes another.
 
 `releaseGraphicsTarget` is not the only way a target's retirement begins. A
 window's own close protocol begins it, and so does the host's quiescence, and
@@ -3910,7 +3932,11 @@ once, so a checkpoint raises while retirement is still to come.
 because that is what a sentinel can wait on; every failure is retained
 separately with the context it propagated with, readable through
 `readOwnerFailures` and reported by the exit, because a drain that failed
-three operations has three things to report and a latch would keep one. A
+three operations has three things to report and a latch would keep one. How
+many it keeps is derived from the host's own window limit rather than chosen,
+since one retirement round can offer an operation for every window the host
+may hold live and every one of them can fail; a chosen number would silently
+discard evidence this contract promises stays readable. A
 target retirement that failed is marked explicitly unverified and that
 operation is never offered again — not by a later round and not by the drain,
 because an operation that failed once may have disposed part of what it owns

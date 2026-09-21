@@ -167,6 +167,10 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testNormalStopClosesPublications)
     it "settles a direct attachment whose announcement was refused, rather than reporting a release"
       (boundedExample testUnannouncedDirectAttachSettles)
+    it "settles one whose window is then closed, with no release of its own"
+      (boundedExample testUnannouncedClosedSettles)
+    it "attaches nothing at all once the owner's admission has ended"
+      (boundedExample testHandoverAfterStopAttachesNothing)
     it "retires and destroys the whole owner with no target ever attached"
       (boundedExample testWholeOwnerWithoutTargets)
     it "retires and destroys it after the last target has already detached"
@@ -195,6 +199,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testDrainFailureSurfaces)
     it "retains every failed operation, and offers a failed target retirement exactly once"
       (boundedExample testRetirementFailsOnce)
+    it "keeps every one of them when more targets fail than an arbitrary cap would hold"
+      (boundedExample testEveryRetirementFailureRetained)
     it "waits for a terminal group report however the join is interrupted"
       (boundedExample testJoinAwaitsTerminalReport)
 
@@ -1727,8 +1733,9 @@ testSupersededHandover = do
       atomically (writeTVar quiescing (Just host))
       answer ← handOverGraphicsTarget host owner window
       -- The attachment the supersession left behind is retired: the host
-      -- holds none pending, and the ledger has settled that incarnation so
-      -- nothing can announce it again.
+      -- holds none pending, and the ledger settled that incarnation and
+      -- forgot it in the same breath, so nothing can announce it again and
+      -- nothing is retained for an owner round that may never come.
       stage ← case answer of
         HandoverSuperseded target → atomically (custodyOf owner target)
         _ → pure Nothing
@@ -1737,7 +1744,7 @@ testSupersededHandover = do
         <*> pure stage
   answer `shouldBe` "superseded"
   pending `shouldBe` []
-  acknowledgements `shouldBe` Just CustodySettled
+  acknowledgements `shouldBe` Nothing
 
 -- ---------------------------------------------------------------------------
 -- The settlement ledger, failure evidence, and the join gate
@@ -1928,7 +1935,9 @@ testUnannouncedDirectAttachSettles = do
   admitted `shouldBe` EventRefusedFull
   -- Settled here, and said so: the owner was never told and owes nothing.
   answer `shouldBe` "settled here"
-  stage `shouldBe` Just CustodySettled
+  -- Settled and forgotten together: the owner is held in its startup and
+  -- will take no round that could have pruned it.
+  stage `shouldBe` Nothing
   -- Only the first handover's attachment is left pending.
   length pending `shouldBe` 1
 
@@ -1939,6 +1948,114 @@ describeRelease = \case
   ReleaseOwnerRetires → "owner retires it"
   ReleaseNoOp answer → "no-op " <> show answer
   ReleasePortFull → "port full"
+
+-- | A direct attachment whose announcement was refused is settled by its
+-- window's close, with no release of its own.
+--
+-- Nothing ever told the owner about it and nothing ever will, so the only
+-- place its evidence can come from is the attachment's own protocol step —
+-- which is the backstop every path that begins a retirement without a
+-- release arrives at.
+testUnannouncedClosedSettles ∷ IO ()
+testUnannouncedClosedSettles = do
+  rig ← newRigWith (\config → config {ownerEventCapacity = 1})
+  gate ← newTVarIO False
+  entered ← newEmptyMVar
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  clock ← countingClock
+  let config =
+        (ownerSettings clock)
+          { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
+          }
+  (admitted, stage, retirements) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+    takeMVar entered
+    windows ← atomically (hostWindowIdentities host)
+    case windows of
+      [first, second] → do
+        _ ← handedOver host owner first
+        attached ← attachWindowGraphics host second (graphicsTargetProtocol host owner)
+        service ← case attached of
+          GraphicsAttached service → pure service
+          other → unexpected ("the direct attachment failed: " <> show other)
+        admitted ← announceGraphicsTarget owner service
+        -- The close, and nothing else: no release, no detach.
+        _ ← closeHostWindow host second
+        pumpUntil host control "the closed window's retirement" $
+          (== 1) . length <$> atomically (hostPendingAttachments host)
+        stage ← atomically (custodyOf owner (graphicsAttachment service))
+        retirements ← readTVarIO (fakeRetirements (rigFake rig))
+        atomically (writeTVar gate True)
+        pure (admitted, stage, retirements)
+      other → unexpected ("the host created " <> show (length other) <> " windows")
+  admitted `shouldBe` EventRefusedFull
+  -- Settled, and forgotten in the same breath: the owner takes no round that
+  -- could have pruned it.
+  stage `shouldBe` Nothing
+  -- The backend was asked to retire nothing: it never had this target.
+  retirements `shouldBe` []
+
+-- | Once the owner's admission has ended, a handover attaches nothing at all.
+--
+-- Discovering the closure only at the announcement would mean reserving a
+-- window's slot and settling it again on every attempt, against an owner that
+-- will take no further round — one ledger entry per attempt, outside any
+-- bound the configuration sets.
+testHandoverAfterStopAttachesNothing ∷ IO ()
+testHandoverAfterStopAttachesNothing = do
+  rig ← newRig
+  (answers, entries, pending) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    window ← theWindow host
+    -- An ordinary public stop, and the owner runs out.
+    atomically (Worker.requestStop (graphicsOwnerWorker owner))
+    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+    answers ← forM [1 ∷ Int .. 12] $ \_ → describeHandover <$> handOverGraphicsTarget host owner window
+    (,,) answers <$> atomically (readOwnerCustody owner) <*> atomically (hostPendingAttachments host)
+  answers `shouldBe` replicate 12 "owner closed"
+  -- Nothing was attached, so nothing was registered and nothing settled.
+  entries `shouldBe` []
+  pending `shouldBe` []
+
+-- | Every failed target retirement is retained, not the first few.
+--
+-- A host of this size can offer more retirements in one round than any
+-- arbitrary cap would keep, and each failure is evidence the contract says
+-- stays readable.
+testEveryRetirementFailureRetained ∷ IO ()
+testEveryRetirementFailureRetained = do
+  rig ← newRig
+  clock ← countingClock
+  let windows = [windowNamed (Text.pack ("window " <> show n)) | n ← [1 ∷ Int .. 12]]
+      config = (ownerSettings clock) {hostWindowConfigs = windows, hostWindowLimit = 12}
+  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+  keptCount ← newTVarIO 0
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+      identities ← atomically (hostWindowIdentities host)
+      services ← mapM (handedOver host owner) identities
+      forM_ services (awaitStanding owner)
+      forM_ services (releaseGraphicsTarget host owner)
+      -- Every one of them fails its retirement, and every failure is kept.
+      atomically $ do
+        kept ← readOwnerFailures owner
+        check (length kept >= length services)
+      atomically . writeTVar keptCount . length =<< atomically (readOwnerFailures owner)
+      -- Independent evidence lets this example's own exit finish.
+      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+      forM_ services $ \service → do
+        acknowledgement ←
+          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+      pumpUntilRetired host control
+  raised `shouldBe` Scripted (Text.pack "retire target")
+  -- Twelve, which is more than the cap this used to have.
+  readTVarIO keptCount >>= \kept → kept `shouldSatisfy` (>= 12)
+  -- And the bound is the configuration's, not a number chosen here.
+  retainedFailureBound 12 `shouldSatisfy` (>= 12)
 
 -- ---------------------------------------------------------------------------
 -- The extent seam
