@@ -14,7 +14,7 @@
 -- or an observed state, and coordinates threads with STM and 'MVar's.
 module Test.GLFW.Owner (spec) where
 
-import Control.Concurrent (ThreadId, forkFinally, forkIO, myThreadId, yield)
+import Control.Concurrent (ThreadId, forkFinally, forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Concurrent.STM
@@ -39,7 +39,7 @@ import Control.Exception
   , try
   )
 import Control.Exception (finally)
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM, forM_, unless, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -152,6 +152,10 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testExitOrder)
     it "acknowledges one released target while the owner and a second target stay live"
       (boundedExample testIndividualRelease)
+    it "retires the target of a window closed through its own port, with no detach at all"
+      (boundedExample testWindowCloseRetiresTarget)
+    it "strands nothing when the host's admission closes during a handover"
+      (boundedExample testSupersededHandover)
     it "services the main thread's bounded housekeeping while it awaits the owner"
       (boundedExample testHousekeepingDuringDrain)
     it "retires and destroys the whole owner with no target ever attached"
@@ -182,6 +186,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testDrainFailureSurfaces)
     it "forgets the acknowledgement of a handover that rolled itself safely back"
       (boundedExample testAbandonedAcknowledgementForgotten)
+    it "forgets it at once, so a blocked owner's cells cannot grow per cancelled attempt"
+      (boundedExample testAbandonedAcknowledgementBounded)
 
   describe "the owner's GLFW discipline" $
     it "makes no GLFW call of its own: every native call from its thread is the authorized wake"
@@ -1496,6 +1502,8 @@ describeHandover = \case
   HandoverRefused _ → "refused"
   HandoverPortFull → "port full"
   HandoverOwnerClosed → "owner closed"
+  HandoverSuperseded → "superseded"
+  HandoverRolledBack _ → "rolled back"
 
 -- | Whole-owner destruction that produced no evidence retains everything the
 -- owner borrowed, with no target involved at all.
@@ -1637,6 +1645,108 @@ testAbandonedAcknowledgementForgotten = do
     pumpUntil host control "the forgotten acknowledgements" $
       null <$> atomically (readOwnerAcknowledged owner)
     atomically (readOwnerAcknowledged owner)
+  acknowledged `shouldBe` []
+
+-- | Closing a window through its own port retires that window's target,
+-- although nothing detached it.
+--
+-- The close begins the attachment's retirement in the host's model, and no
+-- event passes through the owner's lifetime port at all. An owner that waited
+-- to be told would leave the target unretired, its evidence unproduced, and
+-- the window unable to finish closing while the owner stayed live.
+testWindowCloseRetiresTarget ∷ IO ()
+testWindowCloseRetiresTarget = do
+  rig ← newRig
+  clock ← countingClock
+  let config =
+        (ownerSettings clock)
+          { hostWindowConfigs = [windowNamed (Text.pack "closing"), windowNamed (Text.pack "staying")]
+          }
+  (retirements, livingWorker, other) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+    windows ← atomically (hostWindowIdentities host)
+    case windows of
+      [closing, staying] → do
+        first ← handedOver host owner closing
+        second ← handedOver host owner staying
+        awaitConstructed rig (Text.pack (show staying))
+        -- The close, and nothing else. No detach, no release, no event.
+        _ ← closeHostWindow host closing
+        _ ← awaitTerminal owner first
+        pumpUntil host control "the closed window's retirement" $
+          (== 1) . length <$> atomically (hostPendingAttachments host)
+        -- The owner is still live and still holds the other target.
+        settled ← atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
+        retirements ← readTVarIO (fakeRetirements (rigFake rig))
+        other ← atomically (windowGraphicsStatus host (graphicsWindow second))
+        pure (retirements, isNothing settled, other)
+      other → unexpected ("the host created " <> show (length other) <> " windows")
+  -- Exactly the closed window's target, and only it.
+  map (Text.pack . show . retiringWindow) retirements `shouldBe` [Text.pack "WindowId 1"]
+  livingWorker `shouldBe` True
+  other `shouldSatisfy` \case
+    GraphicsPresent observation → observedSlot observation == SlotAttached
+    _ → False
+
+-- | A handover the host's admission closes under strands nothing.
+--
+-- Quiescence between the reservation and the publication leaves a registered,
+-- retiring attachment the owner was never told about. Nothing else could
+-- produce its evidence, so the exit below would wait for it forever; that the
+-- example finishes at all is the assertion, and the answers say which races
+-- actually happened.
+testSupersededHandover ∷ IO ()
+testSupersededHandover = do
+  answers ← forM [1 ∷ Int .. 8] $ \_ → do
+    rig ← newRig
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      -- The host's admission closes while the handover runs. Whichever wins,
+      -- nothing may be left that only the owner could have retired.
+      quiescing ← forkIO (atomically (quiesceWindowHost host))
+      answer ← handOverGraphicsTarget host owner window
+      killThread quiescing
+      pure (describeHandover answer)
+  -- Every one settled as something the contract names, and every run's exit
+  -- completed rather than waiting on evidence nothing would produce.
+  answers `shouldSatisfy` all (`elem` ["handed over", "refused", "superseded", "owner closed"])
+
+-- | An owner that takes no rounds at all still leaves no acknowledgement
+-- behind, however many handovers are cancelled.
+--
+-- The owner is held inside its startup for the whole example, so nothing it
+-- does can be what cleans up: only the handover's own settlement can.
+testAbandonedAcknowledgementBounded ∷ IO ()
+testAbandonedAcknowledgementBounded = do
+  rig ← newRig
+  gate ← newTVarIO False
+  entered ← newEmptyMVar
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  acknowledged ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    takeMVar entered
+    window ← theWindow host
+    forM_ [1 ∷ Int .. 20] $ \_ → do
+      settled ← newEmptyMVar
+      handing ← forkFinally (handOverGraphicsTarget host owner window) (putMVar settled)
+      throwTo handing ThreadKilled
+      outcome ← takeMVar settled
+      case outcome ∷ Either SomeException GraphicsHandover of
+        Right (TargetHandedOver service) → void (releaseGraphicsTarget host owner service)
+        _ →
+          atomically (windowGraphicsService host window)
+            >>= mapM_ (void . releaseGraphicsTarget host owner)
+      -- Turns retire whatever attached, but the owner takes no round of its
+      -- own: it is still inside its startup.
+      pumpUntilRetired host control
+    held ← atomically (readOwnerAcknowledged owner)
+    rounds ← statusRounds <$> atomically (readOwnerStatusNow owner)
+    rounds `shouldBe` 0
+    atomically (writeTVar gate True)
+    pure held
+  -- One live window's worth at most, and in fact none: every attempt either
+  -- attached and was released, or left nothing.
   acknowledged `shouldBe` []
 
 -- ---------------------------------------------------------------------------

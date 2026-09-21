@@ -3701,6 +3701,21 @@ owner keeps what exists and **reports** the target as unusable through
 attachment's retirement stays the main thread's, because the attachment and the
 window's exclusive slot are the main thread's.
 
+`releaseGraphicsTarget` is not the only way a target's retirement begins. A
+window's own close protocol begins it, and so does the host's quiescence, and
+neither passes through the lifetime port. The owner therefore **reads the
+host's model** rather than waiting to be told: each round it marks every
+target whose attachment has begun retiring, which is idempotent and puts no
+obligation on the application. Without it a closed window's target would
+never be retired, its evidence never produced, and the window never able to
+finish closing while the owner stayed live.
+
+A handover the host's admission closes under is the mirror case. Quiescence
+between the reservation and the publication leaves a registered, retiring
+attachment that the owner was never told about and owns nothing for, so
+`HandoverSuperseded` retires it on the spot; nothing else could produce its
+evidence, and the protected drain would otherwise wait for it.
+
 A released target's own attachment protocol does no owner work on the main
 thread. Its bounded opportunity reads what the owner published and waits,
 naming the owner's own deadline when it has one; when the owner has written
@@ -3896,8 +3911,12 @@ behind; an idle owner woken by a published demand and by a newer scene; a
 required failure closing admission and entering retirement before the
 checkpoint; a failed whole-owner destruction retaining the windows and the
 session until independent evidence arrives, with the one diagnostic written
-once; every publication into the handoff refused after quiescence and again as soon
-as the owner's run has failed; a whole-owner retirement that failed reported
+once; a window closed through its own port having its target retired with no detach
+at all, while the owner and a second target stay live; a handover racing the
+host's quiescence stranding nothing; cancelled handovers leaving no
+acknowledgement even while the owner is held in its startup and takes no
+round; every publication into the handoff refused after quiescence and again
+as soon as the owner's run has failed; a whole-owner retirement that failed reported
 even though the destruction after it did not; and twenty cancelled handovers
 leaving no acknowledgement behind.
 
@@ -4404,7 +4423,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
 | Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
 | Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record, and the geometry — the last coherent framebuffer observation and reported bounds — leaves with its target |
-| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | Kept while a fact may still be owed for a target whose own state is gone; forgotten with that target's record, and forgotten on its own for an attachment a cancelled handover rolled safely back, which leaves no record to prune it by |
+| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | Kept while a fact may still be owed for a target whose own state is gone; forgotten with that target's record, and forgotten by the handover's own settlement for an attachment that left none — which is what bounds them for an owner that takes no rounds at all, held in its startup or its step |
 | Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
 

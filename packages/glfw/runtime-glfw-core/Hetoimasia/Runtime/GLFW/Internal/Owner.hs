@@ -71,9 +71,7 @@
 -- | The target table     | The graphics     | The owner thread alone writes;  | Owner  | The owner's run     | An entry is removed only      |
 -- |                      | owner            | any thread may read it          |        | action              | against a terminal record     |
 -- +----------------------+------------------+---------------------------------+--------+---------------------+-------------------------------+
--- | The acknowledgements | This lifetime    | The main thread writes at       | Any    | The host's lifetime | Never removed: a published    |
--- |                      |                  | registration; the owner reads   |        |                     | fact may be owed after the    |
--- |                      |                  |                                 |        |                     | target's own state is gone    |
+
 -- +----------------------+------------------+---------------------------------+--------+---------------------+-------------------------------+
 -- | The fatal latch      | This lifetime    | The owner writes once; any      | Any    | The owner worker's  | Never cleared; read by the    |
 -- |                      |                  | thread reads                    |        | lifetime            | sentinel and by the exit      |
@@ -255,6 +253,8 @@ import Hetoimasia.Runtime.GLFW.Internal
   , detachWindowGraphics
   , graphicsAttachment
   , hostConfiguration
+  , RolledBack (rolledBackAttachment)
+  , hostAttachmentView
   , hostGraphicsPublisher
   , hostPendingAttachments
   , hostWakeNotifier
@@ -263,6 +263,7 @@ import Hetoimasia.Runtime.GLFW.Internal
   , runProtectedWindowApplication
   , withProtectedWindowHostOver
   )
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentPhase (AttachmentRetiring), viewPhase)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (RenderDeferred))
 import Hetoimasia.Runtime.Logging (LoggingLifetime)
@@ -629,6 +630,12 @@ data GraphicsOwner scene = GraphicsOwner
     -- ^ The host's own pending-attachment set, read only. It is what tells the
     -- owner that an exact attachment has validated the facts it established,
     -- which is the one thing that lets it forget that incarnation's cells.
+  , ownerRetiring ∷ !(STM [AttachmentId])
+    -- ^ The attachments the host's own model says have begun retiring, read
+    -- only. A window's close begins that without anything passing through the
+    -- lifetime port — no @detach@ call is involved at all — so the owner
+    -- learns it by looking rather than by being told, which is idempotent by
+    -- construction and puts no obligation on the application.
   , ownerStarted ∷ !(TVar Bool)
   , ownerReservations ∷ !(TVar Natural)
   , ownerNotifier ∷ !Notifier
@@ -801,6 +808,7 @@ startGraphicsOwner group host config publish = do
           geometry
           seenInputs
           (hostPendingAttachments host)
+          (retiringAttachments host)
           started
           reservations
           (hostWakeNotifier host)
@@ -835,6 +843,13 @@ startGraphicsOwner group host config publish = do
   case outcome of
     Left _ → throwIO OwnerHostUnprotected
     Right (worker, _) → pure (partial worker)
+
+-- | The attachments this host's model says are retiring.
+retiringAttachments ∷ WindowHost → STM [AttachmentId]
+retiringAttachments host = do
+  pending ← hostPendingAttachments host
+  views ← traverse (hostAttachmentView host) pending
+  pure [target | (target, Just view) ← zip pending views, viewPhase view == AttachmentRetiring]
 
 -- | The owner's whole run: the protected retirement, the body, and the settled
 -- outcome.
@@ -903,6 +918,7 @@ ownerRun owner token = do
 ownerRound ∷ GraphicsOwner scene → StopToken → IO Bool
 ownerRound owner token = do
   takeLifetimeEvents owner
+  foldHostRetirements owner
   constructPending owner
   foldObservations owner
   retireReleased owner
@@ -987,6 +1003,32 @@ takeLifetimeEvents owner = atomically $ do
           (TargetState acknowledgement ConstructionPending 0 initialEligibility False)
           states
       TargetReleased target → Map.adjust (\state → state {targetReleasing = True}) target states
+
+-- | Mark every target whose attachment the host has begun retiring.
+--
+-- 'releaseGraphicsTarget' sends a 'TargetReleased' event, but it is not the
+-- only way an attachment starts retiring: a window's own close protocol
+-- begins it, and so does the host's quiescence, and neither passes through
+-- the lifetime port. An owner that waited for the event would leave such a
+-- target unretired, its terminal evidence unproduced, and its window unable
+-- to finish closing while the owner stayed live.
+--
+-- So the owner reads the host's model instead of waiting to be told. That is
+-- idempotent — a target already releasing is unchanged — and it needs nothing
+-- of the application.
+foldHostRetirements ∷ GraphicsOwner scene → IO ()
+foldHostRetirements owner = atomically $ do
+  retiring ← ownerRetiring owner
+  modifyTVar' (ownerTargets owner) $ \states →
+    foldl (\held target → Map.adjust (\state → state {targetReleasing = True}) target held) states retiring
+
+-- | Whether the host has begun retiring a target the owner holds and has not
+-- yet marked.
+retirementsBegun ∷ GraphicsOwner scene → STM Bool
+retirementsBegun owner = do
+  retiring ← ownerRetiring owner
+  states ← readTVar (ownerTargets owner)
+  pure (any (\target → maybe False (not . targetReleasing) (Map.lookup target states)) retiring)
 
 -- | Construct every target the backend has not settled yet.
 --
@@ -1209,8 +1251,11 @@ ownerWait owner token = do
     -- would wait for some unrelated reason to wake the owner, and a host
     -- whose windows are all idle would give it none.
     prunable ← not . null <$> validatedTargets owner
+    -- A window closed from the main thread begins its attachment's retirement
+    -- without an event, so an idle owner has to wake for that too.
+    closing ← retirementsBegun owner
     elapsed ← expired
-    check (stopping || failing || queued || fresher || published || prunable || elapsed)
+    check (stopping || failing || queued || fresher || published || prunable || closing || elapsed)
   where
     handoff = ownerHandoff' owner
     OwnerTimer arm = ownerClockTimer (ownerSettings owner)
@@ -1700,6 +1745,13 @@ data GraphicsHandover
     -- here rather than swallowed: the caller may offer the same window again.
   | HandoverOwnerClosed
     -- ^ The owner's admission has ended. Nothing is left attached.
+  | HandoverSuperseded
+    -- ^ The host's admission closed while the reservation was being made, so
+    -- nothing usable was published. The attachment it left behind has been
+    -- retired: the owner never received it and owned nothing for it.
+  | HandoverRolledBack !RolledBack
+    -- ^ The reservation settled as a rollback, whose attachment — if it left
+    -- one — has been retired for the same reason.
   deriving (Show)
 
 -- | Reserve one open window's exclusive graphics slot for the owner, on the
@@ -1735,7 +1787,16 @@ handOverGraphicsTarget host owner window =
             -- is one finite transaction, so an attachment that exists at all
             -- has already recorded the acknowledgement this announcement needs.
             recovered ← atomically (recoverableTarget owner window)
-            maybe (atomically (releaseEvent owner)) (void . announceReserved owner) recovered
+            case recovered of
+              Just target → void (announceReserved owner target)
+              -- Nothing of this window's is pending, so whatever the attach
+              -- settled as, it left no attachment. Any acknowledgement this
+              -- protocol recorded for it is dropped here rather than at some
+              -- later owner round: an owner blocked in its startup or its
+              -- step takes no rounds, and one acknowledgement per cancelled
+              -- attempt is exactly the unbounded growth the cells must not
+              -- have.
+              Nothing → atomically (releaseEvent owner >> forgetStrandedAcknowledgements owner window)
             rethrowIO failure
           Right (GraphicsAttached service) →
             announceReserved owner (graphicsAttachment service) >>= \case
@@ -1746,6 +1807,27 @@ handOverGraphicsTarget host owner window =
           Right (GraphicsRefused refusal) → do
             atomically (releaseEvent owner)
             pure (HandoverRefused refusal)
+          -- Quiescence won between the reservation and the publication. The
+          -- attachment is registered and retiring, and its acknowledgement is
+          -- recorded, but nothing usable was published and the owner was
+          -- never told — so the owner owns nothing for it and its facts are
+          -- certified here, exactly as an unannounced handover's are. Left
+          -- alone it would be an attachment whose evidence nothing was ever
+          -- going to produce, and the protected drain would wait for it.
+          Right (GraphicsSuperseded target) → do
+            atomically (releaseEvent owner)
+            retireStranded host owner target
+            pure HandoverSuperseded
+          -- A construction that failed and rolled back. This protocol's own
+          -- construction is one finite transaction that cannot fail, so this
+          -- is reachable only through a cancellation inside the reservation;
+          -- either way the owner never received the target and owns nothing
+          -- for it, and an unsafe rollback leaves it retiring and owed the
+          -- same certification.
+          Right (GraphicsRolledBack settled) → do
+            atomically (releaseEvent owner)
+            retireStranded host owner (rolledBackAttachment settled)
+            pure (HandoverRolledBack settled)
           Right other → do
             atomically (releaseEvent owner)
             throwIO (OwnerHandoverUnsettled (Text.pack (show other)))
@@ -1790,12 +1872,19 @@ retireUnannounced host owner service = do
 -- | Certify the facts of an already-detaching attachment the owner never
 -- received, on the owner thread.
 retireDetached ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → GraphicsService → IO ()
-retireDetached host owner service = do
+retireDetached host owner = retireStranded host owner . graphicsAttachment
+
+-- | Retire an attachment the owner never received, naming it by identity.
+--
+-- Certification is refused for anything but that attachment's own current
+-- incarnation, and for one that is not retiring, so this releases nothing it
+-- should not. Its acknowledgement is dropped in the same breath, because
+-- nothing will ever write a terminal record to prune it by.
+retireStranded ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → AttachmentId → IO ()
+retireStranded host owner target = do
   acknowledgement ← atomically (ownerTargetAcknowledgement owner target)
   for_ acknowledgement $ \held → forM_ allRetirementFacts (void . certifyGraphicsFact host held)
   atomically (modifyTVar' (ownerAcknowledged owner) (Map.delete target))
-  where
-    target = graphicsAttachment service
 
 -- | The attachment this window's slot holds that the owner has not been told
 -- about, if there is one.
@@ -1804,6 +1893,22 @@ retireDetached host owner service = do
 -- rather than from a published service, because an attachment interrupted
 -- before its service was published has no service and still needs its
 -- retirement evidence produced.
+-- | Drop every acknowledgement this window left behind that names no
+-- attachment the host still has pending and no target the owner holds.
+forgetStrandedAcknowledgements ∷ GraphicsOwner scene → WindowId → STM ()
+forgetStrandedAcknowledgements owner window = do
+  acknowledged ← Map.keys <$> readTVar (ownerAcknowledged owner)
+  held ← readTVar (ownerTargets owner)
+  pending ← ownerPending owner
+  forM_
+    [ target
+    | target ← acknowledged
+    , attachmentWindow target == window
+    , not (Map.member target held)
+    , target `notElem` pending
+    ]
+    (\target → modifyTVar' (ownerAcknowledged owner) (Map.delete target))
+
 recoverableTarget ∷ GraphicsOwner scene → WindowId → STM (Maybe AttachmentId)
 recoverableTarget owner window = do
   acknowledged ← Map.keys <$> readTVar (ownerAcknowledged owner)
