@@ -15,6 +15,7 @@ module CiImage (spec) where
 
 import Control.Exception (evaluate)
 import Control.Monad (forM_, void)
+import Data.Char (isSpace)
 import Data.List (isInfixOf, isPrefixOf, sort)
 import Json (asArray, asString, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
@@ -309,6 +310,40 @@ spec = describe "CI image" $ do
       withWorker $ \fixture worker → do
         writeFile (workerStubs worker </> "store") "/root/.cabal/store\n"
         refusedWorker fixture worker "resolves its store"
+
+  describe "the image workflow's routes" $ do
+    it "starts a proof route only on its own dispatch, and image resolution for no proof route" $ do
+      -- The routes are read from the workflow's own choice list rather than
+      -- named here, so a route added later without excluding it from
+      -- `resolve` — which is what would let a proof dispatch reach the
+      -- registry — fails this example rather than passing unnoticed.
+      workflow ← imageWorkflow
+      let routes = choiceOptions workflow "route"
+          proofs = filter (/= imageRoute) routes
+      routes `shouldContain` [imageRoute]
+      proofs `shouldNotBe` []
+      let resolving = jobCondition workflow "resolve"
+      forM_ proofs $ \route → do
+        resolving `shouldContain` ("inputs.route != '" ++ route ++ "'")
+        case jobsSelecting workflow route of
+          [job] → do
+            let condition = jobCondition workflow job
+            -- A pull request carries no route input at all, so requiring the
+            -- dispatch event is what keeps every proof route out of one.
+            condition `shouldContain` "github.event_name == 'workflow_dispatch'"
+            condition `shouldContain` ("inputs.route == '" ++ route ++ "'")
+          selecting → expectationFailure (route ++ " is selected by " ++ show selecting)
+
+    it "reaches the registry only through the job the proof routes exclude" $ do
+      workflow ← imageWorkflow
+      -- Excluding `resolve` is only worth anything if nothing that publishes
+      -- can start without it.
+      jobNeeds workflow "publish" `shouldContain` ["resolve"]
+      jobNeeds workflow "descriptor" `shouldContain` ["resolve"]
+      jobNeeds workflow "anonymous-pull" `shouldContain` ["descriptor"]
+      -- And only that chain may hold the package grant.
+      [job | job ← jobNames workflow, "packages: write" `isInfixOf` unlines (jobBlock workflow job)]
+        `shouldBe` ["publish"]
 
   describe "the image builder" $ do
     it "returns a validated hit without building or pushing" $
@@ -750,6 +785,74 @@ executableFile path contents = do
 
 overriding ∷ [(String, String)] → [(String, String)] → [(String, String)]
 overriding overrides inherited = overrides ++ filter ((`notElem` map fst overrides) . fst) inherited
+
+-- ---------------------------------------------------------------------------
+-- The image workflow, read as the pipeline loads it
+--
+-- Deliberately dependency-free, for the reason Sandbox's step reader gives:
+-- an example that needed a YAML library installed to read a workflow would be
+-- skipped exactly when it mattered. Only the shapes this file actually uses
+-- are understood — a job is a two-space key under `jobs:`, and its fields are
+-- the four-space keys under it.
+
+ciImageWorkflow ∷ FilePath
+ciImageWorkflow = ".github/workflows/ci-image.yml"
+
+-- | The route that publishes. Every other route is a proof route.
+imageRoute ∷ String
+imageRoute = "image"
+
+imageWorkflow ∷ IO String
+imageWorkflow = getCurrentDirectory >>= \here → strictRead (here </> ciImageWorkflow)
+
+-- | The lines of one job, without its own key.
+jobBlock ∷ String → String → [String]
+jobBlock workflow name =
+  takeWhile inside (drop 1 (dropWhile (/= ("  " ++ name ++ ":")) (lines workflow)))
+  where
+    inside line = null (trimmed line) || "    " `isPrefixOf` line
+
+jobNames ∷ String → [String]
+jobNames workflow =
+  [ takeWhile (/= ':') (drop 2 line)
+  | line ← drop 1 (dropWhile (/= "jobs:") (lines workflow))
+  , "  " `isPrefixOf` line
+  , not ("   " `isPrefixOf` line)
+  , ":" `isInfixOf` line
+  ]
+
+-- | One field of a job, as written; the empty string when it has none.
+jobField ∷ String → String → String → String
+jobField workflow name key =
+  case [drop (length key + 1) (trimmed line) | line ← jobBlock workflow name, (key ++ ":") `isPrefixOf` trimmed line] of
+    value : _ → trimmed value
+    [] → ""
+
+jobCondition ∷ String → String → String
+jobCondition workflow name = jobField workflow name "if"
+
+-- | A job's declared dependencies, whether written as one name or a list.
+jobNeeds ∷ String → String → [String]
+jobNeeds workflow name =
+  words (map (\character → if character `elem` ("[]," ∷ String) then ' ' else character) (jobField workflow name "needs"))
+
+-- | The jobs one route selects, by their own condition.
+jobsSelecting ∷ String → String → [String]
+jobsSelecting workflow route =
+  [job | job ← jobNames workflow, ("inputs.route == '" ++ route ++ "'") `isInfixOf` jobCondition workflow job]
+
+-- | The values a workflow-dispatch choice input offers.
+choiceOptions ∷ String → String → [String]
+choiceOptions workflow name =
+  [ trimmed (drop 1 (trimmed line))
+  | line ← takeWhile (\line → "- " `isPrefixOf` trimmed line) after
+  ]
+  where
+    declared = dropWhile (/= ("      " ++ name ++ ":")) (lines workflow)
+    after = drop 1 (dropWhile (\line → trimmed line /= "options:") declared)
+
+trimmed ∷ String → String
+trimmed = dropWhile isSpace . reverse . dropWhile isSpace . reverse
 
 -- ---------------------------------------------------------------------------
 -- A fake image root and worker

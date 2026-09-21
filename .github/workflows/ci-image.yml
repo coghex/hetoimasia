@@ -320,7 +320,9 @@ jobs:
 
   wayland-probe:
     # Only ever on an explicit request for this route, so an ordinary image
-    # dispatch and every pull request skip it.
+    # dispatch and every pull request skip it. `resolve` excludes this route by
+    # name, and everything that publishes reaches the registry through
+    # `resolve`, so no part of the publication chain runs for it.
     if: github.event_name == 'workflow_dispatch' && inputs.route == 'wayland-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -332,50 +334,52 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v7
 
-      - name: Name the image the candidate's descriptor describes
+      - name: Identify the image this candidate describes
         id: image
         run: |
           set -euo pipefail
           reference="$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')"
-          weston="$(python3 -c 'import json; print(json.load(open("tools/ci-image/descriptor.json"))["weston"])')"
+          recorded="$(python3 -c 'import json; print(json.load(open("tools/ci-image/descriptor.json"))["recipe_fingerprint"])')"
+          # A proof of some other tree's image proves nothing about this one,
+          # so the descriptor has to describe this candidate before it is used.
+          candidate="$(python3 tools/validation/ci_image.py fingerprint --revision HEAD)"
+          if [ "$recorded" != "$candidate" ]; then
+            echo "::error::the committed descriptor records recipe fingerprint $recorded, but this candidate fingerprints to $candidate"
+            exit 1
+          fi
           echo "reference=$reference" >> "$GITHUB_OUTPUT"
-          echo "proving $reference, which describes weston $weston" >> "$GITHUB_STEP_SUMMARY"
+          echo "fingerprint=$candidate" >> "$GITHUB_OUTPUT"
 
-      - name: Start the isolated headless compositor inside the image
+      - name: Prove the isolated headless compositor inside it
         env:
           REFERENCE: ${{ steps.image.outputs.reference }}
+          FINGERPRINT: ${{ steps.image.outputs.fingerprint }}
+          REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # The candidate tree supplies the helper; the image supplies Weston.
-          # `true` is the whole command: what is under proof is that the helper
-          # establishes a private compositor in this image and tears it down,
-          # not anything the command does.
-          output="$(docker run --rm \
-            --volume "$PWD:/candidate:ro" --workdir /candidate \
-            "$REFERENCE" bash tools/display/wayland.sh -- true 2>&1)"
-          printf '%s\n' "$output"
-          {
-            echo '## Isolated headless compositor'
-            echo
-            echo 'Inside the described image, with the candidate tree mounted:'
-            echo
-            echo '```'
-            echo '$ bash tools/display/wayland.sh -- true'
-            printf '%s\n' "$output"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Show that the compositor left nothing behind
-        env:
-          REFERENCE: ${{ steps.image.outputs.reference }}
-        run: |
-          set -euo pipefail
-          # The helper reports the runtime directory it created; after it
-          # returns, that directory must be gone.
+          # One container, so the helper's cleanup is established while the
+          # container it ran in is still there: a destroyed container would
+          # have taken the runtime directory with it either way. The candidate
+          # tree supplies the helper; the image supplies Weston. `true` is the
+          # whole command — what is under proof is that the helper establishes
+          # a private compositor here and tears it down, not what a command
+          # does inside it.
           docker run --rm \
+            --env EXPECTED_FINGERPRINT="$FINGERPRINT" \
             --volume "$PWD:/candidate:ro" --workdir /candidate \
             "$REFERENCE" bash -c '
               set -euo pipefail
+              embedded="$(jq -r .recipe_fingerprint /opt/hetoimasia/image.json)"
+              compositor="$(jq -r .weston /opt/hetoimasia/image.json)"
+              if [ "$embedded" != "$EXPECTED_FINGERPRINT" ]; then
+                echo "this image embeds recipe fingerprint $embedded, not the candidate'\''s $EXPECTED_FINGERPRINT" >&2
+                exit 1
+              fi
+              echo "image recipe fingerprint: $embedded"
+              echo "installed compositor: weston $(dpkg-query --show --showformat='\''${Version}'\'' weston)"
+              echo "descriptor compositor: weston $compositor"
+              echo
+              echo "$ bash tools/display/wayland.sh --summary summary.md -- true"
               report="$(bash tools/display/wayland.sh --summary /tmp/summary.md -- true)"
               printf "%s\n" "$report"
               runtime="${report##*runtime directory }"
@@ -384,13 +388,21 @@ jobs:
                 echo "the helper left $runtime behind" >&2
                 exit 1
               fi
-              echo "the runtime directory $runtime no longer exists"
+              echo
+              echo "cleanup: $runtime no longer exists, checked inside the same container"
+              echo
               cat /tmp/summary.md
-            ' | tee "$RUNNER_TEMP/cleanup.txt"
+            ' | tee "$RUNNER_TEMP/proof.txt"
           {
-            echo '## The compositor'\''s runtime directory'
+            echo '## WL-1 isolated headless compositor proof'
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Candidate | \`$REVISION\` |"
+            echo "| Recipe fingerprint | \`$FINGERPRINT\` |"
+            echo "| Image | \`$REFERENCE\` |"
             echo
             echo '```'
-            cat "$RUNNER_TEMP/cleanup.txt"
+            cat "$RUNNER_TEMP/proof.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

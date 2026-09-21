@@ -1400,17 +1400,34 @@ that is VK-4's deliberate step. See
 [the compatibility record](vulkan_compatibility_record.md).
 
 `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
-checked-out descriptor names, with the candidate tree mounted, and shows in the
-job summary that the helper established an isolated headless session and
-removed the runtime directory it created:
+checked-out descriptor names, with the candidate tree mounted:
 
 ```bash
 gh workflow run ci-image --ref <branch> --field route=wayland-probe
 ```
 
+It first refuses a descriptor that does not describe the candidate — the
+recorded fingerprint against the one the candidate recomputes — and, inside the
+container, the fingerprint the image itself embeds against the same value, so
+what is proven is this tree's own published environment. Then it runs the
+helper and checks that the runtime directory the helper named is gone, **in
+that same container**, before it is destroyed: a destroyed container would
+have taken the directory with it either way. The job summary retains the
+candidate revision, the recipe fingerprint, the digest-addressed image, the
+invocation, its output, and the cleanup result.
+
 It is WL-1's provisioning proof, dispatched deliberately when the recipe's
 compositor inputs change. Registering a validation group that runs the native
 suite under the Wayland helper is WL-2's and WL-3's work, not this route's.
+
+Every proof route is excluded from `resolve` by name, and everything that
+publishes reaches the registry through `resolve`, so no part of the
+publication chain runs for one. `workflow-tests` reads the workflow and holds
+it to that: each route the dispatch input offers other than `image` must be
+excluded from `resolve` and selected by exactly one job that also requires the
+dispatch event — which is what keeps a proof route out of a pull request,
+since a pull request carries no route input at all — and only `publish` may
+hold the package grant.
 
 A registry error is never a miss, and an existing tag whose metadata does not
 describe the fingerprint is refused rather than overwritten: both fail without
@@ -2411,7 +2428,14 @@ fails validation each publish nothing. The seeding examples run the shipped
 decision step and assert that a default-branch push whose tests were all reused
 seeds a missing cache, that an existing cache, a running engine worker, and a
 pull request do not, that a lookup that did not answer seeds, and that the
-seeding job builds only dependencies. The native examples assert, for a change
+seeding job builds only dependencies. The image workflow's own routing has two:
+that every route the dispatch input offers other than `image` is excluded from
+`resolve` by name and selected by exactly one job that also requires the
+dispatch event, read from the workflow's own choice list so a route added later
+without that exclusion fails rather than passing unnoticed; and that `publish`
+and `descriptor` reach the registry only through `resolve`, `anonymous-pull`
+only through `descriptor`, and no job but `publish` holds the package grant.
+The native examples assert, for a change
 to only the C compiler, the SDK, the architecture, the deployment target, the
 build options, `SDKROOT`, or compiler flags, that the old prefix and a build directory stamped against it are
 refused and the manifest identity changes, and that restoring the configuration
