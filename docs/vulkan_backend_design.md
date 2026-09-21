@@ -37,20 +37,20 @@ concrete precondition
 - [x] VK-2. Prove the native compatibility and completion profile — [#158]
 - [x] VK-3. Model GPU retention and frame ownership — [#160]
 - [x] VK-4. Provision the pinned native Vulkan environment — [#208]
-- [ ] VK-5. Add the loader-aware GLFW surface bridge
-- [ ] VK-6. Capture validation diagnostics with an independent worker
-- [ ] VK-18. Settle the supervised graphics owner's cross-thread contract
-- [ ] VK-7. Own Vulkan instance, device and targets under protected retirement
-- [ ] VK-8. Integrate package-native Vulkan fixtures and CI evidence
-- [ ] VK-9. Make Template Haskell shaders reproducible
-- [ ] VK-10. Manage swapchain generation construction and replacement
-- [ ] VK-11. Record through retained managed resources
-- [ ] VK-12. Track acquisition, submission and safe frame abandonment
-- [ ] VK-13. Track presentation completion and retire generations
-- [ ] VK-14. Apply bounded target and allocation recovery
-- [ ] VK-15. Complete terminal graphics failure and device-loss teardown
-- [ ] VK-16. Compose rendering demand and retirement with TIME and LIFE
-- [ ] VK-17. Deliver the multi-window triangle consumer and final evidence
+- [x] VK-5. Add the loader-aware GLFW surface bridge — [#216]
+- [x] VK-6. Capture validation diagnostics with an independent worker — [#217]
+- [x] VK-18. Settle the supervised graphics owner's cross-thread contract — [#218]
+- [x] VK-7. Own Vulkan instance, device and targets under protected retirement — [#219]
+- [x] VK-8. Integrate package-native Vulkan fixtures and CI evidence — [#220]
+- [x] VK-9. Make Template Haskell shaders reproducible — [#221]
+- [x] VK-10. Manage swapchain generation construction and replacement — [#222]
+- [x] VK-11. Record through retained managed resources — [#223]
+- [x] VK-12. Track acquisition, submission and safe frame abandonment — [#225]
+- [x] VK-13. Track presentation completion and retire generations — [#227]
+- [x] VK-14. Apply bounded target and allocation recovery — [#229]
+- [x] VK-15. Complete terminal graphics failure and device-loss teardown — [#231]
+- [x] VK-16. Compose rendering demand and retirement with TIME and LIFE — [#232]
+- [x] VK-17. Deliver the multi-window triangle consumer and final evidence — [#233]
 
 Slices are mirrored below in dependency order. The owner signed off the
 reviewed contracts and split on 2026-09-17 under D-27. The native proof gate
@@ -79,12 +79,11 @@ merged; they no longer block the new owner contract. The production native
 backend remains planned. D-29–D-33 and LIFE D-6 are approved design, not a
 claim that the current host already implements a surviving graphics owner.
 
-Before filing more children, reconcile existing epic #155's old main-thread
-rendering policy, seventeen-child count and dependency table with this
-eighteen-slice plan through the processor's epic-update step. Keep closed LIFE
-epic #140 and its completed children closed: VK-18/VK-7 own its additive
-extension. No replacement epic is needed. VK-18 can be implemented alongside
-VK-5/VK-6 once its own prerequisites are satisfied; it precedes VK-7.
+Epic #155 was reconciled on 2026-09-20 against `ec85d0e` to this eighteen-slice
+plan, D-29–D-33 and LIFE D-6. Keep closed LIFE epic #140 and its completed
+children closed: VK-18/VK-7 own its additive extension. No replacement epic is
+needed. VK-5 is filed as #216 and VK-6 as #217. VK-18 can be implemented
+alongside VK-5/VK-6 once its own prerequisites are satisfied; it precedes VK-7.
 
 Open documentation repairs #211/#212 still own the proof's nonblocking-present
 wording and this design's obsolete no-platform-selector claims. Consume the
@@ -973,15 +972,19 @@ VK-5 must prove an ordinary GLFW-only build with that component disabled and
 without a Vulkan SDK. Do not silently impose its dependency on window-only
 consumers through package-wide Cabal settings.
 
-A separate runtime/Vulkan/GLFW integration component depends on both interfaces.
+A separate runtime/Vulkan/GLFW integration component depends on both
+interfaces: `hetoimasia-gpu-vulkan-glfw` under `packages/gpu-vulkan/glfw/`,
+listed only in `cabal.project.vulkan` (owner decision, 2026-09-20).
 It assembles loader-aware host construction, attachments and backend targets,
 then TIME-driven progress. The application depends on that integration and its
 renderer. The GPU backend never imports the integration back again.
 
 VK-3 establishes the pure/backend package split; VK-5 adds the GLFW-owned
-boundary; VK-18 implements the reusable owner machinery without Vulkan, VK-7
-supplies its Vulkan operations, and VK-16 completes its loop
-adapter. Component names may follow the existing Cabal conventions, but these
+boundary; VK-18 implements the reusable owner machinery without Vulkan inside
+the GLFW package's runtime integration (owner decision, 2026-09-20), VK-7
+supplies its Vulkan operations from the external integration component, and
+VK-16 completes its loop adapter.
+Component names may follow the existing Cabal conventions, but these
 dependency directions and independent CPU/window-only build checks are part of
 acceptance. Avoid another generic environment that hides both owners.
 
@@ -2436,6 +2439,8 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-5. Add the loader-aware GLFW surface bridge
 
+> Filed as #216 on 2026-09-20.
+
 - **Outcome:** Narrow attachment-protected interop without exposing raw window pointers or requiring Vulkan in ordinary GLFW clients.
 - **Scope:** P-7's Vulkan-header interop shim and opaque session-integration capability, loader selection before init, copied extension names, verified handle ABI and checked surface construction handoff; reset persistent configuration on all exits. Keep SDK inputs out of the ordinary GLFW native component.
 - **Phase:** Native foundations.
@@ -2448,6 +2453,8 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-6. Capture validation diagnostics with an independent worker
 
+> Filed as #217 on 2026-09-20.
+
 - **Outcome:** Bounded callback capture and a backend-owned logging consumer with independently observable failure state.
 - **Scope:** P-11/D-28 C-only native capture reachable from unsafe imports, bounded copies, error/drop/truncation latches, a separately owned foundation worker group, callback storage lifetime and final drain/join.
 - **Phase:** Native foundations.
@@ -2459,6 +2466,13 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None; native callback proof is a VK-2 gate.
 
 ### VK-18. Settle the supervised graphics owner's cross-thread contract
+
+> Filed as #218 on 2026-09-20. Placement decided by the owner the same day: the
+> owner machinery lives inside the existing `runtime-glfw` integration in
+> dedicated modules with an additive protected-host constructor, stays
+> graphics-backend-neutral through narrow injected operations, and is proved by
+> dedicated headless specs in `test.glfw`; VK-7's external integration supplies
+> the Vulkan operations without adding GPU dependencies to the GLFW package.
 
 - **Outcome:** The production supervised graphics owner's ownership and communication machinery, with backend operations injected and proven through fakes, whose handoffs with the main-thread host are explicit, bounded, cancellable and self-scheduled, and whose lifetime runs through protected retirement under D-33; the documents' main-thread assumptions reconciled to D-29.
 - **Scope:** The owner as a foundation worker under the existing supervision and failure contracts, outliving ordinary worker drain (D-33); a narrow injected operation set covering worker ownership, handoffs, cancellation and retirement and nothing resembling a rendering API (D-32); main-thread-to-owner handoff of `WindowObservation` and render-eligibility snapshots, render demand, scene snapshots from any application thread (D-31) and attachment lifetime through bounded ports and latest-value snapshots; owner-to-main-thread publication of progress, earliest absolute next deadline and retirement facts through the TIME wake, with the owner's own waits driven by its own deadlines and demand; cancellation at every wait in dependency order; the D-33 retirement sequence including the main-thread housekeeping-and-await boundary and the final join before window release; the extent policy seam D-30 needs; the documented behaviour during a main-thread stall; and the reconciliation of P-1, P-5, P-6, P-7, VK-8, VK-16, [glfw.md](glfw.md), [the lifetime design](window_graphics_lifetime_design.md) (its D-6 and P-3) and the fixture thread demonstrations.
@@ -2473,6 +2487,13 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-7. Own Vulkan instance, device and targets under protected retirement
 
+> Filed as #219 on 2026-09-20. Placement decided by the owner the same day: the
+> Vulkan resource implementation stays in the GLFW-free native backend package
+> under `packages/gpu-vulkan/native/`, and window/runtime coordination lives in
+> the new integration package `hetoimasia-gpu-vulkan-glfw` under
+> `packages/gpu-vulkan/glfw/`, listed only in `cabal.project.vulkan`; it
+> implements VK-18's injected operations and receives VK-5's surface handoff.
+
 - **Outcome:** A session controller, run by the VK-18 graphics owner, with shared device roots and independently attached surfaces whose every exit respects P-5.
 - **Scope:** The Vulkan operations injected into VK-18's owner machinery (D-32): capability/queue plans, portability features, initial and later surface admission, controller construction/rollback, dependency graph and root destruction inside D-33's retirement, all on the graphics owner's thread; main-thread surface creation handed over under the attachment. Device loss stops admission immediately; no work is yet submitted.
 - **Phase:** Native foundations.
@@ -2484,6 +2505,10 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None after VK-2 and VK-18; consume settled LIFE interfaces.
 
 ### VK-8. Integrate package-native Vulkan fixtures and CI evidence
+
+> Filed as #220 on 2026-09-20. Placement: the native suite and shared fixture
+> belong to `hetoimasia-gpu-vulkan-glfw`, and `test.vulkan-native` runs through
+> `cabal.project.vulkan` on the existing display runner class.
 
 - **Outcome:** The package-native fixture and affected `test.vulkan-native` group alongside VK-3's portable group, isolated Linux execution and enforceable local pre-PR evidence.
 - **Scope:** P-10/Q-3 verification contract, shared roots and surface destruction owned by the graphics owner's thread with surface creation and window commands through main-thread dispatch (D-29/D-33), private destructive fixtures, platform-aware nonempty selection, prebuild versus timed native execution and final-after-teardown diagnostics. Migrate the VK-2/VK-5–VK-7 evidence cases and replace temporary proof routing without dropping assertions.
@@ -2497,6 +2522,10 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-9. Make Template Haskell shaders reproducible
 
+> Filed as #221 on 2026-09-20. Placement: the shader adapter lives in the native
+> backend package under `packages/gpu-vulkan/native/`; whichever of #221 and
+> #217 lands first creates that package.
+
 - **Outcome:** The preserved Synarchy-style glslang TH workflow produces pinned, embedded SPIR-V with correct rebuild identity.
 - **Scope:** Wrap the string quoter and explicit target-env compile splice; provide the pinned private-prefix compiler alias, registered input/fingerprint dependencies and build environment. Track shader source/includes/interpolation, executable/version/flags and Cabal distribution closure.
 - **Phase:** Rendering inputs.
@@ -2508,6 +2537,11 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None once VK-2/VK-4 choose compatible inputs.
 
 ### VK-10. Manage swapchain generation construction and replacement
+
+> Filed as #222 on 2026-09-20. Placement: generation planning, construction,
+> replacement and destruction live in the native backend package; the
+> integration package's controller supplies each target's observation,
+> eligibility and bounds from VK-18's seam.
 
 - **Outcome:** Bounded generation ownership with capability-driven format/extent/image planning and safe partial construction.
 - **Scope:** P-15 small presentation profile, D-30 concrete-capabilities versus cached-framebuffer extent selection, zero-area suspension before clamping, coalesced resize, generation reservations, the irreversible oldSwapchain transition and exact target identity. Reconciliation may replace a generation without a fresh GLFW observation; it cannot invent geometry or bypass render eligibility.
@@ -2521,6 +2555,10 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-11. Record through retained managed resources
 
+> Filed as #223 on 2026-09-20. Placement: managed resources, the recorder,
+> command storage and the audited unsafe import subset live in the native
+> backend package.
+
 - **Outcome:** Minimal managed graphics resources and scoped recording with exact transitive retention for triangle and capture operations.
 - **Scope:** P-1 pipelines, command storage, draws, necessary barriers and readback resources; logical release, sealed single-use batches and safe discard/reset. Keep Vulkan-specific choices visible to consumers. D-28's audited unsafe recording subset through a narrow private import set, with safe imports for waits, submission and presentation.
 - **Phase:** Rendering lifecycle.
@@ -2532,6 +2570,10 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None.
 
 ### VK-12. Track acquisition, submission and safe frame abandonment
+
+> Filed as #225 on 2026-09-20. Placement: acquisition, submission, cleanup
+> submission and image release live in the native backend package and run on
+> the graphics owner through the integration package's controller.
 
 - **Outcome:** Composable acquire/submit/skip operations with protected actual-effect bookkeeping and completion-driven resource holds.
 - **Scope:** Single and batched graphics submissions, finite acquire, suboptimal acquisition, cleanup submission and unused-image return, including submitted-but-unpresented close.
@@ -2545,6 +2587,11 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-13. Track presentation completion and retire generations
 
+> Filed as #227 on 2026-09-20. Placement: presentation, per-target pools and
+> generation retirement live in the native backend package on the graphics
+> owner; window retirement acknowledgement flows through the integration
+> package's controller to the protected host.
+
 - **Outcome:** Independent per-target presentation and complete normal retirement of all submission and presentation obligations.
 - **Scope:** Bounded per-target presentation semaphore/fence pools, delayed present, enqueued-error accounting and incremental generation/window retirement. A new acquisition may use a free pool record without a redundant host wait on its image's older presentation fence.
 - **Phase:** Rendering lifecycle.
@@ -2556,6 +2603,11 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None.
 
 ### VK-14. Apply bounded target and allocation recovery
+
+> Filed as #229 on 2026-09-20. Placement: allocation reclamation and swapchain
+> replacement live in the native backend package; surface replacement on the
+> live window, which needs a main-thread surface creation through VK-5, is
+> orchestrated by the integration package's controller.
 
 - **Outcome:** Recognized failures recover within stable budgets while unrelated healthy targets retain their resources.
 - **Scope:** P-14/P-15 surface replacement on the same live window, support recheck, required/optional disposition and safe reclaim-once/retry-once behavior. Preserve actual oldSwapchain effects.
@@ -2569,6 +2621,11 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-15. Complete terminal graphics failure and device-loss teardown
 
+> Filed as #231 on 2026-09-20. Placement: destruction under device-loss rules
+> lives in the native backend package; the terminal latch, checkpoint exposure
+> and the all-exit drain compose in the integration package's controller on
+> VK-18's owner machinery, inside VK-6's diagnostic lifetime.
+
 - **Outcome:** All-exit terminal retirement preserves the original failure and disposes only under proven normal/device-loss rules.
 - **Scope:** Device loss, strict validation error, callback/sink failure, uncertain native effects, cleanup failures and repeated cancellation; direct owner drain with no event-loop dependency.
 - **Phase:** Failure behavior.
@@ -2581,6 +2638,10 @@ native evidence obligations even when its implementation can run in parallel.
 
 ### VK-16. Compose rendering demand and retirement with TIME and LIFE
 
+> Filed as #232 on 2026-09-20. Placement: the loop adapter and the extended
+> interaction probe live in `hetoimasia-gpu-vulkan-glfw`; the probe stays an
+> opt-in example gated exactly as RR-4's.
+
 - **Outcome:** The main-thread owner loop publishes demand and observations and the VK-18 graphics owner drives rendering, finite GPU progress and all-exit retirement, without a second engine loop.
 - **Scope:** P-5/P-6 deadline combination across the two threads, fair target progress, render suspension, idle retirement-poll backoff with prompt resumption, stop/quiescence order and status delivery to application services; the D-30 extent policy under a main-thread stall, including suspended acquisition for unusable dimensions and the bounded replacement budget; and the native interaction-probe measurement D-29 requires.
 - **Phase:** Runtime integration.
@@ -2592,6 +2653,11 @@ native evidence obligations even when its implementation can run in parallel.
 - **Open questions:** None; consume delivered TIME/LIFE contracts and D-30–D-33. If the measurement shows the capabilities path insufficient on a supported platform, stop and revise D-30 explicitly rather than improvising the reserve record.
 
 ### VK-17. Deliver the multi-window triangle consumer and final evidence
+
+> Filed as #233 on 2026-09-20. Placement: the consumer is a sample executable
+> under `samples/`, listed only in `cabal.project.vulkan` and built on public
+> interfaces; the required two-window profile joins
+> `hetoimasia-gpu-vulkan-glfw`'s native suite.
 
 - **Outcome:** A small renderer client proves the managed API and complete two-window milestone on both platforms.
 - **Scope:** Embedded triangle shaders, required image assertions and two-window resize/first-window close, one/two-frame configurations, final teardown verdict, usage docs and local/remote evidence.
