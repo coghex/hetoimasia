@@ -13,11 +13,12 @@
 # Server startup has three outcomes, and each refusal names the one it was:
 # the server exited before reporting a display, its startup report was closed
 # or invalid without naming one, or the thirty-second bound expired with the
-# report still outstanding. Each is observed on its own channel, so a server
-# that exits never reports a timeout and a server that stays alive never
-# reports an exit. An unusable report is settled at the bound, because a
-# server on its way out has until then to be reaped and named as the exit it
-# is.
+# report still outstanding. Each is observed on its own channel and by a
+# process of its own, so a server that exits never reports a timeout — not even
+# when something that inherited its startup report holds that channel open past
+# the bound — and a server that stays alive never reports an exit. An unusable
+# report is settled at the bound, because a server on its way out has until
+# then to be reaped and named as the exit it is.
 #
 # The native suite enters no session without consent. Once the display is up,
 # and only then, the command runs with HETOIMASIA_NATIVE_SESSION set to
@@ -140,14 +141,25 @@ export XDG_SESSION_TYPE=x11
 #     does not separate the two on every supported shell, returning 1 for both
 #     under Bash 3.2.
 #
-# One process makes the first two, in that order: it starts the server, reads
-# the report channel to its end, and only then waits for the server. Two
-# processes reporting independently could not order what they saw — a server
-# that writes a display number and exits at once would have its completed
-# report overtaken by its own exit whenever the exit was noticed first, and be
-# refused for never reporting. Reading first is also what orders them
-# correctly: a report cannot still arrive on a channel that has closed, and
-# until it closes an exit is not yet the whole story.
+# The first two are made by separate processes, because neither can be made
+# while the other is outstanding. A report channel that another process
+# inherited stays open after the server has gone, so whoever reads it may still
+# be reading long after the bound; if that same process were the one that
+# waits, the exit it was about to reap would go unreported and be refused as a
+# timeout, which is the misdiagnosis this file exists to prevent.
+#
+# Being separate, the two are never ordered against each other, and nothing
+# below asks which arrived first: a server that names a display and exits at
+# once produces both, in whichever order they are noticed. The outcomes are
+# collected until a display is named or the bound expires, and the refusal is
+# then chosen from the set of them by one fixed precedence — a named display
+# outranks everything, an exit is a more specific answer than an unusable
+# report, and the bound is what is left when nothing was seen at all.
+#
+# The reader is started by the process that starts the server, so one request
+# to stop reaches both. Every outcome line is therefore written by a process
+# that was not asked to stop, and a report channel that this script's own
+# cleanup closed is never reported as the server closing it.
 mkfifo "$scratch/displayfd" || refuse "no display-number channel could be created"
 mkfifo "$scratch/startup" || refuse "no startup-outcome channel could be created"
 exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened"
@@ -155,22 +167,21 @@ exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened
 # carry nothing but the notices a shell prints for a background process it
 # stopped — its own doing rather than anything the caller asked to hear.
 {
-  # A request to stop arrives as a signal, because this process spends its
-  # life reading the report channel and then waiting for the server. The
-  # handler stops the server, waits for it to be gone, and ends this process
-  # itself. Recording the request instead would strand it: for as long as the
-  # report is outstanding — which is the whole of the helper's bound — this
-  # process is not in the wait such a record was meant to be noticed after, and
-  # the read it is in can be held open by anything that inherited the channel.
-  # What it stops is what the job table still lists as running, so it never
-  # signals a process id that has been reaped and handed to somebody else, and
-  # what it waits for is what it started, so a descendant that outlives them
+  # A request to stop arrives as a signal, because this process spends its life
+  # waiting. The handler stops what it started, waits for it to be gone, and
+  # ends this process itself. Recording the request instead would strand it:
+  # the reader below can be held open by anything that inherited the report
+  # channel, so a record only a returning reader would notice may never be
+  # looked at. What it stops is what the job table still lists as running, so it
+  # never signals a process id that has been reaped and handed to somebody else,
+  # and what it waits for is what it started, so a descendant that outlives them
   # cannot hold cleanup up.
   #
   # Ending here rather than carrying on is also what keeps a stopped server out
   # of the outcomes: every line below is written by a process that was not
   # asked to stop, so no outcome can be the helper's own signalling coming back
-  # to it. The trap is armed before the server exists, so a request that
+  # to it. The reader is this process's own child for that reason — one request
+  # ends both. The trap is armed before the server exists, so a request that
   # arrives first finds nothing to stop and starts nothing.
   halt() {
     local job
@@ -187,23 +198,42 @@ exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened
   }
   trap 'halt; settle; exit' TERM
   Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" 8>&- &
-  # Read without an `IFS=` prefix, for the reason the bounded read below gives.
-  if read -r reported <"$scratch/displayfd"; then
-    printf 'report %s\n' "$reported"
-  else
-    printf 'closed\n'
-  fi
-  settle
-  # The server was reaped, and that is the whole report.
+  server=$!
+  # The report channel's own result, read by a process that does nothing else,
+  # so a channel held open by something that inherited it delays this answer
+  # alone. Read without an `IFS=` prefix, for the reason the bounded read below
+  # gives.
+  {
+    if read -r reported <"$scratch/displayfd"; then
+      printf 'report %s\n' "$reported"
+    else
+      printf 'closed\n'
+    fi
+  } &
+  # The server's termination, waited for by name. Naming a process is sound
+  # here where signalling one would not be: a process id cannot be reused
+  # before it is reaped, and the only thing that can reap this one is this
+  # wait. A signal that cuts the wait short leaves it still unreaped, so the
+  # answer is still waiting to be collected.
+  while :; do
+    wait "$server"
+    [ "$?" -gt 128 ] || break
+  done
   printf 'exited\n'
+  # Stay until cleanup. The reader may still be blocked on a channel something
+  # else holds open, and it is this process's to stop; leaving now would orphan
+  # it onto a helper that never started it and does not wait for it.
+  settle
 } >&8 2>/dev/null &
 
-# The report is usable until the channel says otherwise. An unusable report is
-# not yet a refusal: the server may be on its way out, and an exit it made for
-# itself is the more specific answer, so the bound is what settles which of the
-# two this was.
+# The outcomes are collected rather than acted on as they arrive, because the
+# two observers cannot order what they saw against each other. Only a display
+# number ends the collection early; everything else is settled once the report
+# channel has answered and the server has been reaped, or at the bound, which a
+# server on its way out has until to be reaped and named as the exit it is.
 number=""
-usable="yes"
+answered=""
+exited="no"
 started=$SECONDS
 while :; do
   remaining=$((30 - (SECONDS - started)))
@@ -217,30 +247,47 @@ while :; do
     read -r -t "$remaining" outcome <&8 || outcome="bound"
   fi
   case "$outcome" in
-    'exited')
-      refuse "the X server exited before reporting a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
-      ;;
     'report '*)
       number="${outcome#report }"
+      answered="unusable"
       case "$number" in
-        '' | *[!0-9]*) usable="no" ;;
+        '' | *[!0-9]*) number="" ;;
         *) break ;;
       esac
       ;;
     'closed')
-      usable="no"
+      answered="unusable"
+      ;;
+    'exited')
+      exited="yes"
       ;;
     *)
-      if [ "$usable" = "no" ]; then
-        refuse "the X server's startup report was closed or invalid before it named a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
-      fi
-      refuse "the X server reported no display within 30 seconds"
+      break
       ;;
   esac
+  if [ "$exited" = "yes" ] && [ -n "$answered" ]; then
+    break
+  fi
 done
-# The report arrived on a channel that has now closed, so nothing more is
-# coming and nothing is left to carry into the command's own environment. A
-# later exit has nowhere to go and nobody it could mislead.
+
+# One precedence, applied to whatever was seen, in the order of how specific an
+# answer each is. A server that named a display is usable however it ended; a
+# server that was reaped exited before reporting, whether its channel closed
+# behind it or is still held open by something that inherited it; a channel
+# that answered without naming a display is the report being unusable; and
+# nothing at all is the bound.
+if [ -z "$number" ]; then
+  if [ "$exited" = "yes" ]; then
+    refuse "the X server exited before reporting a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
+  fi
+  if [ "$answered" = "unusable" ]; then
+    refuse "the X server's startup report was closed or invalid before it named a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
+  fi
+  refuse "the X server reported no display within 30 seconds"
+fi
+# The report named a display, so nothing further is to be collected and nothing
+# is left to carry into the command's own environment. A later exit has nowhere
+# to go and nobody it could mislead.
 exec 8<&-
 export DISPLAY=":$number"
 

@@ -18,6 +18,7 @@
 -- the @ci-image@ workflow's own run inside the published image.
 module Display (spec) where
 
+import Control.Concurrent (threadDelay)
 import Control.Monad (forM_)
 import Sandbox (run, sanitizedEnvironment)
 import Data.List (isInfixOf, isPrefixOf)
@@ -98,6 +99,28 @@ x11Spec = describe "Isolated X11 display" $ do
         "the X server exited before reporting a display: the framebuffer could not be opened"
         ["holder.pid"]
 
+  it "refuses to run the command when the X server exits while its startup report stays open" $
+    withDisplay $ \display → do
+      -- The exit is the only observation there is to make: the stub hands its
+      -- report channel to a process that never closes it, so the channel is
+      -- still open when the bound expires and answers nothing at all. An
+      -- observer that had to read that channel to its end before it could wait
+      -- for the server would never reach the wait, and this exit would be
+      -- refused as the report simply not arriving in time. Which of the two
+      -- the helper said is what this example reads.
+      installStubs display (("Xvfb", handedOffServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server exited before reporting a display: the framebuffer could not be opened"
+        ["server.pid"]
+      -- The writer really did outlive the bound: blocked on a channel with no
+      -- writer of its own, it is still there once the helper has refused. The
+      -- helper never started it and never learned of it, so ending it belongs
+      -- to the example that arranged it.
+      holder ← pidIn display "holder.pid"
+      stopped holder `shouldReturn` False
+      ended holder
+
   it "refuses to run the command when the X server closes its startup report without naming a display" $
     withDisplay $ \display → do
       -- A server that stays alive with the channel shut is not an exit, and a
@@ -131,13 +154,13 @@ x11Spec = describe "Isolated X11 display" $ do
       -- This stub too handles the termination signal and exits cleanly, so the
       -- timeout is the outstanding report rather than the cleanup's doing.
       --
-      -- This is also where the observer spends the whole bound reading the
-      -- report channel rather than waiting for the server, so the request to
-      -- stop that cleanup sends at the bound arrives outside any wait. An
-      -- observer that recorded that request for its wait to notice would never
-      -- reach the wait, and this server would go on running until it ran out
-      -- on its own — long after the refusal, and with the helper still waiting
-      -- on it.
+      -- This is also where the request to stop that cleanup sends at the bound
+      -- arrives: the observer is waiting for a server that has not exited, and
+      -- the reader beside it is waiting on a channel that says nothing. A
+      -- handler that only recorded the request would return into that same
+      -- wait and go on waiting for a server nobody had stopped, which would
+      -- then run until it ran out on its own — long after the refusal, and
+      -- with the helper still waiting on it.
       --
       -- Which of the two happened is settled by the server's own note rather
       -- than by how long any of it took: it writes @stopped@ from the handler
@@ -160,22 +183,25 @@ x11Spec = describe "Isolated X11 display" $ do
     withDisplay $ \display → do
       -- The earliest a request to stop can arrive: the server asks for it at
       -- its own first instruction, while the observer that started it may not
-      -- yet have begun reading the report channel. The observer stops the
-      -- server, waits for it, and ends without writing an outcome, because an
-      -- outcome it was told to produce would be the helper's own signalling
-      -- coming back to it. The helper is left with the report that never came;
-      -- this example waits the bound out.
+      -- yet have reached the wait that reaps it. The observer stops what it
+      -- started — the server and the reader beside it — waits for both, and
+      -- ends without writing an outcome, because an outcome it was told to
+      -- produce would be the helper's own signalling coming back to it, and a
+      -- report channel its own cleanup closed is not the server closing it.
+      -- The helper is left with the report that never came; this example waits
+      -- the bound out.
       installStubs display (("Xvfb", earlyStopServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
   it "follows the report when the X server names a display and exits at once" $
     withDisplay $ \display → do
-      -- One observer reads the report channel to its end before it waits for
-      -- the server, so a completed report cannot be overtaken by the exit that
-      -- follows it. Two observers reporting independently could order these
-      -- either way, and the exit winning would have the helper say the server
-      -- exited before reporting a display it had already named. What a
-      -- departed server is refused for is the answer it does not give.
+      -- The report and the exit are made by separate observers, so they arrive
+      -- in whichever order they were noticed and neither can overtake the
+      -- other. The helper waits for both and answers from the pair: the
+      -- display it was given outranks the exit that came with it, so this is
+      -- never the server exiting before reporting a display it had already
+      -- named. What a departed server is refused for is the answer it does not
+      -- give.
       installStubs
         display
         ( ("Xvfb", departingServer)
@@ -187,6 +213,8 @@ x11Spec = describe "Isolated X11 display" $ do
       errors `shouldContain` "the X server on :42 does not answer: unable to open display"
       errors `shouldNotContain` "exited before reporting a display"
       doesFileExist (directory display </> "environment.txt") `shouldReturn` False
+      server ← pidIn display "server.pid"
+      stopped server `shouldReturn` True
       leftBehind "hetoimasia-x11." display `shouldReturn` []
 
   it "stops the X server and removes its scratch directory when a signal ends the startup" $
@@ -286,6 +314,24 @@ outlivedServer =
     , "exit 1"
     ]
 
+-- | A server that exits before reporting a display and leaves its report
+-- channel open behind it: the writer it forked inherits the channel and then
+-- blocks for good on a channel of its own that no one ever writes to, so the
+-- report channel never closes and answers nothing at all. The exit is the only
+-- observation there is, and it is made while the report is still outstanding.
+handedOffServer ∷ String
+handedOffServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'the framebuffer could not be opened' >&2"
+    , "rm -f gate"
+    , "mkfifo gate"
+    , "sh -c 'read held < gate' &"
+    , "echo $! > holder.pid"
+    , "exit 1"
+    ]
+
 -- | A server that closes its report channel and then stays alive, so the
 -- channel closes with no exit to observe at all. Like the real Xvfb it handles
 -- the termination signal the helper's cleanup sends and exits cleanly, of its
@@ -362,8 +408,8 @@ closedDisplay =
 
 -- | A server that signals the helper as soon as it is running and then stays
 -- alive. The helper is the server's grandparent — the observer process that
--- reads the report channel and waits for the server sits between them — so the
--- signal is aimed through the server's own parent rather than at it.
+-- starts the server, reads nothing itself, and waits for it sits between them
+-- — so the signal is aimed through the server's own parent rather than at it.
 signallingServer ∷ String
 signallingServer =
   unlines
@@ -449,6 +495,24 @@ stopped ∷ String → IO Bool
 stopped pid = do
   (result, _, _) ← run [] "/" "kill" ["-0", pid]
   pure (result /= ExitSuccess)
+
+-- | End a process an example's stub started outside the helper's reach, and
+-- wait until it is gone. Whether the helper stopped what it owns is asserted
+-- before this runs; this is the example clearing up its own apparatus, and the
+-- wait is for the process to be reaped by whoever inherited it rather than for
+-- anything the helper does.
+ended ∷ String → IO ()
+ended pid = do
+  _ ← run [] "/" "kill" [pid]
+  let await attempt =
+        stopped pid >>= \gone →
+          if gone
+            then pure ()
+            else
+              if attempt >= (600 ∷ Int)
+                then expectationFailure (pid ++ " is still running six seconds after it was ended")
+                else threadDelay 10000 >> await (attempt + 1)
+  await 0
 
 installStubs ∷ Display → [(String, String)] → IO ()
 installStubs display stubs =
