@@ -812,6 +812,7 @@ initializationError = do
       forced =
         productionNative
           { nativeHostBackend = Just unavailable
+          , nativeAdmittedBackends = [unavailable]
           , nativePlatformSupported = \_ → pure True
           }
   outcome ← try (withScoped (allocComposite (sessionAssembly forced defaultSessionConfig)) (\_ → pure ()))

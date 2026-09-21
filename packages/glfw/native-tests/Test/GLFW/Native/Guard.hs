@@ -30,6 +30,7 @@ import Test.GLFW.Native.Consent
   , desktopValue
   , isolatedValue
   , refusalMessage
+  , waylandValue
   )
 import Test.GLFW.Native.Fixture (Owner (..), OwnerReport (..), dispatch, runOwned)
 import Test.GLFW.Native.Interaction
@@ -82,6 +83,27 @@ spec = describe "the native opt-in" $ do
       consentFrom "linux" [(consentVariable, desktopValue)] `shouldBe` Right Desktop
       consentFrom "darwin" [(consentVariable, desktopValue), ("DISPLAY", ":0")] `shouldBe` Right Desktop
 
+    it "accepts the isolated Wayland authorization only on Linux, for the socket it names, with no DISPLAY" $ do
+      consentFrom "linux" [(consentVariable, waylandValue "wayland-7"), ("WAYLAND_DISPLAY", "wayland-7")]
+        `shouldBe` Right (IsolatedWayland "wayland-7")
+      -- A socket the run is not on, named or not.
+      consentFrom "linux" [(consentVariable, waylandValue "wayland-7"), ("WAYLAND_DISPLAY", "wayland-0")]
+        `shouldBe` Left (WaylandIsolationElsewhere "wayland-7" (Just "wayland-0"))
+      consentFrom "linux" [(consentVariable, waylandValue "wayland-7")]
+        `shouldBe` Left (WaylandIsolationElsewhere "wayland-7" Nothing)
+      consentFrom "linux" [(consentVariable, waylandValue ""), ("WAYLAND_DISPLAY", "")]
+        `shouldBe` Left (WaylandIsolationElsewhere "" (Just ""))
+      -- Any DISPLAY at all, empty included, could serve X11 or XWayland
+      -- instead of the compositor the helper started.
+      consentFrom "linux" [(consentVariable, waylandValue "wayland-7"), ("WAYLAND_DISPLAY", "wayland-7"), ("DISPLAY", ":0")]
+        `shouldBe` Left (WaylandIsolationBesideX11 "wayland-7" ":0")
+      consentFrom "linux" [(consentVariable, waylandValue "wayland-7"), ("WAYLAND_DISPLAY", "wayland-7"), ("DISPLAY", "")]
+        `shouldBe` Left (WaylandIsolationBesideX11 "wayland-7" "")
+      consentFrom "darwin" [(consentVariable, waylandValue "wayland-7"), ("WAYLAND_DISPLAY", "wayland-7")]
+        `shouldBe` Left (WaylandIsolationOffPlatform "wayland-7" "darwin")
+      -- A bare WAYLAND_DISPLAY is no more consent than a bare DISPLAY.
+      consentFrom "linux" [("WAYLAND_DISPLAY", "wayland-7")] `shouldBe` Left NoConsent
+
     it "accepts the isolated authorization only on Linux and only for the display it names" $ do
       consentFrom "linux" [(consentVariable, isolatedValue ":42"), ("DISPLAY", ":42")]
         `shouldBe` Right (IsolatedX11 ":42")
@@ -102,9 +124,17 @@ spec = describe "the native opt-in" $ do
             message `shouldContain` (consentVariable <> "=" <> desktopValue)
             message `shouldContain` "ask"
             message `shouldContain` "tools/display/x11.sh"
-            message `shouldContain` "DISPLAY and CI are not consent"
+            message `shouldContain` "tools/display/wayland.sh"
+            message `shouldContain` "DISPLAY, WAYLAND_DISPLAY, and CI are not consent"
         )
-        [NoConsent, UnknownConsent "yes", IsolationElsewhere ":42" Nothing, IsolationOffPlatform ":42" "darwin"]
+        [ NoConsent
+        , UnknownConsent "yes"
+        , IsolationElsewhere ":42" Nothing
+        , IsolationOffPlatform ":42" "darwin"
+        , WaylandIsolationElsewhere "wayland-7" Nothing
+        , WaylandIsolationBesideX11 "wayland-7" ":0"
+        , WaylandIsolationOffPlatform "wayland-7" "darwin"
+        ]
 
   describe "before the shared session" $ do
     it "refuses every operation of an unapproved run before it is dispatched, acquiring nothing" $ do
@@ -156,7 +186,7 @@ spec = describe "the native opt-in" $ do
             reportAcquisitions report `shouldBe` 1
             readIORef events `shouldReturn` ["acquired", "released"]
         )
-        [Desktop, IsolatedX11 ":42"]
+        [Desktop, IsolatedX11 ":42", IsolatedWayland "wayland-7"]
 
     it "refuses a native example before its body, so a body that forks and waits on an operation never starts" $ do
       -- The shape of the shared-session examples: a body that forks an

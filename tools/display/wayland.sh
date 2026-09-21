@@ -20,11 +20,12 @@
 #
 # The native suite enters no session without consent. Once the compositor
 # serves, and only then, the command runs with HETOIMASIA_NATIVE_SESSION set to
-# isolated-wayland:SOCKET. The suite does not accept that value yet — WL-2 adds
-# Wayland session selection, and until it lands the suite refuses this consent
-# as an unknown one, which is the correct outcome rather than a gap. This never
-# stands in for the human's HETOIMASIA_NATIVE_SESSION=desktop on a real desktop,
-# which no script supplies.
+# isolated-wayland:SOCKET. The suite accepts that value on Linux, and only when
+# WAYLAND_DISPLAY names exactly this socket and DISPLAY is unset, which is why
+# both are established before the command starts; under it the shared session
+# requests Wayland by name. This never stands in for the human's
+# HETOIMASIA_NATIVE_SESSION=desktop on a real desktop, which no script
+# supplies.
 #
 #   tools/display/wayland.sh [--summary FILE] -- COMMAND [ARGUMENT...]
 #

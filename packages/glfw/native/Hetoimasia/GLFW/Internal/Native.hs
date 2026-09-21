@@ -47,6 +47,7 @@ module Hetoimasia.GLFW.Internal.Native
   , pollEventsForCheck
   , waitEventsForCheck
   , requestCloseForCheck
+  , checkHelperBackends
   , noteProgressForCheck
   , takeWaitNotedForCheck
   , blockedWaitForCheck
@@ -114,6 +115,7 @@ productionNative ∷ Native
 productionNative =
   Native
     { nativeHostBackend = hostBackend
+    , nativeAdmittedBackends = admittedBackends
     , nativeGuard = processGuard
     , nativeIsProcessMainThread = (/= 0) <$> c_isProcessMainThread
     , nativePlatformSupported = \backend →
@@ -260,6 +262,19 @@ installedMonitorCallbackForCheck = do
   _ ← c_glfwSetMonitorCallback installed
   pure (MonitorCallbackStorage installed)
 
+-- | The backends whose native handles the two test-check drivers —
+-- 'requestCloseForCheck' and 'sizeLimitsForCheck' — can reach. Both go through
+-- @glfwGetCocoaWindow@ or @glfwGetX11Display@ and @glfwGetX11Window@; GLFW 3.4
+-- answers either accessor with @GLFW_PLATFORM_UNAVAILABLE@ on a platform that
+-- is not the one it exposes, which the session would capture as a native
+-- failure, so the shim checks @glfwGetPlatform@ first and answers unavailable
+-- instead. Wayland is therefore outside this list: what is unavailable there
+-- is each driver, not window closure or size constraints, and no
+-- compositor-generated close request has been demonstrated on Wayland through
+-- this integration.
+checkHelperBackends ∷ [Backend]
+checkHelperBackends = [X11, Cocoa]
+
 -- | The exclusivity guard for this process's one GLFW instance.
 processGuard ∷ Guard
 processGuard = unsafePerformIO newGuard
@@ -270,6 +285,18 @@ hostBackend = case os of
   "darwin" → Just Cocoa
   "linux" → Just X11
   _ → Nothing
+
+-- | The backends a platform admits to the support check. Linux admits Wayland
+-- beside X11, but only when a request names it: 'hostBackend' keeps X11 as the
+-- backend an unrequested session selects, so no run reaches Wayland by
+-- accident and no request is exchanged for the other backend. macOS admits
+-- Cocoa alone. Whether an admitted backend was compiled into this prefix is
+-- 'glfwPlatformSupported''s answer, not this list's.
+admittedBackends ∷ [Backend]
+admittedBackends = case os of
+  "darwin" → [Cocoa]
+  "linux" → [X11, Wayland]
+  _ → []
 
 platformCode ∷ Backend → CInt
 platformCode X11 = glfwPlatformX11
@@ -403,8 +430,16 @@ waitEventsForCheck seconds = c_glfwWaitEventsTimeout (CDouble seconds)
 -- client message on X11. GLFW reports the request through the window's close
 -- callback — inside this call on Cocoa, and from a later event poll on X11 —
 -- and destroys nothing.
-requestCloseForCheck ∷ Ptr NativeWindow → IO ()
-requestCloseForCheck = c_requestCloseForCheck
+--
+-- 'False' says this driver is unavailable on the session's backend, not that
+-- the window cannot be closed: it reaches the window through the Cocoa or X11
+-- handle GLFW exposes, and 'checkHelperBackends' names the backends that
+-- expose one. On any other backend it asks GLFW for no handle, so it provokes
+-- no report the session would capture, and it answers 'False' rather than
+-- doing nothing observable. A compositor-generated close request on Wayland
+-- has not been demonstrated through this integration.
+requestCloseForCheck ∷ Ptr NativeWindow → IO Bool
+requestCloseForCheck window = (/= 0) <$> c_requestCloseForCheck window
 
 -- | Record progress in the production finite wait in progress, only while the
 -- thread making it is blocked inside GLFW's wait, and wake that wait with an
@@ -470,6 +505,12 @@ windowTitleForCheck window = do
 -- | The size limits the platform itself holds for the window — minimum width and
 -- height, then maximum width and height, 'Nothing' for a bound it does not
 -- hold — for the native examples only. 'Nothing' when they could not be read.
+--
+-- 'Nothing' is this reader's answer, never the window's: GLFW holds the
+-- constraints a control installed whatever the backend, and this reads them
+-- back only through a Cocoa or X11 handle. On a backend outside
+-- 'checkHelperBackends' it asks GLFW for no handle, so nothing is reported,
+-- and answers 'Nothing'.
 sizeLimitsForCheck ∷ Ptr NativeWindow → IO (Maybe (Maybe Int, Maybe Int, Maybe Int, Maybe Int))
 sizeLimitsForCheck window =
   allocaArray 4 $ \limits → do
@@ -517,7 +558,7 @@ foreign import capi unsafe "hetoimasia_glfw.h hetoimasia_glfw_is_process_main_th
   c_isProcessMainThread ∷ IO CInt
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_request_close_for_check"
-  c_requestCloseForCheck ∷ Ptr NativeWindow → IO ()
+  c_requestCloseForCheck ∷ Ptr NativeWindow → IO CInt
 
 -- The production finite wait goes through the shim, which records what the
 -- native examples observe of it and then calls glfwWaitEventsTimeout.

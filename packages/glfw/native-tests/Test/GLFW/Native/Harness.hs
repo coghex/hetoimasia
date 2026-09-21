@@ -72,7 +72,7 @@ import Test.GLFW.Native.Fixture
   , queuedCount
   , runOwned
   )
-import Test.GLFW.Native.Support (Shared (..), acquisitions, consented, failed, hostBackend, owned)
+import Test.GLFW.Native.Support (Shared (..), acquisitions, consented, failed, owned, sharedBackend)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldReturn)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -386,9 +386,9 @@ spec shared = describe "the shared fixture" $ do
     it "settles a deliberately failing example that used the session, and keeps serving" $ do
       nested ←
         runNested id . it "fails after a native operation" $
-          owned shared (pure . sessionBackend) >>= (`shouldNotBe` hostBackend)
+          owned shared (pure . sessionBackend) >>= (`shouldNotBe` sharedBackend (sharedGate shared))
       failures nested `shouldBe` 1
-      owned shared (pure . sessionBackend) `shouldReturn` hostBackend
+      owned shared (pure . sessionBackend) `shouldReturn` sharedBackend (sharedGate shared)
       acquisitions shared `shouldReturn` 1
 
     it "settles a cancelled example's in-flight and queued operations on the owner, and keeps serving" $ do
@@ -411,7 +411,7 @@ spec shared = describe "the shared fixture" $ do
       queuedOutcome >>= (`shouldBe` True) . killed
       inFlightOutcome >>= (`shouldBe` True) . killed
       putMVar gate ()
-      owned shared (pure . sessionBackend) `shouldReturn` hostBackend
+      owned shared (pure . sessionBackend) `shouldReturn` sharedBackend (sharedGate shared)
       readIORef finishedInFlight `shouldReturn` True
       readIORef ranQueued `shouldReturn` False
       acquisitions shared `shouldReturn` 1

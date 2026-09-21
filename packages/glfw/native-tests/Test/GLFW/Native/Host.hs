@@ -36,7 +36,6 @@ import Hetoimasia.GLFW.Command
 import qualified Hetoimasia.GLFW.Input as Input
 import Hetoimasia.GLFW.Internal.Native
   ( noteProgressForCheck
-  , requestCloseForCheck
   , takeLastWaitForCheck
   , takeWaitNotedForCheck
   )
@@ -56,7 +55,7 @@ import Hetoimasia.Runtime.Supervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
-import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned)
+import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned, requestClose)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -144,7 +143,7 @@ spec shared = describe "window host" $ do
                     { loopLogger = quietLogger
                     , loopEvent = noApplicationEvents
                     , loopUpdate = \turn → do
-                        when (turnNumber turn == 1) (requestCloseForCheck (windowNativeHandle window))
+                        when (turnNumber turn == 1) (requestClose (windowNativeHandle window))
                         policy surfacedAt service window turn
                     }
             )
@@ -468,7 +467,7 @@ testHonouredCloseRequest shared = do
             , loopEvent = noApplicationEvents
             , loopUpdate = \turn → do
                 when (turnNumber turn == 1) $
-                  void (withHostWindow host (clientWindow closing) (requestCloseForCheck . windowNativeHandle))
+                  void (withHostWindow host (clientWindow closing) (requestClose . windowNativeHandle))
                 readIORef answered >>= \case
                   Nothing → case [request | request ← turnCloseRequests turn, closeRequestWindow request == clientWindow closing] of
                     request : _ → do

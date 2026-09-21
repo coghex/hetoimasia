@@ -123,6 +123,7 @@ identifier lists are sorted.
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
+| `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -259,11 +260,22 @@ and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
 part of every Linux candidate's identity.
 
-`test.macos-confinement` is the one registered optional group, and it has a
-section of its own below. Further interactive and lengthy desktop probes, when
-they are declared, are optional groups that run only on request; optional
-handling, including an optional display probe whose inputs changed, is proven
-with fixture catalogs in `workflow-tests`.
+`test.glfw-wayland` is the same suite's `on an isolated Wayland session` group,
+selected by that group's own path so it is the only work the group runs: the
+backend a requested Wayland session selected, and both X11 test-check drivers
+answering unavailable there without provoking a GLFW report. It declares the
+same inputs and the same `display` runner class as `test.glfw-native`, but it is
+**optional**: it runs only when a pull request requests it, and the
+[display worker](#the-display-worker) runs it under
+`tools/display/wayland.sh` rather than `x11.sh`, which is what gives it a
+Wayland session to select. Making it required when affected is WL-3's decision,
+not this group's.
+
+`test.macos-confinement` and `test.glfw-wayland` are the registered optional
+groups; the first has a section of its own below. Further interactive and
+lengthy desktop probes, when they are declared, are optional groups that run
+only on request; optional handling, including an optional display probe whose
+inputs changed, is proven with fixture catalogs in `workflow-tests`.
 
 ### The macOS confinement probe
 
@@ -578,7 +590,7 @@ Each worker is declared once, to the planner:
 python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
-  --worker glfw-native=display:test.glfw-native
+  --worker glfw-native=display:test.glfw-native,test.glfw-wayland
 ```
 
 Before producing a plan, the planner refuses — naming every problem — a worker
@@ -692,7 +704,7 @@ class to every execution:
 | --- | --- | --- |
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.lua-confinement-linux`, `test.vulkan`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
-| `glfw-native` | `display` | `test.glfw-native` |
+| `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest
@@ -739,14 +751,21 @@ A cache miss costs time and can never change a result.
 `glfw-native` is the only worker declaring the `display` runner class, and the
 only job that ever starts a display. Its steps are the CPU workers' — verify
 the image, link a native consumer, restore caches keyed separately as
-`dist-newstyle-native-…` — except that it runs each group through the display
-helper:
+`dist-newstyle-native-…` — except that it runs each group through a display
+helper, chosen by the group:
 
 ```bash
 bash tools/display/x11.sh --summary "$GITHUB_STEP_SUMMARY" -- \
   python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
   --worker glfw-native --runner-class display --toolchain ...
 ```
+
+`test.glfw-wayland` is the one group routed elsewhere: it asks the suite for a
+Wayland session, which no X11 display can serve, so the worker runs it under
+`tools/display/wayland.sh` with the same arguments. Every other assigned group,
+`test.glfw-native` included, keeps running under `x11.sh` exactly as before;
+the routing is on the group's identity, so a group added to this worker later
+runs under the X11 helper unless it is named here too.
 
 `tools/display/x11.sh` establishes an isolated X11 display for that one command
 and stops it afterwards. It starts the image's `Xvfb` with `-displayfd`, so the
@@ -789,11 +808,15 @@ bash tools/display/wayland.sh --summary "$GITHUB_STEP_SUMMARY" -- <command>
 ```
 
 It starts the image's pinned Weston for that one command and stops it
-afterwards. No validation group runs under it yet: WL-2 registers the group
-that selects a Wayland session and teaches the native suite to accept one, and
-until then the suite refuses the consent this helper supplies as an unknown
-value, which is the correct outcome rather than a gap. What exercises it
-against a real compositor today is the `ci-image` workflow's dispatch-only
+afterwards. The optional `test.glfw-wayland` runs under it: the native suite
+now accepts the `isolated-wayland:<socket>` consent this helper supplies, on
+Linux, only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is
+unset. Its two examples then assert that the session it requested selected
+Wayland on that socket, and that both X11 test-check drivers answer unavailable
+there while the session's asynchronous reports stay empty — which is what shows
+neither reached for an X11 handle. Because the group is optional it runs only
+when requested, so an ordinary pull request still starts no compositor. What also exercises the
+helper against a real compositor is the `ci-image` workflow's dispatch-only
 [`route: wayland-probe`](#the-builder), which runs
 `bash tools/display/wayland.sh -- true` inside the described image with the
 candidate tree mounted and shows in the job summary that the runtime directory
@@ -1530,7 +1553,8 @@ pulls no image.
 
 `tools/native/native.py`, with the pin in `tools/native/glfw.pin`, builds the
 same GLFW for a local macOS prefix and for the image. It fetches the pinned
-upstream archive, refuses it unless its SHA-256 matches, and builds only a
+upstream archive, refuses it unless its SHA-256 matches, applies every patch in
+`tools/native/patches/` to the unpacked source, and builds only a
 static, position-independent `libglfw3.a`, with upstream examples, tests, and
 documentation disabled, both X11 and Wayland on Linux, and Cocoa on macOS, into
 a private prefix whose library directory is `lib`. The two Linux backends are
@@ -1546,7 +1570,7 @@ macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — the `backends`
 the archive actually compiles, read from its own defined symbols rather than
 restated from the options, so a Linux prefix records `["Wayland", "X11"]` and a
 macOS one `["Cocoa"]` — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
-effective CMake options, and the exact value or absence of every variable CMake
+effective CMake options, the `patches` applied with each one's SHA-256, and the exact value or absence of every variable CMake
 or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
 `CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
 macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
@@ -1561,6 +1585,32 @@ SHA-256.
 | `link-check [--prefix P]` | Link a consumer that calls `glfwGetVersionString` with only the recorded flags and no library-path variables, require it to define the symbol itself and depend on no shared GLFW, and run it. It needs no display. |
 | `toolchain [--prefix P]` | Check, then print `native-manifest=<hash>`. |
 | `identity`, `record`, `fingerprint` | Print this configuration's identity, write a manifest for an existing prefix, or print the recipe fingerprint. |
+
+#### Patches
+
+`tools/native/patches/` holds targeted patches applied to the pinned source,
+in the order their names sort, between unpacking and configuring. They exist
+for one situation: a defect fixed upstream after the release the pin names,
+which this project needs and will not take by moving the pin to an unreleased
+revision. Each is a plain unified diff applied with `git apply` at `-p1`, with
+no fuzz and no skipping — the source is the pinned archive, freshly unpacked,
+so a patch that no longer applies means the pin moved and the backport has to
+be reconsidered rather than worked around. A patch's own header states what it
+backports, from which upstream commit, and why.
+
+Every patch is part of the recipe's identity twice over. Its name and content
+are folded into the [recipe fingerprint](#the-recipe-fingerprint), so adding,
+changing, reordering or removing one changes the image tag and every cache key
+derived from it; and `patches` in the native identity names each one with its
+SHA-256, so `check` refuses a prefix built with a different set — or with none
+— and says which patch differs. A prefix, an image, or a cached build product
+from before a patch is therefore never mistaken for one built with it.
+
+Currently applied:
+
+| Patch | Upstream | Why |
+| --- | --- | --- |
+| `0001-wayland-fix-segfault-when-there-is-no-seat.patch` | `3573c5a8`, glfw/glfw#2517, after the pinned 3.4 | `_glfwInitWayland` dereferenced a NULL `wl_seat` when the compositor advertises none, so every session entered on the headless Weston `tools/display/wayland.sh` starts died inside `glfwInit`. Required for `test.glfw-wayland` to run at all. |
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe

@@ -46,6 +46,8 @@ spec = describe "GLFW window controls" $ do
   describe "honest outcomes" $ do
     it "settles controls the modeled Wayland backend cannot perform as unsupported with a reason, and fabricates no unreportable observation"
       (boundedExample testUnsupported)
+    it "audits every window operation and report against the pinned Wayland backend, restricting exactly what GLFW answers unavailable"
+      (boundedExample testWaylandCapabilityAudit)
     it "attributes a native error to its own command and submission context, never to an unrelated one"
       (boundedExample testNativeErrorAttribution)
     it "reports a failed constraint update's returned, failed, and unattempted calls, refuses sizes until a complete update restores known state"
@@ -285,6 +287,62 @@ testUnsupported = withTwo defaultScript {scriptWindowCapabilities = const (backe
     unsupportedWith target wanted = \case
       Unsupported (UnsupportedControl window operation reason) → window == target && operation == wanted && reason /= ""
       _ → False
+
+-- | The audited Wayland row, against the whole vocabulary rather than the
+-- entries it happens to list.
+--
+-- Of GLFW 3.4's thirteen window operations and eight window reports, five are
+-- restricted, and the two kinds are not the same claim. GLFW itself answers
+-- @GLFW_FEATURE_UNAVAILABLE@ for the global window position, which is
+-- 'SetPositionOperation' and 'PlacementReport'. The model restricts three more
+-- on the strength of what the backend does rather than an error it reports:
+-- 'BorderlessOperation' needs that same refused position, 'IconifiedReport' is
+-- an unconditional false that carries no information, and 'FocusOperation'
+-- only asks a compositor that may do nothing. Everything else the backend
+-- performs or reports. GLFW's other Wayland refusals — the window icon,
+-- floating, opacity, and the cursor position — reach no constructor here, so
+-- the audit adds none of them, and it invents no restriction for an operation
+-- the backend performs. @docs/glfw.md@ records the audit with GLFW's answer
+-- cited per entry.
+testWaylandCapabilityAudit ∷ Expectation
+testWaylandCapabilityAudit = do
+  let wayland = backendWindowCapabilities Wayland
+      unperformable = unperformableOperations wayland
+      unreportable = unreportableAttributes wayland
+  -- Every constructor is accounted for: each is either performable or carries
+  -- a reason, and nothing outside the vocabulary is listed.
+  map fst unperformable `shouldBe` [SetPositionOperation, FocusOperation, BorderlessOperation]
+  map fst unreportable `shouldBe` [PlacementReport, IconifiedReport]
+  filter (`notElem` map fst unperformable) [minBound .. maxBound]
+    `shouldBe` [ SetTitleOperation
+               , SetSizeOperation
+               , SetConstraintsOperation
+               , ShowOperation
+               , HideOperation
+               , AttentionOperation
+               , MinimizeOperation
+               , MaximizeOperation
+               , RestoreOperation
+               , FullscreenOperation
+               ]
+  filter (`notElem` map fst unreportable) [minBound .. maxBound]
+    `shouldBe` [ LogicalExtentReport
+               , FramebufferExtentReport
+               , ContentScaleReport
+               , FocusedReport
+               , MaximizedReport
+               , VisibleReport
+               ]
+  -- Nothing is restricted without a reason, and the backends that restrict
+  -- nothing say so by listing nothing at all.
+  map snd unperformable `shouldSatisfy` all (/= "")
+  map snd unreportable `shouldSatisfy` all (/= "")
+  mapM_
+    ( \backend → do
+        map fst (unperformableOperations (backendWindowCapabilities backend)) `shouldBe` []
+        map fst (unreportableAttributes (backendWindowCapabilities backend)) `shouldBe` []
+    )
+    [X11, Cocoa]
 
 testNativeErrorAttribution ∷ Expectation
 testNativeErrorAttribution = do

@@ -17,9 +17,12 @@
 --
 -- In order, before any native state changes:
 --
--- 1. The requested backend is resolved against the one this platform
---    supports. Wayland is never selected, and a request for it, or for any
---    backend this platform does not support, fails with 'UnsupportedBackend'.
+-- 1. The requested backend is resolved against the backends this platform
+--    admits. Linux admits X11 and Wayland, macOS admits Cocoa, and an absent
+--    request takes the platform's own backend — X11 on Linux, Cocoa on macOS —
+--    so Wayland is selected only when a request names it. A request naming a
+--    backend the platform does not admit fails with 'UnsupportedBackend', and
+--    no request is ever answered with a backend other than the one asked for.
 -- 2. The calling thread must be bound and must be the OS thread that entered
 --    the process main function, or entry fails with 'NotProcessMainThread'. A
 --    bound worker thread is not enough, and neither is an unbound thread that
@@ -345,7 +348,8 @@ data Backend
   | Cocoa
     -- ^ Selected explicitly on macOS.
   | Wayland
-    -- ^ Never selected: requesting it is always 'UnsupportedBackend'.
+    -- ^ Selected on Linux only when a request names it; never the backend an
+    -- unrequested session takes, and always 'UnsupportedBackend' on macOS.
   deriving (Eq, Show)
 
 -- | The backend's name in failure identifiers.
@@ -426,7 +430,11 @@ newtype WindowCallbackStorage = WindowCallbackStorage [FunPtr ()]
 -- | Every native operation a session performs, as the model sees it.
 data Native = Native
   { nativeHostBackend ∷ !(Maybe Backend)
-    -- ^ The backend this platform supports, if any.
+    -- ^ The backend this platform selects when no request names one, if any.
+  , nativeAdmittedBackends ∷ ![Backend]
+    -- ^ Every backend this platform admits to the support check. A request
+    -- naming none of them is 'UnsupportedBackend' before any native call, and
+    -- an admitted one is never exchanged for another: nothing falls back.
   , nativeGuard ∷ !Guard
     -- ^ The exclusivity guard sessions over this library share.
   , nativeIsProcessMainThread ∷ IO Bool
@@ -647,10 +655,22 @@ sessionWindowCapabilities = sessionCapabilities
 
 -- | What GLFW 3.4 windows cannot do or report on a backend. X11 and Cocoa
 -- perform every ordinary control and report every attribute a window observes.
--- Wayland, which no session selects, is described anyway so its restrictions
--- stay explicit rather than emulated: it gives clients no global position to set
--- or read, and so cannot place a borderless window over a monitor, lets only the
--- compositor move input focus, and reports no reliable iconified state.
+--
+-- The Wayland row is audited against the pinned GLFW 3.4 Wayland backend for
+-- every 'WindowOperation' and every 'WindowReport'; the capabilities table in
+-- @docs/glfw.md@ records that audit with GLFW's own answer cited per entry.
+-- Five entries survive the audit, of two kinds. GLFW answers
+-- @GLFW_FEATURE_UNAVAILABLE@ itself for the global window position, which is
+-- 'SetPositionOperation' and 'PlacementReport'. The other three are the model
+-- declining to claim what that behaviour does not establish:
+-- 'BorderlessOperation' composes a placement out of the position GLFW refuses;
+-- 'IconifiedReport' is an unconditional false, which carries no information;
+-- and 'FocusOperation' only asks a compositor that may do nothing, so
+-- reporting it performed would assert a focus change that may never happen.
+-- The operations GLFW answers unavailable outside this vocabulary — the window
+-- icon, floating, opacity, and the cursor position — reach no constructor
+-- here, so the audit adds none of them. Nothing is emulated, and no
+-- restriction is invented for an operation the backend performs.
 backendWindowCapabilities ∷ Backend → WindowCapabilities
 backendWindowCapabilities = \case
   Wayland →
@@ -660,7 +680,7 @@ backendWindowCapabilities = \case
       , (BorderlessOperation, noGlobalPosition)
       ]
       [ (PlacementReport, noGlobalPosition)
-      , (IconifiedReport, "Wayland reports no reliable iconified state")
+      , (IconifiedReport, "Wayland reports no iconified state; GLFW always answers false")
       ]
   X11 → fullWindowCapabilities
   Cocoa → fullWindowCapabilities
@@ -737,6 +757,18 @@ backendIdentifiers ∷ Backend → [(Text, Text)]
 backendIdentifiers backend = [("backend", backendText backend)]
 
 -- | Construct a session over a native table.
+--
+-- Resolution, support, initialization, and verification are four distinct
+-- answers, and each keeps its own evidence. A backend the platform does not
+-- admit is 'UnsupportedBackend' at resolution; a backend the prefix was built
+-- without is 'UnsupportedBackend' at the support check, still before any
+-- native mutation. A supported answer says only that the backend is compiled
+-- in, never that its display or socket can be reached: that is settled by
+-- 'glfwInit', whose failure is a 'NativeFailure' carrying GLFW's own reports,
+-- so an unreachable display is identified by the report's code and description
+-- rather than by a separate outcome. Only once initialization succeeds does
+-- 'glfwGetPlatform' decide whether the backend actually selected is the one
+-- admitted, and a mismatch is 'BackendNotSelected'.
 --
 -- The stages and their releases:
 --
@@ -862,7 +894,7 @@ admit native config = do
     either
       (throwFailure glfwComponent enterSession requestIdentifiers)
       pure
-      (resolveBackend (nativeHostBackend native) (requestedBackend config))
+      (resolveBackend (nativeHostBackend native) (nativeAdmittedBackends native) (requestedBackend config))
   bound ← isCurrentThreadBound
   onMain ← nativeIsProcessMainThread native
   unless (bound && onMain) $
@@ -871,11 +903,19 @@ admit native config = do
   where
     requestIdentifiers = maybe [] backendIdentifiers (requestedBackend config)
 
-resolveBackend ∷ Maybe Backend → Maybe Backend → Either UnsupportedBackend Backend
-resolveBackend platform request =
-  case (request, platform) of
-    (Nothing, Just supported) | supported /= Wayland → Right supported
-    (Just wanted, Just supported) | wanted == supported, wanted /= Wayland → Right wanted
+-- | Resolve a request against the platform's default and the backends it
+-- admits. An absent request takes the default; a request naming an admitted
+-- backend is taken as asked. Nothing else resolves, and no resolution ever
+-- answers a backend other than the one asked for, so no request falls back.
+resolveBackend ∷ Maybe Backend → [Backend] → Maybe Backend → Either UnsupportedBackend Backend
+resolveBackend platform admitted request =
+  case request of
+    Nothing
+      | Just fallback ← platform
+      , fallback `elem` admitted →
+          Right fallback
+    Just wanted
+      | wanted `elem` admitted → Right wanted
     _ → Left (UnsupportedBackend request platform)
 
 claimGuard ∷ Guard → Backend → IO ()

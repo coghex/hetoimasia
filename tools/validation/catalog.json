@@ -269,6 +269,30 @@
       "optional": false
     },
     {
+      "id": "test.glfw-wayland",
+      "description": "The native suite's Wayland-only examples, on the isolated headless compositor tools/display/wayland.sh starts: that a session requesting Wayland selected Wayland on the socket its consent authorized, and that both X11 test-check drivers answer unavailable there without provoking a GLFW report. Optional and requested by name; the selector names that group and nothing else.",
+      "command": [
+        "cabal",
+        "test",
+        "glfw-native-tests",
+        "--test-show-details=direct",
+        "--test-option=--match",
+        "--test-option=/GLFW native/the shared session/on an isolated Wayland session/"
+      ],
+      "component": "hetoimasia-glfw:test:glfw-native-tests",
+      "inputs": [
+        "cabal.project.common",
+        "tools/ci-image/",
+        "tools/display/",
+        "tools/native/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": true
+    },
+    {
       "id": "test.macos-confinement",
       "description": "LUA-15's local macOS feasibility proof: a confined helper's denied filesystem, network, process, and native-module accesses before and after its mod source loads, two-instance process and storage isolation, the enforced whole-process memory limit and the execution bound, and the three lifetime endings. Optional and Darwin-only; the component is not built elsewhere, so a request for it on Linux fails rather than passing vacuously.",
       "command": [

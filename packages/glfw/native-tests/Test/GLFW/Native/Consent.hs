@@ -16,11 +16,16 @@
 --   @tools/display/x11.sh@ gives the command it runs once its private X11
 --   display is up. It authorizes only that display: it must match @DISPLAY@,
 --   and it never describes a Cocoa desktop.
+-- * @HETOIMASIA_NATIVE_SESSION=isolated-wayland:SOCKET@ is what
+--   @tools/display/wayland.sh@ gives the command it runs once its private
+--   compositor is serving. It authorizes only that socket: @WAYLAND_DISPLAY@
+--   must name it and @DISPLAY@ must be unset, so no XWayland display can stand
+--   in for the compositor, and it never describes a Cocoa desktop either.
 --
--- A bare @DISPLAY@, a @CI@ variable, or any other value is not consent. A
--- refusal is a value here, so what the run does with it — refuse the
--- operation, count it, and report once — is decided and tested without an
--- environment or a session.
+-- A bare @DISPLAY@ or @WAYLAND_DISPLAY@, a @CI@ variable, or any other value is
+-- not consent. A refusal is a value here, so what the run does with it —
+-- refuse the operation, count it, and report once — is decided and tested
+-- without an environment or a session.
 module Test.GLFW.Native.Consent
   ( -- * Consent
     Consent (..)
@@ -33,6 +38,8 @@ module Test.GLFW.Native.Consent
   , desktopValue
   , isolatedPrefix
   , isolatedValue
+  , waylandPrefix
+  , waylandValue
 
     -- * Refusing
   , NativeSessionRefused (..)
@@ -51,6 +58,8 @@ data Consent
     -- ^ The human user approved this run on the local desktop.
   | IsolatedX11 String
     -- ^ The isolated display helper started this run on the named display.
+  | IsolatedWayland String
+    -- ^ The isolated compositor helper started this run on the named socket.
   deriving (Eq, Show)
 
 -- | Why a run carries no authorization.
@@ -64,6 +73,15 @@ data Refusal
     -- another, or none.
   | IsolationOffPlatform String String
     -- ^ The isolated authorization was given on a platform without X11.
+  | WaylandIsolationElsewhere String (Maybe String)
+    -- ^ The isolated Wayland authorization names one socket while
+    -- @WAYLAND_DISPLAY@ names another, or none.
+  | WaylandIsolationBesideX11 String String
+    -- ^ The isolated Wayland authorization was given with @DISPLAY@ set, so an
+    -- X11 or XWayland display could stand in for the compositor.
+  | WaylandIsolationOffPlatform String String
+    -- ^ The isolated Wayland authorization was given on a platform without
+    -- Wayland.
   deriving (Eq, Show)
 
 -- | The environment variable the suite reads.
@@ -83,6 +101,15 @@ isolatedPrefix = "isolated-x11:"
 isolatedValue ∷ String → String
 isolatedValue display = isolatedPrefix <> display
 
+-- | The prefix of the value the isolated compositor helper supplies, followed
+-- by the socket it established.
+waylandPrefix ∷ String
+waylandPrefix = "isolated-wayland:"
+
+-- | The value the isolated compositor helper supplies for one socket.
+waylandValue ∷ String → String
+waylandValue socket = waylandPrefix <> socket
+
 -- | The consent an environment carries on a platform, or why it carries none.
 --
 -- The platform is the operating system name as 'System.Info.os' reports it.
@@ -101,6 +128,19 @@ consentFrom platform environment =
                in if null display || current /= Just display
                     then Left (IsolationElsewhere display current)
                     else Right (IsolatedX11 display)
+      -- The Wayland authorization answers to WAYLAND_DISPLAY the way the X11
+      -- one answers to DISPLAY, and additionally requires DISPLAY to be
+      -- absent: a set DISPLAY, empty or not, would let an X11 or XWayland
+      -- display stand in for the compositor the helper started.
+      | Just socket ← stripPrefix waylandPrefix value →
+          if platform /= "linux"
+            then Left (WaylandIsolationOffPlatform socket platform)
+            else
+              let current = lookup "WAYLAND_DISPLAY" environment
+                  display = lookup "DISPLAY" environment
+               in if null socket || current /= Just socket
+                    then Left (WaylandIsolationElsewhere socket current)
+                    else maybe (Right (IsolatedWayland socket)) (Left . WaylandIsolationBesideX11 socket) display
       | otherwise → Left (UnknownConsent value)
 
 -- | The consent this process's environment carries on this platform.
@@ -135,6 +175,25 @@ refusalReason = \case
       <> show display
       <> ", which is not a session on "
       <> platform
+  WaylandIsolationElsewhere socket current →
+    consentVariable
+      <> " authorizes the isolated Wayland socket "
+      <> show socket
+      <> " but WAYLAND_DISPLAY is "
+      <> maybe "not set" show current
+  WaylandIsolationBesideX11 socket display →
+    consentVariable
+      <> " authorizes the isolated Wayland socket "
+      <> show socket
+      <> " but DISPLAY is "
+      <> show display
+      <> ", which could serve an X11 or XWayland session instead"
+  WaylandIsolationOffPlatform socket platform →
+    consentVariable
+      <> " authorizes the isolated Wayland socket "
+      <> show socket
+      <> ", which is not a session on "
+      <> platform
 
 -- | One message naming what is missing, what the native examples would do to
 -- the desktop, how a human approves a run, and the isolated alternative.
@@ -146,4 +205,4 @@ refusalMessage refusal =
     <> consentVariable
     <> "="
     <> desktopValue
-    <> " for that one run. On Linux, `bash tools/display/x11.sh -- <command>` runs the command on an isolated X11 display instead and needs no approval. DISPLAY and CI are not consent."
+    <> " for that one run. On Linux, `bash tools/display/x11.sh -- <command>` runs the command on an isolated X11 display instead, and `bash tools/display/wayland.sh -- <command>` on an isolated Wayland socket; neither needs approval. DISPLAY, WAYLAND_DISPLAY, and CI are not consent."
