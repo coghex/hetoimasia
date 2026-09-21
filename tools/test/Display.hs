@@ -8,7 +8,11 @@
 -- other display protocol removed and with the native suite's isolated-session
 -- consent set for that session alone, and a missing or failing server, window
 -- manager, or compositor stops the run before the command starts, so the
--- consent reaches nothing. A signal the helper can catch ends it the same way,
+-- consent reaches nothing. Where the X server's startup can fail in more than
+-- one way, the examples name which one the helper reported: an exit, a report
+-- channel that closed or named no display, and the startup bound expiring are
+-- each driven by a stub that produces that outcome and no other. A signal the
+-- helper can catch ends it the same way,
 -- with what it started stopped and what it created removed. The real server is
 -- exercised by the @test.glfw-native@ group itself, and the real compositor by
 -- the @ci-image@ workflow's own run inside the published image.
@@ -81,6 +85,55 @@ x11Spec = describe "Isolated X11 display" $ do
       installStubs display (("Xvfb", "#!/bin/sh\necho 'cannot open the framebuffer' >&2\nexit 1\n") : filter ((/= "Xvfb") . fst) workingStubs)
       refused display "the X server exited before reporting a display"
 
+  it "refuses to run the command when the X server exits before its startup report closes" $
+    withDisplay $ \display → do
+      -- The exit is complete before the report channel closes: the stub hands
+      -- the channel to a process that closes it only once the stub has gone.
+      -- The helper reads the closed channel and still names the exit, which is
+      -- what the server's own status says, rather than the timeout the job
+      -- table's later notice of that exit once allowed.
+      installStubs display (("Xvfb", outlivedServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server exited before reporting a display: the framebuffer could not be opened"
+        ["holder.pid"]
+
+  it "refuses to run the command when the X server closes its startup report without naming a display" $
+    withDisplay $ \display → do
+      -- A server that stays alive with the channel shut is neither an exit nor
+      -- the bound expiring, and it is answered as soon as the channel closes.
+      installStubs display (("Xvfb", closingServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server's startup report was closed or invalid before it named a display: the startup report was closed"
+        ["server.pid"]
+
+  it "refuses to run the command when the X server's startup report names no display number" $
+    withDisplay $ \display → do
+      -- A line arrived, so the channel is not closed; it names no display, so
+      -- the report is invalid. Both are the same refusal, and neither is an
+      -- exit while the server is still running.
+      installStubs display (("Xvfb", babblingServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server's startup report was closed or invalid before it named a display: the display number is unavailable"
+        ["server.pid"]
+
+  it "refuses to run the command when the X server reports no display within the bound" $
+    withDisplay $ \display → do
+      -- A server that holds the report channel open and says nothing exhausts
+      -- the helper's thirty-second bound; this example waits that bound out.
+      installStubs display (("Xvfb", silentServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
+
+  it "refuses to run the command when the startup report is still incomplete at the bound" $
+    withDisplay $ \display → do
+      -- Buffered digits are not a display number until the report is complete,
+      -- so this is the bound expiring rather than a readiness the helper may
+      -- act on; this example waits that bound out too.
+      installStubs display (("Xvfb", stammeringServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
+
   it "refuses to run the command when the window manager exits instead of taking the display" $
     withDisplay $ \display → do
       -- A window manager that exits never announces itself on the root window.
@@ -140,6 +193,70 @@ workingStubs =
     )
   ]
 
+-- | A server that exits before reporting a display, and whose report channel
+-- closes only afterwards. The holder inherits the channel and blocks on a
+-- second one whose only writer is the server itself, so it wakes — and closes
+-- the report channel by exiting — exactly when the server has exited. The
+-- handshake is what orders the two: the server does not exit until the holder
+-- is already blocked, so no elapsed time stands in for the ordering.
+outlivedServer ∷ String
+outlivedServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo 'the framebuffer could not be opened' >&2"
+    , "rm -f gate ack"
+    , "mkfifo gate ack"
+    , "sh -c 'exec 5<gate; echo ready > ack; cat <&5 >/dev/null' &"
+    , "echo $! > holder.pid"
+    , "exec 4>gate"
+    , "read ready < ack"
+    , "exit 1"
+    ]
+
+-- | A server that closes its report channel and then stays alive, so the
+-- channel closes with no exit to observe at all.
+closingServer ∷ String
+closingServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'the startup report was closed' >&2"
+    , "exec 3>&-"
+    , "exec sleep 300"
+    ]
+
+-- | A server that reports something other than a display number and stays
+-- alive, so the report is invalid without the channel having closed.
+babblingServer ∷ String
+babblingServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'the display number is unavailable' >&2"
+    , "echo not-a-display >&3"
+    , "exec sleep 300"
+    ]
+
+-- | A server that holds its report channel open and reports nothing.
+silentServer ∷ String
+silentServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "exec sleep 300"
+    ]
+
+-- | A server whose report never becomes a complete line: the digits it wrote
+-- sit in the channel unterminated while it stays alive.
+stammeringServer ∷ String
+stammeringServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "printf 4 >&3"
+    , "exec sleep 300"
+    ]
+
 -- | Run the helper with a PATH holding only the toolbox, where an example wants
 -- the command it names to record its environment if it ever runs. A refusal
 -- runs it never, so no consent reaches anything: the record is absent.
@@ -150,6 +267,18 @@ refused display reason = do
   errors `shouldContain` reason
   errors `shouldContain` "the command did not run"
   doesFileExist (directory display </> "environment.txt") `shouldReturn` False
+
+-- | What a refusal during server startup must leave behind, beyond the refusal
+-- itself: the reason names the outcome it was, quoting the server's own log
+-- where the helper quotes one, the helper's scratch directory is gone, and
+-- every process the stub recorded has been stopped.
+refusedStartup ∷ Display → String → [FilePath] → IO ()
+refusedStartup display reason recorded = do
+  refused display reason
+  leftBehind "hetoimasia-x11." display `shouldReturn` []
+  forM_ recorded $ \name → do
+    process ← pidIn display name
+    stopped process `shouldReturn` True
 
 -- | Run the helper in a Wayland-looking environment that carries no native
 -- consent, whatever the developer's own shell holds, so what the command
@@ -308,13 +437,13 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       case reverse created of
         runtime : _ → doesDirectoryExist runtime `shouldReturn` False
         [] → expectationFailure "the stub recorded no directory"
-      leftBehind session `shouldReturn` []
+      leftBehind "hetoimasia-wayland." session `shouldReturn` []
 
   it "leaves nothing behind when the private runtime directory cannot be prepared" $
     withSession $ \session → do
       installStubs session (("mkdir", "#!/bin/sh\nexit 1\n") : waylandStubs)
       refusedSession session "no private runtime directory could be created"
-      leftBehind session `shouldReturn` []
+      leftBehind "hetoimasia-wayland." session `shouldReturn` []
 
   it "stops and reaps the compositor and removes the runtime directory when a signal ends the startup" $
     withSession $ \session → do
@@ -471,14 +600,14 @@ cleanedUp session = do
   runtime ← privateRuntime session
   runtime `shouldSatisfy` (directory session `isInfixOf`)
   doesDirectoryExist runtime `shouldReturn` False
-  leftBehind session `shouldReturn` []
+  leftBehind "hetoimasia-wayland." session `shouldReturn` []
 
--- | The helper's own scratch directories still sitting in its TMPDIR. The
--- runtime directory lives inside one, so an empty answer is the whole
--- statement: nothing the helper created survived it.
-leftBehind ∷ Display → IO [FilePath]
-leftBehind session =
-  filter ("hetoimasia-wayland." `isPrefixOf`) <$> listDirectory (directory session)
+-- | The named helper's own scratch directories still sitting in its TMPDIR.
+-- The Wayland runtime directory lives inside one, so an empty answer is the
+-- whole statement: nothing that helper created survived it.
+leftBehind ∷ String → Display → IO [FilePath]
+leftBehind prefix session =
+  filter (prefix `isPrefixOf`) <$> listDirectory (directory session)
 
 -- | A @mkdir@ that does what it was asked and then terminates the helper. The
 -- signal is pending before this returns, so the helper handles it before its

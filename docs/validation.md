@@ -763,8 +763,21 @@ suite then refuses any session that is not X11 on that display, so neither a
 dummy or null platform nor an XWayland session nor an accidental backend
 fallback can stand in for it, and the consent names the display it must match.
 
-A missing server or window manager, a server that exits before reporting a
-display, one that does not answer, and a window manager that exits or never
+Server startup has three outcomes, and the helper tells them apart by what it
+observed rather than by a query that races the server's exit: the server
+exited before reporting a display, its startup report closed or named no
+display number while the server was still running, or the thirty-second bound
+expired with the report still outstanding. The report is read by a process
+whose result the helper receives on a channel it keeps a write end of, so a
+failed read there can only be the bound expiring, and the server's own exit
+status — rather than the shell's job table, which notices an exit at its own
+pace — is what says whether it terminated. A server that exits before
+reporting is therefore never reported as a timeout, and one that stays alive
+is never reported as an exit. The first two reasons quote the server log's
+tail; all three refuse with status `1`.
+
+A missing server or window manager, each of those three startup outcomes, a
+server that does not answer, and a window manager that exits or never
 takes the display each end the helper with status `1` before the command
 starts, so the consent reaches nothing and no real desktop is ever authorized
 by a failed isolation. The group then writes no receipt and the job fails, and

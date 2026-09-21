@@ -10,6 +10,13 @@
 # starts, so a requested native group is blocked rather than passed, retried,
 # or skipped.
 #
+# Server startup has three outcomes, and each refusal names the one it was:
+# the server exited before reporting a display, its startup report was closed
+# or invalid without naming one, or the thirty-second bound expired with the
+# report still outstanding. Each is observed on its own channel, so a server
+# that exits never reports a timeout and a server that stays alive never
+# reports an exit.
+#
 # The native suite enters no session without consent. Once the display is up,
 # and only then, the command runs with HETOIMASIA_NATIVE_SESSION set to
 # isolated-x11:DISPLAY, the authorization the suite accepts for that isolated
@@ -59,6 +66,7 @@ done
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/hetoimasia-x11.XXXXXX")" || refuse "no scratch directory could be created"
 server=""
+reporter=""
 manager=""
 
 # Whether a background process this script started is still running. The job
@@ -72,10 +80,32 @@ alive() {
   return 1
 }
 
+# Whether the server ended on its own rather than on the signal sent here.
+#
+# This is asked only where startup has already failed and the server is
+# stopped either way, and it reaps the server rather than sampling the job
+# table, which notices an exit at its own pace. A signal cannot change an exit
+# status a server has already chosen, so any status other than death by this
+# signal is the server's own exit — an observation that races nothing.
+exited() {
+  local status
+  kill "$server" 2>/dev/null
+  wait "$server" 2>/dev/null
+  status=$?
+  # Reaped here, so the cleanup below has no server left to stop and a
+  # recycled process identifier is never signalled.
+  server=""
+  [ "$status" -ne 143 ]
+}
+
 stop() {
   if [ -n "$manager" ]; then
     kill "$manager" 2>/dev/null
     wait "$manager" 2>/dev/null
+  fi
+  if [ -n "$reporter" ]; then
+    kill "$reporter" 2>/dev/null
+    wait "$reporter" 2>/dev/null
   fi
   if [ -n "$server" ]; then
     kill "$server" 2>/dev/null
@@ -90,19 +120,66 @@ export XDG_SESSION_TYPE=x11
 
 # The server picks a free display number and writes it to the descriptor once
 # it accepts connections, so readiness is its own report rather than a guess.
+#
+# Three observations tell the startup outcomes apart, and none of them is a
+# question about a variable that came back empty:
+#
+#   * the report channel's own result, produced by a reporter process that
+#     reads it — a complete line, or the channel closing without one;
+#   * the thirty-second bound, read from an outcome channel this script holds
+#     a write end of. That channel therefore never reaches end-of-file, so a
+#     failed read on it can only be the bound expiring; `read`'s own status
+#     does not separate the two on every supported shell, returning 1 for both
+#     under Bash 3.2;
+#   * the server's termination, taken from reaping the server on the refusal
+#     path rather than from the job table, which notices an exit at its own
+#     pace and is what once let an immediate exit be called a timeout.
 mkfifo "$scratch/displayfd" || refuse "no display-number channel could be created"
+mkfifo "$scratch/startup" || refuse "no startup-outcome channel could be created"
+exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened"
 Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" &
 server=$!
+{
+  if IFS= read -r reported <"$scratch/displayfd"; then
+    printf 'report %s\n' "$reported"
+  else
+    printf 'closed\n'
+  fi
+} >&8 &
+reporter=$!
+
 number=""
-read -r -t 30 number <"$scratch/displayfd"
-case "$number" in
-  '' | *[!0-9]*)
-    if ! alive "$server"; then
+outcome=""
+IFS= read -r -t 30 outcome <&8 || outcome="bound"
+case "$outcome" in
+  'bound')
+    # The bound expired with the report still outstanding. A server that died
+    # closes the channel, but a departed server's children can hold it open,
+    # so the server itself is asked before the bound is blamed.
+    if exited; then
       refuse "the X server exited before reporting a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
     fi
     refuse "the X server reported no display within 30 seconds"
     ;;
+  'report '*)
+    number="${outcome#report }"
+    ;;
 esac
+case "$number" in
+  '' | *[!0-9]*)
+    # The channel closed, or named something that is not a display number.
+    # Which refusal that is depends on whether the server is still there.
+    if exited; then
+      refuse "the X server exited before reporting a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
+    fi
+    refuse "the X server's startup report was closed or invalid before it named a display: $(tail -n 5 "$scratch/server.log" | tr '\n' ' ')"
+    ;;
+esac
+# The report arrived, so the reporter has finished and the outcome channel has
+# nothing left to carry into the command's own environment.
+wait "$reporter" 2>/dev/null
+reporter=""
+exec 8<&-
 export DISPLAY=":$number"
 
 xdpyinfo >"$scratch/server.txt" 2>&1 || refuse "the X server on $DISPLAY does not answer: $(tail -n 5 "$scratch/server.txt" | tr '\n' ' ')"
