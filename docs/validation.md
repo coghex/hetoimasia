@@ -782,8 +782,61 @@ suite then refuses any session that is not X11 on that display, so neither a
 dummy or null platform nor an XWayland session nor an accidental backend
 fallback can stand in for it, and the consent names the display it must match.
 
-A missing server or window manager, a server that exits before reporting a
-display, one that does not answer, and a window manager that exits or never
+Server startup has three outcomes, and the helper tells them apart by what it
+observed rather than by a query that races the server's exit: the server
+exited before reporting a display, its startup report closed or named no
+display number, or the thirty-second bound expired with the report still
+outstanding. The bound is read from a channel the helper keeps a write end of,
+so a failed read there can only be the bound expiring. The other two are
+observed by two processes, one each, because neither can be observed while the
+other is outstanding. A report channel that another process inherited stays
+open after the server has gone, so whoever reads it may still be reading long
+after the bound; were that the same process that waits, the exit it was about
+to reap would go unreported and be refused as a timeout — the misdiagnosis this
+arrangement exists to prevent. Waiting is how the exit is observed, and reaping
+the server *is* the observation: nothing is signalled to make it, nothing is
+read out of an exit status the server chose for itself, and the shell's job
+table, which notices an exit at its own pace and is what once let an immediate
+exit be called a timeout, is never asked.
+
+Being separate, the two observations are never ordered against each other, and
+the helper never asks which arrived first. It collects them until a display is
+named or the bound expires, then chooses from the set by one fixed precedence:
+a named display outranks everything, so a server that names a display and exits
+at once is followed rather than refused for never reporting; an exit is a more
+specific answer than an unusable report; and the bound is what is left when
+nothing was seen at all. An unusable report is therefore settled at the bound
+rather than at once, because a server on its way out has until then to be
+reaped and named as the exit it is. A server that exits before reporting is
+never reported as a timeout, whether its channel closed behind it or is still
+held open by something that inherited it, and one that stays alive is never
+reported as an exit. The first two reasons quote the server log's tail; all
+three refuse with status `1`.
+
+Stopping belongs to the process that starts the server, and is asked for by
+signal. The reader is that process's own child, so one request reaches both.
+The handler stops what it started, waits for it, and ends that process, rather
+than recording the request for a later wait to notice: the reader can be held
+open by anything that inherited the report channel, so a record only a
+returning reader would look at may never be looked at. Ending there is also
+what keeps a stopped server out of the outcomes, since every outcome line is
+written by a process that was not asked to stop — and a report channel the
+helper's own cleanup closed is never reported as the server closing it. It
+stops only what its job table still lists as running, and the helper's own
+cleanup does the same for what it started: a job still listed as running has
+not been reaped, so that number is still that process's own, while a number
+kept in a variable or a file may by then name a process the helper never
+started. Waiting for the server by name is the one exception and is exact for
+the opposite reason: a process id cannot be reused before it is reaped, and the
+only thing that can reap that one is that wait. Nothing in any of this is a
+diagnosis. A signal the helper can catch
+— `TERM`, `INT`, or `HUP` — ends it through that cleanup and reports which
+signal it was, so a
+signal arriving while it waits for the startup report leaves neither a running
+server nor a scratch directory behind; it exits `143`, `130`, or `129`.
+
+A missing server or window manager, each of those three startup outcomes, a
+server that does not answer, and a window manager that exits or never
 takes the display each end the helper with status `1` before the command
 starts, so the consent reaches nothing and no real desktop is ever authorized
 by a failed isolation. The group then writes no receipt and the job fails, and
