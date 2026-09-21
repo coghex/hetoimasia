@@ -38,6 +38,7 @@ import Control.Exception
   , throwTo
   , try
   )
+import Control.Exception (finally)
 import Control.Monad (forM_, unless, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
@@ -52,10 +53,14 @@ import Hetoimasia.Foundation.Time
   , MonotonicSource
   , scriptedSource
   )
-import Hetoimasia.Foundation.Worker (pollCompletion, requestCancel)
+import qualified Hetoimasia.Foundation.Worker as Worker
+import Hetoimasia.Foundation.Worker (requestCancel)
 import Hetoimasia.GLFW.Command
-  ( SubmitResult (SubmitAccepted)
+  ( CommandResult (ObservationPublished)
+  , Disposition (Performed)
+  , SubmitResult (SubmitAccepted)
   , observeWindowCommand
+  , pollCompletion
   , submitWindowCommand
   )
 import Hetoimasia.GLFW.Internal.Seam
@@ -171,6 +176,12 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testUnverifiedDestructionRetains)
     it "refuses every publication into the handoff once the owner has quiesced"
       (boundedExample testPublicationsClosedAtExit)
+    it "refuses every one of them as soon as the owner's own run has failed"
+      (boundedExample testPublicationsClosedOnFailure)
+    it "reports a whole-owner retirement that failed even though the destruction after it did not"
+      (boundedExample testDrainFailureSurfaces)
+    it "forgets the acknowledgement of a handover that rolled itself safely back"
+      (boundedExample testAbandonedAcknowledgementForgotten)
 
   describe "the owner's GLFW discipline" $
     it "makes no GLFW call of its own: every native call from its thread is the authorized wake"
@@ -518,6 +529,15 @@ handedOver host owner window =
     TargetHandedOver service → pure service
     other → unexpected ("the target was not handed over: " <> show other)
 
+-- | Every fact one terminal record established, published or still owed.
+--
+-- A record is written before its facts are offered to the transport, so which
+-- side of the split a fact is on at the instant an example reads it is a
+-- race. That they are all on one side or the other is not: it is exactly what
+-- the record retaining them means.
+accountedFor ∷ TerminalRecord → [RetirementFact]
+accountedFor record = terminalPublished record <> terminalOwed record
+
 -- | Wait until the owner has recorded a terminal record for this target.
 awaitTerminal ∷ GraphicsOwner Scene → GraphicsService → IO TerminalRecord
 awaitTerminal owner service = atomically $ do
@@ -657,7 +677,7 @@ testPartialConstruction = do
     pumpUntilRetired host _control
     pure (standing, record, retirements)
   standing `shouldBe` TargetUnusable True
-  terminalPublished record `shouldBe` allRetirementFacts
+  accountedFor record `shouldBe` allRetirementFacts
   map retiringConstructed retirements `shouldBe` [False]
 
 -- | A construction whose failure the backend did not verify a rollback for
@@ -694,7 +714,7 @@ testCancelledConstruction = do
   -- whatever the interrupted construction left, and retired that.
   readTVarIO observedStanding `shouldReturn` Just (TargetUnusable True)
   record ← readTVarIO observedRecord
-  fmap terminalPublished record `shouldBe` Just allRetirementFacts
+  fmap accountedFor record `shouldBe` Just allRetirementFacts
   retirements ← readTVarIO (fakeRetirements (rigFake rig))
   map retiringConstructed retirements `shouldBe` [False]
 
@@ -718,7 +738,7 @@ testVerifiedRollback = do
   -- Nothing left for the owner to own, so nothing for it to retire.
   standing `shouldBe` TargetUnusable False
   terminalEvidence record `shouldBe` Text.pack "rolled back"
-  terminalPublished record `shouldBe` allRetirementFacts
+  accountedFor record `shouldBe` allRetirementFacts
   retirements `shouldBe` []
 
 -- ---------------------------------------------------------------------------
@@ -747,22 +767,36 @@ testBlockedOwner ∷ IO ()
 testBlockedOwner = do
   rig ← newRig
   gate ← newTVarIO False
+  blocked ← newTVarIO False
   entered ← newEmptyMVar
   script (fakeStep (rigFake rig)) $ \_ → do
+    atomically (writeTVar blocked True)
     putMVar entered ()
     atomically (readTVar gate >>= check)
+    atomically (writeTVar blocked False)
     pure noStepWork
-  submitted ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+  settled ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
     window ← theWindow host
     _ ← handedOver host owner window
     takeMVar entered
-    -- The owner is inside its step. The main thread's own port still admits,
-    -- and its own turn still executes.
+    -- The owner is inside its step and stays there. The main thread's own
+    -- port still admits, its own turn still executes, and the command really
+    -- completes — all before anything releases the owner.
     admitted ← submitWindowCommand (hostCommandPort host) [] (observeWindowCommand window)
+    ticket ← case admitted of
+      SubmitAccepted ticket → pure ticket
+      other → unexpected ("the command was not admitted: " <> show other)
+    pumpUntil host control "the command's completion" $
+      isJust <$> atomically (pollCompletion ticket)
+    settled ← atomically (pollCompletion ticket)
+    -- Only now, so nothing above could have been served by an owner that had
+    -- already left its step.
+    stepping ← atomically (readTVar blocked)
+    stepping `shouldBe` True
     atomically (writeTVar gate True)
-    pure admitted
-  submitted `shouldSatisfy` \case
-    SubmitAccepted _ → True
+    pure settled
+  settled `shouldSatisfy` \case
+    Just (Performed (ObservationPublished {})) → True
     _ → False
 
 -- | The owner's rounds do not depend on the main loop waking it.
@@ -987,7 +1021,7 @@ testIndividualRelease = do
           -- released; the other one is untouched and the owner is still live.
           pumpUntil host _control "one retired attachment" $
             (== 1) . length <$> atomically (hostPendingAttachments host)
-          settled ← atomically (pollCompletion (graphicsOwnerWorker owner))
+          settled ← atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
           records ← atomically (readTargetTerminalsNow owner)
           pending ← atomically (windowGraphicsStatus host second)
           pure (isNothing settled, Map.keys records, pending)
@@ -1107,33 +1141,40 @@ testEarlyFatalWhileRetiring ∷ IO ()
 testEarlyFatalWhileRetiring = do
   rig ← newRig
   release ← newTVarIO False
+  failing ← newTVarIO False
   retiring ← newEmptyMVar
-  -- The owner fails after it has started, and its whole-owner retirement is
-  -- deliberately held open while the application checkpoints.
-  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
+  -- The step fails only once the example says so, so the sentinel is
+  -- certainly registered before the failure it must deliver exists.
+  script (fakeStep (rigFake rig)) $ \_ →
+    readTVarIO failing >>= \doomed →
+      if doomed then throwIO (Scripted (Text.pack "fatal step")) else pure noStepWork
+  -- Its whole-owner retirement is held open across the checkpoint below.
   script (fakeRetireOwner (rigFake rig)) $ \_ → do
     putMVar retiring ()
     atomically (readTVar release >>= check)
     pure (ownerRetired (Text.pack "retired after the checkpoint"))
-  (raised, phaseAtCheckpoint) ← do
-    observedPhase ← newTVarIO OwnerStarting
-    (caught, _) ← caughtAs @Scripted $
-      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner control → do
+  observedPhase ← newTVarIO OwnerStarting
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner control →
+      -- However this body leaves, the held retirement is released, so a path
+      -- the example did not intend fails it rather than hanging it.
+      flip finally (atomically (writeTVar release True)) $ do
         started ← superviseGraphicsOwner control owner
         case started of
           WorkerStarted _ → pure ()
           other → unexpected ("the sentinel did not start: " <> describeStart other)
+        atomically (writeTVar failing True)
+        -- Immediate demand wakes the idle owner into the step that fails.
+        demand ← prepare (OwnerDemand True Nothing)
+        _ ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
         takeMVar retiring
         status ← atomically (readOwnerStatusNow owner)
         atomically (writeTVar observedPhase (statusPhase status))
         -- Retirement is deliberately unfinished, and the checkpoint still
-        -- raises. Released here so the exit can complete afterwards.
-        _ ← forkIO (atomically (writeTVar release True))
+        -- raises.
         checkRuntime control
-    phase ← readTVarIO observedPhase
-    pure (caught, phase)
   raised `shouldBe` Scripted (Text.pack "fatal step")
-  phaseAtCheckpoint `shouldBe` OwnerRetiring
+  readTVarIO observedPhase `shouldReturn` OwnerRetiring
 
 describeStart ∷ SupervisedStart () → String
 describeStart = \case
@@ -1219,6 +1260,11 @@ testRefusedNoticeRetained = do
   (record, admissions) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
     window ← theWindow host
     first ← handedOver host owner window
+    -- Captured before the retirement below, because the owner forgets an
+    -- acknowledgement as soon as its attachment has validated its facts.
+    stale ←
+      atomically (ownerTargetAcknowledgement owner (graphicsAttachment first))
+        >>= maybe (unexpected "the first incarnation kept no acknowledgement") pure
     _ ← releaseGraphicsTarget host owner first
     _ ← awaitTerminal owner first
     pumpUntilRetired host _control
@@ -1227,9 +1273,6 @@ testRefusedNoticeRetained = do
     -- distinct value, so none coalesces; each will be refused by the model
     -- when the owner thread folds it, and none establishes anything.
     publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-    stale ←
-      atomically (ownerTargetAcknowledgement owner (graphicsAttachment first))
-        >>= maybe (unexpected "the first incarnation kept no acknowledgement") pure
     admissions ← mapM (offer publisher (graphicsAttachment first) stale) allRetirementFacts
     -- The inbox is now full and nothing on the main thread is folding it, so
     -- every fact the owner establishes for the live incarnation is refused.
@@ -1517,14 +1560,84 @@ testPublicationsClosedAtExit = do
     _ ← releaseGraphicsTarget host owner service
     _ ← awaitTerminal owner service
     pumpUntilRetired host control
-    putMVar escaped (ownerHandoff owner, graphicsAttachment service)
-  (handoff, target) ← takeMVar escaped
+    putMVar escaped (ownerHandoff owner)
+  handoff ← takeMVar escaped
   demand ← prepare (OwnerDemand True Nothing)
   scene ← prepare (Scene 1)
-  event ← prepare (TargetReleased target)
   atomically (publishOwnerDemand handoff demand) `shouldReturn` PublicationClosed
   atomically (publishOwnerScene handoff scene) `shouldReturn` ScenePublication PublicationClosed
-  atomically (offerTargetEvent handoff event) `shouldReturn` EventPortClosed
+  atomically (targetEventsOpen handoff) `shouldReturn` False
+
+-- | An owner whose run has failed refuses every publication, not only the
+-- lifetime port: it reads none of them again.
+testPublicationsClosedOnFailure ∷ IO ()
+testPublicationsClosedOnFailure = do
+  rig ← newRig
+  escaped ← newEmptyMVar
+  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+      atomically (readOwnerFailure owner >>= check . isJust)
+      -- The owner has failed and is retiring; the host has not quiesced and
+      -- the run has not ended. Every endpoint must already refuse.
+      let handoff = ownerHandoff owner
+      demand ← prepare (OwnerDemand True Nothing)
+      scene ← prepare (Scene 2)
+      atomically (publishOwnerDemand handoff demand) `shouldReturn` PublicationClosed
+      atomically (publishOwnerScene handoff scene) `shouldReturn` ScenePublication PublicationClosed
+      atomically (targetEventsOpen handoff) `shouldReturn` False
+      putMVar escaped ()
+  raised `shouldBe` Scripted (Text.pack "fatal step")
+  takeMVar escaped
+
+-- | A whole-owner retirement that failed is reported even when the
+-- destruction after it succeeded.
+--
+-- Nothing else records it: the destruction evidence exists, so the exit's
+-- wait is satisfied and writes no diagnostic, and the failure was the
+-- /drain's/ rather than the run's, so no latch holds it. The joined worker's
+-- own outcome is the only place it lives.
+testDrainFailureSurfaces ∷ IO ()
+testDrainFailureSurfaces = do
+  rig ← newRig
+  script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control →
+      void (awaitRound owner 0)
+  raised `shouldBe` Scripted (Text.pack "retire owner")
+  terminal ← readTVarIO (rigJournal rig)
+  -- The destruction after it still ran, and still established its evidence,
+  -- so nothing was retained for want of it.
+  terminal `shouldContain` [OwnerDestruction]
+
+-- | A handover interrupted after its protocol recorded an acknowledgement,
+-- whose attach then rolled itself safely back, leaves nothing behind.
+--
+-- Twenty of them: if the acknowledgement of even one survived, the owner
+-- would be holding a cell for an attachment that no longer exists and that no
+-- terminal record will ever name.
+testAbandonedAcknowledgementForgotten ∷ IO ()
+testAbandonedAcknowledgementForgotten = do
+  rig ← newRig
+  acknowledged ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    forM_ [1 ∷ Int .. 20] $ \_ → do
+      settled ← newEmptyMVar
+      handing ← forkFinally (handOverGraphicsTarget host owner window) (putMVar settled)
+      throwTo handing ThreadKilled
+      outcome ← takeMVar settled
+      case outcome ∷ Either SomeException GraphicsHandover of
+        Right (TargetHandedOver service) → void (releaseGraphicsTarget host owner service)
+        _ →
+          atomically (windowGraphicsService host window)
+            >>= mapM_ (void . releaseGraphicsTarget host owner)
+      pumpUntilRetired host control
+    -- Nothing is attached, so nothing the owner holds is owed an
+    -- acknowledgement; the round it takes for that clears every abandoned one.
+    pumpUntil host control "the forgotten acknowledgements" $
+      null <$> atomically (readOwnerAcknowledged owner)
+    atomically (readOwnerAcknowledged owner)
+  acknowledged `shouldBe` []
 
 -- ---------------------------------------------------------------------------
 -- The extent seam

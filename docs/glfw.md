@@ -3656,7 +3656,18 @@ retirement nothing was going to perform.
 Quiescence closes all of it together — the port, the demand and scene
 snapshots, and every observation slot — so a publisher holding an escaped
 endpoint after the owner has ended is told its publication was refused rather
-than left to believe it arrived.
+than left to believe it arrived. A failure that ends the owner's run closes
+exactly the same set, and for the same reason: an owner that has stopped reads
+none of them again. `targetEventsOpen` reports whether the lifetime port still
+admits, which is a read and takes nothing; spending the port's room is the
+reservation's, and no caller is given a way to spend it without one.
+
+A release whose event could not be delivered says so rather than reporting
+success: `ReleaseOwnerClosed` names whether the owner still holds the target,
+and so whether its own drain will produce that target's evidence or the facts
+were certified on the spot because there was nothing of the owner's to retire.
+A detach that raises gives the held room back instead of spending it on an
+event there is now nothing to send.
 
 Every snapshot holds one value, so a publisher never waits and a slow reader
 grows nothing. A target's observations carry their own revision, which must
@@ -3768,6 +3779,16 @@ A whole-session exit runs in this order:
    only then, the boundary joins the owner;
 6. the host's windows, session and parents unwind.
 
+Step 5's join absorbs cancellation until the group has drained, for the same
+reason step 4's wait does: escaping it would let the host unwind with the
+owner still live. It also reads the report it gets back, because the joined
+worker's own outcome is the only place a failure of its protected drain is
+recorded — a `graphicsRetireOwner` that failed while the destruction after it
+succeeded leaves no latch and no missing evidence, and an exit that discarded
+the report would call that run a success. A cancellation somebody asked for is
+not reported: the owner's drain deferred it, finished every operation it owed,
+and re-raised it in order, which is the contract kept rather than broken.
+
 Step 4's wait returns for the evidence and for nothing else. Not for the
 owner's run ending, not for its worker becoming terminal, and not for an empty
 target set: none of those establishes that the owner's shared state was
@@ -3875,7 +3896,10 @@ behind; an idle owner woken by a published demand and by a newer scene; a
 required failure closing admission and entering retirement before the
 checkpoint; a failed whole-owner destruction retaining the windows and the
 session until independent evidence arrives, with the one diagnostic written
-once; and every publication into the handoff refused after quiescence.
+once; every publication into the handoff refused after quiescence and again as soon
+as the owner's run has failed; a whole-owner retirement that failed reported
+even though the destruction after it did not; and twenty cancelled handovers
+leaving no acknowledgement behind.
 
 The opacity examples compile external clients that reach for the owner's
 implementation and its handoff in the private sublibrary, and that forge the
@@ -4380,7 +4404,7 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
 | Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
 | Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record, and the geometry — the last coherent framebuffer observation and reported bounds — leaves with its target |
-| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts | Kept while a fact may still be owed for a target whose own state is gone, and forgotten with that target's record |
+| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | Kept while a fact may still be owed for a target whose own state is gone; forgotten with that target's record, and forgotten on its own for an attachment a cancelled handover rolled safely back, which leaves no record to prune it by |
 | Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
 

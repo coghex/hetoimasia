@@ -87,6 +87,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , offerTargetEvent
   , takeTargetEvents
   , closeTargetEvents
+  , targetEventsOpen
   , pendingTargetEvents
   , closeOwnerPublications
 
@@ -408,6 +409,10 @@ data OwnerHandoff scene = OwnerHandoff
   , handoffStatus ∷ !(TVar OwnerStatus)
   , handoffTargetTerminals ∷ !(TVar (Map AttachmentId TerminalRecord))
   , handoffOwnerTerminal ∷ !(TVar OwnerTerminal)
+  , handoffAdmitting ∷ !(TVar Bool)
+    -- ^ Whether the lifetime port still admits. The channel's own phase is not
+    -- readable without taking from it, and a reader that had to take would be
+    -- a reader that could lose an event.
   }
 
 -- | Build the handoff state for one owner over a host's window limit.
@@ -428,6 +433,7 @@ newOwnerHandoff limit capacity scene = do
     <*> newTVarIO initialOwnerStatus
     <*> newTVarIO Map.empty
     <*> newTVarIO noOwnerTerminal
+    <*> newTVarIO True
 
 -- | The most observation slots the handoff holds at once.
 handoffLimit ∷ OwnerHandoff scene → Int
@@ -460,7 +466,14 @@ takeTargetEvents handoff = go []
 
 -- | End the port's admission. Queued events stay for the owner to drain.
 closeTargetEvents ∷ OwnerHandoff scene → STM ()
-closeTargetEvents = closeChannel . handoffEvents
+closeTargetEvents handoff = do
+  closeChannel (handoffEvents handoff)
+  writeTVar (handoffAdmitting handoff) False
+
+-- | Whether the lifetime port still admits an event, readable from any thread
+-- and taking nothing.
+targetEventsOpen ∷ OwnerHandoff scene → STM Bool
+targetEventsOpen = readTVar . handoffAdmitting
 
 -- | End every publication into the handoff: the lifetime port, the demand
 -- snapshot, the scene snapshot, and each target's observation slot.

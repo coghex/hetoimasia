@@ -208,7 +208,12 @@ import Hetoimasia.Foundation.Time
   , remainingUntil
   )
 import Hetoimasia.Foundation.Worker
-  ( StopToken
+  ( Completion (completionExit, completionResult)
+  , GroupReport (..)
+  , Requested (CancelWasRequested)
+  , Result (..)
+  , RunExit (RunExited)
+  , StopToken
   , Worker
   , WorkerGroup
   , awaitStartup
@@ -708,7 +713,10 @@ awaitOwnerRound owner seen = do
 -- the same path a command admission takes. Everything else GLFW owns stays on
 -- the main thread.
 wakeGraphicsHost ∷ GraphicsOwner scene → IO ()
-wakeGraphicsHost owner = do
+wakeGraphicsHost owner = mask_ $ do
+  -- Masked as 'publishCompletion' masks its own: an obligation registered and
+  -- then not discharged is one the protected exit waits for forever, and a
+  -- cancellation delivered between the two would leave exactly that.
   atomically (registerNotification (ownerNotifier owner))
   void (dischargeNotification (ownerNotifier owner))
 
@@ -763,8 +771,12 @@ instance Exception OwnerHandoverUnsettled
 
 -- | Build the handoff, start the worker, and answer the handle.
 startGraphicsOwner
-  ∷ WorkerGroup → WindowHost → GraphicsOwnerConfig scene → IO (GraphicsOwner scene)
-startGraphicsOwner group host config = do
+  ∷ WorkerGroup
+  → WindowHost
+  → GraphicsOwnerConfig scene
+  → (GraphicsOwner scene → IO ())
+  → IO (GraphicsOwner scene)
+startGraphicsOwner group host config publish = do
   publisher ← maybe (throwIO OwnerHostUnprotected) pure (hostGraphicsPublisher host)
   handoff ←
     newOwnerHandoff
@@ -810,8 +822,16 @@ startGraphicsOwner group host config = do
           -- requires and a 'Scoped' startup release could not provide.
           (\_ → pure ())
           (\token () → readIORef built >>= maybe (throwIO OwnerHandleMissing) (`runOwnerAction` token))
-  outcome ←
-    startWorkerWith group definition (\worker → writeIORef built (Just (partial worker))) awaitStartup
+  -- The preparation step runs under the start's own mask, after the fork and
+  -- before the gate that lets the child run any of its definition. Publishing
+  -- the handle there — to the run action's own cell and to whatever composed
+  -- this owner — is what leaves no instant at which a live owner exists that
+  -- the protected exit cannot see.
+  let publishHandle worker = do
+        let owner = partial worker
+        writeIORef built (Just owner)
+        publish owner
+  outcome ← startWorkerWith group definition publishHandle awaitStartup
   case outcome of
     Left _ → throwIO OwnerHostUnprotected
     Right (worker, _) → pure (partial worker)
@@ -846,8 +866,10 @@ latchFailure owner = \case
     unless (isAsynchronous exception) $ do
       held ← readTVar (ownerLatch owner)
       when (isNothing held) (writeTVar (ownerLatch owner) (Just failure))
-    -- No further target may be handed over to an owner that has ended.
-    closeTargetEvents (ownerHandoff' owner)
+    -- Every publication into the handoff, not only the lifetime port: an
+    -- owner that has ended reads none of them again, and a publisher told its
+    -- demand or its scene was accepted by one would be told a falsehood.
+    closeOwnerPublications (ownerHandoff' owner)
 
 -- ---------------------------------------------------------------------------
 -- The run loop
@@ -1132,15 +1154,32 @@ forgetValidatedTargets owner = atomically $ do
     modifyTVar' (ownerAcknowledged owner) (Map.delete target)
     modifyTVar' (ownerGeometryCells owner) (Map.delete target)
 
--- | The attachments whose cells the owner may now forget: it holds a terminal
--- record for each, holds the target itself no longer, and the host's model no
--- longer has the attachment pending.
+-- | The attachments whose cells the owner may now forget.
+--
+-- Two kinds qualify, and both by the same test: the owner holds the target no
+-- longer and the host's own model no longer has the attachment pending.
+--
+-- One is a target the owner retired and whose record's facts the attachment
+-- has since validated. The other never reached the owner at all — a handover
+-- interrupted after this protocol recorded its acknowledgement and before the
+-- owner was told, whose attach then settled with a safe rollback. It leaves
+-- an acknowledgement and no record, so waiting for a record to prune it would
+-- keep one per cancelled attempt for the host's whole life.
+--
+-- An attachment between its registration and its announcement is /pending/,
+-- so it is never mistaken for either.
 validatedTargets ∷ GraphicsOwner scene → STM [AttachmentId]
 validatedTargets owner = do
   records ← Map.keys <$> targetTerminals (ownerHandoff' owner)
+  acknowledged ← Map.keys <$> readTVar (ownerAcknowledged owner)
   held ← readTVar (ownerTargets owner)
   pending ← ownerPending owner
-  pure [target | target ← records, not (Map.member target held), target `notElem` pending]
+  pure
+    [ target
+    | target ← records <> filter (`notElem` records) acknowledged
+    , not (Map.member target held)
+    , target `notElem` pending
+    ]
 
 -- | Wait for the next thing worth a round: a stop, a lifetime event, a fresher
 -- observation, newly published demand or a newer scene, or the owner's own
@@ -1391,8 +1430,7 @@ withGraphicsOwnerHostOver logger sessionScope config ownerConfig use = do
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
     withProtectedWindowHostOver exit logger sessionScope config $ \host → do
-      owner ← startGraphicsOwner group host ownerConfig
-      writeIORef pending (Just owner)
+      owner ← startGraphicsOwner group host ownerConfig (writeIORef pending . Just)
       use host owner
 
 -- | 'Hetoimasia.Runtime.GLFW.runProtectedWindowApplication' over a host that
@@ -1473,15 +1511,60 @@ finishOwnerExit restore logger host owner = do
   awaited ← awaitOwnerDestruction restore logger host owner
   -- The join, after verified destruction and before the host releases a single
   -- window. It is reached only once the evidence exists, so it can never be
-  -- what lets an unverified owner's parents go.
-  _ ← closeWorkerGroup (ownerGroup owner)
+  -- what lets an unverified owner's parents go — and it absorbs cancellation,
+  -- because escaping it would let the host unwind with the owner still live,
+  -- which is the very thing the wait above refused to do.
+  (report, interrupted) ← joinAbsorbing (ownerGroup owner) []
   latched ← readTVarIO (ownerLatch owner)
   -- Everything this exit found, in the order it found it: what the wait
-  -- absorbed, then the owner's own latched failure. Each is raised only now,
-  -- after the join.
-  case awaited <> maybe [] pure latched of
+  -- absorbed, what the owner's own drain failed with, the latched failure,
+  -- and last the cancellations the join absorbed. Each is raised only now.
+  case awaited <> drainFailuresOf report <> maybe [] pure latched <> interrupted of
     [] → pure ()
     primary : retained → raiseRetainingOwner primary retained
+
+-- | Join the owner's group, absorbing cancellation until it has drained.
+--
+-- 'closeWorkerGroup' is idempotent and answers the same report once the group
+-- has drained, so a cancellation delivered during the wait is kept and the
+-- join is entered again rather than abandoned.
+joinAbsorbing
+  ∷ WorkerGroup
+  → [ExceptionWithContext SomeException]
+  → IO (Maybe GroupReport, [ExceptionWithContext SomeException])
+joinAbsorbing group found =
+  tryWithContext (closeWorkerGroup group) >>= \case
+    Right report → pure (Just report, found)
+    Left caught@(ExceptionWithContext _ (failure ∷ SomeException))
+      | isAsynchronous failure → joinAbsorbing group (found <> [caught])
+      | otherwise → pure (Nothing, found <> [caught])
+
+-- | What the joined owner's own run and drain failed with.
+--
+-- The worker's outcome is the only place a failure of its protected drain is
+-- recorded — a 'graphicsRetireOwner' that failed while the destruction after
+-- it succeeded leaves no latch and no missing evidence — so a host exit that
+-- discarded this report would call that run a success.
+drainFailuresOf ∷ Maybe GroupReport → [ExceptionWithContext SomeException]
+drainFailuresOf Nothing = []
+drainFailuresOf (Just report) =
+  [ failure
+  | summary ←
+      reportExitedBeforeClosing report <> reportDrained report <> reportObservedFailures report
+  , failure ← case completionResult summary of
+      Failed caught → [caught]
+      -- A cancellation somebody asked for is not a failure to report: the
+      -- owner's own drain already deferred it, finished every operation it
+      -- owed, and re-raised it in order, which is the contract being kept
+      -- rather than broken. One nobody asked for is a different matter, and
+      -- is reported like any other outcome.
+      Cancelled caught | not (requestedCancel (completionExit summary)) → [caught]
+      _ → []
+  ]
+  where
+    requestedCancel = \case
+      RunExited _ CancelWasRequested → True
+      _ → False
 
 -- | Service the host's bounded native housekeeping until the owner's injected
 -- destruction has answered.
@@ -1702,11 +1785,17 @@ announceReserved owner target = do
 retireUnannounced ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → GraphicsService → IO ()
 retireUnannounced host owner service = do
   answered ← detachWindowGraphics host service
-  acknowledgement ← atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-  when (answered == DetachBegun) $
-    for_ acknowledgement $ \held →
-      forM_ allRetirementFacts (void . certifyGraphicsFact host held)
-  atomically (modifyTVar' (ownerAcknowledged owner) (Map.delete (graphicsAttachment service)))
+  when (answered == DetachBegun) (retireDetached host owner service)
+
+-- | Certify the facts of an already-detaching attachment the owner never
+-- received, on the owner thread.
+retireDetached ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → GraphicsService → IO ()
+retireDetached host owner service = do
+  acknowledgement ← atomically (ownerTargetAcknowledgement owner target)
+  for_ acknowledgement $ \held → forM_ allRetirementFacts (void . certifyGraphicsFact host held)
+  atomically (modifyTVar' (ownerAcknowledged owner) (Map.delete target))
+  where
+    target = graphicsAttachment service
 
 -- | The attachment this window's slot holds that the owner has not been told
 -- about, if there is one.
@@ -1749,6 +1838,12 @@ data ReleaseAnswer
     -- ^ The attachment is retiring and the owner has been told. Its window is
     -- released once the owner's own retirement evidence has been validated;
     -- the owner and every other target stay live.
+  | ReleaseOwnerClosed !Bool
+    -- ^ The attachment is retiring, and the owner's admission had ended before
+    -- it could be told. The flag says whether the owner still holds the
+    -- target, and so whether its own drain will produce that target's
+    -- evidence; when it does not, the facts were certified here because there
+    -- was nothing of the owner's to retire.
   | ReleaseNoOp !DetachAnswer
   | ReleasePortFull
     -- ^ The owner's port could not take the event, so nothing was detached.
@@ -1768,14 +1863,31 @@ releaseGraphicsTarget host owner service = mask_ $ do
   if not reserved
     then pure ReleasePortFull
     else
-      detachWindowGraphics host service >>= \case
-        DetachBegun → do
+      -- A detach that raises gives the held room back rather than spending it
+      -- on an event there is now nothing to send.
+      tryWithContext (detachWindowGraphics host service) >>= \case
+        Left (failure ∷ ExceptionWithContext SomeException) → do
+          atomically (releaseEvent owner)
+          rethrowIO failure
+        Right DetachBegun → do
           payload ← prepare (TargetReleased (graphicsAttachment service))
-          _ ← atomically (sendReservedEvent owner payload)
-          pure ReleaseBegun
-        other → do
+          admitted ← atomically (sendReservedEvent owner payload)
+          if admitted == EventAdmitted
+            then pure ReleaseBegun
+            else do
+              -- The retirement has begun and the owner was not told. If it
+              -- still holds the target, its own drain retires it and produces
+              -- the evidence; if it never received it, there is nothing of
+              -- the owner's to retire and the facts are certified here, for
+              -- the same reason an unannounced handover's are.
+              held ← atomically (Map.member target <$> readTVar (ownerTargets owner))
+              unless held (retireDetached host owner service)
+              pure (ReleaseOwnerClosed held)
+        Right other → do
           atomically (releaseEvent owner)
           pure (ReleaseNoOp other)
+  where
+    target = graphicsAttachment service
 
 -- ---------------------------------------------------------------------------
 -- Port reservations
