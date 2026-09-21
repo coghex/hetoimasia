@@ -1,0 +1,49 @@
+Wayland: Fix segfault when there is no seat
+
+Backport of upstream GLFW 3573c5a890b4878bb7357f71daaf49260c6fef15, authored
+2024-03-25, after the 3.4 release this recipe pins and before any release that
+carries it. Upstream issue glfw/glfw#2517.
+
+_glfwInitWayland read wl_seat_get_version(_glfw.wl.seat) unconditionally, but a
+compositor advertises no wl_seat when it has no input devices, leaving that
+pointer NULL and the read a NULL dereference. The headless Weston the display
+helper starts is exactly such a compositor, so every session this project
+enters on it died inside glfwInit before the model could observe anything.
+
+The fix is upstream's: create the key-repeat timer where the seat is bound and
+therefore known non-NULL, rather than after the registry roundtrips.
+
+Applied to the pinned source at build time; nothing else in the archive is
+changed, and removing this file changes the recipe fingerprint, so a prefix or
+image built without it is never mistaken for one built with it.
+
+--- a/src/wl_init.c
++++ b/src/wl_init.c
+@@ -136,7 +136,14 @@
+             _glfw.wl.seat =
+                 wl_registry_bind(registry, name, &wl_seat_interface,
+                                  _glfw_min(4, version));
+             _glfwAddSeatListenerWayland(_glfw.wl.seat);
++
++            if (wl_seat_get_version(_glfw.wl.seat) >=
++                WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
++            {
++                _glfw.wl.keyRepeatTimerfd =
++                    timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
++            }
+         }
+     }
+     else if (strcmp(interface, "wl_data_device_manager") == 0)
+@@ -853,12 +860,6 @@
+         }
+     }
+ 
+-    if (wl_seat_get_version(_glfw.wl.seat) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+-    {
+-        _glfw.wl.keyRepeatTimerfd =
+-            timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+-    }
+-
+     if (!_glfw.wl.wmBase)
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR,

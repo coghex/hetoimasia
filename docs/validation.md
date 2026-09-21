@@ -123,7 +123,7 @@ identifier lists are sorted.
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
-| `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=…` | yes | no | any |
+| `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -260,8 +260,10 @@ and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
 part of every Linux candidate's identity.
 
-`test.glfw-wayland` is the same suite's Wayland backend-selection example,
-selected by name so that it is the only example the group runs. It declares the
+`test.glfw-wayland` is the same suite's `on an isolated Wayland session` group,
+selected by that group's own path so it is the only work the group runs: the
+backend a requested Wayland session selected, and both X11 test-check drivers
+answering unavailable there without provoking a GLFW report. It declares the
 same inputs and the same `display` runner class as `test.glfw-native`, but it is
 **optional**: it runs only when a pull request requests it, and the
 [display worker](#the-display-worker) runs it under
@@ -1549,7 +1551,8 @@ pulls no image.
 
 `tools/native/native.py`, with the pin in `tools/native/glfw.pin`, builds the
 same GLFW for a local macOS prefix and for the image. It fetches the pinned
-upstream archive, refuses it unless its SHA-256 matches, and builds only a
+upstream archive, refuses it unless its SHA-256 matches, applies every patch in
+`tools/native/patches/` to the unpacked source, and builds only a
 static, position-independent `libglfw3.a`, with upstream examples, tests, and
 documentation disabled, both X11 and Wayland on Linux, and Cocoa on macOS, into
 a private prefix whose library directory is `lib`. The two Linux backends are
@@ -1565,7 +1568,7 @@ macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — the `backends`
 the archive actually compiles, read from its own defined symbols rather than
 restated from the options, so a Linux prefix records `["Wayland", "X11"]` and a
 macOS one `["Cocoa"]` — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
-effective CMake options, and the exact value or absence of every variable CMake
+effective CMake options, the `patches` applied with each one's SHA-256, and the exact value or absence of every variable CMake
 or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
 `CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
 macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
@@ -1580,6 +1583,32 @@ SHA-256.
 | `link-check [--prefix P]` | Link a consumer that calls `glfwGetVersionString` with only the recorded flags and no library-path variables, require it to define the symbol itself and depend on no shared GLFW, and run it. It needs no display. |
 | `toolchain [--prefix P]` | Check, then print `native-manifest=<hash>`. |
 | `identity`, `record`, `fingerprint` | Print this configuration's identity, write a manifest for an existing prefix, or print the recipe fingerprint. |
+
+#### Patches
+
+`tools/native/patches/` holds targeted patches applied to the pinned source,
+in the order their names sort, between unpacking and configuring. They exist
+for one situation: a defect fixed upstream after the release the pin names,
+which this project needs and will not take by moving the pin to an unreleased
+revision. Each is a plain unified diff applied with `git apply` at `-p1`, with
+no fuzz and no skipping — the source is the pinned archive, freshly unpacked,
+so a patch that no longer applies means the pin moved and the backport has to
+be reconsidered rather than worked around. A patch's own header states what it
+backports, from which upstream commit, and why.
+
+Every patch is part of the recipe's identity twice over. Its name and content
+are folded into the [recipe fingerprint](#the-recipe-fingerprint), so adding,
+changing, reordering or removing one changes the image tag and every cache key
+derived from it; and `patches` in the native identity names each one with its
+SHA-256, so `check` refuses a prefix built with a different set — or with none
+— and says which patch differs. A prefix, an image, or a cached build product
+from before a patch is therefore never mistaken for one built with it.
+
+Currently applied:
+
+| Patch | Upstream | Why |
+| --- | --- | --- |
+| `0001-wayland-fix-segfault-when-there-is-no-seat.patch` | `3573c5a8`, glfw/glfw#2517, after the pinned 3.4 | `_glfwInitWayland` dereferenced a NULL `wl_seat` when the compositor advertises none, so every session entered on the headless Weston `tools/display/wayland.sh` starts died inside `glfwInit`. Required for `test.glfw-wayland` to run at all. |
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe

@@ -49,6 +49,16 @@ PIN_FILE = os.path.join(RECIPE_DIRECTORY, "glfw.pin")
 # identically to the checkout it was copied from.
 RECIPE_FILES = ("glfw.pin", "native.py")
 
+# Targeted patches applied to the pinned source before it is configured, in the
+# order their names sort. They exist for defects the pin cannot avoid: a fix
+# that landed upstream after the pinned release, which this project needs and
+# will not carry by moving the pin. Every one of them is tracked here, is part
+# of the recipe fingerprint and of the native identity, and is named in the
+# manifest, so a prefix or image built with a different set of patches — or
+# with none — is refused rather than mistaken for this one.
+PATCHES_DIRECTORY = os.path.join(RECIPE_DIRECTORY, "patches")
+PATCH_SUFFIX = ".patch"
+
 MANIFEST_NAME = "hetoimasia-native-manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 
@@ -124,12 +134,44 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def patch_names() -> list[str]:
+    """Every tracked patch, in the order it is applied.
+
+    Sorted by name, so the order is the numeric prefix each file carries and
+    never the order a directory happens to list.
+    """
+    try:
+        names = os.listdir(PATCHES_DIRECTORY)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise NativeError(f"cannot read the patch directory {PATCHES_DIRECTORY}: {error}") from error
+    return sorted(name for name in names if name.endswith(PATCH_SUFFIX))
+
+
+def patch_identity() -> list[dict[str, str]]:
+    """What each patch is, by name and content, for the manifest and the check."""
+    return [
+        {"name": name, "sha256": sha256_file(os.path.join(PATCHES_DIRECTORY, name))} for name in patch_names()
+    ]
+
+
 def recipe_fingerprint() -> str:
     digest = hashlib.sha256()
     for name in RECIPE_FILES:
         with open(os.path.join(RECIPE_DIRECTORY, name), "rb") as handle:
             content = handle.read()
         digest.update(name.encode("utf-8") + b"\0" + hashlib.sha256(content).hexdigest().encode("ascii") + b"\n")
+    # Folded in under their directory-qualified names, so adding, changing,
+    # reordering or removing a patch changes the fingerprint and therefore the
+    # image tag, the cache keys, and every prefix built from it.
+    for name in patch_names():
+        digest.update(
+            ("patches/" + name).encode("utf-8")
+            + b"\0"
+            + sha256_file(os.path.join(PATCHES_DIRECTORY, name)).encode("ascii")
+            + b"\n"
+        )
     return digest.hexdigest()
 
 
@@ -251,6 +293,7 @@ def native_identity(target: str, pin: dict[str, str]) -> dict:
         "sdk": sdk,
         "deployment_target": deployment_target,
         "build_options": build_options(target, architecture, deployment_target, sysroot),
+        "patches": patch_identity(),
         "environment": ambient_environment(),
     }
 
@@ -540,6 +583,25 @@ def fetch_source(pin: dict[str, str], cache: str) -> str:
     return target
 
 
+def apply_patches(source: str) -> None:
+    """Apply every tracked patch to the unpacked source, in order.
+
+    A patch that does not apply ends the build. Nothing here tolerates fuzz or
+    skips a patch that is already applied: the source is the pinned archive,
+    freshly unpacked, so a patch that no longer fits means the pin moved and
+    the backport has to be reconsidered, not worked around.
+    """
+    names = patch_names()
+    if not names:
+        return
+    require_tool("git")
+    for name in names:
+        print(f"native: applying patches/{name}", flush=True)
+        # git apply reads a plain directory; the unpacked source is no
+        # repository and never becomes one.
+        run_step(["git", "apply", "--unsafe-paths", "-p1", os.path.join(PATCHES_DIRECTORY, name)], cwd=source)
+
+
 def build(prefix: str, target: str, source_cache: str) -> str:
     if target != host_platform():
         raise NativeError(f"the recipe builds for the host platform {host_platform()}, not {target}")
@@ -555,6 +617,7 @@ def build(prefix: str, target: str, source_cache: str) -> str:
         source = os.path.join(scratch, f"glfw-{pin['GLFW_VERSION']}")
         if not os.path.isdir(source):
             raise NativeError(f"{archive} does not unpack to glfw-{pin['GLFW_VERSION']}/", status=1)
+        apply_patches(source)
         # A fresh prefix every time: a rebuild must not inherit anything an
         # earlier configuration installed there.
         if os.path.lexists(prefix):

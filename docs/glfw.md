@@ -1276,7 +1276,13 @@ GLFW 3.4 answers `glfwGetX11Display` on another platform with
 `GLFW_PLATFORM_UNAVAILABLE` (`src/x11_window.c:3294-3297`) and the session
 would capture that report as a native failure. The answer is observable rather
 than a silent no-op: the close driver returns whether it delivered the request,
-and the size-limit reader returns `Nothing`.
+and the size-limit reader returns `Nothing`. On X11 the close driver reports
+delivery only when `XSendEvent` itself succeeded, so a send the server refused
+is never presented as a request that was made.
+
+[The native suite](#the-native-suite) proves both on a real Wayland session:
+each driver answers unavailable, and the session's asynchronous reports are
+empty afterwards, which is what shows neither reached for an X11 handle.
 
 What is unavailable is each helper, and nothing more. Window closure is GLFW's
 own on every backend and the close protocol above is unchanged; size
@@ -4317,13 +4323,17 @@ The native examples cover:
 - the platform's backend selected explicitly, on an isolated X11 display under
   Linux; pending instead on a run the isolated compositor authorized, which
   selects the other backend;
-- a requested Wayland session selecting Wayland, on the isolated compositor's
-  own socket, with `DISPLAY` unset. This is the one example `test.glfw-wayland`
-  selects. It is listed on every platform, so a dry run names it and the
-  catalog can ask for it anywhere, but it asserts only against a session the
-  isolated Wayland consent authorized: an X11 or Cocoa run reaches its body and
-  reports it pending rather than asserting Wayland against the session it
-  actually has;
+- under `on an isolated Wayland session`, the group `test.glfw-wayland`
+  selects: a requested Wayland session selecting Wayland, on the isolated
+  compositor's own socket with `DISPLAY` unset; and both test-check drivers
+  answering unavailable on that session — `requestCloseForCheck` `False`,
+  `sizeLimitsForCheck` `Nothing` — while `takeAsynchronousReports` returns no
+  report, which is the evidence that neither asked GLFW for the X11 handle it
+  would have refused. Both are listed on every platform, so a dry run names
+  them and the catalog can ask for them anywhere, but each asserts only against
+  a session the isolated Wayland consent authorized: an X11 or Cocoa run
+  reaches the body and reports it pending rather than asserting Wayland against
+  the session it actually has;
 - operations running on the bound process main thread that entered the session,
   never on the Hspec worker, and a single acquisition;
 - nested entry on the owner thread, entry from a bound worker and from an

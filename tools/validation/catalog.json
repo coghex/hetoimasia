@@ -270,14 +270,14 @@
     },
     {
       "id": "test.glfw-wayland",
-      "description": "The native suite's Wayland backend-selection example, on the isolated headless compositor tools/display/wayland.sh starts. Optional and requested by name: it selects only that one example, which asserts that a session requesting Wayland selected Wayland on the socket its consent authorized.",
+      "description": "The native suite's Wayland-only examples, on the isolated headless compositor tools/display/wayland.sh starts: that a session requesting Wayland selected Wayland on the socket its consent authorized, and that both X11 test-check drivers answer unavailable there without provoking a GLFW report. Optional and requested by name; the selector names that group and nothing else.",
       "command": [
         "cabal",
         "test",
         "glfw-native-tests",
         "--test-show-details=direct",
         "--test-option=--match",
-        "--test-option=/GLFW native/the shared session/selects the Wayland backend it requested, on the isolated compositor's own socket/"
+        "--test-option=/GLFW native/the shared session/on an isolated Wayland session/"
       ],
       "component": "hetoimasia-glfw:test:glfw-native-tests",
       "inputs": [
