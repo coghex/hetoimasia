@@ -1996,15 +1996,16 @@ withProtectedWindowHostWith hooks = withProtectedHostOver hooks noProtectedExit
 -- configuration names, exactly as 'withProtectedWindowHost' does.
 withProtectedWindowHostOver
   ∷ HasCallStack
-  ⇒ ProtectedExit
+  ⇒ HostHooks
+  → ProtectedExit
   → Logger
   → Maybe (Scoped Session)
   → HostConfig
   → (WindowHost → IO r)
   → IO r
-withProtectedWindowHostOver exit logger sessionScope config =
+withProtectedWindowHostOver hooks exit logger sessionScope config =
   withProtectedHostOver
-    noHostHooks
+    hooks
     exit
     logger
     (fromMaybe (allocSession (hostSessionConfig config)) sessionScope)

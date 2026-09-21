@@ -135,6 +135,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
     -- * The additive protected-host constructor
   , withGraphicsOwnerHost
   , withGraphicsOwnerHostIn
+  , withGraphicsOwnerHostWith
   , runGraphicsOwnerApplication
   , superviseGraphicsOwner
 
@@ -238,6 +239,8 @@ import Hetoimasia.Runtime.GLFW.Internal
   , GraphicsRefusal (..)
   , GraphicsService
   , HostConfig (..)
+  , HostHooks (..)
+  , noHostHooks
   , NoticeAdmission (..)
   , ProtectedExit (..)
   , RetirementEnvironment (..)
@@ -1449,6 +1452,25 @@ withGraphicsOwnerHostIn
   → IO r
 withGraphicsOwnerHostIn logger sessionScope = withGraphicsOwnerHostOver logger (Just sessionScope)
 
+-- | 'withGraphicsOwnerHostIn' with the private examples' host hooks.
+--
+-- It is available only here, in the private @runtime-glfw-core@ sublibrary:
+-- no public module exports it, and nothing in production calls it. The
+-- examples that must deliver a cancellation, or a quiescence, at exactly the
+-- handoff between an attachment's construction and its publication have no
+-- other way to reach that instant, and asserting what the boundary does there
+-- is worth more than the seam costs.
+withGraphicsOwnerHostWith
+  ∷ HostHooks
+  → Logger
+  → Scoped Session
+  → HostConfig
+  → GraphicsOwnerConfig scene
+  → (WindowHost → GraphicsOwner scene → IO r)
+  → IO r
+withGraphicsOwnerHostWith hooks logger sessionScope =
+  withGraphicsOwnerHostAll hooks logger (Just sessionScope)
+
 withGraphicsOwnerHostOver
   ∷ Logger
   → Maybe (Scoped Session)
@@ -1456,7 +1478,17 @@ withGraphicsOwnerHostOver
   → GraphicsOwnerConfig scene
   → (WindowHost → GraphicsOwner scene → IO r)
   → IO r
-withGraphicsOwnerHostOver logger sessionScope config ownerConfig use = do
+withGraphicsOwnerHostOver = withGraphicsOwnerHostAll noHostHooks
+
+withGraphicsOwnerHostAll
+  ∷ HostHooks
+  → Logger
+  → Maybe (Scoped Session)
+  → HostConfig
+  → GraphicsOwnerConfig scene
+  → (WindowHost → GraphicsOwner scene → IO r)
+  → IO r
+withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- The exit runs after the consumer has returned, so it reads the owner from
   -- a cell the consumer filled rather than from a value it could be given. An
   -- exit that finds none is a host whose owner never started, which still
@@ -1474,7 +1506,7 @@ withGraphicsOwnerHostOver logger sessionScope config ownerConfig use = do
   -- released — is the join that matters. By the time this scope ends the group
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
-    withProtectedWindowHostOver exit logger sessionScope config $ \host → do
+    withProtectedWindowHostOver hooks exit logger sessionScope config $ \host → do
       owner ← startGraphicsOwner group host ownerConfig (writeIORef pending . Just)
       use host owner
 
@@ -1788,7 +1820,16 @@ handOverGraphicsTarget host owner window =
             -- has already recorded the acknowledgement this announcement needs.
             recovered ← atomically (recoverableTarget owner window)
             case recovered of
-              Just target → void (announceReserved owner target)
+              Just target →
+                announceReserved owner target >>= \case
+                  EventAdmitted → pure ()
+                  -- The owner's admission closed in the same moment — a
+                  -- terminal owner failure does that — so it will never hear
+                  -- of this attachment and owns nothing for it. Settling it
+                  -- here is the difference between a window the host drain
+                  -- releases and one it waits on for evidence nobody will
+                  -- produce.
+                  _ → retireStranded host owner target
               -- Nothing of this window's is pending, so whatever the attach
               -- settled as, it left no attachment. Any acknowledgement this
               -- protocol recorded for it is dropped here rather than at some
@@ -1867,7 +1908,10 @@ announceReserved owner target = do
 retireUnannounced ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → GraphicsService → IO ()
 retireUnannounced host owner service = do
   answered ← detachWindowGraphics host service
-  when (answered == DetachBegun) (retireDetached host owner service)
+  -- An attachment already retiring — a close, a quiescence, or an earlier
+  -- detach got there first — is owed its facts exactly as one this call began
+  -- is. Only an absent one is owed nothing, because there is nothing left.
+  when (answered /= DetachAbsent) (retireDetached host owner service)
 
 -- | Certify the facts of an already-detaching attachment the owner never
 -- received, on the owner thread.

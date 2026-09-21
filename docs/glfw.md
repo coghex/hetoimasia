@@ -3714,7 +3714,12 @@ A handover the host's admission closes under is the mirror case. Quiescence
 between the reservation and the publication leaves a registered, retiring
 attachment that the owner was never told about and owns nothing for, so
 `HandoverSuperseded` retires it on the spot; nothing else could produce its
-evidence, and the protected drain would otherwise wait for it.
+evidence, and the protected drain would otherwise wait for it. The same is
+true when a cancelled handover's recovery finds the attachment but the
+owner's admission has closed in that same moment — a terminal owner failure
+does that — and when a detach finds an attachment some other close already
+began retiring. Each settles the attachment rather than leaving it owed
+evidence nobody will produce.
 
 A released target's own attachment protocol does no owner work on the main
 thread. Its bounded opportunity reads what the owner published and waits,
@@ -3912,10 +3917,11 @@ required failure closing admission and entering retirement before the
 checkpoint; a failed whole-owner destruction retaining the windows and the
 session until independent evidence arrives, with the one diagnostic written
 once; a window closed through its own port having its target retired with no detach
-at all, while the owner and a second target stay live; a handover racing the
-host's quiescence stranding nothing; cancelled handovers leaving no
-acknowledgement even while the owner is held in its startup and takes no
-round; every publication into the handoff refused after quiescence and again
+at all, while the owner and a second target stay live; a handover the host quiesces under, at exactly the
+handoff between construction and publication, answering `HandoverSuperseded`
+with its attachment retired and no acknowledgement kept; six handovers
+cancelled at that same handoff, leaving no attachment the owner lacks an
+acknowledgement for and none behind afterwards; every publication into the handoff refused after quiescence and again
 as soon as the owner's run has failed; a whole-owner retirement that failed reported
 even though the destruction after it did not; and twenty cancelled handovers
 leaving no acknowledgement behind.
