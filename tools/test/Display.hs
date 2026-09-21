@@ -318,18 +318,20 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
 
   it "stops and reaps the compositor and removes the runtime directory when a signal ends the startup" $
     withSession $ \session → do
-      -- The compositor signals the helper itself, so the signal lands while the
-      -- helper is still waiting for readiness rather than at some elapsed time;
-      -- the client never answers, so the wait is where the helper is.
+      -- The signal comes from the readiness probe, which is the one thing the
+      -- helper runs while it is waiting: the helper itself decides when that
+      -- happens, and it tries again every tick, so the moment is the helper's
+      -- own rather than an elapsed time. The compositor never serves, so the
+      -- wait is where the helper stays.
       installStubs
         session
-        ( ("weston", signallingCompositor)
-            : ("wayland-info", refusingClient)
+        ( ("weston", idleCompositor)
+            : ("wayland-info", signallingClient)
             : filter ((`notElem` ["weston", "wayland-info"]) . fst) waylandStubs
         )
       (result, _, errors) ← sessionHelper session ["--", "sh", "-c", recordSession session]
-      result `shouldBe` ExitFailure 143
       errors `shouldContain` "terminated by SIGTERM"
+      result `shouldBe` ExitFailure 143
       -- The command never ran, so the consent reached nothing.
       doesFileExist (directory session </> "environment.txt") `shouldReturn` False
       cleanedUp session
@@ -419,10 +421,10 @@ workingCompositor = compositorRecord ++ ": > serving\nexec sleep 300\n"
 exitingCompositor ∷ String
 exitingCompositor = compositorRecord ++ "echo 'no headless backend' >&2\nexit 1\n"
 
--- | A compositor that terminates the helper while the helper is still waiting
--- for it, and stays alive so that the helper stopping it is observable.
-signallingCompositor ∷ String
-signallingCompositor = compositorRecord ++ "kill -TERM \"$PPID\"\nexec sleep 300\n"
+-- | A compositor that comes up and never serves, and stays alive so that the
+-- helper stopping it is observable.
+idleCompositor ∷ String
+idleCompositor = compositorRecord ++ "exec sleep 300\n"
 
 -- | A client that records the socket and runtime directory it was pointed at,
 -- and connects once the compositor is up.
@@ -441,6 +443,20 @@ refusingClient =
   unlines
     [ "#!/bin/sh"
     , "echo \"${WAYLAND_DISPLAY-unset} ${XDG_RUNTIME_DIR-unset}\" > probe.txt"
+    , "exit 1"
+    ]
+
+-- | A client that never connects and terminates the helper instead.
+--
+-- The helper is named by the socket it asked for rather than by this process's
+-- parent, so what is signalled is the process that chose that socket, and the
+-- helper's own retry is what repeats the attempt until it takes.
+signallingClient ∷ String
+signallingClient =
+  unlines
+    [ "#!/bin/sh"
+    , "echo \"${WAYLAND_DISPLAY-unset} ${XDG_RUNTIME_DIR-unset}\" > probe.txt"
+    , "kill -TERM \"${WAYLAND_DISPLAY#hetoimasia-}\" 2>/dev/null"
     , "exit 1"
     ]
 

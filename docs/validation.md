@@ -2461,9 +2461,10 @@ with no session of anyone else's to join, with the headless backend named, with
 rather than a file appearing, so a compositor that records its launch but never
 serves is refused; a missing `weston` or `wayland-info`, a compositor that
 exits, and one that never serves within the bound each stop the run with status
-`1`; a call naming no command exits `2`; and a signal — sent by the compositor
-while the helper is still waiting for it, and by the command once it is
-running, so the moment is coordinated rather than timed — ends the helper with
+`1`; a call naming no command exits `2`; and a signal — sent by the readiness
+probe, which the helper runs only while it is waiting, and by the command once
+it is running, so the moment is the helper's own rather than an elapsed time —
+ends the helper with
 the compositor stopped and reaped, the command stopped, and the runtime
 directory removed. The setup window has its own two: a `mkdir` that terminates
 the helper as it returns, which puts the signal between creating the runtime
