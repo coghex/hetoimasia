@@ -587,11 +587,16 @@ is the wake path's degradation warning, under `glfw.wake`.
 
 `allocSession` constructs the session as a staged composite. In order:
 
-1. **Backend.** The request is resolved against the backend this platform
-   supports: X11 on Linux and Cocoa on macOS, each selected explicitly. Wayland
-   is never selected, and neither is another platform's backend; either request
-   is `UnsupportedBackend` before anything else happens, so no XWayland run is
-   ever presented as Wayland.
+1. **Backend.** The request is resolved against what this platform admits.
+   Linux admits X11 and Wayland; macOS admits Cocoa. An absent request takes
+   the platform's own backend — X11 on Linux, Cocoa on macOS — so nothing
+   reaches Wayland unless a request names it, and Wayland is selected only on
+   explicit request. A request naming a backend the platform does not admit —
+   Cocoa on Linux, X11 or Wayland on macOS — is `UnsupportedBackend` before
+   anything else happens. No request is ever exchanged for the other backend:
+   resolution either answers the backend asked for or refuses, so no XWayland
+   run is presented as Wayland and no Wayland request is quietly served by
+   X11.
 2. **Thread.** The calling thread must be bound and must be the OS thread that
    entered the process main function, or entry is `NotProcessMainThread`. A
    bound worker thread is not enough: the OS identity comes from a C shim
@@ -602,16 +607,32 @@ is the wake path's degradation warning, under `glfw.wake`.
    from any thread, makes this `SessionAlreadyActive`; a poisoned guard makes it
    `SessionPoisoned`.
 4. **Support.** `glfwPlatformSupported` must accept the backend, or entry is
-   `UnsupportedBackend` and the guard is released.
+   `UnsupportedBackend` and the guard is released — still before any native
+   mutation. This answers only whether the prefix was built with that backend.
+   A supported answer is never a working connection: whether the display or
+   socket can actually be reached is settled one step later, by `glfwInit`.
 5. **Callback.** The error callback is installed.
 6. **Initialization.** The platform hint and `GLFW_COCOA_CHDIR_RESOURCES = false`
    are set, so session configuration never changes the process working
    directory, and `glfwInit` runs. A false return is a `NativeFailure` carrying
    the reports GLFW made during the call. That is how an initialization error is
    observed before any event is polled.
+
+   A display or socket that cannot be reached is identified from those reports,
+   by GLFW's own code and description, rather than by an outcome of its own. In
+   GLFW 3.4 an X11 display that will not open is `GLFW_PLATFORM_UNAVAILABLE`
+   (`0x0001000E`) with `X11: Failed to open display …` or `X11: The DISPLAY
+   environment variable is missing` (`src/x11_init.c:1290-1308`), while a
+   Wayland socket that will not connect is `GLFW_PLATFORM_ERROR` (`0x00010008`)
+   with `Wayland: Failed to connect to display` (`src/wl_init.c:544`). The two
+   backends do not agree on the code, so the description is part of the
+   evidence; the session carries both through unaltered rather than folding
+   them into one generic failure.
 7. **Verification.** Reports from a successful initialization are raised only
    now, after termination has been registered, and `glfwGetPlatform` must name
-   the selected backend, or entry is `BackendNotSelected`.
+   the selected backend, or entry is `BackendNotSelected`. A Wayland hint that
+   GLFW answers with X11 fails here and terminates: the hint asked for Wayland,
+   so an X11 session is not presented as one.
 8. **Monitor callback.** The monitor callback's storage is allocated, its detach
    is registered, and it is attached with `glfwSetMonitorCallback`. An
    attachment that raises poisons the guard.
@@ -1241,6 +1262,29 @@ application's decision: the window host
 reject it or honour it by beginning that window's close protocol. There is no
 default close policy, and no request closes a window by itself.
 
+#### Driving one in the native examples
+
+`requestCloseForCheck` and `sizeLimitsForCheck` exist for
+[the native suite](#the-native-suite) alone. Each reaches its window through
+the Cocoa or X11 handle GLFW exposes — `performClose:`, a `WM_DELETE_WINDOW`
+client message, `contentMinSize`/`contentMaxSize`, `WM_NORMAL_HINTS` — so each
+works only on a session whose backend exposes one.
+
+On any other backend, Wayland included, both answer unavailable. They check
+`glfwGetPlatform`, which reports no error, before asking for a handle, because
+GLFW 3.4 answers `glfwGetX11Display` on another platform with
+`GLFW_PLATFORM_UNAVAILABLE` (`src/x11_window.c:3294-3297`) and the session
+would capture that report as a native failure. The answer is observable rather
+than a silent no-op: the close driver returns whether it delivered the request,
+and the size-limit reader returns `Nothing`.
+
+What is unavailable is each helper, and nothing more. Window closure is GLFW's
+own on every backend and the close protocol above is unchanged; size
+constraints are held by GLFW on every backend, and `Nothing` from the reader is
+never evidence that a window has none. A compositor-generated close request has
+not been demonstrated on Wayland through this integration, and nothing here
+claims otherwise; automating one is not attempted.
+
 ### Release
 
 | Order | Part | Release |
@@ -1646,15 +1690,67 @@ with a reason, as `backendWindowCapabilities` defines:
 | Backend | Cannot perform | Cannot report |
 |---|---|---|
 | X11, Cocoa | — | — |
-| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus; `BorderlessOperation`: no global window position to place over a monitor | `PlacementReport`: no global window position; `IconifiedReport`: no reliable iconified state |
+| Wayland | `SetPositionOperation`: no global window position; `FocusOperation`: only the compositor moves input focus; `BorderlessOperation`: no global window position to place over a monitor | `PlacementReport`: no global window position; `IconifiedReport`: no iconified state; GLFW always answers false |
 
-No session selects Wayland. Its description keeps its restrictions explicit
-rather than emulated, and the CPU examples model it through the seam. An
-unperformable operation is `Unsupported`. An unreportable attribute is always
-`Unavailable`: it is not queried, and its callback records nothing, so no
-position, iconified state, or other value is fabricated. A query reporting
+An unperformable operation is `Unsupported`. An unreportable attribute is
+always `Unavailable`: it is not queried, and its callback records nothing, so
+no position, iconified state, or other value is fabricated. A query reporting
 `GLFW_FEATURE_UNAVAILABLE` is `Unavailable` under the
 [observation contract](#observations) as before.
+
+#### The audited Wayland row
+
+The Wayland row is audited against the pinned GLFW 3.4 source
+(`tools/native/glfw.pin`), entry by entry, over the whole vocabulary: all
+thirteen `WindowOperation`s and all eight `WindowReport`s. `Test.GLFW.Control`
+asserts that enumeration, so an operation or attribute added later cannot be
+left unaudited. GLFW's own answer is what each row records — nothing is
+inferred from the protocol, and no restriction GLFW does not report is invented.
+
+| Operation | Wayland | GLFW's answer |
+|---|---|---|
+| `SetTitleOperation` | performable | `xdg_toplevel_set_title`, or libdecor's (`src/wl_window.c:2219`) |
+| `SetSizeOperation` | performable | resizes the surface; video-mode setting, which Wayland has no protocol for, is not an ordinary control (`src/wl_window.c:2259`) |
+| `SetPositionOperation` | **unperformable** | `GLFW_FEATURE_UNAVAILABLE`, "The platform does not support setting the window position" (`src/wl_window.c:2243-2249`); `glfw3.h:3466` says there is no way for an application to set it |
+| `SetConstraintsOperation` | performable | `libdecor_frame_set_min/max_content_size`, else `updateXdgSizeLimits` (`src/wl_window.c:2283`). `glfw3.h:3541`: the limits apply only once the window is next resized |
+| `ShowOperation` | performable | creates the shell objects (`src/wl_window.c:2423`). `glfw3.h:3894`: the window becomes visible at the next framebuffer update, not inside the call |
+| `HideOperation` | performable | destroys the shell objects and attaches a null buffer (`src/wl_window.c:2433`) |
+| `FocusOperation` | **unperformable** | no error, but GLFW never moves focus itself: it asks for an xdg-activation token and returns having done nothing when the compositor exposes no activation manager (`src/wl_window.c:2463-2467`). `glfw3.h:3957`: the compositor will likely ignore the request. The model refuses it rather than reporting a focus change that may never happen |
+| `AttentionOperation` | performable | commits an xdg-activation token (`src/wl_window.c:2445`). Like every performable control, what the compositor then does is its own decision, and nothing here asserts otherwise |
+| `MinimizeOperation` | performable | `xdg_toplevel_set_minimized`, or libdecor's (`src/wl_window.c:2382`). It cannot be observed afterwards — see `IconifiedReport` |
+| `MaximizeOperation` | performable | `xdg_toplevel_set_maximized`, or libdecor's (`src/wl_window.c:2413`) |
+| `RestoreOperation` | performable | unmaximizes (`src/wl_window.c:2390`). It cannot undo a minimize: `glfw3.h:3809` states that once a window is iconified `glfwRestoreWindow` will not restore it, a design decision of xdg-shell. The operation is performable because unmaximizing is what it does; the model claims nothing about un-minimizing |
+| `BorderlessOperation` | **unperformable** | placing an undecorated window over a monitor's work area needs the global position `src/wl_window.c:2243-2249` refuses |
+| `FullscreenOperation` | performable | `xdg_toplevel_set_fullscreen` on the monitor's output, or libdecor's (`src/wl_window.c:501`). `glfw3.h:4060`: the desired position is ignored, which the model does not supply |
+
+| Report | Wayland | GLFW's answer |
+|---|---|---|
+| `LogicalExtentReport` | reportable | the size GLFW tracks for the surface (`src/wl_window.c:2251`) |
+| `FramebufferExtentReport` | reportable | `wl.fbWidth`/`wl.fbHeight` (`src/wl_window.c:2338`). An observation of what the compositor gave, as on every backend |
+| `ContentScaleReport` | reportable | the fractional scale, else the integer buffer scale (`src/wl_window.c:2363`). `glfw3.h:2715` notes monitors have no fractional scale yet. An observation, not a claim about rendering |
+| `PlacementReport` | **unreportable** | `GLFW_FEATURE_UNAVAILABLE`, "The platform does not provide the window position" (`src/wl_window.c:2234-2241`); `glfw3.h:3432`, and `glfw3.h:4221` adds that the position callback is never called |
+| `FocusedReport` | reportable | whether the window holds the keyboard focus (`src/wl_window.c:2522`) |
+| `IconifiedReport` | **unreportable** | always `GLFW_FALSE` (`src/wl_window.c:2527-2532`); `glfw3.h:4098` states the protocol provides no way to check it. A false answer is not evidence, so the model reports `Unavailable` rather than "not iconified" |
+| `MaximizedReport` | reportable | `wl.maximized` (`src/wl_window.c:2539`) |
+| `VisibleReport` | reportable | `wl.visible` (`src/wl_window.c:2534`) |
+
+The audit extends the row nowhere: the three operations and two attributes
+above are the whole of what GLFW answers unavailable within this vocabulary.
+The remaining `GLFW_FEATURE_UNAVAILABLE` answers of the pinned Wayland
+backend — the window icon (`src/wl_window.c:2227`), floating
+(`src/wl_window.c:2599`), opacity (`src/wl_window.c:2622`), and the cursor
+position (`src/wl_window.c:2668`) — name no `WindowOperation` or
+`WindowReport`, so none of them is recorded here.
+
+Two things this row does not claim. Content scale and framebuffer extent above
+are observations of what the compositor supplied, not measurements of anything
+rendered. And compositor suspension and native drawability are **not
+established** through this integration: the scheduler may answer
+`RenderEligible` while visibility or minimization is unknown and a usable
+framebuffer extent is present, but that is a scheduling opportunity under the
+existing policy, not proof that the window is drawable or that the compositor
+is not suspending it. See [Render demand](#render-demand); nothing here infers
+a drawable window from an unknown state.
 
 Where a control is performable, the platform still decides its result. Focus is
 a request a window manager or compositor may decline, and attention may be a
@@ -4149,8 +4245,8 @@ test environment.
 | Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
-| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is a human's approval for this one run on the local desktop; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`. Anything else — the variable unset, empty, or another value, a bare `DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
-| Platform | On Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead. |
+| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is a human's approval for this one run on the local desktop; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`; `isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its command, accepted only on Linux, only when `WAYLAND_DISPLAY` names exactly that socket, and only when `DISPLAY` is unset — a set `DISPLAY`, empty or not, could serve an X11 or XWayland session in the compositor's place, so it is refused. Each refusal names what disagreed: the socket against `WAYLAND_DISPLAY`, the `DISPLAY` that should not be there, or the platform. Anything else — the variable unset, empty, or another value, a bare `DISPLAY` or `WAYLAND_DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
+| Platform | The rule is the fixture's, not the session's, and it follows the run's consent. Under `desktop` or `isolated-x11` on Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Under `isolated-wayland:<socket>` the session is entered only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is unset, it requests Wayland by name — nothing selects Wayland otherwise — and it must select Wayland. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead, and no request falls back to the other backend. |
 
 The fixture's settlement rules are proven against a scripted owner that records
 its acquisition and release — lazy single acquisition, nothing acquired by a dry
@@ -4170,13 +4266,18 @@ The consent gate is proven the same way, under `the native opt-in`, without a
 session, a display, or a child: how consent is read from an environment on
 each platform, including that a bare `DISPLAY`, `CI`, an empty value, an
 unrecognized value, an isolated authorization for another display, and an
-isolated authorization on macOS are each refused; that an unapproved run's
+isolated authorization on macOS are each refused; that a valid isolated Wayland
+authorization is accepted while an empty or mismatched socket name, an absent
+`WAYLAND_DISPLAY`, any set `DISPLAY` including an empty one, a bare
+`WAYLAND_DISPLAY`, and the same authorization on macOS are each refused with a
+reason naming what disagreed; that an unapproved run's
 operations are refused before they are dispatched, so a scripted owner records
 no acquisition, while a dry run and an empty selection still acquire nothing
 and refuse nothing; that a consented example is refused before its body, so a
 body that forks an operation and waits on it never starts, while a consented
 run's body runs; that an approved run, under either consent, is served
-with one acquisition; that a refusal reaching the real shared owner fails its
+with one acquisition, the isolated Wayland consent included; that a refusal
+reaching the real shared owner fails its
 acquisition before the setup check, so before any native step; that the
 private-session parent starts no child without consent and starts one with
 it, through a recorded launcher; and that a directly invoked child refuses
@@ -4187,7 +4288,15 @@ and the isolated alternative.
 The native examples cover:
 
 - the platform's backend selected explicitly, on an isolated X11 display under
-  Linux;
+  Linux; pending instead on a run the isolated compositor authorized, which
+  selects the other backend;
+- a requested Wayland session selecting Wayland, on the isolated compositor's
+  own socket, with `DISPLAY` unset. This is the one example `test.glfw-wayland`
+  selects. It is listed on every platform, so a dry run names it and the
+  catalog can ask for it anywhere, but it asserts only against a session the
+  isolated Wayland consent authorized: an X11 or Cocoa run reaches its body and
+  reports it pending rather than asserting Wayland against the session it
+  actually has;
 - operations running on the bound process main thread that entered the session,
   never on the Hspec worker, and a single acquisition;
 - nested entry on the owner thread, entry from a bound worker and from an
@@ -4211,7 +4320,7 @@ The native examples cover:
 - ordinary window controls on private hidden windows, performed on the owner
   thread with `performWindowCommand` and checked against the test-only
   owner-thread queries `windowSizeForCheck`, `windowPositionForCheck`,
-  `windowTitleForCheck`, `sizeLimitsForCheck`, and `windowStateForCheck`, never
+  `windowTitleForCheck`, `platformSizeLimits`, and `windowStateForCheck`, never
   against public commands: a title, a valid size, a position, and constraints
   applied to the addressed window while a second window stays unchanged;
   showing and then hiding reflected in observations; after constraints are
@@ -4288,7 +4397,9 @@ The native examples cover:
   the wait it just returned from. On the suite's single capability, a wait that
   kept its capability would let no note land;
 - a real close request — `performClose:` on Cocoa, a `WM_DELETE_WINDOW` client
-  message on X11, sent by a test-only shim driver — reaching application policy
+  message on X11, sent by a test-only shim driver, which answers whether it
+  delivered the request so that an example never waits for one nobody sent —
+  reaching application policy
   without destroying the only window, the loop and a worker still running two
   turns later, and the window released only after that worker drained, with the
   run returning normally;

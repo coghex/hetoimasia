@@ -34,7 +34,6 @@ import Hetoimasia.GLFW.Internal.Native
   , injectMouseButtonForCheck
   , injectScrollForCheck
   , inputCallbacksClearedForCheck
-  , requestCloseForCheck
   , takeInputCallbacksClearedForCheck
   , waitEventsForCheck
   )
@@ -53,7 +52,7 @@ import Hetoimasia.GLFW.Window
   , windowIdentity
   , withWindow
   )
-import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned)
+import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned, requestClose)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -201,7 +200,7 @@ spec shared = describe "native input callbacks" $ do
           inject window $ \handle → do
             injectCharForCheck handle (fromEnum 'a')
             injectCharForCheck handle (fromEnum 'b')
-            requestCloseForCheck handle
+            requestClose handle
           atomically (readInput (feedReader feed)) >>= \case
             InputResetRequired _ → pure ()
             other → failed ("expected a full-feed reset, found " <> show other)
@@ -269,7 +268,7 @@ inject window action =
     WindowAvailable () → pure ()
     WindowEnded identity → failed ("window ended during inject: " <> show identity)
 
--- | Cocoa delivers 'requestCloseForCheck' during the call; X11 posts
+-- | Cocoa delivers 'requestClose' during the call; X11 posts
 -- WM_DELETE_WINDOW, which GLFW reports on a later poll or wait.
 awaitCloseRequest ∷ Window → IO (Maybe CloseRequest)
 awaitCloseRequest window = attempt deliveryAttempts

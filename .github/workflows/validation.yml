@@ -151,7 +151,7 @@ jobs:
           # nobody — and every later step reads the assignment out of the plan.
           arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console")
           arguments+=(--worker "haskell-workflow=cpu:test.workflow")
-          arguments+=(--worker "glfw-native=display:test.glfw-native")
+          arguments+=(--worker "glfw-native=display:test.glfw-native,test.glfw-wayland")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
             arguments+=(--request-file request.txt)
@@ -884,10 +884,13 @@ jobs:
             toolchain+=(--toolchain "$entry")
           done < "$RUNNER_TEMP/toolchain.txt"
           status=0
-          # Each group runs inside an isolated X11 display started for it alone
-          # and stopped after it. A display that cannot be established ends the
-          # group before it starts, writes no receipt, and fails this job, which
-          # the aggregate then reports: it is never skipped, retried, or excused.
+          # Each group runs inside a display started for it alone and stopped
+          # after it: the isolated X11 server for every group but
+          # test.glfw-wayland, which asks for a Wayland session and so runs
+          # under the isolated headless compositor instead. A display that
+          # cannot be established ends the group before it starts, writes no
+          # receipt, and fails this job, which the aggregate then reports: it is
+          # never skipped, retried, or excused.
           for group in $ASSIGNED; do
             case " $EXECUTE " in
               *" $group "*) ;;
@@ -899,7 +902,11 @@ jobs:
                 continue
                 ;;
             esac
-            bash tools/display/x11.sh --summary "$GITHUB_STEP_SUMMARY" -- \
+            helper=tools/display/x11.sh
+            if [ "$group" = "test.glfw-wayland" ]; then
+              helper=tools/display/wayland.sh
+            fi
+            bash "$helper" --summary "$GITHUB_STEP_SUMMARY" -- \
               python3 -I tools/validation/run.py "$group" \
               --plan plan.json \
               --receipts receipts \

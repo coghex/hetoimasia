@@ -18,11 +18,16 @@
 -- around the hook enters a session either. The gate counts what it refused,
 -- and 'Main' reports the refusal once; the report shows no acquisition.
 --
--- On Linux the session is only entered on an isolated X11 display: @DISPLAY@
--- must name one and @WAYLAND_DISPLAY@ must be absent, and the session's backend
--- must be X11. On macOS it must be Cocoa. Anything else is 'DisplayUnavailable'
--- at acquisition, which every native example then fails with; nothing selects
--- another platform instead.
+-- On Linux the session is entered only inside the isolation its consent names.
+-- Under the desktop or isolated X11 consent that is an X11 display: @DISPLAY@
+-- must name one, @WAYLAND_DISPLAY@ must be absent, and the session's backend
+-- must be X11. Under the isolated Wayland consent it is the compositor's
+-- socket: @WAYLAND_DISPLAY@ must name exactly the socket the consent
+-- authorized, @DISPLAY@ must be unset so no XWayland display can stand in, the
+-- session requests Wayland by name, and its backend must be Wayland. On macOS
+-- it must be Cocoa. Anything else is 'DisplayUnavailable' at acquisition,
+-- which every native example then fails with; nothing selects another platform
+-- instead, and no request falls back to the other backend.
 module Test.GLFW.Native.Support
   ( -- * The shared session
     Shared (..)
@@ -51,6 +56,9 @@ module Test.GLFW.Native.Support
 
     -- * Platform
   , hostBackend
+  , consentBackend
+  , sharedBackend
+  , consentSessionConfig
   , DisplayUnavailable (..)
 
     -- * Helpers
@@ -58,6 +66,8 @@ module Test.GLFW.Native.Support
   , failed
   , onThread
   , currentObservation
+  , requestClose
+  , platformSizeLimits
   ) where
 
 import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId, newEmptyMVar, putMVar, takeMVar)
@@ -66,16 +76,24 @@ import Control.Exception (Exception, SomeException, displayException, fromExcept
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Maybe (isJust)
+import Foreign.Ptr (Ptr)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.Foundation.Resource (allocResource)
-import Hetoimasia.GLFW.Internal.Native (productionNative)
-import Hetoimasia.GLFW.Internal.Session (Native (nativeIsProcessMainThread))
-import Hetoimasia.GLFW.Session (Backend (..), Session, allocSession, defaultSessionConfig, sessionBackend)
+import Hetoimasia.GLFW.Internal.Native (checkHelperBackends, productionNative, requestCloseForCheck, sizeLimitsForCheck)
+import Hetoimasia.GLFW.Internal.Session (Native (nativeIsProcessMainThread), NativeWindow)
+import Hetoimasia.GLFW.Session
+  ( Backend (..)
+  , Session
+  , SessionConfig (requestedBackend)
+  , allocSession
+  , defaultSessionConfig
+  , sessionBackend
+  )
 import Hetoimasia.GLFW.Window (Window, WindowObservation, windowObservations)
 import System.Environment (lookupEnv)
 import System.Info (os)
-import Test.GLFW.Native.Consent (Consent, NativeSessionRefused (..), Refusal)
+import Test.GLFW.Native.Consent (Consent (..), NativeSessionRefused (..), Refusal)
 import Test.GLFW.Native.Fixture (Fixture, Owner (..), acquisitionCount, dispatch)
 import Test.Hspec (SpecWith, before_, expectationFailure)
 
@@ -203,10 +221,10 @@ sharedSessionOwner evidence gate =
   Owner
     { ownerAcquire = do
         allocResource claimOwner (\() → recordCheck evidence AfterReleaseCheck)
-        allocResource (admit gate >> requireDisplay) pure
-        session ← allocSession defaultSessionConfig
+        consent ← allocResource (admit gate >>= \granted → requireDisplay granted >> pure granted) (\_ → pure ())
+        session ← allocSession (consentSessionConfig consent)
         allocResource
-          (recordCheck evidence SetupCheck >> requireBackend session)
+          (recordCheck evidence SetupCheck >> requireBackend consent session)
           (\() → recordCheck evidence BeforeReleaseCheck)
         pure session
     , ownerSettled = pure ()
@@ -226,28 +244,100 @@ owned shared action =
 acquisitions ∷ Shared → IO Int
 acquisitions = acquisitionCount . sharedFixture
 
--- | The backend this platform's session must select.
+-- | The backend this platform's session selects when nothing requests another.
 hostBackend ∷ Backend
 hostBackend = if os == "darwin" then Cocoa else X11
 
-requireDisplay ∷ IO ()
-requireDisplay = case os of
-  "darwin" → pure ()
-  "linux" → do
-    display ← lookupEnv "DISPLAY"
-    wayland ← lookupEnv "WAYLAND_DISPLAY"
-    when (maybe True null display) . throwIO $
-      DisplayUnavailable
-        "DISPLAY is not set, so there is no X11 display to run on, and the native examples never select another platform"
-    when (isJust wayland) . throwIO $
-      DisplayUnavailable
-        "WAYLAND_DISPLAY is set; the native examples require an isolated X11 display, not a Wayland or XWayland session"
-  other → throwIO (DisplayUnavailable ("the native examples run on Linux X11 and macOS Cocoa, not " <> other))
+-- | The backend the shared session must select under one consent. Only the
+-- isolated compositor's consent asks for Wayland, and it asks explicitly; every
+-- other consent takes the platform's own backend, exactly as before.
+consentBackend ∷ Consent → Backend
+consentBackend = \case
+  IsolatedWayland _ → Wayland
+  Desktop → hostBackend
+  IsolatedX11 _ → hostBackend
 
-requireBackend ∷ Session → IO ()
-requireBackend session =
-  unless (sessionBackend session == hostBackend) . throwIO . DisplayUnavailable $
-    "the session selected " <> show (sessionBackend session) <> ", not " <> show hostBackend
+-- | The backend the shared session selects under this run's consent, for the
+-- examples that assert on it. A run carrying no consent enters no session, so
+-- the platform's own backend is the only answer it could be asked for.
+sharedBackend ∷ Gate → Backend
+sharedBackend = either (const hostBackend) consentBackend . gateConsent
+
+-- | How the shared session is entered under one consent. The compositor's
+-- consent requests Wayland by name, because nothing selects it otherwise.
+consentSessionConfig ∷ Consent → SessionConfig
+consentSessionConfig consent = case consent of
+  IsolatedWayland _ → defaultSessionConfig {requestedBackend = Just Wayland}
+  _ → defaultSessionConfig
+
+-- | The private environment one consent requires before a session is entered.
+--
+-- This is the fixture's rule, not the session's: the session resolves a
+-- backend from what it was asked for, while the suite additionally refuses to
+-- run anywhere but the isolation its consent names.
+requireDisplay ∷ Consent → IO ()
+requireDisplay consent = case os of
+  "darwin" → pure ()
+  "linux" → case consent of
+    IsolatedWayland socket → do
+      wayland ← lookupEnv "WAYLAND_DISPLAY"
+      display ← lookupEnv "DISPLAY"
+      unless (wayland == Just socket) . throwIO . DisplayUnavailable $
+        "WAYLAND_DISPLAY is "
+          <> maybe "not set" show wayland
+          <> ", not the isolated socket "
+          <> show socket
+          <> " this run was authorized for"
+      when (isJust display) . throwIO $
+        DisplayUnavailable
+          "DISPLAY is set; the Wayland examples require the isolated compositor alone, never an X11 or XWayland display"
+    _ → do
+      display ← lookupEnv "DISPLAY"
+      wayland ← lookupEnv "WAYLAND_DISPLAY"
+      when (maybe True null display) . throwIO $
+        DisplayUnavailable
+          "DISPLAY is not set, so there is no X11 display to run on, and the native examples never select another platform"
+      when (isJust wayland) . throwIO $
+        DisplayUnavailable
+          "WAYLAND_DISPLAY is set; the native examples require an isolated X11 display, not a Wayland or XWayland session"
+  other → throwIO (DisplayUnavailable ("the native examples run on Linux X11 and Wayland and macOS Cocoa, not " <> other))
+
+requireBackend ∷ Consent → Session → IO ()
+requireBackend consent session =
+  unless (sessionBackend session == wanted) . throwIO . DisplayUnavailable $
+    "the session selected " <> show (sessionBackend session) <> ", not " <> show wanted
+  where
+    wanted = consentBackend consent
+
+-- | Ask the platform to close a window as its close button would, failing the
+-- example when the driver could not deliver the request.
+--
+-- The driver is unavailable on a backend that exposes no Cocoa or X11 handle,
+-- and answers so rather than doing nothing observable, which is why every
+-- example that drives a close asks through here: an unavailable driver fails
+-- its example instead of leaving it waiting for a request nobody sent. The
+-- backends that expose a handle are 'checkHelperBackends'.
+requestClose ∷ Ptr NativeWindow → IO ()
+requestClose handle = do
+  delivered ← requestCloseForCheck handle
+  unless delivered . failed $
+    "the close-request driver is unavailable on this session's backend; it reaches a window through "
+      <> show checkHelperBackends
+      <> " handles only, and what is unavailable is the driver, not window closure"
+
+-- | The size limits the platform itself holds for a window, failing the
+-- example when this session's backend exposes no handle to read them through.
+-- A 'Nothing' from the reader is never evidence that the window holds no
+-- constraints.
+platformSizeLimits ∷ Ptr NativeWindow → IO (Maybe Int, Maybe Int, Maybe Int, Maybe Int)
+platformSizeLimits handle =
+  sizeLimitsForCheck handle >>= \case
+    Just limits → pure limits
+    Nothing →
+      failed $
+        "the platform size-limit reader is unavailable on this session's backend; it reads back through "
+          <> show checkHelperBackends
+          <> " handles only, and says nothing about the constraints GLFW holds"
 
 -- | Run an action that must fail with one exception type, and return it.
 expectFailure ∷ Exception e ⇒ IO a → IO e

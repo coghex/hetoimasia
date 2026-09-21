@@ -73,10 +73,12 @@ spec = do
       (boundedExample testNestedEntryRejected)
     it "rejects a concurrent entry from another main-thread candidate while a session is active"
       (boundedExample testConcurrentEntryRejected)
-    it "answers a Wayland request, or a Wayland-only platform, as unsupported before any native call"
-      (boundedExample testWaylandUnsupported)
-    it "answers another platform's backend, or one the library reports unavailable, as unsupported"
-      (boundedExample testOtherBackendsUnsupported)
+    it "selects X11 for an unrequested Linux session and admits a Wayland request to the support check"
+      (boundedExample testLinuxBackendSelection)
+    it "answers a backend the platform does not admit as unsupported, on Linux and on Darwin, before any native call"
+      (boundedExample testUnadmittedBackendsUnsupported)
+    it "answers an admitted backend the prefix was built without as unsupported, before any native mutation"
+      (boundedExample testBackendNotCompiledUnsupported)
 
   describe "GLFW session construction rollback" $ do
     it "rolls back a failed initialization without terminating, keeping its reports as evidence"
@@ -85,6 +87,10 @@ spec = do
       (boundedExample testInitializationReportTerminates)
     it "terminates when the initialized platform is not the selected backend"
       (boundedExample testBackendMismatchTerminates)
+    it "terminates a Wayland hint the platform answered with X11, without presenting it as Wayland"
+      (boundedExample testWaylandHintAnsweredWithX11)
+    it "carries GLFW's own display-unavailable report, distinguishably from another native error"
+      (boundedExample testDisplayUnreachableReported)
     it "keeps a rolled-back failure primary beside a failing rollback, and poisons the guard"
       (boundedExample testRollbackFailurePoisons)
 
@@ -168,37 +174,80 @@ testConcurrentEntryRejected = do
   misuse `shouldBe` SessionAlreadyActive
   seamCalls seam `shouldReturn` entryCalls <> exitCalls
 
-testWaylandUnsupported ∷ Expectation
-testWaylandUnsupported = do
-  seam ← newSeam defaultScript
-  (unsupported, caught) ←
-    asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just Wayland)) (\_ → pure ())))
-  unsupported `shouldBe` UnsupportedBackend (Just Wayland) (Just X11)
-  originOf caught `shouldBe` Just ("glfw", "enter session", [("backend", "wayland")])
-  seamCalls seam `shouldReturn` []
+-- | Linux admits both backends, but only a request reaches Wayland. An
+-- unrequested session selects X11, and neither selection is ever exchanged for
+-- the other.
+testLinuxBackendSelection ∷ Expectation
+testLinuxBackendSelection = do
+  unrequested ← newSeam defaultScript
+  asProcessMainThread unrequested (entered unrequested defaultSessionConfig (pure . sessionBackend))
+    `shouldReturn` X11
+  seamCalls unrequested `shouldReturn` entryCalls <> exitCalls
 
-  waylandOnly ← newSeam defaultScript {scriptHostBackend = Just Wayland}
-  (fallback, _) ←
-    asProcessMainThread waylandOnly (caughtAs (entered waylandOnly defaultSessionConfig (\_ → pure ())))
-  fallback `shouldBe` UnsupportedBackend Nothing (Just Wayland)
-  seamCalls waylandOnly `shouldReturn` []
+  -- The same platform, asked for Wayland: admitted at resolution, hinted, and
+  -- verified as the backend GLFW actually selected.
+  requested ← newSeam defaultScript
+  asProcessMainThread requested (entered requested (SessionConfig (Just Wayland)) (pure . sessionBackend))
+    `shouldReturn` Wayland
+  seamCalls requested
+    `shouldReturn` [ QueryPlatformSupported Wayland
+                   , CreateErrorCallback
+                   , AttachErrorCallback
+                   , SetInitHints Wayland
+                   , Initialize
+                   , QueryPlatform
+                   , CreateMonitorCallback
+                   , AttachMonitorCallback
+                   , QueryMonitors
+                   , QueryPrimaryMonitor
+                   ]
+      <> exitCalls
 
-testOtherBackendsUnsupported ∷ Expectation
-testOtherBackendsUnsupported = do
-  seam ← newSeam defaultScript
-  (other, _) ← asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just Cocoa)) (\_ → pure ())))
-  other `shouldBe` UnsupportedBackend (Just Cocoa) (Just X11)
-  seamCalls seam `shouldReturn` []
+-- | A request naming a backend its platform does not admit is refused at
+-- resolution, on either platform, before anything native is asked.
+testUnadmittedBackendsUnsupported ∷ Expectation
+testUnadmittedBackendsUnsupported = do
+  linux ← newSeam defaultScript
+  (cocoaOnLinux, caught) ←
+    asProcessMainThread linux (caughtAs (entered linux (SessionConfig (Just Cocoa)) (\_ → pure ())))
+  cocoaOnLinux `shouldBe` UnsupportedBackend (Just Cocoa) (Just X11)
+  originOf caught `shouldBe` Just ("glfw", "enter session", [("backend", "cocoa")])
+  seamCalls linux `shouldReturn` []
 
-  unavailable ← newSeam defaultScript {scriptPlatformSupported = False}
-  refusals ← asProcessMainThread unavailable $ do
-    (first, _) ← caughtAs (entered unavailable defaultSessionConfig (\_ → pure ()))
-    (second, _) ← caughtAs (entered unavailable defaultSessionConfig (\_ → pure ()))
+  mapM_
+    ( \(wanted, named) → do
+        darwin ← newSeam darwinScript
+        (refused, raised) ←
+          asProcessMainThread darwin (caughtAs (entered darwin (SessionConfig (Just wanted)) (\_ → pure ())))
+        refused `shouldBe` UnsupportedBackend (Just wanted) (Just Cocoa)
+        originOf raised `shouldBe` Just ("glfw", "enter session", [("backend", named)])
+        seamCalls darwin `shouldReturn` []
+    )
+    [(X11, "x11"), (Wayland, "wayland")]
+
+  -- Darwin still selects Cocoa when nothing is requested.
+  darwin ← newSeam darwinScript
+  asProcessMainThread darwin (entered darwin defaultSessionConfig (pure . sessionBackend)) `shouldReturn` Cocoa
+
+-- | An admitted backend the prefix was built without is refused by the support
+-- check, which asks @glfwPlatformSupported@ and nothing else: the guard is
+-- claimed and released, and no native state is changed.
+testBackendNotCompiledUnsupported ∷ Expectation
+testBackendNotCompiledUnsupported = do
+  waylandMissing ← newSeam defaultScript {scriptPlatformSupported = (/= Wayland)}
+  refusals ← asProcessMainThread waylandMissing $ do
+    (first, _) ← caughtAs (entered waylandMissing (SessionConfig (Just Wayland)) (\_ → pure ()))
+    (second, _) ← caughtAs (entered waylandMissing (SessionConfig (Just Wayland)) (\_ → pure ()))
     pure [first, second]
   -- The second refusal is the same answer, not SessionAlreadyActive: the
   -- first released the guard it had claimed.
-  refusals `shouldBe` replicate 2 (UnsupportedBackend (Just X11) (Just X11))
-  seamCalls unavailable `shouldReturn` replicate 2 (QueryPlatformSupported X11)
+  refusals `shouldBe` replicate 2 (UnsupportedBackend (Just Wayland) (Just X11))
+  seamCalls waylandMissing `shouldReturn` replicate 2 (QueryPlatformSupported Wayland)
+
+  -- The same platform still enters X11, so the refusal named the backend asked
+  -- for rather than the platform.
+  asProcessMainThread waylandMissing (entered waylandMissing defaultSessionConfig (pure . sessionBackend))
+    `shouldReturn` X11
 
 -- ---------------------------------------------------------------------------
 -- Construction rollback
@@ -259,6 +308,66 @@ testBackendMismatchTerminates = do
   mismatch `shouldBe` BackendNotSelected X11 (Just Wayland)
   originOf caught `shouldBe` Just ("glfw", "verify backend", x11)
   seamCalls seam `shouldReturn` initializationCalls <> initializationExitCalls
+
+-- | A Wayland hint the platform answers with X11 fails verification. Nothing
+-- presents the X11 session that GLFW actually initialized as Wayland, and the
+-- initialization is terminated.
+testWaylandHintAnsweredWithX11 ∷ Expectation
+testWaylandHintAnsweredWithX11 = do
+  seam ← newSeam defaultScript {scriptReportedPlatform = const (Just X11)}
+  (mismatch, caught) ←
+    asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just Wayland)) (\_ → pure ())))
+  mismatch `shouldBe` BackendNotSelected Wayland (Just X11)
+  originOf caught `shouldBe` Just ("glfw", "verify backend", [("backend", "wayland")])
+  seamCalls seam
+    `shouldReturn` [ QueryPlatformSupported Wayland
+                   , CreateErrorCallback
+                   , AttachErrorCallback
+                   , SetInitHints Wayland
+                   , Initialize
+                   , QueryPlatform
+                   ]
+      <> initializationExitCalls
+
+-- | A display or socket that cannot be reached is identified by the report
+-- GLFW itself made during @glfwInit@, not by an outcome of its own. The
+-- session carries the code and the description through, so a display that is
+-- unavailable stays distinguishable from an unrelated platform error that
+-- fails the same call.
+testDisplayUnreachableReported ∷ Expectation
+testDisplayUnreachableReported = do
+  let failing code description =
+        defaultScript
+          { scriptInitialize = \reporter → reportError reporter code description >> pure False
+          }
+  unreachable ← newSeam (failing glfwPlatformUnavailableCode "Wayland: Failed to connect to display")
+  (missing, caught) ←
+    asProcessMainThread unreachable (caughtAs (entered unreachable (SessionConfig (Just Wayland)) (\_ → pure ())))
+  nativeOutcome missing `shouldBe` NativeCallFailed
+  map errorSummary (reportedErrors (nativeReports missing))
+    `shouldBe` [(glfwPlatformUnavailableCode, "Wayland: Failed to connect to display", False, ProcessMainThread)]
+  originOf caught `shouldBe` Just ("glfw", "initialize", [("backend", "wayland")])
+
+  -- A different native error fails the same call with the same outcome; only
+  -- GLFW's own report tells the two apart.
+  other ← newSeam (failing glfwPlatformErrorCode "Wayland: Failed to create window surface")
+  (unrelated, _) ←
+    asProcessMainThread other (caughtAs (entered other (SessionConfig (Just Wayland)) (\_ → pure ())))
+  nativeOutcome unrelated `shouldBe` NativeCallFailed
+  map errorSummary (reportedErrors (nativeReports unrelated))
+    `shouldBe` [(glfwPlatformErrorCode, "Wayland: Failed to create window surface", False, ProcessMainThread)]
+
+  -- The supported answer that admitted the backend said only that it was
+  -- compiled in: the connection is what failed, one call later.
+  seamCalls other
+    `shouldReturn` [ QueryPlatformSupported Wayland
+                   , CreateErrorCallback
+                   , AttachErrorCallback
+                   , SetInitHints Wayland
+                   , Initialize
+                   , DetachErrorCallback
+                   , FreeErrorCallback
+                   ]
 
 testRollbackFailurePoisons ∷ Expectation
 testRollbackFailurePoisons = do
@@ -494,6 +603,17 @@ initializationExitCalls = [Terminate, DetachErrorCallback, FreeErrorCallback]
 
 x11 ∷ [(Text, Text)]
 x11 = [("backend", "x11")]
+
+-- | A Darwin platform: Cocoa alone, admitted and built.
+darwinScript ∷ SeamScript
+darwinScript = defaultScript {scriptHostBackend = Just Cocoa, scriptAdmittedBackends = [Cocoa]}
+
+-- | @GLFW_PLATFORM_UNAVAILABLE@, which GLFW 3.4 reports when it cannot reach
+-- an X11 display, and @GLFW_PLATFORM_ERROR@, which it reports when it cannot
+-- connect to a Wayland socket.
+glfwPlatformUnavailableCode, glfwPlatformErrorCode ∷ Int
+glfwPlatformUnavailableCode = 0x0001000E
+glfwPlatformErrorCode = 0x00010008
 
 errorSummary ∷ NativeError → (Int, Text, Bool, ReportingThread)
 errorSummary entry =

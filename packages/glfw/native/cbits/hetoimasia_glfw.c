@@ -11,9 +11,14 @@
  * assumes the structure's layout.
  *
  * The close-request driver and the size-limit query exist for the native
- * examples only. It asks the
+ * examples only. The first asks the
  * platform to close a window the way its close button would, so GLFW's own
- * close callback reports a real native request.
+ * close callback reports a real native request. Both reach the window through
+ * a Cocoa or X11 handle, so both check the selected platform before asking
+ * GLFW for one and answer unavailable rather than provoking a
+ * GLFW_PLATFORM_UNAVAILABLE report the session would capture. An unavailable
+ * answer is this shim's, not the window's: closure and size constraints are
+ * GLFW's own on every backend.
  */
 #if defined(__linux__)
 #define _GNU_SOURCE
@@ -62,12 +67,15 @@ int hetoimasia_glfw_is_process_main_thread(void)
 }
 
 /* performClose: sends windowShouldClose: to GLFW's window delegate, which
- * reports the close request and answers NO, so nothing is closed. */
-void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
+ * reports the close request and answers NO, so nothing is closed. Zero says
+ * this helper could not deliver the request, not that the window refused it. */
+int hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 {
     id handle = glfwGetCocoaWindow(window);
-    if (handle != nil)
-        ((void (*)(id, SEL, id)) objc_msgSend)(handle, sel_registerName("performClose:"), nil);
+    if (handle == nil)
+        return 0;
+    ((void (*)(id, SEL, id)) objc_msgSend)(handle, sel_registerName("performClose:"), nil);
+    return 1;
 }
 
 /* NSSize is two CGFloats, doubles on every 64-bit Cocoa platform, and both
@@ -136,14 +144,28 @@ int hetoimasia_glfw_is_process_main_thread(void)
 /* Send the WM_DELETE_WINDOW client message a window manager sends for the
  * close button. GLFW 3.4 loads libX11 at run time rather than linking it, so
  * the three Xlib functions are looked up in that same library instead of
- * adding a link requirement for the examples. */
-void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
+ * adding a link requirement for the examples.
+ *
+ * The X11 accessors are asked for nothing unless GLFW selected X11: on any
+ * other platform glfwGetX11Display answers GLFW_PLATFORM_UNAVAILABLE, and the
+ * session would capture that report as a native failure. So the platform is
+ * checked first — glfwGetPlatform reports no error — and this helper simply
+ * answers unavailable. That is this driver being unavailable, not window
+ * closure: on a Wayland session a compositor-generated close request has not
+ * been demonstrated yet. */
+int hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 {
-    Display* display = glfwGetX11Display();
-    Window handle = glfwGetX11Window(window);
-    void* xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    Display* display;
+    Window handle;
+    void* xlib;
+    int delivered = 0;
+    if (glfwGetPlatform() != GLFW_PLATFORM_X11)
+        return 0;
+    display = glfwGetX11Display();
+    handle = glfwGetX11Window(window);
+    xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
     if (xlib == NULL)
-        return;
+        return 0;
     Atom (*internAtom)(Display*, const char*, Bool) = dlsym(xlib, "XInternAtom");
     Status (*sendEvent)(Display*, Window, Bool, long, XEvent*) = dlsym(xlib, "XSendEvent");
     int (*flush)(Display*) = dlsym(xlib, "XFlush");
@@ -158,16 +180,25 @@ void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
         event.xclient.data.l[1] = CurrentTime;
         sendEvent(display, handle, False, NoEventMask, &event);
         flush(display);
+        delivered = 1;
     }
     dlclose(xlib);
+    return delivered;
 }
 
-/* Read WM_NORMAL_HINTS through the same run-time libX11 the close driver uses. */
+/* Read WM_NORMAL_HINTS through the same run-time libX11 the close driver uses,
+ * behind the same platform check: zero says this helper could not read the
+ * limits, never that the window holds none. */
 int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
 {
-    Display* display = glfwGetX11Display();
-    Window handle = glfwGetX11Window(window);
-    void* xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    Display* display;
+    Window handle;
+    void* xlib;
+    if (glfwGetPlatform() != GLFW_PLATFORM_X11)
+        return 0;
+    display = glfwGetX11Display();
+    handle = glfwGetX11Window(window);
+    xlib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
     if (xlib == NULL)
         return 0;
     XSizeHints* (*allocHints)(void) = dlsym(xlib, "XAllocSizeHints");
@@ -208,9 +239,10 @@ static int waiting_thread_blocked(void)
     return 0;
 }
 
-void hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
+int hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
 {
     (void) window;
+    return 0;
 }
 
 int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
