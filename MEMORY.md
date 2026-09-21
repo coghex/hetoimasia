@@ -21,8 +21,14 @@ The owner accepted legacy coverage through `a89d419`; together these complete
 the guide's historical review queue through `d40c387`. Those five findings are
 now processed; implementation remains tracked in #201, #208, #211 and #212,
 and qualification gates remain in force. The [next guide review](docs/guide/2026-09-20T201612Z-8b2fcfd-ff7e.md)
-extends coverage through `8b2fcfd` (PR #210), verifies the dispositions, and
-records the remaining owner-loop policy decision and a small wording correction.
+extends coverage through `8b2fcfd` (PR #210). Its two findings are now processed:
+graphics-owner design under #155 and the wording repair #224. The
+[latest guide review](docs/guide/2026-09-21T035017Z-9f72b04-768f.md) extends coverage
+through `9f72b04` (PRs #213/#214), checks the newly approved Vulkan and repair
+issues, and records the owner-approved amendments now posted to #216/#220, with
+coordination on #229/#221. GUIDE-3 remains unprocessed: the reproduced X11 helper
+diagnostic flake needs a repair issue. Posting the amendments does not claim
+their implementations are complete or replace canonical readiness review.
 `$guide continue` handles one follow-up at a time without repeating old audits.
 
 ## Direction and owner preferences
@@ -35,8 +41,9 @@ records the remaining owner-loop policy decision and a small wording correction.
   engine import of concrete game code, or new all-purpose application monad.
 - Develop infrastructure methodically before Vulkan. A rendered triangle is the
   first eventual graphics result; it is not a reason to skip lifecycle work.
-  The first GLFW/render owner runs on the process main thread. Concurrency needs
-  a concrete purpose, explicit ownership and bounded communication.
+  GLFW stays on the process main thread; accepted Vulkan D-29–D-33 place rendering
+  on a separate supervised graphics owner with protected retirement and bounded
+  handoffs. Native evidence must still establish progress during Cocoa modal loops.
 - Preserve Synarchy's useful behavior and rationale deliberately: inspect its
   windowing, monotonic time, Vulkan ownership, Lua and rendering code before
   replacing concepts. Do not copy its central environment or game managers.
@@ -239,10 +246,12 @@ records the remaining owner-loop policy decision and a small wording correction.
   observed, with no owner turn and no update opportunity in either — while a
   window move does not block it at all. Cocoa keeps requesting a redraw about
   111 times a second throughout a resize; a menu tracking loop delivers nothing.
-  Open decision, owned before VK-16: accept the stall, add a narrowly controlled
-  redraw path, or introduce a separate rendering owner. The
-  [verdict](docs/owner_loop_interaction_verdict.md) states what each implies and
-  chooses none. The probe behind it is selectable and never routine.
+  Resolved by Vulkan D-29–D-33: introduce the separate graphics owner in VK-18/#218
+  and its Vulkan integration in VK-7/#219; VK-16/#232 owes the Cocoa progress
+  evidence. The [verdict](docs/owner_loop_interaction_verdict.md) is historical
+  measurement, not a later policy decision. Its probe stays selectable, never
+  routine. Simulation remains application-owned; scene snapshots can originate
+  on any application thread without introducing a simulation driver in this arc.
 - [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
   #141, #142, #143, and #144 are merged. The current review report records
   follow-up repairs; #166–#169 have now merged. The review ledger records their
