@@ -14,7 +14,7 @@
 -- or an observed state, and coordinates threads with STM and 'MVar's.
 module Test.GLFW.Owner (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId)
+import Control.Concurrent (ThreadId, forkFinally, forkIO, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Concurrent.STM
@@ -38,13 +38,14 @@ import Control.Exception
   , throwTo
   , try
   )
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, unless, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.Foundation.Time
   ( Duration
@@ -82,13 +83,18 @@ import Hetoimasia.Runtime.Supervision
   , checkRuntime
   )
 import Numeric.Natural (Natural)
+import Hetoimasia.Foundation.Log (Logger)
 import Test.GLFW.Support
-  ( at
+  ( SinkTrace
+  , at
   , boundedExample
   , caughtAs
   , current
   , millis
+  , newSinkTrace
   , quietLogger
+  , sinkFailingOn
+  , traced
   , unexpected
   , windowNamed
   )
@@ -107,6 +113,12 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testCancelledConstruction)
     it "certifies a verified rollback's facts without a retirement of its own"
       (boundedExample testVerifiedRollback)
+    it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
+      (boundedExample testHandoverRecovery)
+    it "leaves no attachment the owner never hears of, however a handover is cancelled"
+      (boundedExample testCancelledHandover)
+    it "keeps its retained per-target cells bounded across repeated detach-and-reattach cycles"
+      (boundedExample testReattachmentBounded)
 
   describe "independent progress" $ do
     it "keeps taking rounds while the main thread is blocked"
@@ -117,6 +129,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testWakeWithheld)
     it "meets a deadline of its own from its own timer, with nothing else waking it"
       (boundedExample testOwnDeadline)
+    it "wakes an idle owner for newly published demand and a newer scene"
+      (boundedExample testPublicationWakesIdleOwner)
 
   describe "the bounded lifetime port" $ do
     it "reports a full port as backpressure, having reserved and attached nothing"
@@ -151,6 +165,12 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testCompletionWithoutEvidence)
     it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
       (boundedExample testRefusedNoticeRetained)
+    it "closes the owner's admission and begins its retirement as soon as a required failure is latched"
+      (boundedExample testRequiredFailureClosesAdmission)
+    it "retains the windows, the session and every parent when whole-owner destruction fails, with no target at all"
+      (boundedExample testUnverifiedDestructionRetains)
+    it "refuses every publication into the handoff once the owner has quiesced"
+      (boundedExample testPublicationsClosedAtExit)
 
   describe "the owner's GLFW discipline" $
     it "makes no GLFW call of its own: every native call from its thread is the authorized wake"
@@ -177,6 +197,7 @@ data Note
   | TargetRetirement !Text
   | OwnerRetirement
   | OwnerDestruction
+  | DestroyRaised !Text
   | WindowGone !Int
     -- ^ The seam's own destroy call, named by the window's creation order.
   | SessionEnded
@@ -279,7 +300,12 @@ fakeOperations fake =
     , graphicsDestroyOwner = \destroy → do
         mark
         note (fakeJournal fake) OwnerDestruction
-        readTVarIO (fakeDestroy fake) >>= ($ destroy)
+        outcome ← try (readTVarIO (fakeDestroy fake) >>= ($ destroy))
+        case outcome ∷ Either SomeException OwnerDestroyed of
+          Right evidence → pure evidence
+          Left caught → do
+            note (fakeJournal fake) (DestroyRaised (Text.pack (show caught)))
+            throwIO caught
     }
   where
     mark = do
@@ -391,14 +417,25 @@ ownedHost
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
-ownedHost seam config ownerConfig action =
+ownedHost = ownedHostWith quietLogger
+
+-- | 'ownedHost' over a logger the example supplies, for the one example that
+-- must observe the diagnostic an unverified destruction writes.
+ownedHostWith
+  ∷ Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostWith logger seam config ownerConfig action =
   asProcessMainThread seam $
     runGraphicsOwnerApplication
-      (withLoggingLifetime quietLogger)
+      (withLoggingLifetime logger)
       (Text.pack "owner-example")
       ( \_ use →
           withGraphicsOwnerHostIn
-            quietLogger
+            logger
             (seamSession seam defaultSessionConfig)
             config
             ownerConfig
@@ -631,6 +668,13 @@ testCancelledConstruction = do
   script (fakeConstruct (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "transfer")))
   observedStanding ← newTVarIO Nothing
   observedRecord ← newTVarIO Nothing
+  -- Its retirement is held until the example has read the standing, because
+  -- a required failure takes the owner into its drain at once and the drain
+  -- retires the target it kept.
+  gate ← newTVarIO False
+  script (fakeRetireTarget (rigFake rig)) $ \retire → do
+    atomically (readTVar gate >>= check)
+    pure (targetRetired (Text.pack (show (retiringWindow retire))))
   -- The owner's disposition is required, so the failure it kept is terminal
   -- and the whole run reports it. What the example asserts is what the owner
   -- did with the target /before/ that: it kept it, and it retired it.
@@ -640,6 +684,7 @@ testCancelledConstruction = do
       service ← handedOver host owner window
       standing ← awaitStanding owner service
       atomically (writeTVar observedStanding (Just standing))
+      atomically (writeTVar gate True)
       _ ← releaseGraphicsTarget host owner service
       record ← awaitTerminal owner service
       atomically (writeTVar observedRecord (Just record))
@@ -691,7 +736,9 @@ testBlockedMainThread = do
     _ ← handedOver host owner window
     -- The main thread does nothing at all from here: no turn, no pump, no
     -- publication. The owner's rounds are its own.
-    awaitRound owner 5
+    observed' ← awaitRound owner 5
+    script (fakeStep (rigFake rig)) (\_ → pure noStepWork)
+    pure observed'
   statusRounds status `shouldSatisfy` (> 5)
 
 -- | An owner blocked inside its own step does not stop the main thread's
@@ -727,8 +774,16 @@ testWakeWithheld = do
     -- No target, no observation, no demand, no scene, and no pump: nothing at
     -- all crosses from the main thread, and the owner still progresses.
     status ← awaitRound owner 3
+    -- Stop owing work before the exit, so what it asserts is the owner's
+    -- progress rather than a hot loop racing its own retirement.
+    script (fakeStep (rigFake rig)) (\_ → pure noStepWork)
     pure (statusRounds status)
   rounds `shouldSatisfy` (> 3)
+  journalled (rigJournal rig) >>= \notes → filter raised notes `shouldBe` []
+  where
+    raised = \case
+      DestroyRaised _ → True
+      _ → False
 
 -- | A deadline the backend named is met from the owner's own timer.
 testOwnDeadline ∷ IO ()
@@ -977,10 +1032,6 @@ testHousekeepingDuringDrain = do
   maybe True (\main → all ((== main) . fst) (filter (isPump . snd) calls)) owner `shouldBe` True
   where
     housekeeping = filter (isPump . snd)
-    isPump = \case
-      PollEvents → True
-      WaitEvents _ → True
-      _ → False
 
 -- | Whole-owner retirement does not depend on there ever having been a target.
 testWholeOwnerWithoutTargets ∷ IO ()
@@ -1095,14 +1146,19 @@ describeStart = \case
 testCompletionWithoutEvidence ∷ IO ()
 testCompletionWithoutEvidence = do
   rig ← newRig
-  -- Nothing the backend is asked for succeeds after startup, so the owner ends
-  -- with no record for its target and no destruction evidence of its own.
-  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "step")))
+  trace ← newSinkTrace
+  let recording = sinkFailingOn (Text.pack "never") trace
+  -- Nothing the backend is asked for succeeds once it holds a target, so the
+  -- owner ends with no record for it and no destruction evidence of its own.
+  -- The step fails only after the target exists, so the handover below is the
+  -- ordinary one rather than a race with the owner's own admission closing.
+  script (fakeStep (rigFake rig)) $ \step →
+    if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
   script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
   script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
   script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
       window ← theWindow host
       service ← handedOver host owner window
       -- The owner's run has ended and it established nothing.
@@ -1118,16 +1174,32 @@ testCompletionWithoutEvidence = do
       pending ← atomically (hostPendingAttachments host)
       length pending `shouldBe` 1
       -- Independent evidence, from a thread that is not the main one, is the
-      -- only thing that can retire it — which is what lets this example's own
-      -- exit finish rather than retaining the window forever.
+      -- only thing that can retire any of this — the attachment's facts, and
+      -- then the owner's own destruction. Without both, the boundary retains
+      -- the window, the session and every parent for good, which is the whole
+      -- point; with them, this example's exit can finish.
       publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
       acknowledgement ←
         atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
           >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-      void . forkIO . forM_ allRetirementFacts $ \fact →
-        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+      void . forkIO $ do
+        -- The attachment is still the main thread's and is only retiring once
+        -- the exit's quiescence has begun it, so the facts are published into
+        -- a model that can record them rather than refuse them.
+        atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+        -- Then the owner's own destruction, once the boundary is demonstrably
+        -- retaining everything for the want of it: the attachment drain has
+        -- finished and the exit has said, once, what it is retaining.
+        atomically (check . null =<< hostPendingAttachments host)
+        awaitDiagnostic trace
+        publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
   unverifiedRetired unverified `shouldBe` False
   unverifiedTargets unverified `shouldBe` 1
+  -- Said exactly once, whatever the wait then had to do.
+  components ← traced trace
+  length (filter (== Text.pack "glfw.graphics-owner") components) `shouldBe` 1
 
 -- | A terminal fact the completion publisher could not carry stays owed, and
 -- nothing loses it.
@@ -1203,6 +1275,256 @@ testOwnerMakesNoGlfwCall = do
   filter (/= PostEmptyEvent) fromOwner `shouldBe` []
   -- And the wake really was used, so the assertion above is not vacuous.
   fromOwner `shouldSatisfy` (not . null)
+
+-- ---------------------------------------------------------------------------
+-- Reservations, cancellation, and bounded retention
+
+-- | A refused handover spends no reservation, and an attachment whose answer
+-- was lost is still announced.
+testHandoverRecovery ∷ IO ()
+testHandoverRecovery = do
+  -- One event of room, so a leaked reservation makes the next handover fail.
+  rig ← newRigWith (\config → config {ownerEventCapacity = 1})
+  clock ← countingClock
+  let config =
+        (ownerSettings clock)
+          { hostWindowConfigs = [windowNamed (Text.pack "closing"), windowNamed (Text.pack "open")]
+          }
+  gate ← newTVarIO False
+  entered ← newEmptyMVar
+  -- The owner is held inside its startup, so it drains no event: the one slot
+  -- has to be given back by each refusal for the last handover to fit at all.
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  (refusals, announced, owned) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+    takeMVar entered
+    windows ← atomically (hostWindowIdentities host)
+    case windows of
+      [closing, open] → do
+        _ ← closeHostWindow host closing
+        -- Refused before any effect, three times over, each of which must
+        -- give its held reservation back.
+        refusals ← mapM (\_ → handOverGraphicsTarget host owner closing) [1 ∷ Int .. 3]
+        -- The recovery path an interrupted handover takes: attach with the
+        -- owner's own protocol, then announce. It spends the one slot every
+        -- refusal above returned, so a leak would refuse it.
+        attached ← attachWindowGraphics host open (graphicsTargetProtocol host owner)
+        announced ← case attached of
+          GraphicsAttached service → announceGraphicsTarget owner service
+          other → unexpected ("the direct attachment failed: " <> show other)
+        atomically (writeTVar gate True)
+        awaitConstructed rig (Text.pack (show open))
+        owned ← atomically (readOwnerTargets owner)
+        pure (refusals, announced, owned)
+      other → unexpected ("the host created " <> show (length other) <> " windows")
+  map describeHandover refusals `shouldBe` replicate 3 "refused"
+  announced `shouldBe` EventAdmitted
+  length owned `shouldBe` 1
+
+-- | However a handover is cancelled, the host never ends up holding an
+-- attachment the owner was not told about.
+--
+-- The cancellation is delivered without coordination, on purpose: the
+-- assertion is an invariant that must hold wherever it lands, so an arbitrary
+-- instant is better evidence than a chosen one. Twenty attempts cover the
+-- reservation, the attachment and the announcement between them.
+testCancelledHandover ∷ IO ()
+testCancelledHandover = do
+  rig ← newRig
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    forM_ [1 ∷ Int .. 20] $ \_ → do
+      settled ← newEmptyMVar
+      -- 'forkFinally' settles the cell under a mask, so a cancellation that
+      -- arrives before the handover is even entered still reports.
+      handing ← forkFinally (handOverGraphicsTarget host owner window) (putMVar settled)
+      throwTo handing ThreadKilled
+      outcome ← takeMVar settled
+      -- Either nothing is attached, or the owner knows about exactly what is.
+      pending ← atomically (hostPendingAttachments host)
+      forM_ pending $ \target →
+        atomically (ownerTargetAcknowledgement owner target) >>= \held →
+          isJust held `shouldBe` True
+      -- Put the window back for the next attempt.
+      case outcome ∷ Either SomeException GraphicsHandover of
+        Right (TargetHandedOver service) → void (releaseGraphicsTarget host owner service)
+        _ →
+          atomically (windowGraphicsService host window)
+            >>= mapM_ (void . releaseGraphicsTarget host owner)
+      pumpUntilRetired host control
+
+-- | Repeated detach-and-reattach leaves one window's worth of retained cells,
+-- not one per incarnation.
+testReattachmentBounded ∷ IO ()
+testReattachmentBounded = do
+  rig ← newRig
+  (records, geometry, acknowledged) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    forM_ [1 ∷ Int .. 4] $ \_ → do
+      service ← handedOver host owner window
+      seen ← sampledObservation host window
+      _ ← observed owner service 1 seen
+      awaitStanding owner service `shouldReturn` TargetUsable
+      _ ← releaseGraphicsTarget host owner service
+      _ ← awaitTerminal owner service
+      pumpUntilRetired host control
+    -- The round after the last validation prunes what it established.
+    pumpUntil host control "the pruned round" (Map.null <$> atomically (readTargetTerminalsNow owner))
+    (,,)
+      <$> atomically (readTargetTerminalsNow owner)
+      <*> atomically (readOwnerGeometry owner)
+      <*> atomically (readOwnerAcknowledged owner)
+  Map.size records `shouldBe` 0
+  Map.size geometry `shouldBe` 0
+  length acknowledged `shouldBe` 0
+
+-- | An idle owner wakes for demand and for a scene, not only for an event, an
+-- observation or its own timer.
+testPublicationWakesIdleOwner ∷ IO ()
+testPublicationWakesIdleOwner = do
+  rig ← newRig
+  (afterDemand, afterScene, scenes) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+    -- The owner is idle: no target, no deadline, no event, and its step owes
+    -- nothing. Only a publication can wake it.
+    first ← awaitIdle owner
+    demand ← prepare (OwnerDemand True Nothing)
+    published ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
+    published `shouldBe` Published
+    afterDemand ← atomically (awaitOwnerRound owner (statusRounds first))
+    second ← awaitIdle owner
+    scene ← prepare (Scene 7)
+    _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+    afterScene ← atomically (awaitOwnerRound owner (statusRounds second))
+    scenes ← readTVarIO (fakeScenes (rigFake rig))
+    pure (statusRounds afterDemand, statusRounds afterScene, scenes)
+  afterDemand `shouldSatisfy` (> 0)
+  afterScene `shouldSatisfy` (> afterDemand)
+  -- The scene the owner stepped with is the one that was published.
+  last scenes `shouldBe` Scene 7
+
+-- | Wait until the owner has settled into a round it will not leave by itself.
+--
+-- It is the owner's own idleness the example needs, not a count: the round
+-- number is read once the owner has stopped advancing it, so the wait the
+-- example then makes can only be ended by the publication it makes.
+awaitIdle ∷ GraphicsOwner Scene → IO OwnerStatus
+awaitIdle owner = do
+  status ← atomically (awaitOwnerRound owner 0)
+  settled ← atomically (readOwnerStatusNow owner)
+  if statusRounds settled == statusRounds status then pure settled else awaitIdle owner
+
+-- | A required failure closes the owner's admission and takes it into its
+-- retirement at once, rather than waiting for the exit.
+testRequiredFailureClosesAdmission ∷ IO ()
+testRequiredFailureClosesAdmission = do
+  rig ← newRig
+  release ← newTVarIO False
+  retiring ← newEmptyMVar
+  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
+  script (fakeRetireOwner (rigFake rig)) $ \_ → do
+    putMVar retiring ()
+    atomically (readTVar release >>= check)
+    pure (ownerRetired (Text.pack "retired"))
+  observedRefusal ← newTVarIO Nothing
+  observedPhase ← newTVarIO OwnerStarting
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      takeMVar retiring
+      -- The owner is already retiring and its admission is already closed, so
+      -- a handover now leaves nothing attached at all.
+      answer ← handOverGraphicsTarget host owner window
+      pending ← atomically (hostPendingAttachments host)
+      length pending `shouldBe` 0
+      status ← atomically (readOwnerStatusNow owner)
+      atomically $ do
+        writeTVar observedRefusal (Just (describeHandover answer))
+        writeTVar observedPhase (statusPhase status)
+      void (forkIO (atomically (writeTVar release True)))
+  raised `shouldBe` Scripted (Text.pack "fatal step")
+  readTVarIO observedRefusal `shouldReturn` Just "owner closed"
+  readTVarIO observedPhase `shouldReturn` OwnerRetiring
+
+describeHandover ∷ GraphicsHandover → String
+describeHandover = \case
+  TargetHandedOver _ → "handed over"
+  HandoverRefused _ → "refused"
+  HandoverPortFull → "port full"
+  HandoverOwnerClosed → "owner closed"
+
+-- | Whole-owner destruction that produced no evidence retains everything the
+-- owner borrowed, with no target involved at all.
+testUnverifiedDestructionRetains ∷ IO ()
+testUnverifiedDestructionRetains = do
+  rig ← newRig
+  trace ← newSinkTrace
+  let recording = sinkFailingOn (Text.pack "never") trace
+  script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+  releasedWhileRetained ← newTVarIO Nothing
+  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+      _ ← awaitRound owner 0
+      -- From another thread: wait until the exit has said, once, what it is
+      -- retaining and why — which it does before it settles into the wait —
+      -- then record what has been released, and only then supply the
+      -- independent evidence that lets the boundary finish.
+      void . forkIO $ do
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        awaitDiagnostic trace
+        notes ← journalled (rigJournal rig)
+        atomically (writeTVar releasedWhileRetained (Just (filter released notes)))
+        publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
+  unverifiedRetired unverified `shouldBe` True
+  unverifiedTargets unverified `shouldBe` 0
+  -- Nothing of the host's was released while the evidence was missing.
+  readTVarIO releasedWhileRetained `shouldReturn` Just []
+  -- And it was released in the end, after the evidence existed.
+  notes ← journalled (rigJournal rig)
+  notes `shouldContain` [SessionEnded]
+  where
+    released = \case
+      WindowGone _ → True
+      SessionEnded → True
+      _ → False
+
+-- | Wait until the graphics owner's own component has written its one
+-- diagnostic, which the exit writes before it settles into retaining.
+-- The sink's record is an ordinary cell rather than a transaction, so this
+-- polls it; 'yield' between polls is a scheduler hint, not a wait for a
+-- timing outcome, and it keeps the poll from starving the thread it is
+-- waiting for.
+awaitDiagnostic ∷ SinkTrace → IO ()
+awaitDiagnostic trace = do
+  components ← traced trace
+  unless (Text.pack "glfw.graphics-owner" `elem` components) (yield >> awaitDiagnostic trace)
+
+isPump ∷ NativeCall → Bool
+isPump = \case
+  PollEvents → True
+  WaitEvents _ → True
+  _ → False
+
+-- | Every publication into the handoff is refused once the owner has quiesced.
+testPublicationsClosedAtExit ∷ IO ()
+testPublicationsClosedAtExit = do
+  rig ← newRig
+  escaped ← newEmptyMVar
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    service ← handedOver host owner window
+    _ ← releaseGraphicsTarget host owner service
+    _ ← awaitTerminal owner service
+    pumpUntilRetired host control
+    putMVar escaped (ownerHandoff owner, graphicsAttachment service)
+  (handoff, target) ← takeMVar escaped
+  demand ← prepare (OwnerDemand True Nothing)
+  scene ← prepare (Scene 1)
+  event ← prepare (TargetReleased target)
+  atomically (publishOwnerDemand handoff demand) `shouldReturn` PublicationClosed
+  atomically (publishOwnerScene handoff scene) `shouldReturn` ScenePublication PublicationClosed
+  atomically (offerTargetEvent handoff event) `shouldReturn` EventPortClosed
 
 -- ---------------------------------------------------------------------------
 -- The extent seam

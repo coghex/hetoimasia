@@ -88,6 +88,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , takeTargetEvents
   , closeTargetEvents
   , pendingTargetEvents
+  , closeOwnerPublications
 
     -- * Main thread to owner: observations
   , TargetObservation (..)
@@ -125,12 +126,14 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , targetTerminal
   , recordTargetTerminal
   , recordPublishedFact
+  , forgetTargetTerminal
   , OwnerTerminal (..)
   , noOwnerTerminal
   , ownerTerminal
   , recordOwnerRetired
   , recordOwnerDestroyed
   , recordOwnerEnded
+  , ownerDestructionVerified
 
     -- * The extent seam
   , TargetGeometry (..)
@@ -156,6 +159,7 @@ import Control.Concurrent.STM
   )
 import Control.DeepSeq (NFData (rnf))
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Hetoimasia.Foundation.Messaging.Channel
@@ -176,6 +180,7 @@ import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue
 import Hetoimasia.Foundation.Messaging.Snapshot
   ( Publication (..)
   , SnapshotPublisher
+  , closeSnapshot
   , cursorRevision
   , newSnapshot
   , observedCursor
@@ -457,6 +462,22 @@ takeTargetEvents handoff = go []
 closeTargetEvents ∷ OwnerHandoff scene → STM ()
 closeTargetEvents = closeChannel . handoffEvents
 
+-- | End every publication into the handoff: the lifetime port, the demand
+-- snapshot, the scene snapshot, and each target's observation slot.
+--
+-- The owner's quiescence closes all of them together, for the reason the
+-- host's own quiescence closes its ports: after it, a publisher holding an
+-- escaped endpoint is told its publication was refused rather than being left
+-- to believe an owner that has ended received it. Each is idempotent, and none
+-- is ever reopened.
+closeOwnerPublications ∷ OwnerHandoff scene → STM ()
+closeOwnerPublications handoff = do
+  closeTargetEvents handoff
+  closeSnapshot (handoffDemand handoff)
+  closeSnapshot (handoffScene handoff)
+  slots ← readTVar (handoffSlots handoff)
+  mapM_ (closeSnapshot . slotSnapshot) (Map.elems slots)
+
 -- | How many events are queued, for an example that must prove the port is
 -- full rather than assume it. It takes nothing and changes nothing.
 pendingTargetEvents ∷ OwnerHandoff scene → STM Natural
@@ -610,8 +631,24 @@ recordPublishedFact handoff target fact =
         , terminalPublished = terminalPublished record <> [fact]
         }
 
+-- | Drop one target's terminal record, once the attachment it belongs to has
+-- validated the facts it established and left the host's pending set.
+--
+-- Nothing here is dropped on the owner's say-so: the caller establishes that
+-- the exact attachment is gone from the host's own model first, which is what
+-- keeps these cells bounded by the live windows rather than by how many
+-- incarnations a window has ever had.
+forgetTargetTerminal ∷ OwnerHandoff scene → AttachmentId → STM ()
+forgetTargetTerminal handoff target =
+  modifyTVar' (handoffTargetTerminals handoff) (Map.delete target)
+
 ownerTerminal ∷ OwnerHandoff scene → STM OwnerTerminal
 ownerTerminal = readTVar . handoffOwnerTerminal
+
+-- | Whether the owner's whole-owner destruction evidence has been established,
+-- by the owner itself or by an independent publisher.
+ownerDestructionVerified ∷ OwnerHandoff scene → STM Bool
+ownerDestructionVerified handoff = isJust . ownerDestroyedEvidence <$> ownerTerminal handoff
 
 recordOwnerRetired ∷ OwnerHandoff scene → Text → STM ()
 recordOwnerRetired handoff evidence =

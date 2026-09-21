@@ -72,16 +72,30 @@ application checkpoints through `superviseGraphicsOwner`, which registers one
 ordinary supervised service in the application's own group — a separate worker
 group gives supervision no connection by itself, so the connection is explicit.
 An owner that ends without the injected whole-owner destruction returning
-evidence answers `OwnerDestructionUnverified`, which retains that fact and
-authorizes nothing: not a disposal, and not a replay of the work that failed.
+evidence does not let the boundary finish: the main thread keeps servicing
+housekeeping, the windows, the session and every borrowed parent stay
+retained, and `OwnerDestructionUnverified` is written once as the diagnostic
+that says so. That is D-4's retention rule applied to the owner's own shared
+state, and it authorizes nothing: not a disposal, and not a replay of the work
+that failed. Only independent evidence ends it —
+`publishOwnerDestruction`, from a thread that established it, which is the
+same shape the attachment model already has for a fact certified by a thread
+other than the owner — and operator process termination remains the escape.
 Whole-owner retirement is independent of the attachment count in both
-directions — it happens for an owner that never held a target, and after the
+directions: it happens for an owner that never held a target, and after the
 last one has detached.
 
 An individual close or detach is not that: `releaseGraphicsTarget` retires one
 target, the owner publishes that target's exact evidence, the main thread
 acknowledges it and its window is released, and the shared owner and every
 other target stay live. Only a whole-host exit requires the final join.
+
+A terminal failure under a `Required` disposition is terminal at once: the same
+transaction that latches it closes every admission into the owner's handoff,
+and its run ends there and enters the drain, so nothing further is handed to
+an owner that is about to retire. The latch stays for supervision, which
+reaches application checkpoints through one ordinary supervised service the
+composition registers in the application's own group.
 
 One rule the delivered machinery makes explicit that D-6 left implicit: the
 owner never retires an attachment the main thread still holds. When a target's

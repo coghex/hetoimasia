@@ -3638,6 +3638,26 @@ publishing terminal evidence, or from making progress on what it already
 holds — those travel on the stop token, on the terminal cells, and on the
 snapshots.
 
+Every step from holding that room to spending it runs under a mask, and only
+the attachment itself — the one part that runs for an unbounded time — is
+restored. So no cancellation can land in the gap between reserving the port's
+room and spending it, between reserving the window's slot and telling the
+owner, or between beginning a detach and delivering its event. A cancellation
+delivered inside the attachment can still lose the caller's answer while the
+attachment is perfectly established; the handover finds it from the
+acknowledgement its own protocol recorded and announces it before the
+cancellation propagates, so no attachment is ever left that the owner never
+hears of. The one case where the main thread retires a target itself is an
+attachment the owner's admission closed under: the owner never received it,
+never entered its construction and owns nothing for it, so there is no backend
+work to have ended and leaving it retiring would retain its window against a
+retirement nothing was going to perform.
+
+Quiescence closes all of it together — the port, the demand and scene
+snapshots, and every observation slot — so a publisher holding an escaped
+endpoint after the owner has ended is told its publication was refused rather
+than left to believe it arrived.
+
 Every snapshot holds one value, so a publisher never waits and a slow reader
 grows nothing. A target's observations carry their own revision, which must
 strictly increase: a delayed publication answers `ObservationStale` and changes
@@ -3683,11 +3703,15 @@ only independent evidence revives it.
 
 The owner schedules its own waits from its own deadlines and its own demand, on
 the host's injected `hostClock` and an injected `OwnerTimer`. It wakes for a
-stop, a lifetime event, a fresher observation, or its own deadline. Nothing
-here waits for the main thread to wake it: with the main loop's wake withheld
-entirely the owner still meets its deadlines and still makes progress on what
-it holds, and the deadline it publishes back is coordination for the main
-loop's idle bound and nothing more.
+stop, a latched terminal failure, a lifetime event, a fresher observation, a
+newly published demand or scene, a record it may now forget, or its own
+deadline. Publications are in that list for a reason worth saying plainly: an
+owner with no deadline and no event of its own would otherwise sleep through a
+publisher asking for a frame *now*. Nothing here waits for the main thread to
+wake it: with the main loop's wake withheld entirely the owner still meets its
+deadlines and still makes progress on what it holds, and the deadline it
+publishes back is coordination for the main loop's idle bound and nothing
+more.
 
 #### During a main-thread stall
 
@@ -3744,6 +3768,20 @@ A whole-session exit runs in this order:
    only then, the boundary joins the owner;
 6. the host's windows, session and parents unwind.
 
+Step 4's wait returns for the evidence and for nothing else. Not for the
+owner's run ending, not for its worker becoming terminal, and not for an empty
+target set: none of those establishes that the owner's shared state was
+released, and returning on one would unwind the windows, the session and every
+borrowed parent behind it. An owner that ended without the evidence therefore
+retains them — exactly as a stalled attachment retains its window — and says
+so once, through `OwnerDestructionUnverified` under the
+`glfw.graphics-owner` component, which is a diagnostic and never an authority.
+Only independent evidence ends the wait after that: `publishOwnerDestruction`,
+from a thread that established it, which is the same shape the attachment
+model already has for a fact a thread other than the owner certified. Operator
+process termination remains the escape, and no timeout grants the authority,
+because a timeout is not evidence.
+
 An individual close or detach is not that. `releaseGraphicsTarget` retires one
 target, the owner publishes that target's exact evidence, the main thread
 acknowledges it and its window is released, and the owner and every other
@@ -3757,8 +3795,16 @@ not evidence, and neither is the worker ending.
 
 #### Failure, cancellation and what is never permission
 
-A terminal owner failure is latched as soon as it is known and closes the
-admission it affects, without waiting for retirement to finish.
+A terminal owner failure is latched as soon as it is known. Under a `Required`
+disposition that is terminal in full: the same transaction closes every
+admission into the handoff, the owner's run ends there rather than taking
+another round, and it goes into its own protected drain — so no further target
+is handed to an owner that is about to retire, and none is constructed by the
+round the failure interrupted. The latch stays for supervision, and the main
+thread is woken at once, so a checkpoint raises while retirement is still to
+come. An `Optional` owner's recognized failure leaves the component
+unavailable and the run going, which is the established disposition contract
+and not a second one.
 `superviseGraphicsOwner` registers one ordinary supervised service in the
 application's own group whose whole job is to wait on that latch and fail with
 what it holds; a separate worker group gives supervision no connection by
@@ -3821,7 +3867,15 @@ with no retirement evidence retaining its window, its slot and every owed fact,
 with independent evidence the only thing that retires it; terminal facts the
 completion publisher refused staying owed and transported at the next
 opportunity; every native call from the owner's thread being the authorized
-wake; and the extent seam's four pure cases.
+wake; the extent seam's four pure cases; a refused handover leaking no reservation
+and an attachment whose answer was lost still being announced; twenty
+cancelled handovers, each leaving either nothing attached or an attachment the
+owner knows of; four detach-and-reattach cycles leaving no retained cell
+behind; an idle owner woken by a published demand and by a newer scene; a
+required failure closing admission and entering retirement before the
+checkpoint; a failed whole-owner destruction retaining the windows and the
+session until independent evidence arrives, with the one diagnostic written
+once; and every publication into the handoff refused after quiescence.
 
 The opacity examples compile external clients that reach for the owner's
 implementation and its handoff in the private sublibrary, and that forge the
@@ -4324,9 +4378,9 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Graphics target observation slots | The graphics owner's handoff | The main thread publishes; the owner reads | Any; STM | A target's attachment until the owner releases it | At most one per window the host may hold; removed when the owner releases the target, after which a publication for it answers unknown |
 | Graphics render demand and scene snapshots | The graphics owner's handoff | The main thread publishes the demand; any application thread publishes the scene; the owner reads both | Any; STM | The owner worker | One value each, replaced by every publication; closed by the exit |
 | Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
-| Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | The owner worker | At most one per window the host may hold; a record is written once and never replaced, and its facts stay owed until they have been validated |
-| Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record; the geometry keeps the last coherent framebuffer observation and reported bounds per target |
-| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | The host | Kept after the target's own state is gone, because a fact may still be owed once the target has retired |
+| Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
+| Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record, and the geometry — the last coherent framebuffer observation and reported bounds — leaves with its target |
+| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts | Kept while a fact may still be owed for a target whose own state is gone, and forgotten with that target's record |
 | Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
 

@@ -686,15 +686,19 @@ module Hetoimasia.Runtime.GLFW
   , GraphicsHandover (..)
   , handOverGraphicsTarget
   , announceGraphicsTarget
+  , graphicsTargetProtocol
   , publishGraphicsObservation
   , releaseGraphicsTarget
   , ReleaseAnswer (..)
+  , publishOwnerRetirement
+  , publishOwnerDestruction
 
     -- ** What crosses, and what comes back
   , OwnerHandoff
   , ownerHandoff
   , TargetEvent (..)
   , EventAdmission (..)
+  , offerTargetEvent
   , TargetObservation (..)
   , ObservationPublication (..)
   , OwnerDemand (..)
@@ -708,10 +712,12 @@ module Hetoimasia.Runtime.GLFW
   , awaitOwnerRound
   , TerminalRecord (..)
   , readTargetTerminalsNow
+  , ownerDestructionVerified
   , OwnerTerminal (..)
   , noOwnerTerminal
   , readOwnerTerminalNow
   , readOwnerTargets
+  , readOwnerAcknowledged
   , TargetStanding (..)
   , readTargetStanding
   , readOwnerFailure

@@ -228,7 +228,9 @@ their implementations are complete or replace canonical readiness review.
   backend's operations as an injected record. The owner makes no GLFW call —
   its one cross-thread reach is the session's existing wake — and the exit
   retires each target, then the owner, then destroys it, then joins, and only
-  then releases the windows. Nothing but the injected evidence is permission.
+  then releases the windows. Nothing but the injected evidence is permission:
+  an owner that ends without whole-owner destruction evidence retains the
+  windows, the session and every parent until independent evidence arrives.
 - [Validation](docs/validation.md): mandatory floor plus affected non-optional
   and PR-requested groups. Optional probes remain opt-in. CI evidence and review
   approval have independent freshness rules; approved clean merges may retain
