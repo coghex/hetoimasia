@@ -35,8 +35,15 @@ void hetoimasia_glfw_video_mode_at(const GLFWvidmode* modes, int index, int* fie
 
 /* Ask the platform to close a window, as its close button would, for the
  * native examples only. GLFW reports the request through the window's close
- * callback and destroys nothing. Call it on the session's owner thread. */
-void hetoimasia_glfw_request_close_for_check(GLFWwindow* window);
+ * callback and destroys nothing. Call it on the session's owner thread.
+ *
+ * Non-zero when the request was delivered. It is this helper that is
+ * unavailable outside Cocoa and X11, not window closure itself: it drives the
+ * close through the X11 or Cocoa handle GLFW exposes, and the session may run
+ * on a backend that exposes neither. On a Wayland session it answers zero
+ * before asking GLFW for any X11 handle, so no GLFW error is reported. No
+ * compositor-generated close request has been demonstrated on Wayland yet. */
+int hetoimasia_glfw_request_close_for_check(GLFWwindow* window);
 
 /* Invoke the currently registered input callback through its C function
  * pointer, for the native examples only. Each helper reads the pointer GLFW
@@ -61,7 +68,12 @@ int hetoimasia_glfw_take_input_callbacks_cleared_for_check(void);
  * window, read back from the platform itself — contentMinSize and contentMaxSize
  * on Cocoa, WM_NORMAL_HINTS on X11 — into limits as minimum width and height,
  * then maximum width and height, with -1 for a bound the platform does not
- * hold. Non-zero when they were read. Call it on the session's owner thread. */
+ * hold. Non-zero when they were read. Call it on the session's owner thread.
+ *
+ * Zero says this helper could not read them, never that the window has no size
+ * constraints: GLFW holds those whatever the backend, and this reads back only
+ * what an X11 or Cocoa handle exposes. On a Wayland session it answers zero
+ * before asking GLFW for any X11 handle, so no GLFW error is reported. */
 int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits);
 
 /* The production finite event wait: glfwWaitEventsTimeout, recording which OS

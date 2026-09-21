@@ -48,7 +48,8 @@
 -- key and its arguments in native types — and runs the script's
 -- 'scriptWindowControl' step, which may report errors. The script's
 -- 'scriptWindowCapabilities' describes what windows cannot do or report on the
--- session's backend, so an example can model a platform no session selects. None of them is a public command, and none is exported by the
+-- session's backend, so an example can model a backend this machine cannot
+-- run. None of them is a public command, and none is exported by the
 -- public seam. Each also refuses, with 'ForeignSeamWindow' and before anything
 -- else, a window whose session was not entered over this seam's own native
 -- table.
@@ -379,8 +380,13 @@ data DriveOrigin
 -- 'Reporter' it is given, or throw.
 data SeamScript = SeamScript
   { scriptHostBackend ∷ Maybe Backend
-    -- ^ The backend the scripted platform supports.
-  , scriptPlatformSupported ∷ Bool
+    -- ^ The backend the scripted platform selects when no request names one.
+  , scriptAdmittedBackends ∷ [Backend]
+    -- ^ Which backends the scripted platform admits to the support check. A
+    -- request naming another is refused at resolution, before any call.
+  , scriptPlatformSupported ∷ Backend → Bool
+    -- ^ Whether the prefix was built with the admitted backend, as
+    -- @glfwPlatformSupported@ answers it.
   , scriptInitialize ∷ Reporter → IO Bool
   , scriptReportedPlatform ∷ Maybe Backend → Maybe Backend
     -- ^ What the platform query answers, given the backend last hinted.
@@ -421,12 +427,15 @@ data SeamScript = SeamScript
     -- tracks instead of the script.
   }
 
--- | A platform supporting X11 on which every step succeeds silently.
+-- | A Linux platform on which every step succeeds silently: X11 is what an
+-- unrequested session selects, Wayland is admitted only when a request names
+-- it, and the prefix is built with both.
 defaultScript ∷ SeamScript
 defaultScript =
   SeamScript
     { scriptHostBackend = Just X11
-    , scriptPlatformSupported = True
+    , scriptAdmittedBackends = [X11, Wayland]
+    , scriptPlatformSupported = const True
     , scriptInitialize = \_ → pure True
     , scriptReportedPlatform = id
     , scriptTerminate = \_ → pure ()
@@ -829,11 +838,12 @@ seamNative ∷ Seam → Native
 seamNative seam =
   Native
     { nativeHostBackend = scriptHostBackend script
+    , nativeAdmittedBackends = scriptAdmittedBackends script
     , nativeGuard = seamGuard seam
     , nativeIsProcessMainThread = identity
     , nativePlatformSupported = \backend → do
         record (QueryPlatformSupported backend)
-        pure (scriptPlatformSupported script)
+        pure (scriptPlatformSupported script backend)
     , nativeNewErrorCallback = \callback → do
         record CreateErrorCallback
         key ← atomicModifyIORef' (seamNextKey seam) (\next → (next + 1, next))

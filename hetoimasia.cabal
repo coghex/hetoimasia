@@ -49,6 +49,7 @@ extra-source-files:
     tools/docs_land_paths.py
     tools/native/glfw.pin
     tools/native/native.py
+    tools/native/patches/0001-wayland-fix-segfault-when-there-is-no-seat.patch
     tools/validation/ci_image.py
     tools/validation/plan.py
     tools/validation/range.py

@@ -7,7 +7,7 @@
 -- through a public command. The out-of-range resize is the test-only native
 -- stimulus 'setWindowSizeForCheck', distinct from the public command path, and
 -- the installed limits are read back from the platform with
--- 'sizeLimitsForCheck'. Whether a programmatic resize is clamped is the
+-- 'platformSizeLimits'. Whether a programmatic resize is clamped is the
 -- platform's decision: Cocoa's content limits bound only the user's resizing,
 -- so its reported size may be the unclamped request, while an X11 window
 -- manager may clamp to the size hints.
@@ -24,7 +24,6 @@ import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Native
   ( WindowStateForCheck (..)
   , setWindowSizeForCheck
-  , sizeLimitsForCheck
   , waitEventsForCheck
   , windowPositionForCheck
   , windowSizeForCheck
@@ -35,7 +34,7 @@ import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
 import Hetoimasia.GLFW.Session (Session)
 import Hetoimasia.GLFW.Window
 import Numeric.Natural (Natural)
-import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned)
+import Test.GLFW.Native.Support (Shared, currentObservation, failed, owned, platformSizeLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -85,7 +84,7 @@ spec shared = describe "window controls" $ do
               constraints = sizeConstraints (Extent 200 150) (Extent 400 300) Nothing
           installed ← perform (setSizeConstraintsCommand target constraints)
           refused ← perform (setWindowSizeCommand target (Extent 1000 1000))
-          limits ← (,) <$> sizeLimitsForCheck (windowNativeHandle window) <*> sizeLimitsForCheck (windowNativeHandle untouched)
+          limits ← (,) <$> platformSizeLimits (windowNativeHandle window) <*> platformSizeLimits (windowNativeHandle untouched)
           setWindowSizeForCheck (windowNativeHandle window) 1000 1000
           agreed ← converge window $ \observation → do
             (width, height) ← windowSizeForCheck (windowNativeHandle window)
@@ -98,7 +97,7 @@ spec shared = describe "window controls" $ do
       _ → False
     -- The platform itself holds the installed limits for the addressed window,
     -- and not for the other one.
-    addressedLimits `shouldBe` Just (Just 200, Just 150, Just 400, Just 300)
+    addressedLimits `shouldBe` (Just 200, Just 150, Just 400, Just 300)
     untouchedLimits `shouldSatisfy` (/= addressedLimits)
     observed `shouldBe` reported
     -- The size is the platform's: clamped into the limits by a platform that

@@ -4,7 +4,8 @@ Buildable package: `hetoimasia-glfw`.
 
 Owns the small private binding to upstream GLFW 3.4 and the one scoped session
 over it. `Hetoimasia.GLFW.Session` enters a session on the process main thread:
-backend selection (X11 on Linux, Cocoa on macOS, never Wayland), exclusive
+backend selection (X11 by default on Linux, Wayland there on explicit
+request, Cocoa on macOS), exclusive
 initialization and termination, bounded evidence of native error reports,
 poisoning when teardown cannot finish safely, and an opaque wake capability
 (`sessionWake`, `wakeSession`) that any thread may use to end the owner's native

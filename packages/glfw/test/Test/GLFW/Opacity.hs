@@ -84,6 +84,7 @@ module Test.GLFW.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
+import System.Info (os)
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
 import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
@@ -538,7 +539,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       status `shouldBe` ExitSuccess
       err `shouldBe` ""
       lines out
-        `shouldBe` [ "wayland = unsupported Just Wayland, raised by glfw enter session"
+        `shouldBe` [ "unadmitted backend = unsupported Just " <> unadmittedBackend <> ", raised by glfw enter session"
                    , "without the threaded runtime = NotProcessMainThread, raised by glfw enter session"
                    , "capacity = 16, description limit = 1024"
                    , "zero width = WindowExtentRejected {rejectedWidth = 0, rejectedHeight = 48}"
@@ -547,6 +548,11 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "mode = (2,Just (Extent {extentWidth = 1920, extentHeight = 1080},Just 60),WindowedPresentation)"
                    , "wake outcomes = [WakePosted,WakeTerminal,WakeFailed (Reports {reportedErrors = [], reportsLost = 0, callbackFaults = 1})]"
                    ]
+
+-- | The backend this platform does not admit, which the public client asks for
+-- so that its request is refused at resolution wherever the suite runs.
+unadmittedBackend ∷ String
+unadmittedBackend = if os == "darwin" then "Wayland" else "Cocoa"
 
 -- | Compile a client that can also see the runtime and the window host's
 -- sublibrary, by its unit id.
@@ -1251,11 +1257,12 @@ publisherClient =
     , "endObservations window = atomically (closeSnapshot (windowObservations window))"
     ]
 
--- | A client using only the public interface. A Wayland request is refused as
--- unsupported before anything else, and a default request is refused because
--- this client is built without the threaded runtime, so no thread is the bound
--- process main thread: neither reaches GLFW, so the window command path inside
--- the second compiles and links but never runs.
+-- | A client using only the public interface. A request naming the backend
+-- this platform does not admit is refused as unsupported before anything else,
+-- and a default request is refused because this client is built without the
+-- threaded runtime, so no thread is the bound process main thread: neither
+-- reaches GLFW, so the window command path inside the second compiles and
+-- links but never runs.
 publicClient ∷ String
 publicClient =
   unlines
@@ -1273,11 +1280,13 @@ publicClient =
     , "import Hetoimasia.GLFW.Monitor"
     , "import Hetoimasia.GLFW.Session"
     , "import Hetoimasia.GLFW.Window"
+    , "import System.Info (os)"
     , ""
     , "main ∷ IO ()"
     , "main = do"
-    , "  wayland ← try (withSession defaultSessionConfig {requestedBackend = Just Wayland} (\\_ → pure ()))"
-    , "  report \"wayland\" wayland"
+    , "  let unadmitted = if os == \"darwin\" then Wayland else Cocoa"
+    , "  refused ← try (withSession defaultSessionConfig {requestedBackend = Just unadmitted} (\\_ → pure ()))"
+    , "  report \"unadmitted backend\" refused"
     , "  unthreaded ← try (withSession defaultSessionConfig (\\session → monitors session >> withWindow session starting (request session) >> pure ()))"
     , "  report \"without the threaded runtime\" unthreaded"
     , "  putStrLn (\"capacity = \" <> show errorEvidenceCapacity <> \", description limit = \" <> show errorDescriptionLimit)"
