@@ -66,16 +66,19 @@ spec shared = describe "the shared session" $ do
     -- Requirement 4's own check, on the backend it is about. Both drivers
     -- reach a window through a Cocoa or X11 handle, so on Wayland each must
     -- answer unavailable, and must do so without asking GLFW for a handle it
-    -- would refuse: a GLFW_PLATFORM_UNAVAILABLE from glfwGetX11Display would
-    -- be captured on the owner thread, and takeAsynchronousReports settles
-    -- exactly those strays, so an empty report list is the evidence that
-    -- neither driver touched X11 at all.
+    -- would refuse: a GLFW_PLATFORM_UNAVAILABLE from glfwGetX11Display is
+    -- captured on the owner thread, and takeAsynchronousReports settles
+    -- exactly those strays. Reports are taken once before the two calls, so
+    -- whatever creating the window on this backend reported is cleared first
+    -- and what the second take returns is the drivers' own contribution and
+    -- nothing else: empty is the evidence that neither touched X11.
     it "answers both X11 test-check helpers unavailable, leaving no GLFW report" $
       onIsolatedWayland $ \_ → do
         (closed, limits, reports) ←
           owned shared $ \session →
             withWindow session (hiddenTestWindowConfig "wayland helper check" 200 150) $ \window → do
               let handle = windowNativeHandle window
+              _ ← takeAsynchronousReports session
               closed ← requestCloseForCheck handle
               limits ← sizeLimitsForCheck handle
               reports ← takeAsynchronousReports session
