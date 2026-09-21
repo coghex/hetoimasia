@@ -130,6 +130,13 @@ x11Spec = describe "Isolated X11 display" $ do
       -- the helper's thirty-second bound; this example waits that bound out.
       -- This stub too handles the termination signal and exits cleanly, so the
       -- timeout is the outstanding report rather than the cleanup's doing.
+      --
+      -- This is also where the observer spends the whole bound reading the
+      -- report channel rather than waiting for the server, so the request to
+      -- stop that cleanup sends at the bound arrives outside any wait. An
+      -- observer that recorded that request for its wait to notice would never
+      -- reach the wait: it hangs here with the server still running and the
+      -- scratch directory still there, on both supported shells.
       installStubs display (("Xvfb", silentServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
@@ -141,23 +148,38 @@ x11Spec = describe "Isolated X11 display" $ do
       installStubs display (("Xvfb", stammeringServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
-  it "stops the X server when the request to stop it reaches the owner as it starts the server" $
+  it "stops the X server when the request to stop it reaches the observer as it starts the server" $
     withDisplay $ \display → do
-      -- The narrowest window the owner has: a request to stop that arrives
-      -- after the server is started and before it is waited for, where a
-      -- handler that only recorded the request would be left waiting for a
-      -- wait it had already missed. The server asks for it at its own first
-      -- instruction, which is the earliest moment anything but the owner can;
-      -- either side of the window it lands on stops the server there and then,
-      -- so the owner has nothing left to report and the report channel closes
-      -- with the server. What the helper is left with is a report that closed
-      -- without naming a display, settled at the bound like the others; this
-      -- example waits that bound out.
+      -- The earliest a request to stop can arrive: the server asks for it at
+      -- its own first instruction, while the observer that started it may not
+      -- yet have begun reading the report channel. The observer stops the
+      -- server, waits for it, and ends without writing an outcome, because an
+      -- outcome it was told to produce would be the helper's own signalling
+      -- coming back to it. The helper is left with the report that never came;
+      -- this example waits the bound out.
       installStubs display (("Xvfb", earlyStopServer) : filter ((/= "Xvfb") . fst) workingStubs)
-      refusedStartup
+      refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
+
+  it "follows the report when the X server names a display and exits at once" $
+    withDisplay $ \display → do
+      -- One observer reads the report channel to its end before it waits for
+      -- the server, so a completed report cannot be overtaken by the exit that
+      -- follows it. Two observers reporting independently could order these
+      -- either way, and the exit winning would have the helper say the server
+      -- exited before reporting a display it had already named. What a
+      -- departed server is refused for is the answer it does not give.
+      installStubs
         display
-        "the X server's startup report was closed or invalid before it named a display"
-        ["server.pid"]
+        ( ("Xvfb", departingServer)
+            : ("xdpyinfo", closedDisplay)
+            : filter ((`notElem` ["Xvfb", "xdpyinfo"]) . fst) workingStubs
+        )
+      (result, _, errors) ← helper display ["--", "sh", "-c", recordEnvironment display]
+      result `shouldBe` ExitFailure 1
+      errors `shouldContain` "the X server on :42 does not answer: unable to open display"
+      errors `shouldNotContain` "exited before reporting a display"
+      doesFileExist (directory display </> "environment.txt") `shouldReturn` False
+      leftBehind "hetoimasia-x11." display `shouldReturn` []
 
   it "stops the X server and removes its scratch directory when a signal ends the startup" $
     withDisplay $ \display → do
@@ -288,10 +310,11 @@ babblingServer =
     , "exec sleep 300"
     ]
 
--- | A server that asks for its own owner to be stopped at its first
--- instruction, so the request races that owner's startup rather than arriving
--- long after it. Its parent is that owner and not the helper, which is what
--- makes @$PPID@ the right target here and the wrong one in 'signallingServer'.
+-- | A server that asks for its own observer to be stopped at its first
+-- instruction, so the request races that observer's startup rather than
+-- arriving long after it. Its parent is that observer and not the helper,
+-- which is what makes @$PPID@ the right target here and the wrong one in
+-- 'signallingServer'.
 earlyStopServer ∷ String
 earlyStopServer =
   unlines
@@ -301,10 +324,38 @@ earlyStopServer =
     , "exec sleep 300"
     ]
 
+-- | A server that names a display and exits in the same breath. It says it is
+-- leaving before it reports, so by the time the helper has the report the
+-- display is already unservable and nothing about the outcome turns on which
+-- of the two the helper noticed first.
+departingServer ∷ String
+departingServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , ": > departed"
+    , "echo 42 >&3"
+    , "exit 0"
+    ]
+
+-- | An @xdpyinfo@ that answers for a server that is still there and refuses
+-- for one that has said it is leaving, the way the real one fails against a
+-- display with nothing behind it.
+closedDisplay ∷ String
+closedDisplay =
+  unlines
+    [ "#!/bin/sh"
+    , "if [ -e departed ]; then"
+    , "  echo 'unable to open display' >&2"
+    , "  exit 1"
+    , "fi"
+    , "echo 'vendor string:    Stub X Server'"
+    ]
+
 -- | A server that signals the helper as soon as it is running and then stays
--- alive. The helper is the server's grandparent — the owner process that waits
--- for the server sits between them — so the signal is aimed through the
--- server's own parent rather than at it.
+-- alive. The helper is the server's grandparent — the observer process that
+-- reads the report channel and waits for the server sits between them — so the
+-- signal is aimed through the server's own parent rather than at it.
 signallingServer ∷ String
 signallingServer =
   unlines

@@ -71,7 +71,6 @@ done
 # setup — the window in which the server is starting and nothing has reported
 # yet — still ends through the same cleanup.
 scratch=""
-reporter=""
 manager=""
 
 # Whether a background process this script started is still running. The job
@@ -128,66 +127,76 @@ export XDG_SESSION_TYPE=x11
 # Three observations tell the startup outcomes apart, and each is made on its
 # own channel rather than by questioning a variable that came back empty:
 #
-#   * the report channel's own result, produced by a reporter process that
-#     reads it — a complete line, or the channel closing without one;
-#   * the server's termination, produced by an owner process whose only job is
-#     to start the server and wait for it. Reaping it is the observation, so
-#     nothing is signalled to make it, nothing is inferred from an exit status
-#     a server chose for itself, and the job table — which notices an exit at
-#     its own pace, and is what once let an immediate exit be called a timeout
-#     — is never asked. Stopping the server is that same owner's own business,
-#     asked for by signal and carried out only while its job table still lists
-#     the server as running, so a cleanup can never signal a reaped process id;
+#   * the report channel's own result — a complete line, or the channel
+#     closing without one;
+#   * the server's termination. Reaping it is the observation, so nothing is
+#     signalled to make it, nothing is inferred from an exit status a server
+#     chose for itself, and the job table — which notices an exit at its own
+#     pace, and is what once let an immediate exit be called a timeout — is
+#     never asked;
 #   * the thirty-second bound, read from an outcome channel this script holds
 #     a write end of. That channel therefore never reaches end-of-file, so a
 #     failed read on it can only be the bound expiring; `read`'s own status
 #     does not separate the two on every supported shell, returning 1 for both
 #     under Bash 3.2.
+#
+# One process makes the first two, in that order: it starts the server, reads
+# the report channel to its end, and only then waits for the server. Two
+# processes reporting independently could not order what they saw — a server
+# that writes a display number and exits at once would have its completed
+# report overtaken by its own exit whenever the exit was noticed first, and be
+# refused for never reporting. Reading first is also what orders them
+# correctly: a report cannot still arrive on a channel that has closed, and
+# until it closes an exit is not yet the whole story.
 mkfifo "$scratch/displayfd" || refuse "no display-number channel could be created"
 mkfifo "$scratch/startup" || refuse "no startup-outcome channel could be created"
 exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened"
-# The server writes to its own log, so the owner's standard error would carry
-# nothing but the notices a shell prints for a background process it stopped —
-# its own doing rather than anything the caller asked to hear.
+# The server writes to its own log, so this process's standard error would
+# carry nothing but the notices a shell prints for a background process it
+# stopped — its own doing rather than anything the caller asked to hear.
 {
-  # A request to stop arrives as a signal, because this process spends its life
-  # waiting for the server. The handler stops the server itself rather than
-  # leaving it to be noticed after the wait: a request that arrives while this
-  # process is between starting the server and waiting for it would otherwise
-  # be recorded and then wait forever, since the wait it was meant to interrupt
-  # had not begun. What it stops is what the job table still lists as running,
-  # so it never signals a process id that has been reaped and handed to
-  # somebody else. The trap is armed before the server exists, so a request
-  # that arrives first finds nothing to stop and is caught by the check after
-  # the server is started instead.
-  stopping=""
+  # A request to stop arrives as a signal, because this process spends its
+  # life reading the report channel and then waiting for the server. The
+  # handler stops the server, waits for it to be gone, and ends this process
+  # itself. Recording the request instead would strand it: for as long as the
+  # report is outstanding — which is the whole of the helper's bound — this
+  # process is not in the wait such a record was meant to be noticed after, and
+  # the read it is in can be held open by anything that inherited the channel.
+  # What it stops is what the job table still lists as running, so it never
+  # signals a process id that has been reaped and handed to somebody else, and
+  # what it waits for is what it started, so a descendant that outlives them
+  # cannot hold cleanup up.
+  #
+  # Ending here rather than carrying on is also what keeps a stopped server out
+  # of the outcomes: every line below is written by a process that was not
+  # asked to stop, so no outcome can be the helper's own signalling coming back
+  # to it. The trap is armed before the server exists, so a request that
+  # arrives first finds nothing to stop and starts nothing.
   halt() {
     local job
     for job in $(jobs -pr); do
       kill "$job" 2>/dev/null
     done
   }
-  trap 'stopping=yes; halt' TERM
+  settle() {
+    while :; do
+      wait
+      [ "$?" -gt 128 ] || break
+      halt
+    done
+  }
+  trap 'halt; settle; exit' TERM
   Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" 8>&- &
-  [ -z "$stopping" ] || halt
-  while :; do
-    wait
-    [ "$?" -gt 128 ] || break
-    halt
-  done
-  # The server was reaped, and that is the whole report. A server this process
-  # was told to stop ended because of that request, which is nobody's outcome
-  # to hear.
-  [ -n "$stopping" ] || printf 'exited\n'
-} >&8 2>/dev/null &
-{
-  if IFS= read -r reported <"$scratch/displayfd"; then
+  # Read without an `IFS=` prefix, for the reason the bounded read below gives.
+  if read -r reported <"$scratch/displayfd"; then
     printf 'report %s\n' "$reported"
   else
     printf 'closed\n'
   fi
-} >&8 &
-reporter=$!
+  settle
+  # The server was reaped, and that is the whole report.
+  printf 'exited\n'
+} >&8 2>/dev/null &
 
 # The report is usable until the channel says otherwise. An unusable report is
 # not yet a refusal: the server may be on its way out, and an exit it made for
@@ -229,10 +238,9 @@ while :; do
       ;;
   esac
 done
-# The report arrived, so the reporter has finished and the outcome channel has
-# nothing left to carry into the command's own environment.
-wait "$reporter" 2>/dev/null
-reporter=""
+# The report arrived on a channel that has now closed, so nothing more is
+# coming and nothing is left to carry into the command's own environment. A
+# later exit has nowhere to go and nobody it could mislead.
 exec 8<&-
 export DISPLAY=":$number"
 

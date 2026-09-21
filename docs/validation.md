@@ -786,33 +786,39 @@ Server startup has three outcomes, and the helper tells them apart by what it
 observed rather than by a query that races the server's exit: the server
 exited before reporting a display, its startup report closed or named no
 display number, or the thirty-second bound expired with the report still
-outstanding. The report is read by a process whose result the helper receives
-on a channel it keeps a write end of, so a failed read there can only be the
-bound expiring. Termination is observed by a second process whose only job is
-to wait for the server: reaping it *is* the observation, so nothing is
-signalled to make it, nothing is read out of an exit status the server chose
-for itself, and the shell's job table — which notices an exit at its own pace,
-and is what once let an immediate exit be called a timeout — is never asked.
-Stopping the server is separate from that, and a server that handles the
-termination signal and exits cleanly, as a real Xvfb does, is not thereby
-reported as having exited on its own. An unusable report is settled at the
-bound rather than at once, because a server on its way out has until then to be
-reaped and named as the exit it is. A server that exits before reporting is
-therefore never reported as a timeout, and one that stays alive is never
-reported as an exit. The first two reasons quote the server log's tail; all
-three refuse with status `1`.
+outstanding. The bound is read from a channel the helper keeps a write end of,
+so a failed read there can only be the bound expiring. The other two are
+observed by one process, in one order: it starts the server, reads the report
+channel to its end, and only then waits for the server, where reaping it *is*
+the observation — nothing is signalled to make it, nothing is read out of an
+exit status the server chose for itself, and the shell's job table, which
+notices an exit at its own pace and is what once let an immediate exit be
+called a timeout, is never asked. Observing the two independently could not
+order them: a server that names a display and exits at once would have its
+completed report overtaken whenever the exit was noticed first, and be refused
+for never reporting. Reading first is also the right order, because a report
+cannot still arrive on a channel that has closed, while an exit is not the
+whole story until it has. An unusable report is settled at the bound rather
+than at once, because a server on its way out has until then to be reaped and
+named as the exit it is. A server that exits before reporting is therefore
+never reported as a timeout, and one that stays alive is never reported as an
+exit. The first two reasons quote the server log's tail; all three refuse with
+status `1`.
 
-Stopping the server belongs to that same owner process and is asked for by
-signal, because waiting for the server is where it spends its life. The
-handler stops the server itself rather than recording the request for the wait
-to notice, since a request arriving between the server being started and being
-waited for would otherwise be recorded and then waited on forever. It stops
-only what its job table still lists as running, and the helper's own cleanup
-does the same for what it started: a job still listed as running has not been
-reaped, so that number is still that process's own, while a number kept in a
-variable or a file may by then name a process the helper never started. Nothing
-in either is a diagnosis. A signal the helper can catch — `TERM`, `INT`, or
-`HUP` — ends it through that cleanup and reports which signal it was, so a
+Stopping the server belongs to that same observer and is asked for by signal.
+The handler stops the server, waits for it, and ends that process, rather than
+recording the request for a later wait to notice: while the report is
+outstanding — which is the whole of the bound — the observer is not in that
+wait at all, and the read it is in can be held open by anything that inherited
+the channel. Ending there is also what keeps a stopped server out of the
+outcomes, since every outcome line is written by a process that was not asked
+to stop. It stops only what its job table still lists as running, and the
+helper's own cleanup does the same for what it started: a job still listed as
+running has not been reaped, so that number is still that process's own, while
+a number kept in a variable or a file may by then name a process the helper
+never started. Nothing in either is a diagnosis. A signal the helper can catch
+— `TERM`, `INT`, or `HUP` — ends it through that cleanup and reports which
+signal it was, so a
 signal arriving while it waits for the startup report leaves neither a running
 server nor a scratch directory behind; it exits `143`, `130`, or `129`.
 
