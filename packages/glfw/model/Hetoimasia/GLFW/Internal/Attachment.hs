@@ -252,8 +252,11 @@ import Numeric.Natural (Natural)
 -- Identities and authority
 
 -- | A window host's identity, supplied fresh by the owning boundary.
+-- | Ordered as 'Hetoimasia.GLFW.Window.WindowId' is, over the same kind of
+-- unique: the order is stable within a process and means nothing across one,
+-- which is all a keyed collection needs of it.
 newtype HostIdentity = HostIdentity Unique
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show HostIdentity where
   show _ = "HostIdentity"
@@ -266,8 +269,11 @@ hostIdentity = HostIdentity
 newtype OwnerAuthority = OwnerAuthority Unique
 
 -- | One attachment: its host, session, window, and incarnation.
+-- | Ordered host, then session, then window, then incarnation, so within one
+-- host's model the order is a window's identity followed by its incarnations
+-- in the order they were issued.
 data AttachmentId = AttachmentId !HostIdentity !Unique !WindowId !Natural
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show AttachmentId where
   showsPrec precedence (AttachmentId _ _ window incarnation) =

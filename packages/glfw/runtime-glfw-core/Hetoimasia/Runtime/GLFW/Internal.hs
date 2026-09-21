@@ -74,7 +74,14 @@ module Hetoimasia.Runtime.GLFW.Internal
   , withProtectedWindowHost
   , withProtectedWindowHostIn
   , withProtectedWindowHostWith
+  , withProtectedWindowHostOver
+  , ProtectedExit (..)
+  , noProtectedExit
+  , RetirementEnvironment (..)
+  , retirementEnvironmentOf
   , runProtectedWindowApplication
+  , hostConfiguration
+  , hostWakeNotifier
 
     -- * The private attachment seam
   , hostAttachmentIdentity
@@ -153,7 +160,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import GHC.Stack (HasCallStack)
@@ -861,6 +868,16 @@ reportHostWakeDegradationAtExit restore logger host =
 
 hostNotifier ∷ WindowHost → Notifier
 hostNotifier = commandHostNotifier . hostCommands
+
+-- | The session's notifier, for a thread that publishes to the owner and must
+-- register and discharge its own wake obligation exactly as an admitted
+-- completion notice does.
+hostWakeNotifier ∷ WindowHost → Notifier
+hostWakeNotifier = hostNotifier
+
+-- | The validated configuration the host was built from.
+hostConfiguration ∷ WindowHost → HostConfig
+hostConfiguration = hostSettings
 
 -- | Wait for every registered notification obligation to be discharged, then
 -- make the wake path's one guarded reporting attempt.
@@ -1963,7 +1980,46 @@ withProtectedWindowHostIn = withProtectedWindowHostWith noHostHooks
 -- | 'withProtectedWindowHostIn' with the private examples' hooks.
 withProtectedWindowHostWith
   ∷ HasCallStack ⇒ HostHooks → Logger → Scoped Session → HostConfig → (WindowHost → IO r) → IO r
-withProtectedWindowHostWith hooks logger sessionScope config use =
+withProtectedWindowHostWith hooks = withProtectedHostOver hooks noProtectedExit
+
+-- | 'withProtectedWindowHostIn' with an additive lifetime interposed on the
+-- exit, for a composition that owns something the host's own drain cannot
+-- retire for it.
+--
+-- It is the one extension point the protected exit has, and it is deliberately
+-- narrow: an interposed lifetime is given the host and the boundary's own
+-- @restore@, at exactly two points in an order it cannot change.
+-- "Hetoimasia.Runtime.GLFW.Internal.Owner" is its only production caller, for
+-- the supervised graphics owner D-33 keeps alive across the attachment drain.
+--
+-- A 'Nothing' session scope means the host enters the session its
+-- configuration names, exactly as 'withProtectedWindowHost' does.
+withProtectedWindowHostOver
+  ∷ HasCallStack
+  ⇒ ProtectedExit
+  → Logger
+  → Maybe (Scoped Session)
+  → HostConfig
+  → (WindowHost → IO r)
+  → IO r
+withProtectedWindowHostOver exit logger sessionScope config =
+  withProtectedHostOver
+    noHostHooks
+    exit
+    logger
+    (fromMaybe (allocSession (hostSessionConfig config)) sessionScope)
+    config
+
+withProtectedHostOver
+  ∷ HasCallStack
+  ⇒ HostHooks
+  → ProtectedExit
+  → Logger
+  → Scoped Session
+  → HostConfig
+  → (WindowHost → IO r)
+  → IO r
+withProtectedHostOver hooks exit logger sessionScope config use =
   -- The scope is entered under this mask, so the handler below is installed
   -- before anything at all can be delivered — including in the handoff out of
   -- the scope's own construction and into the consumer, which is a point the
@@ -1975,7 +2031,35 @@ withProtectedWindowHostWith hooks logger sessionScope config use =
       -- Inside the handler, so an attachment this makes is drained however it
       -- then fails; the consumer follows it on the same protected path.
       outcome ← tryWithContext (restore (beforeConsumer hooks host >> use host))
-      settleProtectedExit restore logger host outcome
+      settleProtectedExit exit restore logger host outcome
+
+-- | What an additive lifetime interposes on the protected host's exit.
+--
+-- Both run on the owner thread, inside the boundary's own mask and after the
+-- host's quiescence, and both are given the boundary's @restore@ so the parts
+-- of them that must stay interruptible can be. Neither may release a window,
+-- the session, or a parent: the boundary still owns that, and still does it
+-- last.
+--
+-- A failure either raises is retained beside the drain's own, under the same
+-- @glfw protected retirement@ label, and never replaces a failure the body
+-- already raised.
+data ProtectedExit = ProtectedExit
+  { exitBeforeDrain ∷ WindowHost → (∀ a. IO a → IO a) → IO ()
+    -- ^ After the host's quiescence has closed every admission, and before the
+    -- attachment drain begins. This is where an interposed lifetime closes its
+    -- own admission and asks its own workers to stop.
+  , exitAfterDrain ∷ WindowHost → (∀ a. IO a → IO a) → IO ()
+    -- ^ After the drain has found every attachment retired against its own
+    -- terminal evidence, and before the wake report and before the host's
+    -- windows, session, and parents unwind. This is where an interposed
+    -- lifetime awaits whatever the drain could not, and joins.
+  }
+
+-- | An exit that interposes nothing, which is what every existing constructor
+-- passes.
+noProtectedExit ∷ ProtectedExit
+noProtectedExit = ProtectedExit (\_ _ → pure ()) (\_ _ → pure ())
 
 -- | 'runWindowApplication' over a protected host lifetime.
 --
@@ -2027,12 +2111,13 @@ retirementEnvironmentOf logger host =
 -- report, and the settled outcome.
 settleProtectedExit
   ∷ HasCallStack
-  ⇒ (∀ a. IO a → IO a)
+  ⇒ ProtectedExit
+  → (∀ a. IO a → IO a)
   → Logger
   → WindowHost
   → Either (ExceptionWithContext SomeException) r
   → IO r
-settleProtectedExit restore logger host outcome = case hostRetirementState host of
+settleProtectedExit exit restore logger host outcome = case hostRetirementState host of
   Nothing → either rethrowIO pure outcome
   Just retirement → do
     -- The host's whole admission, not only its attachments': a command
@@ -2041,22 +2126,32 @@ settleProtectedExit restore logger host outcome = case hostRetirementState host 
     -- waited past. Idempotent, so it changes nothing when the application's
     -- own quiescence already ran before the worker drain.
     atomically (quiesceWindowHost host)
+    -- The interposed lifetime closes its own admission here, after the host's
+    -- and before the drain, so nothing it owns can be admitted into a drain
+    -- that has started waiting for it.
+    began ← tryWithContext (exitBeforeDrain exit host restore)
     drained ← drainRetirement retirement (retirementEnvironmentOf logger host) restore
+    -- Every attachment has been retired against its own terminal evidence.
+    -- Whatever the interposed lifetime still owes — a whole-owner destruction
+    -- no attachment could account for, and its join — happens here, still
+    -- before a single window is released.
+    finished ← tryWithContext (exitAfterDrain exit host restore)
     reported ← tryWithContext (reportHostWakeDegradationAtExit restore logger host)
-    settleProtectedOutcome outcome drained reported
+    settleProtectedOutcome outcome drained [began, finished, reported]
 
--- | Combine the body's outcome with what the drain and the report found.
+-- | Combine the body's outcome with what the drain, the interposed exit, and
+-- the report found.
 --
 -- A body failure stays primary. After a successful body the first drain
--- failure becomes primary, then the report's, then the deferred cancellation;
--- everything not chosen is retained beside the primary as labelled cleanup
--- evidence.
+-- failure becomes primary, then the interposed exit's and the report's in the
+-- order they were attempted, then the deferred cancellation; everything not
+-- chosen is retained beside the primary as labelled cleanup evidence.
 settleProtectedOutcome
   ∷ Either (ExceptionWithContext SomeException) r
   → DrainOutcome
-  → Either (ExceptionWithContext SomeException) ()
+  → [Either (ExceptionWithContext SomeException) ()]
   → IO r
-settleProtectedOutcome body drained reported = case body of
+settleProtectedOutcome body drained afterDrain = case body of
   Left primary → raiseRetaining primary afterwards
   Right result → case afterwards of
     [] → pure result
@@ -2066,7 +2161,10 @@ settleProtectedOutcome body drained reported = case body of
       maybe [] pure (drainPrimary drained)
         <> drainRetained drained
         <> elided
-        <> either pure (const []) reported
+        -- Each interposed step and the wake report contribute their own
+        -- failure, in the order the boundary attempted them: one that fails
+        -- does not hide a later one's.
+        <> concatMap (either pure (const [])) afterDrain
         <> maybe [] pure (drainDeferred drained)
     elided
       | drainElided drained == 0 = []

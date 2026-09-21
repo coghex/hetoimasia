@@ -43,6 +43,55 @@ concrete precondition
 - **Arc label:** existing `resources`; crossing slices use `runtime`/`glfw`
   during processing. No new graphics package or label is required yet.
 
+## Current handoff — 2026-09-21
+
+D-6's lifetime is delivered, by the Vulkan arc's VK-18/#218 as D-6 said it
+would be, and not by a new LIFE slice: the ledger above stays complete. What
+exists now is the machinery, with its backend operations injected; VK-7
+supplies the Vulkan ones.
+
+`Hetoimasia.Runtime.GLFW.withGraphicsOwnerHost` is the additive protected-host
+constructor D-6 describes, beside `withProtectedWindowHost`, which keeps its
+signature and its behaviour, as does every other window-only entry point. Under
+it, a whole-session exit runs D-6's four steps exactly: quiescence closes the
+host's admission and then the owner's own bounded lifetime port; ordinary
+workers stop and drain, untouched by the owner's separate worker group; the
+owner stays alive and retires each target and then itself through its injected
+operations, publishing each certified fact through the existing completion
+publisher; and the main-thread boundary services the host's own bounded native
+housekeeping while it awaits verified retirement, validating each exact
+attachment's terminal evidence and never the owner's completion, before joining
+the owner and letting the windows, session and parents unwind.
+
+D-6's retention rules are delivered as written. The owner's run action installs
+its protected retirement before any dependent construction, and an expected
+stop, a startup failure, a run failure and cancellation all enter that same
+drain; nothing driver-shaped is placed in a `Scoped` startup release. A
+terminal owner failure is latched as soon as it is known and reaches
+application checkpoints through `superviseGraphicsOwner`, which registers one
+ordinary supervised service in the application's own group — a separate worker
+group gives supervision no connection by itself, so the connection is explicit.
+An owner that ends without the injected whole-owner destruction returning
+evidence answers `OwnerDestructionUnverified`, which retains that fact and
+authorizes nothing: not a disposal, and not a replay of the work that failed.
+Whole-owner retirement is independent of the attachment count in both
+directions — it happens for an owner that never held a target, and after the
+last one has detached.
+
+An individual close or detach is not that: `releaseGraphicsTarget` retires one
+target, the owner publishes that target's exact evidence, the main thread
+acknowledges it and its window is released, and the shared owner and every
+other target stay live. Only a whole-host exit requires the final join.
+
+One rule the delivered machinery makes explicit that D-6 left implicit: the
+owner never retires an attachment the main thread still holds. When a target's
+construction cannot be used — a partial construction, one the backend could not
+verify a rollback for, or one that was interrupted — the owner keeps whatever
+it owns and /reports/ it through `readTargetStanding`. Beginning that
+attachment's retirement stays the main thread's, because the attachment and its
+window's exclusive slot are the main thread's; the owner is given no
+cross-thread authority over either.
+
 ## Current handoff — 2026-09-20
 
 At `master@3a8abdc`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
@@ -297,7 +346,8 @@ that rule. Neither worker finalizers nor graphics retirement may await a command
 handled only by the departed normal loop. Initial graphics retirement work is
 owner-thread-owned and must remain progressable after worker drain. A backend
 that needs a live retirement worker requires a different explicitly designed
-lifetime; this arc does not silently add one. D-6 is that lifetime: under it
+lifetime; this arc does not silently add one. D-6 is that lifetime, and
+`withGraphicsOwnerHost` is its delivered composition: under it
 step 2 drains ordinary workers only, step 3's GPU retirement runs on the
 surviving graphics owner while the main thread services housekeeping and
 awaits verified retirement, and the owner is joined before step 4.

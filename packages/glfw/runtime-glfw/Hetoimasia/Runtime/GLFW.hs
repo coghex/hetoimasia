@@ -635,9 +635,132 @@ module Hetoimasia.Runtime.GLFW
   , NoticeAdmission (..)
   , publishCompletion
 
+    -- * The supervised graphics owner
+    -- $owner
+
+    -- ** The injected backend operations
+  , GraphicsOperations (..)
+  , OwnerStart (..)
+  , OwnerReady
+  , ownerReady
+  , TargetStart (..)
+  , TargetHandoff (..)
+  , TargetEvidence
+  , targetEvidence
+  , RollbackEvidence
+  , rollbackEvidence
+  , OwnerStep (..)
+  , TargetStepView (..)
+  , StepReport (..)
+  , noStepWork
+  , NextDeadline (..)
+  , TargetRetire (..)
+  , TargetRetired
+  , targetRetired
+  , OwnerRetire (..)
+  , OwnerRetired
+  , ownerRetired
+  , OwnerDestroy (..)
+  , OwnerDestroyed
+  , ownerDestroyed
+  , HasEvidence (..)
+
+    -- ** Configuration
+  , GraphicsOwnerConfig (..)
+  , graphicsOwnerConfig
+  , OwnerTimer
+  , ownerTimer
+  , realtimeOwnerTimer
+  , graphicsOwnerComponent
+
+    -- ** The owner and its protected host
+  , GraphicsOwner
+  , withGraphicsOwnerHost
+  , withGraphicsOwnerHostIn
+  , runGraphicsOwnerApplication
+  , superviseGraphicsOwner
+  , graphicsOwnerWorker
+  , wakeGraphicsHost
+
+    -- ** Handing targets over, and taking them back
+  , GraphicsHandover (..)
+  , handOverGraphicsTarget
+  , announceGraphicsTarget
+  , publishGraphicsObservation
+  , releaseGraphicsTarget
+  , ReleaseAnswer (..)
+
+    -- ** What crosses, and what comes back
+  , OwnerHandoff
+  , ownerHandoff
+  , TargetEvent (..)
+  , EventAdmission (..)
+  , TargetObservation (..)
+  , ObservationPublication (..)
+  , OwnerDemand (..)
+  , noOwnerDemand
+  , publishOwnerDemand
+  , ScenePublication (..)
+  , publishOwnerScene
+  , OwnerStatus (..)
+  , OwnerPhase (..)
+  , readOwnerStatusNow
+  , awaitOwnerRound
+  , TerminalRecord (..)
+  , readTargetTerminalsNow
+  , OwnerTerminal (..)
+  , noOwnerTerminal
+  , readOwnerTerminalNow
+  , readOwnerTargets
+  , TargetStanding (..)
+  , readTargetStanding
+  , readOwnerFailure
+  , ownerTargetAcknowledgement
+
+    -- ** The extent seam
+  , TargetGeometry (..)
+  , noTargetGeometry
+  , ExtentBounds (..)
+  , observationFramebuffer
+  , observeGeometry
+  , boundGeometry
+  , SuppliedExtent (..)
+  , ChosenExtent (..)
+  , ExtentRefusal (..)
+  , chooseTargetExtent
+  , readOwnerGeometry
+
+    -- ** Failures
+  , OwnerDestructionUnverified (..)
+  , OwnerHostUnprotected (..)
+  , OwnerHandleMissing (..)
+  , OwnerHandoverUnsettled (..)
+
     -- * Applications
   , runWindowApplication
   ) where
 
 import Hetoimasia.Runtime.GLFW.Internal
+import Hetoimasia.Runtime.GLFW.Internal.Owner
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand
+
+-- $owner
+-- 'withGraphicsOwnerHost' is the additive protected-host constructor beside
+-- 'withProtectedWindowHost': the same session, host, windows, attachment
+-- model, and exit drain, with one supervised graphics owner alive across that
+-- drain. Every existing constructor, 'runProtectedWindowApplication', and
+-- every window-only entry point keep their signatures and their behaviour, and
+-- an application that never asks for an owner never has one.
+--
+-- The owner runs rendering on a worker of its own while GLFW stays on the
+-- process main thread. It makes no GLFW call: the main thread keeps the
+-- session, the windows, surface creation, event processing, and every window
+-- command, and a platform modal loop there still stalls all of them. What the
+-- owner is given instead is a narrow, injected 'GraphicsOperations' record and
+-- explicit bounded handoffs in both directions, so the rendering backend is
+-- supplied to this machinery rather than built into it.
+--
+-- See "Hetoimasia.Runtime.GLFW.Internal.Owner" for the exit order, which is
+-- the Vulkan design's D-33, and @docs\/glfw.md@ for what an application sees
+-- during a main-thread stall.

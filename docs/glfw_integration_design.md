@@ -1452,6 +1452,15 @@ TestEnv. Each feature PR adds its native examples when the shared fixture exists
 GLFW-1/GLFW-2 must still carry a small real native lifecycle check before that
 shared fixture lands.
 
+The supervised graphics owner delivered by the Vulkan arc's VK-18 changes
+nothing here. It moves rendering off the process main thread and makes no GLFW
+call of its own, so the session, the windows, the callbacks and the pump this
+fixture owns stay exactly where they are: the executable's main thread still
+owns the session and pumps owner operations, and Hspec still dispatches native
+operations to it. See
+[glfw.md](glfw.md#the-supervised-graphics-owner) for what the owner may and may
+not do.
+
 ### CI and local evidence
 
 Selected policy: required-when-affected window model tests and a small native
