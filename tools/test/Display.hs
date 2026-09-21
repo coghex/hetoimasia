@@ -135,10 +135,18 @@ x11Spec = describe "Isolated X11 display" $ do
       -- report channel rather than waiting for the server, so the request to
       -- stop that cleanup sends at the bound arrives outside any wait. An
       -- observer that recorded that request for its wait to notice would never
-      -- reach the wait: it hangs here with the server still running and the
-      -- scratch directory still there, on both supported shells.
+      -- reach the wait, and this server would go on running until it ran out
+      -- on its own — long after the refusal, and with the helper still waiting
+      -- on it.
+      --
+      -- Which of the two happened is settled by the server's own note rather
+      -- than by how long any of it took: it writes @stopped@ from the handler
+      -- that ends it, and @expired@ only if it was still running when its own
+      -- time ran out. A recording handler leaves exactly the second note.
       installStubs display (("Xvfb", silentServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
+      doesFileExist (directory display </> "stopped") `shouldReturn` True
+      doesFileExist (directory display </> "expired") `shouldReturn` False
 
   it "refuses to run the command when the startup report is still incomplete at the bound" $
     withDisplay $ \display → do
@@ -367,15 +375,21 @@ signallingServer =
     ]
 
 -- | A server that holds its report channel open and reports nothing, and that
--- handles the helper's termination signal and exits cleanly when stopped.
+-- records how it was ended. Stopped by the helper, it handles the termination
+-- signal, notes that it was stopped, and exits cleanly, as a real Xvfb does.
+-- Left to itself it outlives the helper's bound by a wide margin and then
+-- notes that it ran out instead. The two notes are what tell an immediate,
+-- handler-driven shutdown from a server that merely went away on its own
+-- eventually, without either one being read off a clock.
 silentServer ∷ String
 silentServer =
   unlines
     [ "#!/bin/sh"
     , "echo $$ > server.pid"
-    , "trap 'kill $waiter 2>/dev/null; exit 0' TERM"
-    , "sleep 300 & waiter=$!"
+    , "trap 'kill $waiter 2>/dev/null; : > stopped; exit 0' TERM"
+    , "sleep 120 & waiter=$!"
     , "wait"
+    , ": > expired"
     ]
 
 -- | A server whose report never becomes a complete line: the digits it wrote
