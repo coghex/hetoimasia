@@ -30,11 +30,13 @@ extra-source-files:
     .github/workflows/validation.yml
     tools/ci-image/Dockerfile
     tools/ci-image/builder.py
+    tools/ci-image/compositor.pin
     tools/ci-image/descriptor.json
     tools/ci-image/provision.sh
     tools/ci-image/registry.py
     tools/ci-image/toolchain.pin
     tools/docs_land.sh
+    tools/display/wayland.sh
     tools/display/x11.sh
     tools/toolchain/binding.pin
     tools/toolchain/capture-build.sh

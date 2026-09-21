@@ -218,7 +218,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the isolated X11 display helper against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the isolated X11 and headless Wayland display helpers against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
       "command": [
         "cabal",
         "test",

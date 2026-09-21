@@ -16,22 +16,38 @@ fetch() {
 
 case "$stage" in
   packages)
+    set -a
+    # shellcheck disable=SC1091
+    . "$recipe/tools/ci-image/compositor.pin"
+    set +a
     apt-get update
     # C build prerequisites, the libraries GHC's binary distribution links, the
     # tools actions need inside a container (git for checkout, zstd for the
     # cache), the tools the workflow tests' shipped steps and process checks
-    # call (jq, and procps for kill and ps), the X11 development and runtime
-    # libraries GLFW builds against, and the display packages only the native
-    # worker's tools/display/x11.sh starts: the Xvfb server, the Openbox window
-    # manager, and the xdpyinfo and xprop readiness probes. Nothing here starts
-    # a display.
+    # call (jq, and procps for kill and ps), the X11 and Wayland development
+    # libraries GLFW builds both of its Linux backends against — libwayland-dev
+    # also supplies the wayland-scanner the Wayland backend's protocol files are
+    # generated with — and the display packages only the native worker's
+    # tools/display/ helpers start: the Xvfb server, the Openbox window manager,
+    # the xdpyinfo and xprop readiness probes, the pinned Weston compositor, and
+    # the wayland-info client the Wayland helper proves readiness by connecting
+    # with. Nothing here starts a display or a compositor.
+    #
+    # Weston is installed at one exact revision. An `=` constraint apt cannot
+    # satisfy fails this layer rather than silently taking a newer package.
     apt-get install --yes --no-install-recommends \
       binutils build-essential ca-certificates cmake curl git jq pkg-config \
       procps python3 unzip xz-utils zstd \
       libffi-dev libgmp-dev libncurses-dev libnuma-dev zlib1g-dev \
       libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxrandr-dev \
-      openbox x11-utils xvfb
+      libwayland-dev libxkbcommon-dev \
+      openbox x11-utils xvfb \
+      "weston=$WESTON_VERSION" wayland-utils
     rm -rf /var/lib/apt/lists/*
+    # The installed revision is read back from dpkg rather than assumed from the
+    # constraint, so what the image carries is what the pin names.
+    installed="$(dpkg-query --show --showformat='${Version}' weston)"
+    test "$installed" = "$WESTON_VERSION"
     # The resolved package manifest is retained: input hashes cannot promise a
     # byte-identical rebuild once the upstream archive moves.
     dpkg-query -W -f='${Package} ${Version}\n' | sort > "$root/packages.txt"
@@ -83,12 +99,19 @@ manifest = "/opt/hetoimasia/native/glfw/hetoimasia-native-manifest.json"
 with open(manifest, "rb") as handle:
     native = hashlib.sha256(handle.read()).hexdigest()
 version = lambda tool: subprocess.run([tool, "--numeric-version"], capture_output=True, text=True, check=True).stdout.strip()
+package = lambda name: subprocess.run(
+    ["dpkg-query", "--show", "--showformat=${Version}", name], capture_output=True, text=True, check=True
+).stdout.strip()
 document = {
     "schema_version": 1,
     "recipe_fingerprint": fingerprint,
     "native_manifest": native,
     "ghc": version("ghc"),
     "cabal": version("cabal"),
+    # The compositor is identified by its installed package revision, which is
+    # what a worker can verify; `weston --version` reports neither the Ubuntu
+    # revision nor which package supplied the binary.
+    "weston": package("weston"),
 }
 with open("/opt/hetoimasia/image.json", "w", encoding="utf-8") as handle:
     json.dump(document, handle, indent=2, sort_keys=True)

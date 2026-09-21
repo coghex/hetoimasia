@@ -7,28 +7,39 @@
 # ordinary validation workers only pull the digest the committed descriptor
 # names. See docs/validation.md.
 #
-# It also carries one isolated route that has nothing to do with publishing an
-# image: `route: vulkan-proof` builds the throwaway container
+# It also carries two isolated routes that have nothing to do with publishing
+# an image, and both are here rather than in workflows of their own for one
+# reason: GitHub only offers `workflow_dispatch` for a workflow that already
+# exists on the default branch, so a brand-new workflow cannot supply pre-merge
+# evidence for the pull request that introduces it. Dispatch either against the
+# candidate branch with `--ref`. Neither publishes anything, neither writes a
+# descriptor, neither holds a package grant, the image jobs below are skipped
+# whenever either runs, and both are skipped for every other event — no push and
+# no pull request starts them.
+#
+# `route: vulkan-proof` builds the throwaway container
 # `tools/vulkan-proof/Dockerfile.linux-proof` and runs the VK-2 native Vulkan
-# compatibility proof inside it on an isolated X11 display. That route is here
-# rather than in a workflow of its own for one reason: GitHub only offers
-# `workflow_dispatch` for a workflow that already exists on the default branch,
-# so a brand-new workflow cannot supply pre-merge evidence for the pull request
-# that introduces it. Dispatch it against the candidate branch with `--ref`. It
-# publishes nothing, writes no descriptor, and holds no package grant; the image
-# jobs below are skipped whenever it runs, and it is skipped for every other
-# event. See docs/vulkan_compatibility_record.md.
+# compatibility proof inside it on an isolated X11 display. See
+# docs/vulkan_compatibility_record.md.
+#
+# `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
+# checked-out `tools/ci-image/descriptor.json` names, and shows that the helper
+# established an isolated headless session and removed the runtime directory it
+# created. It is WL-1's one-off provisioning proof, dispatched deliberately;
+# registering a validation group that runs the native suite under the Wayland
+# helper is WL-2's and WL-3's work, not this route's.
 name: ci-image
 
 on:
   workflow_dispatch:
     inputs:
       route:
-        description: 'image: resolve and publish the CI image. vulkan-proof: run the VK-2 native proof and publish nothing.'
+        description: 'image: resolve and publish the CI image. vulkan-proof: run the VK-2 native proof and publish nothing. wayland-probe: run the WL-1 compositor proof in the described image and publish nothing.'
         type: choice
         options:
           - image
           - vulkan-proof
+          - wayland-probe
         default: image
   pull_request:
     types: [opened, reopened, synchronize]
@@ -43,10 +54,14 @@ on:
 permissions:
   contents: read
 
-# The image must install exactly the toolchain the validation workflow pins.
+# The image must install exactly the toolchain the validation workflow pins,
+# and exactly the compositor revision tools/ci-image/compositor.pin names. The
+# builder refuses to publish or accept an image whose installed compositor
+# disagrees with this value, which is what catches a drift between the two.
 env:
   GHC_VERSION: '9.14.1'
   CABAL_VERSION: '3.18.1.0'
+  WESTON_VERSION: '13.0.0-4build3'
 
 defaults:
   run:
@@ -122,7 +137,7 @@ jobs:
     # A fork's pull request can neither hold a package grant nor be allowed to
     # start publication. The proof route publishes nothing, so it never reaches
     # this job.
-    if: (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.route != 'vulkan-proof'
+    if: (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.route != 'vulkan-proof' && inputs.route != 'wayland-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -163,7 +178,7 @@ jobs:
           set -euo pipefail
           python3 tools/ci-image/builder.py resolve \
             --image "$IMAGE" --fingerprint "$FINGERPRINT" \
-            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" --weston "$WESTON_VERSION" \
             --registry tools/ci-image/registry.py \
             --github-output "$GITHUB_OUTPUT"
 
@@ -220,7 +235,7 @@ jobs:
           set -euo pipefail
           python3 tools/ci-image/builder.py publish \
             --image "$IMAGE" --fingerprint "$FINGERPRINT" \
-            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" --weston "$WESTON_VERSION" \
             --registry tools/ci-image/registry.py \
             --context "$RUNNER_TEMP/context" \
             --github-output "$GITHUB_OUTPUT"
@@ -256,6 +271,7 @@ jobs:
           python3 tools/ci-image/builder.py descriptor \
             --image "$IMAGE" --digest "$digest" --fingerprint "$FINGERPRINT" \
             --native-manifest "$manifest" --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
+            --weston "$WESTON_VERSION" \
             --output descriptor.json
           echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
           {
@@ -300,4 +316,93 @@ jobs:
             echo "## Anonymous pull"
             echo
             echo "Pulled \`$REFERENCE\` with no registry credentials in $((ended - started))s."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  wayland-probe:
+    # Only ever on an explicit request for this route, so an ordinary image
+    # dispatch and every pull request skip it. `resolve` excludes this route by
+    # name, and everything that publishes reaches the registry through
+    # `resolve`, so no part of the publication chain runs for it.
+    if: github.event_name == 'workflow_dispatch' && inputs.route == 'wayland-probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No package grant and no publication: this route proves what the described
+    # image can do and returns a record.
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v7
+
+      - name: Identify the image this candidate describes
+        id: image
+        run: |
+          set -euo pipefail
+          reference="$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')"
+          recorded="$(python3 -c 'import json; print(json.load(open("tools/ci-image/descriptor.json"))["recipe_fingerprint"])')"
+          # A proof of some other tree's image proves nothing about this one,
+          # so the descriptor has to describe this candidate before it is used.
+          candidate="$(python3 tools/validation/ci_image.py fingerprint --revision HEAD)"
+          if [ "$recorded" != "$candidate" ]; then
+            echo "::error::the committed descriptor records recipe fingerprint $recorded, but this candidate fingerprints to $candidate"
+            exit 1
+          fi
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Prove the isolated headless compositor inside it
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+          FINGERPRINT: ${{ steps.image.outputs.fingerprint }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # One container, so the helper's cleanup is established while the
+          # container it ran in is still there: a destroyed container would
+          # have taken the runtime directory with it either way. The candidate
+          # tree supplies the helper; the image supplies Weston. `true` is the
+          # whole command — what is under proof is that the helper establishes
+          # a private compositor here and tears it down, not what a command
+          # does inside it.
+          docker run --rm \
+            --env EXPECTED_FINGERPRINT="$FINGERPRINT" \
+            --volume "$PWD:/candidate:ro" --workdir /candidate \
+            "$REFERENCE" bash -c '
+              set -euo pipefail
+              embedded="$(jq -r .recipe_fingerprint /opt/hetoimasia/image.json)"
+              compositor="$(jq -r .weston /opt/hetoimasia/image.json)"
+              if [ "$embedded" != "$EXPECTED_FINGERPRINT" ]; then
+                echo "this image embeds recipe fingerprint $embedded, not the candidate'\''s $EXPECTED_FINGERPRINT" >&2
+                exit 1
+              fi
+              echo "image recipe fingerprint: $embedded"
+              echo "installed compositor: weston $(dpkg-query --show --showformat='\''${Version}'\'' weston)"
+              echo "descriptor compositor: weston $compositor"
+              echo
+              echo "$ bash tools/display/wayland.sh --summary summary.md -- true"
+              report="$(bash tools/display/wayland.sh --summary /tmp/summary.md -- true)"
+              printf "%s\n" "$report"
+              runtime="${report##*runtime directory }"
+              runtime="${runtime%%,*}"
+              if [ -e "$runtime" ]; then
+                echo "the helper left $runtime behind" >&2
+                exit 1
+              fi
+              echo
+              echo "cleanup: $runtime no longer exists, checked inside the same container"
+              echo
+              cat /tmp/summary.md
+            ' | tee "$RUNNER_TEMP/proof.txt"
+          {
+            echo '## WL-1 isolated headless compositor proof'
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Candidate | \`$REVISION\` |"
+            echo "| Recipe fingerprint | \`$FINGERPRINT\` |"
+            echo "| Image | \`$REFERENCE\` |"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/proof.txt"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

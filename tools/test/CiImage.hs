@@ -15,7 +15,8 @@ module CiImage (spec) where
 
 import Control.Exception (evaluate)
 import Control.Monad (forM_, void)
-import Data.List (isPrefixOf, sort)
+import Data.Char (isSpace)
+import Data.List (isInfixOf, isPrefixOf, sort)
 import Json (asArray, asString, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
 import System.Directory
@@ -25,6 +26,7 @@ import System.Directory
   , findExecutable
   , getCurrentDirectory
   , getPermissions
+  , removeFile
   , setOwnerExecutable
   , setPermissions
   )
@@ -60,6 +62,7 @@ data Descriptor = Descriptor
   , recipe ∷ String
   , ghc ∷ String
   , cabal ∷ String
+  , weston ∷ String
   }
 
 spec ∷ Spec
@@ -95,7 +98,7 @@ spec = describe "CI image" $ do
             [ checkout fixture </> "tools/ci-image/builder.py", "descriptor"
             , "--image", "ghcr.io/owner/project-ci", "--digest", digestOf 'a'
             , "--fingerprint", first, "--native-manifest", replicate 64 'b'
-            , "--ghc", "9.14.1", "--cabal", "3.18.1.0"
+            , "--ghc", "9.14.1", "--cabal", "3.18.1.0", "--weston", pinnedCompositor
             , "--output", scratch fixture </> "descriptor.json"
             ]
         (built, errors) `shouldBe` (ExitSuccess, "")
@@ -147,6 +150,32 @@ spec = describe "CI image" $ do
             commitDescriptor fixture (alter described)
             refusal ← planRaw fixture "HEAD" Nothing linuxPins
             refusedByBuilder refusal named
+
+    it "refuses a descriptor that names no compositor version" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        change fixture "tools/ci-image/descriptor.json" (withoutCompositor (descriptorJson described))
+        refusal ← planRaw fixture "HEAD" Nothing linuxPins
+        refusedByBuilder refusal "missing 'weston'"
+
+    it "refuses a descriptor whose compositor version is not a package revision" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        commitDescriptor fixture described {weston = "not a version"}
+        refusal ← planRaw fixture "HEAD" Nothing linuxPins
+        refusedByBuilder refusal "is not a package version"
+
+    it "declares the descriptor's compositor revision as a toolchain entry" $
+      withFixture $ \fixture → do
+        void $ describedImage fixture
+        plan ← planLinux fixture []
+        toolchainEntry plan "weston" `shouldBe` Just pinnedCompositor
+        -- A Darwin plan runs no image and therefore no compositor of the
+        -- image's, and declares none.
+        (local, darwin, errors) ←
+          planRaw fixture "HEAD" Nothing ["--runner-os", "Darwin", "--toolchain", "native-manifest=" ++ replicate 64 '1']
+        (local, errors) `shouldBe` (ExitSuccess, "")
+        toolchainEntry darwin "weston" `shouldBe` Nothing
 
     it "reads the descriptor from the integration candidate rather than the head" $
       withFixture $ \fixture → do
@@ -211,6 +240,7 @@ spec = describe "CI image" $ do
             , "ci-image=" ++ digestOf 'a'
             , "ghc=9.14.1"
             , "native-manifest=" ++ workerManifest worker
+            , "weston=" ++ pinnedCompositor
             ]
         planned ← environmentOfPlan fixture (workerPlan worker)
         output `shouldContain` ("environment=" ++ planned)
@@ -244,13 +274,76 @@ spec = describe "CI image" $ do
 
     it "refuses an image embedding another recipe fingerprint" $
       withWorker $ \fixture worker → do
-        writeFile (workerImage worker </> "image.json") ("{\"recipe_fingerprint\": \"" ++ replicate 64 '0' ++ "\"}\n")
+        writeFile (workerImage worker </> "image.json") (embeddedImage (replicate 64 '0') pinnedCompositor)
         refusedWorker fixture worker "embeds recipe fingerprint"
+
+    it "refuses an image that embeds no compositor version at all" $
+      withWorker $ \fixture worker → do
+        current ← fingerprintNow fixture
+        writeFile (workerImage worker </> "image.json") ("{\"recipe_fingerprint\": \"" ++ current ++ "\"}\n")
+        refusedWorker fixture worker "embeds compositor version None"
+
+    it "refuses an image whose embedded compositor version is malformed" $
+      withWorker $ \fixture worker → do
+        current ← fingerprintNow fixture
+        writeFile (workerImage worker </> "image.json") (embeddedImage current "not a version")
+        refusedWorker fixture worker "which is not a package version"
+
+    it "refuses a worker whose installed compositor is not the one its image embeds" $
+      withWorker $ \fixture worker → do
+        -- The installed package is the authority: an image stamped with one
+        -- revision and carrying another is refused rather than believed.
+        writeFile (workerStubs worker </> "weston-version") "13.0.0-5build1\n"
+        refusedWorker fixture worker "but has weston 13.0.0-5build1 installed"
+
+    it "refuses a worker with no installed compositor package" $
+      withWorker $ \fixture worker → do
+        removeFile (workerStubs worker </> "weston-version")
+        refusedWorker fixture worker "no installed weston package"
+
+    it "refuses a plan whose compositor entry is not the worker's" $
+      withWorker $ \fixture worker → do
+        patchPlanToolchain fixture (workerPlan worker) "weston" "13.0.0-5build1"
+        refusedWorker fixture worker "toolchain entry 'weston'"
 
     it "refuses a Cabal store outside the fixed image location" $
       withWorker $ \fixture worker → do
         writeFile (workerStubs worker </> "store") "/root/.cabal/store\n"
         refusedWorker fixture worker "resolves its store"
+
+  describe "the image workflow's routes" $ do
+    it "starts a proof route only on its own dispatch, and image resolution for no proof route" $ do
+      -- The routes are read from the workflow's own choice list rather than
+      -- named here, so a route added later without excluding it from
+      -- `resolve` — which is what would let a proof dispatch reach the
+      -- registry — fails this example rather than passing unnoticed.
+      workflow ← imageWorkflow
+      let routes = choiceOptions workflow "route"
+          proofs = filter (/= imageRoute) routes
+      routes `shouldContain` [imageRoute]
+      proofs `shouldNotBe` []
+      let resolving = jobCondition workflow "resolve"
+      forM_ proofs $ \route → do
+        resolving `shouldContain` ("inputs.route != '" ++ route ++ "'")
+        case jobsSelecting workflow route of
+          [job] → do
+            let condition = jobCondition workflow job
+            -- A pull request carries no route input at all, so requiring the
+            -- dispatch event is what keeps every proof route out of one.
+            condition `shouldContain` "github.event_name == 'workflow_dispatch'"
+            condition `shouldContain` ("inputs.route == '" ++ route ++ "'")
+          selecting → expectationFailure (route ++ " is selected by " ++ show selecting)
+
+    it "reaches the registry only through the job the proof routes exclude" $ do
+      workflow ← imageWorkflow
+      -- Excluding `resolve` is only worth anything if nothing that publishes
+      -- can start without it.
+      jobNeeds workflow "publish" `shouldContain` ["resolve"]
+      jobNeeds workflow "descriptor" `shouldContain` ["resolve"]
+      jobNeeds workflow "anonymous-pull" `shouldContain` ["descriptor"]
+      -- And only that chain may hold the package grant.
+      [job | job ← jobNames workflow, "packages: write" `isInfixOf` unlines (jobBlock workflow job)]
+        `shouldBe` ["publish"]
 
   describe "the image builder" $ do
     it "returns a validated hit without building or pushing" $
@@ -314,6 +407,21 @@ spec = describe "CI image" $ do
         published `shouldBe` ExitFailure 2
         publishErrors `shouldContain` "native manifest label"
         calls registry >>= \made → made `shouldNotContain` ["push"]
+
+    it "refuses an existing image whose compositor label is not the pinned revision" $
+      withRegistry $ \registry → do
+        answer registry [compositorAnswer fingerprintX (replicate 64 'b') "13.0.0-5build1"]
+        (resolved, _, errors) ← builder registry "resolve" []
+        resolved `shouldBe` ExitFailure 2
+        errors `shouldContain` ("its weston label is '13.0.0-5build1', not " ++ pinnedCompositor)
+        errors `shouldContain` "never overwritten"
+        answer registry ["absent", compositorAnswer fingerprintX (replicate 64 'b') "13.0.0-5build1"]
+        (published, _, publishErrors) ← builder registry "publish" ["--context", registryDirectory registry]
+        published `shouldBe` ExitFailure 2
+        publishErrors `shouldContain` "its weston label is"
+        -- The refusal is after the push, on reading the published metadata
+        -- back, so the tag is never left described as something it is not.
+        calls registry `shouldReturn` ["lookup", "lookup", "build", "validate", "push", "lookup"]
 
     it "publishes nothing when the candidate fails validation" $
       withRegistry $ \registry → do
@@ -405,6 +513,30 @@ spec = describe "CI image" $ do
         result `shouldBe` ExitFailure 1
         errors `shouldContain` "native manifest drift"
 
+    it "refuses a prefix whose recorded backends are not the ones the archive compiles" $
+      withNative $ \native → do
+        nativeOk native [] ["record", "--prefix", nativePrefix native]
+        -- The manifest is what makes the compiled backends observable, so a
+        -- manifest claiming a backend the archive does not carry is refused
+        -- rather than believed.
+        (patched, _, patchErrors) ←
+          run
+            (nativeEnvironment native)
+            (nativeDirectory native)
+            (nativePython native)
+            [ "-c"
+            , "import json, sys\n\
+              \path = sys.argv[1]\n\
+              \document = json.load(open(path, encoding='utf-8'))\n\
+              \document['backends'] = ['Wayland']\n\
+              \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+            , nativePrefix native </> "hetoimasia-native-manifest.json"
+            ]
+        (patched, patchErrors) `shouldBe` (ExitSuccess, "")
+        (result, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+        result `shouldBe` ExitFailure 1
+        errors `shouldContain` "the manifest records backends ['Wayland']"
+
     it "fails clearly when pkg-config is missing" $
       withNative $ \native → do
         (result, _, errors) ← nativeTool native [("PATH", nativeDirectory native </> "empty")] ["check", "--prefix", nativePrefix native]
@@ -438,6 +570,7 @@ recipePaths =
   [ ".github/workflows/ci-image.yml"
   , "tools/ci-image/Dockerfile"
   , "tools/ci-image/builder.py"
+  , "tools/ci-image/compositor.pin"
   , "tools/ci-image/provision.sh"
   , "tools/ci-image/registry.py"
   , "tools/ci-image/toolchain.pin"
@@ -532,9 +665,20 @@ descriptorJson described =
     , "  \"platform\": \"linux\","
     , "  \"recipe_fingerprint\": \"" ++ recipe described ++ "\","
     , "  \"reference\": \"ghcr.io/owner/project-ci\","
-    , "  \"schema_version\": 1"
+    , "  \"schema_version\": 1,"
+    , "  \"weston\": \"" ++ weston described ++ "\""
     , "}"
     ]
+
+-- | The same descriptor with the compositor field taken out, which is what a
+-- descriptor written before the image carried one looks like.
+withoutCompositor ∷ String → String
+withoutCompositor =
+  unlines . map trailing . filter (not . isInfixOf "\"weston\"") . lines
+  where
+    trailing line
+      | "  \"schema_version\": 1," `isPrefixOf` line = "  \"schema_version\": 1"
+      | otherwise = line
 
 -- | The same descriptor written with different bytes.
 compactDescriptor ∷ Descriptor → String
@@ -547,7 +691,7 @@ commitDescriptor fixture = change fixture "tools/ci-image/descriptor.json" . des
 describedImage ∷ Fixture → IO Descriptor
 describedImage fixture = do
   current ← fingerprintNow fixture
-  let described = Descriptor (digestOf 'a') (replicate 64 'b') current "9.14.1" "3.18.1.0"
+  let described = Descriptor (digestOf 'a') (replicate 64 'b') current "9.14.1" "3.18.1.0" pinnedCompositor
   commitDescriptor fixture described
   pure described
 
@@ -555,7 +699,19 @@ descriptorNow ∷ Fixture → IO Descriptor
 descriptorNow fixture = do
   text ← strictRead (root fixture </> "tools/ci-image/descriptor.json")
   let value name = maybe (error ("descriptor has no " ++ name)) id (parseJson text >>= field name >>= asString)
-  pure (Descriptor (value "digest") (value "native_manifest") (value "recipe_fingerprint") (value "ghc") (value "cabal"))
+  pure
+    ( Descriptor
+        (value "digest")
+        (value "native_manifest")
+        (value "recipe_fingerprint")
+        (value "ghc")
+        (value "cabal")
+        (value "weston")
+    )
+
+-- | The Ubuntu 24.04 package revision the recipe pins the compositor to.
+pinnedCompositor ∷ String
+pinnedCompositor = "13.0.0-4build3"
 
 linuxPins ∷ [String]
 linuxPins = ["--runner-os", "Linux", "--toolchain", "ghc=9.14.1", "--toolchain", "cabal=3.18.1.0"]
@@ -631,6 +787,74 @@ overriding ∷ [(String, String)] → [(String, String)] → [(String, String)]
 overriding overrides inherited = overrides ++ filter ((`notElem` map fst overrides) . fst) inherited
 
 -- ---------------------------------------------------------------------------
+-- The image workflow, read as the pipeline loads it
+--
+-- Deliberately dependency-free, for the reason Sandbox's step reader gives:
+-- an example that needed a YAML library installed to read a workflow would be
+-- skipped exactly when it mattered. Only the shapes this file actually uses
+-- are understood — a job is a two-space key under `jobs:`, and its fields are
+-- the four-space keys under it.
+
+ciImageWorkflow ∷ FilePath
+ciImageWorkflow = ".github/workflows/ci-image.yml"
+
+-- | The route that publishes. Every other route is a proof route.
+imageRoute ∷ String
+imageRoute = "image"
+
+imageWorkflow ∷ IO String
+imageWorkflow = getCurrentDirectory >>= \here → strictRead (here </> ciImageWorkflow)
+
+-- | The lines of one job, without its own key.
+jobBlock ∷ String → String → [String]
+jobBlock workflow name =
+  takeWhile inside (drop 1 (dropWhile (/= ("  " ++ name ++ ":")) (lines workflow)))
+  where
+    inside line = null (trimmed line) || "    " `isPrefixOf` line
+
+jobNames ∷ String → [String]
+jobNames workflow =
+  [ takeWhile (/= ':') (drop 2 line)
+  | line ← drop 1 (dropWhile (/= "jobs:") (lines workflow))
+  , "  " `isPrefixOf` line
+  , not ("   " `isPrefixOf` line)
+  , ":" `isInfixOf` line
+  ]
+
+-- | One field of a job, as written; the empty string when it has none.
+jobField ∷ String → String → String → String
+jobField workflow name key =
+  case [drop (length key + 1) (trimmed line) | line ← jobBlock workflow name, (key ++ ":") `isPrefixOf` trimmed line] of
+    value : _ → trimmed value
+    [] → ""
+
+jobCondition ∷ String → String → String
+jobCondition workflow name = jobField workflow name "if"
+
+-- | A job's declared dependencies, whether written as one name or a list.
+jobNeeds ∷ String → String → [String]
+jobNeeds workflow name =
+  words (map (\character → if character `elem` ("[]," ∷ String) then ' ' else character) (jobField workflow name "needs"))
+
+-- | The jobs one route selects, by their own condition.
+jobsSelecting ∷ String → String → [String]
+jobsSelecting workflow route =
+  [job | job ← jobNames workflow, ("inputs.route == '" ++ route ++ "'") `isInfixOf` jobCondition workflow job]
+
+-- | The values a workflow-dispatch choice input offers.
+choiceOptions ∷ String → String → [String]
+choiceOptions workflow name =
+  [ trimmed (drop 1 (trimmed line))
+  | line ← takeWhile (\line → "- " `isPrefixOf` trimmed line) after
+  ]
+  where
+    declared = dropWhile (/= ("      " ++ name ++ ":")) (lines workflow)
+    after = drop 1 (dropWhile (\line → trimmed line /= "options:") declared)
+
+trimmed ∷ String → String
+trimmed = dropWhile isSpace . reverse . dropWhile isSpace . reverse
+
+-- ---------------------------------------------------------------------------
 -- A fake image root and worker
 
 data Worker = Worker
@@ -647,20 +871,34 @@ withWorker action = withFixture $ \fixture → do
       prefix = image </> "native/glfw"
       stubs = scratch fixture </> "bin"
   fakePrefix prefix
-  writeFixtureFile image "image.json" ("{\"recipe_fingerprint\": \"" ++ current ++ "\"}\n")
+  writeFixtureFile image "image.json" (embeddedImage current pinnedCompositor)
   createDirectoryIfMissing True (image </> "cabal/store")
   (recorded, _, recordErrors) ←
     pythonIn fixture [checkout fixture </> "tools/native/native.py", "record", "--prefix", prefix]
   (recorded, recordErrors) `shouldBe` (ExitSuccess, "")
   hash ← sha256Of fixture (prefix </> "hetoimasia-native-manifest.json")
-  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.14.1" "3.18.1.0")
+  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.14.1" "3.18.1.0" pinnedCompositor)
   plan ← planLinux fixture []
   let planPath = scratch fixture </> "plan.json"
   writeFile planPath plan
   createDirectoryIfMissing True stubs
   writeFile (stubs </> "ghc-version") "9.14.1\n"
   writeFile (stubs </> "cabal-version") "3.18.1.0\n"
+  writeFile (stubs </> "weston-version") (pinnedCompositor ++ "\n")
   writeFile (stubs </> "store") (image </> "cabal/store\n")
+  -- dpkg answers for the compositor the container actually installed, and
+  -- reports it absent once the file standing in for that installation is gone.
+  executableFile
+    (stubs </> "dpkg-query")
+    ( unlines
+        [ "#!/bin/sh"
+        , "if [ ! -f '" ++ stubs </> "weston-version" ++ "' ]; then"
+        , "  echo 'dpkg-query: no packages found matching weston' >&2"
+        , "  exit 1"
+        , "fi"
+        , "cat '" ++ stubs </> "weston-version" ++ "'"
+        ]
+    )
   executableFile (stubs </> "ghc") ("#!/bin/sh\ncat '" ++ stubs </> "ghc-version" ++ "'\n")
   executableFile
     (stubs </> "cabal")
@@ -720,6 +958,12 @@ sha256Of fixture path = do
     pythonIn fixture ["-c", "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest())", path]
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (takeWhile (/= '\n') output)
+
+-- | The metadata an image embeds at @/opt/hetoimasia/image.json@: the recipe it
+-- was built from and the compositor revision it installed.
+embeddedImage ∷ String → String → String
+embeddedImage fingerprint compositor =
+  "{\"recipe_fingerprint\": \"" ++ fingerprint ++ "\", \"weston\": \"" ++ compositor ++ "\"}\n"
 
 -- | A prefix shaped like the recipe's output, with a placeholder archive. Its
 -- metadata is read by the real pkg-config, which is all a check consults.
@@ -781,13 +1025,18 @@ hitAnswer ∷ String
 hitAnswer = labelledAnswer fingerprintX (replicate 64 'b')
 
 labelledAnswer ∷ String → String → String
-labelledAnswer recipeLabel manifestLabel =
+labelledAnswer recipeLabel manifestLabel = compositorAnswer recipeLabel manifestLabel pinnedCompositor
+
+compositorAnswer ∷ String → String → String → String
+compositorAnswer recipeLabel manifestLabel compositorLabel =
   "{\"digest\": \""
     ++ digestOf 'a'
     ++ "\", \"labels\": {\"org.hetoimasia.ci-image.recipe-fingerprint\": \""
     ++ recipeLabel
     ++ "\", \"org.hetoimasia.ci-image.native-manifest\": \""
     ++ manifestLabel
+    ++ "\", \"org.hetoimasia.ci-image.weston\": \""
+    ++ compositorLabel
     ++ "\", \"org.hetoimasia.ci-image.ghc\": \"9.14.1\", \"org.hetoimasia.ci-image.cabal\": \"3.18.1.0\"}}"
 
 builder ∷ Registry → String → [String] → IO (ExitCode, String, String)
@@ -801,6 +1050,7 @@ builder registry command extra =
       , "--fingerprint", fingerprintX
       , "--ghc", "9.14.1"
       , "--cabal", "3.18.1.0"
+      , "--weston", pinnedCompositor
       , "--registry", registryTool registry
       ]
         ++ extra

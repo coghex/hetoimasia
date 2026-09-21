@@ -1,9 +1,10 @@
 # The Linux CI image: pinned GHC and Cabal, the C build prerequisites, the X11
-# development and runtime libraries GLFW needs, the compiled private GLFW
-# prefix, and the Xvfb server and Openbox window manager the native worker's
-# display helper starts for its own runs. Nothing in the image starts a display,
-# and it carries no project source, project build output, captures, or Vulkan
-# SDK.
+# and Wayland development libraries GLFW's two Linux backends need, the compiled
+# private GLFW prefix, the Xvfb server and Openbox window manager the native
+# worker's X11 display helper starts, and the pinned Weston compositor and
+# wayland-info client its Wayland helper starts. Nothing in the image starts a
+# display or a compositor, and it carries no project source, project build
+# output, captures, or Vulkan SDK.
 #
 # Build it only through the ci-image builder, which stages exactly the recipe
 # inputs the fingerprint covers as the build context and supplies that

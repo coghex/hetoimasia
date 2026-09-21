@@ -24,7 +24,7 @@ protocol, which ``registry.py`` implements against GHCR and Docker:
 - ``lookup REFERENCE:TAG`` prints ``{"digest": ..., "labels": {...}}`` and exits
   ``0``, or exits ``3`` when the registry confirms the tag is absent;
 - ``build CONTEXT LOCAL FINGERPRINT`` prints ``{"native_manifest": ...}``;
-- ``validate LOCAL FINGERPRINT NATIVE_MANIFEST GHC CABAL`` exits ``0``;
+- ``validate LOCAL FINGERPRINT NATIVE_MANIFEST GHC CABAL WESTON`` exits ``0``;
 - ``push LOCAL REFERENCE:TAG`` exits ``0``.
 
 Any other exit status is a registry error. See ``docs/validation.md``.
@@ -100,7 +100,7 @@ def lookup(registry: str, reference: str) -> dict | None:
     return document_from(output, f"the lookup of {reference}")
 
 
-def validated(record: dict, reference: str, fingerprint: str, ghc: str, cabal: str) -> dict:
+def validated(record: dict, reference: str, fingerprint: str, ghc: str, cabal: str, weston: str) -> dict:
     """An existing image's metadata, refused unless it describes this fingerprint."""
     problems: list[str] = []
     digest = record.get("digest")
@@ -117,7 +117,7 @@ def validated(record: dict, reference: str, fingerprint: str, ghc: str, cabal: s
         )
     if not isinstance(native_manifest, str) or not contract.HEX64.match(native_manifest):
         problems.append(f"its native manifest label is {native_manifest!r}")
-    for name, expected in (("ghc", ghc), ("cabal", cabal)):
+    for name, expected in (("ghc", ghc), ("cabal", cabal), ("weston", weston)):
         if labels.get(contract.LABELS[name]) != expected:
             problems.append(f"its {name} label is {labels.get(contract.LABELS[name])!r}, not {expected}")
     if problems:
@@ -126,24 +126,29 @@ def validated(record: dict, reference: str, fingerprint: str, ghc: str, cabal: s
             + "; ".join(problems)
             + "; the tag is never overwritten, so delete that package version deliberately if it must be replaced"
         )
-    return {"digest": digest, "native_manifest": native_manifest, "ghc": ghc, "cabal": cabal}
+    return {"digest": digest, "native_manifest": native_manifest, "ghc": ghc, "cabal": cabal, "weston": weston}
 
 
-def resolve(registry: str, image: str, fingerprint: str, ghc: str, cabal: str) -> dict:
+def resolve(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, weston: str) -> dict:
     reference = tag_for(image, fingerprint)
     record = lookup(registry, reference)
     if record is None:
         return {"status": "miss", "reference": reference}
-    return {"status": "hit", "reference": reference, **validated(record, reference, fingerprint, ghc, cabal)}
+    return {"status": "hit", "reference": reference, **validated(record, reference, fingerprint, ghc, cabal, weston)}
 
 
-def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, context: str) -> dict:
+def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, weston: str, context: str) -> dict:
     reference = tag_for(image, fingerprint)
     # The recheck. This runs serialized per fingerprint, so a builder that
     # published while this one waited is found here and nothing is rebuilt.
     record = lookup(registry, reference)
     if record is not None:
-        return {"status": "hit", "published": False, "reference": reference, **validated(record, reference, fingerprint, ghc, cabal)}
+        return {
+            "status": "hit",
+            "published": False,
+            "reference": reference,
+            **validated(record, reference, fingerprint, ghc, cabal, weston),
+        }
 
     local = f"hetoimasia-ci-candidate:{fingerprint[:16]}"
     status, output, errors = call(registry, "build", context, local, fingerprint)
@@ -154,7 +159,7 @@ def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, c
     if not isinstance(native_manifest, str) or not contract.HEX64.match(native_manifest):
         raise BuilderError(f"the candidate build reported native manifest {native_manifest!r}")
 
-    status, _, errors = call(registry, "validate", local, fingerprint, native_manifest, ghc, cabal)
+    status, _, errors = call(registry, "validate", local, fingerprint, native_manifest, ghc, cabal, weston)
     if status != 0:
         raise BuilderError(f"the candidate image failed validation (exit {status}): {errors or 'no output'}; nothing was published")
 
@@ -165,7 +170,7 @@ def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, c
     published = lookup(registry, reference)
     if published is None:
         raise BuilderError(f"{reference} is absent immediately after it was pushed")
-    result = validated(published, reference, fingerprint, ghc, cabal)
+    result = validated(published, reference, fingerprint, ghc, cabal, weston)
     if result["native_manifest"] != native_manifest:
         raise BuilderError(
             f"{reference} reports native manifest {result['native_manifest'][:12]} after publication, "
@@ -174,7 +179,16 @@ def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, c
     return {"status": "published", "published": True, "reference": reference, **result}
 
 
-def descriptor(image: str, digest: str, fingerprint: str, native_manifest: str, ghc: str, cabal: str, architecture: str) -> dict:
+def descriptor(
+    image: str,
+    digest: str,
+    fingerprint: str,
+    native_manifest: str,
+    ghc: str,
+    cabal: str,
+    weston: str,
+    architecture: str,
+) -> dict:
     document = {
         "schema_version": contract.DESCRIPTOR_SCHEMA_VERSION,
         "reference": image,
@@ -185,6 +199,7 @@ def descriptor(image: str, digest: str, fingerprint: str, native_manifest: str, 
         "architecture": architecture,
         "ghc": ghc,
         "cabal": cabal,
+        "weston": weston,
     }
     try:
         return contract.validate_descriptor(document, "the returned descriptor")
@@ -232,6 +247,7 @@ def main(argv: list[str]) -> int:
         sub.add_argument("--fingerprint", required=True)
         sub.add_argument("--ghc", required=True)
         sub.add_argument("--cabal", required=True)
+        sub.add_argument("--weston", required=True, help="the pinned compositor package revision")
         sub.add_argument("--registry", required=True, help="the registry transport executable")
         sub.add_argument("--github-output", default=None)
 
@@ -247,6 +263,7 @@ def main(argv: list[str]) -> int:
     written.add_argument("--native-manifest", required=True)
     written.add_argument("--ghc", required=True)
     written.add_argument("--cabal", required=True)
+    written.add_argument("--weston", required=True)
     written.add_argument("--architecture", default="amd64")
     written.add_argument("--output", required=True)
     staged = commands.add_parser("stage")
@@ -259,10 +276,18 @@ def main(argv: list[str]) -> int:
         if not contract.HEX64.match(arguments.fingerprint):
             raise BuilderError(f"{arguments.fingerprint!r} is not a recipe fingerprint")
         if arguments.command == "resolve":
-            result = resolve(arguments.registry, arguments.image, arguments.fingerprint, arguments.ghc, arguments.cabal)
+            result = resolve(
+                arguments.registry, arguments.image, arguments.fingerprint, arguments.ghc, arguments.cabal, arguments.weston
+            )
         else:
             result = publish(
-                arguments.registry, arguments.image, arguments.fingerprint, arguments.ghc, arguments.cabal, arguments.context
+                arguments.registry,
+                arguments.image,
+                arguments.fingerprint,
+                arguments.ghc,
+                arguments.cabal,
+                arguments.weston,
+                arguments.context,
             )
         write_outputs(arguments.github_output, result)
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -274,6 +299,7 @@ def main(argv: list[str]) -> int:
             arguments.native_manifest,
             arguments.ghc,
             arguments.cabal,
+            arguments.weston,
             arguments.architecture,
         )
         with open(arguments.output, "w", encoding="utf-8") as handle:
