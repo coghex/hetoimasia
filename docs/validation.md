@@ -811,9 +811,11 @@ It starts the image's pinned Weston for that one command and stops it
 afterwards. The optional `test.glfw-wayland` runs under it: the native suite
 now accepts the `isolated-wayland:<socket>` consent this helper supplies, on
 Linux, only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is
-unset, and the group's one example then asserts that the session it requested
-selected Wayland. Because the group is optional it runs only when requested, so
-an ordinary pull request still starts no compositor. What also exercises the
+unset. Its two examples then assert that the session it requested selected
+Wayland on that socket, and that both X11 test-check drivers answer unavailable
+there while the session's asynchronous reports stay empty — which is what shows
+neither reached for an X11 handle. Because the group is optional it runs only
+when requested, so an ordinary pull request still starts no compositor. What also exercises the
 helper against a real compositor is the `ci-image` workflow's dispatch-only
 [`route: wayland-probe`](#the-builder), which runs
 `bash tools/display/wayland.sh -- true` inside the described image with the

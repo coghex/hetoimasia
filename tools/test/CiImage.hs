@@ -14,7 +14,7 @@
 module CiImage (spec) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import Data.Char (isSpace)
 import Data.List (isInfixOf, isPrefixOf, sort)
 import Json (asArray, asString, field, parseJson)
@@ -22,10 +22,12 @@ import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFi
 import System.Directory
   ( canonicalizePath
   , createDirectoryIfMissing
+  , doesDirectoryExist
   , doesFileExist
   , findExecutable
   , getCurrentDirectory
   , getPermissions
+  , listDirectory
   , removeFile
   , setOwnerExecutable
   , setPermissions
@@ -114,6 +116,83 @@ spec = describe "CI image" $ do
         sort (lines listing) `shouldBe` sort recipePaths
         doesFileExist (scratch fixture </> "context/tools/ci-image/descriptor.json") `shouldReturn` False
         doesFileExist (scratch fixture </> "context/src/note.txt") `shouldReturn` False
+
+  describe "the native recipe's patches" $ do
+    it "applies every patch in name order, and ends the build when one does not apply" $
+      withFixture $ \fixture → do
+        recipeDirectory ← copiedRecipe fixture
+        clearPatches recipeDirectory
+        -- Two patches whose names sort the other way round from the order they
+        -- were written, so an example that passes proves the sort and not the
+        -- directory listing.
+        writeFixtureFile recipeDirectory "patches/0002-second.patch" (appendingPatch ["base", "first"] "second")
+        writeFixtureFile recipeDirectory "patches/0001-first.patch" (appendingPatch ["base"] "first")
+        let source = scratch fixture </> "source"
+        writeFixtureFile source "note.txt" "base\n"
+        (applied, _, failures) ← pythonIn fixture [recipeDirectory </> "native.py", "--help"]
+        (applied, failures) `shouldBe` (ExitSuccess, "")
+        driveApplyPatches fixture recipeDirectory source `shouldReturn` ExitSuccess
+        readFile (source </> "note.txt") `shouldReturn` "base\nfirst\nsecond\n"
+
+        -- The same patches against a source they no longer fit: the recipe
+        -- stops rather than building something the patch did not reach.
+        let stale = scratch fixture </> "stale"
+        writeFixtureFile stale "note.txt" "something else entirely\n"
+        driveApplyPatches fixture recipeDirectory stale >>= (`shouldNotBe` ExitSuccess)
+
+    it "records every patch, in order and by content, in the native identity" $
+      withFixture $ \fixture → do
+        recipeDirectory ← copiedRecipe fixture
+        clearPatches recipeDirectory
+        writeFixtureFile recipeDirectory "patches/0002-second.patch" (appendingPatch ["base", "first"] "second")
+        writeFixtureFile recipeDirectory "patches/0001-first.patch" (appendingPatch ["base"] "first")
+        recorded ← recordedPatches fixture recipeDirectory
+        map fst recorded `shouldBe` ["0001-first.patch", "0002-second.patch"]
+        map snd recorded `shouldSatisfy` all ((== 64) . length)
+        -- Content, not just name: same names, different bytes, different digests.
+        writeFixtureFile recipeDirectory "patches/0001-first.patch" (appendingPatch ["base"] "altered")
+        altered ← recordedPatches fixture recipeDirectory
+        map fst altered `shouldBe` map fst recorded
+        map snd altered `shouldNotBe` map snd recorded
+
+        clearPatches recipeDirectory
+        recordedPatches fixture recipeDirectory `shouldReturn` []
+
+    it "moves the recipe fingerprint for an added, changed, reordered, or removed patch" $
+      withFixture $ \fixture → do
+        recipeDirectory ← copiedRecipe fixture
+        clearPatches recipeDirectory
+        bare ← recipeFingerprint fixture recipeDirectory
+        writeFixtureFile recipeDirectory "patches/0001-first.patch" (appendingPatch ["base"] "first")
+        one ← recipeFingerprint fixture recipeDirectory
+        one `shouldNotBe` bare
+        writeFixtureFile recipeDirectory "patches/0002-second.patch" (appendingPatch ["base", "first"] "second")
+        two ← recipeFingerprint fixture recipeDirectory
+        two `shouldNotBe` one
+        -- The same two patches under swapped names apply in the other order,
+        -- and are a different recipe.
+        writeFixtureFile recipeDirectory "patches/0001-first.patch" (appendingPatch ["base", "first"] "second")
+        writeFixtureFile recipeDirectory "patches/0002-second.patch" (appendingPatch ["base"] "first")
+        swapped ← recipeFingerprint fixture recipeDirectory
+        swapped `shouldNotBe` two
+        clearPatches recipeDirectory
+        recipeFingerprint fixture recipeDirectory `shouldReturn` bare
+
+    it "refuses a prefix whose recorded patches are not this configuration's, naming them" $
+      withFixture $ \fixture → do
+        recipeDirectory ← copiedRecipe fixture
+        let prefix = scratch fixture </> "prefix"
+        createDirectoryIfMissing True prefix
+        -- A manifest exactly as a prefix built before the patch landed would
+        -- carry it: this configuration's identity with the patches left out.
+        stale ← staleManifest fixture recipeDirectory prefix
+        writeFixtureFile prefix "hetoimasia-native-manifest.json" stale
+        (result, _, diagnosis) ←
+          pythonIn fixture [recipeDirectory </> "native.py", "check", "--prefix", prefix]
+        result `shouldNotBe` ExitSuccess
+        diagnosis `shouldContain` "patches"
+        diagnosis `shouldContain` "0001-wayland-fix-segfault-when-there-is-no-seat.patch"
+        diagnosis `shouldContain` "rebuild it with"
 
   describe "the planner" $ do
     it "declares ci-image and native-manifest from a descriptor that describes the candidate" $
@@ -564,6 +643,105 @@ withFixture action = do
     void $ git settings repository ["commit", "-q", "-m", "Seed a project with an image recipe"]
     seed ← revision fixture "HEAD"
     action fixture {seeded = seed}
+
+-- | A writable copy of the shipped native recipe, so an example can vary its
+-- patches without touching the checkout it runs from.
+copiedRecipe ∷ Fixture → IO FilePath
+copiedRecipe fixture = do
+  let destination = scratch fixture </> "recipe"
+  createDirectoryIfMissing True destination
+  (copied, _, errors) ←
+    run (environment fixture) (root fixture) "cp" ["-R", checkout fixture </> "tools/native/.", destination]
+  (copied, errors) `shouldBe` (ExitSuccess, "")
+  pure destination
+
+-- | Remove every patch the copy carries, for an example that supplies its own.
+clearPatches ∷ FilePath → IO ()
+clearPatches recipeDirectory = do
+  let directory = recipeDirectory </> "patches"
+  present ← doesDirectoryExist directory
+  when present $ do
+    names ← listDirectory directory
+    forM_ names $ \name → removeFile (directory </> name)
+
+-- | A patch appending one line to a note.txt that currently holds exactly the
+-- given lines. Each patch in a sequence is written against what the one before
+-- it produced, as a real series of backports is.
+appendingPatch ∷ [String] → String → String
+appendingPatch existing line =
+  unlines $
+    [ "--- a/note.txt"
+    , "+++ b/note.txt"
+    , "@@ -1," ++ show (length existing) ++ " +1," ++ show (length existing + 1) ++ " @@"
+    ]
+      ++ map (' ' :) existing
+      ++ ["+" ++ line]
+
+-- | Drive the recipe's own patch application against a directory, which is
+-- what the build does between unpacking and configuring.
+driveApplyPatches ∷ Fixture → FilePath → FilePath → IO ExitCode
+driveApplyPatches fixture recipeDirectory source = do
+  (result, _, _) ←
+    pythonIn fixture
+      [ "-c"
+      , "import sys; sys.path.insert(0, sys.argv[1]); import native; native.apply_patches(sys.argv[2])"
+      , recipeDirectory
+      , source
+      ]
+  pure result
+
+-- | The patches this configuration records, by name and digest, in order.
+recordedPatches ∷ Fixture → FilePath → IO [(String, String)]
+recordedPatches fixture recipeDirectory = do
+  (result, output, errors) ← pythonIn fixture [recipeDirectory </> "native.py", "identity"]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  case parseJson output >>= field "patches" >>= asArray of
+    Nothing → expectationFailure ("no patches in the identity: " ++ output) >> pure []
+    Just entries →
+      pure
+        [ (name, digest)
+        | entry ← entries
+        , Just name ← [field "name" entry >>= asString]
+        , Just digest ← [field "sha256" entry >>= asString]
+        ]
+
+-- | The recipe fingerprint the copied recipe reports for itself.
+recipeFingerprint ∷ Fixture → FilePath → IO String
+recipeFingerprint fixture recipeDirectory = do
+  (result, output, errors) ← pythonIn fixture [recipeDirectory </> "native.py", "fingerprint"]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (takeWhile (/= '\n') output)
+
+-- | This configuration's manifest with the patches left out, which is exactly
+-- what a prefix built before a patch landed carries.
+staleManifest ∷ Fixture → FilePath → FilePath → IO String
+staleManifest fixture recipeDirectory prefix = do
+  (result, output, errors) ←
+    pythonIn fixture
+      [ "-c"
+      , unlines
+          [ "import json, sys"
+          , "sys.path.insert(0, sys.argv[1])"
+          , "import native"
+          , "pin = native.read_pin()"
+          , "identity = native.native_identity(native.host_platform(), pin)"
+          , "identity.pop('patches', None)"
+          , "print(json.dumps({"
+          , "  'schema_version': native.MANIFEST_SCHEMA_VERSION,"
+          , "  'library': 'glfw3',"
+          , "  'glfw_version': pin['GLFW_VERSION'],"
+          , "  'source_url': pin['GLFW_URL'],"
+          , "  'source_sha256': pin['GLFW_SHA256'],"
+          , "  'recipe_fingerprint': native.recipe_fingerprint(),"
+          , "  'identity': identity,"
+          , "  'prefix': native.normalized(sys.argv[2]),"
+          , "}))"
+          ]
+      , recipeDirectory
+      , prefix
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure output
 
 recipePaths ∷ [FilePath]
 recipePaths =
