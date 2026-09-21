@@ -141,6 +141,24 @@ x11Spec = describe "Isolated X11 display" $ do
       installStubs display (("Xvfb", stammeringServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
+  it "stops the X server and removes its scratch directory when a signal ends the startup" $
+    withDisplay $ \display → do
+      -- Cleanup's first window: the server is running and nothing has reported
+      -- yet, which is where the helper spends the bound. The server itself is
+      -- what signals the helper, so the signal lands there rather than after an
+      -- elapsed time, and it then stays alive so that the helper stopping it is
+      -- what ends it.
+      installStubs display (("Xvfb", signallingServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      (result, _, errors) ← helper display ["--", "sh", "-c", recordEnvironment display]
+      result `shouldBe` ExitFailure 143
+      errors `shouldContain` "terminated by SIGTERM"
+      -- The display was never established, so the command never ran and the
+      -- consent reached nothing.
+      doesFileExist (directory display </> "environment.txt") `shouldReturn` False
+      server ← pidIn display "server.pid"
+      stopped server `shouldReturn` True
+      leftBehind "hetoimasia-x11." display `shouldReturn` []
+
   it "refuses to run the command when the window manager exits instead of taking the display" $
     withDisplay $ \display → do
       -- A window manager that exits never announces itself on the root window.
@@ -252,6 +270,20 @@ babblingServer =
     , "exec sleep 300"
     ]
 
+-- | A server that signals the helper as soon as it is running and then stays
+-- alive. The helper is the server's grandparent — the owner process that waits
+-- for the server sits between them — so the signal is aimed through the
+-- server's own parent rather than at it.
+signallingServer ∷ String
+signallingServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "helper=$(ps -o ppid= -p \"$PPID\" | tr -d ' ')"
+    , "kill -TERM \"$helper\""
+    , "exec sleep 300"
+    ]
+
 -- | A server that holds its report channel open and reports nothing, and that
 -- handles the helper's termination signal and exits cleanly when stopped.
 silentServer ∷ String
@@ -352,7 +384,7 @@ withHelper relative action = do
 -- display programs themselves are deliberately absent unless stubbed.
 utilities ∷ [String]
 utilities =
-  ["cat", "head", "mkdir", "mkfifo", "mktemp", "rm", "sed", "sh", "sleep", "tail", "touch", "tr"]
+  ["cat", "head", "mkdir", "mkfifo", "mktemp", "ps", "rm", "sed", "sh", "sleep", "tail", "touch", "tr"]
 
 -- ---------------------------------------------------------------------------
 -- The isolated headless Wayland session

@@ -783,6 +783,17 @@ therefore never reported as a timeout, and one that stays alive is never
 reported as an exit. The first two reasons quote the server log's tail; all
 three refuse with status `1`.
 
+Stopping the server belongs to that same owner process and is asked for by
+signal, because waiting for the server is where it spends its life. It stops
+only what its job table still lists as running, and the helper's own cleanup
+does the same for what it started: a job still listed as running has not been
+reaped, so that number is still that process's own, while a number kept in a
+variable or a file may by then name a process the helper never started. Nothing
+in either is a diagnosis. A signal the helper can catch — `TERM`, `INT`, or
+`HUP` — ends it through that cleanup and reports which signal it was, so a
+signal arriving while it waits for the startup report leaves neither a running
+server nor a scratch directory behind; it exits `143`, `130`, or `129`.
+
 A missing server or window manager, each of those three startup outcomes, a
 server that does not answer, and a window manager that exits or never
 takes the display each end the helper with status `1` before the command

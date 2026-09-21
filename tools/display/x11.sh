@@ -66,8 +66,11 @@ for tool in Xvfb openbox xdpyinfo xprop; do
   command -v "$tool" >/dev/null 2>&1 || refuse "$tool was not found on PATH"
 done
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/hetoimasia-x11.XXXXXX")" || refuse "no scratch directory could be created"
-owner=""
+# Nothing is created until cleanup owns it. Every one of these is declared and
+# both traps installed before the scratch directory exists, so a signal during
+# setup — the window in which the server is starting and nothing has reported
+# yet — still ends through the same cleanup.
+scratch=""
 reporter=""
 manager=""
 
@@ -82,27 +85,39 @@ alive() {
   return 1
 }
 
+# Stop everything this script started, and wait for it to be gone before the
+# scratch directory goes. What to signal is taken from the job table rather
+# than from a recorded process id: a job it still lists as running has not been
+# reaped, so that number is still that process's own, while a number read back
+# from a variable or a file may by then name a process this script never
+# started. Nothing here decides an outcome; the startup observations below do
+# that, on their own channels.
 stop() {
-  local server
-  if [ -n "$manager" ]; then
-    kill "$manager" 2>/dev/null
-    wait "$manager" 2>/dev/null
+  local job
+  for job in $(jobs -pr); do
+    kill "$job" 2>/dev/null
+  done
+  wait
+  if [ -n "$scratch" ]; then
+    rm -rf "$scratch"
   fi
-  if [ -n "$reporter" ]; then
-    kill "$reporter" 2>/dev/null
-    wait "$reporter" 2>/dev/null
-  fi
-  # Stopping the server is this script's own business and says nothing about
-  # how it ended: the owner below is what reaps it, and waiting for that owner
-  # is how this waits for a process it is not the parent of.
-  if [ -n "$owner" ]; then
-    server="$(cat "$scratch/server.pid" 2>/dev/null)"
-    [ -n "$server" ] && kill "$server" 2>/dev/null
-    wait "$owner" 2>/dev/null
-  fi
-  rm -rf "$scratch"
-}
+} 2>/dev/null
 trap stop EXIT
+
+# A signal the helper can catch ends it through that same cleanup rather than
+# ending it where it stands. Without this, a signal arriving while the helper
+# waits for the server's startup report leaves the server running and the
+# scratch directory behind, because the wait is what the shell dies in.
+terminate() {
+  trap - TERM INT HUP
+  echo "x11.sh: terminated by SIG$1; the X server is stopped and its scratch directory removed" >&2
+  exit "$2"
+}
+trap 'terminate TERM 143' TERM
+trap 'terminate INT 130' INT
+trap 'terminate HUP 129' HUP
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/hetoimasia-x11.XXXXXX")" || refuse "no scratch directory could be created"
 
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11
@@ -116,11 +131,13 @@ export XDG_SESSION_TYPE=x11
 #   * the report channel's own result, produced by a reporter process that
 #     reads it — a complete line, or the channel closing without one;
 #   * the server's termination, produced by an owner process whose only job is
-#     to wait for the server. Reaping it is the observation, so nothing is
-#     signalled to make it, nothing is inferred from an exit status a server
-#     chose for itself, and the job table — which notices an exit at its own
-#     pace, and is what once let an immediate exit be called a timeout — is
-#     never asked;
+#     to start the server and wait for it. Reaping it is the observation, so
+#     nothing is signalled to make it, nothing is inferred from an exit status
+#     a server chose for itself, and the job table — which notices an exit at
+#     its own pace, and is what once let an immediate exit be called a timeout
+#     — is never asked. Stopping the server is that same owner's own business,
+#     asked for by signal and carried out only while its job table still lists
+#     the server as running, so a cleanup can never signal a reaped process id;
 #   * the thirty-second bound, read from an outcome channel this script holds
 #     a write end of. That channel therefore never reaches end-of-file, so a
 #     failed read on it can only be the bound expiring; `read`'s own status
@@ -130,15 +147,36 @@ mkfifo "$scratch/displayfd" || refuse "no display-number channel could be create
 mkfifo "$scratch/startup" || refuse "no startup-outcome channel could be created"
 exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened"
 # The server writes to its own log, so the owner's standard error would carry
-# nothing but the notices a shell prints for a background process this script
-# stopped — its own doing rather than anything the caller asked to hear.
+# nothing but the notices a shell prints for a background process it stopped —
+# its own doing rather than anything the caller asked to hear.
 {
+  # A request to stop arrives as a signal, because this process spends its life
+  # waiting for the server, and the handler only records it: the server is
+  # stopped below by `halt`, which signals what the job table still lists as
+  # running and therefore never signals a process id that has been reaped and
+  # handed to somebody else. The trap is armed before the server exists, so a
+  # request that arrives during startup is recorded rather than ending this
+  # process and orphaning the server it had just started.
+  stopping=""
+  trap 'stopping=yes' TERM
+  halt() {
+    local job
+    for job in $(jobs -pr); do
+      kill "$job" 2>/dev/null
+    done
+  }
   Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" 8>&- &
-  printf '%s\n' "$!" >"$scratch/server.pid"
-  wait
-  printf 'exited\n' 2>/dev/null
+  [ -z "$stopping" ] || halt
+  while :; do
+    wait
+    [ "$?" -gt 128 ] || break
+    halt
+  done
+  # The server was reaped, and that is the whole report. A server this process
+  # was told to stop ended because of that request, which is nobody's outcome
+  # to hear.
+  [ -n "$stopping" ] || printf 'exited\n'
 } >&8 2>/dev/null &
-owner=$!
 {
   if IFS= read -r reported <"$scratch/displayfd"; then
     printf 'report %s\n' "$reported"
@@ -159,7 +197,12 @@ while :; do
   remaining=$((30 - (SECONDS - started)))
   outcome="bound"
   if [ "$remaining" -gt 0 ]; then
-    IFS= read -r -t "$remaining" outcome <&8 || outcome="bound"
+    # Read without an `IFS=` prefix. An assignment prefixed to `read` is
+    # restored when the read returns, but a signal arriving while it waits can
+    # leave the empty value behind under Bash 5.3, and cleanup splits the job
+    # table on whitespace. The outcomes below are single words or a word and a
+    # number, so the surrounding whitespace this strips is nothing they carry.
+    read -r -t "$remaining" outcome <&8 || outcome="bound"
   fi
   case "$outcome" in
     'exited')
