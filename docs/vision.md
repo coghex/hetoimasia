@@ -79,6 +79,17 @@ is per window; simulation pause policy belongs to the application. Expected
 native-wake failure preserves admitted commands and degrades to bounded polling
 with a diagnostic. See [scheduling](runtime_scheduling_design.md) and [GLFW](glfw.md).
 
+The approved production rendering design uses a separate supervised graphics
+owner, with bounded handoffs and explicit ownership of Vulkan roots. GLFW calls
+and record-only callbacks remain on the main thread. The graphics owner's
+component-owned worker group outlives ordinary application workers and remains
+available through protected retirement, with the main thread servicing required
+handoffs before the final join. Rendering consumes published scene snapshots;
+the application chooses which thread produces them, and a simulation driver is
+deferred. This does not promise window-command progress during a Cocoa modal
+loop, or qualify rendering progress without the retained VK-16 native evidence.
+See [Vulkan decisions D-29–D-33](vulkan_backend_design.md) and LIFE D-6.
+
 ## Graphics and platforms
 
 ### V-6. Central lifetime enforcement with flexible renderer scheduling
@@ -95,7 +106,7 @@ replacement, allocation reclamation and explicit frame abandonment preserve
 ownership and finite recovery budgets. Device loss and validation errors stop
 the affected shared graphics session. Elapsed time and render fences do not
 prove presentation retirement. Platform timing assumptions are not correctness
-evidence. See [Vulkan decisions D-12–D-27](vulkan_backend_design.md).
+evidence. See [Vulkan decisions D-12–D-33](vulkan_backend_design.md).
 
 ### V-7. Optimize actual foreign-call and diagnostic boundaries
 
