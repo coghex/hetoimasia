@@ -100,8 +100,13 @@ x11Spec = describe "Isolated X11 display" $ do
 
   it "refuses to run the command when the X server closes its startup report without naming a display" $
     withDisplay $ \display → do
-      -- A server that stays alive with the channel shut is neither an exit nor
-      -- the bound expiring, and it is answered as soon as the channel closes.
+      -- A server that stays alive with the channel shut is not an exit, and a
+      -- shut channel is not a report either. Which of the two this was is
+      -- settled at the bound, because a server on its way out would be reaped
+      -- and named as the exit it is before then; this example waits that bound
+      -- out. The stub handles the helper's termination signal and exits
+      -- cleanly, so a refusal that still says "closed or invalid" cannot have
+      -- come from reading how the cleanup ended it.
       installStubs display (("Xvfb", closingServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup
         display
@@ -111,8 +116,8 @@ x11Spec = describe "Isolated X11 display" $ do
   it "refuses to run the command when the X server's startup report names no display number" $
     withDisplay $ \display → do
       -- A line arrived, so the channel is not closed; it names no display, so
-      -- the report is invalid. Both are the same refusal, and neither is an
-      -- exit while the server is still running.
+      -- the report is invalid. Both are the same refusal, and the bound settles
+      -- it against an exit the same way; this example waits that bound out.
       installStubs display (("Xvfb", babblingServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup
         display
@@ -123,6 +128,8 @@ x11Spec = describe "Isolated X11 display" $ do
     withDisplay $ \display → do
       -- A server that holds the report channel open and says nothing exhausts
       -- the helper's thirty-second bound; this example waits that bound out.
+      -- This stub too handles the termination signal and exits cleanly, so the
+      -- timeout is the outstanding report rather than the cleanup's doing.
       installStubs display (("Xvfb", silentServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
@@ -214,7 +221,11 @@ outlivedServer =
     ]
 
 -- | A server that closes its report channel and then stays alive, so the
--- channel closes with no exit to observe at all.
+-- channel closes with no exit to observe at all. Like the real Xvfb it handles
+-- the termination signal the helper's cleanup sends and exits cleanly, of its
+-- own accord and with a status of its own choosing, so an outcome that can be
+-- told apart from an exit here is being read from the server's own channels
+-- rather than from how the helper's cleanup happened to end it.
 closingServer ∷ String
 closingServer =
   unlines
@@ -222,11 +233,15 @@ closingServer =
     , "echo $$ > server.pid"
     , "echo 'the startup report was closed' >&2"
     , "exec 3>&-"
-    , "exec sleep 300"
+    , "trap 'kill $waiter 2>/dev/null; exit 0' TERM"
+    , "sleep 300 & waiter=$!"
+    , "wait"
     ]
 
 -- | A server that reports something other than a display number and stays
--- alive, so the report is invalid without the channel having closed.
+-- alive, so the report is invalid without the channel having closed. This one
+-- is ended by the helper's cleanup signal rather than handling it, the other
+-- disposition a live server can have when it is stopped.
 babblingServer ∷ String
 babblingServer =
   unlines
@@ -237,13 +252,16 @@ babblingServer =
     , "exec sleep 300"
     ]
 
--- | A server that holds its report channel open and reports nothing.
+-- | A server that holds its report channel open and reports nothing, and that
+-- handles the helper's termination signal and exits cleanly when stopped.
 silentServer ∷ String
 silentServer =
   unlines
     [ "#!/bin/sh"
     , "echo $$ > server.pid"
-    , "exec sleep 300"
+    , "trap 'kill $waiter 2>/dev/null; exit 0' TERM"
+    , "sleep 300 & waiter=$!"
+    , "wait"
     ]
 
 -- | A server whose report never becomes a complete line: the digits it wrote

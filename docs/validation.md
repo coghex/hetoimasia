@@ -766,15 +766,22 @@ fallback can stand in for it, and the consent names the display it must match.
 Server startup has three outcomes, and the helper tells them apart by what it
 observed rather than by a query that races the server's exit: the server
 exited before reporting a display, its startup report closed or named no
-display number while the server was still running, or the thirty-second bound
-expired with the report still outstanding. The report is read by a process
-whose result the helper receives on a channel it keeps a write end of, so a
-failed read there can only be the bound expiring, and the server's own exit
-status — rather than the shell's job table, which notices an exit at its own
-pace — is what says whether it terminated. A server that exits before
-reporting is therefore never reported as a timeout, and one that stays alive
-is never reported as an exit. The first two reasons quote the server log's
-tail; all three refuse with status `1`.
+display number, or the thirty-second bound expired with the report still
+outstanding. The report is read by a process whose result the helper receives
+on a channel it keeps a write end of, so a failed read there can only be the
+bound expiring. Termination is observed by a second process whose only job is
+to wait for the server: reaping it *is* the observation, so nothing is
+signalled to make it, nothing is read out of an exit status the server chose
+for itself, and the shell's job table — which notices an exit at its own pace,
+and is what once let an immediate exit be called a timeout — is never asked.
+Stopping the server is separate from that, and a server that handles the
+termination signal and exits cleanly, as a real Xvfb does, is not thereby
+reported as having exited on its own. An unusable report is settled at the
+bound rather than at once, because a server on its way out has until then to be
+reaped and named as the exit it is. A server that exits before reporting is
+therefore never reported as a timeout, and one that stays alive is never
+reported as an exit. The first two reasons quote the server log's tail; all
+three refuse with status `1`.
 
 A missing server or window manager, each of those three startup outcomes, a
 server that does not answer, and a window manager that exits or never
