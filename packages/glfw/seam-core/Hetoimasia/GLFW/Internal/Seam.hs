@@ -48,7 +48,8 @@
 -- key and its arguments in native types — and runs the script's
 -- 'scriptWindowControl' step, which may report errors. The script's
 -- 'scriptWindowCapabilities' describes what windows cannot do or report on the
--- session's backend, so an example can model a platform no session selects. None of them is a public command, and none is exported by the
+-- session's backend, so an example can model a backend this machine cannot
+-- run. None of them is a public command, and none is exported by the
 -- public seam. Each also refuses, with 'ForeignSeamWindow' and before anything
 -- else, a window whose session was not entered over this seam's own native
 -- table.

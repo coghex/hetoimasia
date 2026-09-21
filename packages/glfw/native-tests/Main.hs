@@ -33,7 +33,7 @@ import Data.List (intercalate)
 import Data.Maybe (isNothing)
 import System.Environment (getArgs)
 import System.Exit (ExitCode, exitFailure, exitWith)
-import System.IO (hFlush, hPutStrLn, stderr, stdout)
+import System.IO (BufferMode (LineBuffering), hFlush, hPutStrLn, hSetBuffering, stderr, stdout)
 import Test.GLFW.Native.Consent (Consent, Refusal, readConsent, refusalMessage)
 import Test.GLFW.Native.Fixture (OwnerReport (..), runOwned)
 import qualified Test.GLFW.Native.Private as Private
@@ -53,6 +53,14 @@ import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWithRe
 
 main ∷ IO ()
 main = do
+  -- A native run's own output is its evidence, and this process enters a real
+  -- GLFW session on the thread that would take the whole program down with it.
+  -- Piped into a runner, stdout would otherwise be block-buffered and flushed
+  -- only at exit, so a session that ended the process took every example line
+  -- and the closing report with it — exactly the run whose output is wanted.
+  -- Line buffering costs a run nothing and makes what happened legible.
+  hSetBuffering stdout LineBuffering
+  hSetBuffering stderr LineBuffering
   consent ← readConsent
   getArgs >>= \case
     [flag, scenario] | flag == Private.privateSessionFlag → Private.runScenario consent scenario

@@ -291,15 +291,19 @@ testUnsupported = withTwo defaultScript {scriptWindowCapabilities = const (backe
 -- | The audited Wayland row, against the whole vocabulary rather than the
 -- entries it happens to list.
 --
--- Of GLFW 3.4's thirteen window operations and eight window reports, the
--- pinned Wayland backend answers @GLFW_FEATURE_UNAVAILABLE@ for the global
--- window position it can neither set nor read, which also denies a borderless
--- placement over a monitor, and always answers false for the iconified
--- attribute; focus is left to the compositor. Everything else it performs or
--- reports. The operations GLFW also refuses on Wayland — the window icon,
--- floating, opacity, and the cursor position — are outside this vocabulary, so
--- the audit adds none of them, and it invents no restriction GLFW does not
--- report. @docs/glfw.md@ records the audit with GLFW's answer cited per entry.
+-- Of GLFW 3.4's thirteen window operations and eight window reports, five are
+-- restricted, and the two kinds are not the same claim. GLFW itself answers
+-- @GLFW_FEATURE_UNAVAILABLE@ for the global window position, which is
+-- 'SetPositionOperation' and 'PlacementReport'. The model restricts three more
+-- on the strength of what the backend does rather than an error it reports:
+-- 'BorderlessOperation' needs that same refused position, 'IconifiedReport' is
+-- an unconditional false that carries no information, and 'FocusOperation'
+-- only asks a compositor that may do nothing. Everything else the backend
+-- performs or reports. GLFW's other Wayland refusals — the window icon,
+-- floating, opacity, and the cursor position — reach no constructor here, so
+-- the audit adds none of them, and it invents no restriction for an operation
+-- the backend performs. @docs/glfw.md@ records the audit with GLFW's answer
+-- cited per entry.
 testWaylandCapabilityAudit ∷ Expectation
 testWaylandCapabilityAudit = do
   let wayland = backendWindowCapabilities Wayland

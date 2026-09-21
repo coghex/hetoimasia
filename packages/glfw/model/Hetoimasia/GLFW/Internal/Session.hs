@@ -17,9 +17,12 @@
 --
 -- In order, before any native state changes:
 --
--- 1. The requested backend is resolved against the one this platform
---    supports. Wayland is never selected, and a request for it, or for any
---    backend this platform does not support, fails with 'UnsupportedBackend'.
+-- 1. The requested backend is resolved against the backends this platform
+--    admits. Linux admits X11 and Wayland, macOS admits Cocoa, and an absent
+--    request takes the platform's own backend — X11 on Linux, Cocoa on macOS —
+--    so Wayland is selected only when a request names it. A request naming a
+--    backend the platform does not admit fails with 'UnsupportedBackend', and
+--    no request is ever answered with a backend other than the one asked for.
 -- 2. The calling thread must be bound and must be the OS thread that entered
 --    the process main function, or entry fails with 'NotProcessMainThread'. A
 --    bound worker thread is not enough, and neither is an unbound thread that
@@ -345,7 +348,8 @@ data Backend
   | Cocoa
     -- ^ Selected explicitly on macOS.
   | Wayland
-    -- ^ Never selected: requesting it is always 'UnsupportedBackend'.
+    -- ^ Selected on Linux only when a request names it; never the backend an
+    -- unrequested session takes, and always 'UnsupportedBackend' on macOS.
   deriving (Eq, Show)
 
 -- | The backend's name in failure identifiers.
@@ -655,14 +659,18 @@ sessionWindowCapabilities = sessionCapabilities
 -- The Wayland row is audited against the pinned GLFW 3.4 Wayland backend for
 -- every 'WindowOperation' and every 'WindowReport'; the capabilities table in
 -- @docs/glfw.md@ records that audit with GLFW's own answer cited per entry.
--- Three operations and two attributes are the whole of what GLFW answers
--- unavailable within this vocabulary: it gives clients no global position to
--- set or read, and so cannot place a borderless window over a monitor's work
--- area, lets only the compositor move input focus, and reports no iconified
--- state at all. The other operations GLFW answers unavailable on Wayland — the
--- window icon, floating, opacity, and the cursor position — are outside this
--- vocabulary, so the audit adds none of them. Nothing here is emulated, and a
--- restriction GLFW does not report is not invented.
+-- Five entries survive the audit, of two kinds. GLFW answers
+-- @GLFW_FEATURE_UNAVAILABLE@ itself for the global window position, which is
+-- 'SetPositionOperation' and 'PlacementReport'. The other three are the model
+-- declining to claim what that behaviour does not establish:
+-- 'BorderlessOperation' composes a placement out of the position GLFW refuses;
+-- 'IconifiedReport' is an unconditional false, which carries no information;
+-- and 'FocusOperation' only asks a compositor that may do nothing, so
+-- reporting it performed would assert a focus change that may never happen.
+-- The operations GLFW answers unavailable outside this vocabulary — the window
+-- icon, floating, opacity, and the cursor position — reach no constructor
+-- here, so the audit adds none of them. Nothing is emulated, and no
+-- restriction is invented for an operation the backend performs.
 backendWindowCapabilities ∷ Backend → WindowCapabilities
 backendWindowCapabilities = \case
   Wayland →

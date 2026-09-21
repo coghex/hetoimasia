@@ -1704,8 +1704,10 @@ The Wayland row is audited against the pinned GLFW 3.4 source
 (`tools/native/glfw.pin`), entry by entry, over the whole vocabulary: all
 thirteen `WindowOperation`s and all eight `WindowReport`s. `Test.GLFW.Control`
 asserts that enumeration, so an operation or attribute added later cannot be
-left unaudited. GLFW's own answer is what each row records — nothing is
-inferred from the protocol, and no restriction GLFW does not report is invented.
+left unaudited. Each row records what the pinned backend actually does, and the
+note after the tables separates the entries GLFW itself answers unavailable
+from the ones the model restricts conservatively on the strength of that
+behaviour.
 
 | Operation | Wayland | GLFW's answer |
 |---|---|---|
@@ -1734,8 +1736,32 @@ inferred from the protocol, and no restriction GLFW does not report is invented.
 | `MaximizedReport` | reportable | `wl.maximized` (`src/wl_window.c:2539`) |
 | `VisibleReport` | reportable | `wl.visible` (`src/wl_window.c:2534`) |
 
-The audit extends the row nowhere: the three operations and two attributes
-above are the whole of what GLFW answers unavailable within this vocabulary.
+The audit extends the row nowhere, but the five entries it confirms are not all
+the same kind of answer, and the row does not pretend they are:
+
+- **GLFW answers `GLFW_FEATURE_UNAVAILABLE` directly** for two of them:
+  `SetPositionOperation` (`src/wl_window.c:2243-2249`) and `PlacementReport`
+  (`src/wl_window.c:2234-2241`). These are GLFW's own refusals, quoted.
+- **The model restricts three more conservatively**, from what GLFW does rather
+  than from an error it reports. `BorderlessOperation` is a model-level
+  composition: placing an undecorated window over a monitor's work area needs
+  the global position GLFW has just refused, so the composition cannot be
+  performed even though there is no `BorderlessOperation` in GLFW to refuse.
+  `IconifiedReport` is unreportable because GLFW answers `GLFW_FALSE`
+  unconditionally (`src/wl_window.c:2527-2532`); that is an answer, not an
+  error, and a false that carries no information is not evidence, so the model
+  reports `Unavailable` rather than "not iconified". `FocusOperation` is
+  unperformable because GLFW never moves focus itself on Wayland — it asks the
+  compositor for an activation token and returns having done nothing when no
+  activation manager exists (`src/wl_window.c:2463-2467`) — so reporting the
+  control as performed would assert a focus change that may never happen.
+
+Only the first kind is GLFW answering unavailable. The second is the model
+declining to claim what the pinned backend does not establish, and each of the
+three is recorded above with the GLFW behaviour it rests on. Nothing is
+inferred from the Wayland protocol itself, and no restriction is invented for
+an operation GLFW performs.
+
 The remaining `GLFW_FEATURE_UNAVAILABLE` answers of the pinned Wayland
 backend — the window icon (`src/wl_window.c:2227`), floating
 (`src/wl_window.c:2599`), opacity (`src/wl_window.c:2622`), and the cursor
@@ -2108,8 +2134,9 @@ complete restoration or constraint update re-establishes known constraints.
 
 ### Platform restrictions
 
-GLFW performs every transition on X11 and Cocoa. Wayland, which no session
-selects, gives clients no global position, so `backendWindowCapabilities Wayland`
+GLFW performs every transition on X11 and Cocoa. Wayland, which a session
+selects only on explicit request, gives clients no global position, so
+`backendWindowCapabilities Wayland`
 names `BorderlessOperation` unperformable: a borderless request settles as
 `Unsupported`, or takes its configured windowed fallback, and is never reported
 as fullscreen. On Cocoa and X11 alike, the platform decides what a request

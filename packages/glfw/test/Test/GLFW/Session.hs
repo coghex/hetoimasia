@@ -57,6 +57,7 @@ import Test.Hspec
   , expectationFailure
   , it
   , shouldBe
+  , shouldNotBe
   , shouldReturn
   )
 
@@ -331,35 +332,60 @@ testWaylandHintAnsweredWithX11 = do
 
 -- | A display or socket that cannot be reached is identified by the report
 -- GLFW itself made during @glfwInit@, not by an outcome of its own. The
--- session carries the code and the description through, so a display that is
--- unavailable stays distinguishable from an unrelated platform error that
--- fails the same call.
+-- session carries the code and the description through unaltered, which is
+-- what keeps an unreachable display or socket distinguishable from another
+-- native error that fails the same call.
+--
+-- The two backends do not answer alike, and each scripted report here is the
+-- one GLFW 3.4 actually makes. An X11 display that will not open is
+-- @GLFW_PLATFORM_UNAVAILABLE@ (@src/x11_init.c:1290-1308@), so on X11 the code
+-- alone separates it. A Wayland socket that will not connect is
+-- @GLFW_PLATFORM_ERROR@ (@src/wl_init.c:544@) — the same code an unrelated
+-- Wayland platform error carries — so there the description is what separates
+-- them, and both must survive for the distinction to exist at all.
 testDisplayUnreachableReported ∷ Expectation
 testDisplayUnreachableReported = do
   let failing code description =
         defaultScript
           { scriptInitialize = \reporter → reportError reporter code description >> pure False
           }
-  unreachable ← newSeam (failing glfwPlatformUnavailableCode "Wayland: Failed to connect to display")
-  (missing, caught) ←
-    asProcessMainThread unreachable (caughtAs (entered unreachable (SessionConfig (Just Wayland)) (\_ → pure ())))
-  nativeOutcome missing `shouldBe` NativeCallFailed
-  map errorSummary (reportedErrors (nativeReports missing))
-    `shouldBe` [(glfwPlatformUnavailableCode, "Wayland: Failed to connect to display", False, ProcessMainThread)]
-  originOf caught `shouldBe` Just ("glfw", "initialize", [("backend", "wayland")])
+      initializationFailure request script = do
+        seam ← newSeam script
+        (failure, caught) ←
+          asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just request)) (\_ → pure ())))
+        nativeOutcome failure `shouldBe` NativeCallFailed
+        pure (map errorSummary (reportedErrors (nativeReports failure)), caught, seam)
 
-  -- A different native error fails the same call with the same outcome; only
-  -- GLFW's own report tells the two apart.
-  other ← newSeam (failing glfwPlatformErrorCode "Wayland: Failed to create window surface")
-  (unrelated, _) ←
-    asProcessMainThread other (caughtAs (entered other (SessionConfig (Just Wayland)) (\_ → pure ())))
-  nativeOutcome unrelated `shouldBe` NativeCallFailed
-  map errorSummary (reportedErrors (nativeReports unrelated))
+  -- X11: the display is unavailable, and GLFW says so with its own code.
+  (x11Reports, x11Caught, _) ←
+    initializationFailure X11 (failing glfwPlatformUnavailableCode "X11: The DISPLAY environment variable is missing")
+  x11Reports
+    `shouldBe` [(glfwPlatformUnavailableCode, "X11: The DISPLAY environment variable is missing", False, ProcessMainThread)]
+  originOf x11Caught `shouldBe` Just ("glfw", "initialize", x11)
+
+  -- Wayland: the socket cannot be connected to, which GLFW reports as a
+  -- platform error rather than an unavailable platform.
+  (waylandReports, waylandCaught, unreachable) ←
+    initializationFailure Wayland (failing glfwPlatformErrorCode "Wayland: Failed to connect to display")
+  waylandReports
+    `shouldBe` [(glfwPlatformErrorCode, "Wayland: Failed to connect to display", False, ProcessMainThread)]
+  originOf waylandCaught `shouldBe` Just ("glfw", "initialize", [("backend", "wayland")])
+
+  -- Another Wayland platform error fails the same call, with the same outcome
+  -- and the same code. Only the description GLFW made tells the two apart, so
+  -- an unreachable socket is identifiable from the report rather than folded
+  -- into a generic failure.
+  (otherReports, _, _) ←
+    initializationFailure Wayland (failing glfwPlatformErrorCode "Wayland: Failed to create window surface")
+  otherReports
     `shouldBe` [(glfwPlatformErrorCode, "Wayland: Failed to create window surface", False, ProcessMainThread)]
+  map (\(code, _, _, _) → code) otherReports `shouldBe` map (\(code, _, _, _) → code) waylandReports
+  map (\(_, description, _, _) → description) otherReports
+    `shouldNotBe` map (\(_, description, _, _) → description) waylandReports
 
   -- The supported answer that admitted the backend said only that it was
   -- compiled in: the connection is what failed, one call later.
-  seamCalls other
+  seamCalls unreachable
     `shouldReturn` [ QueryPlatformSupported Wayland
                    , CreateErrorCallback
                    , AttachErrorCallback

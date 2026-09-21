@@ -178,9 +178,13 @@ int hetoimasia_glfw_request_close_for_check(GLFWwindow* window)
         event.xclient.format = 32;
         event.xclient.data.l[0] = (long) internAtom(display, "WM_DELETE_WINDOW", False);
         event.xclient.data.l[1] = CurrentTime;
-        sendEvent(display, handle, False, NoEventMask, &event);
-        flush(display);
-        delivered = 1;
+        /* XSendEvent answers zero when it could not convert and send the
+         * event. Reporting success then would be the false success this
+         * result exists to remove: an example would wait for a close request
+         * the server was never asked for. */
+        delivered = sendEvent(display, handle, False, NoEventMask, &event) != 0;
+        if (delivered)
+            flush(display);
     }
     dlclose(xlib);
     return delivered;
