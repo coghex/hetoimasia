@@ -19,6 +19,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Concurrent.STM
   ( TVar
+  , stateTVar
   , atomically
   , check
   , modifyTVar'
@@ -31,6 +32,7 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
+  , IOException
   , SomeAsyncException
   , SomeException
   , fromException
@@ -47,7 +49,6 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
-import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.Foundation.Time
   ( Duration
   , MonotonicSource
@@ -160,6 +161,12 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testSupersededHandover)
     it "services the main thread's bounded housekeeping while it awaits the owner"
       (boundedExample testHousekeepingDuringDrain)
+    it "keeps the backend's own startup evidence readable through retirement"
+      (boundedExample testStartupEvidenceRetained)
+    it "closes every publication for an ordinary stop, and drains an announcement admitted before it"
+      (boundedExample testNormalStopClosesPublications)
+    it "settles a direct attachment whose announcement was refused, rather than reporting a release"
+      (boundedExample testUnannouncedDirectAttachSettles)
     it "retires and destroys the whole owner with no target ever attached"
       (boundedExample testWholeOwnerWithoutTargets)
     it "retires and destroys it after the last target has already detached"
@@ -186,6 +193,10 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testPublicationsClosedOnFailure)
     it "reports a whole-owner retirement that failed even though the destruction after it did not"
       (boundedExample testDrainFailureSurfaces)
+    it "retains every failed operation, and offers a failed target retirement exactly once"
+      (boundedExample testRetirementFailsOnce)
+    it "waits for a terminal group report however the join is interrupted"
+      (boundedExample testJoinAwaitsTerminalReport)
 
   describe "the owner's GLFW discipline" $
     it "makes no GLFW call of its own: every native call from its thread is the authorized wake"
@@ -503,9 +514,7 @@ newRigWith adjust = do
   let ownerConfig =
         adjust
           (graphicsOwnerConfig (fakeOperations fake) scene)
-            { ownerClockTimer = injected
-            , ownerFailureDisposition = Required
-            }
+            {ownerClockTimer = injected}
   pure (Rig seam threaded journal fake timer (ownerSettings clock) ownerConfig)
 
 -- | Run owner turns on the main thread until the condition holds.
@@ -1539,7 +1548,7 @@ describeHandover = \case
   HandoverRefused _ → "refused"
   HandoverPortFull → "port full"
   HandoverOwnerClosed → "owner closed"
-  HandoverSuperseded → "superseded"
+  HandoverSuperseded _ → "superseded"
   HandoverRolledBack _ → "rolled back"
 
 -- | Whole-owner destruction that produced no evidence retains everything the
@@ -1717,14 +1726,219 @@ testSupersededHandover = do
       window ← theWindow host
       atomically (writeTVar quiescing (Just host))
       answer ← handOverGraphicsTarget host owner window
-      -- The attachment the supersession left behind is retired, so the host
-      -- holds none pending and the owner kept no acknowledgement for it.
+      -- The attachment the supersession left behind is retired: the host
+      -- holds none pending, and the ledger has settled that incarnation so
+      -- nothing can announce it again.
+      stage ← case answer of
+        HandoverSuperseded target → atomically (custodyOf owner target)
+        _ → pure Nothing
       (,,) (describeHandover answer)
         <$> atomically (hostPendingAttachments host)
-        <*> atomically (readOwnerAcknowledged owner)
+        <*> pure stage
   answer `shouldBe` "superseded"
   pending `shouldBe` []
-  acknowledgements `shouldBe` []
+  acknowledgements `shouldBe` Just CustodySettled
+
+-- ---------------------------------------------------------------------------
+-- The settlement ledger, failure evidence, and the join gate
+
+-- | A failed target retirement is retained, marked unverified, and never
+-- offered again — not by a later round, and not by the drain.
+testRetirementFailsOnce ∷ IO ()
+testRetirementFailsOnce = do
+  rig ← newRig
+  attempts ← newTVarIO (0 ∷ Int)
+  -- Fails the first time and would succeed on any replay, so a replay is
+  -- visible as a target that retired after all.
+  script (fakeRetireTarget (rigFake rig)) $ \retire → do
+    seen ← atomically (stateTVar attempts (\n → (n, n + 1)))
+    if seen == 0
+      then throwIO (Scripted (Text.pack "retire target"))
+      else pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  observedFailures ← newTVarIO 0
+  observedTargets ← newTVarIO []
+  (raised, _) ← caughtAs @Scripted $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      awaitStanding owner service `shouldReturn` TargetUsable
+      _ ← releaseGraphicsTarget host owner service
+      -- The failure is latched and retained; the target stays, unverified.
+      atomically (readOwnerFailure owner >>= check . isJust)
+      atomically $ do
+        held ← readOwnerTargets owner
+        check (graphicsAttachment service `elem` held)
+      -- Turns and rounds go by, and nothing offers the operation again.
+      _ ← awaitRound owner 2
+      atomically . writeTVar observedFailures . length =<< atomically (readOwnerFailures owner)
+      atomically . writeTVar observedTargets =<< atomically (readOwnerTargets owner)
+      -- Independent evidence is the only thing that retires it, which is what
+      -- lets this example's own exit finish.
+      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+      acknowledgement ←
+        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+      pumpUntilRetired host control
+  raised `shouldBe` Scripted (Text.pack "retire target")
+  -- Offered exactly once, over the whole run and its drain.
+  readTVarIO attempts `shouldReturn` 1
+  -- And the failure is evidence, not only a latch.
+  readTVarIO observedFailures `shouldReturn` 1
+  readTVarIO observedTargets >>= \held → length held `shouldBe` 1
+  -- No terminal record was manufactured for it.
+  records ← readTVarIO (rigJournal rig)
+  length [() | TargetRetirement _ ← records] `shouldBe` 1
+
+-- | The join is re-entered until it answers a terminal group report,
+-- whatever is delivered to the thread waiting in it.
+--
+-- The exception delivered is an ordinary 'IOException', not an asynchronous
+-- one: its type says nothing about how it arrived, and a join that returned
+-- on it would let the protected host unwind with the owner never proved
+-- terminal. The owner publishes its destruction evidence independently and
+-- then stays inside its backend call, so the exit is certainly in the join
+-- and not in the wait before it.
+testJoinAwaitsTerminalReport ∷ IO ()
+testJoinAwaitsTerminalReport = do
+  rig ← newRig
+  release ← newTVarIO False
+  joining ← newEmptyMVar
+  script (fakeDestroy (rigFake rig)) $ \_ → do
+    putMVar joining ()
+    atomically (readTVar release >>= check)
+    pure (ownerDestroyed (Text.pack "destroyed"))
+  released ← newTVarIO Nothing
+  (raised, _) ← caughtAs @IOException $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+      main ← myThreadId
+      void . forkIO $ do
+        takeMVar joining
+        -- The owner's destruction evidence exists, so the exit leaves its
+        -- wait and enters the join; the owner is still inside the call.
+        publishOwnerDestruction owner (ownerDestroyed (Text.pack "published early"))
+        atomically (readOwnerTerminalNow owner >>= check . isJust . ownerDestroyedEvidence)
+        throwTo main (userError "delivered during the join")
+        -- Nothing of the host's may be released while the owner is unjoined.
+        notes ← journalled (rigJournal rig)
+        atomically (writeTVar released (Just (filter ended notes)))
+        atomically (writeTVar release True)
+      void (awaitRound owner 0)
+  show raised `shouldContain` "delivered during the join"
+  readTVarIO released `shouldReturn` Just []
+  notes ← journalled (rigJournal rig)
+  notes `shouldContain` [SessionEnded]
+  where
+    ended = \case
+      WindowGone _ → True
+      SessionEnded → True
+      _ → False
+
+-- | The backend's own startup evidence is recorded as it came back and stays
+-- readable after the owner has retired and ended.
+testStartupEvidenceRetained ∷ IO ()
+testStartupEvidenceRetained = do
+  rig ← newRig
+  script (fakeStart (rigFake rig)) (\_ → pure (ownerReady (Text.pack "device 7, queue 2")))
+  duringRun ← newTVarIO Nothing
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+    _ ← awaitRound owner 0
+    atomically . writeTVar duringRun . ownerStartedEvidence =<< atomically (readOwnerTerminalNow owner)
+  readTVarIO duringRun `shouldReturn` Just (Text.pack "device 7, queue 2")
+
+-- | An ordinary public stop closes every publication, and an announcement
+-- admitted just before it is still drained.
+--
+-- 'graphicsOwnerWorker' is public, so any caller can stop the owner without a
+-- failure to latch. If the stop closed nothing, a handover admitted after the
+-- drain's single take would never be processed and the host drain would wait
+-- for evidence forever.
+testNormalStopClosesPublications ∷ IO ()
+testNormalStopClosesPublications = do
+  rig ← newRig
+  gate ← newTVarIO False
+  stepping ← newEmptyMVar
+  -- The owner is held inside a step, so the announcement below is admitted
+  -- and certainly not yet consumed when the stop arrives.
+  script (fakeStep (rigFake rig)) $ \_ → do
+    putMVar stepping ()
+    atomically (readTVar gate >>= check)
+    pure noStepWork
+  (stage, refused) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    window ← theWindow host
+    takeMVar stepping
+    service ← handedOver host owner window
+    stage ← atomically (custodyOf owner (graphicsAttachment service))
+    -- An ordinary stop, from the public handle, with no failure anywhere.
+    atomically (Worker.requestStop (graphicsOwnerWorker owner))
+    atomically (writeTVar gate True)
+    -- The owner's run ends. Its drain must still take that announcement and
+    -- retire the target it names: a stop that closed nothing would leave the
+    -- event unread and no record would ever appear here.
+    _ ← awaitTerminal owner service
+    demand ← prepare (OwnerDemand True Nothing)
+    refused ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
+    pure (stage, refused)
+  -- The owner owed it from the instant the announcement was admitted.
+  stage `shouldBe` Just CustodyAnnounced
+  refused `shouldBe` PublicationClosed
+
+-- | A direct attachment whose announcement was refused is settled by its
+-- release, not reported as one the owner will retire.
+--
+-- The port is full and stays full, so the owner is never told. A release that
+-- answered 'ReleaseBegun' would be claiming an evidence path that does not
+-- exist, and the host drain would wait on it forever.
+testUnannouncedDirectAttachSettles ∷ IO ()
+testUnannouncedDirectAttachSettles = do
+  rig ← newRigWith (\config → config {ownerEventCapacity = 1})
+  gate ← newTVarIO False
+  entered ← newEmptyMVar
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  clock ← countingClock
+  let config =
+        (ownerSettings clock)
+          { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
+          }
+  (admitted, answer, stage, pending) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+    takeMVar entered
+    windows ← atomically (hostWindowIdentities host)
+    case windows of
+      [first, second] → do
+        -- The one slot is spent by a handover the owner cannot drain.
+        _ ← handedOver host owner first
+        -- A direct attach, then an announcement the full port refuses.
+        attached ← attachWindowGraphics host second (graphicsTargetProtocol host owner)
+        service ← case attached of
+          GraphicsAttached service → pure service
+          other → unexpected ("the direct attachment failed: " <> show other)
+        admitted ← announceGraphicsTarget owner service
+        stageBefore ← atomically (custodyOf owner (graphicsAttachment service))
+        stageBefore `shouldBe` Just CustodyRegistered
+        answer ← releaseGraphicsTarget host owner service
+        stage ← atomically (custodyOf owner (graphicsAttachment service))
+        pending ← atomically (hostPendingAttachments host)
+        atomically (writeTVar gate True)
+        pure (admitted, describeRelease answer, stage, pending)
+      other → unexpected ("the host created " <> show (length other) <> " windows")
+  admitted `shouldBe` EventRefusedFull
+  -- Settled here, and said so: the owner was never told and owes nothing.
+  answer `shouldBe` "settled here"
+  stage `shouldBe` Just CustodySettled
+  -- Only the first handover's attachment is left pending.
+  length pending `shouldBe` 1
+
+describeRelease ∷ ReleaseAnswer → String
+describeRelease = \case
+  ReleaseBegun → "begun"
+  ReleaseSettled → "settled here"
+  ReleaseOwnerRetires → "owner retires it"
+  ReleaseNoOp answer → "no-op " <> show answer
+  ReleasePortFull → "port full"
 
 -- ---------------------------------------------------------------------------
 -- The extent seam

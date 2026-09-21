@@ -3612,7 +3612,10 @@ which are identities the host resolves and not handles the backend can reach a
 window through.
 
 Every operation returns **evidence**: an opaque record the owner stores, hands
-back and never interprets, and — the point — never constructs. A record that
+back and never interprets, and — the point — never constructs. That includes
+the startup's own: `ownerStartedEvidence` keeps exactly what
+`graphicsStartOwner` returned, readable through retirement and after the owner
+has ended, rather than reduced to whether the call happened. A record that
 exists is a record an injected operation returned. What it says is the
 backend's business; that there is one is the permission. VK-7 supplies the
 Vulkan operations to this same machinery rather than replacing it.
@@ -3700,6 +3703,56 @@ owner keeps what exists and **reports** the target as unusable through
 `readTargetStanding`, and the main thread releases it. Beginning an
 attachment's retirement stays the main thread's, because the attachment and the
 window's exclusive slot are the main thread's.
+
+#### Who owes an attachment's settlement
+
+Every attachment the owner's protocol registers gets one ledger entry, and it
+is the single place that answers who owes that exact incarnation's retirement
+evidence. Before it, each path decided for itself and each decided from
+whether the owner happened to hold the target — which is a different question,
+and answers wrongly for an attachment the owner has been told about but has
+not yet taken.
+
+| Stage | Who owes it | Reached by |
+|---|---|---|
+| `CustodyRegistered` | The main thread | The attachment's protocol recording its acknowledgement, before anyone is told |
+| `CustodyAnnounced` | The owner | An announcement admitted to the lifetime port — from that instant, before the owner has consumed the event |
+| `CustodyOwned` | The owner | The owner taking that event |
+| `CustodySettled` | Nobody | A terminal record the owner wrote, or facts the main thread certified because nothing was ever owned |
+
+Three invariants hold it together.
+
+**The main thread may settle an attachment only at `CustodyRegistered`.** That
+is the one stage at which no announcement is queued and none can be admitted
+afterwards, and the claim and the move to `CustodySettled` commit in the same
+transaction. Absence from the owner's target table is never consulted, because
+a queued announcement the owner has not yet taken looks exactly like an
+attachment it never received.
+
+**An announcement is admitted in one transaction.** The stage is checked, the
+host is asked whether that exact attachment is still one of its own pending
+ones, the observation slot is installed, and the event is queued, all
+together. So a delayed announcement for an incarnation the slot has moved past
+cannot reopen anything, and neither can one racing the main thread's own
+settlement: whichever transaction commits first decides.
+
+**`CustodySettled` is terminal.** An incarnation that reaches it can never be
+announced again.
+
+Every path routes through those transitions: the handover, a direct attach
+followed by `announceGraphicsTarget`, `releaseGraphicsTarget`, a window close,
+a supersession, a cancellation's recovery, and the exit. The ledger is bounded
+by the windows the host may hold live: a settled entry is forgotten once the
+host's own model no longer has that attachment pending, and an entry whose
+attach left nothing at all is forgotten by the handover's own settlement
+rather than waiting for an owner round.
+
+A release reads that ledger before it reserves anything. An incarnation still
+at `CustodyRegistered` needs no event — there is nobody to tell — so it is
+detached and certified on the spot and answers `ReleaseSettled`, and a full
+port is no obstacle to a release that needs no room. One the owner owes
+answers `ReleaseBegun` when its event is delivered and `ReleaseOwnerRetires`
+when it is not, because then the owner's own drain produces the evidence.
 
 `releaseGraphicsTarget` is not the only way a target's retirement begins. A
 window's own close protocol begins it, and so does the host's quiescence, and
@@ -3836,16 +3889,46 @@ not evidence, and neither is the worker ending.
 
 #### Failure, cancellation and what is never permission
 
-A terminal owner failure is latched as soon as it is known. Under a `Required`
-disposition that is terminal in full: the same transaction closes every
-admission into the handoff, the owner's run ends there rather than taking
-another round, and it goes into its own protected drain — so no further target
-is handed to an owner that is about to retire, and none is constructed by the
-round the failure interrupted. The latch stays for supervision, and the main
-thread is woken at once, so a checkpoint raises while retirement is still to
-come. An `Optional` owner's recognized failure leaves the component
-unavailable and the run going, which is the established disposition contract
-and not a second one.
+This delivery's graphics owner is **required**: its terminal failure stops the
+run, and there is no owner-wide disposition to choose. An optional one would
+have to mean a recognized failure leaves the component unavailable while the
+run continues, and nothing here implements that — the owner would still latch,
+still retire, and the supervision sentinel would still classify its failure as
+unrecognized and so fatal. The per-target required/optional policy the Vulkan
+design accepts is a different question, about one target's recovery rather
+than the owner's, and it is VK-14's.
+
+A terminal owner failure is latched as soon as it is known, and that is
+terminal in full: the same transaction closes every admission into the
+handoff, the owner's run ends there rather than taking another round, and it
+goes into its own protected drain — so no further target is handed to an owner
+that is about to retire, and none is constructed by the round the failure
+interrupted. The latch stays for supervision, and the main thread is woken at
+once, so a checkpoint raises while retirement is still to come.
+
+**The latch is notification, not evidence.** It keeps the first failure,
+because that is what a sentinel can wait on; every failure is retained
+separately with the context it propagated with, readable through
+`readOwnerFailures` and reported by the exit, because a drain that failed
+three operations has three things to report and a latch would keep one. A
+target retirement that failed is marked explicitly unverified and that
+operation is never offered again — not by a later round and not by the drain,
+because an operation that failed once may have disposed part of what it owns
+and this design admits no blind retry. Only independent evidence settles it.
+
+Publications close on **every** run exit, not only a failing one. A normal
+`requestStop` through the public worker handle ends the run with no failure to
+latch, and the drain takes the lifetime port's backlog exactly once, so
+closing first is what makes that single take sound: nothing can be admitted
+after it, and so nothing can be admitted that the take will miss.
+
+The final join waits for a terminal group report and re-enters until it gets
+one, retaining every interruption and every failure rather than returning on
+either. An ordinary `IOException` delivered with `throwTo` is
+indistinguishable here from one the join itself raised — the exception's type
+says nothing about how it arrived — and returning on it would let the host
+unwind with the owner never proved terminal. Re-entering the documented
+idempotent join replays no backend disposal; that is the owner's own drain's.
 `superviseGraphicsOwner` registers one ordinary supervised service in the
 application's own group whose whole job is to wait on that latch and fail with
 what it holds; a separate worker group gives supervision no connection by
@@ -3917,7 +4000,15 @@ required failure closing admission and entering retirement before the
 checkpoint; a failed whole-owner destruction retaining the windows and the
 session until independent evidence arrives, with the one diagnostic written
 once; a window closed through its own port having its target retired with no detach
-at all, while the owner and a second target stay live; a handover the host quiesces under, at exactly the
+at all, while the owner and a second target stay live; a failed target
+retirement offered exactly once over the whole run and its drain, with its
+evidence retained; a join re-entered until it answers a terminal report
+although an ordinary `IOException` was delivered into it, releasing nothing
+meanwhile; the startup's own evidence readable through retirement; an ordinary
+public stop closing every publication and its drain still taking an
+announcement admitted just before it; a direct attachment whose announcement a
+full port refused settled by its release rather than reported as one the owner
+will retire; a handover the host quiesces under, at exactly the
 handoff between construction and publication, answering `HandoverSuperseded`
 with its attachment retired and no acknowledgement kept; six handovers
 cancelled at that same handoff, leaving no attachment the owner lacks an
@@ -4429,7 +4520,8 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
 | Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
 | Graphics owner target table and geometry | The graphics owner | The owner worker writes; any thread reads | Write: owner worker; read: any | The owner's run action | An entry leaves only against a terminal record, and the geometry — the last coherent framebuffer observation and reported bounds — leaves with its target |
-| Graphics owner acknowledgements | The graphics owner composition | The main thread writes one when an attachment registers; the owner reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | Kept while a fact may still be owed for a target whose own state is gone; forgotten with that target's record, and forgotten by the handover's own settlement for an attachment that left none — which is what bounds them for an owner that takes no rounds at all, held in its startup or its step |
+| The settlement ledger | The graphics owner composition | The main thread writes at registration and at its own settlements; the owner writes when it takes and when it settles; any thread reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | One entry per incarnation the protocol registered, so at most one live per window the host may hold; a settled entry is forgotten once the host's model no longer has that attachment pending, and one whose attach left nothing is forgotten by the handover's own settlement — which is what bounds it for an owner that takes no rounds at all, held in its startup or its step |
+| Retained owner failures | The graphics owner composition | The owner writes; the exit and any thread read | Any; STM | The owner worker's lifetime | Oldest first and bounded, so a backend that fails every round cannot grow what it reports through; the latch beside it keeps only the first, for notification |
 | Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
 

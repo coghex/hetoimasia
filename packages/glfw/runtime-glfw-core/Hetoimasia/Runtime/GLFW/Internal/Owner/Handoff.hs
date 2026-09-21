@@ -94,7 +94,9 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
     -- * Main thread to owner: observations
   , TargetObservation (..)
   , ObservationPublication (..)
-  , openTargetSlot
+  , TargetSlot
+  , prepareTargetSlot
+  , installTargetSlot
   , closeTargetSlot
   , publishTargetObservation
   , readTargetObservations
@@ -131,6 +133,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , OwnerTerminal (..)
   , noOwnerTerminal
   , ownerTerminal
+  , recordOwnerStarted
   , recordOwnerRetired
   , recordOwnerDestroyed
   , recordOwnerEnded
@@ -152,7 +155,6 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
 import Control.Concurrent.STM
   ( STM
   , TVar
-  , atomically
   , modifyTVar'
   , newTVarIO
   , readTVar
@@ -383,7 +385,12 @@ data TerminalRecord = TerminalRecord
 -- second is permission for anything. Both are absent until the injected
 -- operation that establishes each has returned one.
 data OwnerTerminal = OwnerTerminal
-  { ownerRetiredEvidence ∷ !(Maybe Text)
+  { ownerStartedEvidence ∷ !(Maybe Text)
+    -- ^ What the injected startup returned, recorded exactly as every other
+    -- operation's evidence is. It is status rather than permission — nothing
+    -- is released against it — but it is the backend's own answer and the
+    -- owner does not reduce it to whether the call happened.
+  , ownerRetiredEvidence ∷ !(Maybe Text)
   , ownerDestroyedEvidence ∷ !(Maybe Text)
   , ownerRunEnded ∷ !Bool
     -- ^ Whether the owner's run action has ended, however it ended. It is
@@ -393,7 +400,7 @@ data OwnerTerminal = OwnerTerminal
   deriving (Eq, Show)
 
 noOwnerTerminal ∷ OwnerTerminal
-noOwnerTerminal = OwnerTerminal Nothing Nothing False
+noOwnerTerminal = OwnerTerminal Nothing Nothing Nothing False
 
 -- ---------------------------------------------------------------------------
 -- The whole handoff state
@@ -499,22 +506,29 @@ pendingTargetEvents handoff = statisticsDepth <$> channelStatistics (handoffEven
 -- ---------------------------------------------------------------------------
 -- Observation slots
 
--- | Open one target's observation slot, from the main thread.
+-- | Build one target's observation slot, without installing it.
+--
+-- A snapshot cannot be created inside a transaction, and installing a slot is
+-- one step of an admission that must commit as a whole — the exact
+-- incarnation checked, the slot installed, and the event queued together — so
+-- the two are separated: this allocates, 'installTargetSlot' commits. A slot
+-- built for an admission that is then refused is simply discarded.
+prepareTargetSlot ∷ IO TargetSlot
+prepareTargetSlot = TargetSlot <$> (prepare Nothing >>= newSnapshot) <*> newTVarIO 0
+
+-- | Install a prepared slot for one target.
 --
 -- It answers 'False' for an attachment that already holds one and for a
 -- handoff already holding its whole limit, having changed nothing. An
 -- attachment identity is never reissued, so the first case is a repeat rather
 -- than a replacement, and the slot the target already has is left exactly as
 -- it is.
-openTargetSlot ∷ OwnerHandoff scene → AttachmentId → IO Bool
-openTargetSlot handoff target = do
-  snapshot ← prepare Nothing >>= newSnapshot
-  revision ← newTVarIO 0
-  atomically $ do
-    slots ← readTVar (handoffSlots handoff)
-    if Map.member target slots || Map.size slots >= handoffLimit' handoff
-      then pure False
-      else True <$ writeTVar (handoffSlots handoff) (Map.insert target (TargetSlot snapshot revision) slots)
+installTargetSlot ∷ OwnerHandoff scene → AttachmentId → TargetSlot → STM Bool
+installTargetSlot handoff target slot = do
+  slots ← readTVar (handoffSlots handoff)
+  if Map.member target slots || Map.size slots >= handoffLimit' handoff
+    then pure False
+    else True <$ writeTVar (handoffSlots handoff) (Map.insert target slot slots)
 
 -- | Close and forget one target's slot, which the owner does once it has
 -- released the target. A later publication for it answers
@@ -662,6 +676,12 @@ ownerTerminal = readTVar . handoffOwnerTerminal
 -- by the owner itself or by an independent publisher.
 ownerDestructionVerified ∷ OwnerHandoff scene → STM Bool
 ownerDestructionVerified handoff = isJust . ownerDestroyedEvidence <$> ownerTerminal handoff
+
+-- | Record what the injected startup returned. Never replaced.
+recordOwnerStarted ∷ OwnerHandoff scene → Text → STM ()
+recordOwnerStarted handoff evidence =
+  modifyTVar' (handoffOwnerTerminal handoff) $ \terminal →
+    terminal {ownerStartedEvidence = maybe (Just evidence) Just (ownerStartedEvidence terminal)}
 
 recordOwnerRetired ∷ OwnerHandoff scene → Text → STM ()
 recordOwnerRetired handoff evidence =

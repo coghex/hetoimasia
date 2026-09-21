@@ -718,9 +718,13 @@ module Hetoimasia.Runtime.GLFW
   , readOwnerTerminalNow
   , readOwnerTargets
   , readOwnerAcknowledged
+  , Stage (..)
+  , custodyOf
+  , readOwnerCustody
   , TargetStanding (..)
   , readTargetStanding
   , readOwnerFailure
+  , readOwnerFailures
   , ownerTargetAcknowledgement
 
     -- ** The extent seam

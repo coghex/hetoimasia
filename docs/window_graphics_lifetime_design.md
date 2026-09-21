@@ -97,6 +97,15 @@ an owner that is about to retire. The latch stays for supervision, which
 reaches application checkpoints through one ordinary supervised service the
 composition registers in the application's own group.
 
+The delivered machinery answers "who owes this attachment's settlement" from
+one ledger rather than per path. Each exact incarnation is registered,
+announced, owned, or settled; the main thread may settle one only while it is
+still registered, which is the one stage at which no announcement is queued
+and none can be admitted afterwards; and an announcement's admission checks
+the incarnation is current and installs its slot in the same transaction, so a
+settled incarnation can never reopen. [glfw.md](glfw.md#who-owes-an-attachments-settlement)
+records the invariants.
+
 One rule the delivered machinery makes explicit that D-6 left implicit: the
 owner never retires an attachment the main thread still holds. When a target's
 construction cannot be used — a partial construction, one the backend could not
