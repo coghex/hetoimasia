@@ -151,20 +151,23 @@ exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened
 # its own doing rather than anything the caller asked to hear.
 {
   # A request to stop arrives as a signal, because this process spends its life
-  # waiting for the server, and the handler only records it: the server is
-  # stopped below by `halt`, which signals what the job table still lists as
-  # running and therefore never signals a process id that has been reaped and
-  # handed to somebody else. The trap is armed before the server exists, so a
-  # request that arrives during startup is recorded rather than ending this
-  # process and orphaning the server it had just started.
+  # waiting for the server. The handler stops the server itself rather than
+  # leaving it to be noticed after the wait: a request that arrives while this
+  # process is between starting the server and waiting for it would otherwise
+  # be recorded and then wait forever, since the wait it was meant to interrupt
+  # had not begun. What it stops is what the job table still lists as running,
+  # so it never signals a process id that has been reaped and handed to
+  # somebody else. The trap is armed before the server exists, so a request
+  # that arrives first finds nothing to stop and is caught by the check after
+  # the server is started instead.
   stopping=""
-  trap 'stopping=yes' TERM
   halt() {
     local job
     for job in $(jobs -pr); do
       kill "$job" 2>/dev/null
     done
   }
+  trap 'stopping=yes; halt' TERM
   Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" 8>&- &
   [ -z "$stopping" ] || halt
   while :; do

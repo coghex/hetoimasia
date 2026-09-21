@@ -784,7 +784,10 @@ reported as an exit. The first two reasons quote the server log's tail; all
 three refuse with status `1`.
 
 Stopping the server belongs to that same owner process and is asked for by
-signal, because waiting for the server is where it spends its life. It stops
+signal, because waiting for the server is where it spends its life. The
+handler stops the server itself rather than recording the request for the wait
+to notice, since a request arriving between the server being started and being
+waited for would otherwise be recorded and then waited on forever. It stops
 only what its job table still lists as running, and the helper's own cleanup
 does the same for what it started: a job still listed as running has not been
 reaped, so that number is still that process's own, while a number kept in a

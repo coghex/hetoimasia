@@ -141,6 +141,24 @@ x11Spec = describe "Isolated X11 display" $ do
       installStubs display (("Xvfb", stammeringServer) : filter ((/= "Xvfb") . fst) workingStubs)
       refusedStartup display "the X server reported no display within 30 seconds" ["server.pid"]
 
+  it "stops the X server when the request to stop it reaches the owner as it starts the server" $
+    withDisplay $ \display → do
+      -- The narrowest window the owner has: a request to stop that arrives
+      -- after the server is started and before it is waited for, where a
+      -- handler that only recorded the request would be left waiting for a
+      -- wait it had already missed. The server asks for it at its own first
+      -- instruction, which is the earliest moment anything but the owner can;
+      -- either side of the window it lands on stops the server there and then,
+      -- so the owner has nothing left to report and the report channel closes
+      -- with the server. What the helper is left with is a report that closed
+      -- without naming a display, settled at the bound like the others; this
+      -- example waits that bound out.
+      installStubs display (("Xvfb", earlyStopServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server's startup report was closed or invalid before it named a display"
+        ["server.pid"]
+
   it "stops the X server and removes its scratch directory when a signal ends the startup" $
     withDisplay $ \display → do
       -- Cleanup's first window: the server is running and nothing has reported
@@ -267,6 +285,19 @@ babblingServer =
     , "echo $$ > server.pid"
     , "echo 'the display number is unavailable' >&2"
     , "echo not-a-display >&3"
+    , "exec sleep 300"
+    ]
+
+-- | A server that asks for its own owner to be stopped at its first
+-- instruction, so the request races that owner's startup rather than arriving
+-- long after it. Its parent is that owner and not the helper, which is what
+-- makes @$PPID@ the right target here and the wrong one in 'signallingServer'.
+earlyStopServer ∷ String
+earlyStopServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "kill -TERM \"$PPID\""
     , "exec sleep 300"
     ]
 
