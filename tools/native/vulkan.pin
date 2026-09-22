@@ -1,0 +1,87 @@
+# The Vulkan inputs the native recipe provisions, pinned per platform: the
+# loader, the driver, the Khronos validation layer, and the glslang compiler.
+# Changing any value here changes the native recipe fingerprint, so every
+# prefix, manifest, and image built from the old pin stops matching and an
+# upgrade becomes an explicit requalification. See docs/validation.md.
+#
+# Nothing here is discovered. Each platform names its inputs, and the recipe
+# refuses one it cannot read or whose identity is not the one named, reporting
+# what the machine holds instead. It never falls back to another loader,
+# driver, or layer. HETOIMASIA_VULKAN_* overrides below relocate an input
+# without waiving that qualification: an override locates, the pin decides.
+
+# --------------------------------------------------------------------------
+# Linux: the packages the CI image installs, at exactly these revisions.
+#
+# `apt-get install` is given each `=` constraint, so a revision the archive no
+# longer offers fails the package layer rather than silently taking a newer
+# one, and the installed revision is read back from dpkg afterwards. The paths
+# are where those packages install, named deliberately: `mesa-vulkan-drivers`
+# installs eight ICD manifests and only Lavapipe — the software driver D-10
+# selects — is the one this recipe adopts.
+LINUX_LOADER_PACKAGE=libvulkan1
+LINUX_LOADER_PACKAGE_VERSION=1.3.275.0-1build1
+LINUX_HEADERS_PACKAGE=libvulkan-dev
+LINUX_HEADERS_PACKAGE_VERSION=1.3.275.0-1build1
+LINUX_DRIVER_PACKAGE=mesa-vulkan-drivers
+LINUX_DRIVER_PACKAGE_VERSION=25.2.8-0ubuntu0.24.04.2
+LINUX_LAYER_PACKAGE=vulkan-validationlayers
+LINUX_LAYER_PACKAGE_VERSION=1.3.275.0-1
+LINUX_GLSLANG_PACKAGE=glslang-tools
+LINUX_GLSLANG_PACKAGE_VERSION=15.1.0-2~ubuntu0.24.04.2
+
+LINUX_LOADER=/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+LINUX_LOADER_VERSION=1.3.275
+LINUX_LOADER_PC=/usr/lib/x86_64-linux-gnu/pkgconfig/vulkan.pc
+LINUX_INCLUDE=/usr/include
+LINUX_DRIVER_MANIFEST=/usr/share/vulkan/icd.d/lvp_icd.json
+LINUX_DRIVER_NAME=lvp
+LINUX_LAYER_MANIFEST=/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json
+LINUX_LAYER_NAME=VK_LAYER_KHRONOS_validation
+LINUX_LAYER_VERSION=1.3.275
+
+# Both Linux manifests name their library by bare filename, which the loader
+# resolves through the dynamic linker's own search path rather than against the
+# manifest's directory. A search is not a pin, so the binary each one stands for
+# is named here and the manifest is held to it: its `library_path` must be
+# exactly this file's name, or the manifest is describing a different library.
+LINUX_DRIVER_LIBRARY=/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+LINUX_LAYER_LIBRARY=/usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+LINUX_GLSLANG=/usr/bin/glslangValidator
+LINUX_GLSLANG_VERSION=15.1.0
+
+# --------------------------------------------------------------------------
+# macOS: the artifacts a developer's machine already carries, adopted only
+# after their identity is qualified.
+#
+# These are inputs the recipe verifies, never assumptions: each path is read,
+# hashed, and required to be exactly the artifact named below before the prefix
+# references it. A path that is a symlink — Homebrew's `opt` is the usual one —
+# is resolved first and the resolved file is what the digest qualifies, so a
+# moving link cannot quietly change what the prefix is a prefix of.
+#
+# The loader is the standard LunarG one, which GLFW and the binding share. The
+# driver is deliberately NOT the SDK's own MoltenVK, whose manifest declares API
+# 1.2 and so cannot satisfy the accepted 1.3 minimum; the Homebrew MoltenVK
+# 1.4.0 build is named instead, which is exactly the override the loader
+# documents for this purpose. Both are the selections VK-2 proved.
+MACOS_LOADER=/usr/local/lib/libvulkan.1.3.296.dylib
+MACOS_LOADER_VERSION=1.3.296
+MACOS_LOADER_SHA256=43e14d232fc727b7f2832da79944650237223a9f47b71cf1aafd3891bf6cb3e6
+MACOS_LOADER_PC=/usr/local/lib/pkgconfig/vulkan.pc
+MACOS_INCLUDE=/usr/local/include
+
+MACOS_DRIVER_MANIFEST=/opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
+MACOS_DRIVER_MANIFEST_SHA256=b514f51690582fb783383154b7a33c7816cc47e98ee1a1f652dccd3e996f0bf1
+MACOS_DRIVER_NAME=MoltenVK
+MACOS_DRIVER_LIBRARY_SHA256=6e9ec5b2968916d5d3172a55e43192727674470d4f16ece10fe579b1c7d01057
+
+MACOS_LAYER_MANIFEST=/usr/local/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json
+MACOS_LAYER_MANIFEST_SHA256=ed025f0d871a2ef3b21d845dc7572d621f78dd178b73e7e5c446604812264985
+MACOS_LAYER_NAME=VK_LAYER_KHRONOS_validation
+MACOS_LAYER_VERSION=1.3.296
+MACOS_LAYER_LIBRARY_SHA256=dc6b9c2fd7b6e19c2b1d66fbc837bceaca72e62ea63114de17bd86b4e2d49d95
+
+MACOS_GLSLANG=/usr/local/bin/glslangValidator
+MACOS_GLSLANG_VERSION=15.0.0
+MACOS_GLSLANG_SHA256=7167bc1261b1a54268ccdb1e57cee3128b198a453fc4c6243925c7bd2484baba
