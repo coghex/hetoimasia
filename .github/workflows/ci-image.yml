@@ -17,9 +17,11 @@
 # whenever either runs, and both are skipped for every other event — no push and
 # no pull request starts them.
 #
-# `route: vulkan-proof` builds the throwaway container
-# `tools/vulkan-proof/Dockerfile.linux-proof` and runs the VK-2 native Vulkan
-# compatibility proof inside it on an isolated X11 display. See
+# `route: vulkan-proof` runs the native Vulkan compatibility proof inside the
+# image the checked-out `tools/ci-image/descriptor.json` names, on an isolated
+# X11 display. VK-4 provisioned the loader, driver, and layers into that image,
+# so the throwaway container this route used to build is gone and the proof now
+# runs against exactly the inputs ordinary Linux validation runs against. See
 # docs/vulkan_compatibility_record.md.
 #
 # `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
@@ -82,36 +84,66 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v7
 
-      - name: Name the commit under proof
-        run: echo "proving ${{ github.sha }} on ${{ github.ref }}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build the pinned proof container
+      - name: Identify the image this candidate describes
+        id: image
         run: |
           set -euo pipefail
-          docker build -f tools/vulkan-proof/Dockerfile.linux-proof \
-            --build-arg SOURCE_REVISION="${{ github.sha }}" \
-            -t hetoimasia-vulkan-proof .
-
-      - name: Record what the container installed
-        run: |
-          set -euo pipefail
+          reference="$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')"
+          recorded="$(python3 -c 'import json; print(json.load(open("tools/ci-image/descriptor.json"))["recipe_fingerprint"])')"
+          # A proof run in some other tree's image proves nothing about this
+          # one, so the descriptor has to describe this candidate before it is
+          # used — exactly as the wayland-probe route requires.
+          candidate="$(python3 tools/validation/ci_image.py fingerprint --revision HEAD)"
+          if [ "$recorded" != "$candidate" ]; then
+            echo "::error::the committed descriptor records recipe fingerprint $recorded, but this candidate fingerprints to $candidate"
+            exit 1
+          fi
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$candidate" >> "$GITHUB_OUTPUT"
           {
-            echo '## The container'\''s Vulkan inventory'
+            echo "proving ${{ github.sha }} on ${{ github.ref }}"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Image | \`$reference\` |"
+            echo "| Recipe fingerprint | \`$candidate\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record the Vulkan identities the image carries
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # What the descriptor names and what the image holds, side by side.
+          # The record below has to be attributable to one set of identities,
+          # and these are they.
+          {
+            echo '## The image'"'"'s Vulkan identities'
             echo
             echo '```'
-            docker run --rm --entrypoint cat hetoimasia-vulkan-proof /opt/vulkan-inventory.txt
+            python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print("\n".join(f"descriptor {k}: {d[k]}" for k in ("vulkan", "vulkan_loader", "vulkan_driver", "vulkan_layers", "glslang")))'
+            docker run --rm --entrypoint python3 "$REFERENCE" /opt/hetoimasia/recipe/tools/native/native.py check --prefix /opt/hetoimasia/native/glfw
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          docker run --rm --entrypoint cat hetoimasia-vulkan-proof /opt/vulkan-inventory.txt
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Run the proof on an isolated X11 display
+      - name: Run the proof on an isolated X11 display inside that image
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+          REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/record"
+          # The candidate tree supplies the harness and the display helper; the
+          # image supplies the toolchain, the private native prefix, and the
+          # Vulkan runtime. The mount is writable because the build directory
+          # lives in it, and the revision is passed in because a checkout
+          # mounted into a container is not one `git` will speak for.
           docker run --rm \
             --env HETOIMASIA_VULKAN_PROOF_RECORD=/record/vulkan-compatibility-linux.md \
+            --env HETOIMASIA_PROOF_REVISION="$REVISION" \
             --volume "$RUNNER_TEMP/record:/record" \
-            hetoimasia-vulkan-proof
+            --volume "$PWD:/candidate" --workdir /candidate \
+            "$REFERENCE" bash tools/display/x11.sh -- bash tools/vulkan-proof/run-proof.sh
 
       - name: Show the record
         if: always()
@@ -149,6 +181,11 @@ jobs:
       status: ${{ steps.lookup.outputs.status }}
       digest: ${{ steps.lookup.outputs.digest }}
       native-manifest: ${{ steps.lookup.outputs.native-manifest }}
+      vulkan: ${{ steps.lookup.outputs.vulkan }}
+      vulkan-loader: ${{ steps.lookup.outputs.vulkan_loader }}
+      vulkan-driver: ${{ steps.lookup.outputs.vulkan_driver }}
+      vulkan-layers: ${{ steps.lookup.outputs.vulkan_layers }}
+      glslang: ${{ steps.lookup.outputs.glslang }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -200,6 +237,11 @@ jobs:
       status: ${{ steps.publish.outputs.status }}
       digest: ${{ steps.publish.outputs.digest }}
       native-manifest: ${{ steps.publish.outputs.native-manifest }}
+      vulkan: ${{ steps.publish.outputs.vulkan }}
+      vulkan-loader: ${{ steps.publish.outputs.vulkan_loader }}
+      vulkan-driver: ${{ steps.publish.outputs.vulkan_driver }}
+      vulkan-layers: ${{ steps.publish.outputs.vulkan_layers }}
+      glslang: ${{ steps.publish.outputs.glslang }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v7
@@ -264,14 +306,35 @@ jobs:
           RESOLVED_MANIFEST: ${{ needs.resolve.outputs.native-manifest }}
           PUBLISHED_DIGEST: ${{ needs.publish.outputs.digest }}
           PUBLISHED_MANIFEST: ${{ needs.publish.outputs.native-manifest }}
+          RESOLVED_VULKAN: ${{ needs.resolve.outputs.vulkan }}
+          RESOLVED_VULKAN_LOADER: ${{ needs.resolve.outputs.vulkan-loader }}
+          RESOLVED_VULKAN_DRIVER: ${{ needs.resolve.outputs.vulkan-driver }}
+          RESOLVED_VULKAN_LAYERS: ${{ needs.resolve.outputs.vulkan-layers }}
+          RESOLVED_GLSLANG: ${{ needs.resolve.outputs.glslang }}
+          PUBLISHED_VULKAN: ${{ needs.publish.outputs.vulkan }}
+          PUBLISHED_VULKAN_LOADER: ${{ needs.publish.outputs.vulkan-loader }}
+          PUBLISHED_VULKAN_DRIVER: ${{ needs.publish.outputs.vulkan-driver }}
+          PUBLISHED_VULKAN_LAYERS: ${{ needs.publish.outputs.vulkan-layers }}
+          PUBLISHED_GLSLANG: ${{ needs.publish.outputs.glslang }}
         run: |
           set -euo pipefail
+          # A hit answers from `resolve`, a miss from `publish`; every value in
+          # the descriptor comes from whichever of the two actually looked at
+          # the image, so a partly-filled descriptor cannot be written.
           digest="${PUBLISHED_DIGEST:-$RESOLVED_DIGEST}"
           manifest="${PUBLISHED_MANIFEST:-$RESOLVED_MANIFEST}"
+          vulkan="${PUBLISHED_VULKAN:-$RESOLVED_VULKAN}"
+          vulkan_loader="${PUBLISHED_VULKAN_LOADER:-$RESOLVED_VULKAN_LOADER}"
+          vulkan_driver="${PUBLISHED_VULKAN_DRIVER:-$RESOLVED_VULKAN_DRIVER}"
+          vulkan_layers="${PUBLISHED_VULKAN_LAYERS:-$RESOLVED_VULKAN_LAYERS}"
+          glslang="${PUBLISHED_GLSLANG:-$RESOLVED_GLSLANG}"
           python3 tools/ci-image/builder.py descriptor \
             --image "$IMAGE" --digest "$digest" --fingerprint "$FINGERPRINT" \
             --native-manifest "$manifest" --ghc "$GHC_VERSION" --cabal "$CABAL_VERSION" \
             --weston "$WESTON_VERSION" \
+            --vulkan "$vulkan" --vulkan-loader "$vulkan_loader" \
+            --vulkan-driver "$vulkan_driver" --vulkan-layers "$vulkan_layers" \
+            --glslang "$glslang" \
             --output descriptor.json
           echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
           {

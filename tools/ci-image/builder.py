@@ -120,13 +120,32 @@ def validated(record: dict, reference: str, fingerprint: str, ghc: str, cabal: s
     for name, expected in (("ghc", ghc), ("cabal", cabal), ("weston", weston)):
         if labels.get(contract.LABELS[name]) != expected:
             problems.append(f"its {name} label is {labels.get(contract.LABELS[name])!r}, not {expected}")
+    # The Vulkan identities are read off the image rather than passed in: what a
+    # published image runs against is decided by the prefix baked into it, and a
+    # value supplied from outside could only restate an expectation.
+    identities: dict[str, str] = {}
+    for entry in contract.VULKAN_ENTRIES:
+        value = labels.get(contract.LABELS[contract.descriptor_field(entry)])
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"its {entry} label is {value!r}")
+        else:
+            identities[contract.descriptor_field(entry)] = value
+    if "vulkan" in identities and not contract.HEX64.match(identities["vulkan"]):
+        problems.append(f"its vulkan identity label is {identities['vulkan']!r}, not a digest")
     if problems:
         raise BuilderError(
             f"{reference} exists but is not a validated image for fingerprint {fingerprint[:12]}: "
             + "; ".join(problems)
             + "; the tag is never overwritten, so delete that package version deliberately if it must be replaced"
         )
-    return {"digest": digest, "native_manifest": native_manifest, "ghc": ghc, "cabal": cabal, "weston": weston}
+    return {
+        "digest": digest,
+        "native_manifest": native_manifest,
+        "ghc": ghc,
+        "cabal": cabal,
+        "weston": weston,
+        **identities,
+    }
 
 
 def resolve(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, weston: str) -> dict:
@@ -176,6 +195,17 @@ def publish(registry: str, image: str, fingerprint: str, ghc: str, cabal: str, w
             f"{reference} reports native manifest {result['native_manifest'][:12]} after publication, "
             f"not the validated {native_manifest[:12]}"
         )
+    # The same question for the Vulkan runtime: the image that is now published
+    # must be the one whose identities were validated, not another build that
+    # reached the tag between the two.
+    drifted = [
+        f"{contract.descriptor_field(entry)} is {result[contract.descriptor_field(entry)]!r} after publication, "
+        f"not the validated {built[contract.descriptor_field(entry)]!r}"
+        for entry in contract.VULKAN_ENTRIES
+        if result[contract.descriptor_field(entry)] != built.get(contract.descriptor_field(entry))
+    ]
+    if drifted:
+        raise BuilderError(f"{reference} does not describe the validated candidate: " + "; ".join(drifted))
     return {"status": "published", "published": True, "reference": reference, **result}
 
 
@@ -188,6 +218,7 @@ def descriptor(
     cabal: str,
     weston: str,
     architecture: str,
+    vulkan: dict[str, str],
 ) -> dict:
     document = {
         "schema_version": contract.DESCRIPTOR_SCHEMA_VERSION,
@@ -200,6 +231,7 @@ def descriptor(
         "ghc": ghc,
         "cabal": cabal,
         "weston": weston,
+        **vulkan,
     }
     try:
         return contract.validate_descriptor(document, "the returned descriptor")
@@ -232,7 +264,10 @@ def write_outputs(path: str | None, result: dict) -> None:
     if not path:
         return
     with open(path, "a", encoding="utf-8") as handle:
-        for key in ("status", "published", "digest", "native_manifest"):
+        keys = ("status", "published", "digest", "native_manifest") + tuple(
+            contract.descriptor_field(entry) for entry in contract.VULKAN_ENTRIES
+        )
+        for key in keys:
             if key in result:
                 value = result[key]
                 handle.write(f"{key.replace('_', '-')}={str(value).lower() if isinstance(value, bool) else value}\n")
@@ -264,6 +299,8 @@ def main(argv: list[str]) -> int:
     written.add_argument("--ghc", required=True)
     written.add_argument("--cabal", required=True)
     written.add_argument("--weston", required=True)
+    for entry in contract.VULKAN_ENTRIES:
+        written.add_argument(f"--{entry}", required=True, help=f"the published image's {entry} identity")
     written.add_argument("--architecture", default="amd64")
     written.add_argument("--output", required=True)
     staged = commands.add_parser("stage")
@@ -301,6 +338,10 @@ def main(argv: list[str]) -> int:
             arguments.cabal,
             arguments.weston,
             arguments.architecture,
+            {
+                contract.descriptor_field(entry): getattr(arguments, contract.descriptor_field(entry))
+                for entry in contract.VULKAN_ENTRIES
+            },
         )
         with open(arguments.output, "w", encoding="utf-8") as handle:
             json.dump(document, handle, indent=2, sort_keys=True)

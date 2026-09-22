@@ -17,9 +17,11 @@ must say and of how the planner, the builder, and each worker check it:
   disagree with the candidate, naming the builder as the fix;
 - each **worker**, running in a container bound to the descriptor's digest,
   checks the fingerprint the image embeds, the native manifest it actually
-  carries, the compilers it actually runs, the compositor package it actually
-  has installed, and the Cabal store it resolves, then declares the toolchain
-  map it verified, which must equal the plan's.
+  carries, the Vulkan loader, driver, layer, and compiler identities that
+  manifest records against the files actually on disk, the compilers it
+  actually runs, the compositor package it actually has installed, and the
+  Cabal store it resolves, then declares the toolchain map it verified, which
+  must equal the plan's.
 
 See ``docs/validation.md`` for the image, the descriptor, and the builder.
 """
@@ -38,7 +40,7 @@ import sys
 sys.dont_write_bytecode = True
 
 DESCRIPTOR_PATH = "tools/ci-image/descriptor.json"
-DESCRIPTOR_SCHEMA_VERSION = 1
+DESCRIPTOR_SCHEMA_VERSION = 2
 FINGERPRINT_SCHEMA_VERSION = 1
 
 # A candidate carries an image recipe when this file exists. One that does not
@@ -59,6 +61,19 @@ RECIPE_ROOTS = (
 # The toolchain map entries this image contributes beside ``ghc`` and ``cabal``.
 IMAGE_ENTRY = "ci-image"
 MANIFEST_ENTRY = "native-manifest"
+
+# The Vulkan runtime the native prefix provisions, as the plan's toolchain map
+# carries it. ``vulkan`` is every loader, driver, layer, and compiler identity
+# in one digest, so a changed input moves the cache environment key and makes a
+# receipt gathered under the old identities unusable; the four beside it name
+# those inputs in the descriptor in a form a reader can compare directly. The
+# descriptor field for each is the entry name with its hyphen as an underscore,
+# except ``glslang``, which is spelled the same in both.
+VULKAN_ENTRIES = ("vulkan", "vulkan-loader", "vulkan-driver", "vulkan-layers", "glslang")
+
+
+def descriptor_field(entry: str) -> str:
+    return entry.replace("-", "_")
 
 # The headless compositor the display helper starts, identified by the exact
 # package revision the image installed. It is part of the environment identity
@@ -83,6 +98,7 @@ LABELS = {
     "ghc": "org.hetoimasia.ci-image.ghc",
     "cabal": "org.hetoimasia.ci-image.cabal",
     "weston": "org.hetoimasia.ci-image.weston",
+    **{descriptor_field(entry): f"org.hetoimasia.ci-image.{entry}" for entry in VULKAN_ENTRIES},
 }
 
 BUILDER_INSTRUCTION = (
@@ -110,6 +126,7 @@ DESCRIPTOR_FIELDS = {
     "ghc": str,
     "cabal": str,
     "weston": str,
+    **{descriptor_field(entry): str for entry in VULKAN_ENTRIES},
 }
 
 
@@ -215,6 +232,11 @@ def validate_descriptor(document, source: str) -> dict:
                 problems.append(f"{key} {document[key]!r} is not a version")
         if not PACKAGE_VERSION.match(document["weston"]):
             problems.append(f"weston {document['weston']!r} is not a package version")
+        if not HEX64.match(document["vulkan"]):
+            problems.append("vulkan is not a 64-digit lowercase hex identity digest")
+        for entry in VULKAN_ENTRIES[1:]:
+            if not document[descriptor_field(entry)].strip():
+                problems.append(f"{descriptor_field(entry)} names no identity")
     if problems:
         raise ImageError(f"{source} is malformed: " + "; ".join(problems) + f"; {BUILDER_INSTRUCTION}")
     return document
@@ -263,6 +285,7 @@ def plan_image(read, entries, toolchain: dict[str, str], runner_os: str, label: 
         IMAGE_ENTRY: descriptor["digest"],
         MANIFEST_ENTRY: descriptor["native_manifest"],
         COMPOSITOR_ENTRY: descriptor["weston"],
+        **{entry: descriptor[descriptor_field(entry)] for entry in VULKAN_ENTRIES},
     }
     for name, value in expected.items():
         if name in toolchain and toolchain[name] != value:
@@ -305,6 +328,28 @@ def sha256_file(path: str) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def vulkan_identities(repo_root: str, manifest_file: str) -> dict[str, str]:
+    """The Vulkan toolchain entries this machine's own native manifest yields.
+
+    Computed through the recipe that wrote them, so the planner reading a
+    descriptor and the worker reading a prefix arrive at one spelling of an
+    identity rather than two that can drift apart.
+    """
+    recipe = os.path.join(repo_root, "tools", "native")
+    if recipe not in sys.path:
+        sys.path.insert(0, recipe)
+    try:
+        import vulkan
+    except ImportError as error:
+        raise ImageError(f"the native recipe at {recipe} has no Vulkan module ({error})") from error
+    try:
+        return vulkan.toolchain_entries(vulkan.recorded_from(manifest_file))
+    except vulkan.VulkanError as failure:
+        raise ImageError(str(failure)) from failure
+    except (KeyError, TypeError) as error:
+        raise ImageError(f"the native manifest {manifest_file} records incomplete Vulkan inputs ({error})") from error
 
 
 def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]:
@@ -385,6 +430,18 @@ def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]
     if native.returncode != 0:
         problems.append("the native prefix check failed: " + native.stderr.decode("utf-8", errors="replace").strip())
 
+    # The Vulkan identities are taken from the manifest this container actually
+    # carries, not from the descriptor, and only after the check above has read
+    # and re-hashed every file that manifest names. A container whose loader,
+    # driver, layer, or compiler was replaced therefore declares a different map
+    # here and is refused, rather than passing because the manifest still looks
+    # well-formed.
+    vulkan_declared: dict[str, str] = {}
+    try:
+        vulkan_declared = vulkan_identities(repo_root, manifest_file)
+    except ImageError as failure:
+        problems.append(str(failure))
+
     ghc = command_output(["ghc", "--numeric-version"])
     cabal = command_output(["cabal", "--numeric-version"])
     expected_directory = os.path.join(image_root, "cabal")
@@ -400,6 +457,7 @@ def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]
         "cabal": cabal,
         IMAGE_ENTRY: image["digest"],
         MANIFEST_ENTRY: actual_manifest,
+        **vulkan_declared,
     }
     if installed_compositor is not None:
         declared[COMPOSITOR_ENTRY] = installed_compositor
