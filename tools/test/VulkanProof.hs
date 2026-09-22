@@ -38,6 +38,15 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldConta
 retainedRecords ∷ [(String, FilePath)]
 retainedRecords = [("macOS", "docs/vulkan/macos.md"), ("Linux", "docs/vulkan/linux.md")]
 
+-- | The records VK-4 produced from the environment this recipe provisions.
+--
+-- A second pair rather than a revision of the first: they consumed different
+-- files by a different discovery route, so the VK-2 pair stays exactly as it
+-- was and these are retained beside it.
+provisionedRecords ∷ [(String, FilePath)]
+provisionedRecords =
+  [("macOS", "docs/vulkan/macos-provisioned.md"), ("Linux", "docs/vulkan/linux-provisioned.md")]
+
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
@@ -61,6 +70,7 @@ readByTheseExamples =
   , compatibilityRecord
   ]
     <> map snd retainedRecords
+    <> map snd provisionedRecords
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -207,6 +217,42 @@ spec = describe "The Vulkan proof boundary" $ do
               hex `shouldSatisfy` all (`elem` ("0123456789abcdef" ∷ String))
       )
       retainedRecords
+
+  it "retains a provisioned record for each platform, each a pass on the provisioned inputs" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          -- The harness writes its own verdict; a record retained for a run
+          -- that did not pass would be evidence of the opposite of what the
+          -- requirement asks for.
+          lines record `shouldContain` ["Verdict: **pass**."]
+          -- And it says it is the provisioned pair rather than the VK-2 one,
+          -- so neither can be mistaken for the other by its heading alone.
+          take 1 (lines record)
+            `shouldBe` ["# The VK-4 provisioned native Vulkan compatibility record, " <> platform]
+          -- Every Vulkan path it consumed came from the provisioned prefix.
+          case settingOf record "- VK_DRIVER_FILES:" of
+            Nothing → expectationFailure (platform <> "'s provisioned record names no driver manifest")
+            Just manifest → trim manifest `shouldSatisfy` ("/vulkan/share/vulkan/icd.d/" `isInfixOf`)
+          case settingOf record "- VK_LAYER_PATH:" of
+            Nothing → expectationFailure (platform <> "'s provisioned record names no layer path")
+            Just path' → trim path' `shouldSatisfy` ("/vulkan/share/vulkan/explicit_layer.d" `isSuffixOf`)
+          -- One layer, because the prefix holds a selection rather than a
+          -- directory to search. This is the difference from the VK-2 records,
+          -- which offered whatever their platform's directory happened to hold.
+          case settingOf record "- layers the pinned path offers:" of
+            Nothing → expectationFailure (platform <> "'s provisioned record lists no layers")
+            Just offered → length (splitOn ',' offered) `shouldBe` 1
+      )
+      provisionedRecords
+
+  it "proved both platforms from one tree in the provisioned pair too" $ do
+    -- The same property the VK-2 pair has, and for the same reason: one digest
+    -- computed independently on each platform, from a checkout on macOS and
+    -- from the candidate mounted into the image on Linux.
+    digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") provisionedRecords
+    map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
+    length (nub (map (fmap trim) digests)) `shouldBe` 1
 
   it "proved both platforms from one tree, by the digest each computed" $ do
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") retainedRecords
