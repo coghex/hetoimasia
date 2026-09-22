@@ -1485,13 +1485,16 @@ because GitHub offers `workflow_dispatch` only for a workflow already on the
 default branch, so a new workflow cannot supply pre-merge evidence for the pull
 request introducing it; dispatch a candidate branch with `--ref`.
 
-`route: vulkan-proof` runs the VK-2 native Vulkan compatibility proof inside
-the throwaway container `tools/vulkan-proof/Dockerfile.linux-proof` and on the
-isolated X11 display `tools/display/x11.sh` starts. It uploads the record as
-the `vulkan-compatibility-linux` artifact and repeats it in the job summary.
-Nothing about it is required, and the CI image gains no Vulkan input from it —
-that is VK-4's deliberate step. See
-[the compatibility record](vulkan_compatibility_record.md).
+`route: vulkan-proof` runs the native Vulkan compatibility proof inside the
+image the checked-out `tools/ci-image/descriptor.json` names — refusing to run
+at all unless that descriptor describes the candidate — and on the isolated X11
+display `tools/display/x11.sh` starts. It uploads the record as the
+`vulkan-compatibility-linux` artifact and repeats it in the job summary, beside
+the Vulkan identities the descriptor names and the ones the image itself
+reports. VK-4 provisioned that runtime into the image, so the throwaway
+container this route used to build is gone and the proof now runs against
+exactly the inputs ordinary Linux validation runs against. Nothing about it is
+required. See [the compatibility record](vulkan_compatibility_record.md).
 
 `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
 checked-out descriptor names, with the candidate tree mounted:
@@ -2317,7 +2320,10 @@ candidate whose checks have not passed reports `BLOCKED`.
 ## What the hosted platform cannot cover
 
 Every worker runs on GitHub's hosted `ubuntu-latest` runners, inside the CI
-image: Linux, CPU only, with no GPU and no Vulkan loader. The CPU workers are
+image: Linux, CPU only, with no GPU. Since VK-4 the image carries a Vulkan
+loader and Mesa's Lavapipe, so Vulkan evidence from CI is a software
+rasterizer's — API and image correctness, never hardware behaviour or
+performance. The CPU workers are
 headless, and the display worker's only display is the isolated Xvfb X11 server
 it starts itself, so native evidence from CI is X11 on a virtual framebuffer: it
 covers the session, thread, and window lifecycle, not Wayland, macOS, physical

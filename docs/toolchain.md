@@ -131,10 +131,13 @@ reproduces this set. `cabal build all --dry-run` prints it.
 
 `vulkan-3.27` and `vulkan-utils-0.5.11.0` — the newest pair at this index, and
 the pair `vulkan-utils`'s own `vulkan >=3.27 && <3.28` bound requires. Neither
-is a dependency of any package this repository builds: there is no
-`packages/gpu-vulkan` Cabal package, `cabal.project` does not list one, and the
-Linux CI image gains no Vulkan input. They are proved here so VK-2 and later
-inherit a proven pair instead of re-deciding it.
+is a dependency of any package the mandatory floor builds: there is no
+`packages/gpu-vulkan` Cabal package and neither `cabal.project` nor
+`cabal.project.cpu` lists one. That independence used to follow from the Linux
+CI image carrying no Vulkan input at all; VK-4 provisioned one, so it is now
+asserted directly instead — `tools/test/VulkanProof.hs` reads every package
+those two files name and requires that none depends on the binding. The pair is
+proved here so VK-2 and later inherit a proven one instead of re-deciding it.
 
 Both flags are set opposite to the package's own defaults, and
 `tools/toolchain/binding.pin` records why:
@@ -220,7 +223,10 @@ bash tools/toolchain/qualify-binding.sh
 
 On Linux, inside the pinned throwaway container
 `tools/toolchain/Dockerfile.linux-binding`, which pins its base image by digest
-and installs the toolchain from the same checksummed bindists the CI image uses:
+and installs the toolchain from the same checksummed bindists the CI image uses.
+This container is #157's own and is unrelated to the one VK-4 retired: it proves
+the binding *builds*, and the published CI image is where the runtime profile is
+now proved instead.
 
 ```bash
 docker build -f tools/toolchain/Dockerfile.linux-binding \

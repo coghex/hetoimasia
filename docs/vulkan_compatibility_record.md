@@ -279,9 +279,13 @@ both platforms.
   performance coverage.
 - **Hosted macOS CI.** macOS evidence is local and requires a human's per-run
   approval, exactly as D-3 and AGENTS.md require. Nothing here changes that.
-- **The production environment.** The CI image still carries no Vulkan input and
-  the native manifest still describes GLFW alone. Promoting this recipe is VK-4's
-  deliberate step, not a side effect of this proof.
+- **The production environment.** At the time of this proof the CI image carried
+  no Vulkan input and the native manifest described GLFW alone; promoting the
+  recipe was left to VK-4 rather than taken as a side effect here. VK-4 (#208)
+  has since done it, and the
+  [provisioned records](vulkan/linux-provisioned.md) are that environment's own
+  evidence. This record remains what it was: a proof of the profile, not of the
+  environment that now carries it.
 - **Multiple windows, resize, and a triangle.** One surface, one swapchain, no
   pipeline, no shader. VK-10 and VK-17 own those.
 

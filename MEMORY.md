@@ -350,12 +350,17 @@ their implementations are complete or replace canonical readiness review.
   and glslang compiler per platform, `tools/native/vulkan.py` provisions them
   into `<native prefix>/vulkan`, and their identities reach the image
   descriptor and the plan's toolchain map, so a changed input is an explicit
-  requalification rather than a silent drift. The macOS side of that prefix is
-  provisioned but **not natively qualified**: the VK-2 macOS record names
-  versions and paths but no binary or manifest digests, so it cannot establish
-  that the identities the prefix now records are the ones that proof consumed,
-  and qualifying it needs a consented local native run. A third thing the
-  record leaves unproved is a rule rather than an observation: a present fence's status before it is waited on is not a
+  requalification rather than a silent drift. Both prefixes are **natively
+  qualified against the provisioned inputs**, by a second pair of records
+  retained beside the VK-2 pair: `docs/vulkan/linux-provisioned.md` from inside
+  the published image, and `docs/vulkan/macos-provisioned.md` from a local run
+  under the human's explicit approval for that one session. Reusing the VK-2
+  macOS record could not have done it — that record names versions and paths but
+  no binary or manifest digests, so it cannot establish that the identities the
+  prefix now records are the ones it consumed — which is why the consented run
+  was needed. The provisioned pair carries one source digest computed
+  independently on both platforms, as the VK-2 pair does. A third thing the
+  VK-2 record leaves unproved is a rule rather than an observation: a present fence's status before it is waited on is not a
   contract on either platform, so the fence is waited for and nothing is read
   into whether it happened to be signalled already. Later
   native slices' #158 prerequisite is satisfied by PR #174. Host-retirement
