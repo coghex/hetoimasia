@@ -53,6 +53,12 @@ PIN_FILE = os.path.join(RECIPE_DIRECTORY, PIN_NAME)
 # native build needs, and so one manifest describes all of it.
 VULKAN_DIRECTORY = "vulkan"
 
+# What `-lvulkan` actually opens. The linker looks for the unversioned name
+# first, so this link — not the versioned file it points at — is the loader's
+# discovery route on macOS, and it is recorded and verified as its own input.
+LOADER_LINK = "libvulkan.dylib"
+LOADER_FILE = "libvulkan.1.dylib"
+
 # The wrapper's own flag. It is deliberately not a glslang flag: the wrapper
 # answers it itself and never reaches the compiler, so the identity can be read
 # from a machine where the compiler would refuse to run at all.
@@ -709,22 +715,37 @@ def install_loader(prefix: str, target: str, loader: dict) -> tuple[dict, str]:
     records its own identity honestly rather than pretending to be runnable.
     """
     if target != "Darwin":
-        return {"path": loader["resolved"], "sha256": loader["sha256"], "installed": False}, os.path.dirname(
-            loader["resolved"]
-        )
+        return {
+            "path": loader["resolved"],
+            "sha256": loader["sha256"],
+            "installed": False,
+            "link": None,
+            "link_target": None,
+        }, os.path.dirname(loader["resolved"])
     directory = loader_directory(prefix)
     os.makedirs(directory, exist_ok=True)
-    installed = os.path.join(directory, "libvulkan.1.dylib")
+    installed = os.path.join(directory, LOADER_FILE)
     shutil.copyfile(loader["resolved"], installed)
     os.chmod(installed, 0o755)
-    link = os.path.join(directory, "libvulkan.dylib")
+    # `-lvulkan` opens this name, so it is what a link actually goes through.
+    # It is a link rather than a second copy so that one file carries the
+    # identity, and it is recorded below so that removing it, pointing it
+    # somewhere else, or replacing it with a file is refused rather than left to
+    # surface as a link failure in whatever builds next.
+    link = os.path.join(directory, LOADER_LINK)
     if os.path.lexists(link):
         os.remove(link)
-    os.symlink("libvulkan.1.dylib", link)
+    os.symlink(LOADER_FILE, link)
     if platform.system() == "Darwin":
         run(["install_name_tool", "-id", installed, installed])
         run(["codesign", "--force", "--sign", "-", installed])
-    return {"path": installed, "sha256": sha256_file(installed), "installed": True}, directory
+    return {
+        "path": installed,
+        "sha256": sha256_file(installed),
+        "installed": True,
+        "link": link,
+        "link_target": LOADER_FILE,
+    }, directory
 
 
 def run(command: list[str]) -> None:
@@ -804,6 +825,8 @@ def provision(prefix: str, target: str, pin: dict[str, str] | None = None) -> di
             "path": loader["path"],
             "sha256": loader["sha256"],
             "installed": loader["installed"],
+            "link": loader["link"],
+            "link_target": loader["link_target"],
             "include": includedir,
             "headers_sha256": headers_digest(includedir),
             "source_headers_sha256": resolved["headers_sha256"],
@@ -895,12 +918,42 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
     root = vulkan_prefix(prefix)
     owned = [
         ("the loader's package description", recorded["loader"].get("pkg_config")),
+        ("the loader's linker-facing link", recorded["loader"].get("link")),
         ("the driver manifest", recorded["driver"].get("manifest")),
         ("the glslangValidator wrapper", recorded["glslang"].get("wrapper")),
     ] + [(f"the {layer.get('name')} manifest", layer.get("manifest")) for layer in recorded.get("layers", [])]
     for description, path in owned:
+        if path is None and description == "the loader's linker-facing link":
+            # Only a prefix that installed the loader owns a link to it.
+            continue
         if not isinstance(path, str) or os.path.commonpath([root, os.path.abspath(path)]) != root:
             problems.append(f"{description} is recorded at {path!r}, which is not inside {root}")
+
+    # The link `-lvulkan` opens. Its identity is not a digest — it is that it is
+    # a symbolic link, and which file it names. A check that only hashed the
+    # versioned loader beside it would pass a prefix whose link was deleted,
+    # retargeted, or replaced by a file, and every one of those either fails a
+    # clean build or silently links a different loader.
+    link = recorded["loader"].get("link")
+    if isinstance(link, str):
+        expected_target = recorded["loader"].get("link_target")
+        if not os.path.islink(link):
+            problems.append(
+                f"the loader's linker-facing link is missing from {link} ({holdings(link)}); "
+                "`-lvulkan` opens that name, so a prefix without it does not link"
+            )
+        else:
+            actual_target = os.readlink(link)
+            if actual_target != expected_target:
+                problems.append(
+                    f"the loader's linker-facing link at {link} points at {actual_target!r}, "
+                    f"not the recorded {expected_target!r}"
+                )
+            elif os.path.realpath(link) != os.path.realpath(recorded["loader"]["path"]):
+                problems.append(
+                    f"the loader's linker-facing link at {link} resolves to {os.path.realpath(link)}, "
+                    f"not the recorded loader {recorded['loader']['path']}"
+                )
 
     # The headers the prefix offers, re-walked rather than taken from the
     # record: on macOS they are a copy inside the prefix, and a copy nobody
@@ -1013,8 +1066,11 @@ def environment(prefix: str, recorded: dict) -> dict[str, str]:
 def summary(recorded: dict) -> list[str]:
     """One line per input, for a command that reports what a prefix holds."""
     lines = [
-        "loader {} ({}) at {}".format(
-            recorded["loader"]["version"], recorded["loader"]["sha256"][:12], recorded["loader"]["path"]
+        "loader {} ({}) at {}{}".format(
+            recorded["loader"]["version"],
+            recorded["loader"]["sha256"][:12],
+            recorded["loader"]["path"],
+            ", opened as " + os.path.basename(recorded["loader"]["link"]) if recorded["loader"].get("link") else "",
         ),
         "driver {} {} ({}) via {}".format(
             recorded["driver"]["name"],

@@ -859,6 +859,20 @@ spec = describe "CI image" $ do
             errors `shouldContain` "a substituted driver binary invalidates the evidence"
             doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
 
+      forM_ loaderLinkDamage $ \(label, damage, named) →
+        it ("refuses a prefix whose linker-facing loader link was " ++ label) $
+          withNative $ \native → do
+            -- `-lvulkan` opens `libvulkan.dylib`, not the versioned file beside
+            -- it, so the link is the loader's discovery route rather than a
+            -- convenience. Hashing only what it points at would accept a prefix
+            -- that no longer links, or one that links something else.
+            nativeOk native [] ["record", "--prefix", nativePrefix native]
+            let link = nativePrefix native </> "vulkan/lib/libvulkan.dylib"
+            damage link
+            (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` named
+
       it "refuses a Vulkan product the prefix does not own" $
         withNative $ \native → do
           nativeOk native [] ["record", "--prefix", nativePrefix native]
@@ -2139,6 +2153,27 @@ substitutions =
   , Substitution "glslang compiler" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "bin/glslangValidator")
   , Substitution "headers" "the Vulkan headers at" (\native → nativePrefix native </> "vulkan/include/vulkan/vulkan.h")
   , Substitution "source headers" "the recorded header digest" (\native → nativeInputs native </> "include/vulkan/vulkan.h")
+  ]
+
+-- | The ways the loader's linker-facing link can stop doing its job.
+--
+-- Each one leaves the recorded loader itself untouched and every digest in the
+-- manifest correct, which is what makes them the cases a content check alone
+-- cannot see.
+loaderLinkDamage ∷ [(String, FilePath → IO (), String)]
+loaderLinkDamage =
+  [ ("deleted", removeFile, "linker-facing link is missing")
+  , ( "pointed at another library"
+    , \link → removeFile link >> createFileLink "libSomethingElse.dylib" link
+    , "points at"
+    )
+  , ( "replaced by a file of its own"
+    , \link → do
+        target ← canonicalizePath link
+        removeFile link
+        copyFile target link
+    , "linker-facing link is missing"
+    )
   ]
 
 -- | Replace a file's bytes while leaving everything that described it alone.

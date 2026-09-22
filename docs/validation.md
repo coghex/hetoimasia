@@ -1714,6 +1714,7 @@ and `record` establishes a *project-managed Vulkan prefix* at
 | --- | --- |
 | `lib/pkgconfig/vulkan.pc` | Generated, describing the qualified loader, so `pkgconfig-depends: vulkan` resolves this prefix and never a machine-wide one. |
 | `lib/libvulkan.1.dylib` | macOS only: the qualified loader, copied in and given an absolute install name. |
+| `lib/libvulkan.dylib` | macOS only: the name `-lvulkan` opens, linked to the file above. Its identity is not a digest but that it is a symbolic link and which file it names, so deleting it, pointing it elsewhere, or replacing it with a file is refused — each of those either fails a clean build or links a different loader. |
 | `include/` | macOS only: the qualified headers, copied in beside it. On Linux the pinned development package's own `/usr/include` is referenced. |
 | `share/vulkan/icd.d/<driver>_icd.json` | Generated, naming exactly one driver binary by absolute path. |
 | `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. |
