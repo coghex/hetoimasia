@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 19,
+  "policy_version": 20,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -238,7 +238,8 @@
         "tools/native/",
         "tools/toolchain/",
         "tools/validation/",
-        "tools/vulkan-proof/"
+        "tools/vulkan-proof/",
+        "tools/flake/"
       ],
       "framework": "hspec",
       "runner": "cpu",

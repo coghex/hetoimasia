@@ -360,9 +360,9 @@ their implementations are complete or replace canonical readiness review.
 - Test selection follows [the owner policy](docs/test_classification.md): quick
   core contracts in the floor, relevant integration/tooling contracts selected
   by changes, and optional local display-deadline/nontermination/confinement
-  probes. `$test`/`$autotest` can discover the documented local inventory; this
-  is not a new scheduler, receipt adapter, or execution-history integration.
-  CI-5's broader adapter work remains deferred. The old foundation umbrella is
+  probes. The [local lab](tools/flake/README.md) supplies shared `$test`/`$flake`
+  selection, `$autotest` integration and durable evidence; broader CI-5
+  receipt/scheduler work remains deferred. The old foundation umbrella is
   architectural context, not another queue for duplicating completed arcs.
 - No game save schema, full Synarchy port, permanent RTS tuning, or general
   engine-wide rendering abstraction is committed yet.
