@@ -16,12 +16,14 @@ module CiImage (spec) where
 import Control.Exception (evaluate)
 import Control.Monad (forM_, void, when)
 import Data.Char (isSpace)
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, sort)
 import Json (asArray, asString, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
 import System.Directory
   ( canonicalizePath
+  , copyFile
   , createDirectoryIfMissing
+  , createFileLink
   , doesDirectoryExist
   , doesFileExist
   , findExecutable
@@ -33,7 +35,9 @@ import System.Directory
   , setPermissions
   )
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.IO (IOMode (AppendMode), hPutStr, withBinaryFile)
+import System.Info (os)
+import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
   ( Spec
@@ -65,6 +69,7 @@ data Descriptor = Descriptor
   , ghc ∷ String
   , cabal ∷ String
   , weston ∷ String
+  , vulkanIdentities ∷ [(String, String)]
   }
 
 spec ∷ Spec
@@ -96,13 +101,16 @@ spec = describe "CI image" $ do
         first ← fingerprintNow fixture
         first `shouldSatisfy` ((== 64) . length)
         (built, written, errors) ←
-          pythonIn fixture
-            [ checkout fixture </> "tools/ci-image/builder.py", "descriptor"
-            , "--image", "ghcr.io/owner/project-ci", "--digest", digestOf 'a'
-            , "--fingerprint", first, "--native-manifest", replicate 64 'b'
-            , "--ghc", "9.14.1", "--cabal", "3.18.1.0", "--weston", pinnedCompositor
-            , "--output", scratch fixture </> "descriptor.json"
-            ]
+          pythonIn
+            fixture
+            ( [ checkout fixture </> "tools/ci-image/builder.py", "descriptor"
+              , "--image", "ghcr.io/owner/project-ci", "--digest", digestOf 'a'
+              , "--fingerprint", first, "--native-manifest", replicate 64 'b'
+              , "--ghc", "9.14.1", "--cabal", "3.18.1.0", "--weston", pinnedCompositor
+              , "--output", scratch fixture </> "descriptor.json"
+              ]
+                ++ concat [["--" ++ name, value] | (name, value) ← placeholderVulkan]
+            )
         (built, errors) `shouldBe` (ExitSuccess, "")
         written `shouldContain` first
         void $ describedImage fixture
@@ -230,6 +238,38 @@ spec = describe "CI image" $ do
             refusal ← planRaw fixture "HEAD" Nothing linuxPins
             refusedByBuilder refusal named
 
+    it "declares the descriptor's Vulkan identities as toolchain entries" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        -- Every identity reaches the map, not just the digest that stands for
+        -- all of them: a worker compares entry by entry, and a reader of a plan
+        -- has to be able to see which loader, driver, layer, and compiler the
+        -- image runs against without recomputing anything.
+        plan ← planLinux fixture []
+        forM_ (vulkanIdentities described) $ \(name, value) →
+          (name, toolchainEntry plan name) `shouldBe` (name, Just value)
+
+    it "refuses a descriptor that names no Vulkan identities" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        change fixture "tools/ci-image/descriptor.json" (withoutField "vulkan" (descriptorJson described))
+        refusal ← planRaw fixture "HEAD" Nothing linuxPins
+        refusedByBuilder refusal "missing 'vulkan'"
+
+    it "refuses a descriptor whose Vulkan identity is not a digest" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        change fixture "tools/ci-image/descriptor.json" (withField "vulkan" "1.3.275" (descriptorJson described))
+        refusal ← planRaw fixture "HEAD" Nothing linuxPins
+        refusedByBuilder refusal "vulkan is not a 64-digit lowercase hex identity digest"
+
+    it "refuses a descriptor that names a Vulkan input by nothing at all" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        change fixture "tools/ci-image/descriptor.json" (withField "vulkan_driver" "" (descriptorJson described))
+        refusal ← planRaw fixture "HEAD" Nothing linuxPins
+        refusedByBuilder refusal "vulkan_driver names no identity"
+
     it "refuses a descriptor that names no compositor version" $
       withFixture $ \fixture → do
         described ← describedImage fixture
@@ -291,7 +331,7 @@ spec = describe "CI image" $ do
         claimed `shouldBe` ExitFailure 2
         claimErrors `shouldContain` "only Linux workers run that image"
 
-  describe "cache environment keys" $
+  describe "cache environment keys" $ do
     it "move with the image identity and never with the commit carrying the descriptor" $
       withFixture $ \fixture → do
         described ← describedImage fixture
@@ -307,6 +347,44 @@ spec = describe "CI image" $ do
         native `shouldNotBe` first
         native `shouldNotBe` image
 
+    forM_ vulkanEntries $ \entry →
+      it ("move when the image's " ++ entry ++ " identity moves") $
+        withFixture $ \fixture → do
+          described ← describedImage fixture
+          before ← environmentKey fixture
+          -- A changed loader, driver, layer, or compiler is a changed
+          -- environment, whatever else stayed the same. If any of these did not
+          -- move the key, a cache filled under the old runtime would be
+          -- restored into a job running the new one.
+          let replacement = if entry == "vulkan" then replicate 64 'd' else "something else entirely"
+          change
+            fixture
+            "tools/ci-image/descriptor.json"
+            (withField (descriptorField entry) replacement (descriptorJson described))
+          after ← environmentKey fixture
+          after `shouldNotBe` before
+
+    it "make a receipt gathered under other Vulkan identities unusable" $
+      withFixture $ \fixture → do
+        described ← describedImage fixture
+        before ← planLinux fixture []
+        change
+          fixture
+          "tools/ci-image/descriptor.json"
+          (withField "vulkan_driver" "another driver entirely" (descriptorJson described))
+        after ← planLinux fixture []
+        -- The toolchain map is one of the compatibility fields an execution has
+        -- to match, so this is the whole mechanism: the identities are in the
+        -- map, and evidence gathered under one map does not answer a candidate
+        -- planned under another.
+        problems ← reuseProblems fixture before after
+        -- The input identity moves too, because the descriptor is a tracked
+        -- file; the toolchain is the one that would still differ if the change
+        -- had reached the image without touching the candidate.
+        problems `shouldContain` ["records a different toolchain"]
+        sameProblems ← reuseProblems fixture before before
+        sameProblems `shouldBe` []
+
   describe "worker verification" $ do
     it "declares exactly the planned map when every entry agrees" $
       withWorker $ \fixture worker → do
@@ -315,12 +393,19 @@ spec = describe "CI image" $ do
         declared ← strictRead (scratch fixture </> "toolchain.txt")
         sort (lines declared)
           `shouldBe` sort
-            [ "cabal=3.18.1.0"
-            , "ci-image=" ++ digestOf 'a'
-            , "ghc=9.14.1"
-            , "native-manifest=" ++ workerManifest worker
-            , "weston=" ++ pinnedCompositor
-            ]
+            ( [ "cabal=3.18.1.0"
+              , "ci-image=" ++ digestOf 'a'
+              , "ghc=9.14.1"
+              , "native-manifest=" ++ workerManifest worker
+              , "weston=" ++ pinnedCompositor
+              ]
+                ++ [name ++ "=" ++ value | (name, value) ← workerVulkan worker]
+            )
+        -- Every Vulkan input is named in the map, not folded away into the one
+        -- identity digest beside them: a reader comparing a worker with a
+        -- record has to be able to see which loader, driver, layer, and
+        -- compiler it ran against.
+        sort (map fst (workerVulkan worker)) `shouldBe` sort vulkanEntries
         planned ← environmentOfPlan fixture (workerPlan worker)
         output `shouldContain` ("environment=" ++ planned)
 
@@ -389,6 +474,28 @@ spec = describe "CI image" $ do
       withWorker $ \fixture worker → do
         writeFile (workerStubs worker </> "store") "/root/.cabal/store\n"
         refusedWorker fixture worker "resolves its store"
+
+    it "refuses a plan whose Vulkan identity is not the worker's" $
+      withWorker $ \fixture worker → do
+        patchPlanToolchain fixture (workerPlan worker) "vulkan" (replicate 64 '7')
+        refusedWorker fixture worker "toolchain entry 'vulkan'"
+
+    forM_ ["vulkan-loader", "vulkan-driver", "vulkan-layers", "glslang"] $ \entry →
+      it ("refuses a plan whose " ++ entry ++ " identity is not the worker's") $
+        withWorker $ \fixture worker → do
+          patchPlanToolchain fixture (workerPlan worker) entry "something else entirely"
+          refusedWorker fixture worker ("toolchain entry '" ++ entry ++ "'")
+
+    it "refuses a worker whose provisioned Vulkan inputs were replaced under an intact manifest" $
+      withWorker $ \fixture worker → do
+        -- The worker re-reads and re-hashes what the prefix holds. Nothing
+        -- about the plan, the descriptor, or the manifest changes here, which
+        -- is the point: a container whose loader description was swapped after
+        -- the image was stamped declares a different map and is refused.
+        let described = workerPrefix worker </> "vulkan/lib/pkgconfig/vulkan.pc"
+        existing ← strictRead described
+        writeFile described (existing ++ "# a substituted byte\n")
+        refusedWorker fixture worker "the native prefix check failed"
 
   describe "the image workflow's routes" $ do
     it "starts a proof route only on its own dispatch, and image resolution for no proof route" $ do
@@ -565,6 +672,137 @@ spec = describe "CI image" $ do
           nativeOk native [] ["record", "--prefix", nativePrefix native]
           nativeManifestNow native [] `shouldReturn` original
           nativeOk native [] ["check", "--prefix", nativePrefix native, "--build-dir", nativeBuild native]
+
+
+    describe "the Vulkan runtime it provisions" $ do
+      it "provisions one identity cold and warm, and rebuilds nothing to do it" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          cold ← nativeManifestNow native []
+          coldIdentities ← nativeIdentities native
+          archive ← strictRead (nativePrefix native </> "lib/libglfw3.a")
+          -- Provisioning again from an unchanged machine. The loader, the two
+          -- manifests, the package description, and the wrapper are all
+          -- rewritten, and every identity has to come out the same — otherwise
+          -- warm reuse would move the toolchain map on every job.
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          nativeManifestNow native [] `shouldReturn` cold
+          nativeIdentities native `shouldReturn` coldIdentities
+          strictRead (nativePrefix native </> "lib/libglfw3.a") `shouldReturn` archive
+          nativeOk native [] ["check", "--prefix", nativePrefix native]
+
+      it "names every Vulkan input in the toolchain map it contributes" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          identities ← nativeIdentities native
+          sort (map fst identities) `shouldBe` sort vulkanEntries
+          lookup "vulkan-loader" identities `shouldSatisfy` maybe False (fixtureLoaderVersion `isPrefixOf`)
+          lookup "vulkan-layers" identities `shouldSatisfy` maybe False (fixtureLayerName `isPrefixOf`)
+          lookup "glslang" identities `shouldSatisfy` maybe False (fixtureGlslangVersion `isPrefixOf`)
+
+      forM_ substitutions $ \substitution →
+        it ("refuses a prefix whose " ++ substitutionLabel substitution ++ " was replaced, manifest and all") $
+          withNative $ \native → do
+            nativeOk native [] ["record", "--prefix", nativePrefix native]
+            let recorded = nativePrefix native </> "hetoimasia-native-manifest.json"
+            before ← strictRead recorded
+            -- The manifest is deliberately left exactly as it was: the point is
+            -- that verification reads and hashes the files themselves, so a
+            -- substitution under an intact record is caught rather than
+            -- believed. A check that trusted the recorded digests would pass
+            -- every one of these.
+            substitute native (substitutionPath substitution native)
+            (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` substitutionNamed substitution
+            strictRead recorded `shouldReturn` before
+
+      it "refuses an input the machine no longer holds, naming what it does hold" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          -- The loader is gone, but its directory still holds the driver and
+          -- layer libraries. Nothing falls back to either: the diagnosis says
+          -- what is there and stops.
+          let loader = nativeInputs native </> "lib/libvulkan.1.4.2.dylib"
+              kept = nativeDirectory native </> "loader.kept"
+          copyFile loader kept
+          removeFile loader
+          (missing, _, listed) ← nativeTool native [] ["record", "--prefix", nativePrefix native]
+          missing `shouldBe` ExitFailure 1
+          listed `shouldContain` "the pinned loader"
+          listed `shouldContain` "does not exist"
+          listed `shouldContain` "holds: libFixtureDriver.dylib"
+          listed `shouldContain` "nothing else is used instead"
+          -- And an empty directory is reported as empty rather than as a list
+          -- of nothing, which is the case a reader is most likely to hit.
+          removeFile (nativeInputs native </> "share/vulkan/icd.d/fixture_icd.json")
+          copyFile kept loader
+          (refused, _, errors) ← nativeTool native [] ["record", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "icd.d is empty"
+
+      it "accepts an override resolving to the qualified input and refuses one that does not" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          original ← nativeManifestNow native []
+          -- A link is not a different input: it is resolved, and the file it
+          -- resolves to is what the pin qualifies. The identity still moves,
+          -- because a prefix provisioned through a relocated input is a prefix
+          -- of that route.
+          let link = nativeDirectory native </> "moving-icd.json"
+          createFileLink (nativeInputs native </> "share/vulkan/icd.d/fixture_icd.json") link
+          let relocated = [("HETOIMASIA_VULKAN_DRIVER_MANIFEST", link)]
+          nativeOk native relocated ["record", "--prefix", nativePrefix native]
+          nativeOk native relocated ["check", "--prefix", nativePrefix native]
+          relocatedManifest ← nativeManifestNow native relocated
+          relocatedManifest `shouldNotBe` original
+          -- And the same override pointed at something else is refused, which
+          -- is what makes the acceptance above a qualification rather than a
+          -- waiver.
+          writeFileEnsuring
+            (nativeDirectory native </> "other-icd.json")
+            (unlines (map replaceVersion (lines (fixtureIcd (nativeInputs native)))))
+          (refused, _, errors) ←
+            nativeTool
+              native
+              [("HETOIMASIA_VULKAN_DRIVER_MANIFEST", nativeDirectory native </> "other-icd.json")]
+              ["record", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "not the pinned"
+
+      it "runs the pinned compiler through its wrapper, whatever PATH offers" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          -- An unrelated executable of the same name, ahead of everything on
+          -- PATH. The wrapper names its compiler absolutely, so this is never
+          -- what runs through it.
+          let decoy = nativeDirectory native </> "decoy"
+          createDirectoryIfMissing True decoy
+          executableFile (decoy </> "glslangValidator") "#!/bin/sh\necho 'Glslang Version: 11:0.0.0'\n"
+          let wrapper = nativePrefix native </> "vulkan/bin/glslangValidator"
+              ahead = decoy ++ maybe "" (':' :) (lookup "PATH" (nativeEnvironment native))
+              shadowed = overriding [("PATH", ahead)] (nativeEnvironment native)
+          (ran, version, _) ← run shadowed (nativeDirectory native) wrapper ["--version"]
+          ran `shouldBe` ExitSuccess
+          version `shouldContain` fixtureGlslangVersion
+          version `shouldNotContain` "0.0.0"
+          -- And it answers for itself, compiling nothing: the fixture compiler
+          -- exits non-zero for every other argument, so a wrapper that passed
+          -- this through would fail here.
+          (reported, identity, _) ← run shadowed (nativeDirectory native) wrapper ["--hetoimasia-identity"]
+          reported `shouldBe` ExitSuccess
+          identity `shouldContain` ("glslang " ++ fixtureGlslangVersion)
+          identity `shouldContain` "sha256 "
+
+      it "refuses a Vulkan product the prefix does not own" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          -- A record naming a manifest outside the prefix describes a different
+          -- prefix, and hashing that file would say nothing about this one.
+          patchManifest native "['vulkan']['driver']['manifest'] = '/elsewhere/icd.json'"
+          (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "which is not inside"
 
     it "refuses an absent prefix even when a system GLFW is visible" $
       withNative $ \native → do
@@ -754,6 +992,8 @@ recipePaths =
   , "tools/ci-image/toolchain.pin"
   , "tools/native/glfw.pin"
   , "tools/native/native.py"
+  , "tools/native/vulkan.pin"
+  , "tools/native/vulkan.py"
   , "tools/validation/ci_image.py"
   ]
 
@@ -832,35 +1072,73 @@ digestOf ∷ Char → String
 digestOf character = "sha256:" ++ replicate 64 character
 
 descriptorJson ∷ Descriptor → String
-descriptorJson described =
-  unlines
-    [ "{"
-    , "  \"architecture\": \"amd64\","
-    , "  \"cabal\": \"" ++ cabal described ++ "\","
-    , "  \"digest\": \"" ++ digest described ++ "\","
-    , "  \"ghc\": \"" ++ ghc described ++ "\","
-    , "  \"native_manifest\": \"" ++ manifest described ++ "\","
-    , "  \"platform\": \"linux\","
-    , "  \"recipe_fingerprint\": \"" ++ recipe described ++ "\","
-    , "  \"reference\": \"ghcr.io/owner/project-ci\","
-    , "  \"schema_version\": 1,"
-    , "  \"weston\": \"" ++ weston described ++ "\""
-    , "}"
-    ]
+descriptorJson described = renderObject (descriptorFields described)
+
+-- | Every field a descriptor carries, as the contract names them.
+descriptorFields ∷ Descriptor → [(String, String)]
+descriptorFields described =
+  [ ("architecture", "\"amd64\"")
+  , ("cabal", quoted (cabal described))
+  , ("digest", quoted (digest described))
+  , ("ghc", quoted (ghc described))
+  , ("native_manifest", quoted (manifest described))
+  , ("platform", "\"linux\"")
+  , ("recipe_fingerprint", quoted (recipe described))
+  , ("reference", "\"ghcr.io/owner/project-ci\"")
+  , ("schema_version", "2")
+  , ("weston", quoted (weston described))
+  ]
+    ++ [(descriptorField name, quoted value) | (name, value) ← vulkanIdentities described]
+
+-- | A JSON object from its fields, sorted, with the comma discipline handled
+-- once rather than at each call site that adds or removes a field.
+renderObject ∷ [(String, String)] → String
+renderObject fields =
+  unlines (["{"] ++ zipWith line [1 ..] (sort fields) ++ ["}"])
+  where
+    line index (name, value) =
+      "  \"" ++ name ++ "\": " ++ value ++ (if index == length fields then "" else ",")
+
+quoted ∷ String → String
+quoted value = "\"" ++ value ++ "\""
+
+-- | The descriptor spelling of one toolchain entry: the entry name with its
+-- hyphen as an underscore, exactly as the contract derives it.
+descriptorField ∷ String → String
+descriptorField = map (\character → if character == '-' then '_' else character)
 
 -- | The same descriptor with the compositor field taken out, which is what a
 -- descriptor written before the image carried one looks like.
 withoutCompositor ∷ String → String
-withoutCompositor =
-  unlines . map trailing . filter (not . isInfixOf "\"weston\"") . lines
-  where
-    trailing line
-      | "  \"schema_version\": 1," `isPrefixOf` line = "  \"schema_version\": 1"
-      | otherwise = line
+withoutCompositor = withoutField "weston"
+
+-- | The same descriptor with one field removed entirely.
+withoutField ∷ String → String → String
+withoutField name = renderObject . filter ((/= name) . fst) . objectFields
+
+-- | The same descriptor with one field replaced, for an example that varies a
+-- single identity without restating the rest.
+withField ∷ String → String → String → String
+withField name value =
+  renderObject . map (\entry → if fst entry == name then (name, quoted value) else entry) . objectFields
+
+-- | The fields of a rendered object, read back so a variation can be expressed
+-- as an edit rather than as a second spelling of the whole document.
+objectFields ∷ String → [(String, String)]
+objectFields text =
+  [ (takeWhile (/= '"') (drop 1 body), dropWhileEnd (== ',') (drop 2 (dropWhile (/= ':') body)))
+  | line ← map trimmed (lines text)
+  , line /= "{" && line /= "}" && not (null line)
+  , let body = line
+  ]
 
 -- | The same descriptor written with different bytes.
+--
+-- Only the layout is removed. An identity such as a driver's name and version
+-- carries spaces of its own, and squeezing those out would write a different
+-- descriptor rather than the same one differently.
 compactDescriptor ∷ Descriptor → String
-compactDescriptor = filter (`notElem` ['\n', ' ']) . descriptorJson
+compactDescriptor = concatMap (dropWhile (== ' ')) . lines . descriptorJson
 
 commitDescriptor ∷ Fixture → Descriptor → IO ()
 commitDescriptor fixture = change fixture "tools/ci-image/descriptor.json" . descriptorJson
@@ -869,9 +1147,25 @@ commitDescriptor fixture = change fixture "tools/ci-image/descriptor.json" . des
 describedImage ∷ Fixture → IO Descriptor
 describedImage fixture = do
   current ← fingerprintNow fixture
-  let described = Descriptor (digestOf 'a') (replicate 64 'b') current "9.14.1" "3.18.1.0" pinnedCompositor
+  let described =
+        Descriptor (digestOf 'a') (replicate 64 'b') current "9.14.1" "3.18.1.0" pinnedCompositor placeholderVulkan
   commitDescriptor fixture described
   pure described
+
+-- | Vulkan identities shaped like a real image's, for the planner examples.
+--
+-- The planner only carries these into the toolchain map, so what they say does
+-- not matter to it; that they are well formed and that a change to any of them
+-- reaches the map does. A worker example uses the machine's own identities
+-- instead, because there the two sides have to agree.
+placeholderVulkan ∷ [(String, String)]
+placeholderVulkan =
+  [ ("vulkan", replicate 64 'c')
+  , ("vulkan-loader", "1.3.275 0123456789ab")
+  , ("vulkan-driver", "lvp 1.4.309 cdef01234567")
+  , ("vulkan-layers", "VK_LAYER_KHRONOS_validation 1.3.275 89abcdef0123")
+  , ("glslang", "15.1.0 456789abcdef")
+  ]
 
 descriptorNow ∷ Fixture → IO Descriptor
 descriptorNow fixture = do
@@ -885,7 +1179,13 @@ descriptorNow fixture = do
         (value "ghc")
         (value "cabal")
         (value "weston")
+        [(name, value (descriptorField name)) | name ← vulkanEntries]
     )
+
+-- | The toolchain-map entries the Vulkan runtime contributes, in the order a
+-- descriptor and a declared map both list them.
+vulkanEntries ∷ [String]
+vulkanEntries = ["vulkan", "vulkan-loader", "vulkan-driver", "vulkan-layers", "glslang"]
 
 -- | The Ubuntu 24.04 package revision the recipe pins the compositor to.
 pinnedCompositor ∷ String
@@ -935,6 +1235,50 @@ environmentOfPlan fixture plan = do
     [] → expectationFailure ("no environment in " ++ output) >> pure ""
   where
     prefix = "environment="
+
+-- | Why an execution planned under one toolchain does not answer another.
+--
+-- Asked of the evidence tool itself rather than restated here, because the
+-- compatibility fields are its contract and an example that listed them again
+-- would agree with itself while the two drifted apart.
+reuseProblems ∷ Fixture → String → String → IO [String]
+reuseProblems fixture evidencePlan candidatePlan = do
+  let evidencePath = scratch fixture </> "evidence-plan.json"
+      candidatePath = scratch fixture </> "candidate-plan.json"
+  writeFile evidencePath evidencePlan
+  writeFile candidatePath candidatePlan
+  (result, output, errors) ←
+    pythonIn
+      fixture
+      [ "-c"
+      , unlines
+          [ "import json, sys"
+          , "sys.path.insert(0, sys.argv[1])"
+          , "import receipts"
+          , "evidence = receipts.load_plan(sys.argv[2])"
+          , "candidate = receipts.load_plan(sys.argv[3])"
+          , "print(json.dumps(receipts.compatibility_problems("
+          , "    receipts.candidate_identity(candidate),"
+          , "    receipts.candidate_identity(evidence),"
+          , "    'the earlier execution')))"
+          ]
+      , checkout fixture </> "tools/validation"
+      , evidencePath
+      , candidatePath
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure
+    [ drop (length prefix) piece
+    | raw ← splitOnComma (takeWhile (/= ']') (drop 1 (dropWhile (/= '[') output)))
+    , let piece = filter (/= '"') (trimmed raw)
+    , let prefix = "the earlier execution "
+    , prefix `isPrefixOf` piece
+    ]
+
+splitOnComma ∷ String → [String]
+splitOnComma text = case break (== ',') text of
+  (piece, []) → [piece]
+  (piece, _ : rest) → piece : splitOnComma rest
 
 environmentKey ∷ Fixture → IO String
 environmentKey fixture = do
@@ -1040,7 +1384,21 @@ data Worker = Worker
   , workerStubs ∷ FilePath
   , workerPlan ∷ FilePath
   , workerManifest ∷ String
+  , workerPrefix ∷ FilePath
+  , workerVulkan ∷ [(String, String)]
   }
+
+-- | Every toolchain entry the prefix itself yields, as the recipe spells them.
+--
+-- Read through the recipe rather than restated here: the planner, the image,
+-- and the worker all have to arrive at one spelling, and an example that
+-- invented a second would pass while the three disagreed.
+provisionedIdentities ∷ Fixture → FilePath → IO [(String, String)]
+provisionedIdentities fixture prefix = do
+  (result, output, errors) ←
+    pythonIn fixture [checkout fixture </> "tools/native/native.py", "toolchain", "--prefix", prefix]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure [(name, drop 1 value) | line ← lines output, let (name, value) = break (== '=') line, name /= "native-manifest"]
 
 withWorker ∷ (Fixture → Worker → IO a) → IO a
 withWorker action = withFixture $ \fixture → do
@@ -1055,7 +1413,11 @@ withWorker action = withFixture $ \fixture → do
     pythonIn fixture [checkout fixture </> "tools/native/native.py", "record", "--prefix", prefix]
   (recorded, recordErrors) `shouldBe` (ExitSuccess, "")
   hash ← sha256Of fixture (prefix </> "hetoimasia-native-manifest.json")
-  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.14.1" "3.18.1.0" pinnedCompositor)
+  -- The Vulkan identities this machine actually provisioned into the fixture
+  -- prefix. The descriptor has to name these rather than a placeholder,
+  -- because a worker declares what it finds and the two must agree.
+  identities ← provisionedIdentities fixture prefix
+  commitDescriptor fixture (Descriptor (digestOf 'a') hash current "9.14.1" "3.18.1.0" pinnedCompositor identities)
   plan ← planLinux fixture []
   let planPath = scratch fixture </> "plan.json"
   writeFile planPath plan
@@ -1089,7 +1451,7 @@ withWorker action = withFixture $ \fixture → do
         , "esac"
         ]
     )
-  action fixture (Worker image stubs planPath hash)
+  action fixture (Worker image stubs planPath hash prefix identities)
 
 verify ∷ Fixture → Worker → IO (ExitCode, String, String)
 verify fixture worker = do
@@ -1215,7 +1577,21 @@ compositorAnswer recipeLabel manifestLabel compositorLabel =
     ++ manifestLabel
     ++ "\", \"org.hetoimasia.ci-image.weston\": \""
     ++ compositorLabel
-    ++ "\", \"org.hetoimasia.ci-image.ghc\": \"9.14.1\", \"org.hetoimasia.ci-image.cabal\": \"3.18.1.0\"}}"
+    ++ "\", \"org.hetoimasia.ci-image.ghc\": \"9.14.1\", \"org.hetoimasia.ci-image.cabal\": \"3.18.1.0\""
+    ++ concat
+      [ ", \"org.hetoimasia.ci-image." ++ name ++ "\": \"" ++ value ++ "\""
+      | (name, value) ← placeholderVulkan
+      ]
+    ++ "}}"
+
+-- | The Vulkan identities the stub transport reports for a candidate it built.
+--
+-- The builder reads these off the image rather than being told them, so the
+-- transport is what supplies them here, exactly as the real one reads them out
+-- of the image the recipe stamped.
+builtIdentities ∷ String
+builtIdentities =
+  concat [", \"" ++ descriptorField name ++ "\": \"" ++ value ++ "\"" | (name, value) ← placeholderVulkan]
 
 builder ∷ Registry → String → [String] → IO (ExitCode, String, String)
 builder registry command extra =
@@ -1256,7 +1632,7 @@ registryStub =
     , "      error) echo \"registry stub: the manifest endpoint answered 500\" >&2; exit 2 ;;"
     , "    esac"
     , "    cat \"$answer\" ;;"
-    , "  build) printf '{\"native_manifest\": \"%s\"}\\n' \"$(cat \"$state/built-manifest\")\" ;;"
+    , "  build) printf '{\"native_manifest\": \"%s\"" ++ builtIdentities ++ "}\\n' \"$(cat \"$state/built-manifest\")\" ;;"
     , "  validate) exit \"$(cat \"$state/validate-status\" 2>/dev/null || echo 0)\" ;;"
     , "  push) ;;"
     , "  *) echo \"registry stub: unexpected request $1\" >&2; exit 2 ;;"
@@ -1302,9 +1678,102 @@ data Native = Native
   , nativeBuild ∷ FilePath
   , nativeStubs ∷ FilePath
   , nativePython ∷ FilePath
-  , nativeCheckout ∷ FilePath
   , nativeEnvironment ∷ [(String, String)]
+  , nativeRecipe ∷ FilePath
+  , nativeInputs ∷ FilePath
   }
+
+-- | One Vulkan input the fixture pins: where the recipe looks for it, and what
+-- it holds.
+data Input = Input
+  { inputPath ∷ FilePath
+  , inputContents ∷ String
+  }
+
+-- | The Vulkan inputs a fixture prefix is provisioned from.
+--
+-- Real files with real digests, written into the fixture rather than taken from
+-- the machine, so these examples ask the same questions of the recipe on a
+-- developer's macOS desktop and on the Linux CI image — neither of which holds
+-- the other's loader, driver, layers, or compiler.
+fixtureInputs ∷ FilePath → [Input]
+fixtureInputs directory =
+  [ Input (directory </> "lib/libvulkan.1.4.2.dylib") "a fixture standing in for the loader\n"
+  , Input (directory </> "lib/pkgconfig/vulkan.pc") fixtureLoaderPc
+  , Input (directory </> "share/vulkan/icd.d/fixture_icd.json") (fixtureIcd directory)
+  , Input (directory </> "lib/libFixtureDriver.dylib") "a fixture standing in for the driver\n"
+  , Input (directory </> "share/vulkan/explicit_layer.d/VK_LAYER_FIXTURE.json") (fixtureLayer directory)
+  , Input (directory </> "lib/libVkLayer_fixture.dylib") "a fixture standing in for the layer\n"
+  , Input (directory </> "include/vulkan/vulkan.h") "/* a fixture standing in for the headers */\n"
+  ]
+
+fixtureLoaderVersion ∷ String
+fixtureLoaderVersion = "1.4.2"
+
+fixtureLayerName ∷ String
+fixtureLayerName = "VK_LAYER_FIXTURE"
+
+fixtureGlslangVersion ∷ String
+fixtureGlslangVersion = "15.1.0"
+
+fixtureLoaderPc ∷ String
+fixtureLoaderPc =
+  unlines
+    [ "prefix=/fixture"
+    , "libdir=${prefix}/lib"
+    , "includedir=${prefix}/include"
+    , "Name: Vulkan-Loader"
+    , "Description: A fixture standing in for the qualified loader"
+    , "Version: " ++ fixtureLoaderVersion ++ ".0"
+    , "Libs: -L${libdir} -lvulkan"
+    ]
+
+fixtureIcd ∷ FilePath → String
+fixtureIcd directory =
+  unlines
+    [ "{"
+    , "  \"file_format_version\": \"1.0.0\","
+    , "  \"ICD\": {"
+    , "    \"library_path\": \"" ++ (directory </> "lib/libFixtureDriver.dylib") ++ "\","
+    , "    \"api_version\": \"1.4.2\""
+    , "  }"
+    , "}"
+    ]
+
+fixtureLayer ∷ FilePath → String
+fixtureLayer directory =
+  unlines
+    [ "{"
+    , "  \"file_format_version\": \"1.2.0\","
+    , "  \"layer\": {"
+    , "    \"name\": \"" ++ fixtureLayerName ++ "\","
+    , "    \"type\": \"GLOBAL\","
+    , "    \"api_version\": \"" ++ fixtureLoaderVersion ++ "\","
+    , "    \"implementation_version\": \"1\","
+    , "    \"description\": \"A fixture standing in for the validation layer\","
+    , "    \"library_path\": \"" ++ (directory </> "lib/libVkLayer_fixture.dylib") ++ "\""
+    , "  }"
+    , "}"
+    ]
+
+-- | The same manifest describing a different driver, for an override that
+-- points somewhere the pin does not qualify.
+replaceVersion ∷ String → String
+replaceVersion line
+  | "\"api_version\"" `isInfixOf` line = "    \"api_version\": \"9.9.9\""
+  | otherwise = line
+
+-- | A compiler that answers `--version` the way glslang does and compiles
+-- nothing, which is all the recipe ever asks of it.
+fixtureGlslang ∷ String
+fixtureGlslang =
+  unlines
+    [ "#!/bin/sh"
+    , "case \"$1\" in"
+    , "  --version) echo 'Glslang Version: 11:" ++ fixtureGlslangVersion ++ "' ;;"
+    , "  *) echo 'the fixture compiler compiles nothing' >&2; exit 1 ;;"
+    , "esac"
+    ]
 
 data Variation = Variation
   { variationLabel ∷ String
@@ -1366,12 +1835,120 @@ withNative action = do
         , "  *--show-sdk-build-version) " ++ answering "sdk-build" ++ " ;;"
         , "esac"
         ]
+    -- A writable copy of the recipe, whose Vulkan pin names inputs written into
+    -- this fixture. The recipe in the checkout pins the machine's own loader,
+    -- driver, layers, and compiler, and only one of the two platforms this
+    -- suite runs on ever holds a given platform's set; pinning the fixture's
+    -- own files is what lets these examples ask the same questions on both.
+    let recipe = directory </> "recipe"
+        inputs = directory </> "inputs"
+        compiler = inputs </> "bin/glslangValidator"
+    createDirectoryIfMissing True recipe
+    (copied, _, copyErrors) ← run settings here "cp" ["-R", here </> "tools/native/.", recipe]
+    (copied, copyErrors) `shouldBe` (ExitSuccess, "")
+    forM_ (fixtureInputs inputs) $ \input → writeFileEnsuring (inputPath input) (inputContents input)
+    -- The recipe gives a macOS prefix's loader an absolute install name, which
+    -- is a real edit to a real Mach-O. Where those tools exist the fixture has
+    -- to offer something they can edit, so the stand-in loader is compiled
+    -- rather than written; elsewhere the recipe makes no such edit and the
+    -- placeholder above is exactly as good.
+    when (os == "darwin") $ do
+      writeFileEnsuring (inputs </> "loader.c") "int hetoimasia_fixture_loader(void) { return 0; }\n"
+      (compiled, _, compileErrors) ←
+        run
+          settings
+          directory
+          "cc"
+          ["-dynamiclib", "-o", inputs </> "lib/libvulkan.1.4.2.dylib", inputs </> "loader.c"]
+      (compiled, compileErrors) `shouldBe` (ExitSuccess, "")
+    createDirectoryIfMissing True (takeDirectory compiler)
+    executableFile compiler fixtureGlslang
+    pinFixtureInputs interpreter settings directory recipe inputs compiler
     let inherited =
           filter
-            ((`notElem` (["CC", "MACOSX_DEPLOYMENT_TARGET", "HETOIMASIA_GLFW_BUILD_TYPE", "PKG_CONFIG_PATH", "HETOIMASIA_NATIVE_PREFIX"] ++ ambientBuildVariables)) . fst)
+            ((`notElem` (["CC", "MACOSX_DEPLOYMENT_TARGET", "HETOIMASIA_GLFW_BUILD_TYPE", "PKG_CONFIG_PATH", "HETOIMASIA_NATIVE_PREFIX"] ++ vulkanOverrides ++ ambientBuildVariables)) . fst)
             settings
         path = stubs ++ maybe "" (':' :) (lookup "PATH" inherited)
-    action (Native directory prefix (directory </> "dist-newstyle") stubs interpreter here (overriding [("PATH", path)] inherited))
+    action
+      ( Native
+          directory
+          prefix
+          (directory </> "dist-newstyle")
+          stubs
+          interpreter
+          (overriding [("PATH", path)] inherited)
+          recipe
+          inputs
+      )
+
+-- | The environment variables that relocate one Vulkan input, cleared from a
+-- fixture's inherited environment so a developer's own shell cannot move what
+-- an example is describing.
+vulkanOverrides ∷ [String]
+vulkanOverrides =
+  [ "HETOIMASIA_VULKAN_LOADER"
+  , "HETOIMASIA_VULKAN_DRIVER_MANIFEST"
+  , "HETOIMASIA_VULKAN_LAYER_MANIFEST"
+  , "HETOIMASIA_VULKAN_GLSLANG"
+  , "HETOIMASIA_VULKAN_PREFIX"
+  ]
+
+-- | Rewrite the copied recipe's Vulkan pin to name the fixture's own inputs,
+-- each with the digest it actually has.
+--
+-- The digests are computed rather than written down: the point of the pin is
+-- that it names what a file *is*, and a fixture that asserted a digest its own
+-- file does not have would be testing the assertion rather than the recipe.
+pinFixtureInputs ∷ FilePath → [(String, String)] → FilePath → FilePath → FilePath → FilePath → IO ()
+pinFixtureInputs interpreter settings directory recipe inputs compiler = do
+  (result, _, errors) ←
+    run
+      settings
+      directory
+      interpreter
+      [ "-c"
+      , unlines
+          [ "import hashlib, os, sys"
+          , "recipe, inputs, compiler, layer, loader, glslang = sys.argv[1:7]"
+          , "digest = lambda path: hashlib.sha256(open(path, 'rb').read()).hexdigest()"
+          , "values = {"
+          , "  'MACOS_LOADER': os.path.join(inputs, 'lib/libvulkan.1.4.2.dylib'),"
+          , "  'MACOS_LOADER_VERSION': loader,"
+          , "  'MACOS_LOADER_PC': os.path.join(inputs, 'lib/pkgconfig/vulkan.pc'),"
+          , "  'MACOS_INCLUDE': os.path.join(inputs, 'include'),"
+          , "  'MACOS_DRIVER_MANIFEST': os.path.join(inputs, 'share/vulkan/icd.d/fixture_icd.json'),"
+          , "  'MACOS_DRIVER_NAME': 'fixture',"
+          , "  'MACOS_LAYER_MANIFEST': os.path.join(inputs, 'share/vulkan/explicit_layer.d/%s.json' % layer),"
+          , "  'MACOS_LAYER_NAME': layer,"
+          , "  'MACOS_LAYER_VERSION': loader,"
+          , "  'MACOS_GLSLANG': compiler,"
+          , "  'MACOS_GLSLANG_VERSION': glslang,"
+          , "}"
+          , "values['MACOS_LOADER_SHA256'] = digest(values['MACOS_LOADER'])"
+          , "values['MACOS_DRIVER_MANIFEST_SHA256'] = digest(values['MACOS_DRIVER_MANIFEST'])"
+          , "values['MACOS_DRIVER_LIBRARY_SHA256'] = digest(os.path.join(inputs, 'lib/libFixtureDriver.dylib'))"
+          , "values['MACOS_LAYER_MANIFEST_SHA256'] = digest(values['MACOS_LAYER_MANIFEST'])"
+          , "values['MACOS_LAYER_LIBRARY_SHA256'] = digest(os.path.join(inputs, 'lib/libVkLayer_fixture.dylib'))"
+          , "values['MACOS_GLSLANG_SHA256'] = digest(compiler)"
+          , "path = os.path.join(recipe, 'vulkan.pin')"
+          , "kept = [line for line in open(path, encoding='utf-8').read().splitlines()"
+          , "        if not line.startswith('MACOS_')]"
+          , "body = kept + ['%s=%s' % item for item in sorted(values.items())]"
+          , "open(path, 'w', encoding='utf-8').write(chr(10).join(body) + chr(10))"
+          ]
+      , recipe
+      , inputs
+      , compiler
+      , fixtureLayerName
+      , fixtureLoaderVersion
+      , fixtureGlslangVersion
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+writeFileEnsuring ∷ FilePath → String → IO ()
+writeFileEnsuring path contents = do
+  createDirectoryIfMissing True (takeDirectory path)
+  writeFile path contents
 
 -- | The ambient variables the native identity records, cleared from the
 -- inherited environment so a developer's own shell cannot move a fixture's
@@ -1389,11 +1966,76 @@ nativeTool native overrides arguments =
     (overriding overrides (nativeEnvironment native))
     (nativeDirectory native)
     (nativePython native)
-    ((nativeCheckout native </> "tools/native/native.py") : "--platform" : "Darwin" : arguments)
+    ((nativeRecipe native </> "native.py") : "--platform" : "Darwin" : arguments)
 
 nativeOk ∷ Native → [(String, String)] → [String] → IO ()
 nativeOk native overrides arguments = do
   (result, _, errors) ← nativeTool native overrides arguments
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+-- | One Vulkan input an example replaces while leaving the manifest alone.
+data Substitution = Substitution
+  { substitutionLabel ∷ String
+  , substitutionNamed ∷ String
+  , substitutionPath ∷ Native → FilePath
+  }
+
+-- | Each half of each input, on both sides of the prefix boundary.
+--
+-- A manifest and the binary it names are two inputs, and so are a wrapper and
+-- the compiler it runs; replacing the half that is not hashed is exactly how a
+-- substitution would otherwise go unnoticed. The sources outside the prefix are
+-- held to the pin, the products inside it to the record, and both have to
+-- refuse.
+substitutions ∷ [Substitution]
+substitutions =
+  [ Substitution "loader" "the Vulkan loader at" (\native → nativePrefix native </> "vulkan/lib/libvulkan.1.dylib")
+  , Substitution "package description" "the loader's package description at" (\native → nativePrefix native </> "vulkan/lib/pkgconfig/vulkan.pc")
+  , Substitution "driver manifest" "the driver manifest at" (\native → nativePrefix native </> "vulkan/share/vulkan/icd.d/fixture_icd.json")
+  , Substitution "wrapper" "the glslangValidator wrapper at" (\native → nativePrefix native </> "vulkan/bin/glslangValidator")
+  , Substitution "layer manifest" ("the " ++ fixtureLayerName ++ " manifest at") (\native → nativePrefix native </> ("vulkan/share/vulkan/explicit_layer.d/" ++ fixtureLayerName ++ ".json"))
+  , Substitution "source loader" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "lib/libvulkan.1.4.2.dylib")
+  , Substitution "driver library" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "lib/libFixtureDriver.dylib")
+  , Substitution "layer library" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "lib/libVkLayer_fixture.dylib")
+  , Substitution "glslang compiler" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "bin/glslangValidator")
+  , Substitution "headers" "the Vulkan headers at" (\native → nativePrefix native </> "vulkan/include/vulkan/vulkan.h")
+  , Substitution "source headers" "the recorded header digest" (\native → nativeInputs native </> "include/vulkan/vulkan.h")
+  ]
+
+-- | Replace a file's bytes while leaving everything that described it alone.
+--
+-- Written as bytes rather than as text: some of these inputs are real Mach-O
+-- libraries, and reading one as a string would fail on this machine's own
+-- encoding rather than on anything the recipe does.
+substitute ∷ Native → FilePath → IO ()
+substitute _ path = withBinaryFile path AppendMode (\handle → hPutStr handle "a substituted byte\n")
+
+-- | The Vulkan toolchain entries the fixture prefix yields.
+nativeIdentities ∷ Native → IO [(String, String)]
+nativeIdentities native = do
+  (result, output, errors) ← nativeTool native [] ["toolchain", "--prefix", nativePrefix native]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure [(name, drop 1 value) | line ← lines output, let (name, value) = break (== '=') line, name /= "native-manifest"]
+
+-- | Edit the recorded manifest in place, for an example describing a record
+-- that no longer says what the recipe would write.
+patchManifest ∷ Native → String → IO ()
+patchManifest native expression = do
+  (result, _, errors) ←
+    run
+      (nativeEnvironment native)
+      (nativeDirectory native)
+      (nativePython native)
+      [ "-c"
+      , unlines
+          [ "import json, sys"
+          , "path = sys.argv[1]"
+          , "document = json.load(open(path, encoding='utf-8'))"
+          , "document" ++ expression
+          , "json.dump(document, open(path, 'w', encoding='utf-8'))"
+          ]
+      , nativePrefix native </> "hetoimasia-native-manifest.json"
+      ]
   (result, errors) `shouldBe` (ExitSuccess, "")
 
 nativeManifestNow ∷ Native → [(String, String)] → IO String

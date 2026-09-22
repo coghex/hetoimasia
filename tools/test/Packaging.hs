@@ -41,6 +41,8 @@ consumed =
   , ("tools/ci-image/builder.py", "CiImage.hs runs it")
   , ("tools/native/native.py", "CiImage.hs runs it, and ci_image.py runs it to verify a worker")
   , ("tools/native/glfw.pin", "native.py reads it")
+  , ("tools/native/vulkan.pin", "vulkan.py reads it, and provision.sh sources it")
+  , ("tools/native/vulkan.py", "native.py imports it, and ci_image.py imports it to declare a worker's map")
   , ("tools/validation/range.py", "Execution.hs runs it")
   , ("tools/validation/run.py", "Execution.hs, Reuse.hs, and TimingStep.hs run it")
   , ("tools/validation/receipts.py", "run.py, aggregate.py, and reuse.py load it")
@@ -55,7 +57,6 @@ consumed =
   , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, and Reuse.hs reads its worker declarations")
   , ("cabal.project.vulkan", "VulkanProof.hs reads the packages and constraints it declares")
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
-  , ("tools/vulkan-proof/environment.pin", "VulkanProof.hs reads the driver manifests it pins")
   , ("tools/vulkan-proof/run-proof.sh", "VulkanProof.hs reads it to check it supplies no native-session consent")
   , ("docs/vulkan/macos.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan/linux.md", "VulkanProof.hs reads the retained record it must agree with")
@@ -91,7 +92,7 @@ spec = describe "Source distribution" $ do
     -- added to it later is carried or this fails.
     checkout ← getCurrentDirectory
     sourced ← sourcedPins checkout
-    sourced `shouldBe` ["tools/ci-image/compositor.pin", "tools/ci-image/toolchain.pin"]
+    sourced `shouldBe` ["tools/ci-image/compositor.pin", "tools/ci-image/toolchain.pin", "tools/native/vulkan.pin"]
     inventory ← packagedFiles checkout
     filter (`notElem` inventory) sourced `shouldBe` []
 

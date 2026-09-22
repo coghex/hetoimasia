@@ -1,30 +1,37 @@
--- | Hspec coverage for the boundary around the VK-2 Vulkan proof harness.
+-- | Hspec coverage for the boundary around the Vulkan proof harness.
 --
 -- Issue #158's first requirement is that the harness exists and that the
--- mandatory validation floor never builds it, on a CI image that has no Vulkan
--- loader.
+-- mandatory validation floor never builds it. That used to be established for
+-- free: the floor ran on a CI image with no Vulkan loader at all, so a package
+-- added to either ordinary project file failed outright. VK-4 provisioned a
+-- loader, a driver, the validation layers, and a compiler into that image, and
+-- a successful build there now proves nothing about independence. So the claim
+-- is checked here directly instead, by reading the two ordinary project files
+-- and requiring that neither names the proof package or resolves the binding.
 --
--- That the two ordinary project files do not name the package is not checked
--- here, and deliberately: `build.all` and every `test.*` group already run
--- through them on an image with no loader, so a package added to either fails
--- the floor outright. A text check would be a weaker restatement of a stronger
--- one, and it would mean shipping `cabal.project` inside this package's own
--- source distribution, which breaks resolution wherever that distribution is
--- unpacked.
+-- Those two files are read out of the checkout and are deliberately not in the
+-- root package's source distribution — a `cabal.project` inside an unpacked
+-- distribution breaks resolution wherever it lands — which `Packaging` records
+-- and holds to as its own invariant.
 --
--- What these examples do check is everything the floor cannot see: that the one
--- project file which does select the proof agrees with the toolchain record's
--- binding flags, that the validation catalog declares no group reaching it,
--- that each platform's driver is pinned by absolute path, and that the runner
--- never supplies the native-session consent AGENTS.md reserves for a human.
+-- What the rest of these examples check is everything the floor cannot see:
+-- that the one project file which does select the proof agrees with the
+-- toolchain record's binding flags, that the validation catalog declares no
+-- group reaching it, that every Vulkan input is pinned by absolute path, that
+-- the runner takes its discovery from the provisioned prefix rather than from
+-- a retired environment pin or a generated project file, and that it never
+-- supplies the native-session consent AGENTS.md reserves for a human.
 --
--- They read the repository's own project file, pins, and catalog out of the
+-- They read the repository's own project files, pins, and catalog out of the
 -- checkout they run in. They start no session and build nothing.
 module VulkanProof (spec) where
 
+import Control.Monad (forM_)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
+import System.Directory (listDirectory)
+import System.FilePath ((</>))
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
 
 -- | The retained per-platform records, and the summary that quotes them.
@@ -44,18 +51,29 @@ compatibilityRecord = "docs/vulkan_compatibility_record.md"
 -- against the catalog below.
 readByTheseExamples ∷ [FilePath]
 readByTheseExamples =
-  [ "cabal.project.vulkan"
+  [ "cabal.project"
+  , "cabal.project.cpu"
+  , "cabal.project.vulkan"
+  , "tools/native/vulkan.pin"
   , "tools/toolchain/binding.pin"
   , "tools/validation/catalog.json"
-  , "tools/vulkan-proof/environment.pin"
   , "tools/vulkan-proof/run-proof.sh"
   , compatibilityRecord
   ]
     <> map snd retainedRecords
 
+-- | The two project files every mandatory validation group runs through.
+ordinaryProjects ∷ [FilePath]
+ordinaryProjects = ["cabal.project", "cabal.project.cpu"]
+
 -- | The package directory the proof lives in, as a project file would name it.
 proofPackage ∷ String
 proofPackage = "tools/vulkan-proof"
+
+-- | The Hackage package that is the Vulkan binding. Nothing the mandatory floor
+-- builds may depend on it, whatever the image happens to carry.
+bindingPackage ∷ String
+bindingPackage = "vulkan"
 
 spec ∷ Spec
 spec = describe "The Vulkan proof boundary" $ do
@@ -101,15 +119,58 @@ spec = describe "The Vulkan proof boundary" $ do
               ]
         offending `shouldBe` []
 
-  it "pins each platform's driver manifest by absolute path" $ do
-    pin ← readFile "tools/vulkan-proof/environment.pin"
-    let manifests =
-          [ value
-          | name ← ["MACOS_VULKAN_DRIVER_MANIFEST=", "LINUX_VULKAN_DRIVER_MANIFEST="]
-          , Just value ← [settingOf pin name]
+  it "pins every Vulkan input on both platforms, each by absolute path" $ do
+    -- One pin now names the loader, the driver manifest, the layer manifest and
+    -- the compiler for each platform, and a relative path among them would mean
+    -- the recipe resolved an input against whatever directory it happened to
+    -- run in. The count is checked too: an input silently dropped from the pin
+    -- would otherwise leave this passing over the ones that remain.
+    pin ← readFile "tools/native/vulkan.pin"
+    let names =
+          [ platform <> input
+          | platform ← ["MACOS_", "LINUX_"]
+          , input ← ["LOADER=", "LOADER_PC=", "INCLUDE=", "DRIVER_MANIFEST=", "LAYER_MANIFEST=", "GLSLANG="]
           ]
-    length manifests `shouldBe` 2
-    manifests `shouldSatisfy` all ("/" `isPrefixOf`)
+        values = [(name, value) | name ← names, Just value ← [settingOf pin name]]
+    map fst values `shouldBe` names
+    [name | (name, value) ← values, not ("/" `isPrefixOf` value)] `shouldBe` []
+
+  it "keeps the binding out of every package the mandatory floor builds" $ do
+    -- The image carries a loader now, so a build that resolved the binding
+    -- would succeed rather than fail, and the floor would stop being the proof
+    -- of independence it used to be. This is that proof instead, and it reads
+    -- the dependencies rather than the project text: `packages/gpu-vulkan/model`
+    -- is named by both files and is exactly the package whose independence
+    -- matters, so a check that merely looked for the word would have to be
+    -- taught to ignore the one entry worth reading.
+    forM_ ordinaryProjects $ \path → do
+      declared ← projectPackages path
+      (path, filter (proofPackage `isPrefixOf`) declared) `shouldBe` (path, [])
+      resolved ← mapM packageDependencies declared
+      (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
+      -- And the package the proof itself is, to show the check would notice.
+      proofDependencies ← packageDependencies proofPackage
+      proofDependencies `shouldContain` [bindingPackage]
+
+  it "takes the runner's discovery from the provisioned prefix, not a pinned environment" $ do
+    -- VK-4 retired `tools/vulkan-proof/environment.pin`; the prefix's own
+    -- manifest is the single place a driver manifest, a layer directory, and
+    -- the loader's directories are named. A runner that read a pin again, or
+    -- named a machine path itself, would be selecting inputs nothing qualified.
+    runner ← readFile "tools/vulkan-proof/run-proof.sh"
+    let active = [line | line ← map trim (lines runner), not ("#" `isPrefixOf` line)]
+    filter ("environment.pin" `isInfixOf`) active `shouldBe` []
+    active `shouldSatisfy` any ("native.py\" prepare --prefix" `isInfixOf`)
+    active `shouldSatisfy` any ("--extra-lib-dirs=\"$HETOIMASIA_VULKAN_LIBDIR\"" `isInfixOf`)
+
+  it "diagnoses an obsolete generated project file rather than building under it" $ do
+    -- Cabal reads `<project-file>.local` silently, so one left over from before
+    -- VK-4 would put the former SDK paths back into every build here without
+    -- saying so. The runner must refuse and name it, and must not write one.
+    runner ← readFile "tools/vulkan-proof/run-proof.sh"
+    let active = [line | line ← map trim (lines runner), not ("#" `isPrefixOf` line)]
+    active `shouldSatisfy` any (\line → "refuse " `isPrefixOf` line && "$local_project exists" `isInfixOf` line)
+    filter (\line → "cat > \"$local_project\"" `isInfixOf` line) active `shouldBe` []
 
   it "attributes each record's callback total to that record's own platform" $ do
     -- The summary is declared authoritative for later Vulkan slices, and it
@@ -253,6 +314,47 @@ projectPackages path = collect . lines <$> readFile path
       if name `isPrefixOf` trim line && not ("--" `isPrefixOf` trim line)
         then Just (drop (length name) (trim line))
         else Nothing
+
+-- | Every package one project entry declares a dependency on, across all of its
+-- components.
+--
+-- Cabal writes @build-depends@ and @pkgconfig-depends@ as a comma-separated
+-- list that may run over indented continuation lines, and each entry is a name
+-- followed by an optional version range or sublibrary. Only the name is taken,
+-- so a version range mentioning nothing and a comment mentioning everything
+-- both contribute nothing.
+packageDependencies ∷ FilePath → IO [String]
+packageDependencies directory = do
+  files ← filter (".cabal" `isSuffixOf`) <$> listDirectory (normalisedPackage directory)
+  concat <$> mapM (\file → dependencyNames <$> readFile (normalisedPackage directory </> file)) files
+  where
+    normalisedPackage entry = if entry == "." then "." else entry
+
+dependencyNames ∷ String → [String]
+dependencyNames text = concatMap entries (stanzas (map (dropWhileEnd isSpace) (lines text)))
+  where
+    fields = ["build-depends:", "pkgconfig-depends:"]
+    stanzas [] = []
+    stanzas (line : rest)
+      | Just remainder ← firstJust [stripPrefix name (trim line) | name ← fields] =
+          let (continued, following) = span continuation rest
+           in (remainder : continued) : stanzas following
+      | otherwise = stanzas rest
+    continuation line = case line of
+      (c : _) → isSpace c && not (null (trim line)) && not (any (`isPrefixOf` trim line) sectionStarts)
+      [] → False
+    -- A continuation is indented, and so is every field inside a component, so
+    -- the run has to end at the next field rather than at the next blank line.
+    sectionStarts = ["build-depends:", "if ", "else", "ghc-options:", "hs-source-dirs:", "other-modules:", "default-language:", "exposed-modules:", "type:", "main-is:", "import:", "c-sources:", "include-dirs:", "frameworks:", "extra-libraries:", "default-extensions:", "build-tool-depends:"]
+    entries block = [name | piece ← splitOn ',' (unwords (map trim block)), Just name ← [firstWord piece]]
+    firstWord piece = case words (trim piece) of
+      (name : _) → Just name
+      [] → Nothing
+
+firstJust ∷ [Maybe a] → Maybe a
+firstJust values = case [value | Just value ← values] of
+  (value : _) → Just value
+  [] → Nothing
 
 -- | The first line beginning with a prefix, with that prefix removed. Serves
 -- both a shell-style @NAME=@ pin and a record's @- label:@ bullet, so the two
