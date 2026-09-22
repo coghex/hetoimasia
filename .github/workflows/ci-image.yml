@@ -109,20 +109,27 @@ jobs:
             echo "| Recipe fingerprint | \`$candidate\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record the Vulkan identities the image carries
+      - name: Verify the pulled image is the one the descriptor describes
         env:
           REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
-          # What the descriptor names and what the image holds, side by side.
-          # The record below has to be attributable to one set of identities,
-          # and these are they.
+          # The descriptor is excluded from the recipe fingerprint, so matching
+          # that fingerprint against the candidate says nothing about which
+          # image the descriptor's digest actually points at. This asks the
+          # image what it is — the fingerprint it embeds, the native manifest it
+          # carries, and the Vulkan identities its own prefix yields — and
+          # refuses to prove anything on an image that answers differently.
           {
-            echo '## The image'"'"'s Vulkan identities'
+            echo '## The image the record is attributable to'
             echo
             echo '```'
-            python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print("\n".join(f"descriptor {k}: {d[k]}" for k in ("vulkan", "vulkan_loader", "vulkan_driver", "vulkan_layers", "glslang")))'
-            docker run --rm --entrypoint python3 "$REFERENCE" /opt/hetoimasia/recipe/tools/native/native.py check --prefix /opt/hetoimasia/native/glfw
+            docker run --rm \
+              --volume "$PWD:/candidate:ro" --workdir /candidate \
+              --entrypoint python3 "$REFERENCE" \
+              tools/validation/ci_image.py verify-image \
+                --descriptor tools/ci-image/descriptor.json \
+                --repo-root /opt/hetoimasia/recipe
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 

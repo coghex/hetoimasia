@@ -497,6 +497,39 @@ spec = describe "CI image" $ do
         writeFile described (existing ++ "# a substituted byte\n")
         refusedWorker fixture worker "the native prefix check failed"
 
+  describe "verifying a pulled image against the descriptor" $ do
+    it "accepts the image the descriptor describes" $
+      withWorker $ \fixture worker → do
+        (result, output, errors) ← verifyImage fixture worker []
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        output `shouldContain` "verified:"
+
+    it "refuses an image embedding another recipe fingerprint" $
+      withWorker $ \fixture worker → do
+        writeFile (workerImage worker </> "image.json") (embeddedImage (replicate 64 '0') pinnedCompositor)
+        refusedImage fixture worker [] "embeds recipe fingerprint"
+
+    it "refuses an image whose native manifest is not the descriptor's" $
+      withWorker $ \fixture worker → do
+        described ← descriptorNow fixture
+        commitDescriptor fixture described {manifest = replicate 64 'e'}
+        refusedImage fixture worker [] "native manifest this image carries"
+
+    forM_ vulkanEntries $ \entry →
+      it ("refuses an image whose " ++ entry ++ " is not the descriptor's") $
+        withWorker $ \fixture worker → do
+          -- The descriptor's digest is what a route pulls by, and the
+          -- descriptor is excluded from the fingerprint — so it can name the
+          -- fingerprint a candidate expects while pointing at another image.
+          -- Asking the image itself is what closes that.
+          described ← descriptorNow fixture
+          let replacement = if entry == "vulkan" then replicate 64 'd' else "something else entirely"
+          change
+            fixture
+            "tools/ci-image/descriptor.json"
+            (withField (descriptorField entry) replacement (descriptorJson described))
+          refusedImage fixture worker [] ("but the descriptor names '" ++ replacement ++ "'")
+
   describe "the image workflow's routes" $ do
     it "starts a proof route only on its own dispatch, and image resolution for no proof route" $ do
       -- The routes are read from the workflow's own choice list rather than
@@ -1583,6 +1616,26 @@ verify fixture worker = do
     , "--repo-root", checkout fixture
     , "--toolchain-file", scratch fixture </> "toolchain.txt"
     ]
+
+verifyImage ∷ Fixture → Worker → [(String, String)] → IO (ExitCode, String, String)
+verifyImage fixture worker overrides = do
+  let inherited = environment fixture
+      path = workerStubs worker ++ maybe "" (':' :) (lookup "PATH" inherited)
+  run
+    (overriding (("PATH", path) : overrides) inherited)
+    (root fixture)
+    (python fixture)
+    [ checkout fixture </> "tools/validation/ci_image.py", "verify-image"
+    , "--descriptor", root fixture </> "tools/ci-image/descriptor.json"
+    , "--image-root", workerImage worker
+    , "--repo-root", checkout fixture
+    ]
+
+refusedImage ∷ Fixture → Worker → [(String, String)] → String → IO ()
+refusedImage fixture worker overrides named = do
+  (result, _, errors) ← verifyImage fixture worker overrides
+  result `shouldBe` ExitFailure 2
+  errors `shouldContain` named
 
 refusedWorker ∷ Fixture → Worker → String → IO ()
 refusedWorker fixture worker named = do

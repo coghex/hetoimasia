@@ -41,6 +41,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import subprocess
 
 # A one-shot tool must not write into the checkout it runs from.
@@ -648,7 +649,7 @@ def write_wrapper(prefix: str, glslang: dict) -> dict:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(body)
     os.chmod(path, 0o755)
-    return {"path": path, "sha256": sha256_file(path)}
+    return {"path": path, "sha256": sha256_file(path), "mode": stat.S_IMODE(os.stat(path).st_mode)}
 
 
 def shell_quote(value: str) -> str:
@@ -864,6 +865,7 @@ def provision(prefix: str, target: str, pin: dict[str, str] | None = None) -> di
             "compiler_sha256": resolved["glslang"]["sha256"],
             "wrapper": wrapper["path"],
             "wrapper_sha256": wrapper["sha256"],
+            "wrapper_mode": wrapper["mode"],
         },
         "packages": resolved["packages"],
     }
@@ -987,6 +989,28 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
                 "a substituted input invalidates every receipt gathered under the recorded one"
             )
 
+    # The wrapper is the compiler as far as anything else here is concerned, so
+    # what matters is not only that its bytes are the recorded ones but that it
+    # still runs and still answers for the compiler that was recorded. Bytes
+    # alone would pass a wrapper whose execute bits were cleared: direct use
+    # then fails outright, and a PATH lookup walks past it to whatever else is
+    # called `glslangValidator`.
+    wrapper = recorded["glslang"].get("wrapper")
+    if isinstance(wrapper, str) and os.path.isfile(wrapper):
+        mode = stat.S_IMODE(os.stat(wrapper).st_mode)
+        if mode != recorded["glslang"].get("wrapper_mode"):
+            problems.append(
+                f"the glslangValidator wrapper at {wrapper} has mode {mode:04o}, not the recorded "
+                f"{recorded['glslang'].get('wrapper_mode', 0):04o}"
+            )
+        if not os.access(wrapper, os.X_OK):
+            problems.append(
+                f"the glslangValidator wrapper at {wrapper} is not executable, so nothing can run the "
+                "qualified compiler through it and a PATH lookup would walk past it"
+            )
+        else:
+            problems.extend(wrapper_reports(wrapper, recorded["glslang"]))
+
     try:
         current = resolve(target, pin)
     except VulkanError as failure:
@@ -1040,6 +1064,38 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
 
 # --------------------------------------------------------------------------
 # What a consumer is told
+
+
+def wrapper_reports(wrapper: str, glslang: dict) -> list[str]:
+    """Run the wrapper's own identity flag and hold it to what was recorded.
+
+    This compiles nothing — the flag is answered by the wrapper itself — so it
+    is a cheap way to establish the thing a digest cannot: that the file still
+    executes, and that what it would run is the compiler the manifest names.
+    """
+    try:
+        process = subprocess.run([wrapper, IDENTITY_FLAG], capture_output=True, check=False)
+    except OSError as error:
+        return [f"the glslangValidator wrapper at {wrapper} could not be run ({error})"]
+    if process.returncode != 0:
+        detail = process.stderr.decode("utf-8", errors="replace").strip()
+        return [f"the glslangValidator wrapper at {wrapper} exited {process.returncode}: {detail or 'no output'}"]
+    reported = dict(
+        line.split(" ", 1)
+        for line in process.stdout.decode("utf-8", errors="replace").splitlines()
+        if " " in line
+    )
+    expected = {
+        "glslang": glslang.get("version"),
+        "compiler": glslang.get("compiler"),
+        "sha256": glslang.get("compiler_sha256"),
+    }
+    return [
+        f"the glslangValidator wrapper at {wrapper} reports {name} {reported.get(name)!r}, "
+        f"not the recorded {value!r}"
+        for name, value in expected.items()
+        if reported.get(name) != value
+    ]
 
 
 def environment(prefix: str, recorded: dict) -> dict[str, str]:

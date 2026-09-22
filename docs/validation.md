@@ -1718,7 +1718,7 @@ and `record` establishes a *project-managed Vulkan prefix* at
 | `include/` | macOS only: the qualified headers, copied in beside it. On Linux the pinned development package's own `/usr/include` is referenced. |
 | `share/vulkan/icd.d/<driver>_icd.json` | Generated, naming exactly one driver binary by absolute path. |
 | `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. |
-| `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. |
+| `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. Its mode is recorded and `check` runs that flag: bytes alone would accept a wrapper whose execute bits were cleared, which fails outright when used directly and is walked past when used through `PATH`. |
 
 On Linux every input is referenced where its pinned package installed it. On
 macOS the loader is copied instead, because its own install name is
@@ -1755,6 +1755,27 @@ fingerprint](#the-recipe-fingerprint), so an upgrade is an explicit
 requalification: a new image tag, new cache keys, and no receipt reuse across
 it. Cold provisioning and warm reuse resolve the same inputs and write the same
 bytes, so an ordinary run records one identity and rebuilds no native library.
+
+#### Verifying a pulled image
+
+A validation worker runs in a `container:` bound to the descriptor's digest and
+is then checked against the plan. A route that pulls the image itself — the
+`vulkan-proof` route does — has no plan, and matching the descriptor's recipe
+fingerprint against the candidate establishes nothing about *which* image its
+digest points at, because the descriptor is excluded from that fingerprint. So
+the descriptor could name the expected fingerprint while pointing at another
+image, and an older one built from the same native recipe would pass
+`native.py check` quite happily.
+
+```bash
+python3 tools/validation/ci_image.py verify-image --descriptor tools/ci-image/descriptor.json
+```
+
+asks the image what it is instead: the fingerprint it embeds, the native
+manifest it carries, and the Vulkan identities its own prefix yields, each
+against the descriptor's corresponding field. The proof route runs it inside the
+pulled image before proving anything, so a record is only ever attributable to
+the image the committed descriptor describes.
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe

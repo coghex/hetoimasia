@@ -352,6 +352,75 @@ def vulkan_identities(repo_root: str, manifest_file: str) -> dict[str, str]:
         raise ImageError(f"the native manifest {manifest_file} records incomplete Vulkan inputs ({error})") from error
 
 
+def verify_image(descriptor: dict, image_root: str, repo_root: str) -> dict[str, str]:
+    """Check a running container is the image one descriptor describes.
+
+    A worker is bound to the descriptor's digest by the container runtime and
+    then verified against the plan; a route that pulls the image itself has no
+    plan, and the descriptor is excluded from the recipe fingerprint — so it can
+    carry the fingerprint a candidate expects while naming another digest
+    entirely, and an older image built from the same native recipe would run
+    `native.py check` quite happily. This asks the image what it is instead of
+    taking the reference on trust: the fingerprint it embeds, the native
+    manifest it carries, and the Vulkan identities its own prefix yields, each
+    against the descriptor's corresponding field.
+    """
+    validate_descriptor(descriptor, "the committed descriptor")
+    problems: list[str] = []
+
+    embedded_path = os.path.join(image_root, EMBEDDED_NAME)
+    try:
+        with open(embedded_path, encoding="utf-8") as handle:
+            embedded = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ImageError(f"this container embeds no readable {embedded_path} ({error}); it is not a CI image") from error
+    if not isinstance(embedded, dict):
+        raise ImageError(f"{embedded_path} is not a JSON object; it is not a CI image")
+    if embedded.get("recipe_fingerprint") != descriptor["recipe_fingerprint"]:
+        problems.append(
+            f"this image embeds recipe fingerprint {str(embedded.get('recipe_fingerprint'))[:12]}, not the "
+            f"descriptor's {descriptor['recipe_fingerprint'][:12]}"
+        )
+
+    prefix = os.path.join(image_root, NATIVE_PREFIX)
+    manifest_file = os.path.join(prefix, NATIVE_MANIFEST_NAME)
+    try:
+        actual_manifest = sha256_file(manifest_file)
+    except OSError as error:
+        raise ImageError(f"this container carries no native manifest at {manifest_file} ({error})") from error
+    if actual_manifest != descriptor["native_manifest"]:
+        problems.append(
+            f"the native manifest this image carries hashes to {actual_manifest[:12]}, not the descriptor's "
+            f"{descriptor['native_manifest'][:12]}"
+        )
+
+    native = subprocess.run(
+        [sys.executable, os.path.join(repo_root, "tools", "native", "native.py"), "check", "--prefix", prefix],
+        capture_output=True,
+        check=False,
+    )
+    if native.returncode != 0:
+        problems.append("the native prefix check failed: " + native.stderr.decode("utf-8", errors="replace").strip())
+
+    declared: dict[str, str] = {}
+    try:
+        declared = vulkan_identities(repo_root, manifest_file)
+    except ImageError as failure:
+        problems.append(str(failure))
+    for entry in VULKAN_ENTRIES:
+        expected = descriptor[descriptor_field(entry)]
+        if declared.get(entry) != expected:
+            problems.append(
+                f"this image's {entry} is {declared.get(entry)!r}, but the descriptor names {expected!r}"
+            )
+
+    if problems:
+        raise ImageError(
+            "this container is not the image the committed descriptor describes: " + "; ".join(problems)
+        )
+    return {**declared, MANIFEST_ENTRY: actual_manifest}
+
+
 def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]:
     """Check this execution environment is the planned image, and declare its map.
 
@@ -500,6 +569,13 @@ def main(argv: list[str]) -> int:
     outputs = commands.add_parser("outputs", help="print a plan's image reference and cache environment key")
     outputs.add_argument("--plan", required=True)
 
+    described = commands.add_parser(
+        "verify-image", help="verify this container is the image the committed descriptor describes"
+    )
+    described.add_argument("--descriptor", default=DESCRIPTOR_PATH, help="the committed descriptor to check against")
+    described.add_argument("--image-root", default=IMAGE_ROOT)
+    described.add_argument("--repo-root", default=".")
+
     verified = commands.add_parser("verify-worker", help="verify this worker runs the planned image")
     verified.add_argument("--plan", required=True)
     verified.add_argument("--image-root", default=IMAGE_ROOT)
@@ -514,6 +590,10 @@ def main(argv: list[str]) -> int:
         image = plan.get("ci_image")
         print("image=" + (f"{image['reference']}@{image['digest']}" if isinstance(image, dict) else ""))
         print("environment=" + environment_key(plan))
+    elif arguments.command == "verify-image":
+        with open(arguments.descriptor, encoding="utf-8") as handle:
+            declared = verify_image(json.load(handle), arguments.image_root, os.path.abspath(arguments.repo_root))
+        print("verified: " + ", ".join(f"{name} {declared[name]}" for name in sorted(declared)))
     elif arguments.command == "verify-worker":
         plan = load_plan(arguments.plan)
         declared = verify_worker(plan, arguments.image_root, os.path.abspath(arguments.repo_root))
