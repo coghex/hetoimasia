@@ -646,9 +646,12 @@ data Custody = Custody
 
 -- | Where one incarnation stands between registration and settled.
 --
--- The stages only advance. 'CustodySettled' is terminal: an incarnation that
--- reaches it can never be announced again, which is what keeps a delayed
--- announcement from reopening a slot the host has already finished with.
+-- The stages advance, with one exception: a claim that could not complete
+-- returns 'CustodySettling' to 'CustodyRegistered', so the settlement can be
+-- attempted again. Nothing else moves backwards, and 'CustodySettled' is
+-- terminal — an incarnation that reaches it can never be announced again,
+-- which is what keeps a delayed announcement from reopening a slot the host
+-- has already finished with.
 data Stage
   = CustodyRegistered
     -- ^ Registered with the host, its acknowledgement recorded, and nobody
@@ -699,14 +702,29 @@ readOwnerCustody owner = Map.toAscList . Map.map custodyStage <$> readTVar (owne
 
 -- | Claim the right to settle an owner-unseen attachment on the main thread.
 --
--- It answers the acknowledgement only for an incarnation still at
--- 'CustodyRegistered', and moves it to 'CustodySettled' in the same
--- transaction. That is the whole of the exclusion: an announcement admitted
--- before this commits leaves the stage at 'CustodyAnnounced' and this
--- answers nothing, and an announcement attempted after it finds
--- 'CustodySettled' and is refused. Absence from the owner's target table is
--- never consulted, because a queued announcement the owner has not yet taken
--- looks exactly like an attachment it never received.
+-- It answers the acknowledgement only for an incarnation the owner does not
+-- owe — one still at 'CustodyRegistered', or one at 'CustodySettling' whose
+-- earlier claim did not finish — and moves it to 'CustodySettling' in the
+-- same transaction.
+--
+-- That claim, not the settlement, is what excludes an announcement: settling
+-- an attachment means certifying its facts against the host, which is not a
+-- transaction and cannot be one, so the stage the claim commits has to hold
+-- the exclusion for however long the certification takes. An announcement
+-- admitted before this commits leaves the stage at 'CustodyAnnounced' and
+-- this answers nothing; one attempted while the claim is held finds
+-- 'CustodySettling' and is refused, as is one attempted after the settlement
+-- finished and reached 'CustodySettled'.
+--
+-- The claim is therefore /retryable/ rather than terminal. 'recordSettled'
+-- is what makes it terminal, and only once the facts really exist; a claim
+-- that could not certify them all puts the stage back at
+-- 'CustodyRegistered', so a later opportunity can settle the attachment
+-- instead of leaving it claimed by a settlement that never happened.
+--
+-- Absence from the owner's target table is never consulted, because a queued
+-- announcement the owner has not yet taken looks exactly like an attachment
+-- it never received.
 claimSettlement ∷ GraphicsOwner scene → AttachmentId → STM (Maybe Acknowledgement)
 claimSettlement owner target = do
   held ← Map.lookup target <$> readTVar (ownerCustody owner)
@@ -1777,12 +1795,18 @@ finishOwnerExit restore logger host owner = do
   -- because escaping it would let the host unwind with the owner still live,
   -- which is the very thing the wait above refused to do.
   (report, interrupted) ← joinAbsorbing (ownerGroup owner) []
-  latched ← readTVarIO (ownerLatch owner)
   -- Everything this exit found, in the order it found it: what the wait
-  -- absorbed, what the owner's own drain failed with, the latched failure,
-  -- and last the cancellations the join absorbed. Each is raised only now.
+  -- absorbed, what the owner survived, what its own run and drain failed
+  -- with, and last the cancellations the join absorbed. Each is raised only
+  -- now, after the join.
   kept ← readTVarIO (ownerRetained owner)
-  case awaited <> kept <> drainFailuresOf report <> maybe [] pure latched <> interrupted of
+  -- The latch is deliberately absent. It is notification — what the
+  -- supervision sentinel waits on — and every failure it can hold is already
+  -- in exactly one of the two stores beside it: a target failure the owner
+  -- caught is in the retained store, and one that ended its run is in the
+  -- worker's own outcome. Raising it here as well would report a single
+  -- failure twice, once as the primary and once as retained cleanup.
+  case awaited <> kept <> drainFailuresOf report <> interrupted of
     [] → pure ()
     primary : rest → raiseRetainingOwner primary rest
 

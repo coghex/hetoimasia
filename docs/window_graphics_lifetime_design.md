@@ -99,12 +99,14 @@ composition registers in the application's own group.
 
 The delivered machinery answers "who owes this attachment's settlement" from
 one ledger rather than per path. Each exact incarnation is registered,
-announced, owned, or settled; the main thread may settle one only while it is
-still registered, which is the one stage at which no announcement is queued
-and none can be admitted afterwards; and an announcement's admission checks
-the incarnation is current and installs its slot in the same transaction, so a
-settled incarnation can never reopen. [glfw.md](glfw.md#who-owes-an-attachments-settlement)
-records the invariants.
+being settled, announced, owned, or settled; the main thread may settle one
+only from the registered stage, and its claim — not the settlement, which
+certifies facts against the host and so cannot be a transaction — is what
+excludes an announcement for as long as it is held; a claim that could not
+complete is retryable, while recorded facts are terminal; and an
+announcement's admission checks the incarnation is current and installs its
+slot in the same transaction, so a settled incarnation can never reopen.
+[glfw.md](glfw.md#who-owes-an-attachments-settlement) records the invariants.
 
 One rule the delivered machinery makes explicit that D-6 left implicit: the
 owner never retires an attachment the main thread still holds. When a target's

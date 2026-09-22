@@ -3721,18 +3721,33 @@ not yet taken.
 | Stage | Who owes it | Reached by |
 |---|---|---|
 | `CustodyRegistered` | The main thread | The attachment's protocol recording its acknowledgement, before anyone is told |
+| `CustodySettling` | The main thread | Claiming that settlement, for as long as it is being performed |
 | `CustodyAnnounced` | The owner | An announcement admitted to the lifetime port — from that instant, before the owner has consumed the event |
 | `CustodyOwned` | The owner | The owner taking that event |
 | `CustodySettled` | Nobody | A terminal record the owner wrote, or facts the main thread certified because nothing was ever owned |
 
-Three invariants hold it together.
+The stages advance, with one exception: a claim that could not complete
+returns `CustodySettling` to `CustodyRegistered`. Three invariants hold the
+ledger together.
 
-**The main thread may settle an attachment only at `CustodyRegistered`.** That
-is the one stage at which no announcement is queued and none can be admitted
-afterwards, and the claim and the move to `CustodySettled` commit in the same
-transaction. Absence from the owner's target table is never consulted, because
-a queued announcement the owner has not yet taken looks exactly like an
-attachment it never received.
+**The main thread may settle an attachment only from `CustodyRegistered`, and
+its claim is what excludes an announcement.** Settling means certifying the
+attachment's facts against the host, which is not a transaction and cannot be
+one, so the claim and the settlement do not commit together: the claim moves
+the stage to `CustodySettling` in one transaction, and that stage holds the
+exclusion for however long the certification takes. An announcement admitted
+before the claim commits leaves the stage at `CustodyAnnounced` and the claim
+answers nothing; one attempted while the claim is held is refused, as is one
+attempted after the settlement reached `CustodySettled`. Absence from the
+owner's target table is never consulted, because a queued announcement the
+owner has not yet taken looks exactly like an attachment it never received.
+
+**A claim is retryable; only recorded facts are terminal.** The move to
+`CustodySettled` happens when the facts really exist, and a settlement that
+could not certify them all puts the stage back at `CustodyRegistered` so a
+later opportunity can perform it. That is also what makes a settlement
+interrupted part-way safe: the incarnation is claimable again rather than
+stranded at a stage nothing will move.
 
 **An announcement is admitted in one transaction.** The stage is checked, the
 host is asked whether that exact attachment is still one of its own pending
@@ -3742,7 +3757,7 @@ cannot reopen anything, and neither can one racing the main thread's own
 settlement: whichever transaction commits first decides.
 
 **`CustodySettled` is terminal.** An incarnation that reaches it can never be
-announced again.
+announced again, and a settled entry is never reopened by a later claim.
 
 Every path routes through those transitions: the handover, a direct attach
 followed by `announceGraphicsTarget`, `releaseGraphicsTarget`, a window close,
@@ -3946,6 +3961,13 @@ failures the owner *survived* — the ones that would otherwise be lost, since
 nothing else records them. Between the two, every failure is reported exactly
 once.
 
+The exit never raises the latch itself, for that reason. Every failure the
+latch can hold is already in exactly one of the two stores beside it — a
+target failure the owner caught is in the retained store, and one that ended
+its run is in the worker's own outcome — so raising it as well would report a
+single failed operation twice, once as the exit's primary and once as its
+retained cleanup, and invent a second failure that never happened.
+
 How many the store keeps is derived from the host's own window limit rather
 than chosen, since one retirement round can offer an operation for every
 window the host may hold live and every one of them can fail; a chosen number
@@ -3984,6 +4006,18 @@ drain owed has been offered, in dependency order: every target, then the owner,
 then its destruction. Repeated cancellation cannot shorten that, and cannot
 release a borrowed parent early. The main thread's own wait for the owner
 absorbs cancellation the same way and re-raises it after the join.
+
+A cancellation that *escapes* an injected operation leaves that operation's
+outcome unknown, and each of the three is treated accordingly. A construction
+it ended settles as unverified: the owner must assume it owns whatever the
+call had built, reports the target unusable through `readTargetStanding`, and
+retires it in the drain's ordinary order. A target retirement it ended
+manufactures no acknowledgement and writes no terminal record — the target
+stays the owner's, explicitly unverified, and the operation is never offered
+again, by a later round or by the drain, because it may already have disposed
+part of what it owns. A destruction it ended establishes nothing, so the
+windows, the session and every borrowed parent stay retained until independent
+evidence arrives, exactly as a destruction that raised does.
 
 Nothing but the injected evidence is permission. The owner's completion is not;
 an empty target set is not; a cancellation, a timeout and a cleanup failure are
@@ -4049,13 +4083,20 @@ announcement admitted just before it; a direct attachment whose announcement a
 full port refused settled by its release rather than reported as one the owner
 will retire, and another settled by its window's close with no release at all;
 a published attachment whose answer was lost while the owner's admission
-closed in the same instant, settled rather than marked settled with nothing
-recorded; a delayed announcement of an incarnation the slot has moved past
+closed in the same instant — observed *active* at that moment, so the recovery
+had to begin its retirement itself — settled rather than marked settled with
+nothing recorded; a delayed announcement of an incarnation the slot has moved past
 refused, with no slot reopened, no ghost target and the replacement
 untouched; a handover attaching nothing once admission has ended; a
 cancellation delivered inside the backend's construction, its target
 retirement and its destruction in turn, absorbed by each and releasing
-nothing early; a handover the host quiesces under, at exactly the
+nothing early, and the same three delivered so that it *escapes* each call —
+the construction settling unverified and retiring in order, the target
+retirement manufacturing no evidence and never being offered again, and the
+destruction retaining everything until independent evidence arrives; a
+failure the owner retained while it ran, and one that escaped its run, each
+appearing exactly once across the exit's primary and every cleanup failure
+retained beside it; a handover the host quiesces under, at exactly the
 handoff between construction and publication, answering `HandoverSuperseded`
 with its attachment retired and no acknowledgement kept; six handovers
 cancelled at that same handoff, leaving no attachment the owner lacks an

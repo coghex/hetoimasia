@@ -609,6 +609,13 @@ data HostHooks = HostHooks
     -- ^ Runs at the end of a window's registration, masked and with nothing
     -- interruptible before it: after the collection and the host have both
     -- registered the window, before its creation's result is published.
+  , afterPublication ∷ IO ()
+    -- ^ Runs inside 'attachWindowGraphics', after the attachment has settled
+    -- and its service has been published, and outside the handler that would
+    -- have begun its retirement. It is the one way to reach an attachment
+    -- that is /active/ and whose caller never received the answer, which is
+    -- otherwise unreachable: the window between publication and the caller's
+    -- own next step is masked.
   , beforePublication ∷ IO ()
     -- ^ Runs inside 'attachWindowGraphics', after the attachment's construction
     -- has settled and before its service is published, so an example can reach
@@ -622,7 +629,7 @@ data HostHooks = HostHooks
   }
 
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ()) (pure ()) (\_ → pure ())
+noHostHooks = HostHooks (pure ()) (pure ()) (pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol
@@ -2421,7 +2428,15 @@ attachWindowGraphics host target protocol =
           attempted ←
             tryWithContext (attachRetirement retirement restore target protocol (releaseEarlierCell host))
           case attempted of
-            Right outcome → settleAttachment host retirement outcome
+            Right outcome → do
+              answered ← settleAttachment host retirement outcome
+              -- Outside 'publishOrRetire''s own handler, so a failure here
+              -- leaves the attachment exactly as a published one is: active,
+              -- with its caller about to lose the answer.
+              case answered of
+                GraphicsAttached _ → afterPublication (hostHooks host)
+                _ → pure ()
+              pure answered
             Left (caught ∷ ExceptionWithContext SomeException) → do
               -- A construction that was cancelled, and a rollback that could not
               -- establish safety, both leave the attachment retiring and

@@ -18,7 +18,8 @@ import Control.Concurrent (ThreadId, forkIO, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Concurrent.STM
-  ( TVar
+  ( STM
+  , TVar
   , stateTVar
   , atomically
   , check
@@ -32,6 +33,7 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , IOException
   , SomeAsyncException
   , SomeException
@@ -48,6 +50,7 @@ import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailures)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
 import Hetoimasia.Foundation.Time
   ( Duration
@@ -74,6 +77,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , seamCalls
   , seamSession
   )
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentPhase (..), viewPhase)
 import Hetoimasia.GLFW.Session (defaultSessionConfig)
 import Hetoimasia.GLFW.Window
   ( Extent (..)
@@ -208,6 +212,16 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testEveryRetirementFailureRetained)
     it "honours a cancellation inside construction, target retirement and destruction alike"
       (boundedExample testCancellationAtEachBackendCall)
+    it "settles a construction the cancellation escaped as unverified, and retires it in order"
+      (boundedExample testEscapedConstructionCancellation)
+    it "manufactures no evidence for a target retirement the cancellation escaped, and offers it once"
+      (boundedExample testEscapedRetirementCancellation)
+    it "retains everything until independent evidence when the cancellation escaped the destruction"
+      (boundedExample testEscapedDestructionCancellation)
+    it "reports a failure it retained while it ran exactly once, not once again as cleanup"
+      (boundedExample testRetainedFailureReportedOnce)
+    it "reports one that escaped its run exactly once as well"
+      (boundedExample testEscapingRunFailureReportedOnce)
     it "waits for a terminal group report however the join is interrupted"
       (boundedExample testJoinAwaitsTerminalReport)
 
@@ -485,7 +499,33 @@ ownedHostHooked
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
 ownedHostHooked hooks logger seam config ownerConfig action =
-  asProcessMainThread seam $
+  asProcessMainThread seam (ownedHostRun hooks logger seam config ownerConfig action)
+
+-- | 'ownedHost', catching inside the seam's own bound thread.
+--
+-- Cleanup evidence lives in a failure's own context, and an exception that
+-- crosses out of 'asProcessMainThread' arrives with none of it, so an example
+-- that inspects what the exit retained beside its primary has to catch on
+-- this side of that boundary.
+ownedHostCaught
+  ∷ Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO (Either SomeException a)
+ownedHostCaught seam config ownerConfig action =
+  asProcessMainThread seam (try (ownedHostRun Private.noHostHooks quietLogger seam config ownerConfig action))
+
+-- | The composition itself, already on the designated main thread.
+ownedHostRun
+  ∷ Private.HostHooks
+  → Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostRun hooks logger seam config ownerConfig action =
     runGraphicsOwnerApplication
       (withLoggingLifetime logger)
       (Text.pack "owner-example")
@@ -2106,36 +2146,52 @@ testStaleAnnouncementRefused = do
 --
 -- Certifying a fact is refused for an attachment that is still active, so a
 -- settlement that did not first begin its retirement would leave the ledger
--- terminal, the facts unrecorded, and the drain waiting for good.
+-- terminal, the facts unrecorded, and the drain waiting for good. The answer
+-- is lost from 'Private.afterPublication', which is the one seam that reaches
+-- an attachment in exactly that state: published, /active/, and outside the
+-- handler that would otherwise have begun its retirement for us.
 testLostAnswerWithClosedOwner ∷ IO ()
 testLostAnswerWithClosedOwner = do
   rig ← newRig
   closing ← newTVarIO Nothing
+  observedPhases ← newTVarIO Nothing
   let hooks =
         Private.noHostHooks
-          { Private.beforePublication =
+          { Private.afterPublication =
               readTVarIO closing >>= \case
                 Nothing → pure ()
-                Just owner → do
+                Just (host, owner) → do
                   -- The owner's admission ends, and the caller's answer is
                   -- lost, at the one instant the attachment is published and
                   -- active.
                   atomically (Private.closeOwnerPublications (ownerHandoff owner))
-                  myThreadId >>= (`throwTo` ThreadKilled)
+                  phases ← atomically (attachmentPhases host)
+                  atomically (writeTVar observedPhases (Just phases))
+                  throwIO (Scripted (Text.pack "answer lost"))
           }
   (answer, pending, stage) ←
     ownedHostHooked hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
       window ← theWindow host
-      atomically (writeTVar closing (Just owner))
+      atomically (writeTVar closing (Just (host, owner)))
       answer ← try (handOverGraphicsTarget host owner window)
-      (,,) (either (const "cancelled") describeHandover (answer ∷ Either SomeException GraphicsHandover))
+      (,,) (either (const "raised") describeHandover (answer ∷ Either SomeException GraphicsHandover))
         <$> atomically (hostPendingAttachments host)
         <*> atomically (readOwnerCustody owner)
-  answer `shouldBe` "cancelled"
+  answer `shouldBe` "raised"
+  -- The state the recovery actually met: one attachment, active. Nothing had
+  -- begun its retirement, so 'retireStranded' had to begin it itself before a
+  -- single fact could be certified.
+  readTVarIO observedPhases `shouldReturn` Just [Just AttachmentActive]
   -- Settled for real: nothing is left pending for a drain to wait on, and
   -- nothing is left in the ledger claiming to be finished.
   pending `shouldBe` []
   stage `shouldBe` []
+
+-- | Every pending attachment's phase, in the host's own order.
+attachmentPhases ∷ WindowHost → STM [Maybe AttachmentPhase]
+attachmentPhases host = do
+  pending ← hostPendingAttachments host
+  map (fmap viewPhase) <$> traverse (Private.hostAttachmentView host) pending
 
 -- | Cancellation is honoured inside each backend call in turn, and releases
 -- nothing early in any of them.
@@ -2223,6 +2279,249 @@ data BackendCall
   | BackendRetireTarget
   | BackendDestroy
   deriving (Eq, Show)
+
+
+-- | A cancellation that /escapes/ each injected operation, rather than being
+-- absorbed by it, and what the owner then does with the call it interrupted.
+--
+-- The example above proves that a call which absorbs a cancellation is not
+-- abandoned. This one asks the opposite question: the fake absorbs nothing,
+-- so the exception really does leave the operation, and what is asserted is
+-- the owner's own conduct — which is not observable at all while the fake
+-- keeps swallowing it.
+
+-- | A construction the cancellation escaped is settled unverified, and the
+-- owner retires what it must therefore assume it owns, in dependency order.
+testEscapedConstructionCancellation ∷ IO ()
+testEscapedConstructionCancellation = do
+  rig ← newRig
+  inside ← newTVarIO False
+  never ← newTVarIO False
+  observedStanding ← newTVarIO Nothing
+  script (fakeConstruct (rigFake rig)) $ \_ → do
+    atomically (writeTVar inside True)
+    atomically (readTVar never >>= check)
+    unexpected "the interrupted construction returned"
+  -- The retirement is held until the example has read the standing: the
+  -- cancellation takes the owner into its drain at once, and the drain
+  -- retires — and so forgets — the very target the standing is about.
+  gate ← newTVarIO False
+  script (fakeRetireTarget (rigFake rig)) $ \retire → do
+    atomically (readTVar gate >>= check)
+    pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  (raised, _) ← caughtAs @AsyncException $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      void (forkIO (killInside rig inside))
+      service ← handedOver host owner window
+      -- Neither accepted nor verifiably rolled back: the owner records what
+      -- it knows, which is that it may own whatever the call had built.
+      standing ← awaitStanding owner service
+      atomically (writeTVar observedStanding (Just standing))
+      atomically (writeTVar gate True)
+      _ ← releaseGraphicsTarget host owner service
+      _ ← awaitTerminal owner service
+      pumpUntilRetired host control
+  raised `shouldBe` ThreadKilled
+  readTVarIO observedStanding `shouldReturn` Just (TargetUnusable True)
+  -- Retired as an unconstructed target, and the whole exit kept its order.
+  retirements ← readTVarIO (fakeRetirements (rigFake rig))
+  map retiringConstructed retirements `shouldBe` [False]
+  notes ← journalled (rigJournal rig)
+  ordered
+    notes
+    [ TargetRetirement (Text.pack "WindowId 1")
+    , OwnerRetirement
+    , OwnerDestruction
+    , WindowGone 1
+    , SessionEnded
+    ]
+
+-- | A target retirement the cancellation escaped manufactures no evidence and
+-- is never offered again — not by a later round, and not by the drain.
+--
+-- It is the same contract a synchronous failure has, and it must not depend
+-- on which kind of exception ended the call: the operation was entered, what
+-- it did is unknown, and asking again could dispose something twice.
+testEscapedRetirementCancellation ∷ IO ()
+testEscapedRetirementCancellation = do
+  rig ← newRig
+  inside ← newTVarIO False
+  never ← newTVarIO False
+  script (fakeRetireTarget (rigFake rig)) $ \_ → do
+    atomically (writeTVar inside True)
+    atomically (readTVar never >>= check)
+    unexpected "the interrupted target retirement returned"
+  observedTargets ← newTVarIO []
+  observedRecords ← newTVarIO []
+  (raised, _) ← caughtAs @AsyncException $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      awaitStanding owner service `shouldReturn` TargetUsable
+      void (forkIO (killInside rig inside))
+      _ ← releaseGraphicsTarget host owner service
+      -- The run has ended and its drain has finished, so nothing is still to
+      -- come that could offer the operation a second time.
+      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+      atomically . writeTVar observedRecords . Map.keys =<< atomically (readTargetTerminalsNow owner)
+      atomically . writeTVar observedTargets =<< atomically (readOwnerTargets owner)
+      -- Independent evidence is the only thing that can retire it now, which
+      -- is what lets this example's own exit finish.
+      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+      acknowledgement ←
+        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+      pumpUntilRetired host control
+  raised `shouldBe` ThreadKilled
+  -- No acknowledgement was manufactured for a call whose outcome is unknown.
+  readTVarIO observedRecords `shouldReturn` []
+  -- The target stays the owner's, explicitly unverified.
+  readTVarIO observedTargets >>= \held → length held `shouldBe` 1
+  -- And it was offered exactly once, over the whole run and its drain.
+  notes ← journalled (rigJournal rig)
+  length [() | TargetRetirement _ ← notes] `shouldBe` 1
+
+-- | A destruction the cancellation escaped establishes nothing, so the host,
+-- its windows, its session and every parent stay retained until independent
+-- evidence arrives — and nothing is released early on the way there.
+testEscapedDestructionCancellation ∷ IO ()
+testEscapedDestructionCancellation = do
+  rig ← newRig
+  inside ← newTVarIO False
+  never ← newTVarIO False
+  trace ← newSinkTrace
+  let recording = sinkFailingOn (Text.pack "never") trace
+  script (fakeDestroy (rigFake rig)) $ \_ → do
+    atomically (writeTVar inside True)
+    atomically (readTVar never >>= check)
+    unexpected "the interrupted destruction returned"
+  releasedEarly ← newTVarIO Nothing
+  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      awaitStanding owner service `shouldReturn` TargetUsable
+      _ ← releaseGraphicsTarget host owner service
+      _ ← awaitTerminal owner service
+      pumpUntilRetired host control
+      -- The destruction is only ever entered during the exit, when the main
+      -- thread is no longer in the body, so both the interruption and the
+      -- independent evidence come from a thread of the example's own.
+      void . forkIO $ do
+        killInside rig inside
+        -- The owner's run has ended with nothing established, and the exit
+        -- has said once what it is retaining for the want of it.
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        awaitDiagnostic trace
+        notes ← journalled (rigJournal rig)
+        atomically (writeTVar releasedEarly (Just (filter released notes)))
+        publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
+  -- Nothing was released for a destruction that established nothing: the
+  -- windows and the session both outlast the whole retained wait.
+  readTVarIO releasedEarly `shouldReturn` Just []
+  -- The owner retired; only its destruction is unverified, and no target is.
+  unverifiedRetired unverified `shouldBe` True
+  unverifiedTargets unverified `shouldBe` 0
+  -- The destruction raised and was offered exactly once: an operation whose
+  -- outcome is unknown is not repeated, and no evidence was manufactured for
+  -- it. Only the independent publication ended the wait.
+  notes ← journalled (rigJournal rig)
+  length [() | OwnerDestruction ← notes] `shouldBe` 1
+  length [() | DestroyRaised _ ← notes] `shouldBe` 1
+  where
+    released = \case
+      WindowGone _ → True
+      SessionEnded → True
+      _ → False
+
+-- | Wait until an injected call has been entered, then cancel the thread it
+-- is running on — which is the owner's, because the owner is the only thread
+-- that makes one.
+killInside ∷ Rig → TVar Bool → IO ()
+killInside rig inside = do
+  atomically (readTVar inside >>= check)
+  ownerThread ← atomically $
+    readTVar (fakeThreads (rigFake rig)) >>= \case
+      thread : _ → pure thread
+      [] → retry
+  throwTo ownerThread ThreadKilled
+
+-- ---------------------------------------------------------------------------
+-- One failure, reported once
+
+-- | A failure the owner retained while it kept running is reported exactly
+-- once, not once as the exit's own primary and again as its retained cleanup.
+--
+-- The latch and the retained store hold the same first failure by design —
+-- one is notification, what a supervision sentinel waits on, and the other is
+-- evidence with its own context — so an exit that raised both would report a
+-- single failed operation twice and invent a second one that never happened.
+--
+-- The application's own action fails as well, so the boundary keeps that
+-- failure primary and retains everything the exit found beside it, which is
+-- where inspection can count them.
+testRetainedFailureReportedOnce ∷ IO ()
+testRetainedFailureReportedOnce = do
+  rig ← newRig
+  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    service ← handedOver host owner window
+    awaitStanding owner service `shouldReturn` TargetUsable
+    _ ← releaseGraphicsTarget host owner service
+    -- Latched and retained together, which is the pair this example is about.
+    atomically (readOwnerFailure owner >>= check . isJust)
+    atomically (readOwnerFailures owner >>= check . not . null)
+    -- Nothing offers the failed retirement again, so independent evidence is
+    -- what retires the attachment and lets this exit finish at all.
+    publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+    acknowledgement ←
+      atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+        >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+    forM_ allRetirementFacts $ \fact →
+      void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+    pumpUntilRetired host control
+    throwIO (Scripted (Text.pack "body"))
+  caught ← raisedBy outcome
+  fromException caught `shouldBe` Just (Scripted (Text.pack "body"))
+  -- Once over the primary and every cleanup failure retained beside it.
+  occurrencesOf (Scripted (Text.pack "retire target")) caught `shouldBe` 1
+
+-- | A failure that escaped the owner's own run is reported exactly once too.
+--
+-- This one is latched /and/ carried out by the worker's own outcome, so it is
+-- the other way a single failure could be told twice.
+testEscapingRunFailureReportedOnce ∷ IO ()
+testEscapingRunFailureReportedOnce = do
+  rig ← newRig
+  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "step")))
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_host owner _control → do
+    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+    throwIO (Scripted (Text.pack "body"))
+  caught ← raisedBy outcome
+  fromException caught `shouldBe` Just (Scripted (Text.pack "body"))
+  occurrencesOf (Scripted (Text.pack "step")) caught `shouldBe` 1
+
+-- | The failure a caught run raised, failing the example if it returned.
+raisedBy ∷ Either SomeException a → IO SomeException
+raisedBy = either pure (\_ → unexpected "the run returned instead of failing")
+
+-- | How many times one failure appears in a raised exception: as the
+-- exception itself, and in every cleanup failure retained beside it.
+occurrencesOf ∷ Scripted → SomeException → Int
+occurrencesOf wanted caught =
+  length (filter (== Just wanted) (fromException caught : retained))
+  where
+    retained =
+      [ fromException (exceptionOf (cleanupFailureException failure))
+      | failure ← cleanupFailures caught
+      ]
+
+exceptionOf ∷ ExceptionWithContext SomeException → SomeException
+exceptionOf (ExceptionWithContext _ failure) = failure
 
 -- ---------------------------------------------------------------------------
 -- The extent seam
