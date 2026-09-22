@@ -49,9 +49,7 @@ examples that keep the rest of that boundary honest.
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
 | `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record. |
 | `cbits/` | The throwaway GLFW/Vulkan interop shim and the `dladdr` image provenance. |
-| `environment.pin` | Each platform's pinned driver manifest and layer directory. |
-| `run-proof.sh` | The only thing that builds this package, and what establishes the project-local environment. |
-| `Dockerfile.linux-proof` | The pinned temporary Linux container carrying Mesa Lavapipe, the loader, and the layers. |
+| `run-proof.sh` | The only thing that builds this package, and what establishes the project-local environment from the provisioned native prefix. |
 
 The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
@@ -243,25 +241,28 @@ approved that session:
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan-proof/run-proof.sh
 ```
 
-On Linux, inside the pinned container, where `tools/display/x11.sh` supplies its
-own consent for the isolated display it starts and no approval is needed:
+On Linux, inside the published CI image the committed
+`tools/ci-image/descriptor.json` names, where `tools/display/x11.sh` supplies
+its own consent for the isolated display it starts and no approval is needed:
 
 ```bash
-docker build -f tools/vulkan-proof/Dockerfile.linux-proof \
-  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-  -t hetoimasia-vulkan-proof .
-docker run --rm hetoimasia-vulkan-proof
+docker run --rm --volume "$PWD:/candidate" --workdir /candidate \
+  "$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')" \
+  bash tools/display/x11.sh -- bash tools/vulkan-proof/run-proof.sh
 ```
 
-The `route: vulkan-proof` job of `.github/workflows/ci-image.yml` runs exactly
-that and uploads the record; dispatch it against a candidate branch with
-`--ref`.
+VK-4 provisioned the loader, driver, and layers into that image, so the proof
+now runs against exactly the inputs ordinary Linux validation runs against and
+the throwaway container this used to need is gone. The `route: vulkan-proof`
+job of `.github/workflows/ci-image.yml` runs the command above and uploads the
+record; dispatch it against a candidate branch with `--ref`.
 
 `HETOIMASIA_VULKAN_PROOF_RECORD=<path>` writes the record to a file instead of
-standard output. `HETOIMASIA_VULKAN_DRIVER_MANIFEST` and
-`HETOIMASIA_VULKAN_LAYER_PATH` override `environment.pin` for one run;
-`HETOIMASIA_VULKAN_PREFIX` overrides the macOS loader prefix
-`tools/toolchain/binding.pin` names.
+standard output. Every Vulkan path comes from the native prefix rather than
+from a pin of this package's own; relocating one input for a run is
+`tools/native/vulkan.py`'s business, through the `HETOIMASIA_VULKAN_*`
+variables [docs/validation.md](../../docs/validation.md) describes, and an
+override locates an input without waiving its qualification.
 
 A run refused for lack of consent exits non-zero with one line saying what is
 missing and how a human authorizes it. It initializes nothing first. The mode is

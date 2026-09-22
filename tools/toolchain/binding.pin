@@ -25,4 +25,11 @@ VULKAN_FLAG_DARWIN_LIB_DIRS=off
 # The macOS loader prefix the qualification links against when
 # HETOIMASIA_VULKAN_PREFIX does not name another. `<prefix>/lib` must hold the
 # loader and `<prefix>/lib/pkgconfig/vulkan.pc` must describe it.
+#
+# This is #157's own retained invocation and is unchanged by VK-4. The prefix
+# `tools/native/vulkan.py` provisions has exactly that shape, so pointing
+# HETOIMASIA_VULKAN_PREFIX at `<native prefix>/vulkan` qualifies the binding
+# against the loader this repository provisions rather than the one the machine
+# happens to install. Nothing else reads this value: the proof harness takes
+# every Vulkan path from the native prefix instead.
 MACOS_VULKAN_PREFIX=/usr/local
