@@ -43,6 +43,80 @@ concrete precondition
 - **Arc label:** existing `resources`; crossing slices use `runtime`/`glfw`
   during processing. No new graphics package or label is required yet.
 
+## Current handoff — 2026-09-21
+
+D-6's lifetime is delivered, by the Vulkan arc's VK-18/#218 as D-6 said it
+would be, and not by a new LIFE slice: the ledger above stays complete. What
+exists now is the machinery, with its backend operations injected; VK-7
+supplies the Vulkan ones.
+
+`Hetoimasia.Runtime.GLFW.withGraphicsOwnerHost` is the additive protected-host
+constructor D-6 describes, beside `withProtectedWindowHost`, which keeps its
+signature and its behaviour, as does every other window-only entry point. Under
+it, a whole-session exit runs D-6's four steps exactly: quiescence closes the
+host's admission and then the owner's own bounded lifetime port; ordinary
+workers stop and drain, untouched by the owner's separate worker group; the
+owner stays alive and retires each target and then itself through its injected
+operations, publishing each certified fact through the existing completion
+publisher; and the main-thread boundary services the host's own bounded native
+housekeeping while it awaits verified retirement, validating each exact
+attachment's terminal evidence and never the owner's completion, before joining
+the owner and letting the windows, session and parents unwind.
+
+D-6's retention rules are delivered as written. The owner's run action installs
+its protected retirement before any dependent construction, and an expected
+stop, a startup failure, a run failure and cancellation all enter that same
+drain; nothing driver-shaped is placed in a `Scoped` startup release. A
+terminal owner failure is latched as soon as it is known and reaches
+application checkpoints through `superviseGraphicsOwner`, which registers one
+ordinary supervised service in the application's own group — a separate worker
+group gives supervision no connection by itself, so the connection is explicit.
+An owner that ends without the injected whole-owner destruction returning
+evidence does not let the boundary finish: the main thread keeps servicing
+housekeeping, the windows, the session and every borrowed parent stay
+retained, and `OwnerDestructionUnverified` is written once as the diagnostic
+that says so. That is D-4's retention rule applied to the owner's own shared
+state, and it authorizes nothing: not a disposal, and not a replay of the work
+that failed. Only independent evidence ends it —
+`publishOwnerDestruction`, from a thread that established it, which is the
+same shape the attachment model already has for a fact certified by a thread
+other than the owner — and operator process termination remains the escape.
+Whole-owner retirement is independent of the attachment count in both
+directions: it happens for an owner that never held a target, and after the
+last one has detached.
+
+An individual close or detach is not that: `releaseGraphicsTarget` retires one
+target, the owner publishes that target's exact evidence, the main thread
+acknowledges it and its window is released, and the shared owner and every
+other target stay live. Only a whole-host exit requires the final join.
+
+A terminal failure under a `Required` disposition is terminal at once: the same
+transaction that latches it closes every admission into the owner's handoff,
+and its run ends there and enters the drain, so nothing further is handed to
+an owner that is about to retire. The latch stays for supervision, which
+reaches application checkpoints through one ordinary supervised service the
+composition registers in the application's own group.
+
+The delivered machinery answers "who owes this attachment's settlement" from
+one ledger rather than per path. Each exact incarnation is registered,
+being settled, announced, owned, or settled; the main thread may settle one
+only from the registered stage, and its claim — not the settlement, which
+certifies facts against the host and so cannot be a transaction — is what
+excludes an announcement for as long as it is held; a claim that could not
+complete is retryable, while recorded facts are terminal; and an
+announcement's admission checks the incarnation is current and installs its
+slot in the same transaction, so a settled incarnation can never reopen.
+[glfw.md](glfw.md#who-owes-an-attachments-settlement) records the invariants.
+
+One rule the delivered machinery makes explicit that D-6 left implicit: the
+owner never retires an attachment the main thread still holds. When a target's
+construction cannot be used — a partial construction, one the backend could not
+verify a rollback for, or one that was interrupted — the owner keeps whatever
+it owns and /reports/ it through `readTargetStanding`. Beginning that
+attachment's retirement stays the main thread's, because the attachment and its
+window's exclusive slot are the main thread's; the owner is given no
+cross-thread authority over either.
+
 ## Current handoff — 2026-09-20
 
 At `master@3a8abdc`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
@@ -297,7 +371,8 @@ that rule. Neither worker finalizers nor graphics retirement may await a command
 handled only by the departed normal loop. Initial graphics retirement work is
 owner-thread-owned and must remain progressable after worker drain. A backend
 that needs a live retirement worker requires a different explicitly designed
-lifetime; this arc does not silently add one. D-6 is that lifetime: under it
+lifetime; this arc does not silently add one. D-6 is that lifetime, and
+`withGraphicsOwnerHost` is its delivered composition: under it
 step 2 drains ordinary workers only, step 3's GPU retirement runs on the
 surviving graphics owner while the main thread services housekeeping and
 awaits verified retirement, and the owner is joined before step 4.

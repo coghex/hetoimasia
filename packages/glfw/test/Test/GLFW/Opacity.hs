@@ -65,7 +65,11 @@
 -- turn, window, and client capabilities, including a window's input reader and
 -- admission control, and the protected host lifetime and its runner, and every
 -- path it runs is refused
--- before GLFW is initialized.
+-- before GLFW is initialized. Another composes a supervised graphics owner
+-- through the public modules alone — the injected operation record, its
+-- configuration, the additive protected-host constructor, the handover, and
+-- the extent seam — which is the evidence that VK-7's integration can supply
+-- Vulkan operations to this machinery from outside the package.
 --
 -- The test seam is a public component, and this suite declares it for the same
 -- reason. Four more
@@ -479,6 +483,53 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                    , "refusals = [GraphicsAdmissionEnded,GraphicsForeignSession,GraphicsSlotUnavailable]"
                    , "facts = [CpuUseRetired,SubmittedWorkEnded,PresentationEnded,DependentsDisposed]"
                    , "absent = (GraphicsAbsent,DisposalPending,SlotFree)"
+                   ]
+
+  it "rejects a client that reaches for the supervised graphics owner in the host's private implementation" $
+    withHostClient "Client.hs" ownerInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the owner's implementation is reachable:\n" <> clientOutput outcome)
+      -- Found in the built package and refused as private, not missing.
+      clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW.Internal.Owner"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "runtime-glfw-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that forges the owner's evidence or names the owner's constructor" $
+    withHostClient "Client.hs" ownerEvidenceConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "OwnerDestroyed"
+
+  it "accepts and runs a client composing a graphics owner through public modules alone, without initializing GLFW" $
+    withHostClient "Main.hs" graphicsOwnerClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the graphics owner client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "phase = OwnerStarting"
+                   , "no demand = OwnerDemand {ownerDemandImmediate = False, ownerDemandDeadline = Nothing}"
+                   , "step = StepReport {stepAdvanced = False, stepImmediateWork = False}"
+                   , "backend extent = ExtentFromBackend (Extent {extentWidth = 800, extentHeight = 600})"
+                   , "suspended = ExtentWithheld (ExtentNotEligible RenderSuspended)"
+                   , "unobserved = ExtentWithheld ExtentUnobserved"
                    ]
 
   it "rejects a client that reaches for the retirement boundary in the host's private implementation" $
@@ -1020,6 +1071,101 @@ attachmentClient =
     , "  , graphicsAttachment service"
     , "  , toInteger (graphicsIncarnation service)"
     , "  )"
+    ]
+
+
+-- | A client reaching for the supervised graphics owner's implementation and
+-- its handoff state, in the private @runtime-glfw-core@ sublibrary.
+ownerInternalsClient ∷ String
+ownerInternalsClient =
+  unlines
+    [ "module Client (handoff) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW.Internal.Owner (GraphicsOwner, ownerHandoff)"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (OwnerHandoff, newOwnerHandoff)"
+    , ""
+    , "handoff ∷ GraphicsOwner scene → OwnerHandoff scene"
+    , "handoff = ownerHandoff"
+    ]
+
+-- | A client naming the owner's data constructor and forging the evidence its
+-- injected destruction is supposed to be the only source of.
+--
+-- The public contract exports each evidence type and the smart constructor a
+-- /backend/ builds one with; what it must not export is the data constructor,
+-- and 'GraphicsOwner' itself must stay opaque.
+ownerEvidenceConstructorClient ∷ String
+ownerEvidenceConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW (GraphicsOwner (GraphicsOwner), OwnerDestroyed (OwnerDestroyed))"
+    , ""
+    , "forged ∷ Maybe (OwnerDestroyed, GraphicsOwner ())"
+    , "forged = Nothing"
+    ]
+
+-- | A client composing a supervised graphics owner through the public modules
+-- alone: the injected operation record, its configuration, the additive
+-- protected-host constructor, the handover, and the extent seam.
+--
+-- It builds no host, so it initializes no GLFW. What it proves is that every
+-- part of the owner an integration needs — including the operation record
+-- VK-7 will fill with Vulkan operations — is reachable from outside the
+-- package, and that the values it hands back are opaque.
+graphicsOwnerClient ∷ String
+graphicsOwnerClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import qualified Data.Text as Text"
+    , "import Hetoimasia.Foundation.Messaging.Payload (Prepared)"
+    , "import Hetoimasia.GLFW.Window (Extent (..), WindowId)"
+    , "import Hetoimasia.Runtime.GLFW"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  putStrLn (\"phase = \" <> show (statusPhase initialStatus))"
+    , "  putStrLn (\"no demand = \" <> show noOwnerDemand)"
+    , "  putStrLn (\"step = \" <> show noStepWork)"
+    , "  putStrLn (\"backend extent = \" <> show (chooseTargetExtent RenderEligible geometry supplied))"
+    , "  putStrLn (\"suspended = \" <> show (chooseTargetExtent RenderSuspended geometry supplied))"
+    , "  putStrLn (\"unobserved = \" <> show (chooseTargetExtent RenderEligible noTargetGeometry ApplicationChooses))"
+    , "  where"
+    , "    initialStatus = OwnerStatus OwnerStarting 0 0 False Nothing"
+    , "    geometry = observeGeometry (Just (Extent 640 480)) Nothing noTargetGeometry"
+    , "    supplied = BackendSupplied (Extent 800 600)"
+    , ""
+    , "-- | The record an integration supplies. Nothing in it is a GLFW"
+    , "-- capability, and nothing in it is a recording or submission API."
+    , "operations ∷ GraphicsOperations scene"
+    , "operations ="
+    , "  GraphicsOperations"
+    , "    { graphicsStartOwner = \\_ → pure (ownerReady (Text.pack \"ready\"))"
+    , "    , graphicsConstructTarget = \\_ → pure (TargetConstructed (targetEvidence (Text.pack \"built\")))"
+    , "    , graphicsStep = \\_ → pure noStepWork"
+    , "    , graphicsNextDeadline = pure NoOwnerDemand"
+    , "    , graphicsRetireTarget = \\_ → pure (targetRetired (Text.pack \"retired\"))"
+    , "    , graphicsRetireOwner = \\_ → pure (ownerRetired (Text.pack \"retired\"))"
+    , "    , graphicsDestroyOwner = \\_ → pure (ownerDestroyed (Text.pack \"destroyed\"))"
+    , "    }"
+    , ""
+    , "-- | The additive constructor, as a client names it."
+    , "compose"
+    , "  ∷ HostConfig"
+    , "  → Prepared scene"
+    , "  → (WindowHost → GraphicsOwner scene → IO r)"
+    , "  → IO r"
+    , "compose config scene = withGraphicsOwnerHost quietLogger config (graphicsOwnerConfig operations scene)"
+    , "  where"
+    , "    quietLogger = error \"the client never builds a host, so it never writes a line\""
+    , ""
+    , "-- | Handing a target over and taking it back, as a client names them."
+    , "hand ∷ WindowHost → GraphicsOwner scene → WindowId → IO GraphicsHandover"
+    , "hand = handOverGraphicsTarget"
+    , ""
+    , "release ∷ WindowHost → GraphicsOwner scene → GraphicsService → IO ReleaseAnswer"
+    , "release = releaseGraphicsTarget"
     ]
 
 -- | A client reaching for the retirement boundary that owns the attachment

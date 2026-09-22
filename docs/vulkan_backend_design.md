@@ -71,7 +71,30 @@ precondition is now satisfied; unchecked entries above remain unprocessed.
   consumers; agents implementing and testing its bounded parts.
 - **Arc label:** propose `vulkan`, color `A41E22`, description “Vulkan backend, GPU resource lifetimes, presentation and platform verification”. No label is created by this design.
 
-## Current handoff at `3a8abdc` — 2026-09-20
+## Current handoff at `25a37d2` — 2026-09-21
+
+VK-18/#218 is delivered. The supervised graphics owner's reusable machinery now
+exists in the GLFW package's runtime integration, in
+`Hetoimasia.Runtime.GLFW.Internal.Owner` and its `.Handoff` module, exported
+through `Hetoimasia.Runtime.GLFW`: the narrow injected `GraphicsOperations`
+record, the bounded lifetime port and latest-value snapshots in both
+directions, the owner's own timer and deadlines, the D-33 exit composed by
+`withGraphicsOwnerHost`, the supervision sentinel `superviseGraphicsOwner`, and
+D-30's extent seam. [glfw.md](glfw.md#the-supervised-graphics-owner) is its
+contract. The backend operations are fakes in `test.glfw`; no Vulkan handle,
+surface, device or GPU dependency is involved, and the GLFW package depends on
+no GPU package.
+
+P-1, P-5, P-6, P-7, VK-8 and VK-16 were written against D-29–D-33 already and
+needed no revision: the delivered machinery contradicts none of them. What they
+described as intent, the owner now implements — P-6's "report explicit
+backpressure" is `EventRefusedFull` on the lifetime port, its "coalesce
+replaceable status" is `OwnerStatus`, and its "retain terminal facts in bounded
+persistent cells" is `TerminalRecord`. VK-7 supplies the Vulkan operations to
+this same machinery; VK-10 supplies the extent policy behind D-30's seam, which
+here only fixes the order (eligibility, then zero area, then the clamp).
+
+## Historical handoff at `3a8abdc` — 2026-09-20
 
 VK-1–VK-3 and their repairs #181–#184 are merged. VK-4/#208 is filed and
 approved, not merged. TIME #139 and LIFE #144 and their prerequisites have

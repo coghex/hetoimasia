@@ -10,7 +10,9 @@
 -- runtime integration's private host hooks, which this suite may name because it
 -- belongs to the package; "Test.GLFW.Attachments" drives the public attachment
 -- contract over that same seam, on running owner turns rather than only on the
--- exit drain; "Test.GLFW.Linking" checks the package's link
+-- exit drain; "Test.GLFW.Owner" drives the supervised graphics owner over that
+-- seam with its backend operations injected as fakes, which hold no GLFW
+-- capability at all; "Test.GLFW.Linking" checks the package's link
 -- declarations against the native manifest; and "Test.GLFW.Opacity" compiles
 -- external clients against the package, which is the only evidence here of what
 -- a client outside the package can reach.
@@ -34,6 +36,7 @@ import qualified Test.GLFW.Linking as Linking
 import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
 import qualified Test.GLFW.Opacity as Opacity
+import qualified Test.GLFW.Owner as Owner
 import qualified Test.GLFW.Protected as Protected
 import qualified Test.GLFW.Render as Render
 import qualified Test.GLFW.Scheduled as Scheduled
@@ -63,5 +66,6 @@ spec = describe "GLFW" $ do
   Mode.spec
   Attachment.spec
   Attachments.spec
+  Owner.spec
   Linking.spec
   Opacity.spec

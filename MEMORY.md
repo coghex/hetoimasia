@@ -223,6 +223,14 @@ their implementations are complete or replace canonical readiness review.
   behaviour and accept no attachment. On every exit that boundary ends new
   graphics use, retires attachments on the main thread with the windows, the
   session, and the parents live, and retains them all when it cannot.
+  `withGraphicsOwnerHost` is the additive constructor beside it: the same host
+  with one supervised graphics owner alive across that drain, taking the
+  backend's operations as an injected record. The owner makes no GLFW call —
+  its one cross-thread reach is the session's existing wake — and the exit
+  retires each target, then the owner, then destroys it, then joins, and only
+  then releases the windows. Nothing but the injected evidence is permission:
+  an owner that ends without whole-owner destruction evidence retains the
+  windows, the session and every parent until independent evidence arrives.
 - [Validation](docs/validation.md): mandatory floor plus affected non-optional
   and PR-requested groups. Optional probes remain opt-in. CI evidence and review
   approval have independent freshness rules; approved clean merges may retain
@@ -246,9 +254,15 @@ their implementations are complete or replace canonical readiness review.
   observed, with no owner turn and no update opportunity in either — while a
   window move does not block it at all. Cocoa keeps requesting a redraw about
   111 times a second throughout a resize; a menu tracking loop delivers nothing.
-  Resolved by Vulkan D-29–D-33: introduce the separate graphics owner in VK-18/#218
-  and its Vulkan integration in VK-7/#219; VK-16/#232 owes the Cocoa progress
-  evidence. The [verdict](docs/owner_loop_interaction_verdict.md) is historical
+  Resolved by Vulkan D-29–D-33: the separate graphics owner's machinery is
+  delivered by VK-18/#218 inside the GLFW package's runtime integration
+  (`Hetoimasia.Runtime.GLFW.Internal.Owner`, contract in
+  [glfw.md](docs/glfw.md#the-supervised-graphics-owner)), with its backend
+  operations injected and proved through fakes; VK-7/#219 supplies the Vulkan
+  ones and VK-16/#232 owes the Cocoa progress evidence. The owner removes the
+  stale or stretched surface, not the stall: window commands and observations
+  still wait for the pump, and a rendered latest snapshot does not mean
+  gameplay or input continued. The [verdict](docs/owner_loop_interaction_verdict.md) is historical
   measurement, not a later policy decision. Its probe stays selectable, never
   routine. Simulation remains application-owned; scene snapshots can originate
   on any application thread without introducing a simulation driver in this arc.
