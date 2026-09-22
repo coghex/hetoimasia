@@ -3929,14 +3929,27 @@ interrupted. The latch stays for supervision, and the main thread is woken at
 once, so a checkpoint raises while retirement is still to come.
 
 **The latch is notification, not evidence.** It keeps the first failure,
-because that is what a sentinel can wait on; every failure is retained
-separately with the context it propagated with, readable through
-`readOwnerFailures` and reported by the exit, because a drain that failed
-three operations has three things to report and a latch would keep one. How
-many it keeps is derived from the host's own window limit rather than chosen,
-since one retirement round can offer an operation for every window the host
-may hold live and every one of them can fail; a chosen number would silently
-discard evidence this contract promises stays readable. A
+because that is what a sentinel can wait on. Where the rest are kept depends
+on which failure it is, and the split is deliberate:
+
+| Failure | Where it is kept | How the exit reports it |
+|---|---|---|
+| A target's construction or retirement, which the owner caught and carried on from | `readOwnerFailures`, with the context it propagated with | Retained beside whatever else the exit found |
+| The owner's own startup, step, or deadline, which ended its run | The worker's own outcome | Read back from the joined group's report |
+| Its whole-owner retirement or destruction, which its drain absorbed | The worker's own outcome, through the drain it settles into | Read back from the same report |
+
+A failure that ends the run is not put in the retained store, because the run
+ending is how it is already reported: the worker's outcome carries it, the
+exit reads that outcome back from the group report, and duplicating it would
+mean the same failure raised twice. `readOwnerFailures` is therefore the
+failures the owner *survived* — the ones that would otherwise be lost, since
+nothing else records them. Between the two, every failure is reported exactly
+once.
+
+How many the store keeps is derived from the host's own window limit rather
+than chosen, since one retirement round can offer an operation for every
+window the host may hold live and every one of them can fail; a chosen number
+would silently discard evidence this contract promises stays readable. A
 target retirement that failed is marked explicitly unverified and that
 operation is never offered again — not by a later round and not by the drain,
 because an operation that failed once may have disposed part of what it owns
@@ -3960,9 +3973,9 @@ application's own group whose whole job is to wait on that latch and fail with
 what it holds; a separate worker group gives supervision no connection by
 itself, so the connection is explicit. The latch is durable, so a failure
 raised before the application reached its own startup callback is delivered the
-moment the sentinel is registered. Whether a failure is latched follows the
-established disposition: a `Required` owner's failure stops the run, and an
-`Optional` one leaves the component unavailable.
+moment the sentinel is registered. This owner is required, so a latched
+failure stops the run; there is no owner-wide disposition that could make it
+mean anything else.
 
 Cancellation is honoured at every owner wait. It is not latched as a terminal
 failure — an owner asked to stop is entitled to receive one — and the owner's
@@ -4034,7 +4047,15 @@ meanwhile; the startup's own evidence readable through retirement; an ordinary
 public stop closing every publication and its drain still taking an
 announcement admitted just before it; a direct attachment whose announcement a
 full port refused settled by its release rather than reported as one the owner
-will retire; a handover the host quiesces under, at exactly the
+will retire, and another settled by its window's close with no release at all;
+a published attachment whose answer was lost while the owner's admission
+closed in the same instant, settled rather than marked settled with nothing
+recorded; a delayed announcement of an incarnation the slot has moved past
+refused, with no slot reopened, no ghost target and the replacement
+untouched; a handover attaching nothing once admission has ended; a
+cancellation delivered inside the backend's construction, its target
+retirement and its destruction in turn, absorbed by each and releasing
+nothing early; a handover the host quiesces under, at exactly the
 handoff between construction and publication, answering `HandoverSuperseded`
 with its attachment retired and no acknowledgement kept; six handovers
 cancelled at that same handoff, leaving no attachment the owner lacks an

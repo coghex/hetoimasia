@@ -84,6 +84,7 @@ import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import qualified Hetoimasia.Runtime.GLFW.Internal.Owner as Private
+import qualified Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff as Private
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision
   ( RuntimeControl
@@ -125,6 +126,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testHandoverRecovery)
     it "leaves no attachment the owner never hears of, however a handover is cancelled"
       (boundedExample testCancelledHandover)
+    it "refuses a delayed announcement of an incarnation the slot has moved past"
+      (boundedExample testStaleAnnouncementRefused)
     it "keeps its retained per-target cells bounded across repeated detach-and-reattach cycles"
       (boundedExample testReattachmentBounded)
 
@@ -169,6 +172,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testUnannouncedDirectAttachSettles)
     it "settles one whose window is then closed, with no release of its own"
       (boundedExample testUnannouncedClosedSettles)
+    it "settles a published attachment whose answer was lost while the owner was closing"
+      (boundedExample testLostAnswerWithClosedOwner)
     it "attaches nothing at all once the owner's admission has ended"
       (boundedExample testHandoverAfterStopAttachesNothing)
     it "retires and destroys the whole owner with no target ever attached"
@@ -201,6 +206,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testRetirementFailsOnce)
     it "keeps every one of them when more targets fail than an arbitrary cap would hold"
       (boundedExample testEveryRetirementFailureRetained)
+    it "honours a cancellation inside construction, target retirement and destruction alike"
+      (boundedExample testCancellationAtEachBackendCall)
     it "waits for a terminal group report however the join is interrupted"
       (boundedExample testJoinAwaitsTerminalReport)
 
@@ -1848,11 +1855,18 @@ testStartupEvidenceRetained ∷ IO ()
 testStartupEvidenceRetained = do
   rig ← newRig
   script (fakeStart (rigFake rig)) (\_ → pure (ownerReady (Text.pack "device 7, queue 2")))
-  duringRun ← newTVarIO Nothing
+  escaped ← newEmptyMVar
   ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
     _ ← awaitRound owner 0
-    atomically . writeTVar duringRun . ownerStartedEvidence =<< atomically (readOwnerTerminalNow owner)
-  readTVarIO duringRun `shouldReturn` Just (Text.pack "device 7, queue 2")
+    putMVar escaped owner
+  -- Read from the owner's own record after it has retired, destroyed and
+  -- ended, rather than from a copy taken while it was running: a retirement
+  -- that cleared the record would pass the second and fail this.
+  owner ← takeMVar escaped
+  terminal ← atomically (readOwnerTerminalNow owner)
+  ownerRunEnded terminal `shouldBe` True
+  ownerDestroyedEvidence terminal `shouldSatisfy` isJust
+  ownerStartedEvidence terminal `shouldBe` Just (Text.pack "device 7, queue 2")
 
 -- | An ordinary public stop closes every publication, and an announcement
 -- admitted just before it is still drained.
@@ -2056,6 +2070,159 @@ testEveryRetirementFailureRetained = do
   readTVarIO keptCount >>= \kept → kept `shouldSatisfy` (>= 12)
   -- And the bound is the configuration's, not a number chosen here.
   retainedFailureBound 12 `shouldSatisfy` (>= 12)
+
+-- | A delayed announcement of an incarnation the window's slot has moved past
+-- is refused, and touches the replacement not at all.
+testStaleAnnouncementRefused ∷ IO ()
+testStaleAnnouncementRefused = do
+  rig ← newRig
+  (admitted, staleStage, owned, laterStage) ←
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      first ← handedOver host owner window
+      _ ← releaseGraphicsTarget host owner first
+      _ ← awaitTerminal owner first
+      pumpUntilRetired host control
+      -- A fresh incarnation now holds the window's slot.
+      later ← handedOver host owner window
+      awaitStanding owner later `shouldReturn` TargetUsable
+      -- The old service, announced now. It names an incarnation the slot has
+      -- moved past, so nothing may be reopened for it.
+      admitted ← announceGraphicsTarget owner first
+      (,,,) admitted
+        <$> atomically (custodyOf owner (graphicsAttachment first))
+        <*> atomically (readOwnerTargets owner)
+        <*> atomically (custodyOf owner (graphicsAttachment later))
+  admitted `shouldBe` EventPortClosed
+  -- The retired incarnation was not reopened, and no ghost target was made.
+  staleStage `shouldSatisfy` (`notElem` [Just CustodyAnnounced, Just CustodyOwned])
+  -- Only the replacement is held, and it is untouched.
+  length owned `shouldBe` 1
+  laterStage `shouldBe` Just CustodyOwned
+
+-- | An attachment whose service was published and whose answer was then lost,
+-- while the owner's admission closed in the same moment, is settled — not
+-- marked settled with nothing recorded.
+--
+-- Certifying a fact is refused for an attachment that is still active, so a
+-- settlement that did not first begin its retirement would leave the ledger
+-- terminal, the facts unrecorded, and the drain waiting for good.
+testLostAnswerWithClosedOwner ∷ IO ()
+testLostAnswerWithClosedOwner = do
+  rig ← newRig
+  closing ← newTVarIO Nothing
+  let hooks =
+        Private.noHostHooks
+          { Private.beforePublication =
+              readTVarIO closing >>= \case
+                Nothing → pure ()
+                Just owner → do
+                  -- The owner's admission ends, and the caller's answer is
+                  -- lost, at the one instant the attachment is published and
+                  -- active.
+                  atomically (Private.closeOwnerPublications (ownerHandoff owner))
+                  myThreadId >>= (`throwTo` ThreadKilled)
+          }
+  (answer, pending, stage) ←
+    ownedHostHooked hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      atomically (writeTVar closing (Just owner))
+      answer ← try (handOverGraphicsTarget host owner window)
+      (,,) (either (const "cancelled") describeHandover (answer ∷ Either SomeException GraphicsHandover))
+        <$> atomically (hostPendingAttachments host)
+        <*> atomically (readOwnerCustody owner)
+  answer `shouldBe` "cancelled"
+  -- Settled for real: nothing is left pending for a drain to wait on, and
+  -- nothing is left in the ledger claiming to be finished.
+  pending `shouldBe` []
+  stage `shouldBe` []
+
+-- | Cancellation is honoured inside each backend call in turn, and releases
+-- nothing early in any of them.
+--
+-- The delivery point is chosen rather than raced: each call signals that it
+-- has been entered and then waits, and the example throws to the owner's own
+-- thread while it is there.
+testCancellationAtEachBackendCall ∷ IO ()
+testCancellationAtEachBackendCall =
+  forM_ [BackendConstruct, BackendRetireTarget, BackendDestroy] $ \at' → do
+    rig ← newRig
+    inside ← newTVarIO False
+    release ← newTVarIO False
+    absorbed ← newTVarIO (0 ∷ Int)
+    releasedEarly ← newTVarIO Nothing
+    -- Saying it has been entered is itself inside the absorbing loop, so a
+    -- cancellation that arrives before the wait is reached is absorbed like
+    -- any other rather than escaping the call the example means to interrupt.
+    let gated ∷ IO a → IO a
+        gated answer = do
+          absorbing absorbed $ do
+            atomically (writeTVar inside True)
+            atomically (readTVar release >>= check)
+          answer
+    case at' of
+      BackendConstruct →
+        script (fakeConstruct (rigFake rig)) $ \start →
+          gated (pure (TargetConstructed (targetEvidence (Text.pack (show (startingWindow start))))))
+      BackendRetireTarget →
+        script (fakeRetireTarget (rigFake rig)) $ \retire →
+          gated (pure (targetRetired (Text.pack (show (retiringWindow retire)))))
+      BackendDestroy →
+        script (fakeDestroy (rigFake rig)) $ \_ → gated (pure (ownerDestroyed (Text.pack "destroyed")))
+    -- The destruction is only ever entered during the exit, when the main
+    -- thread is no longer in the body, so every case delivers from a helper
+    -- rather than from the body itself.
+    let deliver = do
+          atomically (readTVar inside >>= check)
+          ownerThread ← atomically $
+            readTVar (fakeThreads (rigFake rig)) >>= \case
+              thread : _ → pure thread
+              [] → retry
+          -- Delivered twice while the backend call is running, and absorbed
+          -- by the call itself: a cancellation is not permission to abandon
+          -- it.
+          throwTo ownerThread ThreadKilled
+          atomically (readTVar absorbed >>= check . (>= 1))
+          throwTo ownerThread ThreadKilled
+          atomically (readTVar absorbed >>= check . (>= 2))
+          -- Nothing of the host's was released while the call was unfinished.
+          notes ← journalled (rigJournal rig)
+          atomically (writeTVar releasedEarly (Just (filter released notes)))
+          atomically (writeTVar release True)
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      void (forkIO deliver)
+      service ← handedOver host owner window
+      -- The body must not return before a call that happens during the run
+      -- has been entered and interrupted, or the exit would stop the owner
+      -- first and the gate would never be reached at all. The destruction is
+      -- the exception: it is only ever entered during the exit.
+      case at' of
+        BackendConstruct → atomically (readTVar release >>= check)
+        BackendRetireTarget → do
+          void (awaitStanding owner service)
+          _ ← releaseGraphicsTarget host owner service
+          atomically (readTVar release >>= check)
+          _ ← awaitTerminal owner service
+          pumpUntilRetired host control
+        BackendDestroy → void (awaitStanding owner service)
+    readTVarIO releasedEarly >>= \seen → (show at', seen) `shouldBe` (show at', Just [])
+    readTVarIO absorbed >>= \count → count `shouldSatisfy` (>= 2)
+    -- And the exit still completed in dependency order.
+    notes ← journalled (rigJournal rig)
+    ordered notes [OwnerRetirement, OwnerDestruction, SessionEnded]
+  where
+    released = \case
+      WindowGone _ → True
+      SessionEnded → True
+      _ → False
+
+-- | Which backend call an example delivers its cancellation inside.
+data BackendCall
+  = BackendConstruct
+  | BackendRetireTarget
+  | BackendDestroy
+  deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- The extent seam

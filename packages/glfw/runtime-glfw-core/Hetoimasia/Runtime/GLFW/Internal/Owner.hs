@@ -269,6 +269,7 @@ import Hetoimasia.Runtime.GLFW.Internal
   , publishCompletion
   , retirementEnvironmentOf
   , runProtectedWindowApplication
+  , windowGraphicsService
   , withProtectedWindowHostOver
   )
 import Hetoimasia.GLFW.Internal.Attachment (AttachmentPhase (AttachmentRetiring), viewPhase)
@@ -654,6 +655,13 @@ data Stage
     -- told. __The main thread owes its settlement.__ It is the only stage at
     -- which the main thread may settle the attachment itself, because it is
     -- the only one at which no announcement can be in flight.
+  | CustodySettling
+    -- ^ The main thread has claimed this incarnation's settlement and is
+    -- performing it. No announcement may be admitted while it is here, and
+    -- the claim is /retryable/: a settlement that could not complete puts it
+    -- back at 'CustodyRegistered', and one interrupted part-way can be
+    -- claimed again. It becomes 'CustodySettled' only when the facts are
+    -- really recorded.
   | CustodyAnnounced
     -- ^ An announcement was admitted to the lifetime port. __The owner owes
     -- its settlement from this instant__, before it has consumed the event:
@@ -703,8 +711,12 @@ claimSettlement ∷ GraphicsOwner scene → AttachmentId → STM (Maybe Acknowle
 claimSettlement owner target = do
   held ← Map.lookup target <$> readTVar (ownerCustody owner)
   case held of
-    Just custody | custodyStage custody == CustodyRegistered → do
-      advanceCustody owner target CustodySettled
+    -- 'CustodySettling' is claimable too, so a settlement interrupted between
+    -- its claim and its facts can be performed again. Nothing else may be:
+    -- an announced or owned incarnation is the owner's, and a settled one is
+    -- finished.
+    Just custody | custodyStage custody `elem` [CustodyRegistered, CustodySettling] → do
+      advanceCustody owner target CustodySettling
       pure (Just (custodyAcknowledgement custody))
     _ → pure Nothing
 
@@ -734,8 +746,14 @@ data GraphicsOwner scene = GraphicsOwner
     -- the store, because a latch keeps one failure and a drain can produce
     -- several.
   , ownerRetained ∷ !(TVar [ExceptionWithContext SomeException])
-    -- ^ Every failed operation, with the context it propagated with, oldest
-    -- first and bounded by 'retainedOwnerFailures'.
+    -- ^ The failures the owner /survived/ — a target's construction or
+    -- retirement that it caught and carried on from — with the context each
+    -- propagated with, oldest first and bounded by 'retainedFailureBound'.
+    --
+    -- A failure that ended the run is deliberately not here: the worker's own
+    -- outcome carries it, the exit reads that back from the group report, and
+    -- keeping it in both would report the same failure twice. Between the two
+    -- stores every failure is reported exactly once.
   , ownerTargets ∷ !(TVar (Map AttachmentId TargetState))
   , ownerCustody ∷ !(TVar (Map AttachmentId Custody))
   , ownerGeometryCells ∷ !(TVar (Map AttachmentId TargetGeometry))
@@ -2130,19 +2148,51 @@ retireUnannounced host owner service = do
 -- | Settle an attachment the owner never received, naming it by identity, and
 -- answer whether this call was the one that settled it.
 retireStranded ∷ HasCallStack ⇒ WindowHost → GraphicsOwner scene → AttachmentId → IO Bool
-retireStranded host owner target =
+retireStranded host owner target = mask_ $
+  -- Masked from the claim through the facts, so a cancellation cannot leave
+  -- the ledger claimed with nothing recorded. Every step is a finite,
+  -- non-retrying transaction or an owner-thread certification, so nothing
+  -- here can block. The claim is retryable besides, which is what makes that
+  -- belt as well as braces.
   atomically (claimSettlement owner target) >>= \case
     Nothing → pure False
     Just acknowledgement → do
-      forM_ allRetirementFacts (void . certifyGraphicsFact host acknowledgement)
-      -- Forgotten here rather than at some later owner round. Certifying
-      -- every fact retires the attachment, so the host no longer has it
-      -- pending and the entry is owed to nobody; and the owner whose round
-      -- would otherwise prune it may be one that will never take another.
+      -- Its retirement has to have begun before a fact can be recorded at
+      -- all: 'certifyGraphicsFact' refuses one for an attachment that is
+      -- still active. A settlement that ignored that refusal would mark the
+      -- ledger terminal with nothing recorded and stall the drain for good.
+      retiring ← atomically (elem target <$> ownerRetiring owner)
+      unless retiring (beginStrandedRetirement host target)
+      answers ← forM allRetirementFacts (certifyGraphicsFact host acknowledgement)
       atomically $ do
         pending ← ownerPending owner
-        unless (target `elem` pending) (modifyTVar' (ownerCustody owner) (Map.delete target))
-      pure True
+        let gone = target `notElem` pending
+        if gone || all isJust answers
+          then do
+            recordSettled owner target
+            -- Forgotten here rather than at some later owner round: the
+            -- entry is owed to nobody, and the owner whose round would
+            -- otherwise prune it may be one that never takes another.
+            when gone (modifyTVar' (ownerCustody owner) (Map.delete target))
+            pure True
+          else do
+            -- Nothing was recorded, so nothing was settled. It goes back to
+            -- where it was, and the paths that may announce or settle it are
+            -- free to try again.
+            advanceCustody owner target CustodyRegistered
+            pure False
+
+-- | Begin the retirement of an attachment nobody has begun, so its facts can
+-- be recorded.
+--
+-- The service is asked of the host rather than held, because an attachment
+-- whose answer was lost has one the caller never received. An incarnation the
+-- window's slot has moved past is not this one and is left alone.
+beginStrandedRetirement ∷ HasCallStack ⇒ WindowHost → AttachmentId → IO ()
+beginStrandedRetirement host target =
+  atomically (windowGraphicsService host (attachmentWindow target)) >>= \case
+    Just service | graphicsAttachment service == target → void (detachWindowGraphics host service)
+    _ → pure ()
 
 -- | Forget every ledger entry this window left behind that names no
 -- attachment the host still has pending and no target the owner holds.
