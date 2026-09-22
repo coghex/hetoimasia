@@ -748,6 +748,34 @@ custodyAcknowledgementOf owner target =
   fmap custodyAcknowledgement . Map.lookup target <$> readTVar (ownerCustody owner)
 
 -- ---------------------------------------------------------------------------
+-- The latched failure
+
+-- | The first failure the owner found, and where it is also kept.
+--
+-- The latch is notification and never evidence, so every failure it holds is
+-- kept somewhere else as well. Which somewhere is what the exit needs: once
+-- the supervision sentinel has raised the latch at an application checkpoint,
+-- the exit has to leave out the one store entry that is the same failure, and
+-- report every other one.
+data Latched = Latched
+  { latchedSource ∷ !LatchSource
+  , latchedFailure ∷ !(ExceptionWithContext SomeException)
+  }
+
+-- | Where a latched failure is also kept.
+data LatchSource
+  = LatchedWhileRunning
+    -- ^ A target's construction or retirement the owner caught and carried on
+    -- from. It is also the /first/ entry of 'ownerRetained': 'retainFailure'
+    -- latches only when nothing is latched yet, and appends in the same
+    -- transaction, so the failure that latched is the first one retained.
+  | LatchedByRunEnd
+    -- ^ The failure that ended the run. It is carried by the worker's own
+    -- outcome, with everything the drain contributed retained beside it, and
+    -- 'ownerRetained' is empty — any retained failure would have latched
+    -- first and left this one unlatched.
+
+-- ---------------------------------------------------------------------------
 -- The owner handle
 
 -- | One running supervised graphics owner.
@@ -758,11 +786,16 @@ data GraphicsOwner scene = GraphicsOwner
   { ownerHandoff' ∷ !(OwnerHandoff scene)
   , ownerWorkerHandle ∷ !(Worker ())
   , ownerGroup ∷ !WorkerGroup
-  , ownerLatch ∷ !(TVar (Maybe (ExceptionWithContext SomeException)))
+  , ownerLatch ∷ !(TVar (Maybe Latched))
     -- ^ The first failure, for /notification/: it is what the supervision
-    -- sentinel waits on and what the exit re-raises. It is deliberately not
-    -- the store, because a latch keeps one failure and a drain can produce
-    -- several.
+    -- sentinel waits on. It is deliberately not the store, because a latch
+    -- keeps one failure and a drain can produce several, and it records
+    -- /where/ that failure is also kept so the exit can tell whether it has
+    -- already been reported.
+  , ownerDelivered ∷ !(TVar Bool)
+    -- ^ Whether the supervision sentinel has raised the latched failure at
+    -- the application's own checkpoint. From that moment the runtime owns
+    -- reporting it, and the exit must not report it a second time.
   , ownerRetained ∷ !(TVar [ExceptionWithContext SomeException])
     -- ^ The failures the owner /survived/ — a target's construction or
     -- retirement that it caught and carried on from — with the context each
@@ -844,7 +877,7 @@ readTargetStanding owner target =
 -- | The terminal owner failure, latched as soon as it was known. It is the
 -- notification, not the evidence: 'readOwnerFailures' is the evidence.
 readOwnerFailure ∷ GraphicsOwner scene → STM (Maybe (ExceptionWithContext SomeException))
-readOwnerFailure = readTVar . ownerLatch
+readOwnerFailure owner = fmap latchedFailure <$> readTVar (ownerLatch owner)
 
 -- | Every failure the owner retained, oldest first.
 readOwnerFailures ∷ GraphicsOwner scene → STM [ExceptionWithContext SomeException]
@@ -965,6 +998,7 @@ startGraphicsOwner group host config publish = do
       (max 1 (ownerEventCapacity config))
       (ownerScene config)
   latch ← newTVarIO Nothing
+  delivered ← newTVarIO False
   retained ← newTVarIO []
   targets ← newTVarIO Map.empty
   custody ← newTVarIO Map.empty
@@ -978,6 +1012,7 @@ startGraphicsOwner group host config publish = do
           worker
           group
           latch
+          delivered
           retained
           targets
           custody
@@ -1063,7 +1098,7 @@ latchFailure owner = \case
   Left failure@(ExceptionWithContext _ exception) → atomically $ do
     unless (isAsynchronous exception) $ do
       held ← readTVar (ownerLatch owner)
-      when (isNothing held) (writeTVar (ownerLatch owner) (Just failure))
+      when (isNothing held) (writeTVar (ownerLatch owner) (Just (Latched LatchedByRunEnd failure)))
     -- Every publication into the handoff, not only the lifetime port: an
     -- owner that has ended reads none of them again, and a publisher told its
     -- demand or its scene was accepted by one would be told a falsehood.
@@ -1591,7 +1626,7 @@ retainFailure owner failure@(ExceptionWithContext _ exception)
         -- because a drain that failed three operations has three things to
         -- report and a latch would keep one.
         held ← readTVar (ownerLatch owner)
-        when (isNothing held) (writeTVar (ownerLatch owner) (Just failure))
+        when (isNothing held) (writeTVar (ownerLatch owner) (Just (Latched LatchedWhileRunning failure)))
         modifyTVar' (ownerRetained owner) (\kept → take (ownerRetainedLimit owner) (kept <> [failure]))
         -- Terminal for a required owner, so the admission it affects closes
         -- here rather than at the exit: no further target may be handed to an
@@ -1764,7 +1799,13 @@ superviseGraphicsOwner control owner = startSupervised control policy definition
               held ← readTVar (ownerLatch owner)
               stopping ← stopRequested token
               check (isJust held || stopping)
-              pure held
+              -- Recorded in the same transaction that takes it, so the exit
+              -- can never read a latch this sentinel is about to raise and
+              -- conclude that nobody has. From here the runtime owns
+              -- reporting that failure at the application's own checkpoint,
+              -- and the exit leaves it out of what it raises.
+              when (isJust held) (writeTVar (ownerDelivered owner) True)
+              pure (latchedFailure <$> held)
             traverse_ rethrowIO latched
         )
 
@@ -1800,13 +1841,36 @@ finishOwnerExit restore logger host owner = do
   -- with, and last the cancellations the join absorbed. Each is raised only
   -- now, after the join.
   kept ← readTVarIO (ownerRetained owner)
-  -- The latch is deliberately absent. It is notification — what the
+  -- The latch itself is deliberately absent. It is notification — what the
   -- supervision sentinel waits on — and every failure it can hold is already
-  -- in exactly one of the two stores beside it: a target failure the owner
-  -- caught is in the retained store, and one that ended its run is in the
-  -- worker's own outcome. Raising it here as well would report a single
-  -- failure twice, once as the primary and once as retained cleanup.
-  case awaited <> kept <> drainFailuresOf report <> interrupted of
+  -- in exactly one of the stores beside it, so raising it here as well would
+  -- report a single failed operation twice.
+  --
+  -- That is only half of it, because the sentinel raises the latch at the
+  -- application's own checkpoint, where it becomes the composition's primary
+  -- failure. Once it has, the store entry that is that same failure has
+  -- already been reported and this exit must leave it out — while still
+  -- reporting every failure the sentinel did not raise.
+  delivered ← readTVarIO (ownerDelivered owner)
+  latched ← readTVarIO (ownerLatch owner)
+  (survived, fromWorker) ← case (delivered, latchedSource <$> latched) of
+    (True, Just LatchedWhileRunning) →
+      -- The first retained failure is the one the sentinel raised, and the
+      -- rest are still this exit's to report. The worker's outcome is
+      -- untouched: that latch ended the run without a failure of its own, so
+      -- the outcome carries only what the drain found.
+      pure (drop 1 kept, drainFailuresOf report)
+    (True, Just LatchedByRunEnd) →
+      -- The sentinel raised the failure that ended the run, which is exactly
+      -- what the worker's outcome carries, so this exit reports none of that
+      -- outcome. Nothing distinct is lost with it: whatever the drain found
+      -- is retained inside that same outcome, and the group's own scope —
+      -- which closes after this exit, outside the protected host lifetime —
+      -- reports it there. Re-raising it here would retain a second copy of
+      -- each, under a fresh identity that inspection cannot fold together.
+      pure (kept, [])
+    _ → pure (kept, drainFailuresOf report)
+  case awaited <> survived <> fromWorker <> interrupted of
     [] → pure ()
     primary : rest → raiseRetainingOwner primary rest
 

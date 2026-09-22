@@ -3968,6 +3968,22 @@ its run is in the worker's own outcome — so raising it as well would report a
 single failed operation twice, once as the exit's primary and once as its
 retained cleanup, and invent a second failure that never happened.
 
+That is only half of it, because `superviseGraphicsOwner` raises the latched
+failure at the application's own checkpoint, where it becomes the
+composition's primary failure. The latch therefore records *where* its failure
+is also kept, the sentinel records that it delivered, and the exit leaves out
+the one store entry that is that same failure:
+
+| The latch came from | What the exit leaves out once the sentinel has delivered |
+|---|---|
+| A target failure the owner survived | The first entry of `readOwnerFailures`, which is that failure — `retainFailure` latches only when nothing is latched yet and appends in the same transaction. Every later retained failure is still reported. |
+| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
+
+Re-raising either would retain a second copy under a fresh identity that
+inspection cannot fold together with the first. A composition that registers
+no sentinel is unaffected: nothing else reports the latched failure, so the
+exit reports all of it.
+
 How many the store keeps is derived from the host's own window limit rather
 than chosen, since one retirement round can offer an operation for every
 window the host may hold live and every one of them can fail; a chosen number
@@ -4096,7 +4112,10 @@ retirement manufacturing no evidence and never being offered again, and the
 destruction retaining everything until independent evidence arrives; a
 failure the owner retained while it ran, and one that escaped its run, each
 appearing exactly once across the exit's primary and every cleanup failure
-retained beside it; a handover the host quiesces under, at exactly the
+retained beside it, and the same two in the production composition — with
+`superviseGraphicsOwner` registered, so the sentinel raises the failure at a
+checkpoint first — still appearing once while a distinct drain failure beside
+them is not swallowed; a handover the host quiesces under, at exactly the
 handoff between construction and publication, answering `HandoverSuperseded`
 with its attachment retired and no acknowledgement kept; six handovers
 cancelled at that same handoff, leaving no attachment the owner lacks an

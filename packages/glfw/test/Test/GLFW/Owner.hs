@@ -222,6 +222,10 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testRetainedFailureReportedOnce)
     it "reports one that escaped its run exactly once as well"
       (boundedExample testEscapingRunFailureReportedOnce)
+    it "reports a supervised owner failure once, though the sentinel raised it at a checkpoint"
+      (boundedExample testSupervisedFailureReportedOnce)
+    it "reports a supervised failure it survived once as well"
+      (boundedExample testSupervisedRetainedFailureReportedOnce)
     it "waits for a terminal group report however the join is interrupted"
       (boundedExample testJoinAwaitsTerminalReport)
 
@@ -2504,6 +2508,81 @@ testEscapingRunFailureReportedOnce = do
   caught ← raisedBy outcome
   fromException caught `shouldBe` Just (Scripted (Text.pack "body"))
   occurrencesOf (Scripted (Text.pack "step")) caught `shouldBe` 1
+
+-- | The production composition reports a supervised owner failure exactly
+-- once: the sentinel raises it at the application's checkpoint, and the exit
+-- does not raise it again.
+--
+-- This is the shape a real application has, and the one the two examples
+-- above cannot reach: without 'superviseGraphicsOwner' the exit is the only
+-- reporter and nothing can duplicate. With it, the latched failure has a
+-- designated reporter, and everything the exit still owes — each distinct
+-- failure the drain found — has to survive that.
+testSupervisedFailureReportedOnce ∷ IO ()
+testSupervisedFailureReportedOnce = do
+  rig ← newRig
+  failing ← newTVarIO False
+  -- The step fails only once the example says so, so the sentinel is
+  -- certainly registered before the failure it must deliver exists.
+  script (fakeStep (rigFake rig)) $ \_ →
+    readTVarIO failing >>= \doomed →
+      if doomed then throwIO (Scripted (Text.pack "fatal step")) else pure noStepWork
+  -- A distinct failure in the drain, which the worker's outcome retains
+  -- beside the run's own. It must still be reported exactly once, which is
+  -- what makes this more than "drop the worker's outcome".
+  script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_host owner control → do
+    started ← superviseGraphicsOwner control owner
+    case started of
+      WorkerStarted _ → pure ()
+      other → unexpected ("the sentinel did not start: " <> describeStart other)
+    atomically (writeTVar failing True)
+    -- Immediate demand wakes the idle owner into the step that fails.
+    demand ← prepare (OwnerDemand True Nothing)
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
+    atomically (readOwnerFailure owner >>= check . isJust)
+    -- The checkpoint is where the sentinel's failure reaches the application,
+    -- and from there it is the composition's primary failure.
+    checkRuntime control
+  caught ← raisedBy outcome
+  fromException caught `shouldBe` Just (Scripted (Text.pack "fatal step"))
+  -- Once over the primary and every cleanup failure retained beside it.
+  occurrencesOf (Scripted (Text.pack "fatal step")) caught `shouldBe` 1
+  -- And the drain's own failure, which nothing else reported, is still there
+  -- exactly once: suppressing the duplicate may not swallow a distinct one.
+  occurrencesOf (Scripted (Text.pack "retire owner")) caught `shouldBe` 1
+
+-- | A supervised failure the owner /survived/ is reported exactly once too.
+--
+-- It latches from the retained store rather than from the run's end, which is
+-- the other source the exit has to account for.
+testSupervisedRetainedFailureReportedOnce ∷ IO ()
+testSupervisedRetainedFailureReportedOnce = do
+  rig ← newRig
+  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    started ← superviseGraphicsOwner control owner
+    case started of
+      WorkerStarted _ → pure ()
+      other → unexpected ("the sentinel did not start: " <> describeStart other)
+    window ← theWindow host
+    service ← handedOver host owner window
+    awaitStanding owner service `shouldReturn` TargetUsable
+    _ ← releaseGraphicsTarget host owner service
+    atomically (readOwnerFailure owner >>= check . isJust)
+    -- Nothing offers the failed retirement again, so independent evidence is
+    -- what retires the attachment and lets this exit finish at all.
+    publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+    acknowledgement ←
+      atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+        >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+    forM_ allRetirementFacts $ \fact →
+      void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+    pumpUntilRetired host control
+    checkRuntime control
+  caught ← raisedBy outcome
+  fromException caught `shouldBe` Just (Scripted (Text.pack "retire target"))
+  occurrencesOf (Scripted (Text.pack "retire target")) caught `shouldBe` 1
 
 -- | The failure a caught run raised, failing the example if it returned.
 raisedBy ∷ Either SomeException a → IO SomeException
