@@ -1,9 +1,18 @@
 # The VK-4 provisioned native Vulkan compatibility record, macOS
 
-Everything below the heading is `tools/vulkan-proof/run-proof.sh`'s own output,
-unedited; only the heading it printed is replaced by this one, because this is
-not the VK-2 record. That record — [macos.md](macos.md) — stays exactly as it
-was, and this is retained beside it.
+> **Editorial context, added when this record was retained.** Everything from
+> the heading down to the "Captured record" marker below is written by hand and
+> is not part of the captured evidence. The harness's own output begins at that
+> marker and is unedited from there; the only change made to it is that the
+> heading `tools/vulkan-proof/proof/Test/Vulkan/Proof/Record.hs` printed is
+> replaced by the one above, because this is not the VK-2 record.
+>
+> The `source digest` the captured record names is the harness tree the run was
+> produced from, not this file's commit — evidence exists before it can be
+> retained, and a later prose-only edit under `tools/vulkan-proof/` moves that
+> digest without moving anything the run depended on. What qualifies the prefix
+> is the *recipe fingerprint*, `b777e58594368d…`, which is unchanged by any of
+> this and is the one `tools/ci-image/descriptor.json` names.
 
 What makes this a separate record is what the proof consumed. VK-2 ran against
 the machine's LunarG loader found by an rpath from a generated project file, and
@@ -42,6 +51,8 @@ prefix's own identity — so each earlier record qualifies a configuration this
 recipe would now refuse, which is not evidence about the delivered one. The
 human approved this session separately, for this run alone, as they did each
 earlier one.
+
+## Captured record
 
 Verdict: **pass**.
 

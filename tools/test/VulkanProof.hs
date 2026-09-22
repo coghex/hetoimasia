@@ -43,6 +43,11 @@ retainedRecords = [("macOS", "docs/vulkan/macos.md"), ("Linux", "docs/vulkan/lin
 -- A second pair rather than a revision of the first: they consumed different
 -- files by a different discovery route, so the VK-2 pair stays exactly as it
 -- was and these are retained beside it.
+-- | Where a retained record stops being this repository's prose and starts
+-- being what the harness printed.
+capturedMarker ∷ String
+capturedMarker = "## Captured record"
+
 provisionedRecords ∷ [(String, FilePath)]
 provisionedRecords =
   [("macOS", "docs/vulkan/macos-provisioned.md"), ("Linux", "docs/vulkan/linux-provisioned.md")]
@@ -230,6 +235,24 @@ spec = describe "The Vulkan proof boundary" $ do
           -- so neither can be mistaken for the other by its heading alone.
           take 1 (lines record)
             `shouldBe` ["# The VK-4 provisioned native Vulkan compatibility record, " <> platform]
+          -- The retained file is a captured record with context written above
+          -- it, and a reader has to be able to tell which is which. The harness
+          -- prints its verdict directly under the heading it generates, so the
+          -- marker must sit immediately before that verdict and nowhere else:
+          -- anything above is this repository's narration, everything below is
+          -- what the run actually said.
+          let marked = [number | (number, line) ← zip [0 ∷ Int ..] (lines record), line == capturedMarker]
+          case marked of
+            [only] →
+              take 1 (dropWhile null (drop (only + 1) (lines record)))
+                `shouldBe` ["Verdict: **pass**."]
+            _ →
+              expectationFailure
+                ( platform
+                    <> "'s provisioned record marks its captured output "
+                    <> show (length marked)
+                    <> " times, not once"
+                )
           -- Every Vulkan path it consumed came from the provisioned prefix.
           case settingOf record "- VK_DRIVER_FILES:" of
             Nothing → expectationFailure (platform <> "'s provisioned record names no driver manifest")

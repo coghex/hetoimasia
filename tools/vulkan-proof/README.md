@@ -24,9 +24,11 @@ library; its only component is a test suite, and the only project file that
 names the package is the repository's `cabal.project.vulkan`. Neither
 `cabal.project` nor `cabal.project.cpu` lists it, so neither
 `cabal build all` nor `cabal build all --project-file cabal.project.cpu`
-resolves or links the Vulkan binding, and the mandatory validation floor keeps
-running on a CI image with no loader. `tools/test/VulkanProof.hs` holds the
-examples that keep the rest of that boundary honest.
+resolves or links the Vulkan binding. That used to be proved for free, because
+the floor ran on a CI image with no loader at all; VK-4 provisioned one, so
+`tools/test/VulkanProof.hs` now asserts it directly — reading every package
+those two project files name and requiring that none depends on the binding —
+and holds the rest of that boundary honest besides.
 
 ## How it is arranged
 

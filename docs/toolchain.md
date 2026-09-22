@@ -239,10 +239,14 @@ docker run --rm hetoimasia-binding-qualification
 checkout inside it to ask, only the handful of files the recipe copies.
 
 That container is not the CI image and nothing published depends on it. It
-carries `libvulkan-dev`, which is exactly the input the CI image must not gain
-until VK-4 provisions it deliberately; keeping the two recipes separate is what
-lets this slice prove the binding without changing what every validation worker
-pulls.
+carries its own `libvulkan-dev`, which was the whole reason to keep it separate:
+at the time, that was exactly the input the CI image was not to gain until VK-4
+provisioned one deliberately, so this slice could prove the binding without
+changing what every validation worker pulled. VK-4 has since provisioned a
+qualified Vulkan runtime into the image itself, pinned by digest. The separation
+still earns its keep for a narrower reason — this container answers whether the
+pinned binding compiles against the pinned compiler, on inputs of its own, and
+is not evidence about what the image carries.
 
 Its inputs are pinned so a rebuild qualifies against the same thing: the base
 image by digest, the distribution packages by an Ubuntu archive snapshot, the

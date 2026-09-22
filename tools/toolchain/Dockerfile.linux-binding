@@ -43,8 +43,11 @@ ENV HETOIMASIA_QUALIFICATION_REVISION=${SOURCE_REVISION} \
 
 # The C build prerequisites and GHC's bindist dependencies, plus the Vulkan
 # loader and headers the binding's `pkgconfig-depends: vulkan` needs on Linux.
-# The loader package is what makes this a Vulkan container rather than the CI
-# image, and is exactly what must not be added there.
+# The loader package is what made this a Vulkan container rather than the CI
+# image, back when the image was to gain none until VK-4 provisioned one. It has
+# since done so, from its own pinned and digest-qualified packages; these are
+# this container's, they are not those, and neither says anything about the
+# other.
 # Nothing here comes from a mutable archive, including the trust material.
 #
 # `snapshot.ubuntu.com` redirects to HTTPS and this base image ships no CA
