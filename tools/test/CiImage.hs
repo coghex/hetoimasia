@@ -1413,6 +1413,29 @@ data Worker = Worker
   , workerVulkan ∷ [(String, String)]
   }
 
+-- | The Linux packages the Vulkan pin names, with the revision it pins each to.
+--
+-- Read out of the pin rather than restated here, so a package added to it is
+-- answered for by the fixture's dpkg without anyone remembering to add it.
+-- Empty off Linux, where the recipe pins digests instead of packages.
+linuxPinnedPackages ∷ Fixture → IO [(String, String)]
+linuxPinnedPackages fixture = do
+  (result, output, errors) ←
+    pythonIn
+      fixture
+      [ "-c"
+      , unlines
+          [ "import platform, sys"
+          , "sys.path.insert(0, sys.argv[1])"
+          , "import vulkan"
+          , "for package in vulkan.pinned_inputs(platform.system(), vulkan.read_pin())['packages']:"
+          , "    print(package['name'], package['version'])"
+          ]
+      , checkout fixture </> "tools/native"
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure [(name, version) | line ← lines output, [name, version] ← [words line]]
+
 -- | Every toolchain entry the prefix itself yields, as the recipe spells them.
 --
 -- Read through the recipe rather than restated here: the planner, the image,
@@ -1451,17 +1474,24 @@ withWorker action = withFixture $ \fixture → do
   writeFile (stubs </> "cabal-version") "3.18.1.0\n"
   writeFile (stubs </> "weston-version") (pinnedCompositor ++ "\n")
   writeFile (stubs </> "store") (image </> "cabal/store\n")
-  -- dpkg answers for the compositor the container actually installed, and
-  -- reports it absent once the file standing in for that installation is gone.
+  -- dpkg answers per package, for the compositor and for each Vulkan package
+  -- the recipe pins, and reports one absent once the file standing in for its
+  -- installation is gone. Answering every query with one version would let a
+  -- worker that checks several packages pass while reading the same one back
+  -- each time — which is exactly what it did until Linux said so.
+  pinnedPackages ← linuxPinnedPackages fixture
+  forM_ pinnedPackages $ \(name, version) → writeFile (stubs </> (name ++ "-version")) (version ++ "\n")
   executableFile
     (stubs </> "dpkg-query")
     ( unlines
         [ "#!/bin/sh"
-        , "if [ ! -f '" ++ stubs </> "weston-version" ++ "' ]; then"
-        , "  echo 'dpkg-query: no packages found matching weston' >&2"
+        , "for argument in \"$@\"; do package=\"$argument\"; done"
+        , "answer='" ++ stubs ++ "'/\"$package\"-version"
+        , "if [ ! -f \"$answer\" ]; then"
+        , "  echo \"dpkg-query: no packages found matching $package\" >&2"
         , "  exit 1"
         , "fi"
-        , "cat '" ++ stubs </> "weston-version" ++ "'"
+        , "cat \"$answer\""
         ]
     )
   executableFile (stubs </> "ghc") ("#!/bin/sh\ncat '" ++ stubs </> "ghc-version" ++ "'\n")
