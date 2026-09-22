@@ -8,6 +8,7 @@
 module Test.MacOS.Limits (spec) where
 
 import Control.Monad (unless, void)
+import Data.Word (Word64, Word8)
 import Test.Hspec
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
@@ -76,13 +77,44 @@ spec = describe "enforced limits" $ do
       Just observed → do
         reports ← completeReports launched
         observed `shouldBe` ExitedWith 0
-        [mib | Ceiling mib ← reports] `shouldSatisfy` (not . null)
+        payloads reports `shouldBe` expectedPayloads
+        ceilings reports `shouldBe` [(expectedLuaBytes, expectedNativeBytes, expectedTotalBytes)]
         putStrLn
-          ( "      proved: unlimited, the same workload held "
-              <> show (lastHeld reports)
-              <> " MiB and reached its own ceiling, which is above the "
+          ( "      proved: unlimited, the same workload retained "
+              <> showPayload expectedLuaBytes
+              <> " of Lua payload and "
+              <> showPayload expectedNativeBytes
+              <> " of native payload ("
+              <> showPayload expectedTotalBytes
+              <> " total) and reached its own ceiling, which is above the "
               <> show admittedMiB
-              <> " MiB cap the next example installs"
+              <> " MiB cap the later example installs"
+          )
+
+  it "retains every completed step's native buffer, still live and distinct, at the ceiling" $ \fixture → do
+    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" 0
+    ready ← awaitReady launched guardMicroseconds
+    ready `shouldBe` True
+    status ← awaitExitWithin launched memoryGuardMicroseconds
+    case status of
+      Nothing → do
+        void (sendSignal launched sigKILL)
+        void (awaitExit launched)
+        expectationFailure "the retention workload never finished"
+      Just observed → do
+        reports ← completeReports launched
+        observed `shouldBe` ExitedWith 0
+        -- One reading, taken after a major collection, of every native buffer
+        -- still live. The expected bytes are the workload's own step pattern,
+        -- not a total read off the held counter.
+        [(count, each, fills, sums) | Retained count each fills sums ← reports]
+          `shouldBe` [(stepCount, nativeStepBytes, expectedFills, expectedSums)]
+        putStrLn
+          ( "      proved: after a major collection, one ceiling reading found "
+              <> show stepCount
+              <> " simultaneously live native buffers, oldest step first, each "
+              <> show nativeStepBytes
+              <> " materialized bytes and each a distinct fill, including the earliest step. This is not the held counter."
           )
 
   it "terminates the helper when its whole-process footprint crosses the installed cap" $ \fixture → do
@@ -101,23 +133,27 @@ spec = describe "enforced limits" $ do
         -- The cap is fatal, so the violation is a kill the parent observes; it
         -- is never reported to the child as a failed allocation it could catch.
         observed `shouldBe` Signalled 9
-        [mib | Ceiling mib ← reports] `shouldBe` []
+        [() | Ceiling _ _ _ ← reports] `shouldBe` []
         gone ← processGone (launchedPid launched)
         gone `shouldBe` True
-        let (footprint, virtualSize) = lastFootprint reports
+        let (lua, native, total) = lastPayload reports
+            (footprint, virtualSize) = lastFootprint reports
         putStrLn
           ( "      proved: with a "
               <> show admittedMiB
-              <> " MiB cap the helper was killed by signal 9 after holding "
-              <> show (lastHeld reports)
-              <> " MiB, before its own "
+              <> " MiB cap the helper was killed by signal 9. The last complete report, before termination, was "
+              <> showPayload lua
+              <> " of Lua payload and "
+              <> showPayload native
+              <> " of native payload ("
+              <> showPayload total
+              <> " total). That is a pre-termination observation, not a measurement at the kill. It was before the workload's own "
               <> show ceilingMiB
-              <> " MiB ceiling and before the external guard; the ledger is the physical"
-              <> " footprint ("
+              <> " MiB ceiling and before the external guard. The ledger is the physical footprint ("
               <> showMiB footprint
               <> " MiB last reported), not address space ("
               <> showMiB virtualSize
-              <> " MiB reserved by the threaded RTS)"
+              <> " MiB reserved by the threaded RTS) and not the payload counter."
           )
 
   it "records that no public address-space limit could have been installed instead" $ \fixture →
@@ -188,10 +224,59 @@ completeReports launched = do
   unless complete (expectationFailure "the helper ended but its output never reached end of file")
   collectReports launched
 
-lastHeld ∷ [Report] → Int
-lastHeld reports = case reverse [mib | Held mib ← reports] of
-  [] → 0
+-- | Payload of one completed step, in bytes. Lua is the string
+-- 'hmp_grow_step' retains; native is the helper's buffer. Neither is read
+-- from the helper's counter, and neither is the process footprint.
+luaStepBytes ∷ Word64
+luaStepBytes = 8 * 1024 * 1024
+
+nativeStepBytes ∷ Word64
+nativeStepBytes = 8 * 1024 * 1024
+
+-- | The ceiling 'helperArguments' passes, in bytes.
+ceilingBytes ∷ Word64
+ceilingBytes = 256 * 1024 * 1024
+
+stepCount ∷ Int
+stepCount = fromIntegral (ceilingBytes `div` (luaStepBytes + nativeStepBytes))
+
+expectedLuaBytes ∷ Word64
+expectedLuaBytes = fromIntegral stepCount * luaStepBytes
+
+expectedNativeBytes ∷ Word64
+expectedNativeBytes = fromIntegral stepCount * nativeStepBytes
+
+expectedTotalBytes ∷ Word64
+expectedTotalBytes = expectedLuaBytes + expectedNativeBytes
+
+expectedPayloads ∷ [(Word64, Word64, Word64)]
+expectedPayloads =
+  [ (k * luaStepBytes, k * nativeStepBytes, k * (luaStepBytes + nativeStepBytes))
+  | k ← [1 .. fromIntegral stepCount]
+  ]
+
+-- | Fill byte of step 1, then step 2, and so on. Step 0 is not a step, so the
+-- earliest retained buffer is fill 1.
+expectedFills ∷ [Word8]
+expectedFills = [1 .. fromIntegral stepCount]
+
+expectedSums ∷ [Word64]
+expectedSums = [fromIntegral fill * nativeStepBytes | fill ← expectedFills]
+
+payloads ∷ [Report] → [(Word64, Word64, Word64)]
+payloads reports = [(lua, native, total) | Held lua native total ← reports]
+
+ceilings ∷ [Report] → [(Word64, Word64, Word64)]
+ceilings reports = [(lua, native, total) | Ceiling lua native total ← reports]
+
+lastPayload ∷ [Report] → (Word64, Word64, Word64)
+lastPayload reports = case reverse (payloads reports) of
+  [] → (0, 0, 0)
   (latest : _) → latest
+
+showPayload ∷ Word64 → String
+showPayload bytes =
+  show (bytes `div` (1024 * 1024)) <> " MiB (" <> show bytes <> " bytes)"
 
 lastFootprint ∷ [Report] → (Integer, Integer)
 lastFootprint reports = case reverse [(a, b) | Footprint a b ← reports] of
