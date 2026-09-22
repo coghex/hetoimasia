@@ -7,12 +7,19 @@
 > heading `tools/vulkan-proof/proof/Test/Vulkan/Proof/Record.hs` printed is
 > replaced by the one above, because this is not the VK-2 record.
 >
-> The `source digest` the captured record names is the harness tree the run was
+> Three identities are easy to confuse here, so they are named apart. The
+> `source digest` the captured record prints is the *harness* tree a run was
 > produced from, not this file's commit — evidence exists before it can be
-> retained, and a later prose-only edit under `tools/vulkan-proof/` moves that
-> digest without moving anything the run depended on. What qualifies the prefix
-> is the *recipe fingerprint*, `b777e58594368d…`, which is unchanged by any of
-> this and is the one `tools/ci-image/descriptor.json` names.
+> retained, and a later prose-only edit under `tools/vulkan-proof/` moves it
+> without moving anything the run depended on. What the prefix's own manifest is
+> checked against is the **native recipe fingerprint**, which
+> `python3 tools/native/native.py fingerprint` prints and which covers
+> `glfw.pin`, `native.py`, `vulkan.pin`, `vulkan.py` and the tracked patches;
+> at this head it is `9c853ae239e4ff…`. The **image recipe fingerprint**,
+> `b777e58594368d…`, is a third thing: `tools/validation/ci_image.py` computes
+> it over the whole image recipe and `tools/ci-image/descriptor.json` names it.
+> It binds the published Linux image and has no bearing on this record at all:
+> no image qualifies a local macOS prefix.
 
 What makes this a separate record is what the proof consumed. VK-2 ran against
 the machine's LunarG loader found by an rpath from a generated project file, and
