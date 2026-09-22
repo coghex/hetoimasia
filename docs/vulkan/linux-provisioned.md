@@ -26,9 +26,9 @@ names, so the record and the descriptor can be compared directly:
 | Layer | `VK_LAYER_KHRONOS_validation` `1.3.275`, binary `1d486283e4ce` |
 | glslang | `15.1.0`, `96ea85d4228d` |
 
-Those are the identities the pin now names by digest rather than by package
-revision alone, and this run is the first in which every one of them was
-qualified against its pinned digest before the prefix was provisioned.
+Those are the identities the pin names by digest rather than by package
+revision alone, and every one of them was qualified against its pinned digest
+before the prefix was provisioned.
 
 `tools/display/x11.sh` supplied the isolated display's own consent, as it does
 for every group that needs a display. No desktop session was entered.
@@ -49,8 +49,8 @@ HETOIMASIA_NATIVE_SESSION=isolated-x11::0 \
 
 ## The environment
 
-- source digest: 3ff1b073a8a6c07a59566f97e86d6ee02ef6bb768ab87f7e9a5cb795bc60f2fe
-- repository revision: ace0029389832ebde58953b329862a123cadb945
+- source digest: 1377370d5575f106cbb8d1ae01bfaece1d223ed025f2f0408dc653124e5920d7
+- repository revision: 0396905ff3a96b04666971ea54af641e8734e87c
 - platform: linux/x86_64
 - session authorization: the isolated X11 display :0
 - VK_DRIVER_FILES: /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
@@ -69,11 +69,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x00007f86b03b23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x00007f86b03b23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x00007f86b03b2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- GLFW's vkCreateDevice: 0x00007f86b03b2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- a device-level entry point: 0x00007f868e3ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+- the binding's vkGetInstanceProcAddr: 0x00007f9abeba23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x00007f9abeba23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x00007f9abeba2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- GLFW's vkCreateDevice: 0x00007f9abeba2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- a device-level entry point: 0x00007f9a9a3ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
 - device API version: 1.4.318
 - driver: llvmpipe (DRIVER_ID_MESA_LLVMPIPE)
@@ -111,11 +111,11 @@ driver. What the driver supplied for those is the fence evidence beside them.
 
 | frame | image | slot | acquire | render fence | present | present fence before wait | present fence | retired on |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
-| 1 | 1 | slot 1 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
-| 2 | 2 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
-| 3 | 3 | slot 1 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
-| 4 | 0 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
+| 0 | 0 | slot 0 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 1 | 1 | slot 1 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 2 | 2 | slot 0 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 3 | 3 | slot 1 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 4 | 0 | slot 0 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
 
 - semaphore pool size: 2
 - frames presented: 5
@@ -228,23 +228,23 @@ such; no device loss was induced.
 ```
 ## The environment
 implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-proving repository revision ace0029389832ebde58953b329862a123cadb945
-proving source digest 3ff1b073a8a6c07a59566f97e86d6ee02ef6bb768ab87f7e9a5cb795bc60f2fe
+proving repository revision 0396905ff3a96b04666971ea54af641e8734e87c
+proving source digest 1377370d5575f106cbb8d1ae01bfaece1d223ed025f2f0408dc653124e5920d7
 VK_DRIVER_FILES = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
 VK_LAYER_PATH = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x00007f86b03b23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-GLFW resolves the same name to 0x00007f86b03b23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+the binding dispatches through 0x00007f9abeba23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x00007f9abeba23d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_KHR_xcb_surface
 ## The instance
 the loader reports instance version 1.3.275
-the binding resolves vkCreateDevice to 0x00007f86b03b2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x00007f86b03b2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+the binding resolves vkCreateDevice to 0x00007f9abeba2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x00007f9abeba2090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
 ## The window and its surface
 ## The device profile
 llvmpipe (LLVM 20.1.2, 256 bits) advertises Vulkan 1.4.318
 selected llvmpipe (LLVM 20.1.2, 256 bits), advertising Vulkan 1.4.318
-the binding dispatches image release through 0x00007f868e3f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+the binding dispatches image release through 0x00007f9a9a3f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 4 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 320, height = 240}
