@@ -813,6 +813,52 @@ spec = describe "CI image" $ do
           identity `shouldContain` ("glslang " ++ fixtureGlslangVersion)
           identity `shouldContain` "sha256 "
 
+      forM_ ["Darwin", "Linux"] $ \target →
+        it ("refuses an unqualified " ++ target ++ " input before it provisions anything") $
+          withNative $ \native → do
+            -- Pre-provision, and on both platforms. Linux pins package
+            -- revisions as well as digests, and dpkg saying a package is
+            -- installed is not the same as the file at a path having come from
+            -- it — so without the digest an override here would relocate an
+            -- input and replace it in one move. Nothing is recorded first:
+            -- this is the refusal that happens before a prefix exists at all.
+            let elsewhere = nativeDirectory native </> (target ++ "-other-icd.json")
+            writeFileEnsuring elsewhere (unlines (map replaceVersion (lines (fixtureIcd (nativeInputs native)))))
+            (refused, _, errors) ←
+              nativeToolOn
+                target
+                native
+                [("HETOIMASIA_VULKAN_DRIVER_MANIFEST", elsewhere)]
+                ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "not the pinned"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+            -- And the same override pointed at the qualified file is accepted,
+            -- so the refusal above is the digest talking and not the override.
+            nativeOk
+              native
+              []
+              ["record", "--prefix", nativePrefix native]
+            (accepted, _, acceptErrors) ←
+              nativeToolOn
+                target
+                native
+                [("HETOIMASIA_VULKAN_DRIVER_MANIFEST", nativeInputs native </> "share/vulkan/icd.d/fixture_icd.json")]
+                ["record", "--prefix", nativePrefix native]
+            (accepted, acceptErrors) `shouldBe` (ExitSuccess, "")
+
+      forM_ ["Darwin", "Linux"] $ \target →
+        it ("refuses a substituted " ++ target ++ " source before it provisions anything") $
+          withNative $ \native → do
+            -- The substitution examples above replace a file beneath a record
+            -- that already exists. This one replaces it before any record does,
+            -- which is the case a check of the record cannot reach.
+            substitute native (nativeInputs native </> "lib/libFixtureDriver.dylib")
+            (refused, _, errors) ← nativeToolOn target native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "a substituted driver binary invalidates the evidence"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
       it "refuses a Vulkan product the prefix does not own" $
         withNative $ \native → do
           nativeOk native [] ["record", "--prefix", nativePrefix native]
@@ -1918,6 +1964,22 @@ withNative action = do
       (compiled, compileErrors) `shouldBe` (ExitSuccess, "")
     createDirectoryIfMissing True (takeDirectory compiler)
     executableFile compiler fixtureGlslang
+    -- What a Linux identity and a Linux package check ask the machine. Neither
+    -- exists on a developer's macOS desktop, and the recipe has to be askable
+    -- for either platform from either one.
+    writeFile (stubs </> "libc-version") "glibc 2.39\n"
+    executableFile (stubs </> "getconf") ("#!/bin/sh\ncat '" ++ stubs </> "libc-version" ++ "'\n")
+    executableFile
+      (stubs </> "dpkg-query")
+      ( unlines
+          [ "#!/bin/sh"
+          , "for argument in \"$@\"; do package=\"$argument\"; done"
+          , "case \"$package\" in"
+          , "  fixture-*) echo '1.2.3-4fixture' ;;"
+          , "  *) echo \"dpkg-query: no packages found matching $package\" >&2; exit 1 ;;"
+          , "esac"
+          ]
+      )
     pinFixtureInputs interpreter settings directory recipe inputs compiler
     let inherited =
           filter
@@ -1985,9 +2047,22 @@ pinFixtureInputs interpreter settings directory recipe inputs compiler = do
           , "values['MACOS_LAYER_MANIFEST_SHA256'] = digest(values['MACOS_LAYER_MANIFEST'])"
           , "values['MACOS_LAYER_LIBRARY_SHA256'] = digest(os.path.join(inputs, 'lib/libVkLayer_fixture.dylib'))"
           , "values['MACOS_GLSLANG_SHA256'] = digest(compiler)"
+          , "values['MACOS_LOADER_PC_SHA256'] = digest(values['MACOS_LOADER_PC'])"
+          , "# The same inputs under the Linux names, so one fixture recipe can be"
+          , "# asked either platform's question. The package entries are fixtures"
+          , "# too: dpkg is stubbed, and what matters is that the recipe asks."
+          , "linux = {name.replace('MACOS_', 'LINUX_', 1): value for name, value in values.items()}"
+          , "linux['LINUX_DRIVER_LIBRARY'] = os.path.join(inputs, 'lib/libFixtureDriver.dylib')"
+          , "linux['LINUX_LAYER_LIBRARY'] = os.path.join(inputs, 'lib/libVkLayer_fixture.dylib')"
+          , "for role, package in (('LOADER', 'fixture-loader'), ('HEADERS', 'fixture-headers'),"
+          , "                      ('DRIVER', 'fixture-driver'), ('LAYER', 'fixture-layer'),"
+          , "                      ('GLSLANG', 'fixture-glslang')):"
+          , "    linux['LINUX_%s_PACKAGE' % role] = package"
+          , "    linux['LINUX_%s_PACKAGE_VERSION' % role] = '1.2.3-4fixture'"
+          , "values.update(linux)"
           , "path = os.path.join(recipe, 'vulkan.pin')"
           , "kept = [line for line in open(path, encoding='utf-8').read().splitlines()"
-          , "        if not line.startswith('MACOS_')]"
+          , "        if not line.startswith(('MACOS_', 'LINUX_'))]"
           , "body = kept + ['%s=%s' % item for item in sorted(values.items())]"
           , "open(path, 'w', encoding='utf-8').write(chr(10).join(body) + chr(10))"
           ]
@@ -2016,12 +2091,21 @@ ambientBuildVariables =
   ]
 
 nativeTool ∷ Native → [(String, String)] → [String] → IO (ExitCode, String, String)
-nativeTool native overrides arguments =
+nativeTool = nativeToolOn "Darwin"
+
+-- | Drive the fixture recipe for one platform's identity.
+--
+-- The fixture pins the same files under both platforms' names, so the Linux
+-- question can be asked on a macOS desktop and the macOS one on a Linux CI
+-- worker. Without that, whichever platform a suite happened to run on would be
+-- the only one whose refusals were ever exercised.
+nativeToolOn ∷ String → Native → [(String, String)] → [String] → IO (ExitCode, String, String)
+nativeToolOn target native overrides arguments =
   run
     (overriding overrides (nativeEnvironment native))
     (nativeDirectory native)
     (nativePython native)
-    ((nativeRecipe native </> "native.py") : "--platform" : "Darwin" : arguments)
+    ((nativeRecipe native </> "native.py") : "--platform" : target : arguments)
 
 nativeOk ∷ Native → [(String, String)] → [String] → IO ()
 nativeOk native overrides arguments = do

@@ -65,6 +65,7 @@ INPUTS = ("loader", "driver", "layer", "glslang")
 # them waives the identity the pin names for it.
 OVERRIDES = {
     "loader": "HETOIMASIA_VULKAN_LOADER",
+    "loader package description": "HETOIMASIA_VULKAN_LOADER_PC",
     "driver": "HETOIMASIA_VULKAN_DRIVER_MANIFEST",
     "layer": "HETOIMASIA_VULKAN_LAYER_MANIFEST",
     "glslang": "HETOIMASIA_VULKAN_GLSLANG",
@@ -153,6 +154,7 @@ def pinned_inputs(target: str, pin: dict[str, str]) -> dict:
             "version": pinned("LOADER_VERSION"),
             "sha256": optional("LOADER_SHA256"),
             "pkg_config": pinned("LOADER_PC"),
+            "pkg_config_sha256": optional("LOADER_PC_SHA256"),
             "include": pinned("INCLUDE"),
         },
         "driver": {
@@ -437,7 +439,13 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
     pinned = pinned_inputs(target, pin if pin is not None else read_pin())
 
     loader = qualify("loader", pinned["loader"]["path"], pinned["loader"]["sha256"])
-    described = pkg_config_version(pinned["loader"]["pkg_config"])
+    # The loader's package description decides what the prefix's own generated
+    # one says, so it is an input with an identity rather than a file that came
+    # along with one.
+    description = qualify(
+        "loader package description", pinned["loader"]["pkg_config"], pinned["loader"]["pkg_config_sha256"]
+    )
+    described = pkg_config_version(description["resolved"])
     expected_version = pinned["loader"]["version"]
     if not (described == expected_version or described.startswith(expected_version + ".")):
         raise VulkanError(
@@ -445,7 +453,14 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
             f"{expected_version}; the loader beside it is not the one this recipe qualified",
             status=1,
         )
-    loader.update({"version": expected_version, "described_version": described})
+    loader.update(
+        {
+            "version": expected_version,
+            "described_version": described,
+            "source_pkg_config": description["resolved"],
+            "source_pkg_config_sha256": description["sha256"],
+        }
+    )
 
     driver = qualify("driver", pinned["driver"]["path"], pinned["driver"]["sha256"])
     driver_document = read_manifest("driver", driver["resolved"])
@@ -756,7 +771,7 @@ def provision(prefix: str, target: str, pin: dict[str, str] | None = None) -> di
 
     loader, libdir = install_loader(prefix, target, resolved["loader"])
     includedir = install_headers(prefix, target, resolved["include"])
-    described = write_pkg_config(prefix, resolved["loader"], libdir, includedir)
+    generated = write_pkg_config(prefix, resolved["loader"], libdir, includedir)
 
     # The driver and layer manifests are written here rather than copied, with
     # the library each one names spelled absolutely. The loader is then given
@@ -792,8 +807,10 @@ def provision(prefix: str, target: str, pin: dict[str, str] | None = None) -> di
             "include": includedir,
             "headers_sha256": headers_digest(includedir),
             "source_headers_sha256": resolved["headers_sha256"],
-            "pkg_config": described["path"],
-            "pkg_config_sha256": described["sha256"],
+            "pkg_config": generated["path"],
+            "pkg_config_sha256": generated["sha256"],
+            "source_pkg_config": resolved["loader"]["source_pkg_config"],
+            "source_pkg_config_sha256": resolved["loader"]["source_pkg_config_sha256"],
         },
         "driver": {
             "name": resolved["driver"]["name"],
@@ -928,6 +945,11 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
         ("loader source", recorded["loader"].get("source"), current["loader"]["resolved"]),
         ("loader source digest", recorded["loader"].get("source_sha256"), current["loader"]["sha256"]),
         ("header digest", recorded["loader"].get("source_headers_sha256"), current["headers_sha256"]),
+        (
+            "loader package description digest",
+            recorded["loader"].get("source_pkg_config_sha256"),
+            current["loader"]["source_pkg_config_sha256"],
+        ),
         ("driver", recorded["driver"].get("name"), current["driver"]["name"]),
         ("driver source digest", recorded["driver"].get("source_sha256"), current["driver"]["sha256"]),
         ("driver library digest", recorded["driver"].get("library_sha256"), current["driver"]["library_sha256"]),
