@@ -1,9 +1,8 @@
--- | Headless coverage for tools/display/wayland.sh using stub display
--- programs. X11's real-deadline checks live in tools/x11-test instead.
-module Display (spec) where
+-- | Optional headless Wayland helper probes, including its real readiness
+-- deadline. All display programs are stubs; no desktop session is initialized.
+module Main (main) where
 
 import Control.Monad (forM_)
-import Sandbox (run, sanitizedEnvironment)
 import Data.List (isInfixOf, isPrefixOf)
 import System.Directory
   ( createDirectory
@@ -18,6 +17,8 @@ import System.Directory
   , setOwnerExecutable
   , setPermissions
   )
+import System.Environment (getEnvironment)
+import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExitCode)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -33,14 +34,16 @@ import Test.Hspec
   , shouldSatisfy
   )
 
+import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
+
 data Display = Display
   { directory ∷ FilePath
   , toolbox ∷ FilePath
   , script ∷ FilePath
   }
 
-spec ∷ Spec
-spec = waylandSpec
+main ∷ IO ()
+main = hspecWith defaultConfig { configFailOnEmpty = True } waylandSpec
 
 -- | Whether a process has stopped existing. The helper waits for what it
 -- stops, so by the time it returns this is already settled.
@@ -228,9 +231,10 @@ withSession = withHelper "tools/display/wayland.sh"
 -- from the helper.
 sessionHelper ∷ Display → [String] → IO (ExitCode, String, String)
 sessionHelper session arguments = do
-  inherited ← sanitizedEnvironment
+  inherited ← getEnvironment
   let overrides =
-        [ ("PATH", toolbox session)
+        [ ("LC_ALL", "C")
+        , ("PATH", toolbox session)
         , ("DISPLAY", ":99")
         , ("WAYLAND_DISPLAY", "wayland-0")
         , ("WAYLAND_SOCKET", "7")
@@ -387,3 +391,9 @@ refusedSession session reason = do
   errors `shouldContain` reason
   errors `shouldContain` "the command did not run"
   doesFileExist (directory session </> "environment.txt") `shouldReturn` False
+
+-- Each shell fixture supplies its private display environment.
+run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
+run environment path executable arguments =
+  readCreateProcessWithExitCode
+    (proc executable arguments) {cwd = Just path, env = Just environment} ""

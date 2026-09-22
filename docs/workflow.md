@@ -147,10 +147,11 @@ planner, run `cabal test workflow-tests --test-show-details=direct`. These Hspec
 checks use temporary Git repositories and a local bare origin, without GitHub
 access.
 
-The long X11 helper checks live separately in `x11-helper-tests`. Run that suite
-and request `test.x11-helper` only for X11 helper or fixture work; the optional
-group is never selected by unrelated workflow changes. It uses stub display
-programs, so it does not open a desktop session.
+The X11 and Wayland helper deadline checks, Lua nontermination experiment,
+and both confinement feasibility suites are local-only optional probes.
+Do not request them in CI or run them merely because their inputs changed.
+[Test classification](test_classification.md) records the suite inventory and
+how `$test`/`$autotest` can select them occasionally.
 
 To find out which of those checks a change actually requires, run
 `python3 tools/validation/plan.py --base origin/master --head HEAD`. It needs

@@ -572,26 +572,29 @@ spec = describe "Validation evidence reuse" $ do
           document ← applicability fixture
           recordText document packageGroup "source_run_url" `shouldBe` Just (runUrl 41 1)
 
-  describe "the checked-in optional X11 helper routing" $ do
-    forM_ ["tools/validation/helper.py", "tools/display/wayland.sh", "unknown/input.bin", "tools/display/x11.sh"] $ \path →
-      it ("leaves real-deadline X11 checks unrequested after changing " ++ path) $
+  describe "the checked-in local-only probe classification" $ do
+    forM_ ["tools/validation/helper.py", "tools/display/wayland.sh", "unknown/input.bin", "tools/display/x11.sh", "packages/scripting-lua/hazard/Main.hs", "packages/scripting-lua/linux/test/Test/Confinement/Limits.hs"] $ \path →
+      it ("keeps local probes unrequested and unrouted after changing " ++ path) $
         withCheckedInRouting $ \fixture workers → do
           change fixture path "changed input\n"
-          plan ← planRouted fixture workers "x11-unrequested-plan.json"
-          entryText plan "test.x11-helper" "reason" `shouldReturn` Just "optional-unrequested"
-          selectedGroups plan >>= (`shouldNotContain` ["test.x11-helper"])
+          plan ← planRouted fixture workers "probes-unrequested-plan.json"
+          selected ← selectedGroups plan
+          owned ← concat <$> mapM (workerGroups plan) ["haskell-engine", "haskell-workflow", "glfw-native"]
+          forM_ ["test.x11-helper", "test.wayland-helper", "test.lua-hazard", "test.lua-confinement-linux", "test.macos-confinement"] $ \group → do
+            entryText plan group "reason" `shouldReturn` Just "optional-unrequested"
+            selected `shouldNotContain` [group]
+            owned `shouldNotContain` [group]
 
-    it "routes a requested X11 check to the CPU workflow worker and publishes its own receipt" $
-      withCheckedInRouting $ \fixture workers → do
-        workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
-        change fixture "tools/display/x11.sh" "changed X11 helper\n"
-        writeFixtureFile (root fixture) "body.txt" "```validation-request\ntest.x11-helper\n```\n"
-        plan ← planRoutedWith fixture workers ["--request-file", root fixture </> "body.txt"] "x11-requested-plan.json"
-        entryText plan "test.x11-helper" "reason" `shouldReturn` Just "requested"
-        selectedGroups plan >>= (`shouldContain` ["test.x11-helper"])
-        workerGroups plan "haskell-workflow" >>= (`shouldContain` ["test.x11-helper"])
-        workflow `shouldContain` "name: receipt-test.x11-helper-${{ needs.plan.outputs.identity }}"
-        workflow `shouldContain` "path: receipts/test.x11-helper.json"
+    forM_ ["test.x11-helper", "test.wayland-helper", "test.lua-hazard", "test.lua-confinement-linux", "test.macos-confinement"] $ \group →
+      it ("selects " ++ group ++ " only through an explicit request with a local owner") $
+        withCheckedInRouting $ \fixture workers → do
+          change fixture "README.md" "revised ordinary prose\n"
+          writeFixtureFile (root fixture) "body.txt" ("```validation-request\n" ++ group ++ "\n```\n")
+          let local = workers ++ ["--worker", "local-probes=cpu:" ++ group]
+          plan ← planRoutedWith fixture local ["--request-file", root fixture </> "body.txt"] "probe-local-plan.json"
+          entryText plan group "reason" `shouldReturn` Just "requested"
+          selectedGroups plan >>= (`shouldContain` [group])
+          workerGroups plan "local-probes" `shouldReturn` [group]
 
   describe "the checked-in routing of the GPU model group" $ do
     -- `test.vulkan` is the first mandatory group that is neither in the floor
