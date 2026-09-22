@@ -157,29 +157,49 @@ The effective flag set the solver actually reported, on both platforms:
 The binding finds the loader differently per platform, and this is a real
 difference rather than an accident:
 
-- **Linux** — `vulkan` declares `pkgconfig-depends: vulkan`. Installing the
-  loader's development package is the entire configuration; nothing is named by
-  this repository.
+- **Linux** — `vulkan` declares `pkgconfig-depends: vulkan`. A package
+  description is the entire configuration.
 - **macOS** — `vulkan` declares `extra-libraries: vulkan` and, with
-  `darwin-lib-dirs` off, supplies no search path at all. The prefix is named
-  explicitly: `MACOS_VULKAN_PREFIX` in `tools/toolchain/binding.pin`, overridden
-  by `HETOIMASIA_VULKAN_PREFIX`.
+  `darwin-lib-dirs` off, supplies no search path at all. A library directory
+  has to be named.
 
-Naming the prefix is necessary but not sufficient, and the qualification is what
-found that. `vulkan-utils` runs Template Haskell against the compiled `vulkan`
-library, so GHC `dlopen`s it *while compiling*, and that dylib records its
-dependency as `@rpath/libvulkan.1.dylib`. `extra-lib-dirs` is a link-time search
-path and contributes no rpath, so the compile-time load fails with
-`Library not loaded: @rpath/libvulkan.1.dylib` even though the link would have
-succeeded. `tools/toolchain/qualify-binding.sh` therefore emits a
-`package vulkan` stanza carrying `extra-lib-dirs`, `extra-include-dirs`, and
-`ghc-options: -optl-Wl,-rpath,<prefix>/lib`. It has to be a project stanza:
-`--ghc-options` on the command line reaches local packages only, never a
-dependency the store builds.
+VK-4 answered both from one place. `tools/native/vulkan.py` provisions the
+loader into the private native prefix and writes
+`<prefix>/vulkan/lib/pkgconfig/vulkan.pc` describing it, so on Linux
+`pkgconfig-depends: vulkan` resolves the project-managed prefix rather than
+whatever a distribution installed; and `native.py prepare` prints
+`HETOIMASIA_VULKAN_LIBDIR` and `HETOIMASIA_VULKAN_INCLUDEDIR`, which
+`tools/vulkan-proof/run-proof.sh` passes to Cabal as `--extra-lib-dirs` and
+`--extra-include-dirs` on the one command line. Those are configure flags, so
+unlike `--ghc-options` they reach a dependency the store builds. Nothing is
+generated on disk and nothing names a machine path.
 
-The `darwin-lib-dirs` default hid this by hard-coding a path that happened to
-hold the loader. Any later slice that links the binding on macOS needs the rpath,
-not only the library directory.
+#### Why the loader is copied on macOS, and why there is no rpath
+
+Naming a library directory is necessary but not sufficient, and the
+qualification is what found that. `vulkan-utils` runs Template Haskell against
+the compiled `vulkan` library, so GHC `dlopen`s it *while compiling*, and a
+dylib linked against the vendor SDK's loader records its dependency as
+`@rpath/libvulkan.1.dylib`. `extra-lib-dirs` is a link-time search path and
+contributes no rpath, so the compile-time load fails with
+`Library not loaded: @rpath/libvulkan.1.dylib` even though the link succeeded.
+An rpath cannot be supplied from the command line either, for the reason above:
+`--ghc-options` never reaches a dependency.
+
+So the recipe removes the `@rpath` rather than working around it. The qualified
+loader is copied into `<prefix>/vulkan/lib` and given an **absolute install
+name**, and the copy is re-signed ad hoc because editing a Mach-O invalidates
+its signature. Everything linked against it then records that absolute path, and
+no rpath, no generated project file, and no machine path is involved at any
+stage. `tools/toolchain/qualify-binding.sh` predates this and still emits its
+own `package vulkan` stanza against `MACOS_VULKAN_PREFIX`; that remains the
+qualification's own retained invocation, and the provisioned prefix satisfies
+the same shape — `<prefix>/vulkan/lib` holds the loader and
+`<prefix>/vulkan/lib/pkgconfig/vulkan.pc` describes it — so
+`HETOIMASIA_VULKAN_PREFIX` may be pointed at it.
+
+The `darwin-lib-dirs` default hid the whole problem by hard-coding a path that
+happened to hold a loader.
 
 ## Running the qualification
 

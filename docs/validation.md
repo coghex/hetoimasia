@@ -1384,7 +1384,13 @@ Linux workers install nothing. They run inside one published image,
   `/opt/hetoimasia/packages.txt`;
 - the private GLFW prefix at `/opt/hetoimasia/native/glfw`, built by the
   [native recipe](#the-native-glfw-recipe) and exported through
-  `PKG_CONFIG_PATH`.
+  `PKG_CONFIG_PATH`;
+- the Vulkan runtime that recipe provisions beside it at
+  `/opt/hetoimasia/native/glfw/vulkan` — the loader and its headers, Mesa's
+  Lavapipe software driver, the Khronos validation layer, and the pinned
+  glslang compiler behind a private-prefix `glslangValidator` wrapper — each
+  installed at exactly the package revision `tools/native/vulkan.pin` names.
+  See [the Vulkan runtime](#the-vulkan-runtime).
 
 It also carries the `xvfb`, `openbox`, and `x11-utils` packages the
 [display worker](#the-display-worker)'s X11 helper uses, and — for its Wayland
@@ -1395,11 +1401,11 @@ with an `=` constraint, so an archive that no longer offers that revision fails
 the layer rather than quietly supplying a newer compositor, and the installed
 revision is read back from `dpkg` rather than assumed. Nothing in the image
 starts a display or a compositor: only those helpers do, inside the display
-worker, for one group at a time. It carries no project source, project build
-output, captures, or Vulkan SDK. It embeds its recipe fingerprint, native
-manifest hash, and installed compositor revision in
-`/opt/hetoimasia/image.json` and in its labels, and never its own digest, which
-does not exist until it is pushed.
+worker, for one group at a time. It compiles no shader, and it carries no
+project source, project build output, captures, or vendor Vulkan SDK. It embeds
+its recipe fingerprint, native manifest hash, installed compositor revision, and
+every Vulkan identity in `/opt/hetoimasia/image.json` and in its labels, and
+never its own digest, which does not exist until it is pushed.
 
 Input hashes cannot promise a byte-identical rebuild: the Ubuntu archive and the
 Hackage index move. That is why an image is published once per fingerprint and
@@ -1409,9 +1415,9 @@ then only ever addressed by digest.
 
 Every file under `tools/ci-image/` and `tools/native/`, plus
 `.github/workflows/ci-image.yml` and `tools/validation/ci_image.py`, is a recipe
-input — the Dockerfile, the provisioning script, the toolchain, compositor, and
-GLFW pin files, the builder and its registry transport, the image contract they
-load, and the native recipe —
+input — the Dockerfile, the provisioning script, the toolchain, compositor,
+GLFW, and Vulkan pin files, the builder and its registry transport, the image
+contract they load, and both halves of the native recipe —
 **except** `tools/ci-image/descriptor.json`.
 `tools/validation/ci_image.py` fingerprints each input's path, mode, type, and
 content id from one commit's tree:
@@ -1430,7 +1436,7 @@ anything its fingerprint does not cover, and the descriptor never reaches it.
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | `1`. |
+| `schema_version` | `2`. |
 | `reference` | The registry repository, without a tag. |
 | `digest` | The image's `sha256:` digest. Workers run exactly this. |
 | `recipe_fingerprint` | The recipe fingerprint the image was built from. |
@@ -1438,6 +1444,18 @@ anything its fingerprint does not cover, and the descriptor never reaches it.
 | `platform`, `architecture` | `linux` and `amd64`. |
 | `ghc`, `cabal` | The compiler versions the image runs. |
 | `weston` | The compositor package revision the image installed, such as `13.0.0-4build3`. |
+| `vulkan` | One SHA-256 over every Vulkan identity the image's native manifest records. Any change to any of them moves it. |
+| `vulkan_loader` | The loader version and the first twelve digits of its digest, such as `1.3.275 0f2c9e41ab07`. |
+| `vulkan_driver` | The driver name, its manifest's API version, and its binary's digest, such as `lvp 1.4.309 4b1d0e77c2aa`. |
+| `vulkan_layers` | Each validation layer's name, API version, and binary digest, separated by `; `. |
+| `glslang` | The compiler version and its digest, such as `15.1.0 9ca7f0132e55`. |
+
+The five Vulkan fields are read off the published image rather than supplied to
+the builder: what a published image runs against is decided by the prefix baked
+into it, and a value passed in from outside could only restate an expectation.
+`vulkan` alone is what makes a cache key and a receipt incompatible after a
+change; the four beside it exist so a reader can compare a descriptor with a
+record without recomputing anything.
 
 The author commits the descriptor the builder returns, in the same pull request
 as the recipe change, through an ordinary push. Because the descriptor is
@@ -1545,7 +1563,9 @@ and refuses it before execution — naming the builder as the fix — when:
 - its `ghc` or `cabal` disagrees with the `--toolchain` pins the workflow passes.
 
 Otherwise `ghc`, `cabal`, `ci-image` (the digest), `native-manifest` (the
-hash), and `weston` (the compositor revision) form the plan's `toolchain` map,
+hash), `weston` (the compositor revision), and the five Vulkan entries
+`vulkan`, `vulkan-loader`, `vulkan-driver`, `vulkan-layers`, and `glslang` form
+the plan's `toolchain` map,
 the descriptor is recorded as the plan's
 `ci_image`, and the prose output names the image. That map describes the planned
 worker environment, not the host that planned it. A candidate with no recipe
@@ -1569,7 +1589,13 @@ manifest it actually carries, the prefix check, the compilers it actually runs,
 the compositor revision `dpkg` reports installed against the one the image
 embeds, `CABAL_DIR`, and the store Cabal resolves, then builds a map from those
 actual values. The compositor is never taken from the descriptor: an image
-stamped with one revision and carrying another is refused rather than believed. That map must equal the plan's in its entirety, and it is what every
+stamped with one revision and carrying another is refused rather than believed.
+Neither are the Vulkan identities: they are computed from the manifest the
+container actually carries, and only after the prefix check above has re-read
+and re-hashed every file that manifest names, so a container whose loader,
+driver, layer, or compiler was replaced declares a different map here rather
+than passing because its manifest still looks well formed. That map must equal
+the plan's in its entirety, and it is what every
 receipt the worker writes records. A second step links and runs a native
 consumer against the image's GLFW. Receipts written before these entries existed
 record a different toolchain and are invalidated once.
@@ -1580,14 +1606,16 @@ Three reuse layers stay distinct:
 
 | Layer | Holds | Invalidated by |
 | --- | --- | --- |
-| The published image | Toolchain, system prerequisites, compiled GLFW | Any recipe input; never project source |
+| The published image | Toolchain, system prerequisites, compiled GLFW, the provisioned Vulkan runtime | Any recipe input; never project source |
 | The Cabal package store | Compiled external Haskell packages | The environment key, `cabal.project`, `cabal.project.common`, any `.cabal` file |
 | The build tree | Incremental local-package compilation | The same, plus any Haskell source |
 
 The **environment key** is a SHA-256 over the plan's `runner_os` and its whole
-toolchain map, printed by `ci_image.py outputs`. A new image digest or native
-manifest therefore moves every cache key, while re-committing the same
-descriptor moves none. Every restore fallback stays inside one environment key,
+toolchain map, printed by `ci_image.py outputs`. A new image digest, native
+manifest, or Vulkan identity therefore moves every cache key, while
+re-committing the same descriptor moves none. Because the toolchain map is also
+one of the fields a reusable execution has to match, evidence gathered under
+one set of Vulkan identities never answers a candidate planned under another. Every restore fallback stays inside one environment key,
 so nothing linked against one native identity is restored into another. Cache
 paths are the fixed container locations. Each worker writes its cache scope and
 whether each cache was a hit, a partial restore, or a miss to the job summary.
@@ -1602,10 +1630,14 @@ executes no validation group and writes no receipt. A documentation-only
 candidate with reusable evidence and a seeded cache still launches no worker and
 pulls no image.
 
-### The native GLFW recipe
+### The native recipe
 
 `tools/native/native.py`, with the pin in `tools/native/glfw.pin`, builds the
-same GLFW for a local macOS prefix and for the image. It fetches the pinned
+same GLFW for a local macOS prefix and for the image. Its sibling
+`tools/native/vulkan.py`, with the pin in `tools/native/vulkan.pin`, provisions
+the [Vulkan runtime](#the-vulkan-runtime) into the same prefix. One `--prefix`
+names all of it and one manifest describes all of it, so a prefix is accepted or
+refused as a whole. It fetches the pinned
 upstream archive, refuses it unless its SHA-256 matches, applies every patch in
 `tools/native/patches/` to the unpacked source, and builds only a
 static, position-independent `libglfw3.a`, with upstream examples, tests, and
@@ -1622,8 +1654,11 @@ source URL and checksum, the recipe fingerprint, the archive's checksum, the
 macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — the `backends`
 the archive actually compiles, read from its own defined symbols rather than
 restated from the options, so a Linux prefix records `["Wayland", "X11"]` and a
-macOS one `["Cocoa"]` — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
-effective CMake options, the `patches` applied with each one's SHA-256, and the exact value or absence of every variable CMake
+macOS one `["Cocoa"]` — the `vulkan` section described
+[below](#the-vulkan-runtime) — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
+effective CMake options, the `patches` applied with each one's SHA-256, what
+`tools/native/vulkan.pin` names for this platform together with any
+`HETOIMASIA_VULKAN_*` override in force, and the exact value or absence of every variable CMake
 or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
 `CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
 macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
@@ -1634,9 +1669,9 @@ SHA-256.
 | --- | --- |
 | `build [--prefix P]` | Fetch, verify, build, install, and record a fresh prefix. |
 | `check [--prefix P] [--build-dir D]` | Refuse the prefix unless it is exactly what this configuration would build. |
-| `prepare [--prefix P] [--build-dir D]` | Check, stamp the build directory with the manifest, and print the `PKG_CONFIG_PATH` export. |
+| `prepare [--prefix P] [--build-dir D]` | Check, stamp the build directory with the manifest, and print the `PKG_CONFIG_PATH` export and the Vulkan discovery the prefix owns. |
 | `link-check [--prefix P]` | Link a consumer that calls `glfwGetVersionString` with only the recorded flags and no library-path variables, require it to define the symbol itself and depend on no shared GLFW, and run it. It needs no display. |
-| `toolchain [--prefix P]` | Check, then print `native-manifest=<hash>`. |
+| `toolchain [--prefix P]` | Check, then print every toolchain-map entry the prefix contributes: `native-manifest`, `vulkan`, `vulkan-loader`, `vulkan-driver`, `vulkan-layers`, and `glslang`. |
 | `identity`, `record`, `fingerprint` | Print this configuration's identity, write a manifest for an existing prefix, or print the recipe fingerprint. |
 
 #### Patches
@@ -1664,6 +1699,58 @@ Currently applied:
 | Patch | Upstream | Why |
 | --- | --- | --- |
 | `0001-wayland-fix-segfault-when-there-is-no-seat.patch` | `3573c5a8`, glfw/glfw#2517, after the pinned 3.4 | `_glfwInitWayland` dereferenced a NULL `wl_seat` when the compositor advertises none, so every session entered on the headless Weston `tools/display/wayland.sh` starts died inside `glfwInit`. Required for `test.glfw-wayland` to run at all. |
+
+#### The Vulkan runtime
+
+`tools/native/vulkan.pin` names every Vulkan input on each platform — the
+loader, the driver, the Khronos validation layer, and the glslang compiler —
+and `record` establishes a *project-managed Vulkan prefix* at
+`<prefix>/vulkan` from exactly those:
+
+| Path | What it is |
+| --- | --- |
+| `lib/pkgconfig/vulkan.pc` | Generated, describing the qualified loader, so `pkgconfig-depends: vulkan` resolves this prefix and never a machine-wide one. |
+| `lib/libvulkan.1.dylib` | macOS only: the qualified loader, copied in and given an absolute install name. |
+| `include/` | macOS only: the qualified headers, copied in beside it. On Linux the pinned development package's own `/usr/include` is referenced. |
+| `share/vulkan/icd.d/<driver>_icd.json` | Generated, naming exactly one driver binary by absolute path. |
+| `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. |
+| `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. |
+
+On Linux every input is referenced where its pinned package installed it. On
+macOS the loader is copied instead, because its own install name is
+`@rpath/libvulkan.1.dylib`: a consumer pointed at the vendor SDK would need an
+rpath and would record a machine path in every product, and the copy's absolute
+install name is what lets `cabal.project.vulkan` link with no generated project
+file and no rpath at all. Editing a Mach-O invalidates its signature, so the
+copy is re-signed ad hoc.
+
+The manifest's `vulkan` section records, for every input, both halves of its
+identity — the manifest *and* the binary it names, the wrapper *and* the
+compiler it runs — as a path and a SHA-256, together with the source each was
+adopted from and the distribution revisions `dpkg` reports. The Vulkan headers
+a consumer compiles against get an identity too: one digest over every file
+under `vulkan/` and `vk_video/`, each contributing its relative path and its own
+content, so an added, removed, renamed, or edited header moves it. `check` re-reads
+and re-hashes each of those files rather than trusting the digests recorded
+beside them, and independently asks this machine to qualify under the pin
+again, so a prefix whose manifest is intact while a loader, driver, layer, or
+compiler underneath it was replaced is refused.
+
+Nothing searches and nothing falls back. A missing, unreadable, or substituted
+input is refused with a diagnosis naming what the machine holds instead. The
+`HETOIMASIA_VULKAN_LOADER`, `HETOIMASIA_VULKAN_DRIVER_MANIFEST`,
+`HETOIMASIA_VULKAN_LAYER_MANIFEST`, and `HETOIMASIA_VULKAN_GLSLANG` variables
+relocate one input each without waiving its qualification — an override
+locates, the pin decides — and a path that is a symlink, such as Homebrew's
+`opt`, is resolved before it is hashed, so a moving link cannot quietly change
+what the prefix is a prefix of. An override is part of the identity, because a
+prefix provisioned through a relocated input is a prefix of that route.
+
+Changing `tools/native/vulkan.pin` changes the [recipe
+fingerprint](#the-recipe-fingerprint), so an upgrade is an explicit
+requalification: a new image tag, new cache keys, and no receipt reuse across
+it. Cold provisioning and warm reuse resolve the same inputs and write the same
+bytes, so an ordinary run records one identity and rebuilds no native library.
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe

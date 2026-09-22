@@ -86,10 +86,13 @@ SDK's MoltenVK, whose manifest declares API 1.2.0 — below D-12's accepted
 minimum. Homebrew's MoltenVK 1.4.0 sits under `/opt/homebrew` with a manifest the
 default loader never reads.
 
-So the proof names the driver rather than accepting discovery:
-`tools/vulkan-proof/environment.pin` pins the Homebrew manifest by absolute path
-and `run-proof.sh` passes it as `VK_DRIVER_FILES`, which is the loader's own
-documented override. The harness additionally clears `VK_ICD_FILENAMES`,
+So the proof names the driver rather than accepting discovery. At the time of
+this record that selection lived in `tools/vulkan-proof/environment.pin`, which
+pinned the Homebrew manifest by absolute path; VK-4 (#208) retired that file and
+moved the same selection into `tools/native/vulkan.pin`, which the native recipe
+qualifies by digest and provisions into `<native prefix>/vulkan`. Either way
+`run-proof.sh` passes the selected manifest as `VK_DRIVER_FILES`, which is the
+loader's own documented override. The harness additionally clears `VK_ICD_FILENAMES`,
 `VK_ADD_DRIVER_FILES`, `VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`, and the loader's
 select/disable variables out of its own environment before initializing, and
 records which it removed — a run whose driver selection could have been
