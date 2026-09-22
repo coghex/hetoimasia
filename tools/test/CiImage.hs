@@ -520,6 +520,25 @@ spec = describe "CI image" $ do
             condition `shouldContain` ("inputs.route == '" ++ route ++ "'")
           selecting → expectationFailure (route ++ " is selected by " ++ show selecting)
 
+    it "reads each builder output under the name the builder writes it" $ do
+      -- The builder writes a GitHub output per identity, hyphenating the
+      -- descriptor's own field names as GitHub conventionally does. A job that
+      -- read `outputs.vulkan_loader` would therefore read an empty string and
+      -- pass every step until the descriptor it composed was rejected for
+      -- naming no identity — which is exactly what happened once. Nothing here
+      -- may refer to a step output by its underscored spelling.
+      workflow ← imageWorkflow
+      let referenced =
+            [ trimmed (takeWhile (/= ' ') (drop (length marker) piece))
+            | line ← lines workflow
+            , piece ← tails' line
+            , marker `isPrefixOf` piece
+            ]
+          marker = ".outputs."
+          underscored = [name | name ← referenced, '_' `elem` name]
+      referenced `shouldSatisfy` (not . null)
+      underscored `shouldBe` []
+
     it "reaches the registry only through the job the proof routes exclude" $ do
       workflow ← imageWorkflow
       -- Excluding `resolve` is only worth anything if nothing that publishes
@@ -1323,6 +1342,12 @@ ciImageWorkflow = ".github/workflows/ci-image.yml"
 -- | The route that publishes. Every other route is a proof route.
 imageRoute ∷ String
 imageRoute = "image"
+
+-- | Every suffix of a line, so a marker can be found wherever it sits.
+tails' ∷ String → [String]
+tails' text = text : case text of
+  (_ : rest) → tails' rest
+  [] → []
 
 imageWorkflow ∷ IO String
 imageWorkflow = getCurrentDirectory >>= \here → strictRead (here </> ciImageWorkflow)

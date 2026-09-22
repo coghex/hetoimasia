@@ -182,9 +182,9 @@ jobs:
       digest: ${{ steps.lookup.outputs.digest }}
       native-manifest: ${{ steps.lookup.outputs.native-manifest }}
       vulkan: ${{ steps.lookup.outputs.vulkan }}
-      vulkan-loader: ${{ steps.lookup.outputs.vulkan_loader }}
-      vulkan-driver: ${{ steps.lookup.outputs.vulkan_driver }}
-      vulkan-layers: ${{ steps.lookup.outputs.vulkan_layers }}
+      vulkan-loader: ${{ steps.lookup.outputs.vulkan-loader }}
+      vulkan-driver: ${{ steps.lookup.outputs.vulkan-driver }}
+      vulkan-layers: ${{ steps.lookup.outputs.vulkan-layers }}
       glslang: ${{ steps.lookup.outputs.glslang }}
     steps:
       - name: Check out the candidate
@@ -238,9 +238,9 @@ jobs:
       digest: ${{ steps.publish.outputs.digest }}
       native-manifest: ${{ steps.publish.outputs.native-manifest }}
       vulkan: ${{ steps.publish.outputs.vulkan }}
-      vulkan-loader: ${{ steps.publish.outputs.vulkan_loader }}
-      vulkan-driver: ${{ steps.publish.outputs.vulkan_driver }}
-      vulkan-layers: ${{ steps.publish.outputs.vulkan_layers }}
+      vulkan-loader: ${{ steps.publish.outputs.vulkan-loader }}
+      vulkan-driver: ${{ steps.publish.outputs.vulkan-driver }}
+      vulkan-layers: ${{ steps.publish.outputs.vulkan-layers }}
       glslang: ${{ steps.publish.outputs.glslang }}
     steps:
       - name: Check out the candidate
