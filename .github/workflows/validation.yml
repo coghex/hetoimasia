@@ -150,7 +150,7 @@ jobs:
           # a display group on a CPU-only worker, or a group owned twice or by
           # nobody — and every later step reads the assignment out of the plan.
           arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console")
-          arguments+=(--worker "haskell-workflow=cpu:test.workflow")
+          arguments+=(--worker "haskell-workflow=cpu:test.workflow,test.x11-helper")
           arguments+=(--worker "glfw-native=display:test.glfw-native,test.glfw-wayland")
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
@@ -769,6 +769,15 @@ jobs:
           if-no-files-found: error
           # A re-run of this same run would otherwise collide with the attempt
           # before it; the newest attempt is the one that should stand.
+          overwrite: true
+
+      - name: Publish the test.x11-helper receipt as reusable evidence
+        if: always() && hashFiles('receipts/test.x11-helper.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.x11-helper-${{ needs.plan.outputs.identity }}
+          path: receipts/test.x11-helper.json
+          if-no-files-found: error
           overwrite: true
 
   glfw-native:

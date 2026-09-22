@@ -122,6 +122,7 @@ identifier lists are sorted.
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
+| `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
 
@@ -244,7 +245,25 @@ project and running the suite through the other one. A change to either project
 file therefore selects the group, because changing either changes what the group
 proves.
 
-`test.workflow` runs only when affected or requested.
+`test.workflow` runs only when affected or requested. It includes the Wayland
+helper checks, but no X11 helper examples.
+
+`test.x11-helper` owns the 16 headless X11 helper examples in `tools/x11-test/`.
+They run stub servers and window managers, including six cases that exhaust the
+real 30-second startup deadline and a window-manager readiness deadline. They
+initialize no native session and require no desktop consent. They are optional:
+neither an affected input, a policy change, nor conservative fallback selects
+them. For changes to `tools/display/x11.sh` or `tools/x11-test/`, request
+`test.x11-helper` in the PR's `validation-request` block and run
+`cabal test x11-helper-tests --test-show-details=direct` locally. Do not add this
+group to unrelated workflow or engine work. Its explicit Cabal target also keeps
+`cabal test workflow-tests` free of these waits. Like other optional Hspec
+groups, an explicit `all-hspec` request includes it; that broad request remains
+prohibited in PRs because it also names the local-only macOS confinement probe.
+
+The group runs on the CPU workflow worker and publishes its own reusable
+receipt. Its inputs are the X11 helper and its test component's Cabal closure;
+Wayland-only changes do not count as changes to these examples.
 
 `test.glfw-native` is the native GLFW Hspec group: the shared main-thread
 fixture and its small, stable session, thread, and window examples, described in
@@ -271,7 +290,7 @@ same inputs and the same `display` runner class as `test.glfw-native`, but it is
 Wayland session to select. Making it required when affected is WL-3's decision,
 not this group's.
 
-`test.macos-confinement` and `test.glfw-wayland` are the registered optional
+`test.macos-confinement`, `test.glfw-wayland`, and `test.x11-helper` are the registered optional
 groups; the first has a section of its own below. Further interactive and
 lengthy desktop probes, when they are declared, are optional groups that run
 only on request; optional handling, including an optional display probe whose
@@ -589,7 +608,7 @@ Each worker is declared once, to the planner:
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console \
-  --worker haskell-workflow=cpu:test.workflow \
+  --worker haskell-workflow=cpu:test.workflow,test.x11-helper \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland
 ```
 
@@ -2572,7 +2591,8 @@ setup moves the candidate's identity, so earlier display evidence cannot cross
 either.
 
 Both display helpers are driven with a `PATH` holding only ordinary utilities
-and stub display programs. For the X11 helper: the command runs inside the
+and stub display programs. Wayland examples remain in `workflow-tests`; the
+X11 examples belong to the optional `x11-helper-tests` suite. For the X11 helper: the command runs inside the
 display the helper established, with `WAYLAND_DISPLAY` removed and the server
 stopped afterwards; a missing X server, one that exits before reporting a
 display, and a window manager that exits each stop the run with status `1`
@@ -2605,4 +2625,7 @@ copy's declaration is caught, and that it carries every pin the shipped
 provisioning script sources — read from the script itself, so a pin added to it
 later is carried or the example fails.
 
-Run them with `cabal test workflow-tests --test-show-details=direct`.
+Run the ordinary workflow checks with
+`cabal test workflow-tests --test-show-details=direct`. For X11 helper work,
+explicitly run `cabal test x11-helper-tests --test-show-details=direct` and
+request `test.x11-helper` in the PR validation block.

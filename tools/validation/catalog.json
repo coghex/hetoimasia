@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 17,
+  "policy_version": 18,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -218,7 +218,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the isolated X11 and headless Wayland display helpers against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the headless Wayland display helper against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
       "command": [
         "cabal",
         "test",
@@ -245,6 +245,26 @@
       "timeout_seconds": 1800,
       "category": "test",
       "optional": false
+    },
+    {
+      "id": "test.x11-helper",
+      "description": "Optional headless checks of the isolated X11 helper using stub servers and window managers, including real 30-second startup deadlines. Request for X11 helper or fixture changes; excluded from ordinary workflow-tests. Opens no desktop session.",
+      "command": [
+        "cabal",
+        "test",
+        "x11-helper-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia:test:x11-helper-tests",
+      "inputs": [
+        "cabal.project.common",
+        "tools/display/x11.sh"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 600,
+      "category": "test",
+      "optional": true
     },
     {
       "id": "test.glfw-native",

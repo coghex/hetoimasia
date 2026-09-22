@@ -31,7 +31,7 @@ consumed ∷ [(FilePath, String)]
 consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
-  , ("tools/display/x11.sh", "Display.hs runs it")
+  , ("tools/display/x11.sh", "the separate x11-helper-tests suite runs it")
   , ("tools/display/wayland.sh", "Display.hs runs it")
   , ("tools/ci-image/provision.sh", "Packaging.hs reads the pins it sources")
   , ("tools/ci-image/compositor.pin", "provision.sh sources it")

@@ -130,6 +130,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   library at `tools/test-support/`; only test suites depend on it. Domain
   fixtures stay beside their owning suite, built through public APIs; see
   [its README](tools/test-support/README.md) for what belongs there.
+- The real-deadline X11 helper checks are separate, optional `x11-helper-tests`
+  (`test.x11-helper`). Run and request them for changes to `tools/display/x11.sh`
+  or `tools/x11-test/`; ordinary `workflow-tests` excludes them. Do not run them
+  for unrelated workflow or engine work. They use stubs and need no desktop consent.
 - Every validation group is declared once in `tools/validation/catalog.json`.
   Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
   groups a change requires and why; see [validation.md](docs/validation.md) for
