@@ -24,6 +24,14 @@ checkout, and inside the Linux container from the files the recipe copied into
 it, with no checkout to consult. That is direct evidence the two platforms
 proved one tree rather than two that were believed to match.
 
+VK-4 later ran the same harness against the environment it provisions rather
+than against the temporary one this record was produced on, and retained what
+that produced beside these: [`docs/vulkan/macos-provisioned.md`](vulkan/macos-provisioned.md)
+and [`docs/vulkan/linux-provisioned.md`](vulkan/linux-provisioned.md). Those are
+a separate pair, not a revision of this one — they consumed different files by
+a different discovery route, and each says which. This record and the two it
+summarises are unchanged.
+
 **Verdict: pass on both platforms.** The design's 1.3 minimum, its present-fence
 retirement, and its `VK_EXT_swapchain_maintenance1` image release all hold. No
 part of the contract was weakened to reach it.
