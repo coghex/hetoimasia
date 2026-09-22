@@ -4035,6 +4035,26 @@ part of what it owns. A destruction it ended establishes nothing, so the
 windows, the session and every borrowed parent stay retained until independent
 evidence arrives, exactly as a destruction that raised does.
 
+Each injected operation is interruptible across the call and masked from its
+answer through the state that answer settles. The call itself must stay
+interruptible — that is what lets a cancellation end a construction the owner
+then keeps as unverified — but a cancellation between a *successful* call and
+the record of what it returned would discard evidence the backend really
+established: a construction would stay pending and be built a second time, and
+a target retirement would be neither recorded nor marked, so the drain would
+offer it again and dispose a second time what the backend has already
+disposed. The owner's startup, its construction and its target retirement each
+close that window; the whole-owner retirement and destruction already sit
+inside the drain's own mask.
+
+The supervision sentinel closes the matching one on its own side: it records
+that it has taken the latch in the same transaction that takes it, and is
+masked from there through the raise. Were a cancellation able to land between
+them, the sentinel would end without ever publishing the failure while the
+exit, seeing the record, left it out — and the owner's failure would be
+reported by nobody. A sentinel cancelled while it waits has taken nothing,
+records nothing, and suppresses nothing.
+
 Nothing but the injected evidence is permission. The owner's completion is not;
 an empty target set is not; a cancellation, a timeout and a cleanup failure are
 not. A target is released only against the terminal record its own injected
@@ -4109,7 +4129,11 @@ retirement and its destruction in turn, absorbed by each and releasing
 nothing early, and the same three delivered so that it *escapes* each call —
 the construction settling unverified and retiring in order, the target
 retirement manufacturing no evidence and never being offered again, and the
-destruction retaining everything until independent evidence arrives; a
+destruction retaining everything until independent evidence arrives; every injected operation's answer committed with no interruption point
+after it, observed from inside that window at each site that has one; a
+sentinel cancelled before it delivered suppressing nothing; a target
+retirement that returned still recorded and never offered again, however many
+cancellations arrive as it returns; a
 failure the owner retained while it ran, and one that escaped its run, each
 appearing exactly once across the exit's primary and every cleanup failure
 retained beside it, and the same two in the production composition — with

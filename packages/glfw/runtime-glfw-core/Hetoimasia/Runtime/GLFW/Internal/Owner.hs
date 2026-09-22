@@ -832,6 +832,10 @@ data GraphicsOwner scene = GraphicsOwner
   , ownerNotifier ∷ !Notifier
   , ownerPublisher ∷ !CompletionPublisher
   , ownerClock ∷ !MonotonicSource
+  , ownerSettled ∷ !(IO ())
+    -- ^ The private examples' own seam, run after an injected operation has
+    -- returned and before the state it settles is committed. Production
+    -- passes 'noHostHooks', whose is @pure ()@.
   , ownerSettings ∷ !(GraphicsOwnerConfig scene)
   }
 
@@ -987,10 +991,11 @@ instance Exception OwnerHandoverUnsettled
 startGraphicsOwner
   ∷ WorkerGroup
   → WindowHost
+  → IO ()
   → GraphicsOwnerConfig scene
   → (GraphicsOwner scene → IO ())
   → IO (GraphicsOwner scene)
-startGraphicsOwner group host config publish = do
+startGraphicsOwner group host settled config publish = do
   publisher ← maybe (throwIO OwnerHostUnprotected) pure (hostGraphicsPublisher host)
   handoff ←
     newOwnerHandoff
@@ -1026,6 +1031,7 @@ startGraphicsOwner group host config publish = do
           (hostWakeNotifier host)
           publisher
           (hostClock (hostConfiguration host))
+          settled
           config
   -- The worker is registered and forked before a handle naming it exists, so
   -- the run action takes it from this cell. The starter's own preparation step
@@ -1110,16 +1116,22 @@ latchFailure owner = \case
 -- | The owner's own body: start the backend, then take rounds until a stop.
 ownerRun ∷ GraphicsOwner scene → StopToken → IO ()
 ownerRun owner token = do
-  ready ← graphicsStartOwner operations (OwnerStart (ownerLabel (ownerSettings owner))) >>= evaluate
-  -- Recorded exactly as it came back, and as /status/ rather than anywhere
-  -- that could be mistaken for permission: what a successful startup
-  -- establishes is that whole-owner retirement and destruction have something
-  -- to act on, which the drain is told separately. It stays readable through
-  -- retirement and after the owner has ended.
-  atomically $ do
-    recordOwnerStarted (ownerHandoff' owner) (evidenceDetail ready)
-    writeTVar (ownerStarted owner) True
-    writeOwnerPhase (ownerHandoff' owner) OwnerRunning
+  -- The call is interruptible and the record of what it returned is not. A
+  -- cancellation delivered between the two would discard evidence the backend
+  -- really established, and the drain would then be told that a started owner
+  -- was never started.
+  mask $ \restore → do
+    ready ← restore (graphicsStartOwner operations (OwnerStart (ownerLabel (ownerSettings owner))) >>= evaluate)
+    ownerSettled owner
+    -- Recorded exactly as it came back, and as /status/ rather than anywhere
+    -- that could be mistaken for permission: what a successful startup
+    -- establishes is that whole-owner retirement and destruction have
+    -- something to act on, which the drain is told separately. It stays
+    -- readable through retirement and after the owner has ended.
+    atomically $ do
+      recordOwnerStarted (ownerHandoff' owner) (evidenceDetail ready)
+      writeTVar (ownerStarted owner) True
+      writeOwnerPhase (ownerHandoff' owner) OwnerRunning
   wakeGraphicsHost owner
   loop
   where
@@ -1280,18 +1292,26 @@ constructPending owner = readTVarIO (ownerTargets owner) >>= go . unsettled
       -- is not constructed into an owner that is already retiring.
       terminal ← isJust <$> readTVarIO (ownerLatch owner)
       unless terminal (construct target >> go rest)
-    construct target =
+    -- Interruptible across the injected call and masked from its return to
+    -- the settlement it commits, so a cancellation can land /in/ the
+    -- construction — where the owner must assume it owns whatever was built —
+    -- but never between the answer and the record of it. Losing that record
+    -- would leave the target pending, and the next round would construct it a
+    -- second time.
+    construct target = mask $ \restore →
       tryWithContext
-        ( graphicsConstructTarget
-            (ownerOperations (ownerSettings owner))
-            (TargetStart target (attachmentWindow target) (attachmentIncarnation target))
-            >>= evaluate
+        ( restore
+            ( graphicsConstructTarget
+                (ownerOperations (ownerSettings owner))
+                (TargetStart target (attachmentWindow target) (attachmentIncarnation target))
+                >>= evaluate
+            )
         )
         >>= \case
           Left failure → do
             settle target ConstructionUnverified
             retainFailure owner failure
-          Right (TargetConstructed evidence) → settle target (ConstructionAccepted evidence)
+          Right (TargetConstructed evidence) → ownerSettled owner >> settle target (ConstructionAccepted evidence)
           Right (TargetPartial evidence) → settle target (ConstructionPartial evidence)
           Right (TargetRolledBack evidence) → settle target (ConstructionRolledBack evidence)
     settle target settlement =
@@ -1349,26 +1369,37 @@ retireOneTarget owner target state = case targetConstruction state of
   -- to retire and nothing to ask it for. The rollback evidence it returned is
   -- the terminal record.
   ConstructionRolledBack evidence → settle (evidenceDetail evidence)
+  -- Interruptible across the injected call and masked from its return to the
+  -- record it commits. The gap matters more here than anywhere: a
+  -- cancellation delivered after a /successful/ retirement returned but
+  -- before its terminal record existed would leave the target unmarked and
+  -- unrecorded, and the drain would offer the operation again — disposing a
+  -- second time what the backend has already disposed, which is exactly the
+  -- blind retry this design admits nowhere.
   _ →
-    tryWithContext
-      ( graphicsRetireTarget
-          (ownerOperations (ownerSettings owner))
-          (TargetRetire target (attachmentWindow target) (constructed (targetConstruction state)))
-          >>= evaluate
-      )
-      >>= \case
-        -- A failed retirement preserves its evidence and manufactures no
-        -- acknowledgement: no record is written, so nothing downstream can
-        -- mistake the attempt for the fact, the target stays in the owner's
-        -- table, and it is marked so that nothing offers the operation again.
-        Left failure → do
-          atomically
-            ( modifyTVar'
-                (ownerTargets owner)
-                (Map.adjust (\held → held {targetRetirementFailed = True}) target)
+    mask $ \restore →
+      tryWithContext
+        ( restore
+            ( graphicsRetireTarget
+                (ownerOperations (ownerSettings owner))
+                (TargetRetire target (attachmentWindow target) (constructed (targetConstruction state)))
+                >>= evaluate
             )
-          retainFailure owner failure
-        Right retired → settle (evidenceDetail retired)
+        )
+        >>= \case
+          -- A failed retirement preserves its evidence and manufactures no
+          -- acknowledgement: no record is written, so nothing downstream can
+          -- mistake the attempt for the fact, the target stays in the owner's
+          -- table, and it is marked so that nothing offers the operation
+          -- again.
+          Left failure → do
+            atomically
+              ( modifyTVar'
+                  (ownerTargets owner)
+                  (Map.adjust (\held → held {targetRetirementFailed = True}) target)
+              )
+            retainFailure owner failure
+          Right retired → ownerSettled owner >> settle (evidenceDetail retired)
   where
     settle evidence = do
       atomically $ do
@@ -1745,7 +1776,7 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
     withProtectedWindowHostOver hooks exit logger sessionScope config $ \host → do
-      owner ← startGraphicsOwner group host ownerConfig (writeIORef pending . Just)
+      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) ownerConfig (writeIORef pending . Just)
       use host owner
 
 -- | 'Hetoimasia.Runtime.GLFW.runProtectedWindowApplication' over a host that
@@ -1794,18 +1825,26 @@ superviseGraphicsOwner control owner = startSupervised control policy definition
       workerDefinition
         (ownerLabel (ownerSettings owner) <> ".supervision")
         (\_ → pure ())
-        ( \token () → do
+        ( \token () → mask_ $ do
+            -- The wait is the interruptible part, and it is interruptible on
+            -- purpose: a sentinel cancelled before it has taken anything has
+            -- delivered nothing, records nothing, and the exit reports the
+            -- failure in full.
             latched ← atomically $ do
               held ← readTVar (ownerLatch owner)
               stopping ← stopRequested token
               check (isJust held || stopping)
               -- Recorded in the same transaction that takes it, so the exit
               -- can never read a latch this sentinel is about to raise and
-              -- conclude that nobody has. From here the runtime owns
-              -- reporting that failure at the application's own checkpoint,
-              -- and the exit leaves it out of what it raises.
+              -- conclude that nobody has.
               when (isJust held) (writeTVar (ownerDelivered owner) True)
               pure (latchedFailure <$> held)
+            -- Masked from that commit through the raise, so the record and
+            -- the delivery it promises cannot come apart. Were a cancellation
+            -- able to land between them, the sentinel would end without ever
+            -- publishing the failure while the exit, seeing the record,
+            -- suppressed it — and the owner's failure would be reported by
+            -- nobody at all.
             traverse_ rethrowIO latched
         )
 
