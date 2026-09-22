@@ -132,15 +132,17 @@ presentation semaphore and the swapchain behind it — a use-after-free rather
 than a failed assertion.
 
 So the call and that entry are one masked step, exactly as a create and its
-registration are. `Publication.hs` is that step. The mask covers a native call
-that does not block and a write to an `IORef` and nothing else: no wait moves
-inside it, no native call becomes preemptible, and no destroy is wrapped in a
-timeout. What it withholds from a caller trying to stop the run is not the stop
-but the instant it is taken — a cancellation delivered across the handoff is
-deferred until the entry is in and then stops the run at the presentation step,
-carrying its own failure, rather than escaping as an unexpected exception at no
-step at all. The result recorded is the one the call reported; a cancellation
-that arrived afterwards happened to the run, not to the present.
+registration are. `Publication.hs` is that step. The mask covers the native
+presentation call and the `IORef` write that records its effect. The driver may
+block inside the call; the binding's `safe` import does not make it interruptible
+or bound cancellation latency. Explicit fence and acquire waits stay outside
+the mask with their existing cancellation behaviour, which may also defer
+cancellation until native return. No native call becomes preemptible, and no
+destroy is wrapped in a timeout. A cancellation deferred across the handoff is
+taken once the entry is in and stops the run at the presentation step, carrying
+its own failure, rather than escaping as an unexpected exception at no step at
+all. The result recorded is the one the call reported; a cancellation that
+arrived afterwards happened to the run, not to the present.
 
 `PublicationSpec.hs` asserts that headlessly, with `vkQueuePresentKHR` replaced
 by a stand-in and a real `throwTo` delivered at the first point the code under

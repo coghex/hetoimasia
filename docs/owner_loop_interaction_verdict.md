@@ -203,9 +203,10 @@ nothing.
 - that **other windows** stall with it. The host serves every window from the
   same owner turn. **The probe held one window**, so this is read off the
   structure, not observed.
-- that **simulation** stops. Simulation is application work behind `loopUpdate`,
-  which was not entered. **The probe ran no simulation**, so this is read off
-  the structure, not observed.
+- that **simulation executed from `loopUpdate`** stops while that hook is not
+  entered. **The probe ran no simulation**, so this is read off the structure,
+  not observed. Simulation on another application thread is outside what the
+  probe measured.
 - that **future owner-driven rendering** stops. VK-16 currently specifies
   rendering on the owner loop. **No renderer exists**, so this is a statement
   about that design, not a measured rendering defect.
@@ -264,9 +265,9 @@ turn does not run.
   the duration is unbounded above, because it is however long the person holds
   the mouse down. 68.9 s was measured simply because that is how long the drag
   lasted.
-- **Simulation:** does not advance. Whether that is acceptable depends on
-  whether simulation is owner-driven, which the scheduling design leaves to the
-  application.
+- **Simulation:** if executed from `loopUpdate`, it does not advance during the
+  stall. Simulation on another application thread is outside this measurement;
+  the scheduling design leaves that placement to the application.
 - **Queued commands:** none dispatched, and none rejected either — they stay
   queued and are dispatched when the call returns. Command capacity is finite
   (`hostCommandCapacity`, 64 by default), so a producer submitting during a long
@@ -283,9 +284,10 @@ turn does not run.
 Let the refresh callback, or something it signals, drive a bounded redraw while
 the pump is blocked.
 
-- **Other windows and simulation:** still frozen. This buys a current surface
-  during the interaction, nothing else. Continuous simulation is not implied by
-  it.
+- **Other windows and owner-driven simulation:** window service and simulation
+  executed from `loopUpdate` still wait for the pump to return. A redraw path
+  alone does not provide update opportunities. Simulation on another application
+  thread is outside what this probe measured.
 - **Queued commands:** still not dispatched, unless the path is widened beyond a
   redraw, which is a different policy.
 - **What the measurement adds:** the platform is already asking, on its own

@@ -6,20 +6,23 @@
 -- fixture vocabulary this package's own examples need to prove the boundary
 -- holds.
 --
--- The trampoline is the containment. A Haskell exception must never unwind
--- through the C frame Lua called us from: that frame is not a Haskell frame,
--- and leaving it that way is undefined behaviour rather than an error report.
--- So every failure, synchronous or asynchronous, is caught here with the
--- context it carried, recorded on the VM, and replaced by an ordinary Lua
--- error carrying a fixed message.
+-- The trampoline contains failures raised by the callback's own action. They
+-- are caught with their type and context and recorded on the VM, rather than
+-- unwinding through the C frame that called in. Once every Haskell frame has
+-- returned, the C closure raises a Lua error whose value is a light userdata
+-- carrying no message.
 --
 -- That Lua error is a placeholder, not the failure. Lua may catch it with
 -- @pcall@ and carry on to a successful finish; the operation's outer boundary
 -- still re-raises the recorded exception, with its original type and context,
--- and adds its own operation to that context. A cancellation delivered to a
--- thread that is inside a callback is handled the same way and is likewise
--- re-raised rather than swallowed -- what it is not is converted into an
--- ordinary Lua error that a script could catch and ignore.
+-- and adds its own operation to that context.
+--
+-- Cancellation targets the VM's execution owner, where it is deferred until
+-- the native call and the operation's bookkeeping finish. Direct cancellation
+-- of a callback thread is unsupported: the runtime's foreign-export prologue
+-- and epilogue are outside this containment, and cancellation there can end
+-- the process. A trusted callback must not publish its own 'ThreadId' or leave
+-- work running past its return.
 --
 -- A callback borrows whatever Haskell state it closes over. Its release is
 -- retained on the VM and run only after the terminal close, because until
@@ -169,8 +172,9 @@ data Installed = Installed !Vm !Callback
 -- exception could unwind through C to the runtime's own prologue and epilogue
 -- around this function. It does not close it, and the contract does not claim
 -- it does: a cancellation aimed at this thread from outside can still end the
--- process, which is why nothing in this package hands out its identity and why
--- no registration surface may start.
+-- process. A registration surface must preserve the trusted-callback rules
+-- above: no publishing the callback thread's identity and no work left running
+-- past its return. This does not prohibit LUA-3's planned registration surface.
 hetoimasiaEnter ∷ PreCFunction
 hetoimasiaEnter state = mask $ \restore → do
   -- The C closure put the carrier below the call's own arguments.

@@ -1,4 +1,4 @@
--- | The two examples that need a process of their own.
+-- | The three examples that need a process of their own.
 --
 -- The first is the execution path this bridge does not support. A thread inside
 -- Lua cannot be cancelled: @lua_pcall@ is a @safe@ foreign call, and an

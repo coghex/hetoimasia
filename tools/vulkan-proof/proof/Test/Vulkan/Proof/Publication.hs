@@ -21,13 +21,16 @@
 -- and teardown then destroys the present fence, the presentation semaphore and
 -- the swapchain behind it — a use-after-free rather than a failed assertion.
 --
--- The mask covers a native call that does not block and a write to an 'IORef',
--- and nothing else. No native call is made preemptible, no destroy is wrapped
--- in a timeout, and no wait moves inside it. What masking withholds from a
--- caller trying to stop the run is therefore not the stop but the point it is
--- taken at, and 'published' is where that deferred stop is taken: at the
--- presentation step, carrying the cancellation's own failure, rather than
--- escaping to 'catchAll' as an unexpected exception.
+-- The mask covers the native presentation call and the 'IORef' write that
+-- records its effect. The driver may block inside that call: the binding's
+-- @safe@ import does not make it interruptible or bound cancellation latency.
+-- Explicit fence and acquire waits stay outside this mask with their existing
+-- cancellation behaviour; they too may defer cancellation until native return.
+-- No native call is made preemptible and no destroy is wrapped in a timeout.
+-- 'published' takes any cancellation deferred across the handoff after the
+-- effect has been recorded: at the presentation step, carrying the
+-- cancellation's own failure, rather than escaping to 'catchAll' as an
+-- unexpected exception.
 --
 -- Nothing here makes a native call, so the whole mechanism the native path
 -- uses is exercised headlessly by "Test.Vulkan.Proof.PublicationSpec", with
@@ -123,8 +126,11 @@ data Publication a = Publication
     -- raised somewhere further on.
   }
 
--- | Make one non-blocking native call and record what it did, with no point
--- between the two at which a cancellation can be taken.
+-- | Make the native presentation call and record what it did, with no point
+-- between the two at which a cancellation can be taken. The driver may block
+-- inside the call; its @safe@ import does not promise interruptibility or
+-- bounded cancellation latency. Explicit fence and acquire waits remain
+-- outside this handoff, with their cancellation behaviour unchanged.
 --
 -- The call's own synchronous failure is not what this is about: 'try' hands
 -- that to the publication, which classifies it exactly as it classifies a

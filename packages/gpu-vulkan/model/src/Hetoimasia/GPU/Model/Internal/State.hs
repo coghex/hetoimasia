@@ -531,7 +531,7 @@ escalateSession cause model = case gpuState model of
   SessionFailed _ → model
   SessionRunning → (note (SessionEscalated cause) model) {gpuState = SessionFailed cause}
 
--- | Retain one notice, keeping the window finite.
+-- | Retain one escalation notice, keeping the session's notice window finite.
 --
 -- Deduplication alone is not a bound: a target number is reissued under a fresh
 -- incarnation, so a session that admits, loses and readmits an optional target
@@ -553,9 +553,8 @@ note escalation model
     capacity = fromIntegral (targetRecordLimit (gpuBudgets model)) + 1
 
 -- | Everything the owner has to act on, counted so that two models can be
--- compared. Both the schedule and the scheduling policy read this one summary,
--- so what the owner is told is pending and what resets its backoff can never
--- describe different things.
+-- compared. Schedule resets, deadline selection and 'pendingObligations' read
+-- this summary, selecting the fields relevant to each decision.
 data Work = Work
   { workRenderDemand ∷ !Natural
   , workFrames ∷ !Natural
@@ -569,6 +568,7 @@ data Work = Work
   }
   deriving (Eq, Show)
 
+-- | Summarize render demand and outstanding work without changing the model.
 work ∷ GpuModel → Work
 work model =
   Work
@@ -635,16 +635,17 @@ pollableWork summary =
         ]
     ]
 
--- | Schedule an immediate progress opportunity.
+-- | Reset the owner's polling backoff to request an immediate progress
+-- opportunity. This changes scheduling state; it performs no progress work.
 roused ∷ GpuModel → GpuModel
 roused model = model {gpuBackoff = resetBackoff (gpuBackoff model)}
 
 -- | The one scheduling rule, applied to every transition.
 --
--- Requirement 7 names four things that restart the schedule: new demand, a new
--- obligation, an observed completion, and a close. The first two are exactly
--- "the owner has more to do than before", which is decided here by comparing
--- the work summary rather than by remembering to call something at each site —
+-- The owner-progress contract names four things that restart the schedule:
+-- new demand, a new obligation, an observed completion, and a close. The first
+-- two mean "the owner has more to do than before", decided by comparing the
+-- work summary rather than by remembering to call something at each site —
 -- the previous arrangement, where two dozen transitions each reset the backoff
 -- by hand, is the one that let a replacement request slip through unscheduled.
 -- The other two are not visible in that comparison, since a completion reduces
@@ -665,8 +666,8 @@ scheduling before = fmap (\(after, value) → (settleSchedule False before after
 scheduling_ ∷ GpuModel → Outcome GpuModel → Outcome GpuModel
 scheduling_ before = fmap (settleSchedule False before)
 
--- | The same, for one of the two transitions requirement 7 names outright: an
--- observed completion, or a close.
+-- | Apply the rule to an observed completion or a close, which request an
+-- immediate progress opportunity even when the work summary does not grow.
 observing_ ∷ GpuModel → Outcome GpuModel → Outcome GpuModel
 observing_ before = fmap (settleSchedule True before)
 
@@ -2418,12 +2419,12 @@ recoveryDeadlines model =
       | otherwise = [addDuration since healthyProgressPeriod | Just since ← [episodeHealthySince episode]]
 
 
--- | Everything the model is still waiting on: pending submissions, enqueued
--- presentations, records awaiting settlement, and subjects that are settled but
--- not yet disposed of.
--- | Everything the owner is still waiting on, read out of the one work summary
--- the scheduling policy also reads. Render demand is not an obligation and is
--- counted separately, by 'nextDeadline'.
+-- | Sum the owner's outstanding work categories: submissions, presentations
+-- (including records awaiting settlement), retiring generations and targets,
+-- disposable subjects, replacement requests and recovery deadlines. Categories
+-- can overlap, so this is not a count of distinct objects. Render demand and
+-- reserved or acquired frames are excluded; 'nextDeadline' handles render demand
+-- separately.
 pendingObligations ∷ GpuModel → Natural
 pendingObligations model =
   sum
@@ -2689,18 +2690,18 @@ data ReclaimReport = ReclaimReport
   }
   deriving (Eq, Show)
 
--- | One bounded reclamation pass over subjects that are already eligible for
--- disposal. It examines at most the configured number of records, waits for
--- nothing, and counts progress only where a disposal actually completed —
--- finding eligible work, or asking for a disposal that then failed, is not
--- progress and unlocks no retry.
+-- | Examine a bounded window of generation and managed-resource records and
+-- offer its eligible subjects for disposal. It examines at most the configured
+-- number of records, waits for nothing, and counts progress only where a
+-- disposal actually completed. Finding eligible work, or asking for a disposal
+-- that then failed, is not progress and unlocks no retry.
 reclaimPass ∷ EvidenceSource → GpuModel → (GpuModel, ReclaimReport)
 reclaimPass source model = (advanced, report)
   where
     limit = fromIntegral (reclaimExaminationLimit (gpuBudgets model))
-    -- The window is taken from every record the model holds, not from the
-    -- eligible ones, because deciding that a record is ineligible is itself an
-    -- examination. Filtering first would let a pass read the whole model while
+    -- The window is taken from all generation and managed-resource records,
+    -- not just the eligible ones: deciding that a record is ineligible is itself
+    -- an examination. Filtering first would let a pass read every subject while
     -- reporting that it read almost nothing.
     examined = take limit (rotated (gpuReclaimCursor model) (allSubjects model))
     candidates = filter (eligible model) examined
@@ -2731,8 +2732,10 @@ rememberFailure ∷ SubjectKey → GpuModel → GpuModel
 rememberFailure key model =
   model {gpuDisposalFailures = Set.insert key (gpuDisposalFailures model)}
 
--- | Every record the model holds, in a stable order. This is what a bounded
--- reclamation pass reads a window of.
+-- | Every generation and managed-resource record, in a stable order. These are
+-- the subjects that carry holds; a bounded reclamation pass reads a window of
+-- them. Frames, submissions, presentations and allocation attempts are not
+-- separately disposable subjects.
 allSubjects ∷ GpuModel → [SubjectKey]
 allSubjects model =
   [ GenerationKey number generation
@@ -2741,8 +2744,9 @@ allSubjects model =
   ]
     ++ [ResourceKey logical generation | (logical, generation) ← Map.keys (gpuResources model)]
 
--- | Whether this record may be disposed of: every hold has ended, a generation
--- has been retired, and no earlier disposal of it failed.
+-- | Whether this subject may be offered for disposal: every hold has ended, a
+-- generation has been retired, and no earlier disposal of it failed. Unlike
+-- 'disposalEligible', this includes the phase and failed-disposal checks.
 eligible ∷ GpuModel → SubjectKey → Bool
 eligible model key
   | key `Set.member` gpuDisposalFailures model = False
@@ -2754,8 +2758,8 @@ eligible model key
       ResourceKey logical generation →
         maybe False (holdsSettled . resourceHolds) (Map.lookup (logical, generation) (gpuResources model))
 
--- | Every subject whose holds have all ended and whose disposal has not already
--- been attempted and failed.
+-- | Every subject 'eligible' permits offering for disposal, including its
+-- retired-generation and failed-disposal checks.
 eligibleSubjects ∷ GpuModel → [SubjectKey]
 eligibleSubjects model = filter (eligible model) (allSubjects model)
 
@@ -2792,8 +2796,11 @@ holdView subject model = do
       target ← Map.lookup (batchTargetNumber batch) (gpuTargets model)
       pure (targetIdOf model (batchTargetNumber batch) target)
 
--- | Whether every hold on a subject has ended. This is the /only/ condition
--- under which the model will offer it for disposal.
+-- | Whether a live subject has no outstanding holds; an unresolved identity
+-- answers 'False'. This is necessary for disposal, but does not check generation
+-- phase or an earlier failed disposal. In particular, 'True' does not authorize
+-- retrying a failed disposal: the owner's progress and reclamation paths apply
+-- those additional checks before offering a subject.
 disposalEligible ∷ HoldSubject → GpuModel → Bool
 disposalEligible subject model = case holdView subject model of
   Nothing → False
