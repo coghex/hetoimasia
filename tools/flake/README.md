@@ -83,8 +83,19 @@ run is active; retained results live separately in the common Git directory.
 Each child has a separate process group and a guardian holding the execution
 lock. The guardian observes parent-pipe EOF, deadlines and termination signals;
 it sends TERM, then KILL after a one-second grace, and reaps its direct child.
-Only its own groups are signalled. A successful leader leaving descendants is a
-harness error. Trials have a 64 MiB log ceiling. Build preparation has a separate
+Only its own groups are signalled. Exited members of that group can remain
+unreaped, because the guardian can wait only for its direct child. Their
+presence does not turn a timeout or an interruption into a harness error.
+
+`group_exists` follows kill(2). On Linux a zombie-only group still accepts the
+signal, so the group exists until those zombies are reaped, and cleanup still
+runs. On Darwin `killpg` raises `EPERM` for that group. `EPERM` counts as no
+live member only when `ps` shows every remaining member as a zombie (a state
+starting with `Z`) or the group lists none. A live member, or a state that
+cannot be read, stays a reported cleanup failure. A group whose members have
+all exited is not a leak on either platform. A live descendant after a
+successful leader exit remains a harness error.
+Trials have a 64 MiB log ceiling. Build preparation has a separate
 30-minute ceiling; it never spends the probe's execution budget. Batch deadlines
 exclude build/discovery. A trial starts only with enough budget for its full
 deadline, so a shortened final window cannot masquerade as a flaky timeout.
