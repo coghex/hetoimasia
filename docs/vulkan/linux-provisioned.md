@@ -68,8 +68,8 @@ HETOIMASIA_NATIVE_SESSION=isolated-x11::0 \
 
 ## The environment
 
-- source digest: 2af178a4c2cf93362b1b2d29b6e9de8a92b21aa6ac453294655702af64cea963
-- repository revision: 0bc2b36c857a531a245115ef09f3cc8e5544c1ee
+- source digest: f91c3447e6df1f1453d89c65b6cb55f3ce21f14f57c004585d85ba01f3124a88
+- repository revision: 8483c09e5cb2164209722f162cee80897df31234
 - platform: linux/x86_64
 - session authorization: the isolated X11 display :0
 - VK_DRIVER_FILES: /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
@@ -88,11 +88,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x00007fd4a2d083d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x00007fd4a2d083d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x00007fd4a2d08090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- GLFW's vkCreateDevice: 0x00007fd4a2d08090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- a device-level entry point: 0x00007fd47e3ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+- the binding's vkGetInstanceProcAddr: 0x00007f5429a9c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x00007f5429a9c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x00007f5429a9c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- GLFW's vkCreateDevice: 0x00007f5429a9c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- a device-level entry point: 0x00007f540825c850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
 - device API version: 1.4.318
 - driver: llvmpipe (DRIVER_ID_MESA_LLVMPIPE)
@@ -132,9 +132,9 @@ driver. What the driver supplied for those is the fence evidence beside them.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0 | 0 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
 | 1 | 1 | slot 1 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
-| 2 | 2 | slot 0 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 2 | 2 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
 | 3 | 3 | slot 1 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
-| 4 | 0 | slot 0 | SUCCESS | yes | SUCCESS | not ready | yes | present fence |
+| 4 | 0 | slot 0 | SUCCESS | yes | SUCCESS | signalled | yes | present fence |
 
 - semaphore pool size: 2
 - frames presented: 5
@@ -247,23 +247,23 @@ such; no device loss was induced.
 ```
 ## The environment
 implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-proving repository revision 0bc2b36c857a531a245115ef09f3cc8e5544c1ee
-proving source digest 2af178a4c2cf93362b1b2d29b6e9de8a92b21aa6ac453294655702af64cea963
+proving repository revision 8483c09e5cb2164209722f162cee80897df31234
+proving source digest f91c3447e6df1f1453d89c65b6cb55f3ce21f14f57c004585d85ba01f3124a88
 VK_DRIVER_FILES = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
 VK_LAYER_PATH = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x00007fd4a2d083d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-GLFW resolves the same name to 0x00007fd4a2d083d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+the binding dispatches through 0x00007f5429a9c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x00007f5429a9c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_KHR_xcb_surface
 ## The instance
 the loader reports instance version 1.3.275
-the binding resolves vkCreateDevice to 0x00007fd4a2d08090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x00007fd4a2d08090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+the binding resolves vkCreateDevice to 0x00007f5429a9c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x00007f5429a9c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
 ## The window and its surface
 ## The device profile
 llvmpipe (LLVM 20.1.2, 256 bits) advertises Vulkan 1.4.318
 selected llvmpipe (LLVM 20.1.2, 256 bits), advertising Vulkan 1.4.318
-the binding dispatches image release through 0x00007fd47e3f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+the binding dispatches image release through 0x00007f54082a62e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 4 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 320, height = 240}
