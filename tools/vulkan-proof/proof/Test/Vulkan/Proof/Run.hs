@@ -73,6 +73,7 @@ import qualified Data.Vector as Vector
 import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (castFunPtrToPtr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peekByteOff)
+import System.Directory (canonicalizePath)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Info (arch, os)
 
@@ -130,6 +131,7 @@ import Test.Vulkan.Proof.Construction
   , slotPlaceReleases
   )
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
+import Test.Vulkan.Proof.Loader (loaderSelection, loaderVariable)
 import Test.Vulkan.Proof.Ownership
   ( Cleanups
   , Ledger
@@ -467,6 +469,16 @@ procedure journal consent cleanups sink ledger = do
     "the shared loader"
     "the Haskell binding's own vkGetInstanceProcAddr resolved to nothing, so there is no loader to share"
     (provenanceAddress bindingEntry /= nullPtr)
+  -- GLFW is handed this same entry point, so the two share a loader by
+  -- construction; what that does not establish is that the loader is the
+  -- qualified one rather than a substitute a runtime search path put ahead of
+  -- it. Both paths are canonicalized, because the dynamic linker reports the
+  -- soname it opened and the record names the file behind it.
+  recordedLoader ← lookupEnv loaderVariable >>= traverse canonicalizePath
+  loadedLoader ← traverse (canonicalizePath . Text.unpack) (provenanceImage bindingEntry)
+  case loaderSelection recordedLoader loadedLoader of
+    Left reason → stop "the recorded loader" reason
+    Right loaded → note journal ("the binding's loader is the recorded loader " <> Text.pack loaded)
   initVulkanLoader entry
   -- The registration is inside the mask with the call that earns it, so a
   -- cancellation delivered here cannot leave GLFW initialized with nothing to

@@ -10,8 +10,8 @@ import Test.Hspec (describe, hspec, it, shouldBe, shouldContain, shouldReturn)
 import qualified ApprovalProvenance
 import qualified CiImage
 import qualified DismissalStep
-import qualified Display
 import qualified Execution
+import qualified FlakeLab
 import qualified Packaging
 import qualified Reuse
 import qualified ReviewGate
@@ -76,6 +76,7 @@ main = hspec $ do
 
   Validation.spec
   Execution.spec
+  FlakeLab.spec
   Reuse.spec
   Timings.spec
   TimingStep.spec
@@ -84,7 +85,6 @@ main = hspec $ do
   DismissalStep.spec
   ApprovalProvenance.spec
   CiImage.spec
-  Display.spec
   VulkanProof.spec
   Packaging.spec
 
