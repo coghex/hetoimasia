@@ -892,6 +892,18 @@ spec = describe "CI image" $ do
             errors `shouldContain` "a substituted driver binary invalidates the evidence"
             doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
 
+      forM_ ["Darwin", "Linux"] $ \target →
+        it ("refuses substituted " ++ target ++ " headers before it provisions anything") $
+          withNative $ \native → do
+            -- The header tree is compared with the pin, not only with a record:
+            -- a record taken after the substitution would otherwise describe
+            -- the substitute, and every later check would agree with it.
+            substitute native (nativeInputs native </> "include/vulkan/vulkan.h")
+            (refused, _, errors) ← nativeToolOn target native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "substituted headers are never adopted"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
       forM_ loaderLinkDamage $ \(label, damage, named) →
         it ("refuses a prefix whose linker-facing loader link was " ++ label) $
           withNative $ \native → do
@@ -905,6 +917,26 @@ spec = describe "CI image" $ do
             (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
             refused `shouldBe` ExitFailure 1
             errors `shouldContain` named
+
+      forM_ linuxLoaderLinkDamage $ \(label, damage, recordedNamed, sourceNamed) → do
+        it ("refuses a Linux prefix whose linker-facing loader link was " ++ label) $
+          withNative $ \native → do
+            -- A referenced Linux loader is linked through the development
+            -- package's `libvulkan.so` beside it, not through the versioned
+            -- file the pin qualifies, so that link is held to the record too.
+            (recorded, _, recordErrors) ← nativeToolOn "Linux" native [] ["record", "--prefix", nativePrefix native]
+            (recorded, recordErrors) `shouldBe` (ExitSuccess, "")
+            damage (nativeInputs native </> "lib/libvulkan.so")
+            (refused, _, errors) ← nativeToolOn "Linux" native [] ["check", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` recordedNamed
+        it ("refuses a Linux loader link " ++ label ++ " before it provisions anything") $
+          withNative $ \native → do
+            damage (nativeInputs native </> "lib/libvulkan.so")
+            (refused, _, errors) ← nativeToolOn "Linux" native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` sourceNamed
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
 
       it "refuses a Vulkan product the prefix does not own" $
         withNative $ \native → do
@@ -2031,6 +2063,10 @@ withNative action = do
       (compiled, compileErrors) `shouldBe` (ExitSuccess, "")
     createDirectoryIfMissing True (takeDirectory compiler)
     executableFile compiler fixtureGlslang
+    -- What `-lvulkan` opens beside a referenced Linux loader: the development
+    -- package's unversioned link to it. The Linux recipe qualifies that link
+    -- before it provisions anything, so the fixture offers one.
+    createFileLink "libvulkan.1.4.2.dylib" (inputs </> "lib/libvulkan.so")
     -- What a Linux identity and a Linux package check ask the machine. Neither
     -- exists on a developer's macOS desktop, and the recipe has to be askable
     -- for either platform from either one.
@@ -2115,6 +2151,12 @@ pinFixtureInputs interpreter settings directory recipe inputs compiler = do
           , "values['MACOS_LAYER_LIBRARY_SHA256'] = digest(os.path.join(inputs, 'lib/libVkLayer_fixture.dylib'))"
           , "values['MACOS_GLSLANG_SHA256'] = digest(compiler)"
           , "values['MACOS_LOADER_PC_SHA256'] = digest(values['MACOS_LOADER_PC'])"
+          , "# The header digest is the recipe's own tree walk over the fixture's"
+          , "# headers, so the pin names the tree the fixture actually holds."
+          , "sys.dont_write_bytecode = True"
+          , "sys.path.insert(0, recipe)"
+          , "import vulkan"
+          , "values['MACOS_HEADERS_SHA256'] = vulkan.headers_digest(values['MACOS_INCLUDE'])"
           , "# The same inputs under the Linux names, so one fixture recipe can be"
           , "# asked either platform's question. The package entries are fixtures"
           , "# too: dpkg is stubbed, and what matters is that the recipe asks."
@@ -2205,7 +2247,7 @@ substitutions =
   , Substitution "layer library" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "lib/libVkLayer_fixture.dylib")
   , Substitution "glslang compiler" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "bin/glslangValidator")
   , Substitution "headers" "the Vulkan headers at" (\native → nativePrefix native </> "vulkan/include/vulkan/vulkan.h")
-  , Substitution "source headers" "the recorded header digest" (\native → nativeInputs native </> "include/vulkan/vulkan.h")
+  , Substitution "source headers" "no longer qualifies under vulkan.pin" (\native → nativeInputs native </> "include/vulkan/vulkan.h")
   ]
 
 -- | The ways the loader's linker-facing link can stop doing its job.
@@ -2226,6 +2268,27 @@ loaderLinkDamage =
         removeFile link
         copyFile target link
     , "linker-facing link is missing"
+    )
+  ]
+
+-- | The same damage to the link beside a referenced Linux loader, which the
+-- development package owns rather than the prefix: what a check of the record
+-- names, and what refuses the damage before any record exists.
+linuxLoaderLinkDamage ∷ [(String, FilePath → IO (), String, String)]
+linuxLoaderLinkDamage =
+  [ ("deleted", removeFile, "linker-facing link is missing", "linker-facing link is missing from")
+  , ( "pointed at another library"
+    , \link → removeFile link >> createFileLink "libFixtureDriver.dylib" link
+    , "points at"
+    , "not the qualified loader"
+    )
+  , ( "replaced by a file of its own"
+    , \link → do
+        target ← canonicalizePath link
+        removeFile link
+        copyFile target link
+    , "linker-facing link is missing"
+    , "is a file of its own"
     )
   ]
 

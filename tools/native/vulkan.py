@@ -56,8 +56,12 @@ VULKAN_DIRECTORY = "vulkan"
 
 # What `-lvulkan` actually opens. The linker looks for the unversioned name
 # first, so this link — not the versioned file it points at — is the loader's
-# discovery route on macOS, and it is recorded and verified as its own input.
+# discovery route, and it is recorded and verified as its own input. On macOS
+# the prefix writes it beside its copy of the loader; on Linux it is the
+# development package's link beside the referenced loader, and it is qualified
+# as resolving to that loader before anything is provisioned.
 LOADER_LINK = "libvulkan.dylib"
+LINUX_LOADER_LINK = "libvulkan.so"
 LOADER_FILE = "libvulkan.1.dylib"
 
 # The wrapper's own flag. It is deliberately not a glslang flag: the wrapper
@@ -163,6 +167,7 @@ def pinned_inputs(target: str, pin: dict[str, str]) -> dict:
             "pkg_config": pinned("LOADER_PC"),
             "pkg_config_sha256": optional("LOADER_PC_SHA256"),
             "include": pinned("INCLUDE"),
+            "headers_sha256": pinned("HEADERS_SHA256"),
         },
         "driver": {
             "path": pinned("DRIVER_MANIFEST"),
@@ -355,6 +360,38 @@ def qualify_library(role: str, manifest: dict, expected_sha256: str | None) -> d
     return {"path": manifest["library"], "resolved": resolved, "sha256": digest}
 
 
+def qualify_loader_link(loader: dict) -> dict:
+    """The name ``-lvulkan`` opens beside a referenced loader, held to that loader.
+
+    A referenced loader's package description points the linker at the
+    loader's own directory, and there ``-lvulkan`` opens the unversioned name,
+    never the versioned file the pin qualified. A digest of that file alone
+    would accept the name deleted, pointed elsewhere, or replaced by another
+    library, and each of those either fails a clean build or links a loader
+    this recipe never qualified.
+    """
+    link = os.path.join(os.path.dirname(loader["resolved"]), LINUX_LOADER_LINK)
+    if not os.path.islink(link):
+        state = (
+            f"at {link} is a file of its own rather than a link"
+            if os.path.lexists(link)
+            else f"is missing from {link}"
+        )
+        raise VulkanError(
+            f"the loader's linker-facing link {state}; `-lvulkan` opens that name, so it has to be a "
+            f"link to the qualified loader {loader['resolved']}; {holdings(link)}",
+            status=1,
+        )
+    resolved = os.path.realpath(link)
+    if resolved != loader["resolved"]:
+        raise VulkanError(
+            f"the loader's linker-facing link at {link} resolves to {resolved}, not the qualified loader "
+            f"{loader['resolved']}; `-lvulkan` would link a loader this recipe did not qualify",
+            status=1,
+        )
+    return {"path": link, "target": os.readlink(link)}
+
+
 # The header trees a consumer compiles against. Only these two, rather than the
 # whole include directory the pin names: on Linux that directory is the
 # distribution's own `/usr/include`, and hashing all of it would describe the
@@ -468,6 +505,11 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
             "source_pkg_config_sha256": description["sha256"],
         }
     )
+    # macOS writes its own link beside the copy it installs; a referenced
+    # loader is linked through the one already beside it, so that link is a
+    # source input and is qualified here, before anything is provisioned.
+    if target != "Darwin":
+        loader["link"] = qualify_loader_link(loader)
 
     driver = qualify("driver", pinned["driver"]["path"], pinned["driver"]["sha256"])
     driver_document = read_manifest("driver", driver["resolved"])
@@ -531,6 +573,18 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
     glslang["version"] = reported
 
     include = pinned["loader"]["include"]
+    # The package revision says which headers were installed, not that the tree
+    # at this path is still theirs, so the tree is held to its own pinned
+    # digest. Without it, headers substituted before the first record would be
+    # adopted, and every later check would compare against the substitute.
+    headers = headers_digest(include)
+    if headers != pinned["loader"]["headers_sha256"]:
+        raise VulkanError(
+            f"the Vulkan headers at {include} have digest {headers}, not the pinned "
+            f"{pinned['loader']['headers_sha256']}; substituted headers are never adopted, and an "
+            f"upgrade is an explicit requalification that moves {PIN_NAME}",
+            status=1,
+        )
     return {
         "schema_version": 1,
         "loader": loader,
@@ -538,7 +592,7 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
         "layer": layer,
         "glslang": glslang,
         "include": include,
-        "headers_sha256": headers_digest(include),
+        "headers_sha256": headers,
         "packages": installed_packages(target, pinned["packages"]),
     }
 
@@ -708,7 +762,9 @@ def install_loader(prefix: str, target: str, loader: dict) -> tuple[dict, str]:
 
     On Linux the loader is referenced where its pinned package installed it: its
     soname is already absolute enough for the dynamic linker, and copying an ELF
-    out of a package directory would only hide which package supplied it.
+    out of a package directory would only hide which package supplied it. The
+    link ``-lvulkan`` opens beside it was qualified by :func:`resolve` and is
+    recorded here, so verification holds it exactly as it holds macOS's.
 
     The Mach-O edit needs macOS's own tools, so it is done where those exist.
     Describing a Darwin prefix from another host is something only a fixture
@@ -720,8 +776,8 @@ def install_loader(prefix: str, target: str, loader: dict) -> tuple[dict, str]:
             "path": loader["resolved"],
             "sha256": loader["sha256"],
             "installed": False,
-            "link": None,
-            "link_target": None,
+            "link": loader["link"]["path"],
+            "link_target": loader["link"]["target"],
         }, os.path.dirname(loader["resolved"])
     directory = loader_directory(prefix)
     os.makedirs(directory, exist_ok=True)
@@ -928,6 +984,10 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
         if path is None and description == "the loader's linker-facing link":
             # Only a prefix that installed the loader owns a link to it.
             continue
+        if description == "the loader's linker-facing link" and not recorded["loader"].get("installed"):
+            # A referenced loader's link belongs to its package, not to this
+            # prefix; it is held below to the one the pin qualifies instead.
+            continue
         if not isinstance(path, str) or os.path.commonpath([root, os.path.abspath(path)]) != root:
             problems.append(f"{description} is recorded at {path!r}, which is not inside {root}")
 
@@ -1035,6 +1095,15 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
     ):
         if recorded_value != actual_value:
             problems.append(f"the recorded {field} is {recorded_value!r}, but this machine resolves {actual_value!r}")
+
+    if not recorded["loader"].get("installed"):
+        current_link = current["loader"].get("link") or {}
+        for field, recorded_value, actual_value in (
+            ("loader's linker-facing link", recorded["loader"].get("link"), current_link.get("path")),
+            ("loader's linker-facing link target", recorded["loader"].get("link_target"), current_link.get("target")),
+        ):
+            if recorded_value != actual_value:
+                problems.append(f"the recorded {field} is {recorded_value!r}, but this machine resolves {actual_value!r}")
 
     recorded_layers = {layer.get("name"): layer for layer in recorded.get("layers", [])}
     if current["layer"]["name"] not in recorded_layers:

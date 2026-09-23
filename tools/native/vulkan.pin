@@ -41,11 +41,18 @@ LINUX_GLSLANG_PACKAGE_VERSION=15.1.0-2~ubuntu0.24.04.2
 LINUX_LOADER=/usr/lib/x86_64-linux-gnu/libvulkan.so.1
 LINUX_LOADER_VERSION=1.3.275
 # The path is the soname link; it resolves to libvulkan.so.1.3.275, and the
-# resolved file is what this digest qualifies.
+# resolved file is what this digest qualifies. `-lvulkan` opens the
+# development package's `libvulkan.so` beside it instead, so that link is
+# required to resolve to this same file before anything is provisioned.
 LINUX_LOADER_SHA256=e833b010f814b72c6aca0300c8b5f19b6106ffa06c24ddc95a293970c7d6058e
 LINUX_LOADER_PC=/usr/lib/x86_64-linux-gnu/pkgconfig/vulkan.pc
 LINUX_LOADER_PC_SHA256=d61e9b8e0609be4e9e9fec64578c6f5f2d53e09de85536df17791c64141e579d
 LINUX_INCLUDE=/usr/include
+# The Vulkan header trees (`vulkan/` and `vk_video/`) under LINUX_INCLUDE, as
+# `vulkan.py`'s `headers_digest` computes it: each file's relative path and
+# SHA-256, in order. Taken from the pinned `libvulkan-dev` `.deb` and confirmed
+# against the digest the published image reported for its own tree.
+LINUX_HEADERS_SHA256=c2fe3093ec24c93d92a31eced02f5800ad9dcce16606898ebcef2b2de566feb0
 LINUX_DRIVER_MANIFEST=/usr/share/vulkan/icd.d/lvp_icd.json
 LINUX_DRIVER_MANIFEST_SHA256=70d49f7fd41a7593a4e283543ed4855c139c700e5c1b31792f56e9576ede2398
 LINUX_DRIVER_NAME=lvp
@@ -89,6 +96,10 @@ MACOS_LOADER_SHA256=43e14d232fc727b7f2832da79944650237223a9f47b71cf1aafd3891bf6c
 MACOS_LOADER_PC=/usr/local/lib/pkgconfig/vulkan.pc
 MACOS_LOADER_PC_SHA256=3e75cb3cd2ad6db24c9e9b53a8bb5b72e6a5f3072556416041c3fe8b4aaf6fab
 MACOS_INCLUDE=/usr/local/include
+# The Vulkan header trees under MACOS_INCLUDE, computed as LINUX_HEADERS_SHA256
+# is: the SDK's headers are an input with an identity, not a directory that
+# came along with the loader.
+MACOS_HEADERS_SHA256=ec14c8cb2a13dcc958cbbb64d25f6bb1da956553ac7305c2071b9e5c7dd12ae4
 
 MACOS_DRIVER_MANIFEST=/opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json
 MACOS_DRIVER_MANIFEST_SHA256=b514f51690582fb783383154b7a33c7816cc47e98ee1a1f652dccd3e996f0bf1

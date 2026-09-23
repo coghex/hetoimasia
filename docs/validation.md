@@ -1720,7 +1720,12 @@ and `record` establishes a *project-managed Vulkan prefix* at
 | `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. |
 | `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. Its mode is recorded and `check` runs that flag: bytes alone would accept a wrapper whose execute bits were cleared, which fails outright when used directly and is walked past when used through `PATH`. |
 
-On Linux every input is referenced where its pinned package installed it. On
+On Linux every input is referenced where its pinned package installed it,
+including the name `-lvulkan` opens: the development package's `libvulkan.so`
+beside the referenced loader. That link is qualified before anything is
+provisioned — it has to be a symbolic link resolving to the loader the pin
+qualifies — and is then recorded and checked as the macOS one is, so deleting
+it, pointing it elsewhere, or replacing it with a file is refused. On
 macOS the loader is copied instead, because its own install name is
 `@rpath/libvulkan.1.dylib`: a consumer pointed at the vendor SDK would need an
 rpath and would record a machine path in every product, and the copy's absolute
@@ -1734,7 +1739,11 @@ compiler it runs — as a path and a SHA-256, together with the source each was
 adopted from and the distribution revisions `dpkg` reports. The Vulkan headers
 a consumer compiles against get an identity too: one digest over every file
 under `vulkan/` and `vk_video/`, each contributing its relative path and its own
-content, so an added, removed, renamed, or edited header moves it. `check` re-reads
+content, so an added, removed, renamed, or edited header moves it. That digest
+is pinned per platform as `LINUX_HEADERS_SHA256` and `MACOS_HEADERS_SHA256`, and
+the source tree is held to it before anything is provisioned, so headers
+substituted before the first `record` are refused rather than adopted under an
+unchanged package revision. `check` re-reads
 and re-hashes each of those files rather than trusting the digests recorded
 beside them, and independently asks this machine to qualify under the pin
 again, so a prefix whose manifest is intact while a loader, driver, layer, or
