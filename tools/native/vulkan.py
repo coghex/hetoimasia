@@ -410,6 +410,16 @@ def headers_digest(include: str) -> str:
     and its own digest, so an added, removed, renamed, or edited header moves
     this.
     """
+    # A header that cannot be read, or a directory that cannot be listed, is
+    # refused rather than skipped: `os.walk` would otherwise pass over an
+    # unlistable directory silently and digest whatever remained.
+    def unlistable(error: OSError) -> None:
+        raise VulkanError(
+            f"the Vulkan header directory {error.filename} cannot be listed ({error.strerror or error}); "
+            f"{holdings(error.filename)}",
+            status=1,
+        )
+
     digest = hashlib.sha256()
     found = False
     for tree in HEADER_TREES:
@@ -417,12 +427,19 @@ def headers_digest(include: str) -> str:
         if not os.path.isdir(root):
             continue
         found = True
-        for base, directories, names in os.walk(root):
+        for base, directories, names in os.walk(root, onerror=unlistable):
             directories.sort()
             for name in sorted(names):
                 full = os.path.join(base, name)
                 relative = os.path.relpath(full, include)
-                digest.update(relative.encode("utf-8") + b"\0" + sha256_file(full).encode("ascii") + b"\n")
+                try:
+                    content = sha256_file(full)
+                except OSError as error:
+                    raise VulkanError(
+                        f"the Vulkan header {full} cannot be read ({error.strerror or error}); {holdings(full)}",
+                        status=1,
+                    ) from error
+                digest.update(relative.encode("utf-8") + b"\0" + content.encode("ascii") + b"\n")
     if not found:
         raise VulkanError(
             f"{include} holds none of the Vulkan header directories {', '.join(HEADER_TREES)}; {holdings(include)}",

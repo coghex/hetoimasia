@@ -13,7 +13,7 @@
 -- and the builder workflow's own runs are what exercise it.
 module CiImage (spec) where
 
-import Control.Exception (evaluate)
+import Control.Exception (evaluate, finally)
 import Control.Monad (forM_, void, when)
 import Data.Char (isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, sort)
@@ -26,6 +26,7 @@ import System.Directory
   , createFileLink
   , doesDirectoryExist
   , doesFileExist
+  , emptyPermissions
   , findExecutable
   , getCurrentDirectory
   , getPermissions
@@ -36,6 +37,7 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.IO (IOMode (AppendMode), hPutStr, withBinaryFile)
+import System.IO.Error (catchIOError)
 import System.Info (os)
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -44,6 +46,7 @@ import Test.Hspec
   , describe
   , expectationFailure
   , it
+  , pendingWith
   , shouldBe
   , shouldContain
   , shouldNotBe
@@ -952,6 +955,47 @@ spec = describe "CI image" $ do
             refused `shouldBe` ExitFailure 1
             errors `shouldContain` "substituted headers are never adopted"
             doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
+      forM_ ["Darwin", "Linux"] $ \target →
+        it ("refuses an unreadable " ++ target ++ " header before it provisions anything") $
+          withNative $ \native → do
+            -- A header that cannot be read is a diagnosis naming it, never a
+            -- traceback and never a header quietly left out of the digest. A
+            -- dangling link cannot be read even by root, so this holds on a CI
+            -- worker as well as on a desktop.
+            createFileLink (nativeInputs native </> "absent.h") (nativeInputs native </> "include/vulkan/unreadable.h")
+            (refused, _, errors) ← nativeToolOn target native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "include/vulkan/unreadable.h cannot be read"
+            errors `shouldNotContain` "Traceback"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
+      it "refuses a prefix whose header can no longer be read" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          createFileLink (nativePrefix native </> "absent.h") (nativePrefix native </> "vulkan/include/vulkan/unreadable.h")
+          (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "vulkan/include/vulkan/unreadable.h cannot be read"
+          errors `shouldNotContain` "Traceback"
+
+      it "refuses an unlistable header directory before it provisions anything" $
+        withNative $ \native →
+          sealed (nativeInputs native </> "include/vulkan/sealed") $ do
+            (refused, _, errors) ← nativeTool native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "include/vulkan/sealed cannot be listed"
+            errors `shouldNotContain` "Traceback"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
+      it "refuses a prefix whose header directory can no longer be listed" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          sealed (nativePrefix native </> "vulkan/include/vulkan/sealed") $ do
+            (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "vulkan/include/vulkan/sealed cannot be listed"
+            errors `shouldNotContain` "Traceback"
 
       forM_ loaderLinkDamage $ \(label, damage, named) →
         it ("refuses a prefix whose linker-facing loader link was " ++ label) $
@@ -2387,6 +2431,21 @@ linuxLoaderLinkDamage =
 -- Written as bytes rather than as text: some of these inputs are real Mach-O
 -- libraries, and reading one as a string would fail on this machine's own
 -- encoding rather than on anything the recipe does.
+-- | Run an example with a header directory that cannot be listed, restoring
+-- it afterwards so the temporary tree can still be removed. Root lists a
+-- directory whatever its mode, so where the mode refuses nothing the example
+-- says so rather than passing without having exercised the refusal.
+sealed ∷ FilePath → IO () → IO ()
+sealed directory action = do
+  writeFixtureFile directory "hidden.h" "/* a header behind an unlistable directory */\n"
+  before ← getPermissions directory
+  setPermissions directory emptyPermissions
+  flip finally (setPermissions directory before) $ do
+    listable ← (not . null <$> listDirectory directory) `catchIOError` const (pure False)
+    if listable
+      then pendingWith "this user lists a directory whatever its mode, so an unlistable one cannot be made here"
+      else action
+
 substitute ∷ Native → FilePath → IO ()
 substitute _ path = withBinaryFile path AppendMode (\handle → hPutStr handle "a substituted byte\n")
 
