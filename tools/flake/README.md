@@ -6,8 +6,7 @@ reproducer. CI-covered Hspec examples are eligible for a flake investigation,
 not ordinary `$test` repetition. The ordinary regression stays in its owning
 suite. Python manages subprocesses and records; Hspec keeps engine assertions.
 
-The installed skills select through this tool, not through a second handwritten
-queue. From a checkout containing the lab, with the qualified toolchain on PATH:
+The Codex skills installed by `install_skills.py` select through this tool. From a checkout containing the lab, with the qualified toolchain on PATH:
 
 ```sh
 python3 tools/flake/lab.py run
@@ -72,7 +71,10 @@ run JSON are regenerable views of the database; never hand-edit them.
 A repository-local OS lock serializes test/flake execution and prevents competing
 lab runs from consuming the same resources. It does not lock other repositories
 or stop their builds. A detached checkout per revision lives in a sibling
-`.hetoimasia-flake-worktrees/` directory and is reused for incremental builds.
+`.hetoimasia-flake-worktrees/` directory. Repeated runs of that exact revision
+reuse its checkout and build output. Each newly selected revision gets a fresh
+checkout and `dist-newstyle`; build output is not shared between revisions.
+Old checkouts accumulate until explicitly removed; there is no automatic pruning.
 The lab verifies its repository, detached commit and cleanliness; it never
 resets a dirty cache. Preserve and inspect an unexpected edit. These caches may
 be removed with ordinary `git worktree remove <exact-owned-path>` when no lab
@@ -198,7 +200,13 @@ replace nor duplicate engine Hspec assertions. They initialize no engine, Lua VM
 GPU or desktop. Actual repeated measurements remain optional local work.
 
 `install_skills.py` installs the thin repository routes into the personal
-`flake`, `test`, and `autotest` skills. Preview with no arguments; use `--apply`
+`flake`, `test`, and `autotest` skills under `~/.codex/skills` by default.
+It does not install routes into Copilot, Kimi, Grok, or other agents. Those agents
+can use this same CLI and ledger, but their legacy generic `codex-test` registry
+receives no claims or results from this lab. Until their routes are ported, do
+not assume cross-registry exclusion or freshness; use this CLI for coordinated
+Hetoimasia probes instead of running the two coordinators concurrently.
+Preview with no arguments; use `--apply`
 only when the user authorized skill changes. It preserves Synarchy's original
 workflow as a skill reference, keeps the other test workflows intact, backs up
 changed files, and can be rerun without duplicating the adapter blocks. The

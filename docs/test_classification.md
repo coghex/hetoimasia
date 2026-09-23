@@ -103,13 +103,17 @@ Other existing apparatus is already outside routine automation:
 
 ## Coordinated local selection
 
-`$test` and `$autotest` select optional probes through the repository's
-[local lab](../tools/flake/README.md). `$flake` uses the same coordinator and can
+The Codex `$test` and `$autotest` routes installed by
+`tools/flake/install_skills.py` select optional probes through the repository's
+[local lab](../tools/flake/README.md). Its `$flake` route uses that coordinator and can
 also repeatedly investigate CI-covered Hspec examples. Ordinary CI regressions
 remain where they are; the stress measurement is optional. The coordinator owns
 claims, deferrals, source/build provenance, all attempts, and new-probe proposals.
 It records results locally and produces a readable `coordinator.md` under the
 common Git directory's `flake-lab/`. No daemon or CI receipt import is involved.
+Other agents may use the same CLI to participate. Their legacy generic
+`codex-test` registries receive no lab claims or results; route their Hetoimasia
+probes through this CLI before relying on shared exclusion or freshness.
 
 A skill invocation selects one eligible workload. If useful existing work is
 exhausted, the skill records and presents one missing-probe proposal for approval.
