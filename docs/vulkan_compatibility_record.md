@@ -24,6 +24,14 @@ checkout, and inside the Linux container from the files the recipe copied into
 it, with no checkout to consult. That is direct evidence the two platforms
 proved one tree rather than two that were believed to match.
 
+VK-4 later ran the same harness against the environment it provisions rather
+than against the temporary one this record was produced on, and retained what
+that produced beside these: [`docs/vulkan/macos-provisioned.md`](vulkan/macos-provisioned.md)
+and [`docs/vulkan/linux-provisioned.md`](vulkan/linux-provisioned.md). Those are
+a separate pair, not a revision of this one — they consumed different files by
+a different discovery route, and each says which. This record and the two it
+summarises are unchanged.
+
 **Verdict: pass on both platforms.** The design's 1.3 minimum, its present-fence
 retirement, and its `VK_EXT_swapchain_maintenance1` image release all hold. No
 part of the contract was weakened to reach it.
@@ -86,10 +94,13 @@ SDK's MoltenVK, whose manifest declares API 1.2.0 — below D-12's accepted
 minimum. Homebrew's MoltenVK 1.4.0 sits under `/opt/homebrew` with a manifest the
 default loader never reads.
 
-So the proof names the driver rather than accepting discovery:
-`tools/vulkan-proof/environment.pin` pins the Homebrew manifest by absolute path
-and `run-proof.sh` passes it as `VK_DRIVER_FILES`, which is the loader's own
-documented override. The harness additionally clears `VK_ICD_FILENAMES`,
+So the proof names the driver rather than accepting discovery. At the time of
+this record that selection lived in `tools/vulkan-proof/environment.pin`, which
+pinned the Homebrew manifest by absolute path; VK-4 (#208) retired that file and
+moved the same selection into `tools/native/vulkan.pin`, which the native recipe
+qualifies by digest and provisions into `<native prefix>/vulkan`. Either way
+`run-proof.sh` passes the selected manifest as `VK_DRIVER_FILES`, which is the
+loader's own documented override. The harness additionally clears `VK_ICD_FILENAMES`,
 `VK_ADD_DRIVER_FILES`, `VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`, and the loader's
 select/disable variables out of its own environment before initializing, and
 records which it removed — a run whose driver selection could have been
@@ -268,9 +279,13 @@ both platforms.
   performance coverage.
 - **Hosted macOS CI.** macOS evidence is local and requires a human's per-run
   approval, exactly as D-3 and AGENTS.md require. Nothing here changes that.
-- **The production environment.** The CI image still carries no Vulkan input and
-  the native manifest still describes GLFW alone. Promoting this recipe is VK-4's
-  deliberate step, not a side effect of this proof.
+- **The production environment.** At the time of this proof the CI image carried
+  no Vulkan input and the native manifest described GLFW alone; promoting the
+  recipe was left to VK-4 rather than taken as a side effect here. VK-4 (#208)
+  has since done it, and the
+  [provisioned records](vulkan/linux-provisioned.md) are that environment's own
+  evidence. This record remains what it was: a proof of the profile, not of the
+  environment that now carries it.
 - **Multiple windows, resize, and a triangle.** One surface, one swapchain, no
   pipeline, no shader. VK-10 and VK-17 own those.
 

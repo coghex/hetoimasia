@@ -131,10 +131,13 @@ reproduces this set. `cabal build all --dry-run` prints it.
 
 `vulkan-3.27` and `vulkan-utils-0.5.11.0` — the newest pair at this index, and
 the pair `vulkan-utils`'s own `vulkan >=3.27 && <3.28` bound requires. Neither
-is a dependency of any package this repository builds: there is no
-`packages/gpu-vulkan` Cabal package, `cabal.project` does not list one, and the
-Linux CI image gains no Vulkan input. They are proved here so VK-2 and later
-inherit a proven pair instead of re-deciding it.
+is a dependency of any package the mandatory floor builds: there is no
+`packages/gpu-vulkan` Cabal package and neither `cabal.project` nor
+`cabal.project.cpu` lists one. That independence used to follow from the Linux
+CI image carrying no Vulkan input at all; VK-4 provisioned one, so it is now
+asserted directly instead — `tools/test/VulkanProof.hs` reads every package
+those two files name and requires that none depends on the binding. The pair is
+proved here so VK-2 and later inherit a proven one instead of re-deciding it.
 
 Both flags are set opposite to the package's own defaults, and
 `tools/toolchain/binding.pin` records why:
@@ -157,29 +160,59 @@ The effective flag set the solver actually reported, on both platforms:
 The binding finds the loader differently per platform, and this is a real
 difference rather than an accident:
 
-- **Linux** — `vulkan` declares `pkgconfig-depends: vulkan`. Installing the
-  loader's development package is the entire configuration; nothing is named by
-  this repository.
+- **Linux** — `vulkan` declares `pkgconfig-depends: vulkan`. A package
+  description is the entire configuration.
 - **macOS** — `vulkan` declares `extra-libraries: vulkan` and, with
-  `darwin-lib-dirs` off, supplies no search path at all. The prefix is named
-  explicitly: `MACOS_VULKAN_PREFIX` in `tools/toolchain/binding.pin`, overridden
-  by `HETOIMASIA_VULKAN_PREFIX`.
+  `darwin-lib-dirs` off, supplies no search path at all. A library directory
+  has to be named.
 
-Naming the prefix is necessary but not sufficient, and the qualification is what
-found that. `vulkan-utils` runs Template Haskell against the compiled `vulkan`
-library, so GHC `dlopen`s it *while compiling*, and that dylib records its
-dependency as `@rpath/libvulkan.1.dylib`. `extra-lib-dirs` is a link-time search
-path and contributes no rpath, so the compile-time load fails with
-`Library not loaded: @rpath/libvulkan.1.dylib` even though the link would have
-succeeded. `tools/toolchain/qualify-binding.sh` therefore emits a
-`package vulkan` stanza carrying `extra-lib-dirs`, `extra-include-dirs`, and
-`ghc-options: -optl-Wl,-rpath,<prefix>/lib`. It has to be a project stanza:
-`--ghc-options` on the command line reaches local packages only, never a
-dependency the store builds.
+VK-4 answered both from one place. `tools/native/vulkan.py` provisions the
+loader into the private native prefix and writes
+`<prefix>/vulkan/lib/pkgconfig/vulkan.pc` describing it, so on Linux
+`pkgconfig-depends: vulkan` resolves the project-managed prefix rather than
+whatever a distribution installed; and `native.py prepare` prints
+`HETOIMASIA_VULKAN_LIBDIR` and `HETOIMASIA_VULKAN_INCLUDEDIR`, which
+`tools/vulkan-proof/run-proof.sh` passes to Cabal as `--extra-lib-dirs` and
+`--extra-include-dirs` on the one command line. Those are configure flags, so
+unlike `--ghc-options` they reach a dependency the store builds. Nothing is
+generated on disk and nothing names a machine path.
 
-The `darwin-lib-dirs` default hid this by hard-coding a path that happened to
-hold the loader. Any later slice that links the binding on macOS needs the rpath,
-not only the library directory.
+Linking selects the loader's directory; it does not select the file loaded at
+run time. On Linux `-lvulkan` leaves a `libvulkan.so.1` dependency the dynamic
+linker resolves when the proof starts, so `LD_LIBRARY_PATH` could put an
+ABI-compatible substitute ahead of the one `prepare` verified. `run-proof.sh`
+therefore refuses `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, and the `DYLD_*`
+search and insertion variables before its first check, and `prepare` also
+exports `HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader's path: the
+harness canonicalizes it and the image the binding's `vkGetInstanceProcAddr`
+was resolved from, and stops unless they are the same file.
+
+#### Why the loader is copied on macOS, and why there is no rpath
+
+Naming a library directory is necessary but not sufficient, and the
+qualification is what found that. `vulkan-utils` runs Template Haskell against
+the compiled `vulkan` library, so GHC `dlopen`s it *while compiling*, and a
+dylib linked against the vendor SDK's loader records its dependency as
+`@rpath/libvulkan.1.dylib`. `extra-lib-dirs` is a link-time search path and
+contributes no rpath, so the compile-time load fails with
+`Library not loaded: @rpath/libvulkan.1.dylib` even though the link succeeded.
+An rpath cannot be supplied from the command line either, for the reason above:
+`--ghc-options` never reaches a dependency.
+
+So the recipe removes the `@rpath` rather than working around it. The qualified
+loader is copied into `<prefix>/vulkan/lib` and given an **absolute install
+name**, and the copy is re-signed ad hoc because editing a Mach-O invalidates
+its signature. Everything linked against it then records that absolute path, and
+no rpath, no generated project file, and no machine path is involved at any
+stage. `tools/toolchain/qualify-binding.sh` predates this and still emits its
+own `package vulkan` stanza against `MACOS_VULKAN_PREFIX`; that remains the
+qualification's own retained invocation, and the provisioned prefix satisfies
+the same shape — `<prefix>/vulkan/lib` holds the loader and
+`<prefix>/vulkan/lib/pkgconfig/vulkan.pc` describes it — so
+`HETOIMASIA_VULKAN_PREFIX` may be pointed at it.
+
+The `darwin-lib-dirs` default hid the whole problem by hard-coding a path that
+happened to hold a loader.
 
 ## Running the qualification
 
@@ -200,7 +233,10 @@ bash tools/toolchain/qualify-binding.sh
 
 On Linux, inside the pinned throwaway container
 `tools/toolchain/Dockerfile.linux-binding`, which pins its base image by digest
-and installs the toolchain from the same checksummed bindists the CI image uses:
+and installs the toolchain from the same checksummed bindists the CI image uses.
+This container is #157's own and is unrelated to the one VK-4 retired: it proves
+the binding *builds*, and the published CI image is where the runtime profile is
+now proved instead.
 
 ```bash
 docker build -f tools/toolchain/Dockerfile.linux-binding \
@@ -213,10 +249,14 @@ docker run --rm hetoimasia-binding-qualification
 checkout inside it to ask, only the handful of files the recipe copies.
 
 That container is not the CI image and nothing published depends on it. It
-carries `libvulkan-dev`, which is exactly the input the CI image must not gain
-until VK-4 provisions it deliberately; keeping the two recipes separate is what
-lets this slice prove the binding without changing what every validation worker
-pulls.
+carries its own `libvulkan-dev`, which was the whole reason to keep it separate:
+at the time, that was exactly the input the CI image was not to gain until VK-4
+provisioned one deliberately, so this slice could prove the binding without
+changing what every validation worker pulled. VK-4 has since provisioned a
+qualified Vulkan runtime into the image itself, pinned by digest. The separation
+still earns its keep for a narrower reason — this container answers whether the
+pinned binding compiles against the pinned compiler, on inputs of its own, and
+is not evidence about what the image carries.
 
 Its inputs are pinned so a rebuild qualifies against the same thing: the base
 image by digest, the distribution packages by an Ubuntu archive snapshot, the
