@@ -362,7 +362,8 @@ def verify_image(descriptor: dict, image_root: str, repo_root: str) -> dict[str,
     entirely, and an older image built from the same native recipe would run
     `native.py check` quite happily. This asks the image what it is instead of
     taking the reference on trust: the fingerprint it embeds, the native
-    manifest it carries, and the Vulkan identities its own prefix yields, each
+    manifest it carries, the Vulkan identities its own prefix yields, and the
+    compilers, compositor, platform, and architecture it records and runs, each
     against the descriptor's corresponding field.
     """
     validate_descriptor(descriptor, "the committed descriptor")
@@ -414,11 +415,43 @@ def verify_image(descriptor: dict, image_root: str, repo_root: str) -> dict[str,
                 f"this image's {entry} is {declared.get(entry)!r}, but the descriptor names {expected!r}"
             )
 
+    # The compilers and the compositor, each established twice over: what the
+    # image embedded when it was stamped, and what it actually runs now. Any of
+    # these could otherwise be misstated over an unchanged digest and
+    # fingerprint and still be believed, since the descriptor is excluded from
+    # that fingerprint. The platform and architecture have no embedded copy,
+    # so they are asked of the running container alone. The reference and
+    # digest need no answer from the image: the route runs `reference@digest`,
+    # so the container runtime has already bound them.
+    installed: dict[str, str] = {}
+    for field, command in (
+        ("ghc", ["ghc", "--numeric-version"]),
+        ("cabal", ["cabal", "--numeric-version"]),
+        (COMPOSITOR_ENTRY, ["dpkg-query", "--show", "--showformat=${Version}", "weston"]),
+        ("platform", ["uname", "-s"]),
+        ("architecture", ["dpkg", "--print-architecture"]),
+    ):
+        expected = descriptor[field]
+        if field in ("ghc", "cabal", COMPOSITOR_ENTRY) and embedded.get(field) != expected:
+            problems.append(
+                f"this image embeds {field} {embedded.get(field)!r}, but the descriptor names {expected!r}"
+            )
+        try:
+            actual = command_output(command)
+        except ImageError as failure:
+            problems.append(f"this image cannot report its {field} ({failure})")
+            continue
+        if field == "platform":
+            actual = actual.lower()
+        if actual != expected:
+            problems.append(f"this image runs {field} {actual!r}, but the descriptor names {expected!r}")
+        installed[field] = actual
+
     if problems:
         raise ImageError(
             "this container is not the image the committed descriptor describes: " + "; ".join(problems)
         )
-    return {**declared, MANIFEST_ENTRY: actual_manifest}
+    return {**declared, **installed, MANIFEST_ENTRY: actual_manifest}
 
 
 def verify_worker(plan: dict, image_root: str, repo_root: str) -> dict[str, str]:

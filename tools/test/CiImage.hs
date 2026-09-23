@@ -530,6 +530,55 @@ spec = describe "CI image" $ do
             (withField (descriptorField entry) replacement (descriptorJson described))
           refusedImage fixture worker [] ("but the descriptor names '" ++ replacement ++ "'")
 
+    forM_ [("ghc", "9.12.1"), ("cabal", "3.16.0.0"), ("weston", "12.0.0-1"), ("architecture", "arm64")] $
+      \(name, replacement) →
+        it ("refuses a descriptor whose " ++ name ++ " is not the image's") $
+          withWorker $ \fixture worker → do
+            -- Like the Vulkan identities, these are excluded from the
+            -- fingerprint with the rest of the descriptor, so a misstated
+            -- one would otherwise be believed over an unchanged digest.
+            described ← descriptorNow fixture
+            change fixture "tools/ci-image/descriptor.json" (withField name replacement (descriptorJson described))
+            refusedImage fixture worker [] ("but the descriptor names '" ++ replacement ++ "'")
+
+    forM_ [("ghc", "ghc-version", "9.12.1"), ("cabal", "cabal-version", "3.16.0.0"), ("weston", "weston-version", "12.0.0-1")] $
+      \(name, stub, replacement) → do
+        it ("refuses an image that runs another " ++ name ++ " than the descriptor names") $
+          withWorker $ \fixture worker → do
+            writeFile (workerStubs worker </> stub) (replacement ++ "\n")
+            refusedImage fixture worker [] ("this image runs " ++ name ++ " '" ++ replacement ++ "'")
+
+        it ("refuses an image that embeds another " ++ name ++ " than the descriptor names") $
+          withWorker $ \fixture worker → do
+            current ← fingerprintNow fixture
+            writeFile
+              (workerImage worker </> "image.json")
+              ( renderObject
+                  [ ("recipe_fingerprint", quoted current)
+                  , ("ghc", quoted (if name == "ghc" then replacement else "9.14.1"))
+                  , ("cabal", quoted (if name == "cabal" then replacement else "3.18.1.0"))
+                  , ("weston", quoted (if name == "weston" then replacement else pinnedCompositor))
+                  ]
+              )
+            refusedImage fixture worker [] ("this image embeds " ++ name ++ " '" ++ replacement ++ "'")
+
+    it "refuses an image running on another architecture than the descriptor names" $
+      withWorker $ \fixture worker → do
+        writeFile (workerStubs worker </> "architecture") "arm64\n"
+        refusedImage fixture worker [] "this image runs architecture 'arm64'"
+
+    it "refuses an image running on another platform than the descriptor names" $
+      withWorker $ \fixture worker → do
+        -- The descriptor's platform is refused outright unless it is linux,
+        -- so the only disagreement left to catch is the container's own.
+        writeFile (workerStubs worker </> "system") "Darwin\n"
+        refusedImage fixture worker [] "this image runs platform 'darwin'"
+
+    it "refuses an image that cannot report its architecture" $
+      withWorker $ \fixture worker → do
+        executableFile (workerStubs worker </> "dpkg") "#!/bin/sh\necho 'dpkg: unavailable' >&2\nexit 1\n"
+        refusedImage fixture worker [] "this image cannot report its architecture"
+
   describe "the image workflow's routes" $ do
     it "starts a proof route only on its own dispatch, and image resolution for no proof route" $ do
       -- The routes are read from the workflow's own choice list rather than
@@ -1620,6 +1669,30 @@ withWorker action = withFixture $ \fixture → do
         ]
     )
   executableFile (stubs </> "ghc") ("#!/bin/sh\ncat '" ++ stubs </> "ghc-version" ++ "'\n")
+  -- The platform and architecture the image runs as, answered from files an
+  -- example can rewrite. Anything else asked of `uname` — the native check's
+  -- own machine probe among it — reaches the real one.
+  writeFile (stubs </> "system") "Linux\n"
+  writeFile (stubs </> "architecture") "amd64\n"
+  realUname ← findExecutable "uname" >>= maybe (fail "uname is not on PATH") pure
+  executableFile
+    (stubs </> "uname")
+    ( unlines
+        [ "#!/bin/sh"
+        , "if [ \"$*\" = \"-s\" ]; then cat '" ++ stubs </> "system" ++ "'; exit 0; fi"
+        , "exec '" ++ realUname ++ "' \"$@\""
+        ]
+    )
+  executableFile
+    (stubs </> "dpkg")
+    ( unlines
+        [ "#!/bin/sh"
+        , "case \"$*\" in"
+        , "  --print-architecture) cat '" ++ stubs </> "architecture" ++ "' ;;"
+        , "  *) echo \"dpkg stub: unexpected $*\" >&2; exit 1 ;;"
+        , "esac"
+        ]
+    )
   executableFile
     (stubs </> "cabal")
     ( unlines
@@ -1703,7 +1776,9 @@ sha256Of fixture path = do
 -- was built from and the compositor revision it installed.
 embeddedImage ∷ String → String → String
 embeddedImage fingerprint compositor =
-  "{\"recipe_fingerprint\": \"" ++ fingerprint ++ "\", \"weston\": \"" ++ compositor ++ "\"}\n"
+  "{\"recipe_fingerprint\": \"" ++ fingerprint ++ "\", \"ghc\": \"9.14.1\", \"cabal\": \"3.18.1.0\", \"weston\": \""
+    ++ compositor
+    ++ "\"}\n"
 
 -- | A prefix shaped like the recipe's output, with a placeholder archive. Its
 -- metadata is read by the real pkg-config, which is all a check consults.

@@ -118,7 +118,8 @@ jobs:
           # that fingerprint against the candidate says nothing about which
           # image the descriptor's digest actually points at. This asks the
           # image what it is — the fingerprint it embeds, the native manifest it
-          # carries, and the Vulkan identities its own prefix yields — and
+          # carries, the Vulkan identities its own prefix yields, and the ghc,
+          # cabal, weston, platform, and architecture it records and runs — and
           # refuses to prove anything on an image that answers differently.
           {
             echo '## The image the record is attributable to'

@@ -1782,7 +1782,14 @@ python3 tools/validation/ci_image.py verify-image --descriptor tools/ci-image/de
 
 asks the image what it is instead: the fingerprint it embeds, the native
 manifest it carries, and the Vulkan identities its own prefix yields, each
-against the descriptor's corresponding field. The proof route runs it inside the
+against the descriptor's corresponding field. The descriptor's `ghc`, `cabal`,
+and `weston` are each checked twice, against the version the image embedded
+when it was stamped and against the one it actually runs (`ghc` and `cabal`
+`--numeric-version`, and the installed `weston` package). Its `platform` and
+`architecture` are checked against the running container's `uname -s` and
+`dpkg --print-architecture`. The reference and digest need no answer from the
+image, because the route runs `reference@digest` and the container runtime
+has already bound them. The proof route runs it inside the
 pulled image before proving anything, so a record is only ever attributable to
 the image the committed descriptor describes.
 
