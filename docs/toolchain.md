@@ -177,6 +177,16 @@ whatever a distribution installed; and `native.py prepare` prints
 unlike `--ghc-options` they reach a dependency the store builds. Nothing is
 generated on disk and nothing names a machine path.
 
+Linking selects the loader's directory; it does not select the file loaded at
+run time. On Linux `-lvulkan` leaves a `libvulkan.so.1` dependency the dynamic
+linker resolves when the proof starts, so `LD_LIBRARY_PATH` could put an
+ABI-compatible substitute ahead of the one `prepare` verified. `run-proof.sh`
+therefore refuses `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, and the `DYLD_*`
+search and insertion variables before its first check, and `prepare` also
+exports `HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader's path: the
+harness canonicalizes it and the image the binding's `vkGetInstanceProcAddr`
+was resolved from, and stops unless they are the same file.
+
 #### Why the loader is copied on macOS, and why there is no rpath
 
 Naming a library directory is necessary but not sufficient, and the

@@ -16,7 +16,7 @@ module CiImage (spec) where
 import Control.Exception (evaluate, finally)
 import Control.Monad (forM_, void, when)
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, sort)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, sort, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
 import System.Directory
@@ -1082,6 +1082,31 @@ spec = describe "CI image" $ do
             (refused, _, errors) ← nativeTool native [] ([command, "--prefix", nativePrefix native] ++ build)
             refused `shouldBe` ExitFailure 1
             errors `shouldContain` "holds VkLayer_unqualified.json beside the recorded"
+
+      it "prepares a discovery that exports no input override, and names the qualified loader" $
+        withNative $ \native → do
+          -- The discovery is evaluated into the runner's own environment, and
+          -- the runner checks the prefix again after that. A discovery that
+          -- exported an override name would relocate the very input the check
+          -- then holds to the pin.
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          (prepared, discovery, prepareErrors) ←
+            nativeTool native [] ["prepare", "--prefix", nativePrefix native, "--build-dir", nativeBuild native]
+          (prepared, prepareErrors) `shouldBe` (ExitSuccess, "")
+          (listed, overrides, listErrors) ←
+            run
+              (nativeEnvironment native)
+              (nativeDirectory native)
+              (nativePython native)
+              [ "-c"
+              , "import sys; sys.path.insert(0, sys.argv[1]); import vulkan; print('\\n'.join(vulkan.OVERRIDES.values()))"
+              , nativeRecipe native
+              ]
+          (listed, listErrors) `shouldBe` (ExitSuccess, "")
+          let exported = [takeWhile (/= '=') rest | line ← lines discovery, Just rest ← [stripPrefix "export " line]]
+          lines overrides `shouldNotBe` []
+          filter (`elem` lines overrides) exported `shouldBe` []
+          exported `shouldContain` ["HETOIMASIA_VULKAN_QUALIFIED_LOADER"]
 
       it "refuses a Vulkan product the prefix does not own" $
         withNative $ \native → do

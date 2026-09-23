@@ -1758,6 +1758,9 @@ locates, the pin decides — and a path that is a symlink, such as Homebrew's
 `opt`, is resolved before it is hashed, so a moving link cannot quietly change
 what the prefix is a prefix of. An override is part of the identity, because a
 prefix provisioned through a relocated input is a prefix of that route.
+`prepare`'s discovery never exports one of these names: it is evaluated into
+the environment the next `check` reads, so it names the recorded loader as
+`HETOIMASIA_VULKAN_QUALIFIED_LOADER` instead.
 
 Changing `tools/native/vulkan.pin` changes the [recipe
 fingerprint](#the-recipe-fingerprint), so an upgrade is an explicit

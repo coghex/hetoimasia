@@ -266,6 +266,13 @@ from a pin of this package's own; relocating one input for a run is
 variables [docs/validation.md](../../docs/validation.md) describes, and an
 override locates an input without waiving its qualification.
 
+A runtime library search override is refused outright: `run-proof.sh` exits 2
+naming `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, or a `DYLD_*` search or
+insertion variable before it checks anything, because the loader is resolved
+when the proof starts and such a variable could substitute another one. The
+harness then stops unless the binding's loader image is
+`HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader `prepare` exports.
+
 A run refused for lack of consent exits non-zero with one line saying what is
 missing and how a human authorizes it. It initializes nothing first. The mode is
 decided before consent is read, so `--headless` is refused for nothing and

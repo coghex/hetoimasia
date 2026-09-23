@@ -1239,6 +1239,10 @@ def environment(prefix: str, recorded: dict) -> dict[str, str]:
         # instead of through a generated project file.
         "HETOIMASIA_VULKAN_LIBDIR": os.path.dirname(recorded["loader"]["path"]),
         "HETOIMASIA_VULKAN_INCLUDEDIR": recorded["loader"]["include"],
+        # The loader file the record hashed. A link names only a soname, which
+        # a runtime search path can answer with a different file, so a
+        # consumer holds whatever it actually loaded to this one.
+        "HETOIMASIA_VULKAN_QUALIFIED_LOADER": recorded["loader"]["path"],
         "HETOIMASIA_GLSLANG": recorded["glslang"]["wrapper"],
     }
 

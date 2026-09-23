@@ -26,16 +26,21 @@
 -- supplies the native-session consent AGENTS.md reserves for a human.
 --
 -- They read the repository's own project files, pins, and catalog out of the
--- checkout they run in. They start no session and build nothing.
+-- checkout they run in. They start no session and build nothing; the one that
+-- runs the runner does so only as far as a refusal made before its first check.
 module VulkanProof (spec, readByTheseExamples) where
 
 import Control.Monad (forM_)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
-import System.Directory (doesFileExist, listDirectory)
+import Sandbox (run)
+import System.Directory (doesFileExist, getCurrentDirectory, listDirectory)
+import System.Environment (getEnvironment)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldSatisfy)
+import System.IO.Temp (withSystemTempDirectory)
+import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
 
 -- | The retained per-platform records, and the summary that quotes them.
 retainedRecords ∷ [(String, FilePath)]
@@ -359,6 +364,28 @@ spec = describe "The Vulkan proof boundary" $ do
     runner `shouldSatisfy` any ("--test-option=$argument" `isInfixOf`)
     runner `shouldSatisfy` any ("${options[@]+\"${options[@]}\"}" `isInfixOf`)
 
+  forM_ [("LD_LIBRARY_PATH", False), ("LD_PRELOAD", True)] $ \(variable, namesFile) →
+    it ("refuses " ++ variable ++ " naming an alternate loader before it checks or builds anything") $
+      withSystemTempDirectory "hetoimasia-alternate-loader" $ \directory → do
+        -- An ABI-compatible loader ahead of the pinned one on a runtime search
+        -- path would be loaded after `prepare` verified the pinned file, and
+        -- GLFW and the binding would then share it faithfully. The runner
+        -- refuses the override outright; this refusal comes before the
+        -- toolchain check, so it needs no compiler and starts no session.
+        let alternate = directory </> "libvulkan.so.1"
+        writeFile alternate "an ABI-compatible substitute loader\n"
+        inherited ← filter ((`notElem` searchOverrides) . fst) <$> getEnvironment
+        checkout ← getCurrentDirectory
+        (status, output, errors) ←
+          run
+            ((variable, if namesFile then alternate else directory) : inherited)
+            checkout
+            "bash"
+            ["tools/vulkan-proof/run-proof.sh"]
+        status `shouldBe` ExitFailure 2
+        errors `shouldContain` ("run-proof: " ++ variable ++ " is set")
+        output `shouldNotContain` "run-proof: ghc"
+
   it "never supplies the native-session consent itself" $ do
     -- AGENTS.md: the human's approval is given on one approved command, never
     -- by a script an agent runs on its own, and `tools/display/x11.sh` is the
@@ -371,6 +398,21 @@ spec = describe "The Vulkan proof boundary" $ do
           , not ("#" `isPrefixOf` trim line)
           ]
     assignments `shouldBe` []
+
+-- | The runtime library search overrides the runner refuses, stripped from an
+-- example's inherited environment so only the one under test is present.
+searchOverrides ∷ [String]
+searchOverrides =
+  [ "LD_LIBRARY_PATH"
+  , "LD_PRELOAD"
+  , "LD_AUDIT"
+  , "DYLD_LIBRARY_PATH"
+  , "DYLD_FALLBACK_LIBRARY_PATH"
+  , "DYLD_INSERT_LIBRARIES"
+  , "DYLD_FRAMEWORK_PATH"
+  , "DYLD_FALLBACK_FRAMEWORK_PATH"
+  , "DYLD_IMAGE_SUFFIX"
+  ]
 
 -- | The package locations a project file declares, in order. Cabal's
 -- `packages:` stanza is either inline or a block of indented continuations, and

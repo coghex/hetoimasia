@@ -23,6 +23,13 @@
 # overrides it finds and records which, so the provisioned selection cannot be
 # quietly overridden from outside.
 #
+# The loader itself is a runtime dependency (`libvulkan.so.1` on Linux), so a
+# runtime library search override could load an ABI-compatible substitute after
+# `prepare` verified the pinned file. This refuses any such variable before its
+# first check rather than clearing it, and the harness then requires the image
+# its entry point was resolved from to be `HETOIMASIA_VULKAN_QUALIFIED_LOADER`,
+# the loader `prepare` names.
+#
 # The proof opens a visible window and presents to it, so it needs the same
 # per-run consent `glfw-native-tests` needs. It supplies none: on macOS the
 # human's `HETOIMASIA_NATIVE_SESSION=desktop` must already be on the invocation,
@@ -56,6 +63,22 @@ refuse() {
   echo "run-proof: $1" >&2
   exit 2
 }
+
+# A runtime library search override lets the dynamic linker answer the
+# loader's soname with some other file after `prepare` has verified the pinned
+# one, and an ABI-compatible substitute would then be proved in its place. Each
+# is refused rather than cleared, so a run never proves something other than
+# what its caller's environment asked for without saying so. The harness also
+# holds the loader it actually loaded to the recorded file, which catches what
+# this list cannot name. macOS strips the DYLD_ variables before a protected
+# binary such as /bin/bash runs, so there they are refused wherever they survive.
+for variable in LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+  DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_INSERT_LIBRARIES \
+  DYLD_FRAMEWORK_PATH DYLD_FALLBACK_FRAMEWORK_PATH DYLD_IMAGE_SUFFIX; do
+  if value="$(printenv "$variable")"; then
+    refuse "$variable is set ($value); a runtime library search override can load a Vulkan loader other than the one the prefix qualified, so unset it and run again"
+  fi
+done
 
 # The toolchain identity. A proof run on some other compiler proves nothing
 # about the one this repository pins, so it is refused rather than reported.
