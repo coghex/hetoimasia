@@ -19,6 +19,8 @@ case "$stage" in
     set -a
     # shellcheck disable=SC1091
     . "$recipe/tools/ci-image/compositor.pin"
+    # shellcheck disable=SC1091
+    . "$recipe/tools/native/vulkan.pin"
     set +a
     apt-get update
     # C build prerequisites, the libraries GHC's binary distribution links, the
@@ -33,8 +35,17 @@ case "$stage" in
     # the wayland-info client the Wayland helper proves readiness by connecting
     # with. Nothing here starts a display or a compositor.
     #
-    # Weston is installed at one exact revision. An `=` constraint apt cannot
-    # satisfy fails this layer rather than silently taking a newer package.
+    # Weston and every Vulkan input are installed at one exact revision each. An
+    # `=` constraint apt cannot satisfy fails this layer rather than silently
+    # taking a newer package, which is what keeps a driver or a layer upgrade an
+    # explicit requalification rather than something a rebuild does on its own.
+    #
+    # The Vulkan set is the loader and its headers, Mesa — whose Lavapipe is the
+    # software driver D-10 selects, and which `tools/native/vulkan.pin` names by
+    # manifest rather than letting the recipe pick from the eight that package
+    # installs — the Khronos validation layers, and the pinned glslang compiler.
+    # Nothing here compiles a shader; the compiler is provisioned for D-11 and
+    # VK-9 to inherit already qualified.
     apt-get install --yes --no-install-recommends \
       binutils build-essential ca-certificates cmake curl git jq pkg-config \
       procps python3 unzip xz-utils zstd \
@@ -42,12 +53,31 @@ case "$stage" in
       libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxrandr-dev \
       libwayland-dev libxkbcommon-dev \
       openbox x11-utils xvfb \
-      "weston=$WESTON_VERSION" wayland-utils
+      "weston=$WESTON_VERSION" wayland-utils \
+      "$LINUX_LOADER_PACKAGE=$LINUX_LOADER_PACKAGE_VERSION" \
+      "$LINUX_HEADERS_PACKAGE=$LINUX_HEADERS_PACKAGE_VERSION" \
+      "$LINUX_DRIVER_PACKAGE=$LINUX_DRIVER_PACKAGE_VERSION" \
+      "$LINUX_LAYER_PACKAGE=$LINUX_LAYER_PACKAGE_VERSION" \
+      "$LINUX_GLSLANG_PACKAGE=$LINUX_GLSLANG_PACKAGE_VERSION"
     rm -rf /var/lib/apt/lists/*
-    # The installed revision is read back from dpkg rather than assumed from the
-    # constraint, so what the image carries is what the pin names.
+    # Every installed revision is read back from dpkg rather than assumed from
+    # the constraint, so what the image carries is what the pin names.
     installed="$(dpkg-query --show --showformat='${Version}' weston)"
     test "$installed" = "$WESTON_VERSION"
+    for pinned in \
+      "$LINUX_LOADER_PACKAGE=$LINUX_LOADER_PACKAGE_VERSION" \
+      "$LINUX_HEADERS_PACKAGE=$LINUX_HEADERS_PACKAGE_VERSION" \
+      "$LINUX_DRIVER_PACKAGE=$LINUX_DRIVER_PACKAGE_VERSION" \
+      "$LINUX_LAYER_PACKAGE=$LINUX_LAYER_PACKAGE_VERSION" \
+      "$LINUX_GLSLANG_PACKAGE=$LINUX_GLSLANG_PACKAGE_VERSION"; do
+      name="${pinned%%=*}"
+      want="${pinned#*=}"
+      have="$(dpkg-query --show --showformat='${Version}' "$name")"
+      if [ "$have" != "$want" ]; then
+        echo "provision.sh: $name $have is installed, not the pinned $want" >&2
+        exit 1
+      fi
+    done
     # The resolved package manifest is retained: input hashes cannot promise a
     # byte-identical rebuild once the upstream archive moves.
     dpkg-query -W -f='${Package} ${Version}\n' | sort > "$root/packages.txt"
@@ -102,10 +132,17 @@ version = lambda tool: subprocess.run([tool, "--numeric-version"], capture_outpu
 package = lambda name: subprocess.run(
     ["dpkg-query", "--show", "--showformat=${Version}", name], capture_output=True, text=True, check=True
 ).stdout.strip()
+# The Vulkan identities the prefix recorded, read through the recipe that wrote
+# them so the image and a worker arrive at one spelling rather than two.
+sys.dont_write_bytecode = True
+sys.path.insert(0, "/opt/hetoimasia/recipe/tools/native")
+import vulkan  # noqa: E402
+
 document = {
     "schema_version": 1,
     "recipe_fingerprint": fingerprint,
     "native_manifest": native,
+    **vulkan.toolchain_entries(vulkan.recorded_from(manifest)),
     "ghc": version("ghc"),
     "cabal": version("cabal"),
     # The compositor is identified by its installed package revision, which is

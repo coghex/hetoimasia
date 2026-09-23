@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build, record, and check the private GLFW prefix every native build uses.
+"""Build, record, and check the private native prefix every native build uses.
+
+The prefix carries two things: the GLFW archive this recipe compiles, and the
+Vulkan runtime ``vulkan.py`` provisions beside it — the loader, the driver, the
+Khronos validation layer, and the glslang compiler, each qualified against
+``vulkan.pin``. One ``--prefix`` names all of it and one manifest describes all
+of it, so a prefix is accepted or refused as a whole.
 
 One recipe serves both places GLFW is compiled: a developer's local macOS
 prefix and the copy baked into the Linux CI image. It fetches the upstream
@@ -13,8 +19,13 @@ recipe fingerprint, the native identity (platform, architecture, C compiler,
 SDK, deployment target, and effective build options), the platform backends the
 archive actually compiles, and the link requirements
 ``pkg-config --libs --static glfw3`` derives from the generated ``glfw3.pc``.
+It records the Vulkan inputs the same way: every loader, driver, layer, and
+compiler identity that prefix resolves, so a plan's toolchain map carries them
+and a worker whose actual inputs differ is refused.
+
 ``check`` accepts a prefix only when all of that still holds for this machine,
-and never falls back to a GLFW a package manager happens to supply.
+and never falls back to a GLFW — or a loader, driver, or layer — a package
+manager happens to supply.
 
 It depends on Python 3, and on CMake and ``pkg-config`` for the commands that
 need them. See ``docs/validation.md`` for the developer instructions.
@@ -38,8 +49,17 @@ import tempfile
 import urllib.request
 import zipfile
 
-# A one-shot tool must not write into the checkout it runs from.
+# A one-shot tool must not write into the checkout it runs from. Set before
+# the sibling import below, so reading the recipe never leaves bytecode in it.
 sys.dont_write_bytecode = True
+
+# The Vulkan half of the recipe. It is a sibling module rather than more of this
+# file because it answers a different question — which runtime this platform
+# pins — and because every place that copies this recipe copies the directory
+# whole. Its own directory is put first so the import is this file's sibling
+# rather than anything else on the path that shares the name.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vulkan  # noqa: E402
 
 RECIPE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 PIN_FILE = os.path.join(RECIPE_DIRECTORY, "glfw.pin")
@@ -47,7 +67,7 @@ PIN_FILE = os.path.join(RECIPE_DIRECTORY, "glfw.pin")
 # The files whose bytes decide what the recipe builds. The fingerprint is taken
 # over these exact names so a copy of the recipe inside the image fingerprints
 # identically to the checkout it was copied from.
-RECIPE_FILES = ("glfw.pin", "native.py")
+RECIPE_FILES = ("glfw.pin", "native.py", "vulkan.pin", "vulkan.py")
 
 # Targeted patches applied to the pinned source before it is configured, in the
 # order their names sort. They exist for defects the pin cannot avoid: a fix
@@ -60,7 +80,7 @@ PATCHES_DIRECTORY = os.path.join(RECIPE_DIRECTORY, "patches")
 PATCH_SUFFIX = ".patch"
 
 MANIFEST_NAME = "hetoimasia-native-manifest.json"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 
 # The platform backends GLFW can compile, by the connect function each one
 # defines. A backend's function is in the archive only when that backend was
@@ -294,6 +314,11 @@ def native_identity(target: str, pin: dict[str, str]) -> dict:
         "deployment_target": deployment_target,
         "build_options": build_options(target, architecture, deployment_target, sysroot),
         "patches": patch_identity(),
+        # What the Vulkan pin names for this platform, and any override in
+        # force. This is configuration, not a result: it reads on a machine that
+        # holds none of those files, which is what lets the identity describe
+        # the Vulkan runtime a prefix would be provisioned with before one is.
+        "vulkan": vulkan.configuration(target),
         "environment": ambient_environment(),
     }
 
@@ -319,6 +344,18 @@ def pkg_config_environment(prefix: str) -> dict[str, str]:
     own = os.path.join(prefix, "lib", "pkgconfig")
     environment["PKG_CONFIG_PATH"] = own + (os.pathsep + inherited if inherited else "")
     return environment
+
+
+def vulkan_aware_pkg_config_path(prefix: str) -> str:
+    """Both package descriptions this prefix owns, its own first.
+
+    ``glfw3.pc`` sits in the prefix and ``vulkan.pc`` in the Vulkan prefix
+    beside it; a consumer needs both, and needs them ahead of anything a
+    machine offers, so neither resolves to a system copy.
+    """
+    inherited = os.environ.get("PKG_CONFIG_PATH")
+    own = [os.path.join(prefix, "lib", "pkgconfig"), vulkan.pkg_config_path(prefix)]
+    return os.pathsep.join(own + ([inherited] if inherited else []))
 
 
 def pkg_config(prefix: str | None, *arguments: str) -> str:
@@ -374,13 +411,22 @@ def normalized(path: str) -> str:
 
 
 def record(prefix: str, target: str) -> str:
-    """Write the manifest describing the prefix as it stands, for this identity."""
+    """Establish the Vulkan half of the prefix, then write the whole manifest.
+
+    Recording provisions rather than merely describes, because the Vulkan
+    products in the prefix — the package description, the two manifests, and the
+    wrapper — are written from qualified inputs and there is nothing to record
+    until they have been. Provisioning again from an unchanged machine writes
+    the same bytes, so this is what makes cold provisioning and warm reuse
+    record one identity.
+    """
     pin = read_pin()
     prefix = normalized(prefix)
     archive = archive_path(prefix)
     if not os.path.isfile(archive):
         raise NativeError(f"{prefix} holds no static archive at lib/libglfw3.a to record")
     metadata = resolved_metadata(prefix)
+    provisioned = vulkan.provision(prefix, target)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "library": "glfw3",
@@ -393,6 +439,7 @@ def record(prefix: str, target: str) -> str:
         "archive_sha256": sha256_file(archive),
         "backends": compiled_backends(archive, target),
         "pkg_config": metadata,
+        "vulkan": provisioned,
     }
     target_path = manifest_path(prefix)
     with open(target_path, "w", encoding="utf-8") as handle:
@@ -518,6 +565,20 @@ def check(prefix: str, target: str, build_directory: str | None) -> dict:
             status=1,
         )
 
+    # The Vulkan inputs are verified by reading and hashing the files the record
+    # names, never by trusting the digests beside them, and by asking this
+    # machine to qualify under the pin again. A prefix whose manifest is intact
+    # while a loader, driver, layer, or compiler underneath it was replaced is
+    # refused here.
+    vulkan_problems = vulkan.verify(prefix, target, manifest.get("vulkan"), pin=None)
+    if vulkan_problems:
+        raise NativeError(
+            f"the Vulkan inputs at {prefix} are not the ones this configuration provisions: "
+            + "; ".join(vulkan_problems)
+            + f"; {rebuild}",
+            status=1,
+        )
+
     identity_hash = manifest_hash(manifest_file)
     if build_directory:
         stamp = os.path.join(build_directory, BUILD_STAMP_NAME)
@@ -534,7 +595,12 @@ def check(prefix: str, target: str, build_directory: str | None) -> dict:
                     "so nothing linked against the old native configuration is reused",
                     status=1,
                 )
-    return {"manifest": manifest, "native_manifest": identity_hash, "prefix": prefix}
+    return {
+        "manifest": manifest,
+        "native_manifest": identity_hash,
+        "prefix": prefix,
+        "vulkan": manifest["vulkan"],
+    }
 
 
 def system_glfw() -> str | None:
@@ -724,6 +790,18 @@ def link_check(prefix: str, target: str) -> str:
 # Entry point
 
 
+def report_vulkan(prefix: str, target: str) -> None:
+    """Say which Vulkan inputs the prefix now carries, by identity.
+
+    A build that reported only the archive would leave the loader, driver,
+    layer, and compiler it just qualified invisible, and those are what a reader
+    has to be able to compare against a record or a descriptor.
+    """
+    recorded = check(normalized(prefix), target, None)["vulkan"]
+    for line in vulkan.summary(recorded):
+        print("native: " + line)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="native.py", description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -750,7 +828,7 @@ def main(argv: list[str]) -> int:
     commands.add_parser("identity", help="print this configuration's native identity")
     linked = commands.add_parser("link-check", help="link and run a real consumer against the archive")
     with_prefix(linked)
-    toolchain = commands.add_parser("toolchain", help="print the native-manifest toolchain entry")
+    toolchain = commands.add_parser("toolchain", help="print the toolchain-map entries this prefix contributes")
     with_prefix(toolchain)
     commands.add_parser("fingerprint", help="print the native recipe fingerprint")
 
@@ -761,21 +839,33 @@ def main(argv: list[str]) -> int:
     if arguments.command == "build":
         cache = arguments.source_cache or os.path.join(os.path.dirname(normalized(prefix)), "sources")
         print(f"native: recorded {build(prefix, target, cache)}")
+        report_vulkan(prefix, target)
     elif arguments.command == "record":
         print(f"native: recorded {record(prefix, target)}")
+        report_vulkan(prefix, target)
     elif arguments.command == "check":
         result = check(prefix, target, arguments.build_dir)
         print(f"native: {result['prefix']} matches this configuration (manifest {result['native_manifest'][:12]})")
+        for line in vulkan.summary(result["vulkan"]):
+            print("native: " + line)
     elif arguments.command == "prepare":
         result = check(prefix, target, arguments.build_dir)
         stamp_build_directory(arguments.build_dir, result["native_manifest"])
-        print("export PKG_CONFIG_PATH=" + shlex.quote(pkg_config_environment(result["prefix"])["PKG_CONFIG_PATH"]))
+        print("export PKG_CONFIG_PATH=" + shlex.quote(vulkan_aware_pkg_config_path(result["prefix"])))
+        for name, value in sorted(vulkan.environment(result["prefix"], result["vulkan"]).items()):
+            print(f"export {name}=" + shlex.quote(value))
     elif arguments.command == "identity":
         print(json.dumps(native_identity(target, read_pin()), indent=2, sort_keys=True))
     elif arguments.command == "link-check":
         print(f"native: link check passed: {link_check(prefix, target)}")
     elif arguments.command == "toolchain":
-        print("native-manifest=" + check(prefix, target, None)["native_manifest"])
+        # Every entry the prefix contributes, checked first: a map declared from
+        # a prefix nobody verified would say what the manifest claims rather
+        # than what the machine holds.
+        result = check(prefix, target, None)
+        entries = {"native-manifest": result["native_manifest"], **vulkan.toolchain_entries(result["vulkan"])}
+        for name in sorted(entries):
+            print(f"{name}={entries[name]}")
     elif arguments.command == "fingerprint":
         print(recipe_fingerprint())
     return 0
@@ -784,6 +874,6 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except NativeError as failure:
+    except (NativeError, vulkan.VulkanError) as failure:
         print(f"error: {failure}", file=sys.stderr)
         sys.exit(failure.status)
