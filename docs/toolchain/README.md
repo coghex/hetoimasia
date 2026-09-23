@@ -18,18 +18,8 @@ itself rather than relying on this sentence: the receipts in `executed_commit`,
 the CPU-project capture in `executed-revision` with its tree beside it, and both
 binding runs and their bundles in `repository-revision`.
 
-Commits after that revision add or correct this evidence and the documentation
-around it; none of them changes a qualified input — no pin, bound, project
-setting, recipe, or tool that these artifacts exercised. That is what keeps them
-current rather than stale, and it is a claim you can check rather than take:
-
-```bash
-git diff be92703..HEAD --name-only | grep -v '^docs/'
-```
-
-It should print nothing. If it prints a path, something these results depend on
-moved after they were produced, and they need re-executing rather than
-re-describing.
+[What they establish](#what-these-artifacts-establish-and-what-would-call-for-new-ones)
+below says which later changes bear on them.
 
 The receipts record their own `executed_commit`, `runner_os: Darwin`,
 `runner_arch: arm64`, and the toolchain map actually observed — GHC, Cabal, and
@@ -65,9 +55,75 @@ building without the GLFW SDK — a constraint the published image does not have
 since it carries the pinned GLFW prefix. The local capture is where that
 configuration is actually exercised.
 
-The Linux CI receipts for this candidate are not copied here. They are produced
-by the validation workflow on this pull request, inside the published image
-whose descriptor the same pull request commits, and they live with that run.
+#171's Linux CI receipts are not copied here, and they are separate evidence
+from the `be92703` artifacts, each bound to its own revision. The `validation`
+workflow produced them inside the published image whose descriptor #171
+committed. For the pull request they were produced by run `35366929880` on head
+`cb5fb38` and run `35370852876` on head `057d59a`, each on the merge candidate
+GitHub resolved for that head. After the merge they were produced by push run
+`35371004187` on `3af4cb2`. They live with those runs, and what they establish
+is stated in their own receipts, not in this directory's claim about
+`be92703`.
+
+## What these artifacts establish, and what would call for new ones
+
+They record what held at `be92703`. Later commits do not make that record
+wrong, and every comparison below names both of its revisions, so it gives the
+same answer from any checkout, however far `master` has since moved.
+
+The artifacts exercised these inputs, and only a change to one of them bears on
+the toolchain qualification:
+
+| Input | Paths |
+| --- | --- |
+| Pins | `tools/ci-image/toolchain.pin`, `tools/toolchain/binding.pin`, `tools/native/glfw.pin`, and `.github/workflows/ci-image.yml` and `.github/workflows/validation.yml`, whose env carries `GHC_VERSION` and `CABAL_VERSION` |
+| Bounds | every package description, `*.cabal` outside `docs/` |
+| Project settings | every `cabal.project*` file |
+| Recipes | `tools/ci-image/` and `tools/native/` (the image and native GLFW recipes), `tools/toolchain/Dockerfile.linux-binding` |
+| Tools | `tools/toolchain/qualify-binding.sh`, `tools/toolchain/capture-build.sh`, and `tools/validation/run.py`, which wrote the receipts |
+
+`be92703` to `cb5fb38`, the head #171's final review read, changes no path
+outside `docs/`:
+
+```bash
+git diff --name-only be92703 cb5fb38 -- ':!docs'
+```
+
+That prints nothing. #171's final commit, `057d59a`, merged `master` into the
+branch, so `be92703` to the merged tree `3af4cb2` does change paths outside
+`docs/`: exactly five GLFW implementation and test paths, none of them an input
+above:
+
+```bash
+git diff --name-only be92703 3af4cb2 -- ':!docs'
+```
+
+```text
+packages/glfw/runtime-glfw-core/Hetoimasia/Runtime/GLFW/Internal.hs
+packages/glfw/runtime-glfw-core/Hetoimasia/Runtime/GLFW/Internal/Retirement.hs
+packages/glfw/runtime-glfw/Hetoimasia/Runtime/GLFW.hs
+packages/glfw/test/Test/GLFW/Attachments.hs
+packages/glfw/test/Test/GLFW/Protected.hs
+```
+
+Restricted to the inputs, the same range prints nothing:
+
+```bash
+git diff --name-only be92703 3af4cb2 -- 'cabal.project*' '*.cabal' \
+  tools/ci-image tools/native tools/toolchain tools/validation/run.py \
+  .github/workflows/ci-image.yml .github/workflows/validation.yml ':!docs'
+```
+
+To ask the same of a later revision, substitute it for `3af4cb2`. If that
+prints a path, the historical result still stands as a record of `be92703`, but
+it does not extend to the changed configuration until new evidence is
+produced for that configuration. If it prints nothing, no input the
+qualification exercised has moved, but the receipts here are still only
+evidence for `be92703`. They are application-test receipts, and unchanged pins do not make
+them reusable for a candidate whose source has changed. Whether a receipt may
+stand for a later candidate is decided by its recorded `input_identity` under
+[validation.md's candidate identity](../validation.md#candidate-identity), not
+by this directory.
 
 ## The old-version audit
 
