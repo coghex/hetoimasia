@@ -110,6 +110,9 @@ identifier lists are sorted.
 
 ### The registered groups
 
+[Test classification](test_classification.md) explains the three selection tiers,
+the audited suite inventory, and which optional probes are local-only.
+
 | ID | Command | Optional | In the floor | Platforms |
 | --- | --- | --- | --- | --- |
 | `build.all` | `cabal build all` | no | yes | any |
@@ -118,10 +121,14 @@ identifier lists are sorted.
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes | any |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes | any |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
-| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | no | no | `Linux` |
+| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
+| `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
+| `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
+| `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
+| `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
 
@@ -164,67 +171,27 @@ held, so it is selected when affected rather than added to the evidence every
 candidate must carry. Beside its Cabal closure it declares
 `cabal.project.common`, where the binding's own build settings live -- which Lua
 the build links, and whether Lua's garbage collection may run under unsafe calls
--- because changing either changes what the group proves. Its uninterruptible-Lua
-example runs the package's `lua-hazard` executable as a child process; the Cabal
-closure reaches that executable through `build-tool-depends`, so its sources
-select the group like any other input.
+-- because changing either changes what the group proves. The quick foreign-call
+progress and allocation-failure contracts still use `lua-hazard` through
+`build-tool-depends`. Its deliberate nontermination experiment is now the
+separate local-only `test.lua-hazard` probe.
 
-`test.lua-confinement-linux` runs the Linux confinement and resource-limit
-feasibility probe (LUA-14). It launches children inside the candidate profile --
-user, mount, network, IPC, and UTS namespaces, a private root, an address-space
-ceiling, and a seccomp filter installed with `SECCOMP_FILTER_FLAG_TSYNC` -- and
-checks the fail-closed refusal when a prerequisite is missing, each forbidden
-access with the layer that denied it, two-instance isolation and independent
-termination, the whole-process memory ceiling, the execution bound's escalation,
-and the lifetime cases -- initialization failure, a cancelled owner, a forced
-exit, and a force arriving before the child has said anything at all. Like
-`test.scripting-lua` it is mandatory but outside the floor. Beside its Cabal closure it declares
-`packages/scripting-lua/linux/`, because the probe's native sources are C that
-the Cabal closure's source directories do not reach, and `tools/ci-image/`,
-because what the image permits a child to unshare is part of what the group
-observes.
+`test.lua-confinement-linux` is a local-only optional feasibility probe, like
+`test.macos-confinement`. It checks namespace/private-root/seccomp confinement,
+resource limits, two-instance isolation, and process lifetime. Neither is an
+implemented production sandbox's routine regression suite. Both verdicts remain
+`inconclusive`; reclassification establishes no new security claim.
 
-It is one of the two platform-only groups, beside
-[`test.macos-confinement`](#the-macos-confinement-probe), and the only one of
-them CI runs. Its components are built on Linux alone -- an `if os(linux)`/`else
-buildable` conditional excludes them elsewhere, so the group is not a vacuous
-pass on a machine that cannot run it -- and the planner accepts that conditional
-without reading its body, so the probe's sources count as this group's inputs on
-every platform rather than only on the one that builds them. A change to them
-therefore reports `inputs_changed: true` wherever the candidate is planned.
+Linux's group retains `"platforms": ["Linux"]`: it reports
+`platform-inapplicable` on other operating systems and `optional-unrequested`
+on Linux unless explicitly selected for a local run. Changed inputs remain
+visible on either platform. The components are not built off Linux. The macOS
+group retains its existing convention of omitting `platforms`; explicitly
+requesting it on Linux fails rather than becoming a vacuous pass. Neither group
+has a CI worker. Do not put either in a PR request block.
 
-*What a change touches* and *what this machine can run* are two different
-questions, and `inputs_changed` answers only the first. The catalog answers the
-second itself: the group declares `"platforms": ["Linux"]`. On a Linux plan
-nothing changes -- it is non-optional, selected from its own inputs or the
-unknown-input fallback, and routed to a `cpu` worker like any other mandatory
-group outside the floor. On a plan for any other `runner_os` it is **not
-selected**: it is omitted as `platform-inapplicable`, while still reporting the
-same `inputs_changed` the Linux plan does.
-
-That omission is what makes a local macOS plan possible at all. Every
-dependency change moves `cabal.project.common`, which this group declares, so
-every such candidate planned on Darwin used to select a non-optional group that
-Darwin could neither route (the plan was refused for a group no worker owned)
-nor execute (Cabal refuses the component as `buildable: False`). Declaring the
-platform resolves that without weakening anything: the group is still
-mandatory, CI still selects it from changed inputs, the probe's components are
-still excluded off Linux, and no Darwin receipt for it is written or accepted
--- the runner refuses to execute it, and
-[the aggregate](#the-aggregate-and-build-test) refuses a receipt or an earlier
-execution offered for it rather than reading either as coverage.
-
-[`test.macos-confinement`](#the-macos-confinement-probe) declares no
-`platforms`, and that is deliberate: its policy is the one below, built on
-being *optional*, which already keeps every Linux plan from selecting it. A
-request that names it on Linux is meant to fail loudly in Cabal rather than be
-explained away, so nothing here changes it.
-
-What is unlike every other group here is that a green run of it is evidence,
-never a verdict: each example prints what it proved or, where the machine could
-not install the profile, says so and names the missing prerequisite. What those
-lines add up to is recorded in
-[the Linux confinement verdict](lua_linux_confinement_verdict.md), not here.
+See [the local probe inventory](test_classification.md#local-probe-inventory)
+for selection, commands, limitations, and the retained confinement verdicts.
 
 `test.vulkan` runs the GPU model package's own suite: the typed identities and
 the misuse a stale, foreign, duplicated or already-consumed one is rejected as,
@@ -244,7 +211,19 @@ project and running the suite through the other one. A change to either project
 file therefore selects the group, because changing either changes what the group
 proves.
 
-`test.workflow` runs only when affected or requested.
+`test.workflow` runs only when affected or requested. It contains workflow,
+planner, receipt, packaging, and runner contracts, including short one-second
+fixtures proving that the runner enforces its deadline and reaps children. It
+contains no display-helper examples.
+
+`test.x11-helper` and `test.wayland-helper` own those headless display-helper
+probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
+need no desktop consent. Real readiness deadlines make them occasional local
+probes: changed inputs, policy changes, and unknown-input fallback never select
+them. They have no CI worker and must not appear in PR request blocks. An
+explicit local command or coordinated `$test`/`$autotest` selection runs them;
+a helper edit alone does not authorize execution. Commands and selection policy
+are in [test_classification.md](test_classification.md).
 
 `test.glfw-native` is the native GLFW Hspec group: the shared main-thread
 fixture and its small, stable session, thread, and window examples, described in
@@ -271,11 +250,12 @@ same inputs and the same `display` runner class as `test.glfw-native`, but it is
 Wayland session to select. Making it required when affected is WL-3's decision,
 not this group's.
 
-`test.macos-confinement` and `test.glfw-wayland` are the registered optional
-groups; the first has a section of its own below. Further interactive and
-lengthy desktop probes, when they are declared, are optional groups that run
-only on request; optional handling, including an optional display probe whose
-inputs changed, is proven with fixture catalogs in `workflow-tests`.
+The local-only probes are `test.x11-helper`, `test.wayland-helper`,
+`test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
+`test.glfw-wayland` is also optional, but can be explicitly requested in CI.
+Optional is a selection rule; it does not imply Python, a particular executor,
+or automatic eligibility for `$autotest`. See the
+[classification policy](test_classification.md) before adding a new group.
 
 ### The macOS confinement probe
 
@@ -434,10 +414,10 @@ apart from `unaffected`, from `optional-unrequested`, and from a pass: the
 first two say this platform did not *need* to run the group, and this one says
 this platform *cannot*.
 
-Nothing else follows from it. The group stays non-optional, the
+Platform applicability does not change optionality. The
 [mandatory floor](#the-registered-groups) is unchanged — a floor group may not
-declare `platforms` at all — and the platform that does build the group selects
-it from exactly the inputs it always did.
+declare `platforms` at all. On an applicable platform, required groups follow
+the affected-input rules and optional probes still require an explicit request.
 
 `inputs_changed` is independent of selection, and describes the *contribution*:
 which groups this change touches relative to the base it is compared against. It
@@ -588,7 +568,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland
 ```
@@ -702,7 +682,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.lua-confinement-linux`, `test.vulkan`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 
@@ -1384,7 +1364,13 @@ Linux workers install nothing. They run inside one published image,
   `/opt/hetoimasia/packages.txt`;
 - the private GLFW prefix at `/opt/hetoimasia/native/glfw`, built by the
   [native recipe](#the-native-glfw-recipe) and exported through
-  `PKG_CONFIG_PATH`.
+  `PKG_CONFIG_PATH`;
+- the Vulkan runtime that recipe provisions beside it at
+  `/opt/hetoimasia/native/glfw/vulkan` — the loader and its headers, Mesa's
+  Lavapipe software driver, the Khronos validation layer, and the pinned
+  glslang compiler behind a private-prefix `glslangValidator` wrapper — each
+  installed at exactly the package revision `tools/native/vulkan.pin` names.
+  See [the Vulkan runtime](#the-vulkan-runtime).
 
 It also carries the `xvfb`, `openbox`, and `x11-utils` packages the
 [display worker](#the-display-worker)'s X11 helper uses, and — for its Wayland
@@ -1395,11 +1381,11 @@ with an `=` constraint, so an archive that no longer offers that revision fails
 the layer rather than quietly supplying a newer compositor, and the installed
 revision is read back from `dpkg` rather than assumed. Nothing in the image
 starts a display or a compositor: only those helpers do, inside the display
-worker, for one group at a time. It carries no project source, project build
-output, captures, or Vulkan SDK. It embeds its recipe fingerprint, native
-manifest hash, and installed compositor revision in
-`/opt/hetoimasia/image.json` and in its labels, and never its own digest, which
-does not exist until it is pushed.
+worker, for one group at a time. It compiles no shader, and it carries no
+project source, project build output, captures, or vendor Vulkan SDK. It embeds
+its recipe fingerprint, native manifest hash, installed compositor revision, and
+every Vulkan identity in `/opt/hetoimasia/image.json` and in its labels, and
+never its own digest, which does not exist until it is pushed.
 
 Input hashes cannot promise a byte-identical rebuild: the Ubuntu archive and the
 Hackage index move. That is why an image is published once per fingerprint and
@@ -1409,9 +1395,9 @@ then only ever addressed by digest.
 
 Every file under `tools/ci-image/` and `tools/native/`, plus
 `.github/workflows/ci-image.yml` and `tools/validation/ci_image.py`, is a recipe
-input — the Dockerfile, the provisioning script, the toolchain, compositor, and
-GLFW pin files, the builder and its registry transport, the image contract they
-load, and the native recipe —
+input — the Dockerfile, the provisioning script, the toolchain, compositor,
+GLFW, and Vulkan pin files, the builder and its registry transport, the image
+contract they load, and both halves of the native recipe —
 **except** `tools/ci-image/descriptor.json`.
 `tools/validation/ci_image.py` fingerprints each input's path, mode, type, and
 content id from one commit's tree:
@@ -1430,7 +1416,7 @@ anything its fingerprint does not cover, and the descriptor never reaches it.
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | `1`. |
+| `schema_version` | `2`. |
 | `reference` | The registry repository, without a tag. |
 | `digest` | The image's `sha256:` digest. Workers run exactly this. |
 | `recipe_fingerprint` | The recipe fingerprint the image was built from. |
@@ -1438,6 +1424,18 @@ anything its fingerprint does not cover, and the descriptor never reaches it.
 | `platform`, `architecture` | `linux` and `amd64`. |
 | `ghc`, `cabal` | The compiler versions the image runs. |
 | `weston` | The compositor package revision the image installed, such as `13.0.0-4build3`. |
+| `vulkan` | One SHA-256 over every Vulkan identity the image's native manifest records. Any change to any of them moves it. |
+| `vulkan_loader` | The loader version and the first twelve digits of its digest, such as `1.3.275 0f2c9e41ab07`. |
+| `vulkan_driver` | The driver name, its manifest's API version, and its binary's digest, such as `lvp 1.4.309 4b1d0e77c2aa`. |
+| `vulkan_layers` | Each validation layer's name, API version, and binary digest, separated by `; `. |
+| `glslang` | The compiler version and its digest, such as `15.1.0 9ca7f0132e55`. |
+
+The five Vulkan fields are read off the published image rather than supplied to
+the builder: what a published image runs against is decided by the prefix baked
+into it, and a value passed in from outside could only restate an expectation.
+`vulkan` alone is what makes a cache key and a receipt incompatible after a
+change; the four beside it exist so a reader can compare a descriptor with a
+record without recomputing anything.
 
 The author commits the descriptor the builder returns, in the same pull request
 as the recipe change, through an ordinary push. Because the descriptor is
@@ -1467,13 +1465,16 @@ because GitHub offers `workflow_dispatch` only for a workflow already on the
 default branch, so a new workflow cannot supply pre-merge evidence for the pull
 request introducing it; dispatch a candidate branch with `--ref`.
 
-`route: vulkan-proof` runs the VK-2 native Vulkan compatibility proof inside
-the throwaway container `tools/vulkan-proof/Dockerfile.linux-proof` and on the
-isolated X11 display `tools/display/x11.sh` starts. It uploads the record as
-the `vulkan-compatibility-linux` artifact and repeats it in the job summary.
-Nothing about it is required, and the CI image gains no Vulkan input from it —
-that is VK-4's deliberate step. See
-[the compatibility record](vulkan_compatibility_record.md).
+`route: vulkan-proof` runs the native Vulkan compatibility proof inside the
+image the checked-out `tools/ci-image/descriptor.json` names — refusing to run
+at all unless that descriptor describes the candidate — and on the isolated X11
+display `tools/display/x11.sh` starts. It uploads the record as the
+`vulkan-compatibility-linux` artifact and repeats it in the job summary, beside
+the Vulkan identities the descriptor names and the ones the image itself
+reports. VK-4 provisioned that runtime into the image, so the throwaway
+container this route used to build is gone and the proof now runs against
+exactly the inputs ordinary Linux validation runs against. Nothing about it is
+required. See [the compatibility record](vulkan_compatibility_record.md).
 
 `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
 checked-out descriptor names, with the candidate tree mounted:
@@ -1545,7 +1546,9 @@ and refuses it before execution — naming the builder as the fix — when:
 - its `ghc` or `cabal` disagrees with the `--toolchain` pins the workflow passes.
 
 Otherwise `ghc`, `cabal`, `ci-image` (the digest), `native-manifest` (the
-hash), and `weston` (the compositor revision) form the plan's `toolchain` map,
+hash), `weston` (the compositor revision), and the five Vulkan entries
+`vulkan`, `vulkan-loader`, `vulkan-driver`, `vulkan-layers`, and `glslang` form
+the plan's `toolchain` map,
 the descriptor is recorded as the plan's
 `ci_image`, and the prose output names the image. That map describes the planned
 worker environment, not the host that planned it. A candidate with no recipe
@@ -1569,7 +1572,13 @@ manifest it actually carries, the prefix check, the compilers it actually runs,
 the compositor revision `dpkg` reports installed against the one the image
 embeds, `CABAL_DIR`, and the store Cabal resolves, then builds a map from those
 actual values. The compositor is never taken from the descriptor: an image
-stamped with one revision and carrying another is refused rather than believed. That map must equal the plan's in its entirety, and it is what every
+stamped with one revision and carrying another is refused rather than believed.
+Neither are the Vulkan identities: they are computed from the manifest the
+container actually carries, and only after the prefix check above has re-read
+and re-hashed every file that manifest names, so a container whose loader,
+driver, layer, or compiler was replaced declares a different map here rather
+than passing because its manifest still looks well formed. That map must equal
+the plan's in its entirety, and it is what every
 receipt the worker writes records. A second step links and runs a native
 consumer against the image's GLFW. Receipts written before these entries existed
 record a different toolchain and are invalidated once.
@@ -1580,14 +1589,16 @@ Three reuse layers stay distinct:
 
 | Layer | Holds | Invalidated by |
 | --- | --- | --- |
-| The published image | Toolchain, system prerequisites, compiled GLFW | Any recipe input; never project source |
+| The published image | Toolchain, system prerequisites, compiled GLFW, the provisioned Vulkan runtime | Any recipe input; never project source |
 | The Cabal package store | Compiled external Haskell packages | The environment key, `cabal.project`, `cabal.project.common`, any `.cabal` file |
 | The build tree | Incremental local-package compilation | The same, plus any Haskell source |
 
 The **environment key** is a SHA-256 over the plan's `runner_os` and its whole
-toolchain map, printed by `ci_image.py outputs`. A new image digest or native
-manifest therefore moves every cache key, while re-committing the same
-descriptor moves none. Every restore fallback stays inside one environment key,
+toolchain map, printed by `ci_image.py outputs`. A new image digest, native
+manifest, or Vulkan identity therefore moves every cache key, while
+re-committing the same descriptor moves none. Because the toolchain map is also
+one of the fields a reusable execution has to match, evidence gathered under
+one set of Vulkan identities never answers a candidate planned under another. Every restore fallback stays inside one environment key,
 so nothing linked against one native identity is restored into another. Cache
 paths are the fixed container locations. Each worker writes its cache scope and
 whether each cache was a hit, a partial restore, or a miss to the job summary.
@@ -1602,10 +1613,14 @@ executes no validation group and writes no receipt. A documentation-only
 candidate with reusable evidence and a seeded cache still launches no worker and
 pulls no image.
 
-### The native GLFW recipe
+### The native recipe
 
 `tools/native/native.py`, with the pin in `tools/native/glfw.pin`, builds the
-same GLFW for a local macOS prefix and for the image. It fetches the pinned
+same GLFW for a local macOS prefix and for the image. Its sibling
+`tools/native/vulkan.py`, with the pin in `tools/native/vulkan.pin`, provisions
+the [Vulkan runtime](#the-vulkan-runtime) into the same prefix. One `--prefix`
+names all of it and one manifest describes all of it, so a prefix is accepted or
+refused as a whole. It fetches the pinned
 upstream archive, refuses it unless its SHA-256 matches, applies every patch in
 `tools/native/patches/` to the unpacked source, and builds only a
 static, position-independent `libglfw3.a`, with upstream examples, tests, and
@@ -1622,8 +1637,11 @@ source URL and checksum, the recipe fingerprint, the archive's checksum, the
 macOS carries the Cocoa, IOKit, and CoreFoundation frameworks — the `backends`
 the archive actually compiles, read from its own defined symbols rather than
 restated from the options, so a Linux prefix records `["Wayland", "X11"]` and a
-macOS one `["Cocoa"]` — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
-effective CMake options, the `patches` applied with each one's SHA-256, and the exact value or absence of every variable CMake
+macOS one `["Cocoa"]` — the `vulkan` section described
+[below](#the-vulkan-runtime) — and the native identity: platform, architecture, C compiler, SDK, deployment target, the
+effective CMake options, the `patches` applied with each one's SHA-256, what
+`tools/native/vulkan.pin` names for this platform together with any
+`HETOIMASIA_VULKAN_*` override in force, and the exact value or absence of every variable CMake
 or the compiler reads on its own (`CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `SDKROOT`,
 `CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, and the `CMAKE_*` initializers). On
 macOS the SDK the identity probes is passed to CMake as `CMAKE_OSX_SYSROOT`, so
@@ -1634,9 +1652,9 @@ SHA-256.
 | --- | --- |
 | `build [--prefix P]` | Fetch, verify, build, install, and record a fresh prefix. |
 | `check [--prefix P] [--build-dir D]` | Refuse the prefix unless it is exactly what this configuration would build. |
-| `prepare [--prefix P] [--build-dir D]` | Check, stamp the build directory with the manifest, and print the `PKG_CONFIG_PATH` export. |
+| `prepare [--prefix P] [--build-dir D]` | Check, stamp the build directory with the manifest, and print the `PKG_CONFIG_PATH` export and the Vulkan discovery the prefix owns. |
 | `link-check [--prefix P]` | Link a consumer that calls `glfwGetVersionString` with only the recorded flags and no library-path variables, require it to define the symbol itself and depend on no shared GLFW, and run it. It needs no display. |
-| `toolchain [--prefix P]` | Check, then print `native-manifest=<hash>`. |
+| `toolchain [--prefix P]` | Check, then print every toolchain-map entry the prefix contributes: `native-manifest`, `vulkan`, `vulkan-loader`, `vulkan-driver`, `vulkan-layers`, and `glslang`. |
 | `identity`, `record`, `fingerprint` | Print this configuration's identity, write a manifest for an existing prefix, or print the recipe fingerprint. |
 
 #### Patches
@@ -1664,6 +1682,99 @@ Currently applied:
 | Patch | Upstream | Why |
 | --- | --- | --- |
 | `0001-wayland-fix-segfault-when-there-is-no-seat.patch` | `3573c5a8`, glfw/glfw#2517, after the pinned 3.4 | `_glfwInitWayland` dereferenced a NULL `wl_seat` when the compositor advertises none, so every session entered on the headless Weston `tools/display/wayland.sh` starts died inside `glfwInit`. Required for `test.glfw-wayland` to run at all. |
+
+#### The Vulkan runtime
+
+`tools/native/vulkan.pin` names every Vulkan input on each platform — the
+loader, the driver, the Khronos validation layer, and the glslang compiler —
+and `record` establishes a *project-managed Vulkan prefix* at
+`<prefix>/vulkan` from exactly those:
+
+| Path | What it is |
+| --- | --- |
+| `lib/pkgconfig/vulkan.pc` | Generated, describing the qualified loader, so `pkgconfig-depends: vulkan` resolves this prefix and never a machine-wide one. |
+| `lib/libvulkan.1.dylib` | macOS only: the qualified loader, copied in and given an absolute install name. |
+| `lib/libvulkan.dylib` | macOS only: the name `-lvulkan` opens, linked to the file above. Its identity is not a digest but that it is a symbolic link and which file it names, so deleting it, pointing it elsewhere, or replacing it with a file is refused — each of those either fails a clean build or links a different loader. |
+| `include/` | macOS only: the qualified headers, copied in beside it. On Linux the pinned development package's own `/usr/include` is referenced. |
+| `share/vulkan/icd.d/<driver>_icd.json` | Generated, naming exactly one driver binary by absolute path. |
+| `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. `VK_LAYER_PATH` names this directory and the loader searches it, so `check` refuses any entry in it beside the recorded manifest. |
+| `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. Its mode is recorded and `check` runs that flag: bytes alone would accept a wrapper whose execute bits were cleared, which fails outright when used directly and is walked past when used through `PATH`. |
+
+On Linux every input is referenced where its pinned package installed it,
+including the name `-lvulkan` opens: the development package's `libvulkan.so`
+beside the referenced loader. That link is qualified before anything is
+provisioned — it has to be a symbolic link resolving to the loader the pin
+qualifies — and is then recorded and checked as the macOS one is, so deleting
+it, pointing it elsewhere, or replacing it with a file is refused. On
+macOS the loader is copied instead, because its own install name is
+`@rpath/libvulkan.1.dylib`: a consumer pointed at the vendor SDK would need an
+rpath and would record a machine path in every product, and the copy's absolute
+install name is what lets `cabal.project.vulkan` link with no generated project
+file and no rpath at all. Editing a Mach-O invalidates its signature, so the
+copy is re-signed ad hoc.
+
+The manifest's `vulkan` section records, for every input, both halves of its
+identity — the manifest *and* the binary it names, the wrapper *and* the
+compiler it runs — as a path and a SHA-256, together with the source each was
+adopted from and the distribution revisions `dpkg` reports. The Vulkan headers
+a consumer compiles against get an identity too: one digest over every file
+under `vulkan/` and `vk_video/`, each contributing its relative path and its own
+content, so an added, removed, renamed, or edited header moves it. That digest
+is pinned per platform as `LINUX_HEADERS_SHA256` and `MACOS_HEADERS_SHA256`, and
+the source tree is held to it before anything is provisioned, so headers
+substituted before the first `record` are refused rather than adopted under an
+unchanged package revision. `check` re-reads
+and re-hashes each of those files rather than trusting the digests recorded
+beside them, and independently asks this machine to qualify under the pin
+again, so a prefix whose manifest is intact while a loader, driver, layer, or
+compiler underneath it was replaced is refused.
+
+Nothing searches and nothing falls back. A missing, unreadable, or substituted
+input is refused with a diagnosis naming what the machine holds instead. The
+`HETOIMASIA_VULKAN_LOADER`, `HETOIMASIA_VULKAN_DRIVER_MANIFEST`,
+`HETOIMASIA_VULKAN_LAYER_MANIFEST`, and `HETOIMASIA_VULKAN_GLSLANG` variables
+relocate one input each without waiving its qualification — an override
+locates, the pin decides — and a path that is a symlink, such as Homebrew's
+`opt`, is resolved before it is hashed, so a moving link cannot quietly change
+what the prefix is a prefix of. An override is part of the identity, because a
+prefix provisioned through a relocated input is a prefix of that route.
+`prepare`'s discovery never exports one of these names: it is evaluated into
+the environment the next `check` reads, so it names the recorded loader as
+`HETOIMASIA_VULKAN_QUALIFIED_LOADER` instead.
+
+Changing `tools/native/vulkan.pin` changes the [recipe
+fingerprint](#the-recipe-fingerprint), so an upgrade is an explicit
+requalification: a new image tag, new cache keys, and no receipt reuse across
+it. Cold provisioning and warm reuse resolve the same inputs and write the same
+bytes, so an ordinary run records one identity and rebuilds no native library.
+
+#### Verifying a pulled image
+
+A validation worker runs in a `container:` bound to the descriptor's digest and
+is then checked against the plan. A route that pulls the image itself — the
+`vulkan-proof` route does — has no plan, and matching the descriptor's recipe
+fingerprint against the candidate establishes nothing about *which* image its
+digest points at, because the descriptor is excluded from that fingerprint. So
+the descriptor could name the expected fingerprint while pointing at another
+image, and an older one built from the same native recipe would pass
+`native.py check` quite happily.
+
+```bash
+python3 tools/validation/ci_image.py verify-image --descriptor tools/ci-image/descriptor.json
+```
+
+asks the image what it is instead: the fingerprint it embeds, the native
+manifest it carries, and the Vulkan identities its own prefix yields, each
+against the descriptor's corresponding field. The descriptor's `ghc`, `cabal`,
+and `weston` are each checked twice, against the version the image embedded
+when it was stamped and against the one it actually runs (`ghc` and `cabal`
+`--numeric-version`, and the installed `weston` package). Its `platform` and
+`architecture` are checked against the running container's `uname -s` and
+`dpkg --print-architecture`. The reference and digest need no answer from the
+image, because the route runs `reference@digest` and the container runtime
+has already bound them. The proof route runs it inside the
+pulled image before proving anything, so a record is only ever attributable to
+the image the committed descriptor describes.
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe
@@ -1726,9 +1837,11 @@ Assigning it to the local worker anyway is harmless and pointless: routing is
 decided against the groups the plan *selected*, so the assignment binds
 nothing, and the runner refuses to execute an omitted group. The plan is
 accepted, `test.lua-confinement-linux` is reported unexecuted rather than
-passed, and the Linux evidence for it stays CI's to produce. Running with
-`--runner-os Linux` on this same candidate still selects the group and still
-refuses a plan that assigns it to no `cpu` worker.
+passed. A Linux plan also leaves the local-only optional group
+`optional-unrequested` when its inputs change. No CI worker routes it; a
+local Linux run must explicitly request the group and assign it to a local
+`cpu` worker. The retained Linux receipt, rather than a later CI run, supports
+the [inconclusive verdict](lua_linux_confinement_verdict.md).
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the
@@ -2230,7 +2343,10 @@ candidate whose checks have not passed reports `BLOCKED`.
 ## What the hosted platform cannot cover
 
 Every worker runs on GitHub's hosted `ubuntu-latest` runners, inside the CI
-image: Linux, CPU only, with no GPU and no Vulkan loader. The CPU workers are
+image: Linux, CPU only, with no GPU. Since VK-4 the image carries a Vulkan
+loader and Mesa's Lavapipe, so Vulkan evidence from CI is a software
+rasterizer's — API and image correctness, never hardware behaviour or
+performance. The CPU workers are
 headless, and the display worker's only display is the isolated Xvfb X11 server
 it starts itself, so native evidence from CI is X11 on a virtual framebuffer: it
 covers the session, thread, and window lifecycle, not Wayland, macOS, physical
@@ -2572,8 +2688,9 @@ setup moves the candidate's identity, so earlier display evidence cannot cross
 either.
 
 Both display helpers are driven with a `PATH` holding only ordinary utilities
-and stub display programs. For the X11 helper: the command runs inside the
-display the helper established, with `WAYLAND_DISPLAY` removed and the server
+and stub display programs. They live in the local-only optional
+`wayland-helper-tests` and `x11-helper-tests` suites. For the X11 helper, the
+command runs inside the display the helper established, with `WAYLAND_DISPLAY` removed and the server
 stopped afterwards; a missing X server, one that exits before reporting a
 display, and a window manager that exits each stop the run with status `1`
 before the command starts; and the command's own status is returned once it
@@ -2605,4 +2722,7 @@ copy's declaration is caught, and that it carries every pin the shipped
 provisioning script sources — read from the script itself, so a pin added to it
 later is carried or the example fails.
 
-Run them with `cabal test workflow-tests --test-show-details=direct`.
+Run the ordinary workflow checks with
+`cabal test workflow-tests --test-show-details=direct`. Display-helper probes
+run only on an explicit local request or coordinated local-test selection; see
+[the inventory](test_classification.md#local-probe-inventory).

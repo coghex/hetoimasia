@@ -74,7 +74,7 @@ Checked at `master@af4436d` unless a line says otherwise.
   Openbox for one command, removes `WAYLAND_DISPLAY`, sets
   `XDG_SESSION_TYPE=x11`, and hands the command
   `HETOIMASIA_NATIVE_SESSION=isolated-x11:<display>`, the only scripted consent
-  the native suite accepts. `tools/test/Display.hs` proves that helper.
+  the native suite accepts. `tools/x11-test/Main.hs` proves that helper.
 - **Seam.** `packages/glfw/native/Hetoimasia/GLFW/Internal/Native.hs:268-272`
   chooses Cocoa on Darwin and X11 on Linux and no backend elsewhere; the
   platform codes for all three backends exist at `:274-283`. The Linux C shim
@@ -493,9 +493,10 @@ example at the cost of compositor automation.
   `tools/display/wayland.sh`, with its own consent token, asserting the
   selected backend before any window example; the run's last line still
   reports one acquisition of the shared session.
-- **Workflow checks** in `tools/test/Display.hs` prove the new helper the way
-  they prove `x11.sh`: missing compositor, early exit, readiness timeout, the
-  private runtime directory and socket, `WAYLAND_SOCKET` and `DISPLAY` unset,
+- **Helper checks** in `tools/wayland-test/Main.hs` prove the new helper the way
+  `tools/x11-test/Main.hs` proves `x11.sh`: missing compositor, early exit,
+  readiness timeout, the private runtime directory and socket, `WAYLAND_SOCKET`
+  and `DISPLAY` unset,
   cleanup on every exit path, and the exact environment handed to the command.
 - **Connection loss** is demonstrated only in an isolated subprocess under an
   external timeout with its own compositor, never inside the shared session.

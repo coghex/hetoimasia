@@ -10,9 +10,12 @@ description:
     coroutine, a closure, or a native address; the raw binding, the callback
     trampoline, and the registry bookkeeping stay in this package's private
     bridge sublibrary. A Lua error is reported as a bounded diagnostic without
-    unwinding Haskell, and a Haskell exception or a cancellation that reaches
-    a callback is re-raised at the Haskell boundary with its type and context
-    rather than becoming an ordinary Lua error that @pcall@ can swallow.
+    unwinding Haskell. A failure raised by a callback's own action is re-raised
+    at the owner's Haskell boundary with its type and context, even if Lua
+    catches the message-free light-userdata placeholder. Cancellation targets
+    the VM's execution owner and is deferred until the native call and its
+    bookkeeping finish; direct cancellation of a callback thread is unsupported
+    and can end the process.
     This library has no runtime, GLFW, Vulkan, console, or game dependency.
     Beside the bridge, and sharing no dependency with it, the package owns the
     pure protocol model: bounded script tasks and their transitions, admission
@@ -196,6 +199,21 @@ test-suite lua-host-tests
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge,
         hetoimasia-scripting-lua:model
+
+-- Deliberate nontermination is optional evidence, separate from lua-host-tests.
+test-suite lua-hazard-probes
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: hazard-test
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-tool-depends: hetoimasia-scripting-lua:lua-hazard
+    build-depends:
+        base >=4.22 && <4.23,
+        directory >=1.3 && <1.4,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        hetoimasia-test-support ==0.1.0.0
 
 -- The macOS confinement probe's shared side, private to this package and built
 -- only on Darwin. It is LUA-15's feasibility evidence, not an engine facility:

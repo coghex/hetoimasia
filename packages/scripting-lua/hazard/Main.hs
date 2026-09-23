@@ -227,18 +227,18 @@ capabilityRelease = do
 
 -- | Cancel callback threads while Lua is calling them, over and over.
 --
--- The trampoline runs the callback's own action unmasked, so a cancellation
--- aimed there is delivered and caught; everything after the action is masked,
--- because the frame it returns through is C and an exception unwinding out of
--- one is undefined rather than an error report. That containment is what this
--- provokes, fifty times, in a process whose death would be the suite's evidence
--- rather than its own.
+-- This is a manually runnable diagnostic of an unsupported path, excluded
+-- from the suite's assertions. The trampoline catches a failure delivered
+-- inside the callback's own action, but cannot mask the runtime's
+-- foreign-export prologue or epilogue. Direct cancellation of that thread can
+-- end the process; surviving this run does not establish containment. Supported
+-- cancellation targets the VM's execution owner instead.
 --
 -- The cancellation is coordinated, not hoped for: the callback publishes its
 -- thread and parks interruptibly, so the first exception is delivered inside
--- the action and the count of deliveries is checked, not assumed. The two that
--- follow it overlap the masked epilogue, which is the half a fixture cannot
--- coordinate and can only repeat.
+-- the action and the count of observed deliveries is reported. The two that
+-- follow it race the entry's masked bookkeeping and the runtime's unprotected
+-- return path, which the fixture cannot coordinate and can only repeat.
 callbackCancellation ∷ IO ()
 callbackCancellation = do
   vm ← newVm [LibraryBase]
@@ -255,11 +255,9 @@ callbackCancellation = do
         -- action: a cancellation aimed here is delivered, not merely sent.
         target ← takeMVar live
         -- Three of them. The first reaches the action, where the entry can
-        -- catch it; the rest arrive while the entry is finishing under its
-        -- mask, which is the stretch that would otherwise unwind through a C
-        -- frame. Every Haskell instruction between Lua calling in and this
-        -- thread ending belongs to this package, which is why the later ones
-        -- have nowhere to land.
+        -- catch it. The later deliveries race masked bookkeeping and the
+        -- runtime's return path, which this package cannot protect. They may
+        -- end the process instead of reaching the operation's failure result.
         mapM_ (\_ → forkIO (throwTo target ThreadKilled)) [1 .. 3 ∷ Int]
         result ← timeout boundMicroseconds (takeMVar outcome)
         case result of
@@ -280,7 +278,8 @@ callbackCancellation = do
     (pure ())
   mapM_ (const attempt) [1 .. attempts]
   landed ← readIORef delivered
-  -- Every one of those was contained, so the VM is still a VM.
+  -- If the process survived, report whether the VM remains usable. This
+  -- observation does not establish callback-thread cancellation as supported.
   usable ← try @SomeException (evalChunk vm (chunkName "after") "local ignored = 1")
   closeVm vm
   putStrLn

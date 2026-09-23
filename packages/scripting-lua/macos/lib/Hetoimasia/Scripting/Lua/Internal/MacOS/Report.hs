@@ -26,7 +26,7 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Report
 
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Text.Read (readMaybe)
 
 -- | The protocol's version tag. It leads every line the helper emits.
@@ -115,10 +115,21 @@ data Report
   | -- | The smallest @RLIMIT_AS@ the helper could install, and the errno that
     -- rejected the next step down.
     RlimitFloor Word64 Int
-  | -- | The workload has reached this many mebibytes.
-    Held Int
+  | -- | Retained workload payload after one completed step, in bytes: Lua
+    -- payload, native payload, and their sum. Emitted only once both of that
+    -- step's allocations have succeeded. This is the payload the workload
+    -- kept, not allocator overhead and not the process footprint.
+    Held Word64 Word64 Word64
   | -- | The workload's own finite ceiling was reached without interference.
-    Ceiling Int
+    -- The fields are the Lua, native, and total payload bytes then retained,
+    -- in the same units as 'Held'.
+    Ceiling Word64 Word64 Word64
+  | -- | One simultaneous reading of the native buffers still live at the
+    -- ceiling, oldest completed step first: how many, the size in bytes they
+    -- share (0 when they do not), the uniform fill byte of each (0 when a
+    -- buffer is not uniform), and the sum of the bytes actually read from
+    -- each. This is not the 'Held' counter.
+    Retained Int Word64 [Word8] [Word64]
   | -- | The helper finished its mode.
     Done
   | -- | Anything else the helper or the runtime wrote.
@@ -139,8 +150,15 @@ renderReport report = Text.unwords (protocolTag : body report)
     Footprint footprint virtualSize →
       ["footprint", showText footprint, showText virtualSize]
     RlimitFloor bytes code → ["rlimit-as-floor", showText bytes, showText code]
-    Held mib → ["held", showText mib]
-    Ceiling mib → ["ceiling", showText mib]
+    Held lua native total →
+      ["held", "lua-bytes", showText lua, "native-bytes", showText native, "total-bytes", showText total]
+    Ceiling lua native total →
+      ["ceiling", "lua-bytes", showText lua, "native-bytes", showText native, "total-bytes", showText total]
+    Retained count each fills sums →
+      ["retained", "count", showText count, "bytes-each", showText each, "fills"]
+        <> map showText fills
+        <> ["sums"]
+        <> map showText sums
     Done → ["done"]
     Noise text → ["noise", sanitize text]
 
@@ -168,8 +186,26 @@ parseReport raw
       | Just a ← number footprint, Just b ← number virtualSize → Footprint a b
     ["rlimit-as-floor", bytes, code]
       | Just a ← number bytes, Just b ← number code → RlimitFloor a b
-    ["held", mib] | Just value ← number mib → Held value
-    ["ceiling", mib] | Just value ← number mib → Ceiling value
+    ["held", "lua-bytes", lua, "native-bytes", native, "total-bytes", total]
+      | Just luaBytes ← number lua
+      , Just nativeBytes ← number native
+      , Just totalBytes ← number total →
+          Held luaBytes nativeBytes totalBytes
+    ["ceiling", "lua-bytes", lua, "native-bytes", native, "total-bytes", total]
+      | Just luaBytes ← number lua
+      , Just nativeBytes ← number native
+      , Just totalBytes ← number total →
+          Ceiling luaBytes nativeBytes totalBytes
+    ("retained" : "count" : countText : "bytes-each" : eachText : "fills" : rest)
+      | Just count ← number countText
+      , count >= 0
+      , Just each ← number eachText
+      , (fillTexts, "sums" : sumTexts) ← splitAt count rest
+      , length fillTexts == count
+      , length sumTexts == count
+      , Just fills ← traverse number fillTexts
+      , Just sums ← traverse number sumTexts →
+          Retained count each fills sums
     ["done"] → Done
     ("noise" : rest) → Noise (Text.unwords rest)
     _ → Noise line

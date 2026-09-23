@@ -36,6 +36,9 @@ MANIFEST_TYPES = (
 INDEX_TYPES = MANIFEST_TYPES[:2]
 PLATFORM = "linux/amd64"
 IMAGE_ROOT = "/opt/hetoimasia"
+# The Vulkan prefix the native recipe provisions inside the image, as the
+# Dockerfile's own environment names it.
+VULKAN_PREFIX = f"{IMAGE_ROOT}/native/glfw/vulkan"
 
 REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -178,6 +181,13 @@ def build(context: str, local: str, fingerprint: str) -> int:
         contract.LABELS["ghc"]: embedded["ghc"],
         contract.LABELS["cabal"]: embedded["cabal"],
         contract.LABELS["weston"]: embedded["weston"],
+        # The Vulkan identities the image stamped for itself. They are labels so
+        # a lookup can read what a published image runs against without pulling
+        # and running it.
+        **{
+            contract.LABELS[contract.descriptor_field(entry)]: embedded[entry]
+            for entry in contract.VULKAN_ENTRIES
+        },
     }
     # The manifest hash exists only once the image does, so the labels are
     # applied by a second build that every layer of the first satisfies.
@@ -185,7 +195,14 @@ def build(context: str, local: str, fingerprint: str) -> int:
     for name, value in sorted(labels.items()):
         labelled += ["--label", f"{name}={value}"]
     docker(*labelled, context)
-    print(json.dumps({"native_manifest": embedded["native_manifest"]}))
+    print(
+        json.dumps(
+            {
+                "native_manifest": embedded["native_manifest"],
+                **{contract.descriptor_field(entry): embedded[entry] for entry in contract.VULKAN_ENTRIES},
+            }
+        )
+    )
     return 0
 
 
@@ -201,6 +218,17 @@ echo "manifest=$(sha256sum "$HETOIMASIA_NATIVE_PREFIX/hetoimasia-native-manifest
 echo "embedded=$(python3 -c 'import json; print(json.load(open("{IMAGE_ROOT}/image.json"))["recipe_fingerprint"])')"
 echo "embedded_weston=$(python3 -c 'import json; print(json.load(open("{IMAGE_ROOT}/image.json"))["weston"])')"
 echo "weston=$(dpkg-query --show --showformat='${{Version}}' weston)"
+# Every toolchain entry the prefix itself yields, recomputed from the manifest
+# on disk. Comparing these with what the image stamped is what catches an image
+# whose Vulkan inputs were replaced after it was stamped.
+python3 {IMAGE_ROOT}/recipe/tools/native/native.py toolchain --prefix "$HETOIMASIA_NATIVE_PREFIX" | sed 's/^/prefix_/'
+python3 - <<'STAMPED'
+import json
+document = json.load(open("{IMAGE_ROOT}/image.json"))
+for name in ("vulkan", "vulkan-loader", "vulkan-driver", "vulkan-layers", "glslang"):
+    print(f"stamped_{{name}}={{document[name]}}")
+STAMPED
+echo "glslang_wrapper=$(command -v glslangValidator)"
 echo "compositor=$(command -v weston)"
 echo "wayland_info=$(command -v wayland-info)"
 test ! -e {IMAGE_ROOT}/descriptor.json
@@ -225,7 +253,13 @@ def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal
         "embedded_weston": weston,
         "compositor": "/usr/bin/weston",
         "wayland_info": "/usr/bin/wayland-info",
+        # `glslangValidator` resolves to the private wrapper rather than the
+        # package's own binary, which is what makes a later shader step run the
+        # compiler this recipe qualified.
+        "glslang_wrapper": f"{VULKAN_PREFIX}/bin/glslangValidator",
     }
+    for entry in contract.VULKAN_ENTRIES:
+        expected[f"stamped_{entry}"] = values.get(f"prefix_{entry}")
     problems = [f"{name} is {values.get(name)!r}, expected {value!r}" for name, value in expected.items() if values.get(name) != value]
     labels = json.loads(docker("image", "inspect", "--format", "{{json .Config.Labels}}", local, capture=True)) or {}
     for name, value in (
@@ -234,6 +268,8 @@ def validate(local: str, fingerprint: str, native_manifest: str, ghc: str, cabal
         ("ghc", ghc),
         ("cabal", cabal),
         ("weston", weston),
+    ) + tuple(
+        (contract.descriptor_field(entry), values.get(f"prefix_{entry}")) for entry in contract.VULKAN_ENTRIES
     ):
         if labels.get(contract.LABELS[name]) != value:
             problems.append(f"label {contract.LABELS[name]} is {labels.get(contract.LABELS[name])!r}, expected {value!r}")

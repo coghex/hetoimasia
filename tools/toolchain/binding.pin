@@ -1,9 +1,13 @@
 # The Vulkan binding this repository has qualified against the pinned Haskell
 # toolchain, and the flags it is qualified with. Nothing builds against these
 # values yet: there is no `packages/gpu-vulkan` Cabal package, and the Linux CI
-# image carries no Vulkan input. They exist so the later Vulkan slices inherit a
-# proven pair rather than re-deciding it, and so `qualify-binding.sh` can prove
-# the pair still resolves and builds on demand. See docs/toolchain.md.
+# image carried no Vulkan input when these were qualified. They exist so the
+# later Vulkan slices inherit a proven pair rather than re-deciding it, and so
+# `qualify-binding.sh` can prove the pair still resolves and builds on demand.
+# VK-4 has since provisioned a Vulkan runtime into that image and into the local
+# native prefix; the pair pinned here is unchanged by it, and
+# `tools/vulkan-proof/run-proof.sh` is what builds against the provisioned one.
+# See docs/toolchain.md.
 VULKAN_VERSION=3.27
 VULKAN_UTILS_VERSION=0.5.11.0
 
@@ -25,4 +29,11 @@ VULKAN_FLAG_DARWIN_LIB_DIRS=off
 # The macOS loader prefix the qualification links against when
 # HETOIMASIA_VULKAN_PREFIX does not name another. `<prefix>/lib` must hold the
 # loader and `<prefix>/lib/pkgconfig/vulkan.pc` must describe it.
+#
+# This is #157's own retained invocation and is unchanged by VK-4. The prefix
+# `tools/native/vulkan.py` provisions has exactly that shape, so pointing
+# HETOIMASIA_VULKAN_PREFIX at `<native prefix>/vulkan` qualifies the binding
+# against the loader this repository provisions rather than the one the machine
+# happens to install. Nothing else reads this value: the proof harness takes
+# every Vulkan path from the native prefix instead.
 MACOS_VULKAN_PREFIX=/usr/local
