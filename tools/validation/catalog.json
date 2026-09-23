@@ -227,7 +227,9 @@
       ],
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
+        "cabal.project",
         "cabal.project.common",
+        "cabal.project.cpu",
         "cabal.project.vulkan",
         "docs/vulkan/",
         "docs/vulkan_compatibility_record.md",

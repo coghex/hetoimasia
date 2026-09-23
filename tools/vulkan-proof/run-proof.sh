@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
-# Run the VK-2 native Vulkan compatibility proof against this platform's pinned
-# loader, driver, and validation layers.
+# Run the native Vulkan compatibility proof against the loader, driver, and
+# validation layers the private native prefix was provisioned with.
 #
 # This is the only thing that builds `tools/vulkan-proof`. It selects the
 # repository's third project file, `cabal.project.vulkan`, which is the only one
 # that names that package — so an ordinary `cabal build all`, with either of the
 # other two project files, neither resolves nor links the Vulkan binding.
 #
+# Every input comes from one place: `tools/native/native.py prepare`, which
+# refuses the prefix unless it is exactly what this configuration provisions and
+# then prints the discovery that prefix owns. Nothing here names a machine path,
+# reads `tools/vulkan-proof/environment.pin` — which VK-4 retired — or generates
+# a project file; the loader is found through the prefix's own package
+# description and, where a declaration cannot read one, through link and include
+# directories passed to Cabal on this one command line.
+#
 # The environment it establishes is project-local and reaches one child process:
-# an absolute `VK_DRIVER_FILES` manifest path, a controlled `VK_LAYER_PATH`, and
-# the private GLFW prefix on `PKG_CONFIG_PATH`. It edits no shell profile,
-# installs nothing, and changes nothing another project uses. The harness itself
-# clears conflicting discovery overrides it finds and records which, so the
-# pinned selection cannot be quietly overridden from outside.
+# an absolute `VK_DRIVER_FILES` manifest path, a `VK_LAYER_PATH` holding exactly
+# the qualified layer, and the prefix's two package descriptions on
+# `PKG_CONFIG_PATH`. It edits no shell profile, installs nothing, and changes
+# nothing another project uses. The harness itself clears conflicting discovery
+# overrides it finds and records which, so the provisioned selection cannot be
+# quietly overridden from outside.
+#
+# The loader itself is a runtime dependency (`libvulkan.so.1` on Linux), so a
+# runtime library search override could load an ABI-compatible substitute after
+# `prepare` verified the pinned file. This refuses any such variable before its
+# first check rather than clearing it, and the harness then requires the image
+# its entry point was resolved from to be `HETOIMASIA_VULKAN_QUALIFIED_LOADER`,
+# the loader `prepare` names.
 #
 # The proof opens a visible window and presents to it, so it needs the same
 # per-run consent `glfw-native-tests` needs. It supplies none: on macOS the
@@ -41,14 +57,28 @@ set -a
 . "$root/tools/ci-image/toolchain.pin"
 # shellcheck disable=SC1091
 . "$root/tools/toolchain/binding.pin"
-# shellcheck disable=SC1091
-. "$root/tools/vulkan-proof/environment.pin"
 set +a
 
 refuse() {
   echo "run-proof: $1" >&2
   exit 2
 }
+
+# A runtime library search override lets the dynamic linker answer the
+# loader's soname with some other file after `prepare` has verified the pinned
+# one, and an ABI-compatible substitute would then be proved in its place. Each
+# is refused rather than cleared, so a run never proves something other than
+# what its caller's environment asked for without saying so. The harness also
+# holds the loader it actually loaded to the recorded file, which catches what
+# this list cannot name. macOS strips the DYLD_ variables before a protected
+# binary such as /bin/bash runs, so there they are refused wherever they survive.
+for variable in LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT \
+  DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_INSERT_LIBRARIES \
+  DYLD_FRAMEWORK_PATH DYLD_FALLBACK_FRAMEWORK_PATH DYLD_IMAGE_SUFFIX; do
+  if value="$(printenv "$variable")"; then
+    refuse "$variable is set ($value); a runtime library search override can load a Vulkan loader other than the one the prefix qualified, so unset it and run again"
+  fi
+done
 
 # The toolchain identity. A proof run on some other compiler proves nothing
 # about the one this repository pins, so it is refused rather than reported.
@@ -67,77 +97,42 @@ grep -q '^    vulkan +safe-foreign-calls,$' "$root/cabal.project.vulkan" \
 grep -q '^    vulkan -darwin-lib-dirs$' "$root/cabal.project.vulkan" \
   || refuse "cabal.project.vulkan does not constrain vulkan -darwin-lib-dirs"
 
-# The private GLFW prefix, exactly the one every other native build here uses.
-prefix_default="${XDG_CACHE_HOME:-$HOME/.cache}/hetoimasia/native/glfw"
-glfw_prefix="${HETOIMASIA_NATIVE_PREFIX:-$prefix_default}"
-python3 "$root/tools/native/native.py" check --prefix "$glfw_prefix" >/dev/null \
-  || refuse "the private GLFW prefix at $glfw_prefix is not what this configuration builds; rebuild it with: python3 tools/native/native.py build --prefix $glfw_prefix"
-export PKG_CONFIG_PATH="$glfw_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-
-# The platform's loader, driver, and layers.
-case "$(uname -s)" in
-  Darwin)
-    loader_prefix="${HETOIMASIA_VULKAN_PREFIX:-$MACOS_VULKAN_PREFIX}"
-    driver_manifest="${HETOIMASIA_VULKAN_DRIVER_MANIFEST:-$MACOS_VULKAN_DRIVER_MANIFEST}"
-    layer_path="${HETOIMASIA_VULKAN_LAYER_PATH:-$MACOS_VULKAN_LAYER_PATH}"
-    ;;
-  Linux)
-    # The binding finds the loader through `pkgconfig-depends: vulkan` here, so
-    # no prefix is named; the container's loader development package is the
-    # whole configuration.
-    loader_prefix=""
-    driver_manifest="${HETOIMASIA_VULKAN_DRIVER_MANIFEST:-$LINUX_VULKAN_DRIVER_MANIFEST}"
-    layer_path="${HETOIMASIA_VULKAN_LAYER_PATH:-$LINUX_VULKAN_LAYER_PATH}"
-    ;;
-  *)
-    refuse "$(uname -s) is not a platform this proof is qualified on"
-    ;;
-esac
-
-case "$driver_manifest" in
-  /*) ;;
-  *) refuse "the pinned driver manifest $driver_manifest is not an absolute path" ;;
-esac
-# A refusal here has to say what the platform does offer. The pin names one
-# manifest deliberately, and the useful question when it is absent is which
-# other driver this machine installed — not whether to fall back to one.
-if [ ! -r "$driver_manifest" ]; then
-  available="$(ls -1 "$(dirname "$driver_manifest")" 2>/dev/null | tr '\n' ' ')"
-  refuse "the pinned driver manifest $driver_manifest is not readable; $(dirname "$driver_manifest") holds: ${available:-nothing}"
-fi
-if [ ! -d "$layer_path" ]; then
-  refuse "the pinned layer directory $layer_path does not exist"
-fi
-
-# On macOS the binding is given no search path at all once `darwin-lib-dirs` is
-# off, and `vulkan-utils` makes GHC dlopen the compiled binding while compiling,
-# so the prefix has to supply both a link path and an rpath. This is generated
-# rather than committed because the prefix is a property of the machine, not of
-# the repository; `<project-file>.local` is where Cabal reads exactly that.
+# Nothing generates a project file any more, and a leftover one from before
+# VK-4 would quietly put the former SDK paths back into every build here. Cabal
+# reads `<project-file>.local` silently, so its presence is diagnosed rather
+# than tolerated, and retiring it is the reader's deliberate act: this harness
+# does not delete a file it did not write.
 local_project="$root/cabal.project.vulkan.local"
-if [ -n "$loader_prefix" ]; then
-  [ -d "$loader_prefix/lib" ] || refuse "no Vulkan loader prefix at $loader_prefix (set HETOIMASIA_VULKAN_PREFIX)"
-  cat > "$local_project" <<EOF
--- Generated by tools/vulkan-proof/run-proof.sh; not committed. It names this
--- machine's Vulkan loader prefix, which the repository cannot know.
-package vulkan
-  extra-lib-dirs: $loader_prefix/lib
-  extra-include-dirs: $loader_prefix/include
-  ghc-options: -optl-Wl,-rpath,$loader_prefix/lib
-
-package hetoimasia-vulkan-proof
-  extra-lib-dirs: $loader_prefix/lib
-  extra-include-dirs: $loader_prefix/include
-  ghc-options: -optl-Wl,-rpath,$loader_prefix/lib
-EOF
-else
-  rm -f "$local_project"
+if [ -e "$local_project" ]; then
+  refuse "$local_project exists; VK-4 provisions the loader into the native prefix and generates no project file, so this one is obsolete configuration that would override the provisioned prefix. Delete it and run again."
 fi
+
+# The private native prefix: the GLFW archive and the Vulkan runtime beside it,
+# exactly the ones every other native build here uses. `prepare` refuses a
+# prefix that is not what this configuration provisions, stamps the build
+# directory so nothing linked against another native configuration is reused,
+# and prints the discovery the prefix owns — which is where every Vulkan path
+# below comes from.
+prefix_default="${XDG_CACHE_HOME:-$HOME/.cache}/hetoimasia/native/glfw"
+native_prefix="${HETOIMASIA_NATIVE_PREFIX:-$prefix_default}"
+case "$(uname -s)" in
+  Darwin|Linux) ;;
+  *) refuse "$(uname -s) is not a platform this proof is qualified on" ;;
+esac
+discovery="$(python3 "$root/tools/native/native.py" prepare --prefix "$native_prefix" --build-dir "$root/dist-vulkan-proof")" \
+  || refuse "the private native prefix at $native_prefix is not what this configuration provisions; the diagnosis above says what differs, and a prefix that is simply out of date is rebuilt with: python3 tools/native/native.py build --prefix $native_prefix"
+eval "$discovery"
+
+[ -n "${VK_DRIVER_FILES:-}" ] || refuse "the native prefix named no driver manifest"
+[ -n "${VK_LAYER_PATH:-}" ] || refuse "the native prefix named no layer directory"
+[ -r "$VK_DRIVER_FILES" ] || refuse "the provisioned driver manifest $VK_DRIVER_FILES is not readable"
+[ -d "$VK_LAYER_PATH" ] || refuse "the provisioned layer directory $VK_LAYER_PATH does not exist"
 
 # The exact identity of the sources under proof, computed from their content.
 # A revision is a convenience and can be inexact — a working tree can be dirty,
-# and the Linux container has no checkout at all — so the record is pinned by
-# this instead, and a reader can recompute it with the same command.
+# and a checkout mounted into a container is not one `git` will speak for — so
+# the record is pinned by this instead, and a reader can recompute it with the
+# same command.
 HETOIMASIA_PROOF_SOURCE_DIGEST="$(
   python3 - "$root" <<'DIGEST'
 import hashlib, os, sys
@@ -148,10 +143,11 @@ root = sys.argv[1]
 # left out: `tools/native` holds both the GLFW pin and the recipe that builds
 # from it, and two different recipes must not be able to produce one digest.
 #
-# This set is exactly what the Linux container copies into /work, so the digest
-# computed there and the one computed from a checkout describe the same inputs
-# and can be compared. Generated Python and macOS metadata are excluded because
-# they are not inputs and do not exist identically in both places.
+# Both platforms compute it from a checkout — Linux inside the published CI
+# image with the candidate mounted, macOS from the worktree — so a digest taken
+# on one can be compared with a digest taken on the other. Generated Python and
+# macOS metadata are excluded because they are not inputs and do not exist
+# identically in both places.
 roots = ["tools/vulkan-proof", "tools/native", "tools/display"]
 files = ["cabal.project.vulkan", "cabal.project.common",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
@@ -201,9 +197,6 @@ if [ -z "${HETOIMASIA_PROOF_REVISION:-}" ]; then
   export HETOIMASIA_PROOF_REVISION="$source_revision"
 fi
 
-export VK_DRIVER_FILES="$driver_manifest"
-export VK_LAYER_PATH="$layer_path"
-
 record="${HETOIMASIA_VULKAN_PROOF_RECORD:-}"
 if [ -n "$record" ]; then
   export HETOIMASIA_VULKAN_PROOF_RECORD="$record"
@@ -214,8 +207,11 @@ echo "run-proof: repository revision $HETOIMASIA_PROOF_REVISION"
 echo "run-proof: source digest $HETOIMASIA_PROOF_SOURCE_DIGEST"
 echo "run-proof: VK_DRIVER_FILES=$VK_DRIVER_FILES"
 echo "run-proof: VK_LAYER_PATH=$VK_LAYER_PATH"
-echo "run-proof: GLFW prefix $glfw_prefix"
-[ -n "$loader_prefix" ] && echo "run-proof: loader prefix $loader_prefix"
+echo "run-proof: native prefix $native_prefix"
+echo "run-proof: Vulkan prefix $HETOIMASIA_VULKAN_PREFIX"
+python3 "$root/tools/native/native.py" check --prefix "$native_prefix" | sed 's/^native:/run-proof:/'
+"$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/run-proof: glslang wrapper reports /'
+
 
 # What the caller asked the harness itself to do. The harness owns `--headless`
 # and takes it out of the arguments before Hspec's runner sees them, so an
@@ -225,10 +221,18 @@ for argument in "$@"; do
   options+=("--test-option=$argument")
 done
 
+# The loader's link and include directories are handed to Cabal here rather
+# than written into a project file. The binding declares `extra-libraries:
+# vulkan` on macOS with no directory to find it in, and the loader the prefix
+# installed there carries an absolute install name, so this is the whole
+# configuration a link needs: no rpath, no machine path, and nothing left on
+# disk afterwards to go stale.
 cd "$root"
 exec cabal test \
   --project-file=cabal.project.vulkan \
   --builddir=dist-vulkan-proof \
+  --extra-lib-dirs="$HETOIMASIA_VULKAN_LIBDIR" \
+  --extra-include-dirs="$HETOIMASIA_VULKAN_INCLUDEDIR" \
   --test-show-details=direct \
   hetoimasia-vulkan-proof:vulkan-proof \
   ${options[@]+"${options[@]}"}
