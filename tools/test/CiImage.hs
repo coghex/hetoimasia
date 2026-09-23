@@ -987,6 +987,21 @@ spec = describe "CI image" $ do
             errors `shouldContain` sourceNamed
             doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
 
+      forM_ [("check", False), ("prepare", True)] $ \(command, building) →
+        it ("refuses a layer directory holding an unrecorded manifest, on " ++ command) $
+          withNative $ \native → do
+            -- `VK_LAYER_PATH` names a directory the loader searches, so a
+            -- second manifest dropped beside the recorded one is a layer it
+            -- can load. Every recorded file still hashes as recorded here.
+            nativeOk native [] ["record", "--prefix", nativePrefix native]
+            writeFile
+              (nativePrefix native </> "vulkan/share/vulkan/explicit_layer.d/VkLayer_unqualified.json")
+              "{\"file_format_version\": \"1.2.0\", \"layer\": {\"name\": \"VK_LAYER_unqualified\"}}\n"
+            let build = if building then ["--build-dir", nativeBuild native] else []
+            (refused, _, errors) ← nativeTool native [] ([command, "--prefix", nativePrefix native] ++ build)
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "holds VkLayer_unqualified.json beside the recorded"
+
       it "refuses a Vulkan product the prefix does not own" $
         withNative $ \native → do
           nativeOk native [] ["record", "--prefix", nativePrefix native]

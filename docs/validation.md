@@ -1717,7 +1717,7 @@ and `record` establishes a *project-managed Vulkan prefix* at
 | `lib/libvulkan.dylib` | macOS only: the name `-lvulkan` opens, linked to the file above. Its identity is not a digest but that it is a symbolic link and which file it names, so deleting it, pointing it elsewhere, or replacing it with a file is refused — each of those either fails a clean build or links a different loader. |
 | `include/` | macOS only: the qualified headers, copied in beside it. On Linux the pinned development package's own `/usr/include` is referenced. |
 | `share/vulkan/icd.d/<driver>_icd.json` | Generated, naming exactly one driver binary by absolute path. |
-| `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. |
+| `share/vulkan/explicit_layer.d/<layer>.json` | Generated, naming exactly one layer binary by absolute path. `VK_LAYER_PATH` names this directory and the loader searches it, so `check` refuses any entry in it beside the recorded manifest. |
 | `bin/glslangValidator` | A wrapper that runs the qualified compiler by absolute path, and answers `--hetoimasia-identity` from the recorded identity without compiling anything. Its mode is recorded and `check` runs that flag: bytes alone would accept a wrapper whose execute bits were cleared, which fails outright when used directly and is walked past when used through `PATH`. |
 
 On Linux every input is referenced where its pinned package installed it,

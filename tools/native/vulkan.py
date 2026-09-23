@@ -13,8 +13,10 @@ prefix* at ``<prefix>/vulkan`` that the rest of the repository points at:
   a distribution happens to offer;
 - ``share/vulkan/icd.d/`` holds exactly one driver manifest and
   ``share/vulkan/explicit_layer.d/`` exactly one layer manifest, both written
-  here from the qualified originals, so ``VK_DRIVER_FILES`` and
-  ``VK_LAYER_PATH`` name a selection rather than a directory to search;
+  here from the qualified originals. ``VK_DRIVER_FILES`` names that one
+  driver manifest. ``VK_LAYER_PATH`` names a directory the loader searches,
+  so :func:`verify` holds it to exactly the recorded manifests and refuses
+  any other entry beside them;
 - ``bin/glslangValidator`` is a wrapper that runs the qualified compiler by
   absolute path and can report its identity without compiling anything.
 
@@ -1016,6 +1018,29 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
                     f"the loader's linker-facing link at {link} resolves to {os.path.realpath(link)}, "
                     f"not the recorded loader {recorded['loader']['path']}"
                 )
+
+    # The directory exported as `VK_LAYER_PATH` is searched, not selected from:
+    # the loader offers every manifest it finds there. So hashing the recorded
+    # manifest proves nothing about what else the loader can discover, and the
+    # directory has to hold exactly the recorded set and nothing beside it.
+    selections: dict[str, set[str]] = {}
+    for layer in recorded.get("layers", []):
+        manifest = layer.get("manifest")
+        if isinstance(manifest, str):
+            selections.setdefault(os.path.dirname(manifest), set()).add(os.path.basename(manifest))
+    for directory, expected in sorted(selections.items()):
+        try:
+            present = set(os.listdir(directory))
+        except OSError as error:
+            problems.append(f"the layer directory {directory} is not readable ({error})")
+            continue
+        unrecorded = sorted(present - expected)
+        if unrecorded:
+            problems.append(
+                f"the layer directory {directory} holds {', '.join(unrecorded)} beside the recorded "
+                f"{', '.join(sorted(expected))}; the loader searches that directory, so an unqualified "
+                "manifest there is a layer it can load"
+            )
 
     # The headers the prefix offers, re-walked rather than taken from the
     # record: on macOS they are a copy inside the prefix, and a copy nobody
