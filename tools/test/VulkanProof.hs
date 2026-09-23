@@ -9,10 +9,13 @@
 -- is checked here directly instead, by reading the two ordinary project files
 -- and requiring that neither names the proof package or resolves the binding.
 --
--- Those two files are read out of the checkout and are deliberately not in the
--- root package's source distribution — a `cabal.project` inside an unpacked
--- distribution breaks resolution wherever it lands — which `Packaging` records
--- and holds to as its own invariant.
+-- Those two files, and the sibling packages they name, are read out of the
+-- checkout and are deliberately not in the root package's source distribution:
+-- a `cabal.project` inside an unpacked distribution breaks resolution wherever
+-- it lands. `Packaging` records them as checkout-only and holds that they are
+-- never shipped. From an unpacked distribution, where neither is present, the
+-- independence example reports itself pending and says why; wherever either
+-- is present it runs, and a checkout holding only one of them fails.
 --
 -- What the rest of these examples check is everything the floor cannot see:
 -- that the one project file which does select the proof agrees with the
@@ -24,15 +27,15 @@
 --
 -- They read the repository's own project files, pins, and catalog out of the
 -- checkout they run in. They start no session and build nothing.
-module VulkanProof (spec) where
+module VulkanProof (spec, readByTheseExamples) where
 
 import Control.Monad (forM_)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Json (asArray, asString, field, parseJson)
-import System.Directory (listDirectory)
+import System.Directory (doesFileExist, listDirectory)
 import System.FilePath ((</>))
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldSatisfy)
 
 -- | The retained per-platform records, and the summary that quotes them.
 retainedRecords ∷ [(String, FilePath)]
@@ -158,14 +161,20 @@ spec = describe "The Vulkan proof boundary" $ do
     -- is named by both files and is exactly the package whose independence
     -- matters, so a check that merely looked for the word would have to be
     -- taught to ignore the one entry worth reading.
-    forM_ ordinaryProjects $ \path → do
-      declared ← projectPackages path
-      (path, filter (proofPackage `isPrefixOf`) declared) `shouldBe` (path, [])
-      resolved ← mapM packageDependencies declared
-      (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
-      -- And the package the proof itself is, to show the check would notice.
-      proofDependencies ← packageDependencies proofPackage
-      proofDependencies `shouldContain` [bindingPackage]
+    present ← mapM doesFileExist ordinaryProjects
+    if not (or present)
+      then
+        pendingWith
+          "cabal.project and cabal.project.cpu are checkout-only and absent here, as in an unpacked source \
+          \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
+      else forM_ ordinaryProjects $ \path → do
+        declared ← projectPackages path
+        (path, filter (proofPackage `isPrefixOf`) declared) `shouldBe` (path, [])
+        resolved ← mapM packageDependencies declared
+        (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
+        -- And the package the proof itself is, to show the check would notice.
+        proofDependencies ← packageDependencies proofPackage
+        proofDependencies `shouldContain` [bindingPackage]
 
   it "takes the runner's discovery from the provisioned prefix, not a pinned environment" $ do
     -- VK-4 retired `tools/vulkan-proof/environment.pin`; the prefix's own

@@ -429,6 +429,19 @@ def headers_digest(include: str) -> str:
         found = True
         for base, directories, names in os.walk(root, onerror=unlistable):
             directories.sort()
+            # `os.walk` lists a linked directory without entering it, and the
+            # digest records files rather than directory entries, so a linked
+            # directory added or retargeted here would leave the digest
+            # unchanged while the compiler follows it. None is expected in a
+            # pinned header tree, so one is refused rather than followed.
+            for directory in directories:
+                linked = os.path.join(base, directory)
+                if os.path.islink(linked):
+                    raise VulkanError(
+                        f"the Vulkan header directory {linked} is a symbolic link to {os.readlink(linked)!r}; "
+                        "a linked header directory is refused rather than followed",
+                        status=1,
+                    )
             for name in sorted(names):
                 full = os.path.join(base, name)
                 relative = os.path.relpath(full, include)

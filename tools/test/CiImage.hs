@@ -23,6 +23,7 @@ import System.Directory
   ( canonicalizePath
   , copyFile
   , createDirectoryIfMissing
+  , createDirectoryLink
   , createFileLink
   , doesDirectoryExist
   , doesFileExist
@@ -978,6 +979,42 @@ spec = describe "CI image" $ do
           refused `shouldBe` ExitFailure 1
           errors `shouldContain` "vulkan/include/vulkan/unreadable.h cannot be read"
           errors `shouldNotContain` "Traceback"
+
+      forM_ ["Darwin", "Linux"] $ \target →
+        it ("refuses a linked " ++ target ++ " header directory before it provisions anything") $
+          withNative $ \native → do
+            -- A linked directory is listed but never entered, so following
+            -- nothing and saying nothing would let it change what compiles
+            -- while the digest stays pinned.
+            createDirectoryIfMissing True (nativeInputs native </> "elsewhere")
+            writeFixtureFile (nativeInputs native </> "elsewhere") "extra.h" "/* reached through a link */\n"
+            createDirectoryLink (nativeInputs native </> "elsewhere") (nativeInputs native </> "include/vulkan/linked")
+            (refused, _, errors) ← nativeToolOn target native [] ["record", "--prefix", nativePrefix native]
+            refused `shouldBe` ExitFailure 1
+            errors `shouldContain` "include/vulkan/linked is a symbolic link"
+            doesDirectoryExist (nativePrefix native </> "vulkan") `shouldReturn` False
+
+      it "refuses a Linux prefix once a linked directory appears among its referenced headers" $
+        withNative $ \native → do
+          -- Linux references the package's own headers, so this is what
+          -- `check` and worker verification meet when the tree changes under
+          -- an existing record.
+          (recorded, _, recordErrors) ← nativeToolOn "Linux" native [] ["record", "--prefix", nativePrefix native]
+          (recorded, recordErrors) `shouldBe` (ExitSuccess, "")
+          createDirectoryIfMissing True (nativeInputs native </> "elsewhere")
+          createDirectoryLink (nativeInputs native </> "elsewhere") (nativeInputs native </> "include/vulkan/linked")
+          (refused, _, errors) ← nativeToolOn "Linux" native [] ["check", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "include/vulkan/linked is a symbolic link"
+
+      it "refuses a macOS prefix once a linked directory appears among its copied headers" $
+        withNative $ \native → do
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          createDirectoryIfMissing True (nativeInputs native </> "elsewhere")
+          createDirectoryLink (nativeInputs native </> "elsewhere") (nativePrefix native </> "vulkan/include/vulkan/linked")
+          (refused, _, errors) ← nativeTool native [] ["check", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "vulkan/include/vulkan/linked is a symbolic link"
 
       it "refuses an unlistable header directory before it provisions anything" $
         withNative $ \native →
