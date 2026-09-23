@@ -3170,6 +3170,18 @@ those steps are offered under, and how a failed step is classified. The boundary
 supplies the exclusivity, the ordering, and the retirement rule, and nothing
 else.
 
+Every callback runs on the owner thread, outside every transaction, native
+callback, and release. It may do finite, nonblocking native and backend work —
+constructing dependents, querying, handing work to the graphics owner, and safe
+disposal — and may not wait on a GPU, wait on a worker, or pump native events;
+`protocolStep` is one bounded opportunity that returns finitely. That work does
+not move the graphics owner's responsibilities into a callback: under the
+[lifetime design's D-6](window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
+GPU effects and graphics-owned disposal execute on the graphics owner, and a
+callback that creates a main-thread resource such as a surface hands it to that
+owner under the retained attachment, then requests or observes the owner's
+progress without waiting for it.
+
 Every refusal is answered **before any acquisition effect**, so a refused
 attachment has constructed nothing:
 
