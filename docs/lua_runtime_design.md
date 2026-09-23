@@ -31,8 +31,10 @@ renew readiness before resuming issue processing. The
 [review ledger](project_review/ledger.md) also records implementation
 follow-ups; processing completion is not a clean implementation verdict. The
 [binding review](project_review/173.md) records stale source comments, and the
-[protocol review](project_review/179.md) records failure-settlement and bounded
-failure-detail defects to repair before dependent runtime integration.
+[protocol review](project_review/179.md) recorded failure-settlement and bounded
+failure-detail defects. Those repairs (#193/#194) are closed at the 2026-09-22
+review baseline. PR #241 subsequently corrected the binding comments. Neither
+those repairs nor closed proof issues clear Q-5's confinement gate.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -127,10 +129,10 @@ above and the recorded Q-3/Q-5 results describe the current state.
   suites. New Lua suites should start in their package; they need not wait for
   the migration of existing central tests.
 - Open tracker items at inspection were #123, #124, #86, and #49; none is a Lua
-  arc. The broader [foundation design](engine_foundation_design.md)'s unprocessed
-  FND-5 overlaps host construction. At processing, use this arc for that work
-  and reconcile FND-5 by reference; do not file two independent host issues or
-  silently mark the broader foundation epic complete.
+  arc. The original foundation plan's FND-5 overlapped host construction.
+  Its [current boundary overview](engine_foundation_design.md) now delegates
+  scripting to this arc; do not resurrect the historical slice or create a
+  second host epic.
   Readiness recheck on 2026-09-16 found the same open items and no overlapping
   Lua umbrella.
 
@@ -281,6 +283,17 @@ contracts. Any required change to scope, trust boundary, supported deployment,
 or public lifetime contract returns to the owner for a design decision. Routine
 mechanism selection within the accepted contracts is the proof's responsibility.
 
+### D-12. Run first-party scripts trusted and in-process
+
+Owner selected this explicitly on 2026-09-22. The game's own first-party
+scripts are trusted code. They run in-process in the application's UI and
+gameplay VM owners (D-1) and call application-registered bindings directly,
+without IPC serialization. Untrusted mods keep the confined-process pipeline of
+D-6, D-8 and D-9 unchanged. Both paths share one module and capability
+registration layer: a binding is defined once, and each path exposes the subset
+its trust level permits. The trusted path is never a fallback for a mod whose
+confinement cannot be installed. Q-8 records what this leaves open.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, subject to Q-3/Q-5's proof gates.
@@ -323,19 +336,19 @@ flowchart TD
     Host --> Binding[Private Lua binding]
 ```
 
-Retain HsLua as the first binding candidate because Synarchy already uses it.
-Do not infer that GLFW's private-binding decision also mandates a handwritten
-Lua binding. LUA-1 must pin a compatible Lua/binding pair against the project's
-GHC/Cabal/index baseline and document reproducible Linux/macOS builds, FFI
-annotations, exception translation, and close behavior. Choose a private shim
-only for a demonstrated missing contract. A need for a different execution or
-trust model returns to design; it is not an incidental solver choice.
+LUA-1 selected `lua-2.3.4`, its bundled Lua 5.4.8, and the private C/Haskell
+bridge documented in the [package contract](../packages/scripting-lua/README.md).
+Use that qualified boundary and the binding settings in `cabal.project.common`;
+`lua` is the HsLua project's raw binding layer; its higher-level `hslua-core`
+layer was evaluated and not selected. Binding selection is complete. Q-3 records
+the supported FFI, callback, cancellation and close contracts. A need for a different
+execution or trust model returns to design; it is not an incidental solver choice.
 
 ### P-2. Two owners and coherent application boundaries
 
 ```mermaid
 flowchart LR
-    Main[Main thread: platform input and renderer] --> Broker[Parent capability broker]
+    Main[Main thread: platform input and windows] --> Broker[Parent capability broker]
     Broker -->|bounded validated IPC| UI[UI mod process and Lua VM]
     UI -->|presentation proposal| Broker
     UI -->|intentions| Broker
@@ -343,7 +356,15 @@ flowchart LR
     Game -->|untrusted result proposal| Broker
     Broker -->|validated completed snapshot| UI
     Broker -->|validated completed snapshot| Main
+    Broker -->|validated presentation snapshot| Graphics[Supervised graphics owner]
 ```
+
+Graphics consumes application-published presentation data on its separate owner;
+the GLFW process main thread owns platform events and windows. This does not
+make rendering a dependency of the headless Lua milestone: fake capability and
+presentation consumers establish the same boundary there. Simulation and the
+commit policy remain application-owned. This follows the accepted
+[V-5 ownership boundary](vision.md#v-5-bounded-communication-and-responsive-ownership).
 
 This illustrates one mod's two roles; repeat the child boundaries per admitted
 mod/domain. All cross-mod communication is brokered by the parent. A child
@@ -860,7 +881,7 @@ GLFW scheduling, or a completed game loop artificial prerequisites.
 
 ### Q-5. Verified platform confinement and resource-enforcement profile
 
-**Current result, 2026-09-19:** both preliminary proofs are merged and
+**Result reconciled 2026-09-23:** both preliminary proofs are merged and
 `inconclusive`; no production deployment profile is selected.
 
 - [Linux verdict](lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
@@ -874,9 +895,11 @@ GLFW scheduling, or a completed game loop artificial prerequisites.
   the candidate uses unsupported confinement and memory-limit interfaces.
   Its named residual limits and missing Lua-side network-denial evidence
   remain part of the result. The [#176 review](project_review/176.md) also
-  identifies an optimization defect in the intended native-buffer growth; that
-  experiment needs repair and refreshed evidence. The owner has not accepted
-  this as the supported deployment baseline.
+  identified an optimization defect in the intended native-buffer growth.
+  #228/PR #243 repaired it and refreshed the retained evidence on 2026-09-22;
+  the corrected workload checks distinct native buffers after a major
+  collection. That repair does not establish a supported deployment baseline,
+  which the owner has not selected.
 
 Return the concrete deployment obstacles to the owner under D-11. Further
 mechanism experiments may preserve the existing requirements; any material
@@ -992,6 +1015,15 @@ Resolved by D-9: explicitly granted engine capabilities only, no direct
 filesystem/network/process/native-module access, and terminate the offending
 mod process on enforced execution or memory limit violations. Q-5 chooses the
 verified mechanisms; P-13 distinguishes child termination from parent cleanup.
+
+### Q-8. Reconciling the trusted in-process path
+
+Open after D-12. P-2 draws both domains as mod processes and does not yet show
+first-party domains. Still to decide: whether D-12 lets the in-process slices
+(LUA-2, LUA-3, LUA-5 through LUA-8) resume before Q-5's confinement gate while
+LUA-9 through LUA-13 stay paused; and which binding kinds the confined path
+exposes over IPC. D-6 already settles that a mod never shares a first-party
+in-process VM. Stop and ask the owner; do not resolve these during processing.
 
 ## Verification strategy
 
@@ -1114,11 +1146,10 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-2. Own the VM through a protected IO lifetime
 
-> Deferred on 2026-09-17: this slice's own gate says Q-3 must be resolved
-> before processing it, and Q-3 is delivered by #146's implementation. Draft
-> once #146 has merged and its package contract records the selected binding,
-> safe FFI paths, cancellation-delivery points, and close/finalizer behavior.
-> LUA-4 is labeled independent of LUA-2/LUA-3 and may be processed meanwhile.
+> The former Q-3/#146 prerequisite is satisfied. Reuse the selected binding's
+> package contract rather than repeating its proof. The document-wide D-11
+> pause still applies: resolve Q-5 and renew readiness before processing this
+> slice. LUA-4 has already been processed and implemented independently.
 
 - **Outcome:** one owner constructs, uses, and closes a VM while preserving
   primary/cleanup evidence and callback dependencies on every supported exit.
@@ -1127,13 +1158,13 @@ and verified policy, with adversarial regression coverage.
   proven necessary in foundation. Include its contract and focused tests.
 - **Phase:** host ownership.
 - **Depends on:** LUA-1.
-- **Ordering:** critical path; can run alongside LUA-4.
+- **Ordering:** critical path after readiness resumes; the independent LUA-4 model is already delivered.
 - **Relevant decisions:** D-1, D-2, D-4.
 - **Acceptance signals:** failure/cancellation matrix including close callbacks;
   no ordinary uninterruptible Lua release; no leaked/public native handles;
   cleanup evidence still classifiable by runtime.
 - **Out of scope:** module namespaces, worker adapter, scheduler, hard deadlines.
-- **Open questions:** Q-3 must be resolved before processing this slice.
+- **Open questions:** Q-3 is resolved; Q-5 and renewed document readiness remain the processing gate.
 
 ### LUA-3. Add application-owned modules and bounded value bindings
 
@@ -1387,8 +1418,9 @@ boundaries has restrictions. Protected calls report errors rather than rolling
 back mutations. These facts motivate the proposed ownership and failure rules;
 recheck them against LUA-1's selected version.
 
-The [GHC 9.12.2 FFI guide](https://downloads.haskell.org/ghc/9.12.2/docs/users_guide/exts/ffi.html#multi-threading-and-the-ffi)
-describes threaded-RTS concurrency, safe versus unsafe foreign calls, callback
+The [qualified GHC toolchain](toolchain.md) and its
+[FFI guide](https://downloads.haskell.org/ghc/9.14.1/docs/users_guide/exts/ffi.html#multi-threading-and-the-ffi)
+describe threaded-RTS concurrency, safe versus unsafe foreign calls, callback
 behavior, and bound-thread affinity. Long unsafe calls can impede progress and
 garbage collection. The bridge audit must inspect actual dependency imports;
 adding threads in Haskell does not repair an unsuitable foreign-call boundary.

@@ -153,8 +153,12 @@ Block only in `awaitSupervised`. It supervises framework-owned STM reads and
 nothing else: a foreign call, an ordinary `takeMVar`, a blocking read, or any
 other user `IO` is not interrupted, and a worker failure during one is handled
 at the next checkpoint. No failure-notification exception is injected into the
-application thread. A future GLFW event wait must supply its own wake and check
-integration.
+application thread. The GLFW owner loops provide their own
+[event-wait integration](glfw.md#idle-waits): checkpoints around native event
+processing, configured finite waits, and explicit wake for admitted commands
+and published demand. This does not make an arbitrary native call interruptible
+or guarantee immediate observation of a worker failure; a platform modal loop
+can delay the next checkpoint.
 
 Handling an outcome follows STM's rules. Pending outcomes are selected in STM
 without being marked, classified outside STM, then committed — status set,

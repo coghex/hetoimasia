@@ -251,8 +251,10 @@ The historical pre-GLFW inventory is superseded by implemented contracts:
 application composition, component state, worker ownership and failure evidence
 are delivered; do not rebuild Synarchy's combined Reader/State EngineEnv.
 
-This arc refines FND-2/FND-3 of the older [foundation design](engine_foundation_design.md).
-D-1 supersedes that document's early offscreen-first sequence. TEST-2/#93 and
+This arc refines the Vulkan prerequisites of the original FND-2/FND-3 plan.
+The [foundation overview](engine_foundation_design.md) now records ownership;
+the remaining 3D/2D consumers live in the [renderer report](renderer_foundation_findings.md).
+D-1 supersedes the archived plan's early offscreen-first sequence. TEST-2/#93 and
 its repair #118 delivered the GLFW-only shared fixture; actual GPU completion
 and GPU fixtures belong here. Prior reviews and Git history retain the original
 bootstrap inventories; they are not current prerequisite lists.

@@ -15,7 +15,9 @@ Inspected master `07b982a` and PR #235 at `b3d227b544674764130e683e9756664efd31a
 including provisioning, package bounds, patch handling, Hspec coverage and
 native-session checks. The owner reports the backport works; this report adds
 no new native qualification or PR approval. Release information was checked on
-2026-09-20. Tracker deduplication and disposition remain for `process-report`.
+2026-09-20. Rechecked on 2026-09-22 at `master@da81087`: PR #235 is merged,
+the backport remains in the native recipe, and upstream still lists 3.5.1.
+Tracker deduplication and disposition remain for `process-report`.
 
 ## Status
 
@@ -73,7 +75,12 @@ Sources: [GLFW downloads](https://www.glfw.org/download.html) and
   platform dependencies. Rebuild the private prefixes and cached public Linux
   image; commit the verified descriptor. Old patched archives, linked products
   and test receipts must not qualify the new configuration. Preserve current
-  provisioning changes, including any Vulkan inputs added meanwhile.
+  provisioning changes, including any Vulkan inputs added meanwhile. Coordinate
+  the recipe/image changes with [#208](https://github.com/coghex/hetoimasia/issues/208)
+  and retain the evidence identity needed by
+  [Wayland #207](https://github.com/coghex/hetoimasia/issues/207);
+  these are shared-input coordination concerns, not a
+  requirement to finish the entire Vulkan or Wayland arcs before upgrading.
 - **Qualification:** Run affected headless Hspec/workflow groups and real Linux
   X11 and isolated Wayland checks, including no-seat session entry and helper
   behavior. Run relevant Cocoa checks locally with explicit human approval

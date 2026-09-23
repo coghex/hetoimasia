@@ -6,13 +6,23 @@
 No signing identity, no keychain access, no entitlement, no bundle, no
 privileged installation, and no interactive consent at any point.**
 
-Every proof row the epic's matrix asks for was demonstrated on this host, by the
-probe in `packages/scripting-lua/macos/` and its Hspec target
-`hetoimasia-scripting-lua:macos-confinement-probe`. The verdict is not
-`supported` anyway, and the reason is one sentence: **the only arrangement that
-satisfies all of the rows is built on two interfaces Apple does not support** —
-one the active SDK marks "No longer supported", one absent from the public SDK
-altogether — and Q-5 asks for a *supported, verified* profile, not a working one.
+The probe in `packages/scripting-lua/macos/`, run through
+`hetoimasia-scripting-lua:macos-confinement-probe`, retained evidence for the
+rows below, with a named gap: no Lua-side network attempt. The candidate also
+depends on **two unsupported interfaces** — one the active SDK marks "No longer
+supported", one absent from the public SDK altogether. Q-5 requires a supported,
+verified profile; accepting those interfaces alone would not close the network
+evidence gap.
+
+**Evidence reconciliation, 2026-09-23:** [review #176](project_review/176.md)
+established that optimization shared the original native buffer and removed
+its unused retention accumulator. Its workload counter did not prove mixed
+Lua/native growth. [#228](https://github.com/coghex/hetoimasia/issues/228), merged
+in [PR #243](https://github.com/coghex/hetoimasia/pull/243), repaired that defect
+and refreshed the evidence below on 2026-09-22 at `8ad2755`. The corrected run
+checks distinct materialized native buffers after a major collection. It
+supersedes the original memory-workload evidence; this reconciliation runs no
+new experiment and leaves the verdict `inconclusive`.
 
 That is a decision for the owner, not for this slice. Section
 [What the owner has to decide](#what-the-owner-has-to-decide) states it.
@@ -38,7 +48,8 @@ Run it, on macOS:
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
 ```
 
-Each of the 24 examples prints what it proved.
+The retained run's 24 examples print their observations. A passing suite does
+not close the remaining qualification gaps above.
 
 ### The retained receipt
 
@@ -175,7 +186,8 @@ What is there instead: the native attempt is repeated after the load, under its
 own `native-post-load` origin, so the evidence says a confined process with
 untrusted source resident still cannot open a connection. That is weaker than
 what the requirement asks for, and it is recorded as weaker. It does not change
-the verdict, which is `inconclusive` for an unrelated reason.
+the verdict: the unsupported interfaces independently prevent a supported
+profile, even with the memory-workload repair above.
 
 ### Inherited descriptors, and why the path rules were not the whole answer
 
@@ -343,7 +355,7 @@ the manual investigation, recorded here rather than re-created on each run.
 | Entitlements | none |
 | Privilege | none. No `sudo`, no keychain, no system-settings change, no interactive prompt. |
 | Bundle | none |
-| A distributed build would additionally need | nothing for the profile that passes — which is exactly the problem: it needs no signing arrangement because it uses no supported one. The App Sandbox alternative would need a Developer ID, notarization, and a per-instance container strategy this slice found no acceptable form of. |
+| A distributed build would additionally need | No additional signing arrangement was needed by the observed unsupported-SPI profile; this does not close its qualification gaps. The App Sandbox alternative would need a Developer ID, notarization, and a per-instance container strategy this slice found no acceptable form of. |
 | Missing prerequisites | produce a typed refusal (`confinement-unavailable`, exit 70) and no launch. |
 
 No step of the ordinary run needs a signing identity, keychain access, a
@@ -367,15 +379,17 @@ Q-5's macOS row cannot be closed by this slice. The choice is between:
 3. **Drop macOS from the untrusted-mod platform targets** for this arc, and ship
    the process branch where a supported confinement exists.
 
-Nothing in this document chooses. Under D-11 the design returns to `exploring`
-until one of these is decided, and LUA-9 through LUA-13 stay undrafted.
+Nothing in this document chooses. Under D-11 the design remains `exploring`,
+and LUA-9 through LUA-13 stay undrafted. A deployment decision must be followed
+by the evidence and renewed readiness Q-5 requires; accepting the unsupported
+interfaces alone does not settle the missing network experiment. #228's
+memory-workload repair does not select a supported deployment profile.
 
 ## Related
 
 - [`docs/lua_runtime_design.md`](lua_runtime_design.md): LUA-15, Q-5 and its
-  2026-09-16 follow-up, P-13, D-6, D-8, D-9, D-10, D-11. Recording this
-  verdict's reference in that document is the documentation lane's work after
-  this pull request merges, before LUA-9 is drafted.
+  2026-09-16 follow-up, P-13, D-6, D-8, D-9, D-10, D-11. The design references
+  both inconclusive verdicts and records the current gate on further processing.
 - [`docs/validation.md`](validation.md#the-macos-confinement-probe): the
   optional `test.macos-confinement` group, why Linux never selects it, and the
   local run that produces its `Darwin` receipt.

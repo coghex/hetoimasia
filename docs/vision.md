@@ -47,6 +47,12 @@ Short CPU releases must not hide arbitrary driver, worker or logging waits
 under uninterruptible masking. Workers drain before borrowed dependencies
 disappear; sending cancellation is not proof of termination. If safe release
 cannot be established, retain resources and wait under the protected lifetime.
+That wait is in-process. Owner decision 2026-09-22: the application may bound
+quit with its own watchdog. After an application-chosen deadline, it names the
+owner or worker still running, makes a bounded best-effort log flush, and ends
+the process without unwinding, leaving reclamation to the OS. It never releases
+a resource that a live worker may still borrow. Engine packages gain no
+deadline, detach or forced-release path.
 
 Dynamic windows have independent lifetimes. One exclusive graphics attachment
 holds each window alive until retirement is acknowledged. Closing the first
@@ -147,6 +153,11 @@ explicit capability grants and enforced memory/execution limits. They receive
 no ambient filesystem, network, process-launching or native-module authority.
 Unsafe authoritative-state failure stops the affected gameplay session while
 UI remains available to report it.
+
+The game's own first-party scripts are trusted and run in-process in those
+domains, calling bindings directly without IPC (owner decision 2026-09-22,
+Lua D-12). Mods keep the confined pipeline. Both share one module and
+capability registration layer, and the trusted path is never a mod fallback.
 
 Cooperative scheduling is not hostile-code containment. A merged probe with an
 inconclusive verdict does not qualify deployment or release its dependent gates.

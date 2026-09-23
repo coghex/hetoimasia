@@ -1,11 +1,12 @@
 # Native Wayland qualification design
 
-The GLFW session runs on Cocoa and on X11, and that is the whole of what the
-repository can claim today: the Linux recipe builds GLFW with Wayland off, the
-seam never selects Wayland, and the session model refuses it at entry so no
-XWayland run is ever presented as Wayland. This arc plans real native Wayland
-support and the evidence that would establish it, in the order the owner
-approved on 2026-09-20 through [RR-7](runtime_review_findings.md): provision
+At the 2026-09-22 review baseline (`master@da81087`), WL-1/#204 and
+WL-2/#205 are delivered: the Linux recipe includes Wayland and the session
+admits an explicit Wayland request while retaining X11 as its default. Full
+native qualification and connection-loss evidence remain open in WL-3/#207;
+selection support alone does not establish that profile. This arc supplies
+native Wayland support and the evidence that establishes it, in the order
+the owner approved on 2026-09-20 through [RR-7](runtime_review_findings.md): provision
 the inputs, settle the selection and capability contract, collect headless
 native evidence, then rendering evidence once the Vulkan slices that create
 surfaces exist. Windows execution is recorded as deferred on a machine being
@@ -59,7 +60,10 @@ concrete precondition
 
 ## Current state and evidence
 
-Checked at `master@af4436d` unless a line says otherwise.
+Historical inspection at `master@af4436d` unless a line says otherwise. These
+pre-implementation observations explain the design; the opening status and
+linked issues record subsequent delivery. In particular, the recipe, selection
+and model observations below no longer describe current master.
 
 - **Recipe.** `tools/native/native.py:205-208` configures Linux with
   `GLFW_BUILD_WAYLAND=OFF` and `GLFW_BUILD_X11=ON`, and refuses any target
@@ -252,11 +256,16 @@ the compositor and version, the selected backend, and for rendering the loader,
 driver and layer identities.
 
 **Failure handling.** Entry fails as `UnsupportedBackend` when the backend is
-not compiled in, as `DisplayUnavailable` when no display or socket for the
-selected backend is reachable, or as a native failure attributed to
-session entry when GLFW's own initialization fails on a reachable display,
-each with its reason named. Omitting the request selects X11 under D-8; it
-does not itself produce `UnsupportedBackend`. Compositor disappearance cannot
+not compiled in. A failed `glfwInit`, including an unreachable display or
+socket, produces `NativeFailure` attributed to initialization, retaining
+GLFW's diagnostic code and description. Those diagnostics distinguish an
+unreachable display from another initialization failure; on Wayland the
+description matters because both can carry the same platform-error code.
+`DisplayUnavailable` belongs to the native-test fixture's environment and
+backend checks, not production session entry. This is the delivered contract
+of #205, documented in the session model and its headless examples. Omitting
+the request selects X11 under D-8; it does not itself produce
+`UnsupportedBackend`. Compositor disappearance cannot
 be assumed to produce an ordinary native failure: GLFW 3.4 has a disconnect
 path that generates a close request for every window and reports no error,
 and because an application may reject ordinary close requests, that behaviour
@@ -604,9 +613,12 @@ example at the cost of compositor automation.
 ### WL-4. Collect Wayland rendering evidence on the pinned software stack
 
 > **Deferred:** the slice adds Wayland cases to VK-8's native fixtures through
-> VK-5's surface bridge, and neither is filed yet under #155 — clears when the
-> issues filed for VK-5 and VK-8 have merged, at which point the fixture and
-> bridge shapes this issue must name exist.
+> VK-5's surface bridge. Both are filed under #155 as
+> [#220](https://github.com/coghex/hetoimasia/issues/220) (VK-8) and
+> [#216](https://github.com/coghex/hetoimasia/issues/216) (VK-5), and remain open
+> at the 2026-09-22 review. This deferral clears when
+> both have merged, so the fixture and bridge shapes this issue must name
+> exist. WL-3/#207 also remains an implementation prerequisite.
 
 - **Outcome:** Wayland surface creation, presentation and retirement are
   demonstrated on Lavapipe under the isolated compositor with the same

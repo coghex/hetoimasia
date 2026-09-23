@@ -8,8 +8,9 @@ directly in `fddcac5` and is not repeated here.
 Owner-approved follow-up on 2026-09-20 corrects the premises and records the
 delivery direction below, checked against `af4436d` unless an entry names its
 earlier baseline. The test results in Methodology belong to the original review;
-these documentation amendments did not rerun them. Entries remain unprocessed:
-the processor should verify current tracker coverage before applying a
+these documentation amendments did not rerun them. The ledger below records
+subsequent dispositions; historical findings do not describe every capability
+now delivered. Verify current tracker coverage before changing a remaining
 disposition, drafting an issue or proposing an amendment to an existing slice.
 
 Status legend: `[ ]` unprocessed · `[#N]` filed as issue N · `[no-issue]`
@@ -435,7 +436,7 @@ additional worker mode until such a consumer is demonstrated.
 **Handoff context:**
 
 - **Current behavior:** unbound workers only; the GLFW owner is the process main thread and is not a worker.
-- **Expected disposition:** defer implementation, with the checkable precondition that a selected native service has a documented or reproduced OS-thread-affinity requirement that existing composition cannot satisfy. Name that service, its API/thread contract and the evidence before reopening the design. The processor applies the actual deferred marker; it has not been applied by this amendment.
+- **Expected disposition:** defer implementation, with the checkable precondition that a selected native service has a documented or reproduced OS-thread-affinity requirement that existing composition cannot satisfy. Name that service, its API/thread contract and the evidence before reopening the design. The deferred marker is already applied; retain it until that precondition is met.
 - **Scope and constraints:** do not prebuild a generic `forkOS` option or assume an audio callback automatically requires one. If the precondition is met, design the specific construction/use/teardown affinity and prove startup, cancellation, supervision and drain behavior. A bound worker is still not GLFW's required process main thread.
 - **Remaining uncertainty:** the identity and requirements of a concrete consumer. Current Vulkan work is not gated on adding this worker mode.
 

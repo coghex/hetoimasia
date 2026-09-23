@@ -27,15 +27,19 @@ concrete precondition
 - [x] CI-2. Run selected validation through stable, parallel GitHub checks — [#11]
 - [x] CI-3. Preserve valid CI evidence across documentation changes — [#12]
 - [x] CI-4. Carry review approval through clean base merges independently of CI — [#13]
-- [ ] CI-5. Integrate `test` and `autotest` with the shared testing contract — [deferred]: the owner explicitly requests `test`/`autotest` integration
+- [ ] CI-5. Integrate `test` and `autotest` with the shared testing contract — [deferred]: remaining receipt/scheduler scope needs owner direction; local lab integration is delivered
 
 CI-1 through CI-4 are implemented and epic #8 is closed. Their delivery
 boundaries remain below as design history, not an unfiled work queue. Current
 behavior, including GLFW's later native/display worker and image caching, is in
 [validation.md](validation.md) rather than here, because this document records
 the design rather than the shipped system.
-CI-5 resumes when the owner requests skill integration; inspect the skills'
-actual interfaces then before choosing adapter or scheduler changes.
+**Reconciled 2026-09-23:** PR #242 delivered the [local test/flake lab](../tools/flake/README.md),
+including Codex `test`/`autotest` integration, shared selection, claims and durable
+local evidence. This does not complete CI-5's broader receipt/scheduler scope
+or make local lab results reusable CI receipts. The remaining scope stays
+deferred pending owner direction. The original D-6/P-5 proposal below records
+the initial design; the lab's own contract describes its delivered behavior.
 
 ## Epic contract
 
@@ -221,8 +225,16 @@ request must refresh the plan even without a code commit, and a late run for an
 older plan must not satisfy the new one. Requests for optional groups must say
 whether the declared runner executes them in CI or requires local evidence;
 requesting a GPU-only group must not silently produce a skipped success on a
-CPU runner. An explicit all-Hspec request stays available, including optional
-Hspec groups because that broader coverage was explicitly requested.
+CPU runner. The planner's `all-hspec` request includes optional Hspec groups.
+With the current catalog and Linux-only CI workers, a PR request must name
+neither `all-hspec` nor `test.macos-confinement`: the expansion selects the
+local-only Darwin probe, which has no CI worker, so the plan is refused.
+PR requests must name groups supported by the current CI workers. Request the
+macOS confinement probe separately through the local request-file workflow in
+[validation.md](validation.md#the-macos-confinement-probe); its receipt remains
+local evidence. All local-only probes listed in
+[validation.md](validation.md) stay outside PR requests;
+testing skills must preserve that distinction.
 
 ### P-2. Keep commit identity, execution identity, and review identity distinct
 
@@ -366,6 +378,10 @@ parallelism and failure controls, but CI wall time is the metric to optimize.
 
 ### P-5. Keep a small contract for deferred `test` and `autotest` integration
 
+The following is the original proposal. PR #242's local lab now implements
+part of it; the reconciliation above and the lab contract distinguish shipped
+selection/history from remaining CI-receipt and scheduler work.
+
 The immediate design supplies stable catalog IDs, reproducible local commands,
 and attributable result fields shared with CI. `test` and `autotest` are the
 named future consumers. Their integration is deferred by D-6: do not port their
@@ -394,6 +410,15 @@ input staleness separately rather than silently changing oldest-first order.
 Historical results remain history when their inputs change; they do not become
 current passes. A user can explicitly request an affected or failing group
 ahead of the rotation.
+
+Eligibility must also honor the existing [repository rule](../AGENTS.md#files-launches-and-documentation)
+and [native-session consent contract](glfw.md#the-native-suite).
+A request for periodic testing is not approval for a later desktop session:
+obtain explicit human consent for that session before any disruptive launch,
+or record it as not run. Never set desktop consent automatically. The approved
+isolated Linux display helpers need no desktop permission. Consume the current
+catalog's optional/request restrictions; rotation does not make optional local
+confinement experiments valid PR request groups or prove their verdicts.
 
 Deferred integration must coordinate test identity as well as scarce machine
 resources across worktrees and concurrent skill invocations. Retain completed
@@ -578,12 +603,15 @@ bounded choices were resolved by the affected implementation issues.
 
 ### CI-5. Integrate `test` and `autotest` with the shared testing contract
 
-> **Deferred:** resume only when the owner requests `test`/`autotest` integration.
+> **Partly delivered; remaining scope deferred:** PR #242 supplies local lab
+> integration, shared selection, claims and evidence. Reconcile the remaining
+> receipt/scheduler requirements with that implementation when the owner asks
+> to resume; do not draft a replacement for the delivered lab.
 
 - **Scope and acceptance:** inspect the actual skill interfaces before choosing
   adapters or scheduler changes. Integrate the catalog, commands and result
   contract while preserving oldest-first testing, optional rotation, claims,
-  resource limits and durable history.
+  resource limits, per-session desktop consent and durable history.
 - **Depends on:** CI-1; align results with CI-3 before enabling local evidence reuse.
 
 CI-3 and CI-4 were independent after CI-2. CI-5 does not block the completed CI

@@ -11,10 +11,15 @@ Across 20 s of continuous title-bar dragging the loop took 2128 turns and
 offered 2128 update opportunities, and its longest stretch without one was
 101.1 ms — the configured idle wait.
 
-**This verdict chooses nothing.** [What the owner has to
-decide](#what-the-owner-has-to-decide) states the three candidate policies RR-4
-names and what the measurement says about each. Choosing one is a reviewed
-design decision before VK-16.
+**Decision outcome, reconciled 2026-09-22:** on 2026-09-20 the owner selected
+one supervised graphics owner under
+[Vulkan D-29–D-33](vulkan_backend_design.md#d-29-render-from-one-supervised-graphics-owner-keep-glfw-on-the-main-thread),
+with GLFW and its record-only callbacks remaining on the process main thread.
+#218 has since delivered the [reusable owner machinery](glfw.md#the-supervised-graphics-owner).
+Its injected backend operations and headless tests establish no native
+rendering result; VK-16 still owes rendering-progress evidence during Cocoa
+modal interactions. The [original alternatives](#what-the-owner-has-to-decide)
+below preserve the decision's context, and the measurements remain unchanged.
 
 This is a Cocoa result. No Linux or X11 run substitutes for it, and none was
 used here.
@@ -207,9 +212,10 @@ nothing.
   entered. **The probe ran no simulation**, so this is read off the structure,
   not observed. Simulation on another application thread is outside what the
   probe measured.
-- that **future owner-driven rendering** stops. VK-16 currently specifies
-  rendering on the owner loop. **No renderer exists**, so this is a statement
-  about that design, not a measured rendering defect.
+- that **rendering driven by the GLFW owner loop** would stop with it. That
+  was VK-16's design at the measurement baseline, not an observed rendering
+  defect: the probe contained no renderer. D-29–D-33 subsequently selected a
+  separate graphics owner, whose native progress still needs evidence.
 - that a **shorter idle wait would not help**. The blocked call asked for 100 ms
   and returned after 68 918 ms, so the bound is not what holds it; this follows
   from the measurement but was not tested by varying the bound.
@@ -251,10 +257,11 @@ never performed. No claim in this verdict rests on that session alone.
 
 ## What the owner has to decide
 
-RR-4 names three candidate policies. The measurement above says something about
-each. **This document selects none, and nothing here has been implemented.**
-Record-only callbacks and main-thread ownership are unchanged, no rendering runs
-inside a callback, and no render-worker design is introduced.
+This section retains the alternatives presented after RR-4's measurement,
+before the owner selected D-29–D-33. It is historical decision context; the
+outcome and implementation boundary are recorded above. The probe itself
+implemented no renderer or rendering worker, and its callbacks only recorded
+observations.
 
 ### 1. Temporary acceptance of the stall
 

@@ -102,7 +102,8 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
   whose requested final review marked them ready on 2026-09-16. Actual Vulkan surface/completion and
   platform choices remain exploring in the backend design. The native-test
   opt-in follow-up is approved and filed as #124; its approved body is retained
-  in `docs/native_test_approval_issue_draft.md`. CI-5 (`test`/`autotest` integration)
+  in [the archived approved draft](native_test_approval_issue_draft.md)
+  (originally `docs/native_test_approval_issue_draft.md`). CI-5 (`test`/`autotest` integration)
   remains owner-deferred; completed runtime/messaging arcs need no replacement.
 - Lua, fonts, rendering, and game adapters remain planned. Remote CI stays
   Linux-only; macOS native evidence is local. Dated entries below are history.

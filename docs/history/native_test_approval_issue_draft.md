@@ -3,7 +3,8 @@
 Approved and filed as [#124](https://github.com/coghex/hetoimasia/issues/124).
 Implemented in PR #128 and closed. Labels: `tests`, `glfw`. The body below is
 the historical approved draft, not a current defect or a new filing candidate.
-The implemented contract is in [glfw.md](glfw.md#the-native-suite).
+Archived on 2026-09-22 from `docs/native_test_approval_issue_draft.md`.
+The implemented contract is in [glfw.md](../glfw.md#the-native-suite).
 
 ## Background
 

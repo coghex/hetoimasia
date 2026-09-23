@@ -1,14 +1,14 @@
-# Project review sweep cursor
+# Legacy project-review cursor — retained migration evidence
 
-Machine-owned state for the `project-review` workflow: each repository's
-exclusive older PR boundary, the units completed batches reviewed, the direct
-history endpoint, and the units a user explicitly excluded. PR selection always
-starts at the latest merge and stops before its boundary; a clean batch records
-reviewed coverage exactly as a finding-bearing batch does.
+Current project-review state lives in the [review ledger](project_review/ledger.md),
+maintained by `project_review_ledger.py`. That ledger owns current selection,
+completed reviews, and direct-history progress.
 
-Written by `project_review_cursor.py`. Edit it through that helper rather than
-by hand: the payload below is parsed strictly, and an edit it cannot read stops
-the next sweep instead of being ignored.
+This cursor was written by the former `project_review_cursor.py`, which no
+longer ships with the installed workflow. The ledger helper retains a reader
+for its migration data and does not write this file. Keep the original path,
+marker, and payload as provenance for the ledger's imported coverage; do not
+use it as the current review queue or update its recorded state by hand.
 
 <!-- project-review:cursor:v2 -->
 

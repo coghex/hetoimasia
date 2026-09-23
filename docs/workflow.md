@@ -31,8 +31,9 @@ never makes them green. [validation.md](validation.md) documents the rule.
 The issue-approval service and PR drainer were installed for this repository
 on the owner's machine on 2026-09-10. That installation record does not establish
 their current running state; inspect the board or installed controllers when
-operating the pipeline. GLFW PRs #101–#114 are merged; repair issues #115–#118
-remain open after the completion review.
+operating the pipeline. GLFW PRs #101–#114 are merged; completion-review
+repairs #115–#118 also merged through PRs #119–#122. Current follow-ups belong
+in their reports and the tracker, not this historical bootstrap inventory.
 Installed plugins being available in a conversation does not establish readiness
 of a future CLI session or repository service.
 
@@ -135,7 +136,8 @@ approved ledger changes can accumulate in `docs-wip` for a requested batch landi
 
 Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-foundation:foundation-tests`, `hetoimasia-runtime:runtime-tests`,
-`hetoimasia-glfw:glfw-tests`, and `hetoimasia-tests` Hspec suites for
+`hetoimasia-glfw:glfw-tests`, `hetoimasia-scripting-lua:lua-host-tests`,
+`hetoimasia-gpu-vulkan-model:gpu-model-tests`, and `hetoimasia-tests` Hspec suites for
 the current bootstrap. Prefer Hspec for future integration and
 resource tests too; use Python probes only where Hspec cannot reasonably exercise
 the boundary. Run `cabal check` in the root and each active

@@ -2,12 +2,18 @@
 
 Buildable package: `hetoimasia-runtime`.
 
-Invokes a caller-supplied application action and reports startup/success through
-an injected logger. Exceptions propagate. There are no windows, GPU resources,
-worker threads, game managers, or global environment in this initial component.
+Composes application lifetimes, reporting, supervised workers, inbox services,
+logging lifetimes, and pure update policy over the foundation's public
+services. The optional asynchronous logger owns a writer through a foundation
+worker group. Callers inject narrow services; window and GPU ownership live in
+their own components, and this package defines no game managers or global
+environment.
 
-`Hetoimasia.Runtime.Resources` is this package's second entry point.
-`resourceSmoke` is the owned-resource demonstration: it acquires a workspace and
+The small `Hetoimasia.Runtime` entry point invokes a caller-supplied action and
+reports startup/success through an injected logger. Exceptions propagate.
+
+`Hetoimasia.Runtime.Resources.resourceSmoke` is the owned-resource
+demonstration: it acquires a workspace and
 a composite channel through the foundation's resource scopes, runs injected
 bounded work with them, releases everything, and reports the lifecycle through
 an injected logger. Its work, its cleanup outcomes, and its logger are all

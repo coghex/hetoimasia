@@ -23,13 +23,22 @@ now processed; implementation remains tracked in #201, #208, #211 and #212,
 and qualification gates remain in force. The [next guide review](docs/guide/2026-09-20T201612Z-8b2fcfd-ff7e.md)
 extends coverage through `8b2fcfd` (PR #210). Its two findings are now processed:
 graphics-owner design under #155 and the wording repair #224. The
-[latest guide review](docs/guide/2026-09-21T035017Z-9f72b04-768f.md) extends coverage
+[third guide review](docs/guide/2026-09-21T035017Z-9f72b04-768f.md) extends coverage
 through `9f72b04` (PRs #213/#214), checks the newly approved Vulkan and repair
 issues, and records the owner-approved amendments now posted to #216/#220, with
-coordination on #229/#221. GUIDE-3 remains unprocessed: the reproduced X11 helper
-diagnostic flake needs a repair issue. Posting the amendments does not claim
+coordination on #229/#221. GUIDE-3 is filed as #234, so all three findings have
+tracker destinations. Posting the amendments does not claim
 their implementations are complete or replace canonical readiness review.
 `$guide continue` handles one follow-up at a time without repeating old audits.
+
+The [latest guide review](docs/guide/2026-09-21T140419Z-25a37d2.md) extends completed
+coverage through `25a37d2`, including #235's Wayland/backport work and #236's X11
+repair. Its 170 selected existing examples pass; two new probes on each Bash
+reproduce missed high-status/signal termination in the X11 observer. GUIDE-1
+is filed as #237; all findings in this report are processed. The
+next full audit starts after `25a37d2`. The earlier pending #235 handoff is now
+covered. GLFW-UP-1 remains in its existing upgrade report, and native Wayland,
+Vulkan and Lua qualification gates remain unchanged.
 
 ## Direction and owner preferences
 
@@ -44,6 +53,16 @@ their implementations are complete or replace canonical readiness review.
   GLFW stays on the process main thread; accepted Vulkan D-29–D-33 place rendering
   on a separate supervised graphics owner with protected retirement and bounded
   handoffs. Native evidence must still establish progress during Cocoa modal loops.
+- Owner decisions 2026-09-22 (Ecce Homo rewrite review):
+  - First-party game scripts are trusted and run in-process in the UI and
+    gameplay VM owners with direct bindings. Mods keep the confined-process
+    pipeline, and both share one registration layer
+    ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process)).
+    Q-8 is open: whether in-process slices can resume before Q-5.
+  - Quit may be bounded by an application-level watchdog. It names the stuck
+    owner, makes a bounded best-effort flush, and exits the process without
+    unwinding. Foundation keeps its no-deadline drain
+    ([V-3](docs/vision.md#v-3-ownership-and-completion-are-correctness-boundaries)).
 - Preserve Synarchy's useful behavior and rationale deliberately: inspect its
   windowing, monotonic time, Vulkan ownership, Lua and rendering code before
   replacing concepts. Do not copy its central environment or game managers.
@@ -85,8 +104,8 @@ their implementations are complete or replace canonical readiness review.
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
 - Test-support extraction #125/#132, foundation migration #127/#137, and
   runtime migration #129/#150, and GLFW headless migration #130/#151 are
-  complete. All children of epic #49 are merged; its checklist still needs
-  reconciliation.
+  complete. All children of epic #49 are merged, and #49 closed on
+  2026-09-20.
 - Audit at `8e4eb6e`: the latest twelve merged PRs (#150–#165, exact list in
   [the report](docs/project_review_165-150.md)) cover every merge since the
   previous review through #137. Build and 1,289 existing Hspec examples passed;
@@ -288,14 +307,15 @@ their implementations are complete or replace canonical readiness review.
   explicit capabilities, and enforced whole-process resource/execution limits.
   Epic #145's children #146–#149 are merged: the binding uses #157's qualified
   toolchain, both platform proofs have retained verdicts, and the pure protocol
-  model exists. The [#179 review](docs/project_review/179.md) records
-  failure-settlement and bounded failure-detail defects; the
-  [#173 review](docs/project_review/173.md) records stale binding comments.
-  Repair them before dependent integration relies on those contracts. #148
+  model exists. The [#179 review](docs/project_review/179.md) recorded
+  failure-settlement and bounded failure-detail defects, repaired by #193/#194.
+  The [#173 review](docs/project_review/173.md) recorded stale binding comments,
+  corrected in PR #241. These repairs do not clear the confinement gate. #148
   added bounded OS-conditional `buildable`
   parser support, reused by #147; conservative source hashing is intentional,
-  but [the #177 review](docs/project_review/177.md) records the separate defect
-  in routing a mandatory Linux-only group on Darwin.
+  but [the #177 review](docs/project_review/177.md) records the separate platform
+  eligibility defect repaired by #191. Both confinement probes are now optional
+  and local-only under the current test policy.
   Both confinement verdicts remain inconclusive. LUA-9 through LUA-13 and
   dependent integration slices stay blocked until the owner resolves the
   deployment constraints and both required profiles have successful evidence.
@@ -330,13 +350,18 @@ their implementations are complete or replace canonical readiness review.
   row is the owner's: accept the unsupported-SPI profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
   untrusted-mod targets. Until then the design stays `exploring` and LUA-9
   through LUA-13 stay undrafted, whatever #147 concludes. The
-  [#176 review](docs/project_review/176.md) additionally found that optimization removes the intended native-buffer
-  growth; repair that experiment and refresh its evidence before relying on
-  its claimed mixed-allocation workload.
-- [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
-  tracked by epic #155. Shared toolchain #157, native compatibility proof #158,
-  pure ownership model #160, and native provisioning #208 have merged. The model is implemented; the
-  production native backend is still planned. Vulkan 1.3 minimum, a shared
+  [#176 review](docs/project_review/176.md) found that optimization removed the
+  intended native-buffer growth. #228, merged in PR #243, repaired the workload
+  and refreshed the retained evidence: the unlimited control retains distinct
+  Lua and native payloads, with all 16 native buffers checked after a major
+  collection. This closes that measurement defect, not the deployment or
+  Lua-side network-evidence gaps; the verdict remains `inconclusive`.
+- [Vulkan](docs/vulkan_backend_design.md) has all delivery slices filed under
+  epic #155. Reconciled on 2026-09-23 against `80c974a`: shared toolchain #157,
+  native compatibility proof #158, pure ownership model #160, reusable
+  supervised graphics owner #218, and native provisioning #208 have merged.
+  The production native backend remains outstanding in its filed slices.
+  Vulkan 1.3 minimum, a shared
   loader, managed retention, present-fence retirement, and default two frame
   slots are accepted design choices. #158 proved the native profile on both platforms and recorded it in
   [docs/vulkan_compatibility_record.md](docs/vulkan_compatibility_record.md):
@@ -364,13 +389,14 @@ their implementations are complete or replace canonical readiness review.
   contract on either platform, so the fence is waited for and nothing is read
   into whether it happened to be signalled already. Later
   native slices' #158 prerequisite is satisfied by PR #174. Host-retirement
-  repairs #166–#169 are also merged. Address the new model findings recorded
-  in the review ledger before the native backend depends on those contracts.
-  The [#174 review](docs/project_review/174.md) also identifies unsafe proof
-  cleanup after a presentation-fence timeout and missing rollback for partial
-  native construction. Device idle alone is not presentation retirement. Repair
-  these failure paths before reusing the harness as a native-lifetime template;
-  the retained successful profile evidence remains useful.
+  repairs #166–#169 are also merged. Model/proof repairs #181–#184 and the
+  later publication/cancellation-test repairs #189–#190 are merged too.
+  The [#174 review](docs/project_review/174.md) remains historical evidence of
+  unsafe proof cleanup and missing construction rollback, repaired by
+  #181/#182; it is not a new prerequisite queue. Device idle alone is still
+  not presentation retirement. Preserve the repaired lifetime contracts when
+  implementing the production backend; the retained successful profile
+  evidence remains useful.
 - Test selection follows [the owner policy](docs/test_classification.md): quick
   core contracts in the floor, relevant integration/tooling contracts selected
   by changes, and optional local display-deadline/nontermination/confinement
@@ -385,8 +411,11 @@ their implementations are complete or replace canonical readiness review.
 
 - [Logging/module authoring](docs/logging.md), [failures](docs/failures.md),
   [recovery](docs/recovery.md), and the subsystem contracts above.
-- [Workflow](docs/workflow.md) for publication and [review cursor](docs/project_review_boundaries.md)
-  for exact audited PR coverage. Historical reports keep their original baselines.
+- [Workflow](docs/workflow.md) for publication and the
+  [review ledger](docs/project_review/ledger.md) for project-review coverage,
+  recorded verification revisions, and legacy provenance. The old
+  [cursor](docs/project_review_boundaries.md) is retained migration evidence.
+  Historical reports keep their original baselines.
 - [Historical memory](docs/history/memory_before_2026-09-17.md) for prior rationale
   and delivery history; do not load it automatically or use its old open-issue
   claims as a new work queue.

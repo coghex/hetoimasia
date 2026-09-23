@@ -23,9 +23,11 @@ current findings.
 
 Shared toolchain qualification #157 is complete, and the [Vulkan compatibility
 proof](docs/vulkan_compatibility_record.md) #158 records the selected profiles. The
-[Vulkan design](docs/vulkan_backend_design.md) (#155) remains ready for staged
-processing; repair the reviewed model and proof defects before native
-integration depends on those contracts. The
+[Vulkan design](docs/vulkan_backend_design.md) (#155) has all delivery slices
+filed. The reviewed model/proof repairs #181–#184 and #189–#190 are merged,
+as is the reusable supervised graphics owner #218. Production native backend
+implementation remains outstanding in the filed slices; the proof and pure
+model are not that backend. The
 [Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
 production mod-process work needs the deployment decision required by D-11.
 
@@ -81,7 +83,7 @@ thread, and source line of the run:
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
-2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:99 msg="Hello from Hetoimasia."
+2026-09-10T12:34:56.790Z INFO console thread=4 src=app/Main.hs:102 msg="Hello from Hetoimasia."
 2026-09-10T12:34:56.790Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
 ```
 
@@ -93,13 +95,13 @@ the timestamp, thread, and source line of the run:
 
 ```text
 2026-09-10T12:34:56.789Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:16 msg="Starting hetoimasia"
-2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:303 crumbs=resource-smoke msg="Acquired resource" id=1 resource=workspace
-2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:307 crumbs=resource-smoke msg="Acquired composite" buffer=2 resource=channel store=3
-2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:349 crumbs=resource-smoke msg="Completed bounded work" published=2 staged=3
-2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=2 id=2 resource=channel.buffer
-2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=1 id=3 resource=channel.store
-2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:453 crumbs=resource-smoke msg="Released resource" entries=3 id=1 resource=workspace
-2026-09-10T12:34:56.793Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:286 crumbs=resource-smoke msg="Resource smoke completed" entries=5
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:287 crumbs=resource-smoke msg="Acquired resource" id=1 resource=workspace
+2026-09-10T12:34:56.790Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:291 crumbs=resource-smoke msg="Acquired composite" buffer=2 resource=channel store=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:333 crumbs=resource-smoke msg="Completed bounded work" published=2 staged=3
+2026-09-10T12:34:56.791Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:389 crumbs=resource-smoke msg="Released resource" entries=2 id=2 resource=channel.buffer
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:389 crumbs=resource-smoke msg="Released resource" entries=1 id=3 resource=channel.store
+2026-09-10T12:34:56.792Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:389 crumbs=resource-smoke msg="Released resource" entries=3 id=1 resource=workspace
+2026-09-10T12:34:56.793Z INFO runtime.resources thread=4 src=src/Hetoimasia/Runtime/Resources.hs:270 crumbs=resource-smoke msg="Resource smoke completed" entries=5
 2026-09-10T12:34:56.793Z INFO runtime thread=4 src=src/Hetoimasia/Runtime.hs:18 msg="Completed hetoimasia"
 ```
 

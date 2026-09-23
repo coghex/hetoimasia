@@ -11,8 +11,11 @@ domain. It also records the owner's restricted-capability, enforced-limit, and
 failed-gameplay-session policies. The earlier suggestion to defer those choices
 is no longer the implementation plan.
 
-The canonical design is now `ready for issue processing` under D-11's staged
-plan. Binding and platform confinement remain technical proof gates: LUA-1
-establishes the binding baseline and LUA-14/LUA-15 must both succeed before
-dependent process work is drafted. Process the canonical document, never this
+The canonical design is `exploring` under D-11. LUA-1 established the binding,
+but LUA-14/LUA-15 delivered inconclusive
+[Linux](lua_linux_confinement_verdict.md) and
+[macOS](macos_confinement_verdict.md) confinement verdicts.
+[Q-5](lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)
+and renewed readiness gate further issue processing; closing the proof issues did not
+establish supported confinement. Resume in the canonical document, never this
 pointer as a separate epic.

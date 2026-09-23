@@ -10,9 +10,12 @@ Scope: the values, the arithmetic over them, the injected clock, and how a
 clock failure is reported. Update policy, including capping a long sample,
 turning elapsed time into steps, and pausing, belongs to the runtime. Converting
 a duration into a native timed wait belongs to GLFW. The runtime's update
-policy is described in [scheduling](scheduling.md); native wait conversion does
-not exist yet, and nothing in the owner loop, the command path, or the logging
-clock uses this module today.
+policy is described in [scheduling](scheduling.md). GLFW's
+[scheduled owner loop](glfw.md#the-scheduled-owner-turn) reads the injected
+monotonic source, computes a positive wait from deadlines and the configured
+fallback bound, and converts that duration to native seconds. The ordinary
+`runOwnerLoop` retains its clock-free pacing, and logging timestamps continue
+to use their separate wall-clock metadata provider.
 
 The module owns no state, imports no runtime, GLFW, or wall-clock module, and
 chooses no simulation rate. It takes the validated `Component` from
