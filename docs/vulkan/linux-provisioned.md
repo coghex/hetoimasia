@@ -15,8 +15,8 @@
 > checked against is the **native recipe fingerprint**, which
 > `python3 tools/native/native.py fingerprint` prints and which covers
 > `glfw.pin`, `native.py`, `vulkan.pin`, `vulkan.py` and the tracked patches;
-> at this head it is `9c853ae239e4ff…`. The **image recipe fingerprint**,
-> `bcea93ce2df8eb…`, is a third thing: `tools/validation/ci_image.py` computes
+> at this head it is `0e1acc2ccbb528…`. The **image recipe fingerprint**,
+> `7795918a6eb13d…`, is a third thing: `tools/validation/ci_image.py` computes
 > it over the whole image recipe and `tools/ci-image/descriptor.json` names it.
 > It binds the published image this run happened inside, and nothing else here.
 
