@@ -73,6 +73,7 @@ import qualified Data.Vector as Vector
 import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (castFunPtrToPtr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peekByteOff)
+import System.Directory (canonicalizePath)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Info (arch, os)
 
@@ -130,6 +131,7 @@ import Test.Vulkan.Proof.Construction
   , slotPlaceReleases
   )
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
+import Test.Vulkan.Proof.Loader (loaderSelection, loaderVariable)
 import Test.Vulkan.Proof.Ownership
   ( Cleanups
   , Ledger
@@ -467,6 +469,16 @@ procedure journal consent cleanups sink ledger = do
     "the shared loader"
     "the Haskell binding's own vkGetInstanceProcAddr resolved to nothing, so there is no loader to share"
     (provenanceAddress bindingEntry /= nullPtr)
+  -- GLFW is handed this same entry point, so the two share a loader by
+  -- construction; what that does not establish is that the loader is the
+  -- qualified one rather than a substitute a runtime search path put ahead of
+  -- it. Both paths are canonicalized, because the dynamic linker reports the
+  -- soname it opened and the record names the file behind it.
+  recordedLoader ← lookupEnv loaderVariable >>= traverse canonicalizePath
+  loadedLoader ← traverse (canonicalizePath . Text.unpack) (provenanceImage bindingEntry)
+  case loaderSelection recordedLoader loadedLoader of
+    Left reason → stop "the recorded loader" reason
+    Right loaded → note journal ("the binding's loader is the recorded loader " <> Text.pack loaded)
   initVulkanLoader entry
   -- The registration is inside the mask with the call that earns it, so a
   -- cancellation delivered here cannot leave GLFW initialized with nothing to
@@ -1381,11 +1393,14 @@ awaitPresentFence what device slot = do
 -- device from the instant the call returns; a cancellation taken before the
 -- entry is written would leave teardown with no evidence of it, and teardown
 -- would then destroy the present fence, the presentation semaphore and the
--- swapchain behind it. The mask covers that handoff alone — a call that does
--- not block and a write to an 'IORef' — so the waits below are as
--- interruptible as they always were. The cancellation is deferred rather than
--- discarded: 'publishPresent' takes it once the entry is in, and it stops the
--- run here, at the presentation step, carrying its own failure.
+-- swapchain behind it. The mask covers the native call and the 'IORef' write
+-- that records its effect. The driver may block inside the call; a @safe@
+-- import does not make it interruptible or bound cancellation latency.
+-- Explicit fence and acquire waits remain outside this mask with their
+-- cancellation behaviour unchanged; cancellation may await native return.
+-- No destroy is wrapped in a timeout. 'publishPresent' takes cancellation
+-- deferred across the handoff once the entry is in, stopping the run here at
+-- the presentation step with the cancellation's own failure.
 presentWithFence ∷ Device → Queue → Target → Slot → Word32 → IO (Text, Text, Bool)
 presentWithFence device queue target slot index = do
   resetFences device (Vector.singleton slot.slotPresentFence)

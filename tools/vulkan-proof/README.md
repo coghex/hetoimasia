@@ -24,9 +24,11 @@ library; its only component is a test suite, and the only project file that
 names the package is the repository's `cabal.project.vulkan`. Neither
 `cabal.project` nor `cabal.project.cpu` lists it, so neither
 `cabal build all` nor `cabal build all --project-file cabal.project.cpu`
-resolves or links the Vulkan binding, and the mandatory validation floor keeps
-running on a CI image with no loader. `tools/test/VulkanProof.hs` holds the
-examples that keep the rest of that boundary honest.
+resolves or links the Vulkan binding. That used to be proved for free, because
+the floor ran on a CI image with no loader at all; VK-4 provisioned one, so
+`tools/test/VulkanProof.hs` now asserts it directly — reading every package
+those two project files name and requiring that none depends on the binding —
+and holds the rest of that boundary honest besides.
 
 ## How it is arranged
 
@@ -49,9 +51,7 @@ examples that keep the rest of that boundary honest.
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
 | `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record. |
 | `cbits/` | The throwaway GLFW/Vulkan interop shim and the `dladdr` image provenance. |
-| `environment.pin` | Each platform's pinned driver manifest and layer directory. |
-| `run-proof.sh` | The only thing that builds this package, and what establishes the project-local environment. |
-| `Dockerfile.linux-proof` | The pinned temporary Linux container carrying Mesa Lavapipe, the loader, and the layers. |
+| `run-proof.sh` | The only thing that builds this package, and what establishes the project-local environment from the provisioned native prefix. |
 
 The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
@@ -132,15 +132,17 @@ presentation semaphore and the swapchain behind it — a use-after-free rather
 than a failed assertion.
 
 So the call and that entry are one masked step, exactly as a create and its
-registration are. `Publication.hs` is that step. The mask covers a native call
-that does not block and a write to an `IORef` and nothing else: no wait moves
-inside it, no native call becomes preemptible, and no destroy is wrapped in a
-timeout. What it withholds from a caller trying to stop the run is not the stop
-but the instant it is taken — a cancellation delivered across the handoff is
-deferred until the entry is in and then stops the run at the presentation step,
-carrying its own failure, rather than escaping as an unexpected exception at no
-step at all. The result recorded is the one the call reported; a cancellation
-that arrived afterwards happened to the run, not to the present.
+registration are. `Publication.hs` is that step. The mask covers the native
+presentation call and the `IORef` write that records its effect. The driver may
+block inside the call; the binding's `safe` import does not make it interruptible
+or bound cancellation latency. Explicit fence and acquire waits stay outside
+the mask with their existing cancellation behaviour, which may also defer
+cancellation until native return. No native call becomes preemptible, and no
+destroy is wrapped in a timeout. A cancellation deferred across the handoff is
+taken once the entry is in and stops the run at the presentation step, carrying
+its own failure, rather than escaping as an unexpected exception at no step at
+all. The result recorded is the one the call reported; a cancellation that
+arrived afterwards happened to the run, not to the present.
 
 `PublicationSpec.hs` asserts that headlessly, with `vkQueuePresentKHR` replaced
 by a stand-in and a real `throwTo` delivered at the first point the code under
@@ -243,25 +245,35 @@ approved that session:
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan-proof/run-proof.sh
 ```
 
-On Linux, inside the pinned container, where `tools/display/x11.sh` supplies its
-own consent for the isolated display it starts and no approval is needed:
+On Linux, inside the published CI image the committed
+`tools/ci-image/descriptor.json` names, where `tools/display/x11.sh` supplies
+its own consent for the isolated display it starts and no approval is needed:
 
 ```bash
-docker build -f tools/vulkan-proof/Dockerfile.linux-proof \
-  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-  -t hetoimasia-vulkan-proof .
-docker run --rm hetoimasia-vulkan-proof
+docker run --rm --volume "$PWD:/candidate" --workdir /candidate \
+  "$(python3 -c 'import json; d = json.load(open("tools/ci-image/descriptor.json")); print(d["reference"] + "@" + d["digest"])')" \
+  bash tools/display/x11.sh -- bash tools/vulkan-proof/run-proof.sh
 ```
 
-The `route: vulkan-proof` job of `.github/workflows/ci-image.yml` runs exactly
-that and uploads the record; dispatch it against a candidate branch with
-`--ref`.
+VK-4 provisioned the loader, driver, and layers into that image, so the proof
+now runs against exactly the inputs ordinary Linux validation runs against and
+the throwaway container this used to need is gone. The `route: vulkan-proof`
+job of `.github/workflows/ci-image.yml` runs the command above and uploads the
+record; dispatch it against a candidate branch with `--ref`.
 
 `HETOIMASIA_VULKAN_PROOF_RECORD=<path>` writes the record to a file instead of
-standard output. `HETOIMASIA_VULKAN_DRIVER_MANIFEST` and
-`HETOIMASIA_VULKAN_LAYER_PATH` override `environment.pin` for one run;
-`HETOIMASIA_VULKAN_PREFIX` overrides the macOS loader prefix
-`tools/toolchain/binding.pin` names.
+standard output. Every Vulkan path comes from the native prefix rather than
+from a pin of this package's own; relocating one input for a run is
+`tools/native/vulkan.py`'s business, through the `HETOIMASIA_VULKAN_*`
+variables [docs/validation.md](../../docs/validation.md) describes, and an
+override locates an input without waiving its qualification.
+
+A runtime library search override is refused outright: `run-proof.sh` exits 2
+naming `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, or a `DYLD_*` search or
+insertion variable before it checks anything, because the loader is resolved
+when the proof starts and such a variable could substitute another one. The
+harness then stops unless the binding's loader image is
+`HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader `prepare` exports.
 
 A run refused for lack of consent exits non-zero with one line saying what is
 missing and how a human authorizes it. It initializes nothing first. The mode is

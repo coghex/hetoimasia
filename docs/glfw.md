@@ -3170,6 +3170,18 @@ those steps are offered under, and how a failed step is classified. The boundary
 supplies the exclusivity, the ordering, and the retirement rule, and nothing
 else.
 
+Every callback runs on the owner thread, outside every transaction, native
+callback, and release. It may do finite, nonblocking native and backend work —
+constructing dependents, querying, handing work to the graphics owner, and safe
+disposal — and may not wait on a GPU, wait on a worker, or pump native events;
+`protocolStep` is one bounded opportunity that returns finitely. That work does
+not move the graphics owner's responsibilities into a callback: under the
+[lifetime design's D-6](window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
+GPU effects and graphics-owned disposal execute on the graphics owner, and a
+callback that creates a main-thread resource such as a surface hands it to that
+owner under the retained attachment, then requests or observes the owner's
+progress without waiting for it.
+
 Every refusal is answered **before any acquisition effect**, so a refused
 attachment has constructed nothing:
 
@@ -5136,10 +5148,10 @@ directly refuses the same way. See
 GLFW documents that on some platforms a window move, a window resize, or a menu
 interaction runs a platform modal loop inside `glfwPollEvents` or
 `glfwWaitEventsTimeout`. An owner turn reconciles callbacks, dispatches
-commands, and offers the update hook only after that call returns, so whether
-such a loop exists decides whether anything the application owns progresses
-while a person is interacting. `Test.GLFW.Native.Interaction` measures that
-rather than assuming it; [the verdict](owner_loop_interaction_verdict.md)
+commands, and offers the update hook only after that call returns, so a blocked
+call stalls that owner-driven work. Work the application runs on another thread
+is outside this measurement. `Test.GLFW.Native.Interaction` measures owner-loop
+progress; [the verdict](owner_loop_interaction_verdict.md)
 records what the approved macOS sessions observed, and
 [the records](owner_loop_interaction_evidence.md) retain every timestamped
 record those sessions produced.

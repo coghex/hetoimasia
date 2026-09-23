@@ -156,8 +156,12 @@ because discharging one never implies another:
 | Presentation obligation    | The boundary supplies retirement evidence, or unpresented-frame settlement |
 
 A subject is eligible for disposal only when **every** hold has ended, and the
-model offers nothing else for disposal. `holdView` reports what is still owed and
-`disposalEligible` answers the one question disposal turns on.
+model offers nothing else for disposal. `holdView` reports what is still owed;
+`disposalEligible` reports whether a live subject has no outstanding holds.
+That query does not check generation phase or an earlier failed disposal. The
+progress and reclamation paths also require a generation to be retired and
+exclude subjects whose disposal already failed, so a `True` answer never
+authorizes retrying a failed disposal.
 
 Submitted uses are keyed by their submission record and presentation obligations
 by their presentation record. So a batch of several frames submitted in one call
@@ -415,11 +419,11 @@ session refuses one too: a retry is an admission of new native work, and
 permitting it would invite a construction whose successful result the model would
 then decline to record.
 
-A reclamation pass reads a bounded window of the records the model holds, not of
-the eligible ones — deciding that a record is ineligible is itself an examination,
-and filtering first would let a pass read everything while reporting that it read
-almost nothing. A cursor carries from pass to pass, so a record beyond one
-window is reached by a later pass rather than never.
+A reclamation pass reads a bounded window of generation and managed-resource
+records, not just the eligible ones — deciding that a record is ineligible is
+itself an examination, and filtering first would let a pass read every subject
+while reporting that it read almost nothing. A cursor carries from pass to pass,
+so a record beyond one window is reached by a later pass rather than never.
 
 A failed disposal retains the subject's ownership and its accounting, is never
 replayed, and escalates the session. A cleanup failure is never permission to

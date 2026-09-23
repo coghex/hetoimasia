@@ -3,11 +3,12 @@
 --
 -- A Lua error value is arbitrary: a string, a number, a table, a userdata, or a
 -- value whose @__tostring@ metamethod is itself arbitrary Lua. Rendering it is
--- therefore a bounded, metamethod-free operation. A string or a number is read
--- through @lua_tolstring@, which converts neither through a metamethod, and
--- truncated at 'diagnosticLimit' bytes; anything else is reported by its type
--- name and its address alone. No further Lua runs to produce a diagnostic, so a
--- failing chunk cannot keep executing through the report of its own failure.
+-- therefore a bounded, metamethod-free operation. An existing string is read
+-- through @lua_tolstring@ without conversion or allocation and truncated at
+-- 'diagnosticLimit' bytes. Numbers are read through non-allocating numeric
+-- accessors and formatted in Haskell; other values are reported by their Lua
+-- type name alone, never by address. No further Lua runs to produce a
+-- diagnostic, so a failing chunk cannot keep executing through its report.
 --
 -- Nothing here holds a Lua state, a stack index, or a registry reference: a
 -- fault outlives the call that raised it, and the VM it came from may already

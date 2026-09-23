@@ -507,9 +507,23 @@ data CompletionPolicy
 -- | The trusted, narrow protocol an integration supplies when it attaches.
 --
 -- Every callback runs on the owner thread, outside every transaction, native
--- callback, and release. None may wait on a worker, pump native events, or make
--- a GPU call: 'protocolStep' is one bounded opportunity that must return
--- finitely.
+-- callback, and release. The protocol is registered before 'protocolConstruct'
+-- runs, and only independent certified evidence retires its attachment.
+--
+-- = What a callback may do
+--
+-- A callback may do finite, nonblocking native and backend work, on the terms
+-- 'CompletionPolicy' sets for 'FiniteCompletion': constructing dependents,
+-- querying, handing work to the graphics owner, and safe disposal. No callback
+-- may wait on a GPU, wait on a worker, or pump native events.
+-- 'protocolStep' is one bounded opportunity that must return finitely.
+--
+-- That permission does not move the graphics owner's responsibilities into a
+-- callback. Under the lifetime design's D-6, GPU effects and disposal of
+-- graphics-owned dependents execute on the graphics owner's own thread: a
+-- callback may create a main-thread resource such as a surface and hand its
+-- ownership to that owner under the retained attachment, and it requests or
+-- observes that owner's progress without waiting for it.
 --
 -- = When its declarations are demanded
 --
