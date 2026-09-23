@@ -1706,9 +1706,11 @@ Assigning it to the local worker anyway is harmless and pointless: routing is
 decided against the groups the plan *selected*, so the assignment binds
 nothing, and the runner refuses to execute an omitted group. The plan is
 accepted, `test.lua-confinement-linux` is reported unexecuted rather than
-passed, and the Linux evidence for it stays CI's to produce. Running with
-`--runner-os Linux` on this same candidate still selects the group and still
-refuses a plan that assigns it to no `cpu` worker.
+passed. A Linux plan also leaves the local-only optional group
+`optional-unrequested` when its inputs change. No CI worker routes it; a
+local Linux run must explicitly request the group and assign it to a local
+`cpu` worker. The retained Linux receipt, rather than a later CI run, supports
+the [inconclusive verdict](lua_linux_confinement_verdict.md).
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the
