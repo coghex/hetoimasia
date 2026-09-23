@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "probes": [
+    {
+      "id": "lua-callback-cancellation",
+      "kind": "hspec",
+      "description": "Investigate cancellation between the Lua callback failure and the worker's result publication; baseline failure reported in PR #241.",
+      "component": "hetoimasia-scripting-lua:test:lua-host-tests",
+      "project": "cabal.project.cpu",
+      "match": "keeps a cancellation from leaving a callback's failure for the next call",
+      "seed": 1196626676,
+      "rts": ["-N2"],
+      "attempts": 100,
+      "trial_seconds": 15,
+      "batch_seconds": 300,
+      "priority": 100,
+      "platforms": ["Darwin", "Linux"]
+    }
+  ]
+}
