@@ -23,8 +23,11 @@ extra-doc-files:
     docs/toolchain/*.md
     docs/vulkan/*.md
     tools/README.md
+    tools/flake/README.md
     tools/KANBAN-LICENSE
 extra-source-files:
+    tools/flake/*.py
+    tools/flake/*.json
     .github/workflows/ci-image.yml
     .github/workflows/review-gate.yml
     .github/workflows/validation.yml
@@ -105,6 +108,7 @@ test-suite workflow-tests
         CiImage
         DismissalStep
         Execution
+        FlakeLab
         Json
         Packaging
         Reuse

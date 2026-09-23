@@ -136,6 +136,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   failure-path coverage. See [test_classification.md](docs/test_classification.md)
   for all tiers and the `$test`/`$autotest` probe inventory. Do not use
   `cabal test all` as a routine check: Cabal does not honor catalog optionality.
+- The installed Codex `$test` and `$flake` routes share the local
+  [flake lab](tools/flake/README.md); other agents can use its CLI to participate.
+  Test mode selects optional probes; flake mode also measures Hspec examples.
+  Use its coordinator for selection, claims, results and proposals; do not
+  rerun until green or hand-edit its SQLite history. Lab measurements are optional.
 - Every validation group is declared once in `tools/validation/catalog.json`.
   Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
   groups a change requires and why; see [validation.md](docs/validation.md) for

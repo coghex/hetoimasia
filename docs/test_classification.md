@@ -103,20 +103,24 @@ Other existing apparatus is already outside routine automation:
 
 ## Coordinated local selection
 
-The installed `$autotest` delegates one test at a time to `$test`. That skill
-reads repository testing instructions and apparatus, excludes CI-covered
-commands, uses its own immutable worktree/claims/history, and retains local
-reports. The inventory above makes these five probes discoverable as
-`manual-only` candidates: none is assigned to a CI worker, and neither affected
-inputs nor fallback selects them. Prefer a valuable untested or stale probe;
-respect operating-system constraints and known blockers. Do not run a full
-probe sweep or treat a changed input as an instruction to run it.
+The Codex `$test` and `$autotest` routes installed by
+`tools/flake/install_skills.py` select optional probes through the repository's
+[local lab](../tools/flake/README.md). Its `$flake` route uses that coordinator and can
+also repeatedly investigate CI-covered Hspec examples. Ordinary CI regressions
+remain where they are; the stress measurement is optional. The coordinator owns
+claims, deferrals, source/build provenance, all attempts, and new-probe proposals.
+It records results locally and produces a readable `coordinator.md` under the
+common Git directory's `flake-lab/`. No daemon or CI receipt import is involved.
+Other agents may use the same CLI to participate. Their legacy generic
+`codex-test` registries receive no lab claims or results; route their Hetoimasia
+probes through this CLI before relying on shared exclusion or freshness.
 
-This supplies eligibility and commands, not a schedule or guarantee of periodic
-execution. No daemon, custom selection adapter, or CI receipt import was added;
-the broader CI-5 integration remains deferred. The optional CI Wayland group is
-not eligible merely because its catalog entry says optional. Desktop probes
-still need their human interaction and session consent.
+A skill invocation selects one eligible workload. If useful existing work is
+exhausted, the skill records and presents one missing-probe proposal for approval.
+No-candidate because of platform constraints, deferrals or active ownership is
+not permission to duplicate work or invent a coverage gap. Native desktop runs
+still require fresh human consent. See the lab's README for exact commands and
+state ownership; it is the authority for this repository's skill integration.
 
 ## Remaining harness improvement
 
@@ -127,4 +131,6 @@ a short watchdog, bounded TERM grace, and KILL of only the owned process group.
 No automatic retry. Validate deliberate hangs and escalation in a separately
 selected optional probe. Do not weaken production retirement or resource
 cleanup guarantees to let a test return. This harness is a recommendation;
-the existing in-process timeout ceilings have not been replaced by this change.
+the existing in-process timeout ceilings have not been replaced. The lab now
+provides an external guardian for its selected child executions, including
+parent-death cleanup; ordinary direct Cabal test commands do not use it.
