@@ -371,9 +371,13 @@ their implementations are complete or replace canonical readiness review.
   native construction. Device idle alone is not presentation retirement. Repair
   these failure paths before reusing the harness as a native-lifetime template;
   the retained successful profile evidence remains useful.
-- CI-5 (`test`/`autotest` adapter integration) remains explicitly deferred.
-  The old foundation umbrella is architectural context, not another queue for
-  duplicating completed resources/runtime/GLFW or the newer TIME/LIFE arcs.
+- Test selection follows [the owner policy](docs/test_classification.md): quick
+  core contracts in the floor, relevant integration/tooling contracts selected
+  by changes, and optional local display-deadline/nontermination/confinement
+  probes. `$test`/`$autotest` can discover the documented local inventory; this
+  is not a new scheduler, receipt adapter, or execution-history integration.
+  CI-5's broader adapter work remains deferred. The old foundation umbrella is
+  architectural context, not another queue for duplicating completed arcs.
 - No game save schema, full Synarchy port, permanent RTS tuning, or general
   engine-wide rendering abstraction is committed yet.
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 17,
+  "policy_version": 19,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -153,7 +153,7 @@
     },
     {
       "id": "test.scripting-lua",
-      "description": "Focused Hspec examples for the Lua host package's fault and cancellation transport across the foreign-call boundary, stack and registry discipline, terminal close, independent execution under the threaded RTS, selectable standard libraries, and its export boundary. Runs the uninterruptible-Lua example in a child process.",
+      "description": "Focused Hspec examples for the Lua host package's fault and cancellation transport across the foreign-call boundary, stack and registry discipline, terminal close, independent execution under the threaded RTS, selectable standard libraries, and its export boundary. Deliberate nontermination is a separate local-only probe.",
       "command": [
         "cabal",
         "test",
@@ -172,7 +172,7 @@
     },
     {
       "id": "test.lua-confinement-linux",
-      "description": "The Linux confinement and resource-limit feasibility probe (LUA-14). Launches confined children through the candidate namespace, private-root, and seccomp profile; records the machine, the permissions, and whether the profile installed at all; and checks the fail-closed refusal, the denied native and Lua accesses with the mechanism that denied each, two-instance isolation and independent termination, the whole-process memory ceiling, the execution bound's escalation, and the three lifetime cases. Built and run on Linux only; on other platforms the components are not built. A green run is evidence, never a supported-platform verdict.",
+      "description": "Local-only optional Linux confinement and resource-limit feasibility probe (LUA-14). Launches confined children through the candidate namespace, private-root, and seccomp profile; records the machine, the permissions, and whether the profile installed at all; and checks the fail-closed refusal, the denied native and Lua accesses with the mechanism that denied each, two-instance isolation and independent termination, the whole-process memory ceiling, the execution bound's escalation, and the three lifetime cases. Built and run on Linux only; on other platforms the components are not built. A green run is evidence, never a supported-platform verdict.",
       "command": [
         "cabal",
         "test",
@@ -188,8 +188,8 @@
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,
-      "category": "test",
-      "optional": false,
+      "category": "probe",
+      "optional": true,
       "platforms": [
         "Linux"
       ]
@@ -218,7 +218,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, the native recipe helper, and the isolated X11 and headless Wayland display helpers against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, and the native recipe helper against temporary Git repositories, and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
       "command": [
         "cabal",
         "test",
@@ -247,6 +247,26 @@
       "timeout_seconds": 1800,
       "category": "test",
       "optional": false
+    },
+    {
+      "id": "test.x11-helper",
+      "description": "Local-only optional headless X11 helper probes using stub servers and window managers, including real 30-second startup deadlines. Never selected automatically or routed to CI; eligible for coordinated local testing. Opens no desktop session.",
+      "command": [
+        "cabal",
+        "test",
+        "x11-helper-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia:test:x11-helper-tests",
+      "inputs": [
+        "cabal.project.common",
+        "tools/display/x11.sh"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 600,
+      "category": "probe",
+      "optional": true
     },
     {
       "id": "test.glfw-native",
@@ -310,7 +330,46 @@
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 1800,
-      "category": "test",
+      "category": "probe",
+      "optional": true
+    },
+    {
+      "id": "test.wayland-helper",
+      "description": "Local-only optional headless Wayland helper probes using stub compositor and client programs, including the real readiness deadline. Opens no desktop session.",
+      "command": [
+        "cabal",
+        "test",
+        "wayland-helper-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia:test:wayland-helper-tests",
+      "inputs": [
+        "cabal.project.common",
+        "tools/display/wayland.sh"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 600,
+      "category": "probe",
+      "optional": true
+    },
+    {
+      "id": "test.lua-hazard",
+      "description": "Local-only optional nonterminating-Lua cancellation experiment. Deliberately exhausts a five-second observation window in a child process; ordinary Lua contracts remain in lua-host-tests.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-scripting-lua:lua-hazard-probes",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-scripting-lua:test:lua-hazard-probes",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 600,
+      "category": "probe",
       "optional": true
     }
   ]

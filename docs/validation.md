@@ -110,6 +110,9 @@ identifier lists are sorted.
 
 ### The registered groups
 
+[Test classification](test_classification.md) explains the three selection tiers,
+the audited suite inventory, and which optional probes are local-only.
+
 | ID | Command | Optional | In the floor | Platforms |
 | --- | --- | --- | --- | --- |
 | `build.all` | `cabal build all` | no | yes | any |
@@ -118,10 +121,14 @@ identifier lists are sorted.
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes | any |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes | any |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
-| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | no | no | `Linux` |
+| `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
+| `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
+| `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
+| `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
+| `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
 
@@ -164,67 +171,27 @@ held, so it is selected when affected rather than added to the evidence every
 candidate must carry. Beside its Cabal closure it declares
 `cabal.project.common`, where the binding's own build settings live -- which Lua
 the build links, and whether Lua's garbage collection may run under unsafe calls
--- because changing either changes what the group proves. Its uninterruptible-Lua
-example runs the package's `lua-hazard` executable as a child process; the Cabal
-closure reaches that executable through `build-tool-depends`, so its sources
-select the group like any other input.
+-- because changing either changes what the group proves. The quick foreign-call
+progress and allocation-failure contracts still use `lua-hazard` through
+`build-tool-depends`. Its deliberate nontermination experiment is now the
+separate local-only `test.lua-hazard` probe.
 
-`test.lua-confinement-linux` runs the Linux confinement and resource-limit
-feasibility probe (LUA-14). It launches children inside the candidate profile --
-user, mount, network, IPC, and UTS namespaces, a private root, an address-space
-ceiling, and a seccomp filter installed with `SECCOMP_FILTER_FLAG_TSYNC` -- and
-checks the fail-closed refusal when a prerequisite is missing, each forbidden
-access with the layer that denied it, two-instance isolation and independent
-termination, the whole-process memory ceiling, the execution bound's escalation,
-and the lifetime cases -- initialization failure, a cancelled owner, a forced
-exit, and a force arriving before the child has said anything at all. Like
-`test.scripting-lua` it is mandatory but outside the floor. Beside its Cabal closure it declares
-`packages/scripting-lua/linux/`, because the probe's native sources are C that
-the Cabal closure's source directories do not reach, and `tools/ci-image/`,
-because what the image permits a child to unshare is part of what the group
-observes.
+`test.lua-confinement-linux` is a local-only optional feasibility probe, like
+`test.macos-confinement`. It checks namespace/private-root/seccomp confinement,
+resource limits, two-instance isolation, and process lifetime. Neither is an
+implemented production sandbox's routine regression suite. Both verdicts remain
+`inconclusive`; reclassification establishes no new security claim.
 
-It is one of the two platform-only groups, beside
-[`test.macos-confinement`](#the-macos-confinement-probe), and the only one of
-them CI runs. Its components are built on Linux alone -- an `if os(linux)`/`else
-buildable` conditional excludes them elsewhere, so the group is not a vacuous
-pass on a machine that cannot run it -- and the planner accepts that conditional
-without reading its body, so the probe's sources count as this group's inputs on
-every platform rather than only on the one that builds them. A change to them
-therefore reports `inputs_changed: true` wherever the candidate is planned.
+Linux's group retains `"platforms": ["Linux"]`: it reports
+`platform-inapplicable` on other operating systems and `optional-unrequested`
+on Linux unless explicitly selected for a local run. Changed inputs remain
+visible on either platform. The components are not built off Linux. The macOS
+group retains its existing convention of omitting `platforms`; explicitly
+requesting it on Linux fails rather than becoming a vacuous pass. Neither group
+has a CI worker. Do not put either in a PR request block.
 
-*What a change touches* and *what this machine can run* are two different
-questions, and `inputs_changed` answers only the first. The catalog answers the
-second itself: the group declares `"platforms": ["Linux"]`. On a Linux plan
-nothing changes -- it is non-optional, selected from its own inputs or the
-unknown-input fallback, and routed to a `cpu` worker like any other mandatory
-group outside the floor. On a plan for any other `runner_os` it is **not
-selected**: it is omitted as `platform-inapplicable`, while still reporting the
-same `inputs_changed` the Linux plan does.
-
-That omission is what makes a local macOS plan possible at all. Every
-dependency change moves `cabal.project.common`, which this group declares, so
-every such candidate planned on Darwin used to select a non-optional group that
-Darwin could neither route (the plan was refused for a group no worker owned)
-nor execute (Cabal refuses the component as `buildable: False`). Declaring the
-platform resolves that without weakening anything: the group is still
-mandatory, CI still selects it from changed inputs, the probe's components are
-still excluded off Linux, and no Darwin receipt for it is written or accepted
--- the runner refuses to execute it, and
-[the aggregate](#the-aggregate-and-build-test) refuses a receipt or an earlier
-execution offered for it rather than reading either as coverage.
-
-[`test.macos-confinement`](#the-macos-confinement-probe) declares no
-`platforms`, and that is deliberate: its policy is the one below, built on
-being *optional*, which already keeps every Linux plan from selecting it. A
-request that names it on Linux is meant to fail loudly in Cabal rather than be
-explained away, so nothing here changes it.
-
-What is unlike every other group here is that a green run of it is evidence,
-never a verdict: each example prints what it proved or, where the machine could
-not install the profile, says so and names the missing prerequisite. What those
-lines add up to is recorded in
-[the Linux confinement verdict](lua_linux_confinement_verdict.md), not here.
+See [the local probe inventory](test_classification.md#local-probe-inventory)
+for selection, commands, limitations, and the retained confinement verdicts.
 
 `test.vulkan` runs the GPU model package's own suite: the typed identities and
 the misuse a stale, foreign, duplicated or already-consumed one is rejected as,
@@ -244,7 +211,19 @@ project and running the suite through the other one. A change to either project
 file therefore selects the group, because changing either changes what the group
 proves.
 
-`test.workflow` runs only when affected or requested.
+`test.workflow` runs only when affected or requested. It contains workflow,
+planner, receipt, packaging, and runner contracts, including short one-second
+fixtures proving that the runner enforces its deadline and reaps children. It
+contains no display-helper examples.
+
+`test.x11-helper` and `test.wayland-helper` own those headless display-helper
+probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
+need no desktop consent. Real readiness deadlines make them occasional local
+probes: changed inputs, policy changes, and unknown-input fallback never select
+them. They have no CI worker and must not appear in PR request blocks. An
+explicit local command or coordinated `$test`/`$autotest` selection runs them;
+a helper edit alone does not authorize execution. Commands and selection policy
+are in [test_classification.md](test_classification.md).
 
 `test.glfw-native` is the native GLFW Hspec group: the shared main-thread
 fixture and its small, stable session, thread, and window examples, described in
@@ -271,11 +250,12 @@ same inputs and the same `display` runner class as `test.glfw-native`, but it is
 Wayland session to select. Making it required when affected is WL-3's decision,
 not this group's.
 
-`test.macos-confinement` and `test.glfw-wayland` are the registered optional
-groups; the first has a section of its own below. Further interactive and
-lengthy desktop probes, when they are declared, are optional groups that run
-only on request; optional handling, including an optional display probe whose
-inputs changed, is proven with fixture catalogs in `workflow-tests`.
+The local-only probes are `test.x11-helper`, `test.wayland-helper`,
+`test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
+`test.glfw-wayland` is also optional, but can be explicitly requested in CI.
+Optional is a selection rule; it does not imply Python, a particular executor,
+or automatic eligibility for `$autotest`. See the
+[classification policy](test_classification.md) before adding a new group.
 
 ### The macOS confinement probe
 
@@ -434,10 +414,10 @@ apart from `unaffected`, from `optional-unrequested`, and from a pass: the
 first two say this platform did not *need* to run the group, and this one says
 this platform *cannot*.
 
-Nothing else follows from it. The group stays non-optional, the
+Platform applicability does not change optionality. The
 [mandatory floor](#the-registered-groups) is unchanged — a floor group may not
-declare `platforms` at all — and the platform that does build the group selects
-it from exactly the inputs it always did.
+declare `platforms` at all. On an applicable platform, required groups follow
+the affected-input rules and optional probes still require an explicit request.
 
 `inputs_changed` is independent of selection, and describes the *contribution*:
 which groups this change touches relative to the base it is compared against. It
@@ -588,7 +568,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.lua-confinement-linux,test.vulkan,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland
 ```
@@ -702,7 +682,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.lua-confinement-linux`, `test.vulkan`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 
@@ -1857,9 +1837,11 @@ Assigning it to the local worker anyway is harmless and pointless: routing is
 decided against the groups the plan *selected*, so the assignment binds
 nothing, and the runner refuses to execute an omitted group. The plan is
 accepted, `test.lua-confinement-linux` is reported unexecuted rather than
-passed, and the Linux evidence for it stays CI's to produce. Running with
-`--runner-os Linux` on this same candidate still selects the group and still
-refuses a plan that assigns it to no `cpu` worker.
+passed. A Linux plan also leaves the local-only optional group
+`optional-unrequested` when its inputs change. No CI worker routes it; a
+local Linux run must explicitly request the group and assign it to a local
+`cpu` worker. The retained Linux receipt, rather than a later CI run, supports
+the [inconclusive verdict](lua_linux_confinement_verdict.md).
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the
@@ -2706,8 +2688,9 @@ setup moves the candidate's identity, so earlier display evidence cannot cross
 either.
 
 Both display helpers are driven with a `PATH` holding only ordinary utilities
-and stub display programs. For the X11 helper: the command runs inside the
-display the helper established, with `WAYLAND_DISPLAY` removed and the server
+and stub display programs. They live in the local-only optional
+`wayland-helper-tests` and `x11-helper-tests` suites. For the X11 helper, the
+command runs inside the display the helper established, with `WAYLAND_DISPLAY` removed and the server
 stopped afterwards; a missing X server, one that exits before reporting a
 display, and a window manager that exits each stop the run with status `1`
 before the command starts; and the command's own status is returned once it
@@ -2739,4 +2722,7 @@ copy's declaration is caught, and that it carries every pin the shipped
 provisioning script sources — read from the script itself, so a pin added to it
 later is carried or the example fails.
 
-Run them with `cabal test workflow-tests --test-show-details=direct`.
+Run the ordinary workflow checks with
+`cabal test workflow-tests --test-show-details=direct`. Display-helper probes
+run only on an explicit local request or coordinated local-test selection; see
+[the inventory](test_classification.md#local-probe-inventory).

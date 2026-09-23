@@ -572,6 +572,30 @@ spec = describe "Validation evidence reuse" $ do
           document ← applicability fixture
           recordText document packageGroup "source_run_url" `shouldBe` Just (runUrl 41 1)
 
+  describe "the checked-in local-only probe classification" $ do
+    forM_ ["tools/validation/helper.py", "tools/display/wayland.sh", "unknown/input.bin", "tools/display/x11.sh", "packages/scripting-lua/hazard/Main.hs", "packages/scripting-lua/linux/test/Test/Confinement/Limits.hs"] $ \path →
+      it ("keeps local probes unrequested and unrouted after changing " ++ path) $
+        withCheckedInRouting $ \fixture workers → do
+          change fixture path "changed input\n"
+          plan ← planRouted fixture workers "probes-unrequested-plan.json"
+          selected ← selectedGroups plan
+          owned ← concat <$> mapM (workerGroups plan) ["haskell-engine", "haskell-workflow", "glfw-native"]
+          forM_ ["test.x11-helper", "test.wayland-helper", "test.lua-hazard", "test.lua-confinement-linux", "test.macos-confinement"] $ \group → do
+            entryText plan group "reason" `shouldReturn` Just "optional-unrequested"
+            selected `shouldNotContain` [group]
+            owned `shouldNotContain` [group]
+
+    forM_ ["test.x11-helper", "test.wayland-helper", "test.lua-hazard", "test.lua-confinement-linux", "test.macos-confinement"] $ \group →
+      it ("selects " ++ group ++ " only through an explicit request with a local owner") $
+        withCheckedInRouting $ \fixture workers → do
+          change fixture "README.md" "revised ordinary prose\n"
+          writeFixtureFile (root fixture) "body.txt" ("```validation-request\n" ++ group ++ "\n```\n")
+          let local = workers ++ ["--worker", "local-probes=cpu:" ++ group]
+          plan ← planRoutedWith fixture local ["--request-file", root fixture </> "body.txt"] "probe-local-plan.json"
+          entryText plan group "reason" `shouldReturn` Just "requested"
+          selectedGroups plan >>= (`shouldContain` [group])
+          workerGroups plan "local-probes" `shouldReturn` [group]
+
   describe "the checked-in routing of the GPU model group" $ do
     -- `test.vulkan` is the first mandatory group that is neither in the floor
     -- nor owned by a worker of its own, so the floor examples above cannot
