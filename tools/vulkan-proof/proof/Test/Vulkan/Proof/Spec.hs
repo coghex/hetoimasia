@@ -35,6 +35,7 @@ import Test.Vulkan.Proof.Matrix
   )
 import Test.Vulkan.Proof.Record (achievedFrom, matrixTable, renderRecord)
 import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
+import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import Test.Vulkan.Proof.Retention (teardownEntries)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 
@@ -46,6 +47,7 @@ spec outcome = do
   -- call here either.
   Retention.spec
   Invocation.spec
+  Loader.spec
 
   describe "The native run" $
     it "established every step it started" $

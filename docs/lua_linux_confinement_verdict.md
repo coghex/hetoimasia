@@ -53,9 +53,11 @@ artifact is that group's receipt.
 What that run observed is what this verdict rests on, and a later candidate's
 selection neither strengthens nor retracts it. The probe's own package
 description and the validation policy that classifies it have both moved since
-that commit, so `plan.py --base 6d88ec7 --head HEAD --runner-os Linux` now
-reports the group `affected` and CI runs it again on the evidence's own
-platform. The same command with `--runner-os Darwin` reports it
+that commit. `plan.py --base 6d88ec7 --head HEAD --runner-os Linux` now
+reports the local-only optional group `optional-unrequested`, even though its
+inputs changed. No CI worker routes the probe, so no later CI run re-executes
+it; the environment-1 receipt from run 35462003355 remains the evidence for
+this verdict. The same command with `--runner-os Darwin` reports it
 `platform-inapplicable`: the group declares `"platforms": ["Linux"]`, so a
 Darwin plan omits it rather than requiring an execution no Darwin machine can
 perform. That omission is not a second opinion about confinement. No macOS run

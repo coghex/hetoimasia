@@ -335,7 +335,7 @@ their implementations are complete or replace canonical readiness review.
   its claimed mixed-allocation workload.
 - [Vulkan](docs/vulkan_backend_design.md) is ready for staged processing,
   tracked by epic #155. Shared toolchain #157, native compatibility proof #158,
-  and pure ownership model #160 have merged. The model is implemented; the
+  pure ownership model #160, and native provisioning #208 have merged. The model is implemented; the
   production native backend is still planned. Vulkan 1.3 minimum, a shared
   loader, managed retention, present-fence retirement, and default two frame
   slots are accepted design choices. #158 proved the native profile on both platforms and recorded it in
@@ -345,8 +345,22 @@ their implementations are complete or replace canonical readiness review.
   a transfer-source capture. Two things that record leaves unproved are easy to
   assume wrongly later: the KHR maintenance spelling is an alias neither
   MoltenVK nor Lavapipe resolves, and no device loss was induced, so those rows
-  are specification evidence. A third is a rule rather than an
-  observation: a present fence's status before it is waited on is not a
+  are specification evidence. VK-4/#208 then promoted that profile into the
+  recipe: `tools/native/vulkan.pin` names the loader, driver, validation layer
+  and glslang compiler per platform, `tools/native/vulkan.py` provisions them
+  into `<native prefix>/vulkan`, and their identities reach the image
+  descriptor and the plan's toolchain map, so a changed input is an explicit
+  requalification rather than a silent drift. Both prefixes are **natively
+  qualified against the provisioned inputs**, by a second pair of records
+  retained beside the VK-2 pair: `docs/vulkan/linux-provisioned.md` from inside
+  the published image, and `docs/vulkan/macos-provisioned.md` from a local run
+  under the human's explicit approval for that one session. Reusing the VK-2
+  macOS record could not have done it — that record names versions and paths but
+  no binary or manifest digests, so it cannot establish that the identities the
+  prefix now records are the ones it consumed — which is why the consented run
+  was needed. The provisioned pair carries one source digest computed
+  independently on both platforms, as the VK-2 pair does. A third thing the
+  VK-2 record leaves unproved is a rule rather than an observation: a present fence's status before it is waited on is not a
   contract on either platform, so the fence is waited for and nothing is read
   into whether it happened to be signalled already. Later
   native slices' #158 prerequisite is satisfied by PR #174. Host-retirement
@@ -357,9 +371,13 @@ their implementations are complete or replace canonical readiness review.
   native construction. Device idle alone is not presentation retirement. Repair
   these failure paths before reusing the harness as a native-lifetime template;
   the retained successful profile evidence remains useful.
-- CI-5 (`test`/`autotest` adapter integration) remains explicitly deferred.
-  The old foundation umbrella is architectural context, not another queue for
-  duplicating completed resources/runtime/GLFW or the newer TIME/LIFE arcs.
+- Test selection follows [the owner policy](docs/test_classification.md): quick
+  core contracts in the floor, relevant integration/tooling contracts selected
+  by changes, and optional local display-deadline/nontermination/confinement
+  probes. `$test`/`$autotest` can discover the documented local inventory; this
+  is not a new scheduler, receipt adapter, or execution-history integration.
+  CI-5's broader adapter work remains deferred. The old foundation umbrella is
+  architectural context, not another queue for duplicating completed arcs.
 - No game save schema, full Synarchy port, permanent RTS tuning, or general
   engine-wide rendering abstraction is committed yet.
 

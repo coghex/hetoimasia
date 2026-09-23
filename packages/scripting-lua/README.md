@@ -326,8 +326,9 @@ The suite runs with `-threaded -rtsopts -with-rtsopts=-N2`, and so does the
 `lua-hazard` executable. `-N2` rather than `-N`, so every machine runs the same
 thing: the hazard needs one thread inside Lua and one observing it.
 
-The hazard runner carries four modes. Three are examples: the uninterruptible
-chunk, the allocation sweep, and the progress proof. The fourth,
+The hazard runner carries four modes. The allocation sweep and progress proof
+are routine examples. The uninterruptible chunk is selected separately by
+`lua-hazard-probes`, which deliberately exhausts its observation window. The fourth,
 `callback-cancellation`, is a diagnostic — it cancels callback threads, which
 the contract does not support, and ends the process some of the time, which is
 the evidence for saying so. Run it by hand; the suite does not assert on it.
@@ -601,7 +602,8 @@ and passing vacuously.
 cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct
 ```
 
-The validation group is `test.lua-confinement-linux`. A green run of it is
+The validation group is `test.lua-confinement-linux`, optional and local-only.
+It is not selected automatically, even for affected inputs. A green run of it is
 evidence and never a verdict: each example prints what it proved, or says that
 the machine could not install the profile and names the prerequisite that was
 missing. What those lines add up to is
@@ -641,3 +643,20 @@ cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=
 Each example prints what it proved. The validation group is
 `test.macos-confinement`, optional and local-only; see
 [docs/validation.md](../../docs/validation.md#the-macos-confinement-probe).
+
+## Routine tests and optional probes
+
+`lua-host-tests` keeps the quick bridge/protocol contracts, including protected
+allocation failures and one-capability foreign-call progress. The deliberate
+nonterminating-Lua experiment is separate:
+
+```sh
+cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct
+```
+
+It deliberately waits five seconds and terminates its child process. It and
+both confinement feasibility probes are local-only and optional. Select them
+explicitly or through coordinated local testing; see the repository's
+[test classification](../../docs/test_classification.md). The existing
+`lua-hazard callback-cancellation` mode remains a manual diagnostic with no
+pass/fail oracle, not a routine test.

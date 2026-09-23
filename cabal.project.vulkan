@@ -9,7 +9,10 @@
 --
 --   bash tools/vulkan-proof/run-proof.sh
 --
--- which is also what supplies the platform's loader prefix. See
+-- which is also what points the build at the loader: the native prefix
+-- `tools/native/vulkan.py` provisions carries it, and the runner passes that
+-- prefix's link and include directories on the command line. No project file is
+-- generated, here or beside this one. See docs/validation.md and
 -- docs/vulkan_compatibility_record.md.
 import: cabal.project.common
 

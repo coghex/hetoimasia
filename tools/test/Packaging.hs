@@ -21,6 +21,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath (normalise, pathSeparator, takeDirectory, takeFileName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
+import VulkanProof (readByTheseExamples)
 
 -- | Every package-relative path this suite executes or reads out of the
 -- checkout, together with the helpers those files load for themselves. An
@@ -31,8 +32,8 @@ consumed ∷ [(FilePath, String)]
 consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
-  , ("tools/display/x11.sh", "Display.hs runs it")
-  , ("tools/display/wayland.sh", "Display.hs runs it")
+  , ("tools/display/x11.sh", "the separate x11-helper-tests suite runs it")
+  , ("tools/display/wayland.sh", "the separate wayland-helper-tests suite runs it")
   , ("tools/ci-image/provision.sh", "Packaging.hs reads the pins it sources")
   , ("tools/ci-image/compositor.pin", "provision.sh sources it")
   , ("tools/ci-image/toolchain.pin", "provision.sh sources it")
@@ -41,6 +42,8 @@ consumed =
   , ("tools/ci-image/builder.py", "CiImage.hs runs it")
   , ("tools/native/native.py", "CiImage.hs runs it, and ci_image.py runs it to verify a worker")
   , ("tools/native/glfw.pin", "native.py reads it")
+  , ("tools/native/vulkan.pin", "vulkan.py reads it, and provision.sh sources it")
+  , ("tools/native/vulkan.py", "native.py imports it, and ci_image.py imports it to declare a worker's map")
   , ("tools/validation/range.py", "Execution.hs runs it")
   , ("tools/validation/run.py", "Execution.hs, Reuse.hs, and TimingStep.hs run it")
   , ("tools/validation/receipts.py", "run.py, aggregate.py, and reuse.py load it")
@@ -55,11 +58,23 @@ consumed =
   , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, and Reuse.hs reads its worker declarations")
   , ("cabal.project.vulkan", "VulkanProof.hs reads the packages and constraints it declares")
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
-  , ("tools/vulkan-proof/environment.pin", "VulkanProof.hs reads the driver manifests it pins")
   , ("tools/vulkan-proof/run-proof.sh", "VulkanProof.hs reads it to check it supplies no native-session consent")
   , ("docs/vulkan/macos.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan/linux.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan_compatibility_record.md", "VulkanProof.hs checks it still quotes the records' own totals")
+  , ("docs/vulkan/macos-provisioned.md", "VulkanProof.hs reads the provisioned record it must agree with")
+  , ("docs/vulkan/linux-provisioned.md", "VulkanProof.hs reads the provisioned record it must agree with")
+  ]
+
+-- | Files an example reads out of a checkout that the distribution must never
+-- carry, because a project file inside an unpacked distribution breaks
+-- resolution wherever it lands. The example reading them reports itself
+-- pending where they are absent rather than failing, so the suite still runs
+-- from a distribution; where it can see them it holds them as usual.
+checkoutOnly ∷ [(FilePath, String)]
+checkoutOnly =
+  [ ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
+  , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   ]
 
 -- | The packaging declaration the inventory is derived from.
@@ -85,13 +100,25 @@ spec = describe "Source distribution" $ do
       [] → pure ()
       absent → expectationFailure (report absent)
 
+  it "never carries a checkout-only file" $ do
+    checkout ← getCurrentDirectory
+    inventory ← packagedFiles checkout
+    [path | (path, _) ← checkoutOnly, path `elem` inventory] `shouldBe` []
+
+  it "accounts for every file the Vulkan proof boundary reads" $ do
+    -- That module states what it reads once, for the planner's sake; this holds
+    -- the same list to the packaging inventory's two halves, so a file it
+    -- starts reading is either carried or declared checkout-only.
+    let accounted = map fst consumed ++ map fst checkoutOnly
+    filter (`notElem` accounted) readByTheseExamples `shouldBe` []
+
   it "carries every pin the provisioning script sources, whatever those come to be" $ do
     -- Naming the pins in `consumed` would only hold for the pins someone
     -- remembered to name. This reads the shipped script instead, so a pin
     -- added to it later is carried or this fails.
     checkout ← getCurrentDirectory
     sourced ← sourcedPins checkout
-    sourced `shouldBe` ["tools/ci-image/compositor.pin", "tools/ci-image/toolchain.pin"]
+    sourced `shouldBe` ["tools/ci-image/compositor.pin", "tools/ci-image/toolchain.pin", "tools/native/vulkan.pin"]
     inventory ← packagedFiles checkout
     filter (`notElem` inventory) sourced `shouldBe` []
 

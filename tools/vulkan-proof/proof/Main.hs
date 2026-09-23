@@ -47,6 +47,7 @@ import Test.Vulkan.Proof.Consent (consentVariable, readConsent, refusalMessage)
 import qualified Test.Vulkan.Proof.ConstructionSpec as Construction
 import Test.Vulkan.Proof.Invocation (Mode (..), selectMode)
 import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
+import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import Test.Vulkan.Proof.Journal (entries, newJournal)
 import qualified Test.Vulkan.Proof.PublicationSpec as Publication
 import Test.Vulkan.Proof.Record (renderRecord)
@@ -84,14 +85,16 @@ headless selectors = do
 
 -- | Everything @--headless@ selects: the release decision's own examples, the
 -- composite constructions' ownership examples, the present handoff's
--- cancellation examples, and the invocation policy's. The native run asserts
--- what it can of these too, through "Test.Vulkan.Proof.Spec".
+-- cancellation examples, the invocation policy's, and the loader selection's.
+-- The native run asserts what it can of these too, through
+-- "Test.Vulkan.Proof.Spec".
 headlessExamples ∷ Spec
 headlessExamples = do
   Retention.spec
   Construction.spec
   Publication.spec
   Invocation.spec
+  Loader.spec
 
 native ∷ IO ()
 native = do

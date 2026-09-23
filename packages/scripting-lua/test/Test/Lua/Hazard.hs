@@ -1,23 +1,7 @@
--- | The three examples that need a process of their own.
+-- | Fast foreign-call progress and allocation-failure contracts.
+-- The deliberate nontermination experiment lives in lua-hazard-probes.
 --
--- The first is the execution path this bridge does not support. A thread inside
--- Lua cannot be cancelled: @lua_pcall@ is a @safe@ foreign call, and an
--- asynchronous exception is not delivered to a thread that is inside one, so a
--- chunk that never returns holds its thread for the life of the process.
--- Running that here would leave a thread and an interpreter running for the
--- rest of the suite; so the @lua-hazard@ executable runs it, reports what it
--- observed, and this example ends that process and keeps its exit status. The
--- evidence it reports is @throwTo@'s own behaviour rather than a guess about
--- scheduling: @throwTo@ returns when the exception is delivered, so a @throwTo@
--- that has not returned is a cancellation that has not been delivered.
---
--- What that fixes for later slices: cancelling a task that is inside Lua is a
--- rejected path. A supervisor that must reclaim a running task needs something
--- other than an asynchronous exception -- a hook Lua itself consults, or a
--- process boundary. Both are later slices' work; that they will be needed is
--- this example's finding.
---
--- A fourth mode, @callback-cancellation@, is a diagnostic rather than an
+-- The separate mode @callback-cancellation@ is a diagnostic rather than an
 -- example. It cancels callback threads, which the contract does not support --
 -- a callback thread is the runtime's machinery, not an endpoint an owner
 -- addresses -- and it ends this process some of the time, which is the evidence
@@ -26,12 +10,12 @@
 -- cancellation, of a VM's execution owner, is exercised in
 -- "Test.Lua.Faults".
 --
--- The second is the publication path's behaviour under memory exhaustion, which
--- needs an allocator that fails on demand -- something the binding exports no
+-- The allocation-failure example exercises the publication path under memory
+-- exhaustion. It needs an allocator that fails on demand; the binding exports no
 -- way to install from Haskell.
 --
--- The third is requirement 8's independent-progress proof, and it is here
--- because it needs an RTS option this suite cannot have: exactly one
+-- The progress example is requirement 8's independent-progress proof. It needs
+-- an RTS option this suite cannot have: exactly one
 -- capability. That is what makes the claim falsifiable. Under one capability a
 -- Haskell thread can run during a foreign call only if the call released the
 -- capability; if @lua_pcall@ were imported @unsafe@ it would not, and the count
@@ -39,8 +23,6 @@
 -- the suite's own two capabilities the same example passes either way.
 module Test.Lua.Hazard (spec) where
 
-import Control.Exception (throwIO)
-import Data.List (isInfixOf)
 import System.Directory (findExecutable)
 import System.Exit (ExitCode (ExitSuccess))
 import System.IO (BufferMode (LineBuffering), hGetLine, hSetBuffering)
@@ -48,7 +30,6 @@ import System.Process
   ( CreateProcess (env, std_out)
   , StdStream (CreatePipe)
   , proc
-  , terminateProcess
   , waitForProcess
   , withCreateProcess
   )
@@ -60,33 +41,23 @@ import Test.Hspec
   , it
   , shouldBe
   , shouldContain
-  , shouldNotBe
   )
 import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "hazard" $ do
-  it "cannot cancel a thread that is inside Lua, and says so from a child process" $
-    withHazard ["uninterruptible-lua"] EndedByTheSuite $ \reported status → do
-      reported `shouldContain` "HAZARD uninterrupted"
-      -- It could not end itself: its only remaining thread is inside Lua.
-      status `shouldNotBe` ExitSuccess
-      if "attempts=" `isInfixOf` reported
-        then pure ()
-        else throwIO (userError ("the report named no attempt count: " <> reported))
-
   it "lets Haskell progress inside a Lua computation on a one-capability runtime" $
     -- -N1 overrides the executable's own -with-rtsopts=-N2, which is the whole
     -- point: with a second capability the other thread could have run there
     -- instead, and the example would prove nothing about the foreign call.
-    withHazard ["capability-release", "+RTS", "-N1", "-RTS"] EndsItself $ \reported status → do
+    withHazard ["capability-release", "+RTS", "-N1", "-RTS"] $ \reported status → do
       reported `shouldContain` "HAZARD progressed"
       reported `shouldContain` "samples=2"
       status `shouldBe` ExitSuccess
       grew reported
 
   it "reports memory exhaustion on every protected path instead of dying of it" $
-    withHazard ["allocation-failure"] EndsItself $ \reported status → do
+    withHazard ["allocation-failure"] $ \reported status → do
       -- Publishing a callback, reading a global, and opening a standard library
       -- each replaced a binding wrapper that allocated its arguments before
       -- entering its own protected call. Each is starved at every point along
@@ -147,18 +118,10 @@ grew reported = case (number "first", number "second") of
       Just value | [(parsed ∷ Int, "")] ← reads value → Just parsed
       _ → Nothing
 
--- | Whether a mode can end its own process.
-data Ending
-  = -- | It returns from @main@; the suite waits for it.
-    EndsItself
-  | -- | Its only remaining thread is inside Lua, so the suite ends it and the
-    -- exit status is the evidence that it had to.
-    EndedByTheSuite
-
 -- | Run one hazard mode, read its report, and hand it and the exit status to
 -- the example.
-withHazard ∷ [String] → Ending → (String → ExitCode → Expectation) → Expectation
-withHazard arguments ending check = do
+withHazard ∷ [String] → (String → ExitCode → Expectation) → Expectation
+withHazard arguments check = do
   found ← findExecutable "lua-hazard"
   case found of
     Nothing →
@@ -177,8 +140,5 @@ withHazard arguments ending check = do
         Just reading → do
           hSetBuffering reading LineBuffering
           reported ← bounded (hGetLine reading)
-          case ending of
-            EndsItself → pure ()
-            EndedByTheSuite → terminateProcess handle
           status ← bounded (waitForProcess handle)
           check reported status
