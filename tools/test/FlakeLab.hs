@@ -21,6 +21,7 @@ spec = describe "Local flake lab" $
     , "test_proposals_deduplicate_and_retain_disposition"
     , "test_success_failure_and_crash_distinct"
     , "test_timeout_reaps_stubborn_descendant"
+    , "test_timeout_preserves_outcome_for_exited_unreaped_member"
     , "test_leaked_child_is_not_a_pass"
     , "test_parent_death_stops_child_and_releases_lock"
     , "test_empty_or_inconsistent_probe_report_refused"

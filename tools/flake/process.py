@@ -4,6 +4,13 @@ The coordinator hands this process its execution-lock descriptor. The guardian
 retains it until its child group has been terminated and reaped. EOF on the
 parent's pipe means the coordinator died; the group is then cancelled. No PID
 from a previous run is ever signalled. A returned result is fsynced before exit.
+
+The guardian reaps only its direct child and signals only that child's group.
+An exited member can remain unreaped. Linux kill(2) still succeeds for a
+zombie-only group, so the group counts as present until those zombies are
+reaped. Darwin killpg raises EPERM instead. That EPERM means no live member
+only when every listed member is a zombie, or none remain; a live or unreadable
+member is reported as a cleanup failure. Exited members alone are not a leak.
 """
 from __future__ import annotations
 
@@ -22,12 +29,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import atomic_json, file_hash, utc
 
 
+def members(pgid):
+    """Stat strings for one process group, or None when the listing is unusable."""
+    try:
+        found = subprocess.run(
+            ["ps", "-ax", "-o", "pid=", "-o", "stat=", "-o", "pgid="],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if found.returncode != 0:
+        return None
+    stats = []
+    for line in found.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            return None
+        try:
+            row_pgid = int(parts[2])
+        except ValueError:
+            return None
+        if row_pgid == pgid:
+            stats.append(parts[1])
+    return stats
+
+
+def exited_only(pgid):
+    """True when every remaining member is a zombie or the group lists none."""
+    stats = members(pgid)
+    if stats is None:
+        return None
+    return all(stat.startswith("Z") for stat in stats)
+
+
 def group_exists(pgid):
+    """Whether kill(2) can address this group.
+
+    Linux succeeds for a zombie-only group. Darwin raises EPERM; that is absence
+    of a live member only when every listed member is a zombie or none remain.
+    """
     try:
         os.killpg(pgid, 0)
-        return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        if exited_only(pgid) is True:
+            return False
+        raise
+    return True
+
+
+def has_live_member(pgid):
+    """Whether a member is still running. Exited members are not a leak."""
+    if not group_exists(pgid):
+        return False
+    exited = exited_only(pgid)
+    if exited is None:
+        raise PermissionError(f"cannot read process group {pgid}")
+    return not exited
 
 
 def send(pgid, sig):
@@ -35,6 +95,10 @@ def send(pgid, sig):
         os.killpg(pgid, sig)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # Nothing running can be signalled. A live or unreadable member must surface.
+        if exited_only(pgid) is not True:
+            raise
 
 
 def reap_group(process, grace):
@@ -86,10 +150,12 @@ def supervise(spec):
                     reap_group(child, spec["grace"])
                     result["outcome"] = reason
                 else:
-                    # A successful leader leaving live descendants is a broken
-                    # probe, not a passing test. Still clean up our whole group.
-                    leaked = group_exists(child.pid)
-                    if leaked:
+                    # A successful leader leaving a live descendant is a broken
+                    # probe, not a passing test. Exited members are not a leak.
+                    # A zombie-only group still exists on Linux, so clean it up
+                    # without reporting a leak.
+                    leaked = has_live_member(child.pid)
+                    if leaked or group_exists(child.pid):
                         reap_group(child, spec["grace"])
                     result["outcome"] = ("harness-error" if leaked else
                                          "passed" if child.returncode == 0 else

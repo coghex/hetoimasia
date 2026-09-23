@@ -31,6 +31,91 @@ def fixture_probe(**changes):
                          inputs=["probe.py"], checks=["sample-check"], **changes))
 
 
+# The leader parks one exited member of its own process group, held by a child
+# that has left that group but stayed in the session. waitid observes that
+# zombie without reaping it, pipes announce the park, and the release fifo lets
+# the fixture reap its helper. The leader then sleeps only so the deadline fires.
+_HOLDS_EXITED_MEMBER = r"""
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+status_path = sys.argv[1]
+release_path = sys.argv[2]
+leader = os.getpid()
+held_r, held_w = os.pipe()
+ready_r, ready_w = os.pipe()
+holder = os.fork()
+if holder == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    os.close(held_r)
+    zombie = os.fork()
+    if zombie == 0:
+        os.close(held_w)
+        os.close(ready_r)
+        try:
+            os.setpgid(0, leader)
+        except OSError as error:
+            os.write(ready_w, str(error.errno).encode())
+            os.close(ready_w)
+            os._exit(1)
+        os.write(ready_w, b"1")
+        os.close(ready_w)
+        os._exit(0)
+    try:
+        os.setpgid(zombie, leader)
+    except ProcessLookupError:
+        pass
+    os.close(ready_w)
+    mark = os.read(ready_r, 16)
+    os.close(ready_r)
+    if mark != b"1":
+        os.write(held_w, b"err\n")
+        os.close(held_w)
+        os._exit(1)
+    # Observe the zombie without reaping it, then announce on the pipe.
+    os.waitid(os.P_PID, zombie, os.WEXITED | os.WNOWAIT)
+    release = os.open(release_path, os.O_RDWR)
+    payload = f"{os.getpid()} {os.getpgid(0)} {os.getsid(0)} {zombie}\n".encode()
+    os.write(held_w, payload)
+    os.close(held_w)
+    os.read(release, 1)
+    os.close(release)
+    os.waitpid(zombie, 0)
+    os._exit(0)
+try:
+    os.setpgid(holder, holder)
+except ProcessLookupError:
+    pass
+Path(status_path + ".holder").write_text(str(holder))
+os.close(held_w)
+os.close(ready_r)
+os.close(ready_w)
+line = os.read(held_r, 128)
+os.close(held_r)
+if not line or line.startswith(b"err"):
+    sys.exit(2)
+holder_pid, holder_pgid, holder_sid, zombie = (int(part) for part in line.split())
+lines = [
+    f"leader={leader}",
+    f"leader_pgid={os.getpgid(0)}",
+    f"leader_sid={os.getsid(0)}",
+    f"holder={holder_pid}",
+    f"holder_pgid={holder_pgid}",
+    f"holder_sid={holder_sid}",
+    f"zombie={zombie}",
+]
+path = Path(status_path)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text("\n".join(lines) + "\n")
+os.replace(temporary, path)
+time.sleep(60)
+"""
+
+
 class LabChecks(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hetoimasia-flake-check-")
@@ -41,9 +126,10 @@ class LabChecks(unittest.TestCase):
         self.state.db.close()
         self.temp.cleanup()
 
-    def run_child(self, code, timeout=2):
+    def run_child(self, code, timeout=2, command=None):
+        argv = [sys.executable, "-c", code] if command is None else command
         with self.state.execution_lock() as lock:
-            return process.run([sys.executable, "-c", code], self.root, dict(os.environ),
+            return process.run(argv, self.root, dict(os.environ),
                                self.root / "attempt", timeout, lock, lambda: None, grace=0.1)
 
     def test_history_immutable_and_idempotent(self):
@@ -137,6 +223,89 @@ class LabChecks(unittest.TestCase):
                 return
             time.sleep(0.02)
         self.fail(f"owned child {pid} survived")
+
+    def process_row(self, pid):
+        found = subprocess.run(["ps", "-ax", "-o", "pid=", "-o", "stat=", "-o", "pgid="],
+                               text=True, capture_output=True, check=False)
+        for line in found.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == str(pid):
+                return parts[1], int(parts[2])
+        self.fail(f"process {pid} was not listed")
+
+    def member_status(self, path):
+        self.assertTrue(path.exists(), "exited member was not parked before the deadline")
+        info = {}
+        for line in path.read_text().splitlines():
+            key, value = line.split("=", 1)
+            info[key] = int(value)
+        return info
+
+    def release_held_member(self, release, holder):
+        try:
+            fd = os.open(release, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                os.write(fd, b"x")
+            finally:
+                os.close(fd)
+        if holder is None:
+            return
+        for _ in range(100):
+            try:
+                os.kill(holder, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        try:
+            os.kill(holder, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+    def test_timeout_preserves_outcome_for_exited_unreaped_member(self):
+        status = self.root / "member.status"
+        release = self.root / "member.release"
+        os.mkfifo(release)
+        script = self.root / "hold_exited_member.py"
+        script.write_text(_HOLDS_EXITED_MEMBER)
+        holder = None
+        try:
+            result = self.run_child(
+                "", timeout=2,
+                command=[sys.executable, str(script), str(status), str(release)])
+            early = Path(str(status) + ".holder")
+            if early.exists():
+                holder = int(early.read_text())
+            info = self.member_status(status)
+            holder = info["holder"]
+            self.assertEqual(result["outcome"], "timeout", result.get("error"))
+            self.assertNotIn("error", result)
+            self.assertEqual(info["leader_pgid"], info["leader"])
+            self.assertNotEqual(info["holder_pgid"], info["leader_pgid"])
+            self.assertEqual(info["holder_sid"], info["leader_sid"])
+            self.assertEqual(os.getsid(holder), info["leader_sid"])
+            self.assertEqual(os.getpgid(holder), info["holder_pgid"])
+            zombie_state, zombie_pgid = self.process_row(info["zombie"])
+            self.assertTrue(zombie_state.startswith("Z"), zombie_state)
+            self.assertEqual(zombie_pgid, info["leader_pgid"])
+            holder_state, holder_pgid = self.process_row(holder)
+            self.assertFalse(holder_state.startswith("Z"), holder_state)
+            self.assertEqual(holder_pgid, info["holder_pgid"])
+            self.assertFalse(process.has_live_member(info["leader_pgid"]))
+            if sys.platform == "darwin":
+                self.assertFalse(process.group_exists(info["leader_pgid"]))
+            elif sys.platform.startswith("linux"):
+                self.assertTrue(process.group_exists(info["leader_pgid"]))
+            self.release_held_member(release, holder)
+            released = holder
+            holder = None
+            self.assert_stopped(released)
+            self.assert_stopped(info["zombie"])
+        finally:
+            if holder is not None:
+                self.release_held_member(release, holder)
 
     def test_leaked_child_is_not_a_pass(self):
         code = "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])"
