@@ -15,8 +15,8 @@
 > checked against is the **native recipe fingerprint**, which
 > `python3 tools/native/native.py fingerprint` prints and which covers
 > `glfw.pin`, `native.py`, `vulkan.pin`, `vulkan.py` and the tracked patches;
-> at this head it is `0e1acc2ccbb528…`. The **image recipe fingerprint**,
-> `1d5e6c04b8e7dd…`, is a third thing: `tools/validation/ci_image.py` computes
+> at this head it is `b980d29c71840f…`. The **image recipe fingerprint**,
+> `700a3532dfda8e…`, is a third thing: `tools/validation/ci_image.py` computes
 > it over the whole image recipe and `tools/ci-image/descriptor.json` names it.
 > It binds the published Linux image and has no bearing on this record at all:
 > no image qualifies a local macOS prefix.
