@@ -5136,10 +5136,10 @@ directly refuses the same way. See
 GLFW documents that on some platforms a window move, a window resize, or a menu
 interaction runs a platform modal loop inside `glfwPollEvents` or
 `glfwWaitEventsTimeout`. An owner turn reconciles callbacks, dispatches
-commands, and offers the update hook only after that call returns, so whether
-such a loop exists decides whether anything the application owns progresses
-while a person is interacting. `Test.GLFW.Native.Interaction` measures that
-rather than assuming it; [the verdict](owner_loop_interaction_verdict.md)
+commands, and offers the update hook only after that call returns, so a blocked
+call stalls that owner-driven work. Work the application runs on another thread
+is outside this measurement. `Test.GLFW.Native.Interaction` measures owner-loop
+progress; [the verdict](owner_loop_interaction_verdict.md)
 records what the approved macOS sessions observed, and
 [the records](owner_loop_interaction_evidence.md) retain every timestamped
 record those sessions produced.

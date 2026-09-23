@@ -4,9 +4,9 @@
 -- GLFW documents that on some platforms those interactions run a platform
 -- modal loop inside @glfwPollEvents@ or @glfwWaitEventsTimeout@. An owner turn
 -- reconciles callbacks, dispatches commands, and offers the update hook only
--- after that call returns, so if such a loop exists here, nothing the
--- application owns progresses while the person is interacting. This probe
--- measures that instead of assuming it: it runs the production owner loop over
+-- after that call returns, so a blocked call stalls that owner-driven work.
+-- Work the application runs on another thread is outside this measurement.
+-- This probe measures owner-loop progress: it runs the production loop over
 -- an ordinary window in the shared session, with the session's bounded
 -- interaction trace ("Hetoimasia.GLFW.Internal.Trace") started, and reports the
 -- pump entries and exits, the callbacks delivered between them, the owner

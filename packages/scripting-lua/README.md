@@ -255,11 +255,11 @@ What the contract does promise:
 - **A callback's failure keeps its type and context.** The action runs unmasked,
   so it is interruptible for its own purposes and a failure of any type is
   caught with the context it carried, recorded on the VM, and answered to Lua
-  with the failure marker. Lua may catch that with `pcall` and finish the chunk
-  successfully; the operation's boundary still re-raises the recorded exception,
-  with its own type and context, and adds its operation to that context. The
-  first escape of an operation is the one kept, and an operation that leaves by
-  any other exception takes the record with it.
+  with a light-userdata failure marker carrying no message. Lua may catch that
+  with `pcall` and finish the chunk successfully; the operation's boundary still
+  re-raises the recorded exception with its own type and context, and adds its
+  operation to that context. The first escape of an operation is the one kept,
+  and an operation that leaves by any other exception takes the record with it.
 - **Nothing promises to interrupt arbitrary Lua.** Callbacks are short and do
   not block; work that would block belongs in an asynchronous request or is cut
   into segments. Enforcing limits on untrusted code is the business of the
