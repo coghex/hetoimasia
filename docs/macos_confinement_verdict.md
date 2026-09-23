@@ -27,8 +27,8 @@ LUA-9 through LUA-13 undraftable, whatever the Linux proof (#147) concludes.
 | Proof | Result | Where |
 | --- | --- | --- |
 | Launch and isolation | **Demonstrated, with one gap named below.** Two simultaneous helpers, distinct pids, distinct private directories, distinct IPC endpoints; neither could read the other's sentinel, connect to the other's endpoint, or hold a descriptor for it; ending one left the other running. All four forbidden accesses are refused from native helper code before any mod source is read. **Three** of the four are refused again from Lua after it loads; the network row has no Lua-side attempt at all, and that is [identified missing evidence](#identified-missing-evidence), not a pass. | `Test.MacOS.Confinement`, `Test.MacOS.Isolation` |
-| Whole-process memory | **Demonstrated.** A parent-installed, fatal, whole-process footprint cap terminated a threaded-RTS helper holding Lua strings and native buffers, at 59 MiB of physical footprint against a 64 MiB cap, before the workload's own 256 MiB ceiling and before the parent's external guard. | `Test.MacOS.Limits` |
-| Execution limit | **Demonstrated.** A helper spinning inside Lua outlives its granted 750 ms budget; the parent finds it still running, records `execution-budget-exceeded`, escalates, and reaps the status within the 7.75 s total bound. | `Test.MacOS.Limits` |
+| Whole-process memory | **Demonstrated.** A parent-installed, fatal, whole-process footprint cap terminated a threaded-RTS helper. Each completed step retains a distinct 8 MiB Lua string and a distinct materialized 8 MiB native allocation; the unlimited control reaches 128 MiB of each, 256 MiB total, and one ceiling reading after a major collection still sees all 16 of those native allocations, including the first. The capped run was killed at 60 MiB of physical footprint against a 64 MiB cap. Its last complete report, before the kill, was 16 MiB of Lua payload and 16 MiB of native payload — a pre-termination observation, not a measurement at the kill — before the workload's own 256 MiB ceiling and before the parent's external guard. | `Test.MacOS.Limits` |
+| Execution limit | **Demonstrated.** A helper spinning inside Lua outlived its granted 750 ms budget; the parent found it still running, recorded `execution-budget-exceeded`, and reaped signal 15 at the first signal, 754 ms in, inside the 7.75 s total bound. | `Test.MacOS.Limits` |
 | Lifetime and identity | **Demonstrated.** Initialization failure, parent cancellation, and a forced kill each leave no live process and no admitted owner; the parent's quota is released from the reaped status, never from the signal send; nothing restarts or replays. | `Test.MacOS.Lifetime` |
 | Deployment | **Demonstrated, and this is where the verdict turns.** The whole probe reproduces from an ordinary command-line `cabal test`, headless, with the linker's ad-hoc signature and nothing else. Both load-bearing mechanisms are unsupported interfaces. | this document |
 
@@ -38,7 +38,7 @@ Run it, on macOS:
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
 ```
 
-Each of the 23 examples prints what it proved.
+Each of the 24 examples prints what it proved.
 
 ### The retained receipt
 
@@ -58,24 +58,24 @@ that argues from it.
     "hetoimasia-scripting-lua:macos-confinement-probe",
     "--test-show-details=direct"
   ],
-  "duration_seconds": 3.879,
-  "ended_at": "2026-09-19T16:20:00.000Z",
-  "executed_commit": "391122638858810866aebd38523cb61a94e5e4d3",
-  "executed_tree": "ca24f0a4d1e8db17b6429bbf604108339bec59f7",
+  "duration_seconds": 26.754,
+  "ended_at": "2026-09-22T16:38:29.230Z",
+  "executed_commit": "8ad27556f586fd8f55995ee8094dc929b422e2d7",
+  "executed_tree": "c926a9b914b76fde070e354180c62426527d64b1",
   "exit_status": 0,
   "group": "test.macos-confinement",
-  "head_commit": "391122638858810866aebd38523cb61a94e5e4d3",
-  "input_identity": "770a3116bed0448c14e9bfc7cb69e8b394be57e6f4e3460fb4b753fee1a07ef4",
+  "head_commit": "8ad27556f586fd8f55995ee8094dc929b422e2d7",
+  "input_identity": "10d1f256e65f2b4d68cf7c5ad0e83f101a2069d318e22a3afa6eea7d1c9eaddd",
   "outcome": "passed",
-  "plan_identity": "a0d257a6c801cd25a5cc27261e2c25c599c42e1a544595ae1118a2fb6f9942e8",
-  "policy_version": "dac58ca7cfc567e1fdc5ca84d2314445c36168d6b1f61ead32a4c87108715ee5",
+  "plan_identity": "42e89f66ebae9e277fcc00006610d43ae58c32b90355d7e37e2fb71ba7b5c1e7",
+  "policy_version": "fd8d341bab0f5f522d2b448d20717922ae00b4481ebce83a26dacb8144e41a8b",
   "runner_arch": "arm64",
   "runner_class": "cpu",
   "runner_os": "Darwin",
   "runner_python": "3.14.6",
   "schema_version": 3,
   "source_run_url": "",
-  "started_at": "2026-09-19T16:19:56.121Z",
+  "started_at": "2026-09-22T16:38:02.475Z",
   "timeout_seconds": 1800,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -88,13 +88,14 @@ that argues from it.
 `runner_os` is `Darwin`. Remote CI never runs macOS, so this receipt is local
 evidence only: it can never satisfy a Linux plan.
 
-Its `executed_commit` is not this pull request's head, and it does not need to
-be. Everything committed after it is Markdown, which is
-[harmless prose](validation.md#harmless-prose) excluded from `input_identity` —
-and the head's `input_identity` is still
-`770a3116bed0448c14e9bfc7cb69e8b394be57e6f4e3460fb4b753fee1a07ef4`, the value
-the receipt carries. The receipt answers for the tree this pull request asks to
-merge.
+`executed_commit` is `8ad27556f586fd8f55995ee8094dc929b422e2d7`, the commit that
+contains the corrected helper. The earlier receipt named `3911226` and does not
+answer for this helper. This document is a later Markdown commit. Markdown is
+[harmless prose](validation.md#harmless-prose), so it is excluded from
+`input_identity`, and the head's `input_identity` is still
+`10d1f256e65f2b4d68cf7c5ad0e83f101a2069d318e22a3afa6eea7d1c9eaddd`, the value
+the receipt carries. The receipt answers for the corrected helper this pull
+request merges.
 
 ### Exclusion off Darwin, checked rather than assumed
 
@@ -213,20 +214,30 @@ to index a nil value", which proves only that the allowlist works.
 The limit is on **physical footprint** — the same ledger jetsam uses — and not
 on address space. That distinction is the whole reason the row passes:
 
-- The confined threaded-RTS helper reserves **≈1.44 TiB of virtual address
-  space** and was killed at **59 MiB of physical footprint** against its 64 MiB
-  cap. The probe reports both numbers at every step of the workload.
+- The confined threaded-RTS helper reserves **1473739 MiB of virtual address
+  space** on the capped run's last report, and was killed at **60 MiB of
+  physical footprint** against its 64 MiB cap. The probe reports both numbers
+  at every step of the workload.
 - The violation is **terminal, not catchable**: the process is killed with
   `SIGKILL`. It never surfaces to the child as a failed allocation it could
   swallow, and the parent learns of it by reaping signal 9.
-- The cap covers Lua allocations, native allocations, and the RTS together,
-  because it is a property of the process rather than of an allocator. The
-  workload grows all three.
+- The cap is a property of the process, so Lua payload, native payload, and
+  the RTS are all inside the ledger it measures. They are not the same number.
+  Each completed step retains one 8 MiB Lua string and one distinct
+  materialized 8 MiB native allocation, and the helper reports those two
+  payloads separately, only after both allocations have succeeded. The
+  unlimited control reaches 128 MiB of Lua payload and 128 MiB of native
+  payload, 256 MiB total. At that ceiling, after a major collection, one
+  reading still sees all 16 native allocations, including the first. The
+  capped run's last complete report was 16 MiB of Lua payload and 16 MiB of
+  native payload, 32 MiB total: a pre-termination observation, not a
+  measurement at the kill. Payload is not allocator overhead and not the
+  measured footprint.
 
 The public alternative does not work at all. `RLIMIT_AS` and `RLIMIT_DATA` are
 [routed through the virtual-map size limit](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_resource.c#L1560),
 and the probe measures the consequence directly: **the smallest `RLIMIT_AS` the
-confined helper can install is ≈1.44 TiB**, and anything below that is rejected
+confined helper can install is 1474560 MiB**, and anything below that is rejected
 with `EINVAL` before the child runs a line of its own code. (A *trivial C
 process* on this host bottoms out at ≈415 GiB, from the shared-cache
 reservations alone; the RTS adds the rest.) There is no per-mod budget that the

@@ -12,17 +12,20 @@
 -- none of them continues as a plain unconfined child.
 module Main (main) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM, forM_)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.IO as Text
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import Data.Word (Word64, Word8)
 import System.Environment (getArgs, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
+import System.Mem (performGC)
 import Text.Read (readMaybe)
 
 import Hetoimasia.Scripting.Lua.Bridge
@@ -182,7 +185,7 @@ runMode options vm = case optionMode options of
     callGlobal vm "hmp_spin"
   "grow" → do
     reportFootprint
-    grow 0 []
+    grow 1 0 0 NoNative
   _ → do
     reportFootprint
     floorResult ← addressSpaceFloor
@@ -191,24 +194,86 @@ runMode options vm = case optionMode options of
  where
   -- The workload's own finite ceiling. It is independent of the limit under
   -- test, and reaching it is the observation that the limit did nothing.
-  grow held natively
-    | held >= optionCeilingMiB options = do
+  -- Payload bytes, not footprint: each completed step keeps one Lua string and
+  -- one native buffer, and the report names those two separately.
+  grow ∷ Int → Word64 → Word64 → KeptNative → IO ()
+  grow step lua native kept
+    | payloadMiB (lua + native) >= optionCeilingMiB options = do
+        -- Collect anything the steps did not root, then read the native
+        -- buffers that remain. The reading is one observation of every
+        -- completed step, including the earliest, and it is not the counter.
+        performGC
+        emit (nativeWitness kept)
         reportFootprint
-        emit (Ceiling held)
+        emit (Ceiling lua native (lua + native))
         emit Done
     | otherwise = do
+        -- Both allocations succeed before either is counted. The Lua string
+        -- stays rooted in the state; the native buffer stays rooted in 'kept'
+        -- until this mode returns.
         callGlobal vm "hmp_grow_step"
-        let block = ByteString.replicate (8 * 1024 * 1024) 0x6e
-        ByteString.length block `seq` pure ()
-        emit (Held (held + 16))
+        block ← evaluate (allocateNative (fromIntegral step) nativeStepBytes)
+        let lua' = lua + luaStepBytes
+            native' = native + fromIntegral (ByteString.length block)
+            !kept' = KeptNative block kept
+        emit (Held lua' native' (lua' + native'))
         -- Reported every step, not once: the last footprint before the kill is
         -- what says which ledger the limit was measured against.
         reportFootprint
-        grow (held + 16) (block : natively)
+        grow (step + 1) lua' native' kept'
 
   reportFootprint = do
     measured ← readFootprint
     forM_ measured (\(footprint, virtualSize) → emit (Footprint footprint virtualSize))
+
+-- | Lua payload of one memory-workload step, in bytes. 'hmp_grow_step' retains
+-- a string of this size; the native half is 'nativeStepBytes'.
+luaStepBytes ∷ Word64
+luaStepBytes = 8 * 1024 * 1024
+
+-- | Native payload of one memory-workload step, in bytes.
+nativeStepBytes ∷ Int
+nativeStepBytes = 8 * 1024 * 1024
+
+-- | Mebibytes of payload, used only to compare with the configured ceiling.
+payloadMiB ∷ Word64 → Int
+payloadMiB bytes = fromIntegral (bytes `div` (1024 * 1024))
+
+-- | Native buffers retained by the grow loop, newest step at the head.
+data KeptNative = KeptNative !ByteString !KeptNative | NoNative
+
+-- | A constant 'ByteString.replicate' floated out of the loop is one shared
+-- buffer. The fill is an argument of a function the simplifier does not
+-- inline, so each step materializes its own.
+{-# NOINLINE allocateNative #-}
+allocateNative ∷ Word8 → Int → ByteString
+allocateNative fill size = ByteString.replicate size fill
+
+-- | Read every retained native buffer, oldest step first, after the caller has
+-- collected. The fill is the buffer's byte when every byte is that value, and
+-- 0 otherwise; the sum is the bytes actually read.
+nativeWitness ∷ KeptNative → Report
+nativeWitness kept =
+  Retained count each (map (\(fill, _, _) → fill) inspected) (map (\(_, total, _) → total) inspected)
+ where
+  inspected = observe [] kept
+  count = length inspected
+  each
+    | count > 0 && all (\(_, _, size) → size == nativeStepBytes) inspected =
+        fromIntegral nativeStepBytes
+    | otherwise = 0
+  observe acc NoNative = acc
+  observe acc (KeptNative block older) = observe (inspect block : acc) older
+  inspect block =
+    let size = ByteString.length block
+        first = if size == 0 then 0 else ByteString.index block 0
+        (uniform, total) =
+          ByteString.foldl'
+            (\(same, acc) byte → (same && byte == first, acc + fromIntegral byte))
+            (True, 0 ∷ Word64)
+            block
+        fill = if size > 0 && uniform then first else 0
+    in (fill, total, size)
 
 prelude ∷ Options → Text
 prelude options =
