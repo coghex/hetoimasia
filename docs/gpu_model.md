@@ -19,9 +19,11 @@ which any of them becomes one. Which native mechanism proved a fact is the
 boundary's business and is deliberately absent from the fact.
 
 Scope: one graphics session's bookkeeping, as a value the owner threads. The
-native backend package that will own handles, calls and threads does not exist
-yet; when it does it will depend on this package, and this package will not
-depend on it.
+native backend package that owns handles, calls and threads,
+`packages/gpu-vulkan/native`, depends on this package, and this package does
+not depend on it. Today that package holds only VK-6's validation messengers;
+their header-free capture is the diagnostics package, whose contract is
+[Vulkan validation diagnostics](vulkan_diagnostics.md).
 
 ## Ownership
 

@@ -137,7 +137,8 @@ approved ledger changes can accumulate in `docs-wip` for a requested batch landi
 Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-foundation:foundation-tests`, `hetoimasia-runtime:runtime-tests`,
 `hetoimasia-glfw:glfw-tests`, `hetoimasia-scripting-lua:lua-host-tests`,
-`hetoimasia-gpu-vulkan-model:gpu-model-tests`, and `hetoimasia-tests` Hspec suites for
+`hetoimasia-gpu-vulkan-model:gpu-model-tests`,
+`hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, and `hetoimasia-tests` Hspec suites for
 the current bootstrap. Prefer Hspec for future integration and
 resource tests too; use Python probes only where Hspec cannot reasonably exercise
 the boundary. Run `cabal check` in the root and each active

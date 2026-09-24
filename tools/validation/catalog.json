@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 20,
+  "policy_version": 21,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -217,6 +217,28 @@
       "optional": false
     },
     {
+      "id": "test.vulkan-diagnostics",
+      "description": "Portable Hspec contracts for the Vulkan diagnostic capture: the production C capture storage driven through its package-local producer entry — bounded copying under one shared text budget and an object limit, error latching ahead of admission, saturation with its drop counter, truncation and capture-failure counting, contained producer failures, and concurrent producers — and the diagnostic lifetime around it: delivery through the caller's logger by a worker in a group of its own, the verdict, sink failure beside a preserved primary failure, and teardown ordering on every exit. It runs through the CPU project and needs no Vulkan SDK.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-gpu-vulkan-diagnostics:test:diagnostics-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.workflow",
       "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, and the native recipe helper against temporary Git repositories; the local test/flake lab's selection, durable history, recovery, process guardians, exports, and skill installation; and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
       "command": [
@@ -241,7 +263,8 @@
         "tools/toolchain/",
         "tools/validation/",
         "tools/vulkan-proof/",
-        "tools/flake/"
+        "tools/flake/",
+        "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
       ],
       "framework": "hspec",
       "runner": "cpu",

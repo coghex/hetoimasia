@@ -60,6 +60,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
   `cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct`,
+  `cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
 - On Linux only,
   `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct`

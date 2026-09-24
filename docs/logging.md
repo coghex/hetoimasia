@@ -468,7 +468,7 @@ logger built over the adapter's sink instead of over the borrowed one.
 
 It is not the Vulkan native-capture path. That capture is C-only, owned by the
 graphics backend, and never reached through this adapter; see
-[the Vulkan backend design](vulkan_backend_design.md), VK-6.
+[Vulkan validation capture](#vulkan-validation-capture) below.
 
 ```haskell
 data AsyncLogConfig = AsyncLogConfig
@@ -605,6 +605,31 @@ uncancellable region. The forwarding operations have their own examples in the
 [`packages/foundation/test/Test/Foundation/Logging/Sink.hs`](../packages/foundation/test/Test/Foundation/Logging/Sink.hs),
 in `hetoimasia-foundation:foundation-tests` and selected by
 `--test-options='--match=Forwarding'`.
+
+### Vulkan validation capture
+
+The Vulkan backend's validation diagnostics reach the logger by a different
+path, beside this adapter rather than through it, because their producer is not
+a Haskell thread. A debug-utils messenger reports from inside Vulkan calls —
+under the backend's audited `unsafe` recording imports, from calls that must not
+re-enter Haskell — so its callback is C. It copies a capped record into bounded
+storage the diagnostic lifetime owns and returns; it never waits, writes to a
+sink, or runs Haskell. A drain worker in that lifetime's own worker group then
+hands each record to the logger the backend was given, as an ordinary
+`logEvent` under the component `gpu.vulkan.diagnostics`, with a breadcrumb of
+its own and the record's details in fields.
+
+It follows the module authoring guide like any subsystem: the logger is
+borrowed and injected, never flushed or closed by the capture, and the worker is
+joined inside the application's [logging lifetime](#logging-lifetime). Info and
+verbose reports arrive at `Debug`, warnings at `Warning`, errors at `Error`.
+Whether validation failed does not depend on the logger at all: an error latches
+in the capture storage before its record is admitted, whatever the logger's
+filter, and a sink failure is the worker's own terminal status rather than a
+record written through the sink that failed. Either logger configuration works
+with it, synchronous or through this adapter; the capture itself never touches
+the adapter's queue. [Vulkan validation diagnostics](vulkan_diagnostics.md) is
+the contract.
 
 ## Context and precedence
 
