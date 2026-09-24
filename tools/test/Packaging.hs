@@ -73,6 +73,8 @@ consumed =
   , ("docs/vulkan_compatibility_record.md", "VulkanProof.hs checks it still quotes the records' own totals")
   , ("docs/vulkan/macos-provisioned.md", "VulkanProof.hs reads the provisioned record it must agree with")
   , ("docs/vulkan/linux-provisioned.md", "VulkanProof.hs reads the provisioned record it must agree with")
+  , ("docs/vulkan/macos-vk6.md", "VulkanProof.hs reads the VK-6 record it must agree with")
+  , ("docs/vulkan/linux-vk6.md", "VulkanProof.hs reads the VK-6 record it must agree with")
   ]
 
 -- | Files an example reads out of a checkout that the distribution must never
@@ -84,6 +86,9 @@ checkoutOnly ∷ [(FilePath, String)]
 checkoutOnly =
   [ ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
+  , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
+    , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"
+    )
   ]
 
 -- | The packaging declaration the inventory is derived from.

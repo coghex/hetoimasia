@@ -50,7 +50,9 @@ import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import Test.Vulkan.Proof.Journal (entries, newJournal)
 import qualified Test.Vulkan.Proof.PublicationSpec as Publication
-import Test.Vulkan.Proof.Record (renderRecord)
+import Test.Vulkan.Proof.Diagnostics (runDiagnostics)
+import qualified Test.Vulkan.Proof.DiagnosticsSpec as Diagnostics
+import Test.Vulkan.Proof.Record (diagnosticsSection, renderRecordWith)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 import Test.Vulkan.Proof.Run (runProof)
 import qualified Test.Vulkan.Proof.Spec as Proof
@@ -107,12 +109,23 @@ native = do
 
   journal ← newJournal
   outcome ← runProof journal consent
+  -- VK-6's cases run on their own instance once the VK-2 session has torn
+  -- down, in the environment it established. Their capture lifetime has ended,
+  -- and with it their last callback, before any verdict is computed.
+  diagnostics ← runDiagnostics journal
   transcript ← entries journal
 
-  passed ← runCompleteSpec (Proof.spec outcome)
+  passed ← runCompleteSpec (Proof.spec outcome >> Diagnostics.spec diagnostics)
 
   invocation ← describeInvocation
-  let record = renderRecord "The VK-2 native Vulkan compatibility record" invocation transcript outcome passed
+  let record =
+        renderRecordWith
+          "The VK-2 native Vulkan compatibility record"
+          invocation
+          transcript
+          outcome
+          (diagnosticsSection diagnostics)
+          passed
   destination ← lookupEnv recordVariable
   case destination of
     Nothing → Text.putStrLn record

@@ -1,0 +1,50 @@
+cabal-version: 3.16
+name: hetoimasia-gpu-vulkan-native
+version: 0.1.0.0
+synopsis: The native Vulkan backend for Hetoimasia
+description:
+    The package that owns the Vulkan binding, the handles and the calls. It
+    currently holds VK-6's native integration: the debug-utils messengers that
+    deliver validation diagnostics into a diagnostics-package lifetime through a
+    C-only callback, and the record of this package's own FFI configuration.
+    VK-7 extends it with instance, device and target ownership.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a loader.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+extra-source-files:
+    cbits/hetoimasia_vulkan_native.h
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/gpu-vulkan/native
+
+library
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings PatternSynonyms
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.Native.Diagnostics
+    -- The messenger callback, and the compile-time check that the diagnostics
+    -- package's layout mirror is the Vulkan headers' layout. The headers come
+    -- from the provisioned Vulkan prefix `tools/vulkan-proof/run-proof.sh`
+    -- passes to Cabal; the capture header from the diagnostics package.
+    c-sources: cbits/hetoimasia_vulkan_native.c
+    include-dirs: cbits
+    cc-options: -std=c11 -Wall -Wextra -Werror
+    build-depends:
+        base >=4.22 && <4.23,
+        text >=2.1 && <2.2,
+        vulkan >=3.27 && <3.28,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0

@@ -123,6 +123,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
 | `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
+| `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
@@ -211,10 +212,33 @@ project and running the suite through the other one. A change to either project
 file therefore selects the group, because changing either changes what the group
 proves.
 
+`test.vulkan-diagnostics` runs the diagnostics package's own suite: the
+production C capture storage, driven through its package-local producer entry —
+bounded copying under one shared text budget and an object limit, error
+latching ahead of admission, saturation with its drop counter, truncation and
+capture-failure counting, contained producer failures and concurrent producers
+— and the diagnostic lifetime around it, from delivery through the caller's
+logger to the verdict, sink failure beside a preserved primary failure, and
+teardown ordering on every exit. It is mandatory but outside the floor, like
+`test.vulkan` and for the same reason, and like `test.vulkan` its command names
+`cabal.project.cpu` and the group declares that file beside
+`cabal.project.common`: the package includes no Vulkan header and depends on no
+binding or loader, and running its suite through the CPU project is what shows
+it. Its Cabal closure reaches the package's private `capture` sublibrary and its
+C sources, so a change to the capture itself selects it. The native cases that
+install the same capture on real messengers are not this group; they run through
+the VK-2 proof route until VK-8, as
+[the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture)
+describes.
+
 `test.workflow` runs only when affected or requested. It contains workflow,
 planner, receipt, packaging, and runner contracts, including short one-second
 fixtures proving that the runner enforces its deadline and reaps children. It
-contains no display-helper examples.
+contains no display-helper examples. It declares `packages/gpu-vulkan/native/`
+among its inputs, as it declares `tools/vulkan-proof/`: no CPU group can build
+the native backend package, whose only build is the proof route, and this
+group's Vulkan boundary examples are what hold that package out of the ordinary
+projects and read its dependencies.
 
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
@@ -568,7 +592,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland
 ```
@@ -682,7 +706,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 
@@ -1482,8 +1506,12 @@ display `tools/display/x11.sh` starts. It uploads the record as the
 the Vulkan identities the descriptor names and the ones the image itself
 reports. VK-4 provisioned that runtime into the image, so the throwaway
 container this route used to build is gone and the proof now runs against
-exactly the inputs ordinary Linux validation runs against. Nothing about it is
-required. See [the compatibility record](vulkan_compatibility_record.md).
+exactly the inputs ordinary Linux validation runs against. The same run carries
+VK-6's native capture cases, on an instance of their own after the VK-2 session,
+and builds the native backend package they exercise; its record's source digest
+covers that package and its local closure. Nothing about it is required. See
+[the compatibility record](vulkan_compatibility_record.md) and
+[the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture).
 
 `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
 checked-out descriptor names, with the candidate tree mounted:
@@ -1830,7 +1858,7 @@ native="$(python3 tools/native/native.py toolchain)"
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -1892,7 +1920,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
