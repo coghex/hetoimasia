@@ -30,6 +30,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Bridge
   , SurfaceScript (..)
   , scriptSurface
+  , raiseAfterAttach
   , bridgeLeaseAnswer
 
     -- * The rig
@@ -321,9 +322,16 @@ data ObligationState = Owed | Gone | Uncertain
 
 data Bridge = Bridge
   { bridgeScripts ∷ !(TVar (Map Word64 [SurfaceScript]))
+  , bridgeRaiseAfterAttach ∷ !(TVar (Maybe SomeException))
+    -- ^ Raised once by the next attach, after the host has published it: an
+    -- answer lost between the attachment's publication and its caller.
   , bridgeNext ∷ !(TVar Word64)
   , bridgeLeases ∷ !(TVar [Lease])
   }
+
+-- | Have the next attach raise this, once, after the host has published it.
+raiseAfterAttach ∷ Rig → SomeException → IO ()
+raiseAfterAttach rig failure = atomically (writeTVar (bridgeRaiseAfterAttach (rigBridge rig)) (Just failure))
 
 scriptSurface ∷ Rig → Word64 → SurfaceScript → IO ()
 scriptSurface rig surface scripted =
@@ -358,7 +366,8 @@ surfaceBridge events bridge =
         -- stand-in learns it from the construction step it wraps.
         cell ← newIORef Nothing
         let protocol = build (create cell)
-        attachWindowGraphics host window protocol {protocolConstruct = \attachment acknowledgement → writeIORef cell (Just attachment) >> protocolConstruct protocol attachment acknowledgement}
+        answered ← attachWindowGraphics host window protocol {protocolConstruct = \attachment acknowledgement → writeIORef cell (Just attachment) >> protocolConstruct protocol attachment acknowledgement}
+        atomically (stateTVar (bridgeRaiseAfterAttach bridge) (\pending → (pending, Nothing))) >>= maybe (pure answered) throwIO
     , bridgeObligations = \lease → Map.elems <$> readTVar (leaseOwed lease)
     , bridgeObligationAttachment = obligationTarget
     , bridgeObligationHandle = obligationSurface
@@ -497,7 +506,7 @@ newRigWith windows = do
         , scriptTerminate = \_ → record events SessionEnded
         }
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty
-  bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO 100 <*> newTVarIO []
+  bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   pure
     Rig

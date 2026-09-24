@@ -665,9 +665,9 @@ data VulkanHandover
 -- during the construction step is caught there and delivered here once the
 -- attachment is published and announced, so the caller loses the answer and
 -- not the target. One that escapes the attachment elsewhere still announces an
--- attachment that registered and was never announced, so none is left that the
--- owner never hears of: its surface, if it was created, is on the lease, and
--- the owner settles it.
+-- attachment that registered and was never announced — and has the owner watch
+-- it if its port is full — so none is left that the owner never hears of: its
+-- surface, if it was created, is on the lease, and the owner settles it.
 handOverVulkanTarget
   ∷ VulkanController → WindowHost → GraphicsOwner scene → WindowId → TargetClass → IO VulkanHandover
 handOverVulkanTarget (VulkanController state) host owner window classification =
@@ -724,19 +724,27 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
                   | otherwise → rethrowIO caught
         }
     announce service =
-      announceGraphicsTarget owner service >>= \case
+      announceOrWatch service >>= \case
         EventAdmitted → pure (VulkanTargetHandedOver service)
-        EventRefusedFull → do
-          atomically $
-            modifyTVar' (stateUnannounced state) $
-              Map.insert (graphicsAttachment service) (Unannounced service (custodyOf owner (graphicsAttachment service)))
-          pure (VulkanAnnouncementDeferred service)
+        EventRefusedFull → pure (VulkanAnnouncementDeferred service)
         EventPortClosed → pure (VulkanOwnerClosed (Just service))
+    -- Every announcement this handover makes goes through here, the
+    -- recovery's included: one the full port refused is watched by the owner,
+    -- so a release or a close of it still has its surface destroyed. One the
+    -- closed port refused needs nothing more: the owner's own retirement
+    -- destroys every surface its lease still owes.
+    announceOrWatch service = do
+      admitted ← announceGraphicsTarget owner service
+      when (admitted == EventRefusedFull) $
+        atomically $
+          modifyTVar' (stateUnannounced state) $
+            Map.insert (graphicsAttachment service) (Unannounced service (custodyOf owner (graphicsAttachment service)))
+      pure admitted
     recover = do
       found ← atomically (windowGraphicsService host window)
       for_ found $ \service → do
         stage ← atomically (custodyOf owner (graphicsAttachment service))
-        when (stage == Just CustodyRegistered) (void (announceGraphicsTarget owner service))
+        when (stage == Just CustodyRegistered) (void (announceOrWatch service))
 
 -- | Announce an attachment whose handover answered
 -- 'VulkanAnnouncementDeferred' again, now that the owner's port may have room.

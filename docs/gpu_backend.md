@@ -161,7 +161,10 @@ announces the attachment to the owner through its bounded port:
 when the port was full, and `VulkanOwnerClosed` once the owner's admission has
 ended. `VulkanRootsNotReady` attaches nothing.
 
-A deferred attachment stays attached, with its surface deposited. The caller
+A deferred attachment stays attached, with its surface deposited. The same
+holds for an attachment whose answer a cancellation lost after it was
+published: the handover's recovery re-announces it, and if the port is full it
+is deferred and watched exactly the same way. The caller
 may announce it again with `announceVulkanTarget`, after which the owner
 constructs it as any other target, or release it. Until it is announced the
 owner watches it: while any deferred attachment exists, the owner names its
@@ -281,8 +284,9 @@ examples:
   native call with its thread: thread placement, the shared device, readiness,
   incompatible, unusable and failed surfaces, a full owner port — a deferred
   attachment released and its surface destroyed by the owner while the host
-  runs, one announced again and admitted, and one whose destruction failed
-  reported at a checkpoint without a retry — rollback at every startup and
+  runs, one announced again and admitted, one whose destruction failed
+  reported at a checkpoint without a retry, and one whose answer a cancellation
+  lost after publication, recovered into the same watch — rollback at every startup and
   bootstrap step, a cancellation during the handoff's surface creation,
   repeated cancellation during the exit, a first window's close, an individual
   release, the exit order with the owner joined before any window goes, a

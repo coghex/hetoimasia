@@ -90,6 +90,7 @@ spec = describe "Vulkan controller" $ do
     it "leaves a deferred attachment the owner destroys on its own thread once it is released" (bounded testDeferredReleased)
     it "lets a deferred attachment be announced again and admitted" (bounded testDeferredAnnounced)
     it "reports a deferred surface whose destruction failed at a checkpoint, never retries it, and retains its parents" (bounded testDeferredUncertain)
+    it "watches an attachment whose answer a cancellation lost after publication, when its recovered announcement finds the port full" (bounded testRecoveredDeferred)
 
   describe "close and exit" $ do
     it "closing the first-created window retires its target alone, leaving the shared roots and the second target live" (bounded testCloseFirst)
@@ -454,6 +455,37 @@ testDeferredAnnounced = do
     pure (standing, SurfaceDestroyed 102 `elem` events)
   standing `shouldBe` TargetUsable
   earlyDestruction `shouldBe` False
+
+testRecoveredDeferred ∷ IO ()
+testRecoveredDeferred = do
+  base ← newRigOf 3
+  let rig = base {rigPortCapacity = Just 1}
+  (answer, destroyedWhileRunning) ← runRig rig $ \host control → do
+    gate ← newTVarIO False
+    scriptNative rig AtQueryDevices (HoldsUntil gate)
+    flip finally (atomically (writeTVar gate True)) $ do
+      [first, second, third] ← windowsOf host
+      one ← handedOver host first RequiredTarget
+      atomically (custodyOf (vulkanGraphicsOwner host) (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+      _ ← handedOver host second RequiredTarget
+      -- The third window's attachment is published, and a cancellation then
+      -- loses its answer before the handover hears it; the recovery's
+      -- announcement finds the port full.
+      raiseAfterAttach rig (toException Cancelled)
+      answer ← try @Cancelled (handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) third RequiredTarget)
+      Just service ← atomically (windowGraphicsService (vulkanWindowHost host) third)
+      _ ← releaseGraphicsTarget (vulkanWindowHost host) (vulkanGraphicsOwner host) service
+      atomically (writeTVar gate True)
+      pumpUntil host control "the recovered surface's destruction" (elem (SurfaceDestroyed 102) <$> journal rig)
+      pumpUntil host control "the recovered attachment's retirement" $
+        (== SlotFree) . observedSlot <$> atomically (readGraphicsService service)
+      roots ← atomically (readVulkanRoots (vulkanController host))
+      pure (either (const "cancelled") (const "answered") answer ∷ String, viewInstance roots)
+  answer `shouldBe` "cancelled"
+  destroyedWhileRunning `shouldBe` RootLive
+  owner ← threadsOf rig (== InstanceCreated)
+  destroyer ← threadsOf rig (== SurfaceDestroyed 102)
+  destroyer `shouldBe` owner
 
 testDeferredUncertain ∷ IO ()
 testDeferredUncertain = do
