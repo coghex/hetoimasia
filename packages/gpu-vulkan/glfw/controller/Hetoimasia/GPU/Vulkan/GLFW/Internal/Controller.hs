@@ -96,6 +96,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
     -- * Failures
   , InstanceExtensionsMissing (..)
   , OrphanSurfacesUncertain (..)
+  , UnannouncedSurfaceUncertain (..)
   , LeaseRetained (..)
   , RootsOutlivedHost (..)
   ) where
@@ -323,6 +324,17 @@ newtype OrphanSurfacesUncertain = OrphanSurfacesUncertain Int
 
 instance Exception OrphanSurfacesUncertain
 
+-- | The owner could not verify the destruction of a surface whose attachment
+-- it was never told about, which a full port deferred and which was then
+-- released or closed. The surface is retained with its attachment and the
+-- instance, and its destruction is not attempted again.
+data UnannouncedSurfaceUncertain = UnannouncedSurfaceUncertain !AttachmentId !Text
+  deriving (Eq, Show)
+
+instance Exception UnannouncedSurfaceUncertain where
+  displayException (UnannouncedSurfaceUncertain attachment reason) =
+    "destroying the surface of the unannounced attachment " <> show attachment <> " did not complete: " <> Text.unpack reason
+
 -- | The instance's lease still owes a surface, so the instance is retained.
 newtype LeaseRetained = LeaseRetained LeaseAnswer
   deriving (Eq, Show)
@@ -386,8 +398,11 @@ controllerOperations (VulkanController state) =
 -- was never told about whose slot has begun retiring — released, or its window
 -- closing — and forget it. An attachment still attached may yet be announced,
 -- and one whose announcement was admitted is the owner's ordinary target, so
--- neither is touched. Each is settled once: a destruction that was uncertain
--- stays on the lease, retaining the instance, and is not offered again.
+-- neither is touched. Each is settled once and forgotten, however it went. A
+-- destruction that was uncertain is a failure: it stays on the lease, where it
+-- retains the attachment and the instance, it is never offered again, and
+-- 'UnannouncedSurfaceUncertain' is raised, which ends the owner's run and
+-- reaches the application's checkpoints like any other owner failure.
 settleUnannounced ∷ State inst msgr phys dev lease obligation → IO Bool
 settleUnannounced state = do
   entries ← Map.toList <$> readTVarIO (stateUnannounced state)
@@ -411,9 +426,11 @@ settleUnannounced state = do
               Just (Deposit _ (CreatedLive obligation)) → [obligation]
               Just (Deposit _ (CreatedUnusable obligation _)) → [obligation]
               _ → []
-        mapM_ (bridgeDischarge bridge) (nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed))
+        outcomes ← mapM (bridgeDischarge bridge) (nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed))
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
-        pure True
+        case [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] of
+          failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
+          [] → pure True
   pure (or settled)
   where
     bridge = stateBridge state

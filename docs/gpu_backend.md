@@ -172,7 +172,10 @@ its window closed. That destruction is what lets the attachment's retirement
 finish while the session runs; nothing else would ever tell the owner about
 it. An attachment that is still attached may yet be announced, and one whose
 announcement was admitted is the owner's ordinary target, so neither is
-touched.
+touched. A destruction there that is uncertain is never attempted again: its
+obligation keeps retaining the attachment and the instance, and the step raises
+`UnannouncedSurfaceUncertain`, which ends the owner's run and reaches the
+application's checkpoints like any other owner failure.
 
 The owner's construction takes the deposit:
 
@@ -278,7 +281,8 @@ examples:
   native call with its thread: thread placement, the shared device, readiness,
   incompatible, unusable and failed surfaces, a full owner port — a deferred
   attachment released and its surface destroyed by the owner while the host
-  runs, and one announced again and admitted — rollback at every startup and
+  runs, one announced again and admitted, and one whose destruction failed
+  reported at a checkpoint without a retry — rollback at every startup and
   bootstrap step, a cancellation during the handoff's surface creation,
   repeated cancellation during the exit, a first window's close, an individual
   release, the exit order with the owner joined before any window goes, a

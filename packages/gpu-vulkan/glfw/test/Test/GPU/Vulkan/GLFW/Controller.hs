@@ -89,6 +89,7 @@ spec = describe "Vulkan controller" $ do
   describe "a full owner port" $ do
     it "leaves a deferred attachment the owner destroys on its own thread once it is released" (bounded testDeferredReleased)
     it "lets a deferred attachment be announced again and admitted" (bounded testDeferredAnnounced)
+    it "reports a deferred surface whose destruction failed at a checkpoint, never retries it, and retains its parents" (bounded testDeferredUncertain)
 
   describe "close and exit" $ do
     it "closing the first-created window retires its target alone, leaving the shared roots and the second target live" (bounded testCloseFirst)
@@ -453,6 +454,42 @@ testDeferredAnnounced = do
     pure (standing, SurfaceDestroyed 102 `elem` events)
   standing `shouldBe` TargetUsable
   earlyDestruction `shouldBe` False
+
+testDeferredUncertain ∷ IO ()
+testDeferredUncertain = do
+  base ← newRigOf 3
+  let rig = base {rigPortCapacity = Just 1}
+  scriptSurface rig 102 DestroyFails
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    let owner = vulkanGraphicsOwner host
+        windows = vulkanWindowHost host
+    _ ← superviseGraphicsOwner control owner
+    (deferred, gate, _) ← deferredThird rig host
+    flip finally (atomically (writeTVar gate True)) $ do
+      _ ← releaseGraphicsTarget windows owner deferred
+      atomically (writeTVar gate True)
+      -- The owner's step reports the failed destruction as its own failure.
+      atomically (readOwnerFailure owner >>= check . isJust)
+      roots ← atomically (readVulkanRoots (vulkanController host))
+      atomically (writeTVar observed (Just (viewInstance roots, graphicsAttachment deferred)))
+      -- The uncertain surface retains the instance for good, so the owner can
+      -- produce no destruction evidence; only independent evidence lets this
+      -- example's exit finish.
+      void . forkIO $ do
+        atomically (check . null =<< hostPendingAttachments windows)
+        publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      checkRuntime control
+  UnannouncedSurfaceUncertain attachment _ ← raisedAs @UnannouncedSurfaceUncertain outcome
+  -- It names the deferred attachment, and the instance was still live.
+  atomically (readTVar observed) >>= (`shouldBe` Just (RootLive, attachment))
+  events ← journal rig
+  -- Destroyed once, on the owner's thread, and never again; nothing above it.
+  length [() | SurfaceDestroyed 102 ← events] `shouldBe` 1
+  [e | e ← events, e `elem` [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
+  owner ← threadsOf rig (== InstanceCreated)
+  destroyer ← threadsOf rig (== SurfaceDestroyed 102)
+  destroyer `shouldBe` owner
 
 -- ---------------------------------------------------------------------------
 -- Close and exit

@@ -41,6 +41,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
     -- * Failures
   , InstanceExtensionsMissing (..)
   , OrphanSurfacesUncertain (..)
+  , UnannouncedSurfaceUncertain (..)
   , LeaseRetained (..)
   , RootsOutlivedHost (..)
   ) where
@@ -59,6 +60,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , OrphanSurfacesUncertain (..)
   , Readiness (..)
   , RootsOutlivedHost (..)
+  , UnannouncedSurfaceUncertain (..)
   , VulkanController
   , VulkanHandover (..)
   , VulkanHost (..)
