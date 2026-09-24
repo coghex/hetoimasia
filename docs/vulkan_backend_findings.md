@@ -31,8 +31,8 @@ VKR-3 through VKR-8 remain future capability findings, not automatic gates on th
 
 ## Status
 
-- [ ] VKR-1. Make synchronization-validation coverage explicit
-- [ ] VKR-2. Identify native resources and recording regions in graphics captures
+- [x] VKR-1. Make synchronization-validation coverage explicit — [#220]
+- [x] VKR-2. Identify native resources and recording regions in graphics captures — [#250]
 - [ ] VKR-3. Define GPU allocation beneath existing lifetime accounting
 - [ ] VKR-4. Define managed resource uploads at the content-loader boundary
 - [ ] VKR-5. Define access and layout transitions for reusable resources
@@ -44,7 +44,7 @@ VKR-3 through VKR-8 remain future capability findings, not automatic gates on th
 
 ## Verification and developer tooling
 
-### VKR-1. Make synchronization-validation coverage explicit
+### [#220] VKR-1. Make synchronization-validation coverage explicit
 
 The proof enables the Khronos validation layer, but repository configuration and the native-fixture specification do not explicitly enable and record synchronization validation. A clean ordinary-validation run does not establish that access-hazard checking ran. This is a coverage gap, not evidence that an existing barrier is wrong.
 
@@ -57,7 +57,7 @@ The proof enables the Khronos validation layer, but repository configuration and
 
 **Handoff context:** Prefer a coordinated amendment to #220 and its recording/submission consumers. Require explicit configuration, receipt identity, and a controlled check that demonstrates the configuration is active. Qualify the pinned layers on both platforms; preserve the native execution budget and desktop-consent rules. The actual enablement mechanism and measured cost remain unverified.
 
-### VKR-2. Identify native resources and recording regions in graphics captures
+### [#250] VKR-2. Identify native resources and recording regions in graphics captures
 
 The diagnostic design captures messages and bounded object information, but no inspected implementation or requirement assigns useful Vulkan object names or command-region labels. Validation reports and captures would consequently have less context for identifying the target, resource generation, and operation involved.
 

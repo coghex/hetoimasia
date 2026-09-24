@@ -95,6 +95,12 @@ finding needs one; they do not block recording or processing this report.
 
 ### RTC-1. Runtime performance evidence lacks a correlated engine timeline
 
+The owner requested a documentation-only contract discussion on 2026-09-23.
+The [proposed tracing contract](runtime_tracing_design.md) records an opt-in
+GHC-eventlog direction, observation semantics, bounds and qualification questions.
+It is exploring, not an approved design or implementation; RTC-1 remains
+unprocessed. No issue drafting or filing is authorized by that discussion.
+
 **Verification: Verified capability gap in the inspected production code;
 performance impact unmeasured.**
 

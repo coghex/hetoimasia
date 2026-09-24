@@ -37,7 +37,7 @@ LUA-9 through LUA-13 undraftable, whatever the Linux proof (#147) concludes.
 | Proof | Result | Where |
 | --- | --- | --- |
 | Launch and isolation | **Demonstrated, with one gap named below.** Two simultaneous helpers, distinct pids, distinct private directories, distinct IPC endpoints; neither could read the other's sentinel, connect to the other's endpoint, or hold a descriptor for it; ending one left the other running. All four forbidden accesses are refused from native helper code before any mod source is read. **Three** of the four are refused again from Lua after it loads; the network row has no Lua-side attempt at all, and that is [identified missing evidence](#identified-missing-evidence), not a pass. | `Test.MacOS.Confinement`, `Test.MacOS.Isolation` |
-| Whole-process memory | **Demonstrated.** A parent-installed, fatal, whole-process footprint cap terminated a threaded-RTS helper. Each completed step retains a distinct 8 MiB Lua string and a distinct materialized 8 MiB native allocation; the unlimited control reaches 128 MiB of each, 256 MiB total, and one ceiling reading after a major collection still sees all 16 of those native allocations, including the first. The capped run was killed at 60 MiB of physical footprint against a 64 MiB cap. Its last complete report, before the kill, was 16 MiB of Lua payload and 16 MiB of native payload — a pre-termination observation, not a measurement at the kill — before the workload's own 256 MiB ceiling and before the parent's external guard. | `Test.MacOS.Limits` |
+| Whole-process memory | **Demonstrated.** A parent-installed, fatal, whole-process footprint cap terminated a threaded-RTS helper. Each completed step retains a distinct 8 MiB Lua string and a distinct materialized 8 MiB native allocation; the unlimited control reaches 128 MiB of each, 256 MiB total, and one ceiling reading after a major collection still sees all 16 of those native allocations, including the first. The capped run's last reported physical footprint was 60 MiB; it subsequently terminated with SIGKILL under the installed 64 MiB cap. Its last complete report, before the kill, was 16 MiB of Lua payload and 16 MiB of native payload — a pre-termination observation, not a measurement at the kill — before the workload's own 256 MiB ceiling and before the parent's external guard. | `Test.MacOS.Limits` |
 | Execution limit | **Demonstrated.** A helper spinning inside Lua outlived its granted 750 ms budget; the parent found it still running, recorded `execution-budget-exceeded`, and reaped signal 15 at the first signal, 754 ms in, inside the 7.75 s total bound. | `Test.MacOS.Limits` |
 | Lifetime and identity | **Demonstrated.** Initialization failure, parent cancellation, and a forced kill each leave no live process and no admitted owner; the parent's quota is released from the reaped status, never from the signal send; nothing restarts or replays. | `Test.MacOS.Lifetime` |
 | Deployment | **Demonstrated, and this is where the verdict turns.** The whole probe reproduces from an ordinary command-line `cabal test`, headless, with the linker's ad-hoc signature and nothing else. Both load-bearing mechanisms are unsupported interfaces. | this document |
@@ -226,10 +226,12 @@ to index a nil value", which proves only that the allowlist works.
 The limit is on **physical footprint** — the same ledger jetsam uses — and not
 on address space. That distinction is the whole reason the row passes:
 
-- The confined threaded-RTS helper reserves **1473739 MiB of virtual address
-  space** on the capped run's last report, and was killed at **60 MiB of
-  physical footprint** against its 64 MiB cap. The probe reports both numbers
-  at every step of the workload.
+- The capped run's last report records **1473739 MiB of virtual address
+  space** reserved by the confined threaded-RTS helper and **60 MiB of
+  physical footprint**. The helper subsequently terminated with `SIGKILL`
+  under the installed 64 MiB cap; these are pre-termination samples, not
+  measurements at the kill. The probe reports both numbers at every completed
+  step of the workload.
 - The violation is **terminal, not catchable**: the process is killed with
   `SIGKILL`. It never surfaces to the child as a failed allocation it could
   swallow, and the parent learns of it by reaping signal 9.

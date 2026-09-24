@@ -31,17 +31,37 @@ tracker destinations. Posting the amendments does not claim
 their implementations are complete or replace canonical readiness review.
 `$guide continue` handles one follow-up at a time without repeating old audits.
 
-The [latest guide review](docs/guide/2026-09-21T140419Z-25a37d2.md) extends completed
+The [fourth guide review](docs/guide/2026-09-21T140419Z-25a37d2.md) extends completed
 coverage through `25a37d2`, including #235's Wayland/backport work and #236's X11
 repair. Its 170 selected existing examples pass; two new probes on each Bash
 reproduce missed high-status/signal termination in the X11 observer. GUIDE-1
 is filed as #237; all findings in this report are processed. The
-next full audit starts after `25a37d2`. The earlier pending #235 handoff is now
-covered. GLFW-UP-1 remains in its existing upgrade report, and native Wayland,
+earlier pending #235 handoff is now covered; the next report below advances
+this review boundary. GLFW-UP-1 remains in its existing upgrade report, and native Wayland,
 Vulkan and Lua qualification gates remain unchanged.
+
+The [complete guide continuation](docs/guide/2026-09-23T165422Z-68ddbbc-complete.md)
+closes every review gap through `68ddbbc`: all eight merged PRs #238–#245 and
+the direct documentation delta are covered, including the earlier report's
+148 passing owner/protected/opacity examples. New checks: 98 headless Vulkan
+examples pass; workflow has 497 passes and one reproduced flake-lab failure.
+GUIDE-1 is filed as [#246](https://github.com/coghex/hetoimasia/issues/246)
+after owner approval: repair macOS exited-group EPERM overwriting timeout
+outcomes. GUIDE-2's two footprint passages are corrected in the docs worktree,
+awaiting documentation landing: 60 MiB is the last reported sample before
+termination. No new issue is needed. Filing #246 does not establish readiness or a fix.
+The earlier owner-approved [amendment to #237](https://github.com/coghex/hetoimasia/issues/237#issuecomment-5798902077)
+is posted; its X11 repair remains open. Next audit starts after `68ddbbc`, plus
+changed effective issue specs. Separate report queues and qualification gates
+remain open; completed coverage is not their resolution.
 
 ## Direction and owner preferences
 
+- On 2026-09-23 the owner requested documentation-only tracing design, with no
+  issue drafts or filing. [Runtime tracing](docs/runtime_tracing_design.md)
+  proposes opt-in GHC eventlog capture, bounded engine records and offline
+  inspection. Backend, viewer and cost/budget choices await owner agreement;
+  RTC-1 remains unprocessed and no implementation is claimed.
 - Build a modular Haskell/Vulkan engine with Lua, then separate 2D and 3D
   renderers. Synarchy (`~/work/synarchy`) is valuable prior work and a possible
   future game client; migration is not automatic compatibility.
