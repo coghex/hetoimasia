@@ -34,6 +34,9 @@ package hetoimasia-gpu-vulkan-diagnostics
 package hetoimasia-gpu-vulkan-native
   ghc-options: -Werror -j
 
+package hetoimasia-gpu-vulkan-glfw
+  ghc-options: -Werror -j
+
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 

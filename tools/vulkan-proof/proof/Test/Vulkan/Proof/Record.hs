@@ -6,12 +6,13 @@
 -- stopped still says what it had established before it stopped. The verdict
 -- line at the top is the run's own, and it is computed from the same values the
 -- Hspec examples assert over — not narrated separately.
-module Test.Vulkan.Proof.Record (renderRecord, renderRecordWith, diagnosticsSection, bridgeSection, achievedFrom, matrixTable) where
+module Test.Vulkan.Proof.Record (renderRecord, renderRecordWith, diagnosticsSection, bridgeSection, rootsSection, achievedFrom, matrixTable) where
 
 import Data.Text (Text)
 import qualified Data.Text as Text
 
 import qualified Data.Map.Strict as Map
+import Data.Word (Word64)
 
 import Hetoimasia.Foundation.Log (LogEntry (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics
@@ -36,6 +37,15 @@ import Test.Vulkan.Proof.Diagnostics
   )
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop (describeProvenance)
+import Test.Vulkan.Proof.Roots
+  ( NativeCall (..)
+  , RootsFacts (..)
+  , RootsOutcome (..)
+  , rootsCaptureConfig
+  , teardownReports
+  )
+import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
+import Numeric (showHex)
 import Test.Vulkan.Proof.Matrix
   ( Achieved (..)
   , MatrixRow (..)
@@ -569,3 +579,75 @@ deliveredTable phases =
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
+
+-- | VK-7's section: the production roots under the graphics owner.
+rootsSection ∷ RootsOutcome → [Text]
+rootsSection = \case
+  RootsStopped reason calls →
+    [ ""
+    , "## VK-7: the Vulkan roots under the graphics owner"
+    , ""
+    , "The roots session stopped: " <> reason
+    , ""
+    ]
+      <> callTable Nothing calls
+  RootsProved facts →
+    [ ""
+    , "## VK-7: the Vulkan roots under the graphics owner"
+    , ""
+    , "A fourth session, through the integration package's own composition: the"
+    , "native backend package's production roots, run by the GLFW package's"
+    , "supervised graphics owner, with the GLFW package's production surface bridge,"
+    , "inside a diagnostic lifetime whose capture both of the instance's messengers"
+    , "report into. Two hidden windows are handed over; the first-created is closed"
+    , "while the second stays attached; the host then exits. Every native call is"
+    , "listed below with the OS thread it ran on, read through `pthread_self` at the"
+    , "call itself, and the reports the capture received during it. Reports during"
+    , "child teardown reach the explicit messenger, which is live until its own"
+    , "destruction; reports during `vkDestroyInstance` reach the create-info"
+    , "messenger alone. Their counts are platform-dependent and are recorded, not"
+    , "required."
+    , ""
+    ]
+      <> definitions
+        [ ("capture limits", describeConfig rootsCaptureConfig)
+        , ("main thread", "OS thread " <> hexWord (rootsMainOsThread facts) <> ", " <> tshow (rootsMainHaskellThread facts))
+        , ("readiness", rootsReadiness facts)
+        , ("device", maybe "none" id (viewDeviceName (rootsBeforeClose facts)))
+        , ("queue family", maybe "none" tshow (viewQueueFamily (rootsBeforeClose facts)))
+        , ("targets once both windows were handed over", listOrNone [tshow cls <> " on surface " <> hexWord surface | (cls, surface) ← rootsTargets facts])
+        , ("after the first window closed", describeView (rootsAfterClose facts))
+        , ("second target after the close", maybe "unknown" tshow (rootsSecondAfterClose facts))
+        , ("windows after the close", tshow (rootsWindowsAfterClose facts))
+        , ("reports during child teardown (explicit messenger)", tshow explicit)
+        , ("reports during vkDestroyInstance (create-info messenger)", tshow createInfo)
+        ]
+      <> [""]
+      <> verdictLines (rootsVerdict facts)
+      <> [""]
+      <> callTable (Just (rootsMainOsThread facts)) (rootsCalls facts)
+    where
+      (explicit, createInfo) = teardownReports (rootsCalls facts)
+  where
+    describeView view =
+      "device " <> tshow (viewDevice view) <> ", instance " <> tshow (viewInstance view) <> ", " <> tshow (length (viewTargets view)) <> " targets"
+
+-- | Every observed native call, in the order it returned.
+callTable ∷ Maybe Word64 → [NativeCall] → [Text]
+callTable mainThread calls =
+  [ row ["Native call", "OS thread", "Main thread", "Haskell thread", "Reports during it", "Raised"]
+  , row ["---", "---", "---", "---", "---", "---"]
+  ]
+    <> [ row
+          [ callName call
+          , hexWord (callOsThread call)
+          , maybe "unknown" (\main → yesNo (callOsThread call == main)) mainThread
+          , tshow (callHaskellThread call)
+          , tshow (callReports call)
+          , maybe "no" id (callRaised call)
+          ]
+       | call ← calls
+       ]
+
+hexWord ∷ Word64 → Text
+hexWord value = "0x" <> Text.pack (showHex value "")

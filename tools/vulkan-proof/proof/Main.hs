@@ -54,7 +54,9 @@ import Test.Vulkan.Proof.Bridge (runBridge)
 import qualified Test.Vulkan.Proof.BridgeSpec as Bridge
 import Test.Vulkan.Proof.Diagnostics (runDiagnostics)
 import qualified Test.Vulkan.Proof.DiagnosticsSpec as Diagnostics
-import Test.Vulkan.Proof.Record (bridgeSection, diagnosticsSection, renderRecordWith)
+import Test.Vulkan.Proof.Record (bridgeSection, diagnosticsSection, renderRecordWith, rootsSection)
+import Test.Vulkan.Proof.Roots (runRoots)
+import qualified Test.Vulkan.Proof.RootsSpec as Roots
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 import Test.Vulkan.Proof.Run (runProof)
 import qualified Test.Vulkan.Proof.Spec as Proof
@@ -118,9 +120,15 @@ native = do
   -- VK-5's cases then run through the GLFW package's own Vulkan interop
   -- component, in a production session of their own, on this same main thread.
   bridge ← runBridge journal
+  -- VK-7's cases then run the production roots under the supervised graphics
+  -- owner, over two windows of a session of their own, on this same main
+  -- thread; their diagnostic lifetime has ended before any verdict is computed.
+  roots ← runRoots journal
   transcript ← entries journal
 
-  passed ← runCompleteSpec (Proof.spec outcome >> Diagnostics.spec diagnostics >> Bridge.spec bridge)
+  passed ←
+    runCompleteSpec
+      (Proof.spec outcome >> Diagnostics.spec diagnostics >> Bridge.spec bridge >> Roots.spec roots)
 
   invocation ← describeInvocation
   let record =
@@ -129,7 +137,7 @@ native = do
           invocation
           transcript
           outcome
-          (diagnosticsSection diagnostics <> bridgeSection bridge)
+          (diagnosticsSection diagnostics <> bridgeSection bridge <> rootsSection roots)
           passed
   destination ← lookupEnv recordVariable
   case destination of

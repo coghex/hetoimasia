@@ -3,10 +3,11 @@
 # validation layers the private native prefix was provisioned with.
 #
 # This is the only thing that builds `tools/vulkan-proof`, and with it the
-# native backend package `packages/gpu-vulkan/native` and the GLFW package's
-# Vulkan interop component. It selects the repository's third project file,
-# `cabal.project.vulkan`, which is the only one that names the first two or
-# turns the third on — so an ordinary `cabal build all`, with either of the
+# native backend package `packages/gpu-vulkan/native`, the window integration
+# package `packages/gpu-vulkan/glfw`, and the GLFW package's Vulkan interop
+# component. It selects the repository's third project file,
+# `cabal.project.vulkan`, which is the only one that names the first three or
+# turns the fourth on — so an ordinary `cabal build all`, with either of the
 # other two project files, neither resolves nor links the Vulkan binding.
 #
 # Every input comes from one place: `tools/native/native.py prepare`, which
@@ -42,9 +43,12 @@
 #   bash tools/display/x11.sh -- bash tools/vulkan-proof/run-proof.sh   # Linux
 #
 # Every argument is forwarded to the harness as a test option. `--headless`
-# selects the release decision's own examples and nothing else: they are pure,
-# open no window, initialize no GLFW, and read no consent, so that run needs
-# none and starts no session.
+# selects the harness's pure examples, and also runs the native backend
+# package's and the window integration package's own headless suites: none of
+# them opens a window, initializes GLFW, creates a Vulkan object, or reads
+# consent, so that run needs none and starts no session. Every other argument
+# reaches all three suites, each of which fails a selection that matches none
+# of its own examples.
 #
 #   bash tools/vulkan-proof/run-proof.sh --headless
 #
@@ -145,11 +149,13 @@ root = sys.argv[1]
 # left out: `tools/native` holds both the GLFW pin and the recipe that builds
 # from it, and two different recipes must not be able to produce one digest.
 # The production packages the proof builds against are its inputs too — the
-# native backend package, the diagnostics package whose C capture it installs,
-# the GLFW package whose Vulkan interop component and surface bridge VK-5's
-# cases exercise, and their local dependency closure, C sources, headers and
-# Cabal files included — so a change to production capture or bridge code
-# moves the digest exactly as a change to the harness does.
+# native backend package, whose roots VK-7's cases run, the window integration
+# package that composes them with the graphics owner, the diagnostics package
+# whose C capture it installs, the GLFW package whose Vulkan interop component,
+# surface bridge and graphics owner VK-5's and VK-7's cases exercise, and their
+# local dependency closure, C sources, headers and Cabal files included — so a
+# change to production roots, capture or bridge code moves the digest exactly
+# as a change to the harness does.
 #
 # Both platforms compute it from a checkout — Linux inside the published CI
 # image with the candidate mounted, macOS from the worktree — so a digest taken
@@ -157,7 +163,7 @@ root = sys.argv[1]
 # macOS metadata are excluded because they are not inputs and do not exist
 # identically in both places.
 roots = ["tools/vulkan-proof", "tools/native", "tools/display",
-         "packages/gpu-vulkan/native", "packages/glfw",
+         "packages/gpu-vulkan/native", "packages/gpu-vulkan/glfw", "packages/glfw",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
          "packages/runtime", "packages/foundation"]
 files = ["cabal.project.vulkan", "cabal.project.common",
@@ -200,7 +206,7 @@ if [ -z "${HETOIMASIA_PROOF_REVISION:-}" ]; then
     if ! git -C "$root" diff --quiet HEAD -- \
       "$root/tools/vulkan-proof" "$root/cabal.project.vulkan" \
       "$root/cabal.project.common" "$root/tools/toolchain/binding.pin" \
-      "$root/packages/gpu-vulkan/native" "$root/packages/glfw" \
+      "$root/packages/gpu-vulkan/native" "$root/packages/gpu-vulkan/glfw" "$root/packages/glfw" \
       "$root/packages/gpu-vulkan/diagnostics" "$root/packages/gpu-vulkan/model" \
       "$root/packages/runtime" "$root/packages/foundation" 2>/dev/null; then
       source_revision="$source_revision (dirty)"
@@ -241,6 +247,18 @@ done
 # installed there carries an absolute install name, so this is the whole
 # configuration a link needs: no rpath, no machine path, and nothing left on
 # disk afterwards to go stale.
+# A headless run also runs the native backend package's and the window
+# integration package's own suites, which make no native call either; their
+# mains drop the runner's `--headless` flag and read every other option as the
+# harness does. A native run is the proof alone.
+suites=(hetoimasia-vulkan-proof:vulkan-proof)
+for argument in "$@"; do
+  if [ "$argument" = "--headless" ]; then
+    suites+=(hetoimasia-gpu-vulkan-native:native-tests hetoimasia-gpu-vulkan-glfw:integration-tests)
+    break
+  fi
+done
+
 cd "$root"
 exec cabal test \
   --project-file=cabal.project.vulkan \
@@ -248,5 +266,5 @@ exec cabal test \
   --extra-lib-dirs="$HETOIMASIA_VULKAN_LIBDIR" \
   --extra-include-dirs="$HETOIMASIA_VULKAN_INCLUDEDIR" \
   --test-show-details=direct \
-  hetoimasia-vulkan-proof:vulkan-proof \
+  "${suites[@]}" \
   ${options[@]+"${options[@]}"}

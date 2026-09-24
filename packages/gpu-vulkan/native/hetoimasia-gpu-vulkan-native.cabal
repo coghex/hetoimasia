@@ -3,11 +3,15 @@ name: hetoimasia-gpu-vulkan-native
 version: 0.1.0.0
 synopsis: The native Vulkan backend for Hetoimasia
 description:
-    The package that owns the Vulkan binding, the handles and the calls. It
-    currently holds VK-6's native integration: the debug-utils messengers that
-    deliver validation diagnostics into a diagnostics-package lifetime through a
-    C-only callback, and the record of this package's own FFI configuration.
-    VK-7 extends it with instance, device and target ownership.
+    The package that owns the Vulkan binding, the handles and the calls: VK-6's
+    debug-utils messengers that deliver validation diagnostics into a
+    diagnostics-package lifetime through a C-only callback, the record of this
+    package's own FFI configuration, and VK-7's roots — the instance, the
+    explicit messenger, the one shared device and the per-target surface
+    records, with their profile, admission, device-loss latch and
+    child-before-parent destruction over an open native layer. It depends on no
+    window system: a surface arrives as its handle and the action that
+    destroys it.
     .
     It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
     nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a loader.
@@ -27,13 +31,19 @@ source-repository head
     location: https://github.com/coghex/hetoimasia.git
     subdir: packages/gpu-vulkan/native
 
-library
+common language
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings PatternSynonyms
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
+        Hetoimasia.GPU.Vulkan.Native.Profile
+        Hetoimasia.GPU.Vulkan.Native.Roots
+        Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
     -- from the provisioned Vulkan prefix `tools/vulkan-proof/run-proof.sh`
@@ -43,8 +53,40 @@ library
     cc-options: -std=c11 -Wall -Wextra -Werror
     build-depends:
         base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
+        vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0
+
+-- The roots' headless examples: the profile's decisions, and every ownership
+-- decision of the roots over a stand-in native layer that fails at a chosen
+-- step. They make no native call and create no device; the executable links
+-- the loader only because the library does, so it is built and run through
+-- `tools/vulkan-proof/run-proof.sh --headless`, which points Cabal at the
+-- provisioned prefix.
+test-suite native-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.GPU.Vulkan.Native.Profile
+        Test.GPU.Vulkan.Native.Roots
+        Test.GPU.Vulkan.Native.StandIn
+    ghc-options: -threaded -rtsopts
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        vulkan >=3.27 && <3.28,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native
