@@ -295,8 +295,11 @@ package, the diagnostics package, the GPU model and the foundation beside its
 own directories, so a change to the production capture moves the digest.
 
 The Linux record from the `vulkan-proof` route is retained as
-[`docs/vulkan/linux-vk6.md`](../../docs/vulkan/linux-vk6.md). VK-8 migrates these
-cases into the package-native fixture and retires this route for them.
+[`docs/vulkan/linux-vk6.md`](../../docs/vulkan/linux-vk6.md), and the record of a
+local macOS run under the human's explicit approval for that session as
+[`docs/vulkan/macos-vk6.md`](../../docs/vulkan/macos-vk6.md); both carry one
+source digest. VK-8 migrates these cases into the package-native fixture and
+retires this route for them.
 
 ## Running it
 

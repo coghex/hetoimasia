@@ -60,6 +60,11 @@ provisionedRecords ∷ [(String, FilePath)]
 provisionedRecords =
   [("macOS", "docs/vulkan/macos-provisioned.md"), ("Linux", "docs/vulkan/linux-provisioned.md")]
 
+-- | The records VK-6's native cases produced: the same proof run, retained for
+-- its C-only capture section.
+captureRecords ∷ [(String, FilePath)]
+captureRecords = [("macOS", "docs/vulkan/macos-vk6.md"), ("Linux", "docs/vulkan/linux-vk6.md")]
+
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
@@ -85,6 +90,7 @@ readByTheseExamples =
   ]
     <> map snd retainedRecords
     <> map snd provisionedRecords
+    <> map snd captureRecords
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -322,6 +328,31 @@ spec = describe "The Vulkan proof boundary" $ do
     -- computed independently on each platform, from a checkout on macOS and
     -- from the candidate mounted into the image on Linux.
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") provisionedRecords
+    map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
+    length (nub (map (fmap trim) digests)) `shouldBe` 1
+
+  it "retains a VK-6 record for each platform, each a pass whose capture reported only the error it provoked" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          take 1 (lines record) `shouldBe` ["# The VK-6 validation capture record, " <> platform]
+          let marked = [number | (number, line) ← zip [0 ∷ Int ..] (lines record), line == capturedMarker]
+          case marked of
+            [only] →
+              take 1 (dropWhile null (drop (only + 1) (lines record)))
+                `shouldBe` ["Verdict: **pass**."]
+            _ → expectationFailure (platform <> "'s VK-6 record marks its captured output " <> show (length marked) <> " times, not once")
+          -- The capture section's own verdict, as the lifetime reached it: the
+          -- provoked validation error and nothing else, with every report
+          -- delivered.
+          fmap trim (settingOf record "- verdict issues:") `shouldBe` Just "ErrorLatched"
+          fmap trim (settingOf record "- undelivered:") `shouldBe` Just "0"
+          fmap trim (settingOf record "- drain worker:") `shouldBe` Just "completed"
+      )
+      captureRecords
+
+  it "proved the VK-6 capture on both platforms from one tree" $ do
+    digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") captureRecords
     map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 
