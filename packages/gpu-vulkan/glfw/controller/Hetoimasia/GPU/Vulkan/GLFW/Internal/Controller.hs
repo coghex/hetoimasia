@@ -552,10 +552,13 @@ data VulkanHandover
 --
 -- It must run on the main thread, as the surface's creation is a GLFW call.
 -- The attachment is restored to cancellation, as the owner's own handover
--- restores it; everything around it is masked. A cancellation that loses the
--- attachment's answer still announces an attachment that registered and was
--- never announced, so none is left that the owner never hears of: its surface,
--- if it was created, is on the lease, and the owner settles it.
+-- restores it; everything around it is masked. A cancellation that arrives
+-- during the construction step is caught there and delivered here once the
+-- attachment is published and announced, so the caller loses the answer and
+-- not the target. One that escapes the attachment elsewhere still announces an
+-- attachment that registered and was never announced, so none is left that the
+-- owner never hears of: its surface, if it was created, is on the lease, and
+-- the owner settles it.
 handOverVulkanTarget
   ∷ VulkanController → WindowHost → GraphicsOwner scene → WindowId → TargetClass → IO VulkanHandover
 handOverVulkanTarget (VulkanController state) host owner window classification =

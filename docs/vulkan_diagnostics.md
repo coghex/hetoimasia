@@ -109,9 +109,11 @@ The default budget does not fit everything a driver routinely says. On macOS,
 MoltenVK's info report of its supported extensions during `vkCreateInstance`
 runs past 4 KiB, so a session at the default budget with info reports enabled
 records one truncation and a verdict that is not clean; Lavapipe's reports all
-fit. VK-6's native proof session runs with a 16 KiB budget for that reason. The
-default is unchanged: what it should be, or whether routine commentary should
-count against a clean verdict, is VK-7's and VK-8's to settle.
+fit. VK-6's native proof session runs with a 16 KiB budget for that reason, and
+so does VK-7's. The default is unchanged. VK-7's production composition
+([gpu_backend.md](gpu_backend.md)) takes its capture configuration from its
+caller rather than settling it; what the default should be, or whether routine
+commentary should count against a clean verdict, rests with VK-8.
 
 ## Latches and counters
 
@@ -341,8 +343,10 @@ exception that is itself the finalization cancellation or group-closing
 failure, which the verdict already accompanies.
 
 Stopping graphics admission when the error latch is set is the owner's, at its
-checkpoints (VK-7, VK-15): this package exposes the latch and does nothing
-about it.
+checkpoints: this package exposes the latch and does nothing about it. VK-7's
+controller does not read it yet — it records and submits nothing, so there is
+no graphics work to stop — and stopping on a strict validation error is in
+VK-15's (#231) scope.
 
 ## Messengers on real objects
 

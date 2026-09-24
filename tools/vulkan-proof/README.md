@@ -16,18 +16,22 @@ Read that for what was proved. This file says how the harness is built and run.
 It is not a backend, not a library, and not a public API. Its GLFW/Vulkan
 interop shim in `cbits/` is deliberately throwaway, and nothing production uses
 it: the production surface bridge is the GLFW package's own Vulkan interop
-component, which VK-5's cases here exercise directly. VK-5 through VK-7 attach
-their own focused native cases to this harness until VK-8 migrates them into the
-package-native fixture and retires it.
+component, which VK-5's cases here exercise directly, and the production roots
+are the native backend package's, which VK-7's cases run through the window
+integration package. VK-5 through VK-7 attach their own focused native cases to
+this harness until VK-8 migrates them into the package-native fixture and
+retires it.
 
 It also adds no production component. `hetoimasia-vulkan-proof` exports no
 library; its only component is a test suite, and the only project file that
 names the package is the repository's `cabal.project.vulkan`. That project also
 names the native backend package `packages/gpu-vulkan/native`, whose production
-capture VK-6's cases exercise; the GLFW package `packages/glfw`, with its manual
-`vulkan-interop` flag on, whose production loader capability and surface bridge
-VK-5's cases exercise; and their local dependency closure — the diagnostics
-package, the GPU model, the runtime and the foundation. Neither `cabal.project`
+capture VK-6's cases exercise and whose roots VK-7's run; the window integration
+package `packages/gpu-vulkan/glfw`, whose composition VK-7's cases run; the GLFW
+package `packages/glfw`, with its manual `vulkan-interop` flag on, whose
+production loader capability and surface bridge VK-5's cases exercise; and their
+local dependency closure — the diagnostics package, the GPU model, the runtime
+and the foundation. Neither `cabal.project`
 nor `cabal.project.cpu` lists the proof or the native package or sets that flag,
 so neither `cabal build all` nor `cabal build all --project-file
 cabal.project.cpu` resolves or links the Vulkan binding. That used to be proved for free, because
@@ -35,7 +39,7 @@ the floor ran on a CI image with no loader at all; VK-4 provisioned one, so
 `tools/test/VulkanProof.hs` now asserts it directly — reading every package
 those two project files name and requiring that none depends on the binding —
 and holds the rest of that boundary honest besides, including that the Vulkan
-project names exactly those seven packages and that only it turns the GLFW
+project names exactly those eight packages and that only it turns the GLFW
 interop component on. That check reads a flag-guarded block as Cabal configures
 it — the interop component's dependencies count only where its flag is on —
 and every other line of the GLFW package in full.
@@ -63,9 +67,11 @@ and every other line of the GLFW package in full.
 | `proof/Test/Vulkan/Proof/DiagnosticsSpec.hs` | Their verdict, asserted over what that session observed once its capture lifetime has ended. |
 | `proof/Test/Vulkan/Proof/Bridge.hs` | VK-5's native cases: a third session through the GLFW package's production Vulkan interop component — its loader capability, a loader-aware session behind a protected host, and a surface created and destroyed under an attachment. |
 | `proof/Test/Vulkan/Proof/BridgeSpec.hs` | Their verdict, asserted over what that session observed once it and its instance have ended. |
-| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record, with VK-6's and then VK-5's sections after the VK-2 findings. |
-| `cbits/` | The throwaway GLFW/Vulkan interop shim and the `dladdr` image provenance. |
-| `run-proof.sh` | The only thing that builds this package, the native backend package, and the GLFW package's Vulkan interop component, and what establishes the project-local environment from the provisioned native prefix. |
+| `proof/Test/Vulkan/Proof/Roots.hs` | VK-7's native cases: a fourth session through the window integration package's own composition — the native package's production roots under the GLFW package's supervised graphics owner, over two windows — with every native call's OS thread and its capture reports recorded at the call. |
+| `proof/Test/Vulkan/Proof/RootsSpec.hs` | Their verdict, asserted once that session, its instance and its diagnostic lifetime have all ended. |
+| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record, with VK-6's, VK-5's and then VK-7's sections after the VK-2 findings. |
+| `cbits/` | The throwaway GLFW/Vulkan interop shim, the `dladdr` image provenance, and the `pthread_self` reading VK-7's cases record. |
+| `run-proof.sh` | The only thing that builds this package, the native backend package, the window integration package, and the GLFW package's Vulkan interop component, and what establishes the project-local environment from the provisioned native prefix. With `--headless` it also runs the two packages' own headless suites. |
 
 The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
@@ -229,12 +235,19 @@ native call, and need no consent, which is what lets a fence timeout, a failed
 boundary, a lost device, a construction that stops at a chosen step, and a
 present cancelled between its enqueue and its record be exercised at all.
 
+`--headless` also builds and runs the native backend package's `native-tests`
+and the window integration package's `integration-tests`: VK-7's headless
+examples, over stand-in native layers, which make no native call either — see
+[`docs/gpu_backend.md`](../../docs/gpu_backend.md#evidence). Their mains drop
+the runner's `--headless` flag.
+
 ```bash
 bash tools/vulkan-proof/run-proof.sh --headless
 ```
 
-Every other argument is forwarded to the harness as a test option, so an Hspec
-selector such as `--match` reaches the headless examples unchanged.
+Every other argument is forwarded to all three suites as a test option, so an
+Hspec selector such as `--match` reaches the headless examples unchanged; each
+suite fails a selection that matches none of its own examples.
 
 The native run accepts no test options, and refuses rather than ignoring one.
 Its record carries `Verdict: pass` or `Verdict: fail` as a claim about the whole
@@ -294,9 +307,11 @@ run at the default budget cut exactly one record — MoltenVK's routine info
 report listing its 145 supported extensions, during `vkCreateInstance` — and the
 truncation rightly made that verdict not clean; Lavapipe's reports all fit. The
 default stays as P-11 set it. What it should be, or whether routine driver
-commentary should count against a clean verdict, is left to VK-7 and VK-8, which
-run production sessions under it; this session only needs every report to
-arrive whole.
+commentary should count against a clean verdict, is not settled here: VK-7's
+production composition takes its capture configuration from its caller, its
+native session below runs at the same 16 KiB, and the default's own question
+rests with VK-8, whose package-native fixture runs production sessions under it.
+This session only needs every report to arrive whole.
 
 The record's source digest covers the production packages this session builds
 against as well as the harness: `run-proof.sh` hashes the native backend
@@ -368,6 +383,56 @@ record of a local macOS run under the human's explicit approval for that session
 as [`docs/vulkan/macos-vk5.md`](../../docs/vulkan/macos-vk5.md); both carry one
 source digest. VK-8 migrates these cases into the package-native fixture and
 retires this route for them.
+
+## VK-7: the Vulkan roots under the graphics owner
+
+After VK-5's session, the native run starts a fourth for
+[VK-7](../../docs/gpu_backend.md), through the window integration package's own
+`withVulkanOwnerHost`: the native backend package's production roots
+(`vulkanRootOps`), run by the GLFW package's supervised graphics owner, with
+the GLFW package's production surface bridge, inside a diagnostic lifetime
+whose capture both of the instance's messengers report into, with the
+validation layer enabled and the capture's text budget at 16 KiB as VK-6's is.
+Nothing of this harness takes part but a `NativeObserver`, which records at
+every native call the OS thread it ran on — read through `pthread_self` at the
+call — the Haskell thread, and how many reports the capture received during
+it. Over two hidden windows it:
+
+- waits for the owner's startup to create the instance and its explicit
+  messenger and lease the instance to the surface bridge;
+- hands both windows over as required targets: each surface is created through
+  GLFW on the main thread inside its attachment's construction, the device is
+  selected against the first and created on the owner's thread, and the second
+  is checked against the queue family already chosen;
+- closes the first-created window while the second stays attached, and turns
+  the owner loop until that window is released;
+- exits, so the owner destroys the second surface, the device, the explicit
+  messenger and the instance, in that order, before it is joined.
+
+`RootsSpec.hs` then requires that no native call raised; that both surfaces were
+created on the process main thread; that the ten owner calls — the instance,
+messenger and device creation, the device and support queries, both surfaces'
+destruction, and the device, messenger and instance destruction — shared one
+Haskell thread that is not the main one, and each ran off the main OS thread
+(the owner is one serialized Haskell thread, not a promise of OS-thread
+affinity); that creation ran instance, messenger, first surface, device query,
+device, second surface, support query; that both targets were admitted, each
+required, on the one device; that after the close the device, the instance and
+the second target were live and one window remained; that destruction ran
+surface, surface, device, messenger, instance; that the capture delivered every
+report it admitted, dropped and lost none, drained completely and was quiesced
+by the instance's destruction; and that no validation error was reported. The
+reports the explicit messenger received during child teardown and the ones the
+create-info messenger received during `vkDestroyInstance` are counted apart and
+printed, not required: how many a driver and the layer produce is
+platform-dependent, and a fixed count would be a claim about a driver rather
+than about the roots.
+
+The record's source digest covers the window integration package as well, so a
+change to the roots or their composition moves it. The Linux record from the
+`vulkan-proof` route is retained as
+[`docs/vulkan/linux-vk7.md`](../../docs/vulkan/linux-vk7.md). VK-8 migrates these
+cases into the package-native fixture and retires this route for them.
 
 ## Running it
 

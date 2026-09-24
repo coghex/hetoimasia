@@ -91,6 +91,7 @@ readByTheseExamples =
   , "tools/validation/catalog.json"
   , "tools/vulkan-proof/run-proof.sh"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
+  , integrationPackage </> "hetoimasia-gpu-vulkan-glfw.cabal"
   , glfwPackage </> "hetoimasia-glfw.cabal"
   , compatibilityRecord
   ]
@@ -112,6 +113,13 @@ proofPackage = "tools/vulkan-proof"
 nativePackage ∷ String
 nativePackage = "packages/gpu-vulkan/native"
 
+-- | The window integration package, which composes the native package with
+-- the GLFW package's graphics owner and surface bridge. It depends on both, so
+-- it resolves the binding through the native package and the interop
+-- component, and the Vulkan project is the only one that may name it.
+integrationPackage ∷ String
+integrationPackage = "packages/gpu-vulkan/glfw"
+
 -- | The GLFW package. The ordinary projects list it with its Vulkan interop
 -- component switched off; the Vulkan project lists it with that component on.
 glfwPackage ∷ String
@@ -123,14 +131,15 @@ interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
 -- | Everything the Vulkan project names: the proof, the native package, the
--- GLFW package whose interop component it enables, and the local dependency
--- closure of the native package and that component. All but the first two are
--- ordinary packages the other projects list too, and with the interop flag
--- off none of them depends on the binding.
+-- window integration package, the GLFW package whose interop component it
+-- enables, and the local dependency closure of the native package and that
+-- component. All but the first three are ordinary packages the other projects
+-- list too, and with the interop flag off none of them depends on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ proofPackage
   , nativePackage
+  , integrationPackage
   , glfwPackage
   , "packages/gpu-vulkan/diagnostics"
   , "packages/gpu-vulkan/model"
@@ -145,7 +154,7 @@ bindingPackage = "vulkan"
 
 spec ∷ Spec
 spec = describe "The Vulkan proof boundary" $ do
-  it "names the proof and the native package, with its local closure, in the one project file that selects them" $ do
+  it "names the proof, the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
     declared `shouldBe` vulkanProject
 
@@ -247,7 +256,7 @@ spec = describe "The Vulkan proof boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (\entry → proofPackage `isPrefixOf` entry || nativePackage `isPrefixOf` entry) declared)
+        (path, filter (\entry → any (`isPrefixOf` entry) [proofPackage, nativePackage, integrationPackage]) declared)
           `shouldBe` (path, [])
         -- The diagnostics package is the header-free half: it is in both, and
         -- the dependency check below is what holds it free of the binding.
@@ -266,6 +275,10 @@ spec = describe "The Vulkan proof boundary" $ do
         nativeDependencies `shouldContain` [bindingPackage]
         interopDependencies ← packageDependenciesWith [interopFlag] glfwPackage
         interopDependencies `shouldContain` [bindingPackage]
+        -- The integration package reaches the binding through both of them.
+        integrationDependencies ← packageDependencies integrationPackage
+        integrationDependencies `shouldContain` ["hetoimasia-gpu-vulkan-native"]
+        integrationDependencies `shouldContain` ["hetoimasia-glfw:vulkan-interop"]
 
   it "sets aside only a disabled flag's own block when it reads a package's dependencies" $ do
     -- The rule above must not become an exemption: a dependency outside the

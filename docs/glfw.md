@@ -3634,7 +3634,9 @@ the startup's own: `ownerStartedEvidence` keeps exactly what
 has ended, rather than reduced to whether the call happened. A record that
 exists is a record an injected operation returned. What it says is the
 backend's business; that there is one is the permission. VK-7 supplies the
-Vulkan operations to this same machinery rather than replacing it.
+Vulkan operations to this same machinery rather than replacing it: the
+controller in `hetoimasia-gpu-vulkan-glfw`, whose contract is
+[gpu_backend.md](gpu_backend.md).
 
 #### The handoffs
 
@@ -4752,9 +4754,10 @@ cannot leave the attachment waiting with no further evidence to come.
 `releaseSurfaceInstance` closes the lease to new
 constructions and answers `InstanceReleasable` only when nothing is in flight or
 owed against it; until then it is `InstanceRetained`, and the instance must not
-be destroyed. The graphics owner that will receive the surface, own the
-instance, and discharge the obligation on its own thread is VK-7's; this slice's
-examples discharge from a scripted owner.
+be destroyed. The graphics owner that receives the surface, owns the instance,
+and discharges the obligation on its own thread is VK-7's
+([gpu_backend.md](gpu_backend.md)); this package's own examples discharge from a
+scripted owner.
 
 `Hetoimasia.GLFW.Vulkan.Provenance` answers what the native proof needs to hold
 the one-loader claim to addresses and images — the entry point a capability was

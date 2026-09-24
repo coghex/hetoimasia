@@ -51,7 +51,7 @@ to these focused contracts and work queues:
 | Original concern | Current authority and status |
 | --- | --- |
 | FND-1, CPU resource ownership | [Resource contract](resources.md), delivered through #22; no duplicate slice |
-| FND-2, Vulkan initialization and disposal | [Vulkan backend design](vulkan_backend_design.md), epic #155; native proof #158 delivered, production ownership #219 remains open |
+| FND-2, Vulkan initialization and disposal | [Vulkan backend design](vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
 | FND-3, minimal depth-tested 3D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-3; needs focused refinement |
 | FND-4, independent textured 2D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-4; needs focused refinement |
 | FND-5, Lua hosting and application bindings | [Lua runtime design](lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |

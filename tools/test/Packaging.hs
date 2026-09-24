@@ -91,6 +91,9 @@ checkoutOnly =
   , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
     , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"
     )
+  , ( "packages/gpu-vulkan/glfw/hetoimasia-gpu-vulkan-glfw.cabal"
+    , "VulkanProof.hs reads the window integration package's dependencies beside the ordinary projects, as a sibling package"
+    )
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"
     )
