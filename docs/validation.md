@@ -777,7 +777,13 @@ arrangement exists to prevent. Waiting is how the exit is observed, and reaping
 the server *is* the observation: nothing is signalled to make it, nothing is
 read out of an exit status the server chose for itself, and the shell's job
 table, which notices an exit at its own pace and is what once let an immediate
-exit be called a timeout, is never asked.
+exit be called a timeout, is never asked. A status above 128 is not read as
+that outcome and is not taken to mean the server is still alive. It is either
+the saved status of a child this wait has already reaped — a later wait would
+only return it again and never finish — or an interruption that left the child
+unreaped. The child is still present only in the second case, which is the
+wait collected again. Presence is asked of the process table, not the job
+table, and nothing is signalled to ask it.
 
 Being separate, the two observations are never ordered against each other, and
 the helper never asks which arrived first. It collects them until a display is

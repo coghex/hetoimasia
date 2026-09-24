@@ -213,11 +213,19 @@ exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened
   # The server's termination, waited for by name. Naming a process is sound
   # here where signalling one would not be: a process id cannot be reused
   # before it is reaped, and the only thing that can reap this one is this
-  # wait. A signal that cuts the wait short leaves it still unreaped, so the
-  # answer is still waiting to be collected.
+  # wait.
+  #
+  # A status above 128 does not say whether that wait finished. A child that
+  # exits with such a status, or dies by a signal, has been reaped, and the
+  # shell returns that saved status from every later wait, so waiting again
+  # would spin and never report the exit. A signal that cuts the wait short
+  # is the other event: the child is still unreaped, so its process is still
+  # present, and the answer is still waiting to be collected. Presence is
+  # what separates them. It is not the job table, nothing is signalled to
+  # ask it, and the status itself is neither an outcome nor a liveness test.
   while :; do
     wait "$server"
-    [ "$?" -gt 128 ] || break
+    ps -p "$server" >/dev/null 2>&1 || break
   done
   printf 'exited\n'
   # Stay until cleanup. The reader may still be blocked on a channel something
