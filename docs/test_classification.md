@@ -74,7 +74,7 @@ also includes them and must not be used in a PR request.
 
 | Stable local test ID / catalog group | Command | Cost and question |
 | --- | --- | --- |
-| `probe:x11-helper` / `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | 16 stub-based examples, approximately 3.2 minutes; startup failures, deadline exhaustion, and cleanup; no desktop |
+| `probe:x11-helper` / `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | 19 stub-based examples, approximately 3.7 minutes; startup failures, deadline exhaustion, and cleanup; no desktop |
 | `probe:wayland-helper` / `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | 11 stub-based examples, including a ten-second readiness deadline; isolated socket environment and cleanup; no desktop |
 | `probe:lua-nontermination` / `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | Five-second cancellation observation of deliberately nonterminating Lua in a child that the probe terminates |
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |

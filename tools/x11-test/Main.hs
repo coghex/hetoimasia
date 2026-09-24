@@ -5,7 +5,8 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_)
+import Control.Exception (finally)
+import Control.Monad (forM_, when)
 import Data.List (isPrefixOf)
 import System.Directory
   ( createDirectory, createFileLink, doesFileExist, findExecutable
@@ -93,6 +94,55 @@ x11Spec = describe "Isolated X11 display" $ do
       holder ← pidIn display "holder.pid"
       stopped holder `shouldReturn` False
       ended holder
+
+  it "refuses to run the command when the X server exits with a status above 128 before reporting a display" $
+    withDisplay $ \display → do
+      -- The channel closes as the stub exits, so both observations are
+      -- available at once. Status 143 is also what an interrupted wait
+      -- returns, and the shell hands that saved status back from every later
+      -- wait for the reaped pid. The refusal has to name the exit rather than
+      -- waiting out the bound and calling the closed channel the whole story.
+      installStubs display (("Xvfb", highStatusServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server exited before reporting a display: exit status 143 before a display"
+        ["server.pid"]
+
+  it "refuses to run the command when a signal kills the X server before it reports a display" $
+    withDisplay $ \display → do
+      -- Signal death is reported as a status above 128 too, 128 plus the
+      -- signal, and that saved status would spin a wait that treated every
+      -- such status as an interruption. The channel closes as the stub dies,
+      -- and the refusal names the exit.
+      installStubs display (("Xvfb", signalDeathServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      refusedStartup
+        display
+        "the X server exited before reporting a display: killed by SIGTERM before a display"
+        ["server.pid"]
+
+  it "refuses to run the command when the X server exits with a status above 128 while its startup report stays open" $
+    withDisplay $ \display → do
+      -- The exit is again the only observation there is to make: the stub
+      -- hands its report channel to a process that never closes it, and then
+      -- ends with status 143. A wait that treated every status above 128 as
+      -- an interruption would never report the exit, and the bound would be
+      -- refused as a report that merely did not arrive. The holder is not a
+      -- process the helper started. The example asserts that, then ends the
+      -- holder itself, and that cleanup runs whether or not the assertions pass.
+      installStubs display (("Xvfb", heldOpenHighStatus) : filter ((/= "Xvfb") . fst) workingStubs)
+      let release =
+            doesFileExist (directory display </> "holder.pid") >>= \exists →
+              when exists $ pidIn display "holder.pid" >>= ended
+      finally
+        ( do
+            refusedStartup
+              display
+              "the X server exited before reporting a display: exit status 143 with the report still open"
+              ["server.pid"]
+            holder ← pidIn display "holder.pid"
+            stopped holder `shouldReturn` False
+        )
+        release
 
   it "refuses to run the command when the X server closes its startup report without naming a display" $
     withDisplay $ \display → do
@@ -303,6 +353,47 @@ handedOffServer =
     , "sh -c 'read held < gate' &"
     , "echo $! > holder.pid"
     , "exit 1"
+    ]
+
+-- | A server that exits with a status above 128 before reporting a display.
+-- The report channel closes because the process does: nothing inherits it.
+-- Status 143 is the shape an interrupted wait also returns.
+highStatusServer ∷ String
+highStatusServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'exit status 143 before a display' >&2"
+    , "exit 143"
+    ]
+
+-- | A server that dies by a signal before reporting a display. The shell
+-- reports that death as a status above 128, and the report channel closes
+-- with the process.
+signalDeathServer ∷ String
+signalDeathServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'killed by SIGTERM before a display' >&2"
+    , "kill -TERM $$"
+    ]
+
+-- | 'handedOffServer' ended with a status above 128. The inherited writer
+-- keeps the report channel open past the bound, so the exit is the only
+-- observation there is, and it has to be recognized from a status an
+-- interrupted wait could also have returned.
+heldOpenHighStatus ∷ String
+heldOpenHighStatus =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "echo 'exit status 143 with the report still open' >&2"
+    , "rm -f gate"
+    , "mkfifo gate"
+    , "sh -c 'read held < gate' &"
+    , "echo $! > holder.pid"
+    , "exit 143"
     ]
 
 -- | A server that closes its report channel and then stays alive, so the
