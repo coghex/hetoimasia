@@ -70,6 +70,11 @@ captureRecords = [("macOS", "docs/vulkan/macos-vk6.md"), ("Linux", "docs/vulkan/
 bridgeRecords ∷ [(String, FilePath)]
 bridgeRecords = [("macOS", "docs/vulkan/macos-vk5.md"), ("Linux", "docs/vulkan/linux-vk5.md")]
 
+-- | The record VK-7's native cases produced: the same proof run, retained for
+-- its roots section. Linux alone unless a consented macOS run is retained too.
+rootsRecords ∷ [(String, FilePath)]
+rootsRecords = [("Linux", "docs/vulkan/linux-vk7.md")]
+
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
@@ -99,6 +104,7 @@ readByTheseExamples =
     <> map snd provisionedRecords
     <> map snd captureRecords
     <> map snd bridgeRecords
+    <> map snd rootsRecords
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -477,6 +483,37 @@ spec = describe "The Vulkan proof boundary" $ do
     map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 
+  it "retains a VK-7 record, a pass whose roots lived on the graphics owner and were destroyed child before parent" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          take 1 (lines record) `shouldBe` ["# The VK-7 Vulkan roots record, " <> platform]
+          let marked = [number | (number, line) ← zip [0 ∷ Int ..] (lines record), line == capturedMarker]
+          case marked of
+            [only] →
+              take 1 (dropWhile null (drop (only + 1) (lines record)))
+                `shouldBe` ["Verdict: **pass**."]
+            _ → expectationFailure (platform <> "'s VK-7 record marks its captured output " <> show (length marked) <> " times, not once")
+          -- Read from the VK-7 section alone: the VK-6 section above it carries
+          -- settings of the same names.
+          let section = unlines (drop 1 (dropWhile (/= "## VK-7: the Vulkan roots under the graphics owner") (lines record)))
+              table = [cells line | line ← lines section, "| vk" `isPrefixOf` line || "| glfw" `isPrefixOf` line]
+              cells line = map trim (splitOn '|' line)
+          fmap trim (settingOf section "- readiness:") `shouldBe` Just "RootsReady"
+          fmap trim (settingOf section "- after the first window closed:") `shouldBe` Just "device RootLive, instance RootLive, 1 targets"
+          fmap trim (settingOf section "- second target after the close:") `shouldBe` Just "TargetUsable"
+          fmap trim (settingOf section "- verdict issues:") `shouldBe` Just "none"
+          fmap trim (settingOf section "- undelivered:") `shouldBe` Just "0"
+          -- Every call ran without raising; surfaces were created on the main
+          -- thread and everything else off it; destruction ran child first.
+          [row | row ← table, lookup' 6 row /= Just "no"] `shouldBe` []
+          [lookup' 3 row | row ← table, lookup' 1 row == Just "glfwCreateWindowSurface"] `shouldBe` [Just "yes", Just "yes"]
+          [lookup' 3 row | row ← table, lookup' 1 row /= Just "glfwCreateWindowSurface"] `shouldSatisfy` all (== Just "no")
+          [name | row ← table, Just name ← [lookup' 1 row], "vkDestroy" `isPrefixOf` name]
+            `shouldBe` ["vkDestroySurfaceKHR", "vkDestroySurfaceKHR", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      )
+      rootsRecords
+
   it "proved both platforms from one tree, by the digest each computed" $ do
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") retainedRecords
     -- Computed independently: from a Git checkout on one, from the files the
@@ -789,3 +826,10 @@ recordTotal record = do
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace
+
+-- | The cell at this index of a Markdown table row split on @|@, where index 0
+-- is the empty text before the row's opening bar.
+lookup' ∷ Int → [String] → Maybe String
+lookup' index row = case drop index row of
+  (cell : _) → Just cell
+  [] → Nothing
