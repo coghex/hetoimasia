@@ -1,11 +1,15 @@
--- The VK-2 proof harness's own project, and the only one that names it.
+-- The Vulkan project: the VK-2 proof harness and the native backend package,
+-- and the only project file that names either.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
--- `tools/vulkan-proof`, so neither resolves nor links the Vulkan binding and
--- neither `cabal build all` nor `cabal build all --project-file
--- cabal.project.cpu` needs a loader on the unchanged CI image. Every mandatory
--- validation group runs through one of those two, so the floor never builds
--- this. Selecting it is an explicit act:
+-- `tools/vulkan-proof` or `packages/gpu-vulkan/native`, so neither resolves nor
+-- links the Vulkan binding and neither `cabal build all` nor `cabal build all
+-- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
+-- mandatory validation group runs through one of those two, so the floor never
+-- builds this. The other three packages here are the native package's local
+-- dependency closure — the diagnostics package whose C capture it installs, the
+-- GPU model, and the foundation — which the ordinary projects list too.
+-- Selecting this project is an explicit act:
 --
 --   bash tools/vulkan-proof/run-proof.sh
 --
@@ -18,12 +22,20 @@ import: cabal.project.common
 
 packages:
   tools/vulkan-proof
+  packages/gpu-vulkan/native
+  packages/gpu-vulkan/diagnostics
+  packages/gpu-vulkan/model
+  packages/foundation
 
 -- The flags docs/toolchain.md qualified, restated here because a constraint is
 -- what actually reaches the dependency: `safe-foreign-calls` so a Vulkan call
--- may re-enter the Haskell debug-utils callback, and `darwin-lib-dirs` off so
--- the loader is the one this repository names rather than whatever sits in
--- /usr/local/lib. `run-proof.sh` checks these against tools/toolchain/binding.pin.
+-- may re-enter the proof's Haskell debug-utils callback, and `darwin-lib-dirs`
+-- off so the loader is the one this repository names rather than whatever sits
+-- in /usr/local/lib. `run-proof.sh` checks these against
+-- tools/toolchain/binding.pin. They are the native package's build too: a
+-- project builds one configuration of the binding, and that package records the
+-- flags it is built under, and the C-only capture callback that needs neither,
+-- in `nativeFfiConfiguration`, which the proof record prints.
 constraints:
     vulkan +safe-foreign-calls,
     vulkan -darwin-lib-dirs

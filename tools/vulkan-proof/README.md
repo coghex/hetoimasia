@@ -21,14 +21,18 @@ package-native fixture and retires it.
 
 It also adds no production component. `hetoimasia-vulkan-proof` exports no
 library; its only component is a test suite, and the only project file that
-names the package is the repository's `cabal.project.vulkan`. Neither
-`cabal.project` nor `cabal.project.cpu` lists it, so neither
+names the package is the repository's `cabal.project.vulkan`. That project also
+names the native backend package `packages/gpu-vulkan/native`, whose production
+capture VK-6's cases exercise, and that package's local dependency closure — the
+diagnostics package, the GPU model and the foundation. Neither `cabal.project`
+nor `cabal.project.cpu` lists the proof or the native package, so neither
 `cabal build all` nor `cabal build all --project-file cabal.project.cpu`
 resolves or links the Vulkan binding. That used to be proved for free, because
 the floor ran on a CI image with no loader at all; VK-4 provisioned one, so
 `tools/test/VulkanProof.hs` now asserts it directly — reading every package
 those two project files name and requiring that none depends on the binding —
-and holds the rest of that boundary honest besides.
+and holds the rest of that boundary honest besides, including that the Vulkan
+project names exactly those five packages.
 
 ## How it is arranged
 
@@ -49,9 +53,11 @@ and holds the rest of that boundary honest besides.
 | `proof/Test/Vulkan/Proof/InvocationSpec.hs` | The invocation policy's examples, selected alongside them. |
 | `proof/Test/Vulkan/Proof/Spec.hs` | The verdict: pure Hspec assertions over those findings. |
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
-| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record. |
+| `proof/Test/Vulkan/Proof/Diagnostics.hs` | VK-6's native cases: a second session, on its own instance, whose only callback is the production C capture. |
+| `proof/Test/Vulkan/Proof/DiagnosticsSpec.hs` | Their verdict, asserted over what that session observed once its capture lifetime has ended. |
+| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record, with VK-6's section after the VK-2 findings. |
 | `cbits/` | The throwaway GLFW/Vulkan interop shim and the `dladdr` image provenance. |
-| `run-proof.sh` | The only thing that builds this package, and what establishes the project-local environment from the provisioned native prefix. |
+| `run-proof.sh` | The only thing that builds this package and the native backend package, and what establishes the project-local environment from the provisioned native prefix. |
 
 The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
@@ -231,6 +237,56 @@ For the same reason the native verdict is computed through Hspec's own
 primitives with the configuration-reading step left out, so neither `./.hspec`,
 `~/.hspec`, nor an ambient `HSPEC_*` can narrow what the record speaks for.
 Selecting among the pure examples is free of that, because they write no record.
+
+## VK-6: validation capture
+
+After the VK-2 session has torn down, the native run starts a second session for
+[VK-6](../../docs/vulkan_diagnostics.md): its own instance, with no window and no
+surface, owned by a `withDiagnosticCapture` lifetime from the diagnostics
+package. Both of its messengers — the one chained into `VkInstanceCreateInfo`
+and the explicit one — are the native backend package's, and both register the
+production C callback with the capture's storage as user data. No Haskell
+callback is installed on that instance, so none of its Vulkan calls can re-enter
+Haskell, and two of them go through genuine `unsafe` foreign imports of the
+instance's and the device's own dispatch pointers:
+
+- `vkSubmitDebugUtilsMessageEXT`, delivering one chosen message to the explicit
+  messenger from inside the call; and
+- `vkCmdSetViewport` with a viewport count of zero, a short recording command
+  the validation layer rejects with
+  `VUID-vkCmdSetViewport-viewportCount-arraylength`, so a validation error
+  reaches the C callback from inside an unsafe recording call.
+
+This is a focused proof operation, not the audited recording subset, which is
+VK-11's. Around every native call the session reads the capture storage's own
+counters, so each report is attributed to the call it arrived in by the
+callback's synchronous effect, and the delivered records are attributed back to
+those calls in admission order. `vkDestroyInstance` is the last thing the
+lifetime's body does, after the explicit messenger has gone, and the verdict is
+read only after the lifetime has ended.
+
+`DiagnosticsSpec.hs` then requires that the callback lies in the proof
+executable's own image — a Haskell callback would be an adjustor the runtime
+allocated, in no image at all — and that no Haskell callback was installed; that
+instance creation reported through the create-info chain; that the submitted
+message arrived, exactly once, inside its unsafe call; that the zero viewport's
+validation error arrived inside its unsafe call and latched the error state;
+that `vkDestroyInstance` reported after the explicit messenger was destroyed and
+every one of those reports was delivered; that the verdict delivered every
+report offered, left nothing undelivered and had a worker that completed; that
+the provoked error is the only issue and the only error; and that the native
+package's recorded FFI configuration matches `tools/toolchain/binding.pin`. The
+record's VK-6 section prints each step's reports, every delivered record, the
+verdict, and that configuration.
+
+The record's source digest covers the production packages this session builds
+against as well as the harness: `run-proof.sh` hashes the native backend
+package, the diagnostics package, the GPU model and the foundation beside its
+own directories, so a change to the production capture moves the digest.
+
+The Linux record from the `vulkan-proof` route is retained as
+[`docs/vulkan/linux-vk6.md`](../../docs/vulkan/linux-vk6.md). VK-8 migrates these
+cases into the package-native fixture and retires this route for them.
 
 ## Running it
 

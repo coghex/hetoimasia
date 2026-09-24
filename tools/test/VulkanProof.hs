@@ -80,6 +80,7 @@ readByTheseExamples =
   , "tools/toolchain/binding.pin"
   , "tools/validation/catalog.json"
   , "tools/vulkan-proof/run-proof.sh"
+  , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
   , compatibilityRecord
   ]
     <> map snd retainedRecords
@@ -93,6 +94,24 @@ ordinaryProjects = ["cabal.project", "cabal.project.cpu"]
 proofPackage ∷ String
 proofPackage = "tools/vulkan-proof"
 
+-- | The native backend package. Like the proof it resolves the binding and the
+-- Vulkan headers, so the Vulkan project is the only one that may name it.
+nativePackage ∷ String
+nativePackage = "packages/gpu-vulkan/native"
+
+-- | Everything the Vulkan project names: the proof, the native package, and
+-- the native package's local dependency closure. The last three are ordinary
+-- packages the other two projects list too; none of them depends on the
+-- binding.
+vulkanProject ∷ [String]
+vulkanProject =
+  [ proofPackage
+  , nativePackage
+  , "packages/gpu-vulkan/diagnostics"
+  , "packages/gpu-vulkan/model"
+  , "packages/foundation"
+  ]
+
 -- | The Hackage package that is the Vulkan binding. Nothing the mandatory floor
 -- builds may depend on it, whatever the image happens to carry.
 bindingPackage ∷ String
@@ -100,9 +119,17 @@ bindingPackage = "vulkan"
 
 spec ∷ Spec
 spec = describe "The Vulkan proof boundary" $ do
-  it "names the proof in the one project file that selects it" $ do
+  it "names the proof and the native package, with its local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
-    declared `shouldBe` [proofPackage]
+    declared `shouldBe` vulkanProject
+
+  it "hashes every package the Vulkan project builds into the proof's source digest" $ do
+    -- A record's digest has to move when production capture code moves, not
+    -- only when the harness does, or two different builds could be recorded
+    -- as one. The runner names its roots by directory, so each is looked for
+    -- as a quoted root.
+    runner ← readFile "tools/vulkan-proof/run-proof.sh"
+    [package | package ← vulkanProject, not (("\"" <> package <> "\"") `isInfixOf` runner)] `shouldBe` []
 
   it "shares the qualified index with every other project" $ do
     text ← readFile "cabal.project.vulkan"
@@ -174,12 +201,19 @@ spec = describe "The Vulkan proof boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (proofPackage `isPrefixOf`) declared) `shouldBe` (path, [])
+        (path, filter (\entry → proofPackage `isPrefixOf` entry || nativePackage `isPrefixOf` entry) declared)
+          `shouldBe` (path, [])
+        -- The diagnostics package is the header-free half: it is in both, and
+        -- the dependency check below is what holds it free of the binding.
+        (path, filter (== "packages/gpu-vulkan/diagnostics") declared)
+          `shouldBe` (path, ["packages/gpu-vulkan/diagnostics"])
         resolved ← mapM packageDependencies declared
         (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
-        -- And the package the proof itself is, to show the check would notice.
+        -- And the packages that do resolve it, to show the check would notice.
         proofDependencies ← packageDependencies proofPackage
         proofDependencies `shouldContain` [bindingPackage]
+        nativeDependencies ← packageDependencies nativePackage
+        nativeDependencies `shouldContain` [bindingPackage]
 
   it "takes the runner's discovery from the provisioned prefix, not a pinned environment" $ do
     -- VK-4 retired `tools/vulkan-proof/environment.pin`; the prefix's own

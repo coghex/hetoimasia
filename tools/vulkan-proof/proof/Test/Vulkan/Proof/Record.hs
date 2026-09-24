@@ -6,11 +6,27 @@
 -- stopped still says what it had established before it stopped. The verdict
 -- line at the top is the run's own, and it is computed from the same values the
 -- Hspec examples assert over — not narrated separately.
-module Test.Vulkan.Proof.Record (renderRecord, achievedFrom, matrixTable) where
+module Test.Vulkan.Proof.Record (renderRecord, renderRecordWith, diagnosticsSection, achievedFrom, matrixTable) where
 
 import Data.Text (Text)
 import qualified Data.Text as Text
 
+import qualified Data.Map.Strict as Map
+
+import Hetoimasia.Foundation.Log (LogEntry (..))
+import Hetoimasia.GPU.Vulkan.Diagnostics
+  ( CaptureCounters (..)
+  , CaptureStatus (..)
+  , ConsumerOutcome (..)
+  , DiagnosticVerdict (..)
+  , verdictIssues
+  )
+import Hetoimasia.GPU.Vulkan.Native.Diagnostics (describeFfiConfiguration)
+import Test.Vulkan.Proof.Diagnostics
+  ( DiagnosticsFacts (..)
+  , DiagnosticsOutcome (..)
+  , PhaseReports (..)
+  )
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop (describeProvenance)
 import Test.Vulkan.Proof.Matrix
@@ -25,7 +41,12 @@ import Test.Vulkan.Proof.Matrix
 
 -- | The whole record, as Markdown.
 renderRecord ∷ Text → Text → [Text] → Outcome → Bool → Text
-renderRecord title invocation transcript outcome passed =
+renderRecord title invocation transcript outcome = renderRecordWith title invocation transcript outcome []
+
+-- | The record with further sections — a later slice's native cases — placed
+-- after the VK-2 findings and before the operation matrix.
+renderRecordWith ∷ Text → Text → [Text] → Outcome → [Text] → Bool → Text
+renderRecordWith title invocation transcript outcome extra passed =
   Text.unlines $
     [ "# " <> title
     , ""
@@ -41,6 +62,7 @@ renderRecord title invocation transcript outcome passed =
     , ""
     ]
       <> body outcome
+      <> extra
       <> [ ""
          , "## Operation and result matrix"
          , ""
@@ -372,3 +394,104 @@ supportedEnabled supported enabled =
 
 number ∷ (Show a, Integral a) ⇒ a → Text
 number = Text.pack . show
+
+-- | VK-6's section: what reached the production C callback, step by step,
+-- and the verdict the diagnostic lifetime reached after its last callback.
+diagnosticsSection ∷ DiagnosticsOutcome → [Text]
+diagnosticsSection = \case
+  DiagnosticsStopped reason verdict phases →
+    [ ""
+    , "## VK-6: C-only validation capture"
+    , ""
+    , "The capture session stopped: " <> reason
+    , ""
+    ]
+      <> maybe [] verdictLines verdict
+      <> phaseTable phases
+  DiagnosticsProved facts →
+    [ ""
+    , "## VK-6: C-only validation capture"
+    , ""
+    , "A second session on its own instance, with no window, whose only"
+    , "debug-utils callback is the native backend package's C function handing"
+    , "each report to the diagnostics package's C producer. Both messengers — the"
+    , "one chained into `VkInstanceCreateInfo` and the explicit one — register it"
+    , "with the capture storage as user data, and no Haskell callback is installed."
+    , "Two calls go through genuine `unsafe` imports of the instance's and device's"
+    , "own dispatch pointers. Each step's reports are read off the storage's own"
+    , "counters around the call, so a report counted against an unsafe call"
+    , "arrived inside it."
+    , ""
+    ]
+      <> definitions
+        ( [ ("device", facts.factsDevice)
+          , ("messenger callback", describeProvenance facts.factsCallback)
+          , ("this executable", facts.factsExecutable)
+          , ("unsafe imports this session declares", listOrNone facts.factsUnsafeImports)
+          , ("binding safe-foreign-calls in binding.pin", maybe "(unset)" id facts.factsPinnedSafeForeignCalls)
+          , ("binding darwin-lib-dirs in binding.pin", maybe "(unset)" id facts.factsPinnedDarwinLibDirs)
+          ]
+            <> [("native package " <> label, value) | (label, value) ← describeFfiConfiguration facts.factsFfi]
+        )
+      <> [""]
+      <> verdictLines facts.factsVerdict
+      <> phaseTable facts.factsPhases
+      <> deliveredTable facts.factsPhases
+
+verdictLines ∷ DiagnosticVerdict → [Text]
+verdictLines verdict =
+  let counters = verdict.verdictStatus.statusCounters
+   in definitions
+        [ ("verdict issues", listOrNone (map (Text.pack . show) (verdictIssues verdict)))
+        , ("error latched", yesNo verdict.verdictStatus.statusErrorLatched)
+        , ("capture failure latched", yesNo verdict.verdictStatus.statusCaptureFailureLatched)
+        , ("reports offered", tshow counters.countOffered)
+        , ("admitted", tshow counters.countAdmitted)
+        , ("dropped", tshow counters.countDropped)
+        , ("truncated", tshow counters.countTruncated)
+        , ("capture failures", tshow counters.countCaptureFailed)
+        , ("error reports", tshow counters.countErrors)
+        , ("delivered to the logger", tshow verdict.verdictDelivered)
+        , ("undelivered", tshow verdict.verdictUndelivered)
+        , ("drain worker", consumer verdict.verdictConsumer)
+        ]
+  where
+    consumer = \case
+      ConsumerCompleted → "completed"
+      ConsumerSinkFailed failure → "sink failed: " <> Text.pack (show failure)
+      ConsumerFailed failure → "failed: " <> Text.pack (show failure)
+      ConsumerCancelled failure → "cancelled: " <> Text.pack (show failure)
+
+phaseTable ∷ [PhaseReports] → [Text]
+phaseTable phases =
+  [ ""
+  , "### Reports by step"
+  , ""
+  , row ["Step", "Reports", "Errors"]
+  , row ["---", "---", "---"]
+  ]
+    <> [row [p.phaseName, tshow p.phaseReports, tshow p.phaseErrors] | p ← phases]
+
+deliveredTable ∷ [PhaseReports] → [Text]
+deliveredTable phases =
+  [ ""
+  , "### Delivered records"
+  , ""
+  , "Every record the drain worker handed to the logger, in delivery order, with"
+  , "the step whose reports it was."
+  , ""
+  , row ["Step", "Severity", "Message id", "Message"]
+  , row ["---", "---", "---", "---"]
+  ]
+    <> [ row [p.phaseName, field "severity" entry, field "message.id" entry, abbreviated (field "text" entry)]
+       | p ← phases
+       , entry ← p.phaseEntries
+       ]
+  where
+    field key entry = Map.findWithDefault "" key entry.entryFields
+    abbreviated text
+      | Text.length text > 160 = Text.take 157 (Text.replace "\n" " " text) <> "..."
+      | otherwise = Text.replace "\n" " " text
+
+tshow ∷ Show a ⇒ a → Text
+tshow = Text.pack . show

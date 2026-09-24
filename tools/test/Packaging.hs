@@ -84,6 +84,9 @@ checkoutOnly ∷ [(FilePath, String)]
 checkoutOnly =
   [ ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
+  , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
+    , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"
+    )
   ]
 
 -- | The packaging declaration the inventory is derived from.

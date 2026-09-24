@@ -2,10 +2,11 @@
 # Run the native Vulkan compatibility proof against the loader, driver, and
 # validation layers the private native prefix was provisioned with.
 #
-# This is the only thing that builds `tools/vulkan-proof`. It selects the
+# This is the only thing that builds `tools/vulkan-proof`, and with it the
+# native backend package `packages/gpu-vulkan/native`. It selects the
 # repository's third project file, `cabal.project.vulkan`, which is the only one
-# that names that package — so an ordinary `cabal build all`, with either of the
-# other two project files, neither resolves nor links the Vulkan binding.
+# that names either — so an ordinary `cabal build all`, with either of the other
+# two project files, neither resolves nor links the Vulkan binding.
 #
 # Every input comes from one place: `tools/native/native.py prepare`, which
 # refuses the prefix unless it is exactly what this configuration provisions and
@@ -142,13 +143,20 @@ root = sys.argv[1]
 # rather than by file, because naming files individually is how an input gets
 # left out: `tools/native` holds both the GLFW pin and the recipe that builds
 # from it, and two different recipes must not be able to produce one digest.
+# The production packages the proof builds against are its inputs too — the
+# native backend package, the diagnostics package whose C capture it installs,
+# and their local dependency closure, C sources, headers and Cabal files
+# included — so a change to production capture code moves the digest exactly
+# as a change to the harness does.
 #
 # Both platforms compute it from a checkout — Linux inside the published CI
 # image with the candidate mounted, macOS from the worktree — so a digest taken
 # on one can be compared with a digest taken on the other. Generated Python and
 # macOS metadata are excluded because they are not inputs and do not exist
 # identically in both places.
-roots = ["tools/vulkan-proof", "tools/native", "tools/display"]
+roots = ["tools/vulkan-proof", "tools/native", "tools/display",
+         "packages/gpu-vulkan/native", "packages/gpu-vulkan/diagnostics",
+         "packages/gpu-vulkan/model", "packages/foundation"]
 files = ["cabal.project.vulkan", "cabal.project.common",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 
@@ -188,7 +196,9 @@ if [ -z "${HETOIMASIA_PROOF_REVISION:-}" ]; then
   if source_revision="$(git -C "$root" rev-parse HEAD 2>/dev/null)"; then
     if ! git -C "$root" diff --quiet HEAD -- \
       "$root/tools/vulkan-proof" "$root/cabal.project.vulkan" \
-      "$root/cabal.project.common" "$root/tools/toolchain/binding.pin" 2>/dev/null; then
+      "$root/cabal.project.common" "$root/tools/toolchain/binding.pin" \
+      "$root/packages/gpu-vulkan/native" "$root/packages/gpu-vulkan/diagnostics" \
+      "$root/packages/gpu-vulkan/model" "$root/packages/foundation" 2>/dev/null; then
       source_revision="$source_revision (dirty)"
     fi
   else
