@@ -16,7 +16,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , validateCaptureConfig
   , withDiagnosticCapture
   )
-import Test.GPU.Vulkan.Diagnostics.Support (everythingFilter, recordingLogger)
+import Test.GPU.Vulkan.Diagnostics.Support (everythingFilter, quiescent, recordingLogger)
 
 spec ∷ Spec
 spec = describe "Configuration" $ do
@@ -53,7 +53,7 @@ spec = describe "Configuration" $ do
     (logger, _) ← recordingLogger everythingFilter
     ran ← newIORef False
     result ←
-      try (withDiagnosticCapture defaultCaptureConfig {captureTextBudget = 0} logger (\_ → writeIORef ran True))
+      try (withDiagnosticCapture defaultCaptureConfig {captureTextBudget = 0} logger (\capture → writeIORef ran True >> quiescent capture ()))
     fmap snd' result `shouldBe` Left (CaptureLimitRejected (TextBudgetRejected 0))
     readIORef ran `shouldReturn` False
   where

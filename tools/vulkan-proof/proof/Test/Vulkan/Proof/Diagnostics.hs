@@ -45,7 +45,7 @@ module Test.Vulkan.Proof.Diagnostics
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (SomeException, displayException, throwIO, try)
+import Control.Exception (SomeException, displayException, mask, onException, throwIO, try)
 import Control.Monad (forM, unless)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
@@ -87,6 +87,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureStatus (..)
   , DiagnosticCapture
   , DiagnosticVerdict (..)
+  , Quiesced
   , captureStatus
   , defaultCaptureConfig
   , diagnosticVerdict
@@ -98,6 +99,7 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
   , captureMessengerCreateInfo
   , createCaptureMessenger
   , destroyCaptureMessenger
+  , destroyInstanceQuiesced
   , nativeFfiConfiguration
   )
 import Test.Vulkan.Proof.Interop (Provenance (..), provenanceOf)
@@ -288,7 +290,7 @@ session
   → IORef [PhaseReports]
   → IORef (Word64, Word64)
   → DiagnosticCapture
-  → IO (Text, Provenance)
+  → IO ((Text, Provenance), Quiesced)
 session journal phases cursor capture = do
   let step ∷ Text → IO a → IO a
       step = measure capture phases cursor
@@ -325,106 +327,110 @@ session journal phases cursor capture = do
           ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT]
   -- The instance is the outermost native scope, so vkDestroyInstance is the
   -- last thing this body does: after the explicit messenger, and before the
-  -- lifetime closes admission.
-  withResourceLabelled
-    "the VK-6 instance"
-    (step creationPhase (createInstance createInfo Nothing))
-    (\vulkan → step destructionPhase (destroyInstance vulkan Nothing))
-    $ \vulkan →
-      withResourceLabelled
-        "the VK-6 explicit messenger"
-        (step "vkCreateDebugUtilsMessengerEXT" (createCaptureMessenger vulkan capture))
-        (step "vkDestroyDebugUtilsMessengerEXT" . destroyCaptureMessenger vulkan)
-        $ \_ → do
-          heading journal "VK-6: a message submitted through an unsafe import"
-          step submitPhase (submitUnsafely vulkan)
-          note journal "vkSubmitDebugUtilsMessageEXT returned from its unsafe import"
+  -- lifetime closes admission. It is destroyed through the native package's
+  -- quiescing destroy on both the returning and the unwinding path, and its
+  -- return is the evidence the lifetime needs that no callback can still run.
+  let inside vulkan =
+        withResourceLabelled
+          "the VK-6 explicit messenger"
+          (step "vkCreateDebugUtilsMessengerEXT" (createCaptureMessenger vulkan capture))
+          (step "vkDestroyDebugUtilsMessengerEXT" . destroyCaptureMessenger vulkan)
+          $ \_ → do
+            heading journal "VK-6: a message submitted through an unsafe import"
+            step submitPhase (submitUnsafely vulkan)
+            note journal "vkSubmitDebugUtilsMessageEXT returned from its unsafe import"
 
-          heading journal "VK-6: a validation error from an unsafe recording call"
-          (_, physicals) ← step "vkEnumeratePhysicalDevices" (enumeratePhysicalDevices vulkan)
-          candidates ← forM (Vector.toList physicals) $ \physical → do
-            properties ← getPhysicalDeviceProperties physical
-            families ← getPhysicalDeviceQueueFamilyProperties physical
-            (_, deviceExtensions) ← enumerateDeviceExtensionProperties physical Nothing
-            let graphics =
-                  [ index
-                  | (index, family) ← zip [0 ..] (Vector.toList families)
-                  , family.queueFlags .&. QUEUE_GRAPHICS_BIT /= zero
-                  ]
-                subset = KHR_PORTABILITY_SUBSET_EXTENSION_NAME `elem` [e.extensionName | e ← Vector.toList deviceExtensions]
-            pure [(physical, decode properties.deviceName, family, subset) | family ← take 1 graphics]
-          (physical, deviceName, family, subset) ← case concat candidates of
-            chosen : _ → pure chosen
-            [] → stopWith "no physical device offers a graphics queue"
-          note journal ("recording on " <> deviceName <> ", queue family " <> tshow family)
-          let deviceInfo =
-                DeviceCreateInfo
-                  { next = ()
-                  , flags = zero
-                  , queueCreateInfos =
-                      Vector.singleton
-                        ( SomeStruct
-                            ( DeviceQueueCreateInfo
-                                { next = ()
-                                , flags = zero
-                                , queueFamilyIndex = family
-                                , queuePriorities = Vector.singleton 1.0
-                                }
-                                ∷ DeviceQueueCreateInfo '[]
-                            )
-                        )
-                  , enabledLayerNames = Vector.empty
-                  , enabledExtensionNames = Vector.fromList [KHR_PORTABILITY_SUBSET_EXTENSION_NAME | subset]
-                  , enabledFeatures = Nothing
-                  }
-                  ∷ DeviceCreateInfo '[]
-          withResourceLabelled
-            "the VK-6 device"
-            (step "vkCreateDevice" (createDevice physical deviceInfo Nothing))
-            (\device → step "vkDestroyDevice" (destroyDevice device Nothing))
-            $ \device →
-              withResourceLabelled
-                "the VK-6 command pool"
-                ( step
-                    "vkCreateCommandPool"
-                    ( createCommandPool
-                        device
-                        CommandPoolCreateInfo {next = (), flags = zero, queueFamilyIndex = family}
-                        Nothing
-                    )
-                )
-                (\pool → step "vkDestroyCommandPool" (destroyCommandPool device pool Nothing))
-                $ \pool → do
-                  buffers ←
-                    step
-                      "vkAllocateCommandBuffers"
-                      ( allocateCommandBuffers
+            heading journal "VK-6: a validation error from an unsafe recording call"
+            (_, physicals) ← step "vkEnumeratePhysicalDevices" (enumeratePhysicalDevices vulkan)
+            candidates ← forM (Vector.toList physicals) $ \physical → do
+              properties ← getPhysicalDeviceProperties physical
+              families ← getPhysicalDeviceQueueFamilyProperties physical
+              (_, deviceExtensions) ← enumerateDeviceExtensionProperties physical Nothing
+              let graphics =
+                    [ index
+                    | (index, family) ← zip [0 ..] (Vector.toList families)
+                    , family.queueFlags .&. QUEUE_GRAPHICS_BIT /= zero
+                    ]
+                  subset = KHR_PORTABILITY_SUBSET_EXTENSION_NAME `elem` [e.extensionName | e ← Vector.toList deviceExtensions]
+              pure [(physical, decode properties.deviceName, family, subset) | family ← take 1 graphics]
+            (physical, deviceName, family, subset) ← case concat candidates of
+              chosen : _ → pure chosen
+              [] → stopWith "no physical device offers a graphics queue"
+            note journal ("recording on " <> deviceName <> ", queue family " <> tshow family)
+            let deviceInfo =
+                  DeviceCreateInfo
+                    { next = ()
+                    , flags = zero
+                    , queueCreateInfos =
+                        Vector.singleton
+                          ( SomeStruct
+                              ( DeviceQueueCreateInfo
+                                  { next = ()
+                                  , flags = zero
+                                  , queueFamilyIndex = family
+                                  , queuePriorities = Vector.singleton 1.0
+                                  }
+                                  ∷ DeviceQueueCreateInfo '[]
+                              )
+                          )
+                    , enabledLayerNames = Vector.empty
+                    , enabledExtensionNames = Vector.fromList [KHR_PORTABILITY_SUBSET_EXTENSION_NAME | subset]
+                    , enabledFeatures = Nothing
+                    }
+                    ∷ DeviceCreateInfo '[]
+            withResourceLabelled
+              "the VK-6 device"
+              (step "vkCreateDevice" (createDevice physical deviceInfo Nothing))
+              (\device → step "vkDestroyDevice" (destroyDevice device Nothing))
+              $ \device →
+                withResourceLabelled
+                  "the VK-6 command pool"
+                  ( step
+                      "vkCreateCommandPool"
+                      ( createCommandPool
                           device
-                          CommandBufferAllocateInfo
-                            { commandPool = pool
-                            , level = COMMAND_BUFFER_LEVEL_PRIMARY
-                            , commandBufferCount = 1
-                            }
+                          CommandPoolCreateInfo {next = (), flags = zero, queueFamilyIndex = family}
+                          Nothing
                       )
-                  commands ← maybe (stopWith "vkAllocateCommandBuffers returned no command buffer") pure (listToMaybe (Vector.toList buffers))
-                  step
-                    "vkBeginCommandBuffer"
-                    ( beginCommandBuffer
-                        commands
-                        ( CommandBufferBeginInfo
-                            { next = ()
-                            , flags = COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-                            , inheritanceInfo = Nothing
-                            }
-                            ∷ CommandBufferBeginInfo '[]
+                  )
+                  (\pool → step "vkDestroyCommandPool" (destroyCommandPool device pool Nothing))
+                  $ \pool → do
+                    buffers ←
+                      step
+                        "vkAllocateCommandBuffers"
+                        ( allocateCommandBuffers
+                            device
+                            CommandBufferAllocateInfo
+                              { commandPool = pool
+                              , level = COMMAND_BUFFER_LEVEL_PRIMARY
+                              , commandBufferCount = 1
+                              }
                         )
-                    )
-                  step recordingPhase (recordUnsafely commands)
-                  note journal "vkCmdSetViewport returned from its unsafe import"
-                  step "vkEndCommandBuffer" (endCommandBuffer commands)
-          heading journal "VK-6: teardown"
-          note journal "the device and its pool are gone; the explicit messenger is destroyed next, then the instance"
-          pure (deviceName, callback)
+                    commands ← maybe (stopWith "vkAllocateCommandBuffers returned no command buffer") pure (listToMaybe (Vector.toList buffers))
+                    step
+                      "vkBeginCommandBuffer"
+                      ( beginCommandBuffer
+                          commands
+                          ( CommandBufferBeginInfo
+                              { next = ()
+                              , flags = COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+                              , inheritanceInfo = Nothing
+                              }
+                              ∷ CommandBufferBeginInfo '[]
+                          )
+                      )
+                    step recordingPhase (recordUnsafely commands)
+                    note journal "vkCmdSetViewport returned from its unsafe import"
+                    step "vkEndCommandBuffer" (endCommandBuffer commands)
+            heading journal "VK-6: teardown"
+            note journal "the device and its pool are gone; the explicit messenger is destroyed next, then the instance"
+            pure (deviceName, callback)
+  mask $ \restore → do
+    vulkan ← step creationPhase (createInstance createInfo Nothing)
+    let quiesce = step destructionPhase (destroyInstanceQuiesced capture vulkan)
+    result ← restore (inside vulkan) `onException` quiesce
+    token ← quiesce
+    pure (result, token)
   where
     describe provenance =
       maybe "an unnamed address" id provenance.provenanceSymbol

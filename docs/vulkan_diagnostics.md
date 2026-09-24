@@ -135,7 +135,8 @@ the logger filters out entirely is still latched.
 
 ```haskell
 withDiagnosticCapture
-  ∷ CaptureConfig → Logger → (DiagnosticCapture → IO a) → IO (a, DiagnosticVerdict)
+  ∷ CaptureConfig → Logger → (DiagnosticCapture → IO (a, Quiesced)) → IO (a, DiagnosticVerdict)
+afterLastCallback ∷ DiagnosticCapture → IO () → IO Quiesced
 captureUserData ∷ DiagnosticCapture → Ptr ()
 captureCallback ∷ FunPtr CaptureCallback
 requestDrain    ∷ DiagnosticCapture → IO ()
@@ -148,9 +149,10 @@ deliveredCount  ∷ DiagnosticCapture → STM Word64
 The lifetime is established before any messenger exists: it allocates the
 storage, starts the drain worker in a `withWorkerGroup` of its own, and runs the
 body. The body enables messengers with `captureUserData`, does every Vulkan
-operation that could report, and must have finished the last callback-producing
+operation that could report, and finishes the last callback-producing
 destruction — `vkDestroyInstance`, where the create-info messenger reports after
-the explicit messenger is gone — before it returns or throws. On every exit the
+the explicit messenger is gone — through `afterLastCallback`, which returns the
+`Quiesced` evidence the body must hand back with its result. On every exit the
 lifetime then:
 
 1. closes admission and waits for every producer that has announced itself
@@ -175,6 +177,28 @@ lifetime then:
 | `PhaseClosed` | Admission is closed, every producer has left, and the final drain was requested. The storage and the logger are still borrowed. |
 | `PhaseJoined` | The worker is terminal and its outcome has been read. |
 | `PhaseReleased` | The storage is freed, or deliberately retained. |
+
+### Quiescence is the owner's evidence
+
+Vulkan invokes a messenger's callback only from inside a Vulkan call. So once
+the last call that could invoke it — `vkDestroyInstance` — has returned, no
+invocation can be running or begin, and that return is what quiescence is. The
+capture cannot establish it on its own: an invocation that has entered the
+callback but not yet executed its first memory operation has touched nothing
+any barrier could see, and a barrier only moves that window to its own first
+instruction. Quiescence is therefore evidence the owner of the last
+callback-producing destruction supplies, and the lifetime demands it by type.
+
+`afterLastCallback capture destruction` runs the destruction and, once it has
+returned normally, records that the capture is quiescent and returns an opaque
+`Quiesced` naming this capture; it is the only way to make one. The native
+package's `destroyInstanceQuiesced` is `vkDestroyInstance` through it. The body
+returns the token with its result, and the record covers a destruction made
+while a failure unwinds, when there is no result to return it with. A verdict
+without that evidence — no record, and no returned token that names this
+capture — reports `QuiescenceUnproven` and is not clean, because a callback may
+still have been on its way when admission closed. A destruction that throws
+establishes nothing.
 
 A capture is two kinds of memory. The **storage** — the queue, its object
 records and its text — is on the C heap, is the lifetime's, and is freed whole
@@ -271,6 +295,7 @@ failed, failed or cancelled — and whether the storage was retained.
 | `RecordsUnaccounted admitted accounted` | admitted differs from delivered plus undelivered |
 | `CounterSaturated` | a counter reached its ceiling, so no count can be trusted |
 | `ConsumerUnsuccessful` | the sink failed, or the worker failed or was cancelled |
+| `QuiescenceUnproven` | the owner never supplied `Quiesced` evidence for this capture |
 | `StorageRetained` | a registering native object may still report into the storage |
 
 `verdictClean` holds only when the list is empty. Warnings are not issues: they
@@ -297,6 +322,9 @@ can have from one capture:
   explicit messenger. It must be created before the instance's first child and
   destroyed after its last, immediately before the instance, so a device's own
   destruction reports somewhere.
+- `destroyInstanceQuiesced` destroys the instance through `afterLastCallback`,
+  on the path that returns and on the one that unwinds, and yields the
+  `Quiesced` evidence the lifetime needs.
 
 Both register `captureMessengerCallback`, whose code is linked into the
 executable and so lives as long as the process, with the capture's storage as
@@ -350,7 +378,9 @@ preserved primary failure, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, status reads racing the
 release, a producer that announced itself before the body returned counted in
-the verdict, a report not yet begun counted outside it, the verdict's delivered
+the verdict, a report not yet begun counted outside it, quiescence evidence
+missing, established while a failure unwinds, issued by another capture, and
+not established by a destruction that threw, the verdict's delivered
 count matching what the sink received across 300 cancellations, and
 retention. Waits are explicit: a gated sink says when it is entered,
 the delivered count says what the worker has done, and the poll is replaced by

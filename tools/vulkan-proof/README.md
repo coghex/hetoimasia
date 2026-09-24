@@ -262,8 +262,9 @@ VK-11's. Around every native call the session reads the capture storage's own
 counters, so each report is attributed to the call it arrived in by the
 callback's synchronous effect, and the delivered records are attributed back to
 those calls in admission order. `vkDestroyInstance` is the last thing the
-lifetime's body does, after the explicit messenger has gone, and the verdict is
-read only after the lifetime has ended.
+lifetime's body does, after the explicit messenger has gone, through the native
+package's `destroyInstanceQuiesced`, whose return is the quiescence evidence the
+lifetime demands; the verdict is read only after the lifetime has ended.
 
 `DiagnosticsSpec.hs` then requires that the callback lies in the proof
 executable's own image — a Haskell callback would be an adjustor the runtime

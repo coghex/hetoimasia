@@ -15,6 +15,10 @@ device and target ownership.
   producer, with the capture's storage as user data. No Haskell is reachable
   from it, so a Vulkan call made through a genuine `unsafe` import can report
   through it.
+- `destroyInstanceQuiesced` destroys an instance whose messengers deliver into a
+  capture and returns the `Quiesced` evidence the diagnostic lifetime demands:
+  `vkDestroyInstance` is the last call that can invoke the callback, so its
+  return is what establishes that none can still run.
 - `cbits/hetoimasia_vulkan_native.c` is the one translation unit that sees both
   the diagnostics package's header and the Vulkan headers, and it asserts at
   compile time that the diagnostics package's layout mirror is the headers'

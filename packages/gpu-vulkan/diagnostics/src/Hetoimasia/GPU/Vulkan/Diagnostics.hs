@@ -18,10 +18,17 @@
 -- does ever clears one.
 --
 -- 'withDiagnosticCapture' is the lifetime. Its body enables messengers, runs
--- every Vulkan operation that could report, and must have finished the last
+-- every Vulkan operation that could report, and finishes the last
 -- callback-producing destruction — @vkDestroyInstance@, whose create-info
--- messenger reports after the explicit messenger is gone — before it returns
--- or throws. The lifetime then, in this order and on every exit:
+-- messenger reports after the explicit messenger is gone — through
+-- 'afterLastCallback', which is the only source of the 'Quiesced' evidence the
+-- body must return. That destruction's return is what establishes quiescence:
+-- Vulkan invokes a messenger's callback only from inside a Vulkan call, so once
+-- the last call that could invoke it has returned, no invocation can be running
+-- or begin. The capture cannot observe that from inside — an invocation that
+-- has not executed its first instruction touches nothing — which is why it is
+-- the owner's evidence rather than the capture's inference, and why a verdict
+-- without it is not clean. The lifetime then, in this order and on every exit:
 --
 -- 1. closes admission and waits for every producer that has announced itself
 --    inside the callback — announcing is the callback's first memory operation;
@@ -89,6 +96,8 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
     -- * The diagnostic lifetime
   , DiagnosticCapture
   , withDiagnosticCapture
+  , Quiesced
+  , afterLastCallback
   , captureUserData
   , CaptureCallback
   , captureCallback
@@ -299,7 +308,29 @@ data DiagnosticCapture = DiagnosticCapture
   , handleWake ∷ !(TVar Bool)
   , handleFinal ∷ !(TVar Bool)
   , handleRetained ∷ !(TVar Bool)
+  , handleQuiesced ∷ !(TVar Bool)
+    -- ^ Set by 'afterLastCallback' once the owner's last callback-producing
+    -- destruction has returned.
   }
+
+-- | Evidence, for one capture, that the last Vulkan call that could invoke its
+-- callback has returned. Only 'afterLastCallback' makes one.
+newtype Quiesced = Quiesced (Ptr ())
+
+-- | Run the last destruction that could invoke this capture's callback — for
+-- an instance, @vkDestroyInstance@ — and, once it has returned, record and
+-- return the evidence that the callback is quiescent.
+--
+-- Call it from the code that owns that destruction, whether the body is
+-- returning or unwinding: the lifetime also reads the record it leaves, so
+-- quiescence established while a failure propagates still counts. If the
+-- destruction throws, no evidence is recorded — a destroy that did not return
+-- normally establishes nothing.
+afterLastCallback ∷ DiagnosticCapture → IO () → IO Quiesced
+afterLastCallback capture destruction = do
+  destruction
+  atomically (writeTVar (handleQuiesced capture) True)
+  pure (Quiesced (handleUserData capture))
 
 -- | The user data to register beside 'captureCallback' on every messenger:
 -- the explicit one, and the one chained into @VkInstanceCreateInfo@.
@@ -341,7 +372,7 @@ deliveredCount = readTVar . handleDelivered
 -- The configuration is validated first, so a rejected one raises
 -- 'CaptureConfigError' before anything is allocated.
 withDiagnosticCapture
-  ∷ CaptureConfig → Logger → (DiagnosticCapture → IO a) → IO (a, DiagnosticVerdict)
+  ∷ CaptureConfig → Logger → (DiagnosticCapture → IO (a, Quiesced)) → IO (a, DiagnosticVerdict)
 withDiagnosticCapture config logger body = do
   valid ← either throwIO pure (validateCaptureConfig config)
   unless rtsSupportsBoundThreads (throwIO CaptureRequiresThreadedRuntime)
@@ -378,13 +409,20 @@ withDiagnosticCapture config logger body = do
       Nothing → either rethrowIO (\() → error "withDiagnosticCapture: finalization left no result") grouped
       Just finished → do
         retained ← readTVarIO (handleRetained capture)
-        let verdict =
+        recorded ← readTVarIO (handleQuiesced capture)
+        -- Evidence for this capture: its own record, or a returned token that
+        -- names it. A token another capture issued proves nothing here.
+        let returned = case finishedOutcome finished of
+              Right (_, Quiesced issuer) → issuer == handleUserData capture
+              Left _ → False
+            verdict =
               DiagnosticVerdict
                 { verdictStatus = status
                 , verdictDelivered = delivered
                 , verdictUndelivered = (taken - delivered) + remaining
                 , verdictConsumer = finishedConsumer finished
                 , verdictStorageRetained = retained
+                , verdictQuiescent = recorded || returned
                 }
             attach (ExceptionWithContext context failure) =
               ExceptionWithContext (addExceptionAnnotation (VerdictAnnotation verdict) context) failure
@@ -394,7 +432,7 @@ withDiagnosticCapture config logger body = do
           (Just cancellation, _, _) → rethrowIO (attach cancellation)
           (Nothing, Just late, _) → rethrowIO (attach late)
           (Nothing, Nothing, Left failure) → rethrowIO (attach failure)
-          (Nothing, Nothing, Right result) → pure (result, verdict)
+          (Nothing, Nothing, Right (result, _)) → pure (result, verdict)
 
 -- | The worker's startup is trivial, so this is a failure to fork or an
 -- asynchronous exception; either is rethrown as itself.
@@ -411,6 +449,7 @@ newCapture storage =
     <*> newTVarIO PhaseCapturing
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO False
@@ -581,6 +620,9 @@ data DiagnosticVerdict = DiagnosticVerdict
   , verdictUndelivered ∷ !Word64
     -- ^ Admitted records that never reached the logger.
   , verdictConsumer ∷ !ConsumerOutcome
+  , verdictQuiescent ∷ !Bool
+    -- ^ The owner established that no callback could still run, through
+    -- 'afterLastCallback'.
   , verdictStorageRetained ∷ !Bool
     -- ^ The body retained the storage for a native object that may outlive it.
   }
@@ -600,6 +642,9 @@ data VerdictIssue
     -- ^ A counter reached its ceiling, so no count can be trusted.
   | ConsumerUnsuccessful
     -- ^ The worker's sink failed, or the worker failed or was cancelled.
+  | QuiescenceUnproven
+    -- ^ The owner never established that its last callback-producing
+    -- destruction had returned, so a callback may still have been on its way.
   | StorageRetained
     -- ^ A registering native object may still report into the storage.
   deriving (Eq, Show)
@@ -620,6 +665,7 @@ verdictIssues verdict =
       ]
     , [CounterSaturated | any (== maxBound) (countersOf counters)]
     , [ConsumerUnsuccessful | not (consumerCompleted (verdictConsumer verdict))]
+    , [QuiescenceUnproven | not (verdictQuiescent verdict)]
     , [StorageRetained | verdictStorageRetained verdict]
     ]
   where

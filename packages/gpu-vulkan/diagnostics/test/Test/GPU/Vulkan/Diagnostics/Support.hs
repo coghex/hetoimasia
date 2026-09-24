@@ -19,6 +19,7 @@ module Test.GPU.Vulkan.Diagnostics.Support
   , smallConfig
   , quietConfig
   , capturing
+  , quiescent
 
     -- * Waits
   , awaitDelivered
@@ -64,6 +65,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , defaultCaptureConfig
   , deliveredCount
   , requestDrain
+  , Quiesced
+  , afterLastCallback
   , withDiagnosticCapture
   )
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture (Offer, offer)
@@ -159,9 +162,18 @@ quietConfig ∷ CaptureConfig → CaptureConfig
 quietConfig config = config {capturePollInterval = 1000000000}
 
 -- | A lifetime over 'smallConfig' with the quiet poll, bounded so a lifetime
--- that never finishes fails its example instead of hanging the suite.
+-- that never finishes fails its example instead of hanging the suite. The body
+-- stands for an owner whose last callback-producing destruction is its last
+-- step, so it establishes quiescence when it returns.
 capturing ∷ Logger → (DiagnosticCapture → IO a) → IO (a, DiagnosticVerdict)
-capturing logger body = bounded (withDiagnosticCapture (quietConfig smallConfig) logger body)
+capturing logger body =
+  bounded (withDiagnosticCapture (quietConfig smallConfig) logger (\capture → body capture >>= quiescent capture))
+
+-- | Return a body's result with the evidence that it is the last thing that
+-- could have reported: there is no native object here, so the destruction is
+-- empty.
+quiescent ∷ DiagnosticCapture → a → IO (a, Quiesced)
+quiescent capture result = (,) result <$> afterLastCallback capture (pure ())
 
 -- | Wake the worker and wait until it has delivered at least this many records.
 awaitDelivered ∷ DiagnosticCapture → Word64 → IO ()

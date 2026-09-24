@@ -29,6 +29,7 @@ module Hetoimasia.GPU.Vulkan.Native.Diagnostics
   , createCaptureMessenger
   , destroyCaptureMessenger
   , withCaptureMessenger
+  , destroyInstanceQuiesced
 
     -- * FFI configuration
   , NativeFfiConfiguration (..)
@@ -38,7 +39,7 @@ module Hetoimasia.GPU.Vulkan.Native.Diagnostics
 
 import Data.Bits ((.|.))
 import Data.Text (Text)
-import Vulkan.Core10 (Instance)
+import Vulkan.Core10 (Instance, destroyInstance)
 import Vulkan.Extensions.VK_EXT_debug_utils
   ( DebugUtilsMessengerCreateInfoEXT (..)
   , DebugUtilsMessengerEXT
@@ -56,7 +57,7 @@ import Vulkan.Extensions.VK_EXT_debug_utils
 import Vulkan.Zero (zero)
 
 import Hetoimasia.Foundation.Resource (withResourceLabelled)
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, captureUserData)
+import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, Quiesced, afterLastCallback, captureUserData)
 
 -- | The C callback every capture messenger registers.
 captureMessengerCallback ∷ PFN_vkDebugUtilsMessengerCallbackEXT
@@ -104,6 +105,17 @@ withCaptureMessenger vulkan capture =
     "vulkan debug messenger"
     (createCaptureMessenger vulkan capture)
     (destroyCaptureMessenger vulkan)
+
+-- | Destroy an instance whose messengers deliver into this capture, and return
+-- the evidence the diagnostic lifetime needs that its callback is quiescent.
+--
+-- @vkDestroyInstance@ is the last call that can invoke the create-info
+-- messenger's callback, and Vulkan invokes a callback only from inside a
+-- Vulkan call, so once it returns no invocation can be running or begin. Call
+-- this after every child of the instance and the explicit messenger are gone,
+-- on the path that returns and on the one that unwinds.
+destroyInstanceQuiesced ∷ DiagnosticCapture → Instance → IO Quiesced
+destroyInstanceQuiesced capture vulkan = afterLastCallback capture (destroyInstance vulkan Nothing)
 
 -- | How this package calls into Vulkan and what Vulkan can call back into.
 data NativeFfiConfiguration = NativeFfiConfiguration

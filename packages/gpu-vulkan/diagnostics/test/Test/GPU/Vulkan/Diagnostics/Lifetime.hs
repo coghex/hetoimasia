@@ -20,6 +20,7 @@ import Control.Exception
   , Exception
   , SomeException
   , fromException
+  , finally
   , throwIO
   , try
   )
@@ -57,6 +58,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , deliveredCount
   , diagnosticVerdict
   , diagnosticsComponent
+  , afterLastCallback
   , retainStorage
   , verdictClean
   , verdictIssues
@@ -241,7 +243,10 @@ spec = describe "Lifetime" $ do
             Nothing → expectationFailure "the failure carries no verdict"
             Just verdict → do
               consumerName (verdictConsumer verdict) `shouldBe` "sink failed"
-              verdictIssues verdict `shouldBe` [ErrorLatched, RecordsUndelivered 1, ConsumerUnsuccessful]
+              -- It threw before establishing quiescence, which the verdict says
+              -- too.
+              verdictIssues verdict
+                `shouldBe` [ErrorLatched, RecordsUndelivered 1, ConsumerUnsuccessful, QuiescenceUnproven]
 
     it "keeps a body failure as it is when the sink works" $ do
       (logger, recorded) ← recordingLogger everythingFilter
@@ -290,7 +295,7 @@ spec = describe "Lifetime" $ do
       _ ← forkIO $ do
         result ←
           try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
               putMVar handle capture
               offerTo capture (plainOffer SeverityInfo "blocked")
         putMVar done result
@@ -336,7 +341,7 @@ spec = describe "Lifetime" $ do
       thread ← forkIO $ do
         result ←
           try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
               putMVar handle capture
               offerTo capture (plainOffer SeverityInfo "never delivered")
               offerTo capture (plainOffer SeverityInfo "queued behind it")
@@ -368,7 +373,7 @@ spec = describe "Lifetime" $ do
       thread ← forkIO $ do
         result ←
           try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
               offerTo capture (plainOffer SeverityWarning "before the cancellation")
               putMVar started ()
               atomically (readTVar never >>= check)
@@ -416,7 +421,7 @@ spec = describe "Lifetime" $ do
       _ ← forkIO $ do
         result ←
           try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
               _ ← forkIO (offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ())
               bounded (untilM (holdArrived hold))
               putMVar handle capture
@@ -475,7 +480,7 @@ spec = describe "Lifetime" $ do
         thread ← forkIO $ do
           result ←
             try @SomeException $
-              withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+              withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
                 mapM_ (\n → offerTo capture (plainOffer SeverityInfo n)) ["1", "2", "3", "4"]
                 putMVar started ()
           putMVar done result
@@ -495,6 +500,56 @@ spec = describe "Lifetime" $ do
       -- Locally about one round in eight is cancelled mid-lifetime; none at all
       -- would mean the example had stopped exercising what it is for.
       readIORef cancelled `shouldNotReturn` 0
+
+    it "is not clean when the owner never established quiescence" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      outcome ←
+        try $
+          capturing logger $ \capture → do
+            offerTo capture (plainOffer SeverityWarning "before the failure")
+            throwIO PrimaryFailure
+      case outcome of
+        Right _ → expectationFailure "the body's failure was lost"
+        Left failure → do
+          fromException failure `shouldBe` Just PrimaryFailure
+          fmap verdictIssues (diagnosticVerdict failure) `shouldBe` Just [QuiescenceUnproven]
+
+    it "counts quiescence established while a failure unwinds" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      outcome ←
+        try $
+          capturing logger $ \capture →
+            (offerTo capture (plainOffer SeverityWarning "before the failure") >> throwIO PrimaryFailure)
+              `finally` afterLastCallback capture (pure ())
+      case outcome of
+        Right _ → expectationFailure "the body's failure was lost"
+        Left failure → do
+          fromException failure `shouldBe` Just PrimaryFailure
+          fmap verdictIssues (diagnosticVerdict failure) `shouldBe` Just []
+
+    it "accepts no evidence another capture issued" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      ((), verdict) ←
+        bounded $
+          withDiagnosticCapture (quietConfig smallConfig) logger $ \_ → do
+            (issuedElsewhere, _) ←
+              withDiagnosticCapture (quietConfig smallConfig) logger $ \inner → do
+                token ← afterLastCallback inner (pure ())
+                pure (token, token)
+            pure ((), issuedElsewhere)
+      verdictIssues verdict `shouldBe` [QuiescenceUnproven]
+
+    it "records no evidence when the last destruction throws" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      outcome ←
+        try $
+          bounded $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+              token ← afterLastCallback capture (throwIO PrimaryFailure)
+              pure ((), token)
+      case outcome of
+        Right _ → expectationFailure "the destruction's failure was lost"
+        Left failure → fmap verdictIssues (diagnosticVerdict failure) `shouldBe` Just [QuiescenceUnproven]
 
     it "never frees storage the body retained" $ do
       (logger, _) ← recordingLogger everythingFilter
