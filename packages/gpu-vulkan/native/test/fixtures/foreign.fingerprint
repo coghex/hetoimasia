@@ -1,0 +1,14 @@
+# A fingerprint generated against some other prefix. The shader suite requires
+# the adapter to refuse it, naming what it records, rather than trust it. It is
+# also the file that keeps the package's `**/*.fingerprint` source glob from
+# being empty in a checkout that has not generated its own fingerprint yet.
+format 1
+target-env vulkan1.3
+flags -V
+wrapper /nonexistent/foreign-prefix/vulkan/bin/glslangValidator
+wrapper-sha256 0000000000000000000000000000000000000000000000000000000000000000
+glslang 15.0.0
+compiler /nonexistent/foreign-prefix/bin/glslang
+compiler-sha256 1111111111111111111111111111111111111111111111111111111111111111
+native-manifest /nonexistent/foreign-prefix/hetoimasia-native-manifest.json
+native-manifest-sha256 2222222222222222222222222222222222222222222222222222222222222222
