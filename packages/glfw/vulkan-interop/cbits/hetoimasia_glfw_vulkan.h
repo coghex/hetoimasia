@@ -33,7 +33,8 @@ void hetoimasia_glfw_vulkan_set_loader(void *entry);
 /* The value this shim last handed glfwInitVulkanLoader, or NULL if it has
  * handed none or last restored the default. This shim is the only code in the
  * process that sets that hint, so this is the hint's value: GLFW itself offers
- * no way to read it back. */
+ * no way to read it back. Any thread may call it: the record is atomic, and
+ * only a session's owner thread changes it. */
 void *hetoimasia_glfw_vulkan_installed_loader(void);
 
 /* glfwVulkanSupported. */

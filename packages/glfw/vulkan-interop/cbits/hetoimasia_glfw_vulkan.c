@@ -9,6 +9,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
+#include <stdatomic.h>
 #include <stddef.h>
 
 #include "hetoimasia_glfw_vulkan.h"
@@ -19,20 +20,21 @@
 _Static_assert(sizeof(VkSurfaceKHR) == sizeof(uint64_t),
                "the surface bridge assumes a 64-bit non-dispatchable Vulkan handle");
 
-/* What this shim last handed glfwInitVulkanLoader. Written and read on the
- * session's owner thread, which is the only thread that enters or ends a
- * session. */
-static void *installed_loader = NULL;
+/* What this shim last handed glfwInitVulkanLoader. Only a session's owner
+ * thread writes it, but any thread may read it, so it is atomic: a reader sees
+ * either the value before a write or the value after it, never a torn one, and
+ * the release store orders the GLFW call before the value that reports it. */
+static _Atomic(void *) installed_loader = NULL;
 
 void hetoimasia_glfw_vulkan_set_loader(void *entry)
 {
   glfwInitVulkanLoader((PFN_vkGetInstanceProcAddr) entry);
-  installed_loader = entry;
+  atomic_store_explicit(&installed_loader, entry, memory_order_release);
 }
 
 void *hetoimasia_glfw_vulkan_installed_loader(void)
 {
-  return installed_loader;
+  return atomic_load_explicit(&installed_loader, memory_order_acquire);
 }
 
 int hetoimasia_glfw_vulkan_supported(void)
