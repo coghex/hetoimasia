@@ -18,9 +18,9 @@ module Test.GLFW.Surface (spec) where
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM, unless, void)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Ptr (Ptr, intPtrToPtr)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
@@ -31,7 +31,7 @@ import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
-import Hetoimasia.Runtime.GLFW.Internal.Retirement (releaseAttachmentHold)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (advanceRetirements, releaseAttachmentHold, retirementStanding)
 import Hetoimasia.Runtime.GLFW.Internal.Surface
 import Test.GLFW.Support (boundedExample, onThread, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn)
@@ -68,6 +68,10 @@ spec = describe "GLFW surface bridge" $ do
     (boundedExample testSecondObligationRetains)
   it "keeps the attachment and the lease while an admitted construction is still in its native call"
     (boundedExample testConstructionInFlightRetains)
+  it "closes a replacement's access when a cancellation arrives as its body returns"
+    (boundedExample testReplacementCancelledAtReturn)
+  it "keeps an attachment's path revived when its surface is destroyed off the owner during a stalling step"
+    (boundedExample testDischargeDuringStallingStep)
 
 -- ---------------------------------------------------------------------------
 -- Examples
@@ -514,6 +518,85 @@ testConstructionInFlightRetains = do
     certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Nothing
     void (dischargeSurfaceObligation obligation)
     certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Just AttachmentNowRetired
+    atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceReleasable
+
+testReplacementCancelledAtReturn ∷ Expectation
+testReplacementCancelledAtReturn = do
+  seam ← newSeam defaultScript
+  integration ← seamIntegration seam defaultIntegrationScript
+  lease ← leaseSurfaceInstance integration instancePointer
+  bridged seam integration $ \host window → do
+    (service, acknowledgement) ← attachWith host window (\_ → pure ())
+    kept ← newIORef Nothing
+    thrower ← newEmptyMVar
+    attempted ←
+      try $
+        replaceWindowSurface host acknowledgement $ \access → do
+          writeIORef kept (Just access)
+          -- A cancellation is made pending while the body holds exceptions
+          -- off, so it is delivered the moment the body lets them in again, on
+          -- its way back out.
+          uninterruptibleMask_ $ do
+            owner ← myThreadId
+            posting ← forkIO (throwTo owner ThreadKilled)
+            putMVar thrower posting
+            awaitBlockedThrow posting
+    _ ← takeMVar thrower
+    case attempted of
+      Left ThreadKilled → pure ()
+      other → unexpected ("the replacement ended with " <> either show (\(_ ∷ Replacement ()) → "an answer") other)
+    access ← readIORef kept >>= maybe (unexpected "the replacement kept no access") pure
+    show <$> createWindowSurface access lease `shouldReturn` show (SurfaceRefused SurfaceAccessClosed)
+    retireFully host service acknowledgement
+  surfaceCalls seam `shouldReturn` []
+
+testDischargeDuringStallingStep ∷ Expectation
+testDischargeDuringStallingStep = do
+  seam ← newSeam defaultScript
+  integration ← seamIntegration seam defaultIntegrationScript
+  lease ← leaseSurfaceInstance integration instancePointer
+  bridged seam integration $ \host window → do
+    retirement ← maybe (unexpected "the protected host has no retirement state") pure (Private.hostRetirementOf host)
+    created ← newIORef Nothing
+    heard ← newIORef Nothing
+    steps ← newIORef (0 ∷ Int)
+    attached ←
+      attachWindowGraphicsWithSurfaces host window $ \access →
+        (protocolOf
+          (\acknowledgement → do
+              writeIORef heard (Just acknowledgement)
+              createWindowSurface access lease >>= writeIORef created . Just)
+          (pure RollbackUnsafe))
+          { protocolStep = \_ acknowledgement → do
+              modifyIORef' steps (+ 1)
+              mapM_ (certifyGraphicsFact host acknowledgement) [CpuUseRetired, SubmittedWorkEnded, PresentationEnded]
+              certifyGraphicsFact host acknowledgement DependentsDisposed >>= \case
+                Just AttachmentNowRetired → pure RetirementAdvanced
+                _ → do
+                  -- Still held. The graphics owner destroys the surface on its
+                  -- own thread while this step is still running, and the step
+                  -- then answers from what it saw: no safe progress.
+                  surface ← createdSurface created
+                  finished ← newEmptyMVar
+                  _ ← forkIO (dischargeSurfaceObligation (surfaceObligation surface) >>= putMVar finished . show)
+                  takeMVar finished `shouldReturn` "SurfaceDestroyed"
+                  pure RetirementStalled
+          }
+    service ← case attached of
+      GraphicsAttached service → pure service
+      other → unexpected ("the attachment answered " <> show other)
+    _ ← readIORef heard >>= maybe (unexpected "no acknowledgement was issued") pure
+    detachWindowGraphics host service `shouldReturn` DetachBegun
+    cursor ← newIORef Nothing
+    _ ← advanceRetirements retirement cursor 1
+    readIORef steps `shouldReturn` 1
+    -- The destruction arrived during the step, so the step's stall did not
+    -- withdraw the path it revived: another opportunity is owed at once.
+    fmap fst (atomically (retirementStanding retirement)) `shouldReturn` True
+    _ ← advanceRetirements retirement cursor 1
+    readIORef steps `shouldReturn` 2
+    status ← atomically (windowGraphicsStatus host window)
+    show status `shouldBe` show GraphicsAbsent
     atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceReleasable
 
 -- ---------------------------------------------------------------------------

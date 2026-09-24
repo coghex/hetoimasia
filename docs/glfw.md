@@ -4691,7 +4691,9 @@ capability's two surface operations, so the model and the seam stay header-free;
 `Hetoimasia.GLFW.Vulkan` is its public face.
 
 **Where a surface may be created.** Only through a `SurfaceAccess`, which is
-open only while one of two things runs on the owner thread: the construction
+open only while one of two things runs on the owner thread — and is closed by a
+masked release covering the whole step, so no cancellation, however it arrives,
+leaves one open: the construction
 step of an attachment made by `attachWindowGraphicsWithSurfaces` — which is
 `attachWindowGraphics`, unchanged in every answer, with the protocol built from
 the access — for exactly that attachment while it is registering; or an
@@ -4741,7 +4743,13 @@ or folded from a notice — and treats a failed construction's `RollbackSafe` as
 `RollbackUnsafe`. So no cancellation, timeout, or cleanup error can certify the
 attachment's terminal retirement while a surface of it may exist, and a second
 obligation or a replacement still in its native call keeps the attachment held
-after the first is discharged. `releaseSurfaceInstance` closes the lease to new
+after the first is discharged. A confirmed destruction revives the attachment's
+retirement path, and one confirmed on another thread while a retirement step is
+still running outranks that step's own answer: the step reads the registration's
+revival count before it runs and withdraws the path only if nothing revived it
+meanwhile, so a step that stalled on the surface it could not yet see destroyed
+cannot leave the attachment waiting with no further evidence to come.
+`releaseSurfaceInstance` closes the lease to new
 constructions and answers `InstanceReleasable` only when nothing is in flight or
 owed against it; until then it is `InstanceRetained`, and the instance must not
 be destroyed. The graphics owner that will receive the surface, own the

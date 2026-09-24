@@ -50,8 +50,12 @@
 -- A step that answers 'RetirementStalled', and one that fails, both withdraw
 -- the attachment's progress path: the drain never replays a failed step, and it
 -- resumes stepping only when independent evidence — a retirement fact the model
--- did not already hold, certified on the owner thread or folded from a notice —
--- arrives. A declaration of the protocol that raises when the
+-- did not already hold, certified on the owner thread or folded from a notice,
+-- or an owned dependent's hold released from any thread — arrives. Evidence
+-- that arrives while a step is still running outranks that step's answer: each
+-- registration counts its revivals, a step reads the count before it runs, and
+-- it withdraws the path or records its assessment only if the count has not
+-- moved. A declaration of the protocol that raises when the
 -- round demands it does the same: it is contained, recorded as that
 -- attachment's evidence, and withdraws its path, so the exit this drain answers
 -- to keeps the attachment, its window, the session, and every parent. As soon as any pending attachment has no path
@@ -292,6 +296,12 @@ data Registration = Registration
     -- ^ What this attachment's latest opportunity found, which outlives the
     -- round that found it so a later round the budget could not reach it still
     -- knows whether it may be left waiting, and until when.
+  , registrationEvidence ∷ !Natural
+    -- ^ How many times independent evidence has revived this registration. A
+    -- step reads it before it runs, and settles its path and assessment only
+    -- if it has not moved: evidence that arrived from another thread while the
+    -- step ran — a surface destroyed off the owner thread — is newer than
+    -- anything the step saw, so the step's answer must not erase it.
   }
 
 -- | What one attachment's most recent opportunity found, retained beside its
@@ -752,6 +762,7 @@ attachRetirement retirement restore window protocol onReserved =
                     protocol
                     True
                     NeverAssessed
+                    0
                 )
               onReserved (registeredAttachment registered)
               pure (Right registered)
@@ -1128,57 +1139,59 @@ rotateAfter (Just served) pending = case break ((== served) . registrationTarget
 -- settled under the integration's disposition, and any other step failure, like
 -- a cancellation, is still re-raised after the path has been withdrawn.
 offerOne ∷ HostRetirement → ProgressRound → Registration → IO ProgressRound
-offerOne retirement accumulated registration =
+offerOne retirement accumulated registration = do
+  seen ← atomically (evidenceSeen retirement target)
+  let withdraw = atomically (settleUnrevived retirement target seen (\held → held {registrationProgressing = False}))
+      -- Each answer is retained as this attachment's own latest assessment
+      -- before anything else is decided, so a later round that the budget does
+      -- not reach it still knows what it is doing and until when. A later answer
+      -- replaces the earlier one outright: 'RetirementAwaiting' clears a
+      -- deadline an earlier 'RetirementAwaitingUntil' named rather than leaving
+      -- it standing. Evidence that arrived during the step outranks either.
+      assess assessment = atomically (settleUnrevived retirement target seen (\held → held {registrationAssessment = assessment}))
+      settle = \case
+       RetirementAdvanced → do
+         atomically $ do
+           settleUnrevived retirement target seen (\held → held {registrationAssessment = LastAdvanced})
+           pruneRegistrations retirement
+         pure counted {roundAdvanced = roundAdvanced counted + 1}
+       RetirementAwaiting → do
+         assess (LastWaiting Nothing)
+         pure counted
+       RetirementAwaitingUntil due → do
+         assess (LastWaiting (Just due))
+         pure counted
+       RetirementStalled → withdraw >> pure counted
   tryWithContext (demandProtocolMetadata protocol) >>= \case
-    Left caught → do
-      atomically (recordFailure retirement target acknowledgement caught)
-      withdraw
-      -- A cancellation reached this turn rather than the declaration, and is
-      -- answered exactly as one delivered inside a step is.
-      if isCancellation (exceptionOf caught) then rethrowIO caught else pure counted
-    Right BlockingCompletion → do
-      withdraw
-      pure counted {roundRefused = roundRefused counted + 1}
-    Right FiniteCompletion → do
-      attempted ←
-        tryWithContext . recover retirementOperation (stepPolicy protocol) $
-          protocolStep protocol target acknowledgement >>= evaluate
-      case attempted of
-        Right (Available recovered) → settle (recoveredValue recovered)
-        Right (Unavailable unavailability) → do
-          atomically
-            (recordFailure retirement target acknowledgement (attemptException (unavailableReason unavailability)))
-          withdraw
-          pure counted
-        Left caught → do
-          atomically (recordFailure retirement target acknowledgement caught)
-          withdraw
-          rethrowIO caught
+     Left caught → do
+       atomically (recordFailure retirement target acknowledgement caught)
+       withdraw
+       -- A cancellation reached this turn rather than the declaration, and is
+       -- answered exactly as one delivered inside a step is.
+       if isCancellation (exceptionOf caught) then rethrowIO caught else pure counted
+     Right BlockingCompletion → do
+       withdraw
+       pure counted {roundRefused = roundRefused counted + 1}
+     Right FiniteCompletion → do
+       attempted ←
+         tryWithContext . recover retirementOperation (stepPolicy protocol) $
+           protocolStep protocol target acknowledgement >>= evaluate
+       case attempted of
+         Right (Available recovered) → settle (recoveredValue recovered)
+         Right (Unavailable unavailability) → do
+           atomically
+             (recordFailure retirement target acknowledgement (attemptException (unavailableReason unavailability)))
+           withdraw
+           pure counted
+         Left caught → do
+           atomically (recordFailure retirement target acknowledgement caught)
+           withdraw
+           rethrowIO caught
   where
     counted = accumulated {roundOffered = roundOffered accumulated + 1}
     target = registrationTarget registration
     acknowledgement = registrationAcknowledgement registration
     protocol = registrationProtocol registration
-    withdraw = atomically (writeProgressing retirement target False)
-    -- Each answer is retained as this attachment's own latest assessment before
-    -- anything else is decided, so a later round that the budget does not reach
-    -- it still knows what it is doing and until when. A later answer replaces
-    -- the earlier one outright: 'RetirementAwaiting' clears a deadline an
-    -- earlier 'RetirementAwaitingUntil' named rather than leaving it standing.
-    assess = atomically . writeAssessment retirement target
-    settle = \case
-      RetirementAdvanced → do
-        atomically $ do
-          writeAssessment retirement target LastAdvanced
-          pruneRegistrations retirement
-        pure counted {roundAdvanced = roundAdvanced counted + 1}
-      RetirementAwaiting → do
-        assess (LastWaiting Nothing)
-        pure counted
-      RetirementAwaitingUntil due → do
-        assess (LastWaiting (Just due))
-        pure counted
-      RetirementStalled → withdraw >> pure counted
 
 -- | The one recovery policy a retirement step is attempted under, on the owner
 -- turn and in the drain alike: one attempt, never replayed, classified by the
@@ -1458,7 +1471,43 @@ opportunity
   → Registration
   → DrainOutcome
   → IO (Bool, DrainOutcome)
-opportunity retirement restore registration outcome =
+opportunity retirement restore registration outcome = do
+  seen ← atomically (evidenceSeen retirement target)
+  let withdraw = atomically (settleUnrevived retirement target seen (\held → held {registrationProgressing = False}))
+      settleProgress = \case
+       RetirementAdvanced → atomically (pruneRegistrations retirement) >> pure (True, outcome)
+       RetirementAwaiting → pure (False, outcome)
+       -- The drain has its own finite bound and its own wake, so an instant is
+       -- nothing it waits for: it is the running loop's to schedule against.
+       RetirementAwaitingUntil _ → pure (False, outcome)
+       RetirementStalled → withdraw >> pure (False, outcome)
+      settleAttempt = \case
+       Right (Available recovered) → settleProgress (recoveredValue recovered)
+       -- A recognized failure under an optional disposition: the component is
+       -- unavailable, which is never permission to destroy its dependent. Its
+       -- evidence is kept exactly as a fatal step's is.
+       Right (Unavailable unavailability) → do
+         atomically
+           ( recordFailure
+               retirement
+               target
+               (registrationAcknowledgement registration)
+               (attemptException (unavailableReason unavailability))
+           )
+         withdraw
+         pure (False, outcome)
+       Left caught → settleFailure caught
+      settleFailure caught@(ExceptionWithContext _ failure)
+       -- Withdrawn as a failed step is: an interrupted step may have disposed
+       -- part of what it owns, and nothing here knows whether running it again
+       -- would be safe. Independent evidence revives it.
+       | isCancellation failure = withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
+       | otherwise = do
+           -- Evidence, never a fact: the step is withdrawn rather than
+           -- replayed, and the attachment is not safe.
+           atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
+           withdraw
+           pure (False, retainFailure caught outcome)
   -- Demanded inside a handler, like every other part of the protocol this round
   -- reads: 'drainRetirement' owes the protected exit that it raises nothing,
   -- and a declaration that raises here must therefore settle into the round's
@@ -1475,43 +1524,8 @@ opportunity retirement restore registration outcome =
       tryWithContext (restore (recover retirementOperation (stepPolicy protocol) step)) >>= settleAttempt
   where
     step = protocolStep protocol target (registrationAcknowledgement registration)
-    settleAttempt = \case
-      Right (Available recovered) → settleProgress (recoveredValue recovered)
-      -- A recognized failure under an optional disposition: the component is
-      -- unavailable, which is never permission to destroy its dependent. Its
-      -- evidence is kept exactly as a fatal step's is.
-      Right (Unavailable unavailability) → do
-        atomically
-          ( recordFailure
-              retirement
-              target
-              (registrationAcknowledgement registration)
-              (attemptException (unavailableReason unavailability))
-          )
-        withdraw
-        pure (False, outcome)
-      Left caught → settleFailure caught
-    settleFailure caught@(ExceptionWithContext _ failure)
-      -- Withdrawn as a failed step is: an interrupted step may have disposed
-      -- part of what it owns, and nothing here knows whether running it again
-      -- would be safe. Independent evidence revives it.
-      | isCancellation failure = withdraw >> ((,) False <$> absorb retirement (Left caught) outcome)
-      | otherwise = do
-          -- Evidence, never a fact: the step is withdrawn rather than
-          -- replayed, and the attachment is not safe.
-          atomically (recordFailure retirement target (registrationAcknowledgement registration) caught)
-          withdraw
-          pure (False, retainFailure caught outcome)
     target = registrationTarget registration
     protocol = registrationProtocol registration
-    withdraw = atomically (writeProgressing retirement target False)
-    settleProgress = \case
-      RetirementAdvanced → atomically (pruneRegistrations retirement) >> pure (True, outcome)
-      RetirementAwaiting → pure (False, outcome)
-      -- The drain has its own finite bound and its own wake, so an instant is
-      -- nothing it waits for: it is the running loop's to schedule against.
-      RetirementAwaitingUntil _ → pure (False, outcome)
-      RetirementStalled → withdraw >> pure (False, outcome)
 
 -- | The one protected diagnostic the stall policy owes, claimed once whatever
 -- it records.
@@ -1672,15 +1686,6 @@ addRegistration retirement registration =
   readTVar (retirementRegistrations retirement)
     >>= writeTVar (retirementRegistrations retirement) . (<> [registration])
 
-writeProgressing ∷ HostRetirement → AttachmentId → Bool → STM ()
-writeProgressing retirement target progressing =
-  adjustRegistration retirement target (\registration → registration {registrationProgressing = progressing})
-
--- | Retain what this attachment's latest opportunity found.
-writeAssessment ∷ HostRetirement → AttachmentId → RetirementAssessment → STM ()
-writeAssessment retirement target assessment =
-  adjustRegistration retirement target (\registration → registration {registrationAssessment = assessment})
-
 adjustRegistration ∷ HostRetirement → AttachmentId → (Registration → Registration) → STM ()
 adjustRegistration retirement target change =
   readTVar (retirementRegistrations retirement)
@@ -1689,6 +1694,22 @@ adjustRegistration retirement target change =
     adjust registration
       | registrationTarget registration == target = change registration
       | otherwise = registration
+
+-- | The revival count a step reads before it runs.
+evidenceSeen ∷ HostRetirement → AttachmentId → STM Natural
+evidenceSeen retirement target =
+  maybe 0 registrationEvidence . find ((== target) . registrationTarget)
+    <$> readTVar (retirementRegistrations retirement)
+
+-- | Settle a step's answer on its registration, unless independent evidence
+-- revived it while the step ran: that revival is newer than the answer, so it
+-- stands and the registration keeps its path with the opportunity it is owed.
+settleUnrevived ∷ HostRetirement → AttachmentId → Natural → (Registration → Registration) → STM ()
+settleUnrevived retirement target seen change =
+  adjustRegistration
+    retirement
+    target
+    (\registration → if registrationEvidence registration == seen then change registration else registration)
 
 -- | Replace a live registration's declared completion policy, for this
 -- package's own examples.
@@ -1728,7 +1749,13 @@ reviveRegistration retirement target =
   adjustRegistration
     retirement
     target
-    (\registration → registration {registrationProgressing = True, registrationAssessment = NeverAssessed})
+    ( \registration →
+        registration
+          { registrationProgressing = True
+          , registrationAssessment = NeverAssessed
+          , registrationEvidence = registrationEvidence registration + 1
+          }
+    )
 
 -- | Forget the registrations of attachments the model has retired, so the
 -- bookkeeping stays bounded by the attachments still live.

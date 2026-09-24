@@ -135,7 +135,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Surface
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
-import Control.Exception (ExceptionWithContext, SomeException, bracket_, displayException, mask_, onException, rethrowIO, tryWithContext, uninterruptibleMask_)
+import Control.Exception (ExceptionWithContext, SomeException, bracket_, displayException, finally, mask_, rethrowIO, tryWithContext, uninterruptibleMask_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -350,8 +350,9 @@ replaceWindowSurface host acknowledgement body =
         atomically (writeTVar phase AccessClosed)
         pure (ReplacementRefused refusal)
       Right _ →
-        ReplacementRan <$> (body access `onException` atomically (writeTVar phase AccessClosed))
-          <* atomically (writeTVar phase AccessClosed)
+        -- One masked close covers the body and the answer's handoff alike, so
+        -- no cancellation between the two can leave the access open.
+        (ReplacementRan <$> body access) `finally` atomically (writeTVar phase AccessClosed)
   where
     window = attachmentWindow (acknowledgedAttachment acknowledgement)
 
