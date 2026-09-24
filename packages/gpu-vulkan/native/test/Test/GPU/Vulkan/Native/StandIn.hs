@@ -58,6 +58,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , portabilityEnumerationExtension
   , surfaceMaintenance1Extension
   , swapchainExtension
+  , validationFeaturesExtension
   , swapchainMaintenance1Extension
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
@@ -195,6 +196,7 @@ standInOps standIn =
                 , portabilityEnumerationExtension
                 ]
             , offerLayers = ["VK_LAYER_KHRONOS_validation"]
+            , offerLayerExtensions = [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])]
             }
     , opsCreateInstance = \plan → do
         step standIn AtCreateInstance (CreatedInstance (map decode (planInstanceExtensions plan)))
@@ -254,7 +256,7 @@ newStandInRoots standIn budgets = newRoots (standInOps standIn) budgets (scripte
 
 -- | The request a GLFW session on the stand-in platform would make.
 standardRequest ∷ InstanceRequest
-standardRequest = InstanceRequest ["VK_KHR_surface", "VK_KHR_stand_in_surface"] []
+standardRequest = InstanceRequest ["VK_KHR_surface", "VK_KHR_stand_in_surface"] [] []
 
 -- | The model's default budgets, with the target-record limit given.
 testBudgets ∷ Integer → Budgets

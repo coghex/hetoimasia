@@ -161,7 +161,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , withDiagnosticCapture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
-import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..))
+import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationFeature)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( RootOps (..)
   , RootStanding (..)
@@ -244,6 +244,7 @@ data State inst msgr phys dev lease obligation = State
   , statePointer ∷ !(inst → Ptr ())
   , stateBridge ∷ !(SurfaceBridge lease obligation)
   , stateLayers ∷ ![ByteString]
+  , stateValidation ∷ ![ValidationFeature]
   , stateRequest ∷ !(TVar (Maybe InstanceRequest))
     -- ^ Supplied on the main thread from the session, before the owner starts.
   , stateLease ∷ !(TVar (Lease lease))
@@ -294,7 +295,8 @@ data Deposit obligation = Deposit !TargetClass !(Created obligation)
 -- | A controller over a native layer and a surface bridge.
 --
 -- The layers are the ones the instance is asked to enable, each of which the
--- loader must offer. The clock is the one the roots' model and the owner's
+-- loader must offer, and the validation features are the ones its create info
+-- enables through them. The clock is the one the roots' model and the owner's
 -- deadlines read, which must be the host's; the period is how soon the owner
 -- looks again at an attachment whose announcement its port refused.
 newVulkanController
@@ -302,6 +304,7 @@ newVulkanController
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → [ByteString]
+  → [ValidationFeature]
   → Budgets
   → MonotonicSource
   → Duration
@@ -315,14 +318,15 @@ newVulkanControllerWith
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → [ByteString]
+  → [ValidationFeature]
   → Budgets
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks ops pointer bridge layers budgets clock poll = do
+newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   fmap VulkanController $
-    State roots pointer bridge layers
+    State roots pointer bridge layers validation
       <$> newTVarIO Nothing
       <*> newTVarIO LeasePending
       <*> newTVarIO Map.empty
@@ -338,7 +342,7 @@ newVulkanControllerWith hooks ops pointer bridge layers budgets clock poll = do
 -- them; it is refused without them.
 supplyInstanceExtensions ∷ VulkanController → [ByteString] → STM ()
 supplyInstanceExtensions (VulkanController state) required =
-  writeTVar (stateRequest state) (Just (InstanceRequest required (stateLayers state)))
+  writeTVar (stateRequest state) (Just (InstanceRequest required (stateLayers state) (stateValidation state)))
 
 -- | The owner started before the session's instance extensions were supplied.
 data InstanceExtensionsMissing = InstanceExtensionsMissing
@@ -914,6 +918,10 @@ data VulkanHostConfig scene = VulkanHostConfig
   , vulkanCapture ∷ !CaptureConfig
   , vulkanLayers ∷ ![ByteString]
     -- ^ Instance layers to enable, such as the validation layer.
+  , vulkanValidationFeatures ∷ ![ValidationFeature]
+    -- ^ Validation features the instance's create info enables through those
+    -- layers, such as synchronization validation. Empty by default; any at
+    -- all refuses the instance unless an enabled layer offers them.
   , vulkanBudgets ∷ !Budgets
   , vulkanScene ∷ !(Prepared scene)
   , vulkanOwner ∷ GraphicsOwnerConfig scene → GraphicsOwnerConfig scene
@@ -923,9 +931,9 @@ data VulkanHostConfig scene = VulkanHostConfig
   }
 
 -- | A configuration with the given capture configuration and budgets, no
--- layers, the owner's defaults, and no observer.
+-- layers or validation features, the owner's defaults, and no observer.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
-vulkanHostConfig host capture budgets scene = VulkanHostConfig host capture [] budgets scene id (const noObserver)
+vulkanHostConfig host capture budgets scene = VulkanHostConfig host capture [] [] budgets scene id (const noObserver)
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -984,6 +992,7 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
         pointer
         (observeBridge observer bridge)
         (vulkanLayers config)
+        (vulkanValidationFeatures config)
         (vulkanBudgets config)
         (hostClock host)
         (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))

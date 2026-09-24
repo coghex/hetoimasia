@@ -12,9 +12,16 @@
 -- @safe@ (`cabal.project.vulkan` constrains the flag), so any of these calls
 -- may block or re-enter; none installs a Haskell callback, and both messengers
 -- register the C capture callback of "Hetoimasia.GPU.Vulkan.Native.Diagnostics".
+--
+-- A plan that asks for validation features chains a @VkValidationFeaturesEXT@
+-- into the instance's own create info, beside the capture's messenger. That is
+-- the only way this layer turns synchronization validation on: not an
+-- environment variable and not a settings file, either of which a machine
+-- could supply, override or omit without the instance ever saying so.
 module Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
   ( VulkanRootOps
   , vulkanRootOps
+  , validationFeaturesInfo
   , instancePointer
   , isDeviceLoss
   ) where
@@ -27,12 +34,16 @@ import qualified Data.Text.Encoding as Encoding
 import qualified Data.Vector as Vector
 import Data.Word (Word64)
 import Foreign.Ptr (Ptr, castPtr)
-import Vulkan.CStruct.Extends (SomeStruct (..))
+import Vulkan.CStruct.Extends (Chain, SomeStruct (..))
 import Vulkan.Core10
 import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), enumerateInstanceVersion, getPhysicalDeviceFeatures2)
 import Vulkan.Core13 (PhysicalDeviceVulkan13Features (..))
 import Vulkan.Exception (VulkanException (..))
-import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerCreateInfoEXT, DebugUtilsMessengerEXT)
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerEXT)
+import Vulkan.Extensions.VK_EXT_validation_features
+  ( ValidationFeaturesEXT (..)
+  , data VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+  )
 import Vulkan.Extensions.VK_EXT_swapchain_maintenance1 (PhysicalDeviceSwapchainMaintenance1FeaturesKHR (..))
 import Vulkan.Extensions.VK_KHR_surface (SurfaceKHR (..), getPhysicalDeviceSurfaceSupportKHR)
 import Vulkan.Zero (zero)
@@ -50,6 +61,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , InstanceOffer (..)
   , InstancePlan (..)
   , QueueFamilyOffer (..)
+  , ValidationFeature (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootOps (..))
 
@@ -69,32 +81,24 @@ vulkanRootOps capture =
         version ← enumerateInstanceVersion
         (_, extensions) ← enumerateInstanceExtensionProperties Nothing
         (_, layers) ← enumerateInstanceLayerProperties
+        let names = [layer.layerName | layer ← Vector.toList layers]
+        -- A layer's own extensions are listed by naming the layer; the
+        -- loader's listing above does not include them.
+        layerExtensions ← forM names $ \name → do
+          (_, offered) ← enumerateInstanceExtensionProperties (Just name)
+          pure (name, [extension.extensionName | extension ← Vector.toList offered])
         pure
           InstanceOffer
             { offerLoaderVersion = version
             , offerInstanceExtensions = [extension.extensionName | extension ← Vector.toList extensions]
-            , offerLayers = [layer.layerName | layer ← Vector.toList layers]
+            , offerLayers = names
+            , offerLayerExtensions = layerExtensions
             }
     , opsCreateInstance = \plan →
-        createInstance
-          ( InstanceCreateInfo
-              { next = (captureMessengerCreateInfo capture, ())
-              , flags = if plan.planPortabilityEnumeration then INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR else zero
-              , applicationInfo =
-                  Just
-                    ApplicationInfo
-                      { applicationName = Just "hetoimasia"
-                      , applicationVersion = 0
-                      , engineName = Just "hetoimasia"
-                      , engineVersion = 0
-                      , apiVersion = plan.planApiVersion
-                      }
-              , enabledLayerNames = Vector.fromList plan.planLayers
-              , enabledExtensionNames = Vector.fromList plan.planInstanceExtensions
-              }
-              ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT]
-          )
-          Nothing
+        let messenger = captureMessengerCreateInfo capture
+         in if null plan.planValidationFeatures
+              then createInstance (instanceCreateInfo plan (messenger, ())) Nothing
+              else createInstance (instanceCreateInfo plan (messenger, (validationFeaturesInfo plan.planValidationFeatures, ()))) Nothing
     , opsCreateMessenger = \created → createCaptureMessenger created capture
     , opsDestroyMessenger = destroyCaptureMessenger
     , opsDestroyInstance = destroyInstanceQuiesced capture
@@ -105,6 +109,38 @@ vulkanRootOps capture =
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss
     }
+
+-- | The instance's create info over whichever chain the plan needs.
+instanceCreateInfo ∷ InstancePlan → Chain es → InstanceCreateInfo es
+instanceCreateInfo plan chain =
+  InstanceCreateInfo
+    { next = chain
+    , flags = if plan.planPortabilityEnumeration then INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR else zero
+    , applicationInfo =
+        Just
+          ApplicationInfo
+            { applicationName = Just "hetoimasia"
+            , applicationVersion = 0
+            , engineName = Just "hetoimasia"
+            , engineVersion = 0
+            , apiVersion = plan.planApiVersion
+            }
+    , enabledLayerNames = Vector.fromList plan.planLayers
+    , enabledExtensionNames = Vector.fromList plan.planInstanceExtensions
+    }
+
+-- | The create-info structure that enables these validation features, and
+-- disables nothing. Every validation-enabled instance chains it the same way,
+-- the proof's own instances included, so what is validated is decided in one
+-- place.
+validationFeaturesInfo ∷ [ValidationFeature] → ValidationFeaturesEXT
+validationFeaturesInfo features =
+  ValidationFeaturesEXT
+    { enabledValidationFeatures = Vector.fromList (map enable features)
+    , disabledValidationFeatures = Vector.empty
+    }
+  where
+    enable SynchronizationValidation = VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 
 -- | Every physical device, with what the profile asks of it.
 deviceOffers ∷ Instance → Word64 → IO [DeviceOffer PhysicalDevice]

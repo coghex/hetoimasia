@@ -19,7 +19,11 @@
 --   advertises it, and @VK_KHR_portability_subset@ on the device wherever that
 --   device advertises it — two separate decisions, because Linux's loader
 --   advertises the first and Lavapipe does not advertise the second;
--- * @VK_EXT_debug_utils@, which the diagnostic capture's messengers need; and
+-- * @VK_EXT_debug_utils@, which the diagnostic capture's messengers need;
+-- * @VK_EXT_validation_features@, from an enabled layer, exactly when the
+--   caller asks for a 'ValidationFeature' — synchronization validation, which
+--   the Khronos layer leaves off unless the instance's own create info turns
+--   it on; and
 -- * one queue family that answers both graphics and presentation to the
 --   bootstrap surface.
 --
@@ -42,8 +46,10 @@ module Hetoimasia.GPU.Vulkan.Native.Profile
   , swapchainExtension
   , swapchainMaintenance1Extension
   , portabilitySubsetExtension
+  , validationFeaturesExtension
 
     -- * The instance
+  , ValidationFeature (..)
   , InstanceRequest (..)
   , InstanceOffer (..)
   , InstancePlan (..)
@@ -129,8 +135,23 @@ swapchainMaintenance1Extension = "VK_EXT_swapchain_maintenance1"
 portabilitySubsetExtension ∷ ByteString
 portabilitySubsetExtension = "VK_KHR_portability_subset"
 
+-- | The layer extension whose create-info structure enables a validation
+-- feature. A layer offers it, not the loader, so it is looked for among the
+-- extensions of the layers the instance enables.
+validationFeaturesExtension ∷ ByteString
+validationFeaturesExtension = "VK_EXT_validation_features"
+
 -- ---------------------------------------------------------------------------
 -- The instance
+
+-- | A validation feature an enabled layer turns on because the instance's own
+-- create info asks for it — never because a machine's environment or settings
+-- file happened to.
+data ValidationFeature
+  = -- | The Khronos layer's synchronization validation: hazards between
+    -- commands that no barrier orders, which core validation does not check.
+    SynchronizationValidation
+  deriving (Eq, Ord, Show, Bounded, Enum)
 
 -- | What the caller asks the instance for beyond the profile.
 data InstanceRequest = InstanceRequest
@@ -142,6 +163,10 @@ data InstanceRequest = InstanceRequest
   , requestLayers ∷ ![ByteString]
     -- ^ Layers to enable, each of which the loader must offer. Empty unless
     -- the caller wants one, such as the validation layer.
+  , requestValidationFeatures ∷ ![ValidationFeature]
+    -- ^ Validation features to enable through the instance's create info.
+    -- Empty unless the caller wants one; any at all requires an enabled layer
+    -- that offers @VK_EXT_validation_features@.
   }
   deriving (Eq, Show)
 
@@ -151,6 +176,8 @@ data InstanceOffer = InstanceOffer
     -- ^ What @vkEnumerateInstanceVersion@ answered.
   , offerInstanceExtensions ∷ ![ByteString]
   , offerLayers ∷ ![ByteString]
+  , offerLayerExtensions ∷ ![(ByteString, [ByteString])]
+    -- ^ The instance extensions each offered layer provides, by layer name.
   }
   deriving (Eq, Show)
 
@@ -162,6 +189,9 @@ data InstancePlan = InstancePlan
   , planPortabilityEnumeration ∷ !Bool
     -- ^ Whether @VK_KHR_portability_enumeration@ is enabled, and with it the
     -- instance flag that lets the loader enumerate portability drivers.
+  , planValidationFeatures ∷ ![ValidationFeature]
+    -- ^ The validation features the create info enables; when there are any,
+    -- @VK_EXT_validation_features@ is among 'planInstanceExtensions'.
   }
   deriving (Eq, Show)
 
@@ -170,6 +200,10 @@ data InstanceRefusal
   = LoaderVersionTooOld !Word32
   | InstanceExtensionsUnavailable ![ByteString]
   | InstanceLayersUnavailable ![ByteString]
+  | -- | Validation features were asked for, and none of these enabled layers
+    -- offers the extension that enables them. Nothing falls back to validation
+    -- without them.
+    ValidationFeaturesUnavailable ![ByteString]
   deriving (Eq, Show)
 
 instance Exception InstanceRefusal where
@@ -178,6 +212,11 @@ instance Exception InstanceRefusal where
       "the loader offers Vulkan " <> Text.unpack (describeApiVersion version) <> ", below the 1.3 minimum"
     InstanceExtensionsUnavailable names → "the loader does not offer the instance extensions " <> listed names
     InstanceLayersUnavailable names → "the loader does not offer the layers " <> listed names
+    ValidationFeaturesUnavailable names →
+      "validation features were requested, but "
+        <> (if null names then "no layer is enabled" else "none of the enabled layers " <> listed names <> " offers")
+        <> " "
+        <> Char8.unpack validationFeaturesExtension
 
 -- | Plan the instance, or say what the loader lacks.
 --
@@ -188,15 +227,28 @@ planInstance request offer
   | not (meets (offerLoaderVersion offer)) = Left (LoaderVersionTooOld (offerLoaderVersion offer))
   | not (null missingExtensions) = Left (InstanceExtensionsUnavailable missingExtensions)
   | not (null missingLayers) = Left (InstanceLayersUnavailable missingLayers)
+  | not (null features) && not featuresOffered = Left (ValidationFeaturesUnavailable layers)
   | otherwise =
       Right
         InstancePlan
           { planApiVersion = requestedApiVersion
-          , planInstanceExtensions = required <> [portabilityEnumerationExtension | portability]
-          , planLayers = nub (requestLayers request)
+          , planInstanceExtensions =
+              required
+                <> [portabilityEnumerationExtension | portability]
+                <> [validationFeaturesExtension | not (null features)]
+          , planLayers = layers
           , planPortabilityEnumeration = portability
+          , planValidationFeatures = features
           }
   where
+    layers = nub (requestLayers request)
+    features = nub (requestValidationFeatures request)
+    featuresOffered =
+      or
+        [ validationFeaturesExtension `elem` extensions
+        | (layer, extensions) ← offerLayerExtensions offer
+        , layer `elem` layers
+        ]
     offered = offerInstanceExtensions offer
     portability = portabilityEnumerationExtension `elem` offered
     required =
