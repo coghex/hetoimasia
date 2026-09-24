@@ -130,8 +130,11 @@ or filed. Next audit starts after `425e97b`, plus changed specs/docs.
   supervised inboxes, and GLFW dynamic windows/controls/monitors/input exist.
 - In addition to root, foundation, runtime, GLFW, Lua, test support and the GPU
   model, #217 now supplies portable Vulkan diagnostics and a native diagnostics
-  package. #216 supplies GLFW's optional Vulkan interop component. Native
-  instance/device ownership remains #219; fonts and renderers remain plans.
+  package. #216 supplies GLFW's optional Vulkan interop component. #219 adds
+  the native Vulkan roots (instance, messenger, one shared device, per-target
+  surfaces) and the `hetoimasia-gpu-vulkan-glfw` integration that runs them
+  under the graphics owner ([contract](docs/gpu_backend.md)); nothing is
+  recorded or submitted yet. Fonts and renderers remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.

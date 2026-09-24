@@ -26,6 +26,7 @@
 #include <GLFW/glfw3.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -167,4 +168,8 @@ int hetoimasia_proof_image_of(const void *address, char *image, size_t image_cap
     snprintf(symbol, symbol_capacity, "%s", info.dli_sname);
   }
   return 1;
+}
+
+uint64_t hetoimasia_proof_os_thread(void) {
+  return (uint64_t) (uintptr_t) pthread_self();
 }

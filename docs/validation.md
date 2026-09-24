@@ -235,10 +235,11 @@ describes.
 planner, receipt, packaging, and runner contracts, including short one-second
 fixtures proving that the runner enforces its deadline and reaps children. It
 contains no display-helper examples. It declares `packages/gpu-vulkan/native/`
-among its inputs, as it declares `tools/vulkan-proof/`: no CPU group can build
-the native backend package, whose only build is the proof route, and this
-group's Vulkan boundary examples are what hold that package out of the ordinary
-projects and read its dependencies.
+and `packages/gpu-vulkan/glfw/` among its inputs, as it declares
+`tools/vulkan-proof/`: no CPU group can build the native backend package or the
+window integration package, whose only build is the proof route, and this
+group's Vulkan boundary examples are what hold those packages out of the
+ordinary projects and read their dependencies.
 
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
@@ -1518,8 +1519,10 @@ reports. VK-4 provisioned that runtime into the image, so the throwaway
 container this route used to build is gone and the proof now runs against
 exactly the inputs ordinary Linux validation runs against. The same run carries
 VK-6's native capture cases, on an instance of their own after the VK-2 session,
-and builds the native backend package they exercise; its record's source digest
-covers that package and its local closure. Nothing about it is required. See
+VK-5's surface bridge cases, and VK-7's roots under the graphics owner, and
+builds the native backend and window integration packages they exercise; its
+record's source digest covers those packages and their local closure. Nothing
+about it is required. See
 [the compatibility record](vulkan_compatibility_record.md) and
 [the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture).
 

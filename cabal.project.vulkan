@@ -29,6 +29,7 @@ import: cabal.project.common
 packages:
   tools/vulkan-proof
   packages/gpu-vulkan/native
+  packages/gpu-vulkan/glfw
   packages/glfw
   packages/gpu-vulkan/diagnostics
   packages/gpu-vulkan/model

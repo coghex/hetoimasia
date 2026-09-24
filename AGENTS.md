@@ -116,6 +116,10 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
+- The Vulkan native backend and window integration packages build only
+  through `cabal.project.vulkan`; `bash tools/vulkan-proof/run-proof.sh
+  --headless` runs their headless suites (`native-tests`, `integration-tests`)
+  beside the proof harness's own. See [gpu_backend.md](docs/gpu_backend.md).
 - Without the GLFW SDK, build and run the foundation, runtime, Lua host, and
   root suites with `--project-file cabal.project.cpu`, which shares
   `cabal.project.common` with `cabal.project` and leaves out `hetoimasia-glfw`,

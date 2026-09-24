@@ -30,6 +30,7 @@ module Test.Vulkan.Proof.Interop
     -- * Provenance
   , Provenance (..)
   , provenanceOf
+  , osThread
   , describeProvenance
   ) where
 
@@ -81,6 +82,12 @@ foreign import ccall safe "hetoimasia_proof_create_window_surface"
 
 foreign import ccall safe "hetoimasia_proof_last_error"
   c_lastError ∷ IO CString
+
+-- | The OS thread the caller is running on, as @pthread_self@ answers it. It
+-- neither blocks nor calls back, so the import is @unsafe@: there is nothing
+-- to gain from releasing the capability around it.
+foreign import ccall unsafe "hetoimasia_proof_os_thread"
+  osThread ∷ IO Word64
 
 foreign import ccall safe "hetoimasia_proof_image_of"
   c_imageOf ∷ Ptr () → CString → CSize → CString → CSize → IO CInt

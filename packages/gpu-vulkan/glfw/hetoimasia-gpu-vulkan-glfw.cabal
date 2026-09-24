@@ -1,0 +1,106 @@
+cabal-version: 3.16
+name: hetoimasia-gpu-vulkan-glfw
+version: 0.1.0.0
+synopsis: The Vulkan backend's window integration for Hetoimasia
+description:
+    The integration that composes the native Vulkan backend with the GLFW
+    package: a session controller that supplies VK-18's supervised graphics
+    owner with VK-7's Vulkan operations — the instance, its explicit messenger,
+    the one shared device and a target for every window surface — and the
+    main-thread handover that creates each window's surface through VK-5's
+    surface bridge inside its attachment and gives it to the owner. It is the
+    only package that depends on both the native backend and GLFW; neither of
+    them depends on it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a loader.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/gpu-vulkan/glfw
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The controller and the bridge seam, private to this package: the public
+-- module re-exports what an application uses, and the package's own examples
+-- reach the seam a headless run needs.
+library controller
+    import: language
+    visibility: private
+    hs-source-dirs: controller
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.GLFW
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw:controller
+
+-- The controller's headless examples: whole graphics hosts over the GLFW
+-- package's scripted seam, with the real owner machinery, the real controller
+-- and a stand-in native layer and surface bridge. They initialize no GLFW,
+-- open no window and create no Vulkan object; the executable links the loader
+-- only because the native package does, so it is built and run through
+-- `tools/vulkan-proof/run-proof.sh --headless`.
+test-suite integration-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.GPU.Vulkan.GLFW.Controller
+        Test.GPU.Vulkan.GLFW.StandIn
+    ghc-options: -threaded -rtsopts
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:seam ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw:controller

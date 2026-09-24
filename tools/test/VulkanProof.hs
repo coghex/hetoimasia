@@ -70,6 +70,11 @@ captureRecords = [("macOS", "docs/vulkan/macos-vk6.md"), ("Linux", "docs/vulkan/
 bridgeRecords ∷ [(String, FilePath)]
 bridgeRecords = [("macOS", "docs/vulkan/macos-vk5.md"), ("Linux", "docs/vulkan/linux-vk5.md")]
 
+-- | The record VK-7's native cases produced: the same proof run, retained for
+-- its roots section. Linux alone unless a consented macOS run is retained too.
+rootsRecords ∷ [(String, FilePath)]
+rootsRecords = [("Linux", "docs/vulkan/linux-vk7.md")]
+
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
@@ -92,6 +97,7 @@ readByTheseExamples =
   , "tools/vulkan-proof/run-proof.sh"
   , "tools/vulkan-proof/run-shaders.sh"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
+  , integrationPackage </> "hetoimasia-gpu-vulkan-glfw.cabal"
   , glfwPackage </> "hetoimasia-glfw.cabal"
   , compatibilityRecord
   ]
@@ -99,6 +105,7 @@ readByTheseExamples =
     <> map snd provisionedRecords
     <> map snd captureRecords
     <> map snd bridgeRecords
+    <> map snd rootsRecords
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -113,6 +120,13 @@ proofPackage = "tools/vulkan-proof"
 nativePackage ∷ String
 nativePackage = "packages/gpu-vulkan/native"
 
+-- | The window integration package, which composes the native package with
+-- the GLFW package's graphics owner and surface bridge. It depends on both, so
+-- it resolves the binding through the native package and the interop
+-- component, and the Vulkan project is the only one that may name it.
+integrationPackage ∷ String
+integrationPackage = "packages/gpu-vulkan/glfw"
+
 -- | The GLFW package. The ordinary projects list it with its Vulkan interop
 -- component switched off; the Vulkan project lists it with that component on.
 glfwPackage ∷ String
@@ -124,15 +138,16 @@ interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
 -- | Everything the Vulkan project names: the proof, the native package, the
--- GLFW package whose interop component it enables, the local dependency
--- closure of the native package and that component, and the test-only support
--- library the native package's shader suite uses. All but the first two are
--- ordinary packages the other projects list too, and with the interop flag
--- off none of them depends on the binding.
+-- window integration package, the GLFW package whose interop component it
+-- enables, the local dependency closure of the native package and that
+-- component, and the test-only support library the native package's shader
+-- suite uses. All but the first three are ordinary packages the other projects
+-- list too, and with the interop flag off none of them depends on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ proofPackage
   , nativePackage
+  , integrationPackage
   , glfwPackage
   , "packages/gpu-vulkan/diagnostics"
   , "packages/gpu-vulkan/model"
@@ -148,7 +163,7 @@ bindingPackage = "vulkan"
 
 spec ∷ Spec
 spec = describe "The Vulkan proof boundary" $ do
-  it "names the proof and the native package, with its local closure, in the one project file that selects them" $ do
+  it "names the proof, the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
     declared `shouldBe` vulkanProject
 
@@ -292,7 +307,7 @@ spec = describe "The Vulkan proof boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (\entry → proofPackage `isPrefixOf` entry || nativePackage `isPrefixOf` entry) declared)
+        (path, filter (\entry → any (`isPrefixOf` entry) [proofPackage, nativePackage, integrationPackage]) declared)
           `shouldBe` (path, [])
         -- The diagnostics package is the header-free half: it is in both, and
         -- the dependency check below is what holds it free of the binding.
@@ -311,6 +326,10 @@ spec = describe "The Vulkan proof boundary" $ do
         nativeDependencies `shouldContain` [bindingPackage]
         interopDependencies ← packageDependenciesWith [interopFlag] glfwPackage
         interopDependencies `shouldContain` [bindingPackage]
+        -- The integration package reaches the binding through both of them.
+        integrationDependencies ← packageDependencies integrationPackage
+        integrationDependencies `shouldContain` ["hetoimasia-gpu-vulkan-native"]
+        integrationDependencies `shouldContain` ["hetoimasia-glfw:vulkan-interop"]
 
   it "sets aside only a disabled flag's own block when it reads a package's dependencies" $ do
     -- The rule above must not become an exemption: a dependency outside the
@@ -508,6 +527,37 @@ spec = describe "The Vulkan proof boundary" $ do
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") bridgeRecords
     map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
     length (nub (map (fmap trim) digests)) `shouldBe` 1
+
+  it "retains a VK-7 record, a pass whose roots lived on the graphics owner and were destroyed child before parent" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          take 1 (lines record) `shouldBe` ["# The VK-7 Vulkan roots record, " <> platform]
+          let marked = [number | (number, line) ← zip [0 ∷ Int ..] (lines record), line == capturedMarker]
+          case marked of
+            [only] →
+              take 1 (dropWhile null (drop (only + 1) (lines record)))
+                `shouldBe` ["Verdict: **pass**."]
+            _ → expectationFailure (platform <> "'s VK-7 record marks its captured output " <> show (length marked) <> " times, not once")
+          -- Read from the VK-7 section alone: the VK-6 section above it carries
+          -- settings of the same names.
+          let section = unlines (drop 1 (dropWhile (/= "## VK-7: the Vulkan roots under the graphics owner") (lines record)))
+              table = [cells line | line ← lines section, "| vk" `isPrefixOf` line || "| glfw" `isPrefixOf` line]
+              cells line = map trim (splitOn '|' line)
+          fmap trim (settingOf section "- readiness:") `shouldBe` Just "RootsReady"
+          fmap trim (settingOf section "- after the first window closed:") `shouldBe` Just "device RootLive, instance RootLive, 1 targets"
+          fmap trim (settingOf section "- second target after the close:") `shouldBe` Just "TargetUsable"
+          fmap trim (settingOf section "- verdict issues:") `shouldBe` Just "none"
+          fmap trim (settingOf section "- undelivered:") `shouldBe` Just "0"
+          -- Every call ran without raising; surfaces were created on the main
+          -- thread and everything else off it; destruction ran child first.
+          [row | row ← table, lookup' 6 row /= Just "no"] `shouldBe` []
+          [lookup' 3 row | row ← table, lookup' 1 row == Just "glfwCreateWindowSurface"] `shouldBe` [Just "yes", Just "yes"]
+          [lookup' 3 row | row ← table, lookup' 1 row /= Just "glfwCreateWindowSurface"] `shouldSatisfy` all (== Just "no")
+          [name | row ← table, Just name ← [lookup' 1 row], "vkDestroy" `isPrefixOf` name]
+            `shouldBe` ["vkDestroySurfaceKHR", "vkDestroySurfaceKHR", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      )
+      rootsRecords
 
   it "proved both platforms from one tree, by the digest each computed" $ do
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") retainedRecords
@@ -829,3 +879,10 @@ recordTotal record = do
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace
+
+-- | The cell at this index of a Markdown table row split on @|@, where index 0
+-- is the empty text before the row's opening bar.
+lookup' ∷ Int → [String] → Maybe String
+lookup' index row = case drop index row of
+  (cell : _) → Just cell
+  [] → Nothing

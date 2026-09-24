@@ -78,6 +78,7 @@ consumed =
   , ("docs/vulkan/linux-vk6.md", "VulkanProof.hs reads the VK-6 record it must agree with")
   , ("docs/vulkan/macos-vk5.md", "VulkanProof.hs reads the VK-5 record it must agree with")
   , ("docs/vulkan/linux-vk5.md", "VulkanProof.hs reads the VK-5 record it must agree with")
+  , ("docs/vulkan/linux-vk7.md", "VulkanProof.hs reads the VK-7 record it must agree with")
   ]
 
 -- | Files an example reads out of a checkout that the distribution must never
@@ -91,6 +92,9 @@ checkoutOnly =
   , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
     , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"
+    )
+  , ( "packages/gpu-vulkan/glfw/hetoimasia-gpu-vulkan-glfw.cabal"
+    , "VulkanProof.hs reads the window integration package's dependencies beside the ordinary projects, as a sibling package"
     )
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"

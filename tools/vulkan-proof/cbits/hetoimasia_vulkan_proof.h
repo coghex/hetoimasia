@@ -68,4 +68,10 @@ const char *hetoimasia_proof_last_error(void);
 int hetoimasia_proof_image_of(const void *address, char *image, size_t image_capacity,
                               char *symbol, size_t symbol_capacity);
 
+/* The calling OS thread's identity, as `pthread_self` answers it, widened to 64
+ * bits. VK-7's native cases record it at each native call, so which thread
+ * made a call is an observation at the native boundary rather than a reading
+ * of which Haskell thread asked. */
+uint64_t hetoimasia_proof_os_thread(void);
+
 #endif /* HETOIMASIA_VULKAN_PROOF_H */

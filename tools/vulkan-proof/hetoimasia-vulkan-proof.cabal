@@ -70,6 +70,8 @@ test-suite vulkan-proof
         Test.Vulkan.Proof.Record
         Test.Vulkan.Proof.Retention
         Test.Vulkan.Proof.RetentionSpec
+        Test.Vulkan.Proof.Roots
+        Test.Vulkan.Proof.RootsSpec
         Test.Vulkan.Proof.Run
         Test.Vulkan.Proof.Spec
     c-sources: cbits/hetoimasia_vulkan_proof.c
@@ -95,5 +97,8 @@ test-suite vulkan-proof
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0
