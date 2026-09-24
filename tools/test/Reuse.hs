@@ -210,6 +210,20 @@ spec = describe "Validation evidence reuse" $ do
         install fixture plan "build.pass" [passing other]
         refusal fixture plan "build.pass" "a different toolchain"
 
+    it "refuses a receipt whose execution was prepared by something the plan does not declare" $
+      withReceipt $ \fixture receipt → do
+        -- The same command after a different preparation runs a different
+        -- executable, so the receipt describes an execution this plan never
+        -- asked for.
+        prepared ←
+          patched fixture receipt "prepared.json" "preparation"
+            "{\"command\": [\"make\"], \"outcome\": \"passed\", \"exit_status\": 0, \
+            \\"started_at\": \"2026-09-24T00:00:00.000Z\", \"ended_at\": \"2026-09-24T00:00:01.000Z\", \
+            \\"duration_seconds\": 1, \"timeout_seconds\": 60, \"expiry\": null}"
+        plan ← proseCandidate fixture
+        install fixture plan "build.pass" [passing prepared]
+        refusal fixture plan "build.pass" "records a different preparation from the plan's"
+
     it "refuses a receipt whose execution exited non-zero" $
       withReceipt $ \fixture receipt → do
         failed ← patched fixture receipt "failed.json" "outcome" "\"failed\""

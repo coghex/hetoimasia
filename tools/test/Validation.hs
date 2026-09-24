@@ -412,6 +412,30 @@ spec = describe "Validation planner" $ do
         refusal "blank-platforms.json" (platformsCatalog "[\"\"]") "non-string platforms entry"
         refusal "twice-platforms.json" (platformsCatalog "[\"Linux\", \"Linux\"]") "names a platform more than once"
 
+    it "refuses a preparation that is not a whole command and a positive budget" $
+      withFixture $ \fixture → do
+        let refusal name document expected = do
+              writeFixtureFile (root fixture) ("fixtures/" ++ name) document
+              (result, _, errors) ← planner' fixture
+                ["--catalog-check", "--catalog", root fixture </> "fixtures" </> name]
+              result `shouldBe` ExitFailure 2
+              errors `shouldContain` expected
+        refusal "unbudgeted.json" (preparedCatalog "{\"command\": [\"true\"]}") "preparation is missing required key 'timeout_seconds'"
+        refusal "commandless.json" (preparedCatalog "{\"timeout_seconds\": 60}") "preparation is missing required key 'command'"
+        refusal "empty.json" (preparedCatalog "{\"command\": [], \"timeout_seconds\": 60}") "preparation 'command' must be a non-empty list"
+        refusal "blank.json" (preparedCatalog "{\"command\": [\"\"], \"timeout_seconds\": 60}") "preparation 'command' must be a non-empty list"
+        refusal "zero.json" (preparedCatalog "{\"command\": [\"true\"], \"timeout_seconds\": 0}") "preparation 'timeout_seconds' must be a positive integer"
+        refusal "flagged.json" (preparedCatalog "{\"command\": [\"true\"], \"timeout_seconds\": true}") "preparation 'timeout_seconds' must be a positive integer"
+        refusal "extra.json" (preparedCatalog "{\"command\": [\"true\"], \"timeout_seconds\": 60, \"env\": {}}") "preparation has unknown key 'env'"
+        refusal "listed.json" (preparedCatalog "[\"true\"]") "key 'preparation' must be a dict"
+
+    it "accepts a whole preparation" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "fixtures/prepared.json" (preparedCatalog "{\"command\": [\"make\", \"it\"], \"timeout_seconds\": 90}")
+        (checked, _, checkErrors) ← planner' fixture
+          ["--catalog-check", "--catalog", root fixture </> "fixtures/prepared.json"]
+        (checked, checkErrors) `shouldBe` (ExitSuccess, "")
+
     it "names a group that is missing its optional classification" $
       withFixture $ \fixture → do
         writeFixtureFile (root fixture) "fixtures/missing-optional.json" missingOptionalCatalog
@@ -922,6 +946,30 @@ platformsCatalog platforms =
     ["    \"build.all\""]
     [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
     , platformGroupDocument "probe.linux" ["tools/shared.sh"] platforms
+    ]
+
+-- | A catalog whose one optional group declares this preparation, written out
+-- verbatim so a malformed one can be offered at all.
+preparedCatalog ∷ String → String
+preparedCatalog preparation =
+  catalogDocument
+    ["    \"build.all\""]
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , unlines
+        [ "    {"
+        , "      \"id\": \"probe.prepared\","
+        , "      \"description\": \"Fixture group probe.prepared.\","
+        , "      \"command\": [\"true\"],"
+        , "      \"component\": null,"
+        , "      \"inputs\": [\"tools/shared.sh\"],"
+        , "      \"framework\": \"hspec\","
+        , "      \"runner\": \"display\","
+        , "      \"timeout_seconds\": 30,"
+        , "      \"category\": \"test\","
+        , "      \"optional\": true,"
+        , "      \"preparation\": " ++ preparation
+        , "    }"
+        ]
     ]
 
 platformGroupDocument ∷ String → [String] → String → String

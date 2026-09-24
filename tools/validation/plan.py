@@ -653,7 +653,46 @@ GROUP_KEYS = {
 # wherever it is planned.
 OPTIONAL_GROUP_KEYS = {
     "platforms": list,
+    "preparation": dict,
 }
+
+# A preparation stage: a command the runner executes to completion before the
+# group's own command, under a budget of its own, and records separately. It
+# exists for a group whose ``timeout_seconds`` is a measurement rather than a
+# ceiling — a native check whose budget counts its display, fixture, examples
+# and teardown but not the compilation that produced its executable. Its command
+# is part of the plan's identity exactly as the group's own is, so evidence
+# gathered under one preparation never answers for another; and it can never
+# stand in for the command it prepares, because a group whose preparation did
+# not pass is a group that did not run.
+PREPARATION_KEYS = {
+    "command": list,
+    "timeout_seconds": int,
+}
+
+
+def preparation_problems(preparation: dict, where: str) -> list[str]:
+    """Every problem with one group's preparation declaration."""
+    problems: list[str] = []
+    for key in PREPARATION_KEYS:
+        if key not in preparation:
+            problems.append(f"{where} preparation is missing required key {key!r}")
+    for key in preparation:
+        if key not in PREPARATION_KEYS:
+            problems.append(f"{where} preparation has unknown key {key!r}")
+    command = preparation.get("command")
+    if "command" in preparation and (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(token, str) and token for token in command)
+    ):
+        problems.append(f"{where} preparation 'command' must be a non-empty list of non-empty strings")
+    timeout = preparation.get("timeout_seconds")
+    if "timeout_seconds" in preparation and (
+        not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0
+    ):
+        problems.append(f"{where} preparation 'timeout_seconds' must be a positive integer")
+    return problems
 
 
 def validate_catalog(document: dict, path: str, packages: dict[str, Package] | None) -> list[str]:
@@ -744,6 +783,9 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             # counting it would raise where a diagnostic is owed.
             elif len(set(named)) != len(named):
                 problems.append(f"{where} names a platform more than once")
+        preparation = group.get("preparation")
+        if isinstance(preparation, dict):
+            problems.extend(preparation_problems(preparation, where))
 
         if not isinstance(identifier, str) or not ID_PATTERN.match(identifier or ""):
             problems.append(f"{where} has an invalid id; expected dotted lowercase, e.g. 'test.engine'")
@@ -1168,6 +1210,15 @@ def build_plan(
                 "runner": group["runner"],
                 "timeout_seconds": group["timeout_seconds"],
                 "command": list(group["command"]),
+                # `null` for a group whose command is its whole execution.
+                "preparation": (
+                    {
+                        "command": list(group["preparation"]["command"]),
+                        "timeout_seconds": group["preparation"]["timeout_seconds"],
+                    }
+                    if "preparation" in group
+                    else None
+                ),
             }
         )
 

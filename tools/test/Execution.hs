@@ -10,8 +10,9 @@ module Execution (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (void)
+import Data.List (intercalate)
 import Data.Maybe (isNothing)
-import Json (Json (..), asBool, asString, entryFor, field, parseJson)
+import Json (Json (..), asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox
   ( fixtureGenerated
   , fixtureIgnore
@@ -139,6 +140,143 @@ spec = describe "Validation execution" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "did not select"
         doesFileExist (receiptPath fixture "test.fail") `shouldReturn` False
+
+  describe "preparation and the watchdog" $ do
+    it "prepares a group before measuring it, and records the two stages apart" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.prepared"]
+        (result, output, _) ← runGroup fixture "probe.prepared" plan []
+        result `shouldBe` ExitSuccess
+        output `shouldContain` "validation: preparing probe.prepared"
+        receipt ← readReceipt fixture "probe.prepared"
+        stringField receipt "outcome" `shouldBe` Just "passed"
+        boolField receipt "executed" `shouldBe` Just True
+        nestedString receipt "preparation" "outcome" `shouldBe` Just "passed"
+        -- The preparation slept for two seconds and the command did not, so a
+        -- measurement that had included the build would say so.
+        nestedNumber receipt "preparation" "duration_seconds" `shouldSatisfy` maybe False (>= 2)
+        numberField receipt "duration_seconds" `shouldSatisfy` maybe False (< 2)
+        numberField receipt "timeout_seconds" `shouldBe` Just 30
+        nestedNumber receipt "preparation" "timeout_seconds" `shouldBe` Just 60
+        -- What the command found is what the preparation left.
+        stringsField receipt "evidence"
+          `shouldBe` Just ["evidence/probe.prepared/built", "evidence/probe.prepared/ran"]
+
+    it "records a group without a preparation as one stage" $
+      withFixture $ \fixture → do
+        change fixture "src/note.txt" "revised source\n"
+        plan ← planAgainst fixture (seeded fixture)
+        _ ← runGroup fixture "test.fail" plan []
+        receipt ← readReceipt fixture "test.fail"
+        fieldIsNull receipt "preparation" `shouldBe` True
+        fieldIsNull receipt "expiry" `shouldBe` True
+        boolField receipt "executed" `shouldBe` Just True
+
+    it "never runs a command whose preparation failed, and never passes it" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.unprepared"]
+        (result, output, _) ← runGroup fixture "probe.unprepared" plan []
+        result `shouldBe` ExitFailure 1
+        output `shouldContain` "did not run, because its preparation did not pass"
+        receipt ← readReceipt fixture "probe.unprepared"
+        stringField receipt "outcome" `shouldBe` Just "failed"
+        boolField receipt "executed" `shouldBe` Just False
+        nestedString receipt "preparation" "outcome" `shouldBe` Just "failed"
+        numberField receipt "duration_seconds" `shouldBe` Just 0
+        doesFileExist (receiptsDirectory fixture </> "evidence/probe.unprepared/ran") `shouldReturn` False
+        (verdict, report, _) ← aggregate fixture plan []
+        verdict `shouldBe` ExitFailure 1
+        report `shouldContain` "its preparation exited 1, so it never ran"
+
+    it "ends a preparation that exhausts its own budget, and reaps what it started" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.overbuilt"]
+        (result, _, _) ← runGroup fixture "probe.overbuilt" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.overbuilt"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        boolField receipt "executed" `shouldBe` Just False
+        nestedString receipt "preparation" "outcome" `shouldBe` Just "timeout"
+        (receipt >>= field "preparation" >>= field "expiry" >>= field "expired_at" >>= asString)
+          `shouldSatisfy` maybe False (not . null)
+        doesFileExist (receiptsDirectory fixture </> "evidence/probe.overbuilt/ran") `shouldReturn` False
+        child ← readFile (receiptsDirectory fixture </> "evidence/probe.overbuilt/child.pid")
+        reaped fixture (takeWhile (/= '\n') child) 50 `shouldReturn` True
+        (_, report, _) ← aggregate fixture plan []
+        report `shouldContain` "its preparation exhausted its 1s budget, so it never ran"
+
+    it "keeps measuring a command whose leader exited while its descendants run on" $
+      withFixture $ \fixture → do
+        -- The shell reports success at once, and a teardown that has not
+        -- finished is not an execution that has. The deadline expires on what
+        -- the shell left behind, and the group is not a pass.
+        plan ← planRequesting fixture ["probe.lingering"]
+        (result, _, _) ← runGroup fixture "probe.lingering" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.lingering"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        numberField receipt "exit_status" `shouldBe` Just 0
+        numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+        (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+        child ← readFile (receiptsDirectory fixture </> "evidence/probe.lingering/child.pid")
+        reaped fixture (takeWhile (/= '\n') child) 50 `shouldReturn` True
+
+    it "keeps an expired deadline unsuccessful when the stopped command exits zero" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.graceful"]
+        (result, _, _) ← runGroup fixture "probe.graceful" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.graceful"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        numberField receipt "exit_status" `shouldBe` Just 0
+        (_, report, _) ← aggregate fixture plan []
+        report `shouldContain` "exhausted its 1s budget"
+
+    it "measures to the deadline and records the cleanup after it apart" $
+      withFixture $ \fixture → do
+        -- A descendant that ignores SIGTERM holds the cleanup for the whole
+        -- grace period before it is killed; none of that is the measurement.
+        change fixture "stubborn/note.txt" "revised stubborn input\n"
+        plan ← planAgainst fixture (seeded fixture)
+        _ ← runGroup fixture "smoke.stubborn" plan []
+        receipt ← readReceipt fixture "smoke.stubborn"
+        numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+        (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just True
+        (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (>= 5)
+
+    it "retains the evidence a stopped command writes in its own cleanup" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.evidence"]
+        (result, _, _) ← runGroup fixture "probe.evidence" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.evidence"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        stringsField receipt "evidence"
+          `shouldBe` Just ["evidence/probe.evidence/display.log", "evidence/probe.evidence/setup.log"]
+        readFile (receiptsDirectory fixture </> "evidence/probe.evidence/display.log") `shouldReturn` "retained\n"
+
+    it "binds the preparation into the plan's identity and the receipt's comparison" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.prepared"]
+        (floor', _, _) ← runGroup fixture "build.pass" plan []
+        floor' `shouldBe` ExitSuccess
+        (executed, _, _) ← runGroup fixture "probe.prepared" plan []
+        executed `shouldBe` ExitSuccess
+        aggregate fixture plan [] >>= \(result, _, _) → result `shouldBe` ExitSuccess
+        -- A receipt that claims another preparation describes another
+        -- execution, even under the same command.
+        patchPreparation fixture (receiptPath fixture "probe.prepared") "[\"true\"]"
+        (patched, report, _) ← aggregate fixture plan []
+        patched `shouldBe` ExitFailure 1
+        report `shouldContain` "records a different preparation from the plan's"
+        -- And a plan whose preparation was edited is a different plan, so the
+        -- genuine receipt no longer names it.
+        _ ← runGroup fixture "probe.prepared" plan []
+        edited ← planRequesting fixture ["probe.prepared"]
+        patchGroupPreparation fixture edited "probe.prepared" "[\"true\"]"
+        (rebound, rebinding, _) ← aggregate fixture edited []
+        rebound `shouldBe` ExitFailure 1
+        rebinding `shouldContain` "the receipt names plan"
 
   describe "execution provenance" $ do
     it "refuses a stale plan executed from a commit that replaced its candidate" $
@@ -1326,7 +1464,7 @@ planWith fixture arguments name = do
 fixtureWorkers ∷ [String]
 fixtureWorkers =
   [ "--worker", "floor=cpu:build.pass"
-  , "--worker", "extra=cpu:test.fail,test.flag,smoke.slow,smoke.stubborn,probe.optional"
+  , "--worker", "extra=cpu:test.fail,test.flag,smoke.slow,smoke.stubborn,probe.optional," ++ intercalate "," stagedGroups
   , "--worker", "native=display:test.native,probe.desktop"
   ]
 
@@ -1452,6 +1590,75 @@ numberField document name = case document >>= field name of
   Just (JNumber value) → Just value
   _ → Nothing
 
+-- | A plan for the fixture's seeded base whose pull-request body requests
+-- these optional groups.
+planRequesting ∷ Fixture → [String] → IO FilePath
+planRequesting fixture groups = do
+  writeFixtureFile (root fixture) "body.txt" (requestBlock groups)
+  planWith fixture ["--base", seeded fixture, "--head", "HEAD", "--request-file", root fixture </> "body.txt"] "plan.json"
+
+boolField ∷ Maybe Json → String → Maybe Bool
+boolField document name = document >>= field name >>= asBool
+
+stringsField ∷ Maybe Json → String → Maybe [String]
+stringsField document name = document >>= field name >>= asArray >>= traverse asString
+
+fieldIsNull ∷ Maybe Json → String → Bool
+fieldIsNull document name = case document >>= field name of
+  Just JNull → True
+  _ → False
+
+nestedString ∷ Maybe Json → String → String → Maybe String
+nestedString document outer name = document >>= field outer >>= field name >>= asString
+
+nestedNumber ∷ Maybe Json → String → String → Maybe Double
+nestedNumber document outer name = document >>= field outer >>= field name >>= asNumber
+
+asNumber ∷ Json → Maybe Double
+asNumber = \case
+  JNumber value → Just value
+  _ → Nothing
+
+-- | Replace a receipt's recorded preparation command.
+patchPreparation ∷ Fixture → FilePath → String → IO ()
+patchPreparation fixture path command = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json,sys\n\
+        \path, value = sys.argv[1:3]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \document['preparation']['command'] = json.loads(value)\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , path
+      , command
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+-- | Replace one plan group's preparation command.
+patchGroupPreparation ∷ Fixture → FilePath → String → String → IO ()
+patchGroupPreparation fixture path group command = do
+  (result, _, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-c"
+      , "import json,sys\n\
+        \path, group, value = sys.argv[1:4]\n\
+        \document = json.load(open(path, encoding='utf-8'))\n\
+        \entry = next(entry for entry in document['groups'] if entry['id'] == group)\n\
+        \entry['preparation']['command'] = json.loads(value)\n\
+        \json.dump(document, open(path, 'w', encoding='utf-8'))\n"
+      , path
+      , group
+      , command
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
 -- | Replace one string field, so an otherwise genuine receipt can claim the
 -- wrong provenance without hand-writing the whole document.
 patchReceipt ∷ Fixture → String → String → String → IO ()
@@ -1521,7 +1728,7 @@ emptyPlan ∷ String
 emptyPlan =
   unlines
     [ "{"
-    , "  \"schema_version\": 3,"
+    , "  \"schema_version\": 4,"
     , "  \"policy_version\": \"eeee\","
     , "  \"catalog_policy_version\": 1,"
     , "  \"input_identity\": \"ffff\","
@@ -1662,10 +1869,94 @@ fixtureCatalogWith nonAffecting =
     , groupDocument "probe.optional" "[\"true\"]" "[\"probe/\"]" "hspec" "probe" "60" "true" ++ ","
     , displayGroupDocument "test.native" "test" "false" ++ ","
     , displayGroupDocument "probe.desktop" "probe" "true" ++ ","
+    , concatMap (++ ",") stagedGroupDocuments
     , elsewhereGroupDocument
     , "  ]"
     , "}"
     ]
+
+-- | Optional groups whose preparation or teardown decides their outcome, each
+-- consuming a directory of its own so none is selected unless an example
+-- requests it. Every file they leave goes into the evidence directory the
+-- runner names, never into the fixture's tree.
+stagedGroupDocuments ∷ [String]
+stagedGroupDocuments =
+  [ -- A preparation that takes a measurable time and leaves what the command
+    -- needs, so the receipt can show the build was not in the measurement.
+    preparedGroupDocument
+      "probe.prepared"
+      ["sh", "-c", "sleep 2; echo built > \"$HETOIMASIA_VALIDATION_EVIDENCE/built\""]
+      "60"
+      ["sh", "-c", "test -f \"$HETOIMASIA_VALIDATION_EVIDENCE/built\" && echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
+      "30"
+  , -- A preparation that fails, before a command that would leave a mark.
+    preparedGroupDocument
+      "probe.unprepared"
+      ["false"]
+      "60"
+      ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
+      "30"
+  , -- A preparation that exhausts its own budget.
+    preparedGroupDocument
+      "probe.overbuilt"
+      ["sh", "-c", "sleep 300 & echo $! > \"$HETOIMASIA_VALIDATION_EVIDENCE/child.pid\"; wait"]
+      "1"
+      ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
+      "30"
+  , -- A command whose leader exits successfully at once while something it
+    -- started keeps running: a teardown that never finishes.
+    stagedGroupDocument
+      "probe.lingering"
+      ["sh", "-c", "sleep 300 & echo $! > \"$HETOIMASIA_VALIDATION_EVIDENCE/child.pid\"; exit 0"]
+      "1"
+  , -- A stalled setup that answers the watchdog's signal with success.
+    stagedGroupDocument
+      "probe.graceful"
+      ["sh", "-c", "trap 'exit 0' TERM; sleep 300 & wait"]
+      "1"
+  , -- A stalled command that keeps its diagnostics only in its own cleanup.
+    stagedGroupDocument
+      "probe.evidence"
+      [ "sh"
+      , "-c"
+      , "trap 'echo retained > \"$HETOIMASIA_VALIDATION_EVIDENCE/display.log\"; exit 1' TERM; \
+        \echo started > \"$HETOIMASIA_VALIDATION_EVIDENCE/setup.log\"; sleep 300 & wait"
+      ]
+      "1"
+  ]
+
+-- | The optional groups 'stagedGroupDocuments' declares, as a request names
+-- them.
+stagedGroups ∷ [String]
+stagedGroups =
+  ["probe.prepared", "probe.unprepared", "probe.overbuilt", "probe.lingering", "probe.graceful", "probe.evidence"]
+
+-- | An optional CPU group consuming a directory named after it.
+stagedGroupDocument ∷ String → [String] → String → String
+stagedGroupDocument identifier command timeout =
+  groupDocument identifier (jsonList command) (stagedInputs identifier) "none" "probe" timeout "true"
+
+-- | The same, with a preparation stage.
+preparedGroupDocument ∷ String → [String] → String → [String] → String → String
+preparedGroupDocument identifier preparation preparationTimeout command timeout =
+  init (init (stagedGroupDocument identifier command timeout))
+    ++ ",\n      \"preparation\": {\"command\": "
+    ++ jsonList preparation
+    ++ ", \"timeout_seconds\": "
+    ++ preparationTimeout
+    ++ "}\n    }"
+
+stagedInputs ∷ String → String
+stagedInputs identifier = "[\"" ++ drop (length ("probe." ∷ String)) identifier ++ "/\"]"
+
+-- | A list of strings as a JSON array.
+jsonList ∷ [String] → String
+jsonList entries = "[" ++ intercalate ", " (map quoted entries) ++ "]"
+  where
+    quoted entry = "\"" ++ concatMap escape entry ++ "\""
+    escape '"' = "\\\""
+    escape '\\' = "\\\\"
+    escape character = [character]
 
 -- | A catalog that consumes a document the committed one leaves as harmless
 -- prose, so an example can tell which of the two classified a dirty checkout.
