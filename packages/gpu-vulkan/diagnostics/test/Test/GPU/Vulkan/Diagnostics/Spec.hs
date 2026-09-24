@@ -9,6 +9,7 @@ module Test.GPU.Vulkan.Diagnostics.Spec (spec) where
 import qualified Test.GPU.Vulkan.Diagnostics.Capture as Capture
 import qualified Test.GPU.Vulkan.Diagnostics.Config as Config
 import qualified Test.GPU.Vulkan.Diagnostics.Lifetime as Lifetime
+import qualified Test.GPU.Vulkan.Diagnostics.Outcome as Outcome
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -16,3 +17,4 @@ spec = describe "Vulkan diagnostics" $ do
   Config.spec
   Capture.spec
   Lifetime.spec
+  Outcome.spec

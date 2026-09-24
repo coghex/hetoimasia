@@ -169,7 +169,11 @@ lifetime then:
    because a native object that registered the callback may outlive it, in
    which case it is left for process exit and the verdict says so;
 5. returns the body's result with the verdict, or rethrows the body's failure
-   with its own type, value and context and the verdict attached to it.
+   with its own type, value and context and the verdict attached to it. A body
+   failure — a body cancellation included — stays primary whatever
+   finalization observes: a cancellation delivered while the lifetime waits
+   for the worker, or a failure raised while its worker group closes, is kept
+   beside it as `FinalizationEvidence` rather than rethrown in its place.
 
 | Phase | Meaning |
 | --- | --- |
@@ -229,12 +233,21 @@ a body that broke that contract — is refused as a capture failure while the
 storage is still there to count it, and makes the verdict not clean.
 
 A cancellation delivered while the lifetime waits for the worker does not end
-the wait. The first one is kept, the worker is asked to cancel, and the wait
-continues; the storage is released only after the worker is terminal, and then
-the cancellation is rethrown with the verdict attached. A sink that blocks
-forever and cannot be interrupted keeps the lifetime in `PhaseClosed` with the
-storage and the logger borrowed: there is no deadline and no detach, and the
-process's external termination is the escape.
+the wait. The first one is kept — later ones are not — the worker is asked to
+cancel, and the wait continues; the storage is released only after the worker
+is terminal. What is rethrown then follows one precedence:
+
+| Body | Finalization observed | Rethrown | Kept beside it |
+| --- | --- | --- | --- |
+| failed, or cancelled | anything | the body's failure, with its own type, value and context, and the verdict | the finalization cancellation and the group-closing failure, as `FinalizationEvidence` |
+| returned | a cancellation while waiting for the worker | that cancellation, with the verdict | nothing |
+| returned | a failure while its worker group closed | that failure, with the verdict | nothing |
+| returned | neither | nothing: the result and the verdict are returned | — |
+
+A cancellation after a body that returned is never turned into a successful
+return. A sink that blocks forever and cannot be interrupted keeps the lifetime
+in `PhaseClosed` with the storage and the logger borrowed: there is no deadline
+and no detach, and the process's external termination is the escape.
 
 ### The drain worker
 
@@ -304,7 +317,28 @@ lost, cut or refused, every admitted record was delivered, and the worker
 completed — draining everything admitted is not enough on its own. A failed
 body's verdict is read with `diagnosticVerdict` from the exception it rethrows;
 a sink failure never replaces that failure and never authorizes an early
-release.
+release, and neither does a cancellation or a worker-group closing failure
+during finalization.
+
+```haskell
+diagnosticVerdict             ∷ SomeException → Maybe DiagnosticVerdict
+diagnosticVerdictInContext    ∷ ExceptionContext → Maybe DiagnosticVerdict
+finalizationEvidence          ∷ SomeException → Maybe FinalizationEvidence
+finalizationEvidenceInContext ∷ ExceptionContext → Maybe FinalizationEvidence
+
+data FinalizationEvidence = FinalizationEvidence
+  { evidenceCancellation ∷ Maybe (ExceptionWithContext SomeException)
+  , evidenceGroupFailure ∷ Maybe (ExceptionWithContext SomeException)
+  }
+```
+
+`finalizationEvidence` reads what finalization observed beside a body failure
+it kept primary: at most the first cancellation delivered while the lifetime
+waited for its worker, and at most one failure raised while its worker group
+closed, each exactly as it was caught, so the group's own annotations stay
+reachable. It answers `Nothing` when finalization observed neither, and for an
+exception that is itself the finalization cancellation or group-closing
+failure, which the verdict already accompanies.
 
 Stopping graphics admission when the error latch is set is the owner's, at its
 checkpoints (VK-7, VK-15): this package exposes the latch and does nothing
@@ -376,7 +410,10 @@ stale user data naming nothing.
 fields, the worker's own group, the verdict's issues, sink failure beside a
 preserved primary failure, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
-record in the worker's hands counted — and of the body, status reads racing the
+record in the worker's hands counted — and of the body, a failed body kept
+primary over a cancellation during finalization with that cancellation beside
+it, a body's own cancellation kept primary over a different one during
+finalization, status reads racing the
 release, a producer that announced itself before the body returned counted in
 the verdict, a report not yet begun counted outside it, quiescence evidence
 missing, established while a failure unwinds, issued by another capture, and
@@ -385,6 +422,11 @@ count matching what the sink received across 300 cancellations, and
 retention. Waits are explicit: a gated sink says when it is entered,
 the delivered count says what the worker has done, and the poll is replaced by
 one no example reaches.
+`Outcome` drives the lifetime's private precedence selection directly, because
+a failure while the worker group closes arrives after the worker is terminal,
+where no public coordination point exists: a failed body kept primary over a
+group-closing failure whose own context stays reachable, and every combination
+of body outcome, finalization cancellation and group-closing failure.
 
 The native cases run through the VK-2 proof route until VK-8 moves them into
 the package-native fixture; see

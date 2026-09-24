@@ -1,6 +1,6 @@
 -- | The diagnostic lifetime: delivery through the caller's logger, the
--- verdict, sink failure beside a preserved primary failure, and teardown
--- ordering on every exit.
+-- verdict, sink failure and finalization cancellation beside a preserved
+-- primary failure, and teardown ordering on every exit.
 --
 -- Records are offered through the package-local producer entry with the
 -- lifetime's own user data, so every one of them goes through the production C
@@ -10,22 +10,27 @@
 -- sees delivered came from an explicit wake-up or from the final drain.
 module Test.GPU.Vulkan.Diagnostics.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread, yield)
+import Control.Concurrent (forkIO, killThread, throwTo, yield)
 import Control.Monad (forM_, replicateM_, when)
 import Data.Word (Word64)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception
-  ( AsyncException (ThreadKilled)
+  ( AsyncException (ThreadKilled, UserInterrupt)
   , Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , annotateIO
   , fromException
   , finally
+  , someExceptionContext
   , throwIO
   , try
   )
+import Control.Exception.Context (getExceptionAnnotations)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isNothing)
 import Test.Hspec
   ( Spec
   , describe
@@ -51,6 +56,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureStatus (..)
   , ConsumerOutcome (..)
   , DiagnosticVerdict (..)
+  , FinalizationEvidence (..)
   , VerdictIssue (..)
   , captureStatus
   , capturePhase
@@ -58,6 +64,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , deliveredCount
   , diagnosticVerdict
   , diagnosticsComponent
+  , finalizationEvidence
   , afterLastCallback
   , retainStorage
   , verdictClean
@@ -356,6 +363,9 @@ spec = describe "Lifetime" $ do
         Right _ → expectationFailure "the cancellation was lost"
         Left failure → do
           fromException failure `shouldBe` Just ThreadKilled
+          -- The body succeeded, so the cancellation is the failure itself, not
+          -- evidence beside another.
+          finalizationEvidence failure `shouldSatisfy` isNothing
           case diagnosticVerdict failure of
             Nothing → expectationFailure "the cancellation carries no verdict"
             Just verdict → do
@@ -364,6 +374,84 @@ spec = describe "Lifetime" $ do
               -- delivering when it was cancelled, and the one still queued.
               verdictUndelivered verdict `shouldBe` 2
               verdictIssues verdict `shouldBe` [RecordsUndelivered 2, ConsumerUnsuccessful]
+
+    it "keeps a failed body's own failure when cancelled while finalizing, with the cancellation beside it" $ do
+      gate ← newGate
+      (logger, _) ← gatedLogger gate
+      handle ← newEmptyMVar
+      done ← newEmptyMVar
+      thread ← forkIO $ do
+        result ←
+          try @SomeException $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+              putMVar handle capture
+              offerTo capture (plainOffer SeverityInfo "never delivered")
+              awaitInSink capture gate
+              _ ← afterLastCallback capture (pure ())
+              annotateIO (BodyMarker "the body's own context") (throwIO (TaggedFailure 42))
+        putMVar done result
+      ( do
+          capture ← readMVar handle
+          -- The body has failed and the worker is still inside the sink.
+          awaitPhase capture PhaseClosed
+          killThread thread
+          result ← bounded (readMVar done)
+          atomically (capturePhase capture) `shouldReturn` PhaseReleased
+          case result of
+            Right _ → expectationFailure "the body's failure was lost"
+            Left failure → do
+              fromException failure `shouldBe` Just (TaggedFailure 42)
+              getExceptionAnnotations (someExceptionContext failure)
+                `shouldBe` [BodyMarker "the body's own context"]
+              fmap evidenceOf (finalizationEvidence failure)
+                `shouldBe` Just (Just ThreadKilled, False)
+              case diagnosticVerdict failure of
+                Nothing → expectationFailure "the failure carries no verdict"
+                Just verdict → do
+                  consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
+                  verdictUndelivered verdict `shouldBe` 1
+                  verdictStorageRetained verdict `shouldBe` False
+                  verdictIssues verdict `shouldBe` [RecordsUndelivered 1, ConsumerUnsuccessful]
+        )
+        `finally` openGate gate
+
+    it "keeps a body's own cancellation when a different one arrives while finalizing" $ do
+      gate ← newGate
+      (logger, _) ← gatedLogger gate
+      handle ← newEmptyMVar
+      done ← newEmptyMVar
+      never ← newTVarIO False
+      thread ← forkIO $ do
+        result ←
+          try @SomeException $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+              offerTo capture (plainOffer SeverityInfo "never delivered")
+              awaitInSink capture gate
+              _ ← afterLastCallback capture (pure ())
+              putMVar handle capture
+              atomically (readTVar never >>= check)
+              quiescent capture ()
+        putMVar done result
+      ( do
+          capture ← readMVar handle
+          killThread thread
+          -- The body was cancelled and the worker is still inside the sink.
+          awaitPhase capture PhaseClosed
+          throwTo thread UserInterrupt
+          result ← bounded (readMVar done)
+          -- Still referenced here, so the body's wait was never provably endless.
+          atomically (writeTVar never True)
+          atomically (capturePhase capture) `shouldReturn` PhaseReleased
+          case result of
+            Right _ → expectationFailure "the body's cancellation was lost"
+            Left failure → do
+              fromException failure `shouldBe` Just ThreadKilled
+              fmap evidenceOf (finalizationEvidence failure)
+                `shouldBe` Just (Just UserInterrupt, False)
+              fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)
+                `shouldBe` Just "cancelled"
+        )
+        `finally` openGate gate
 
     it "finalizes a body that is cancelled, then rethrows the cancellation" $ do
       (logger, recorded) ← recordingLogger everythingFilter
@@ -567,6 +655,10 @@ spec = describe "Lifetime" $ do
           offerTo capture (plainOffer SeverityWarning "from a retained messenger")
           countCaptureFailed . statusCounters <$> captureStatus capture `shouldReturn` 1
   where
+    evidenceOf evidence =
+      ( evidenceCancellation evidence >>= \(ExceptionWithContext _ cancellation) → fromException cancellation
+      , not (isNothing (evidenceGroupFailure evidence))
+      )
     untilM condition = condition >>= \ok → if ok then pure () else yield >> untilM condition
     describeFailure failure =
       ( fromException failure
