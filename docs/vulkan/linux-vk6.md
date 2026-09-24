@@ -9,15 +9,15 @@
 
 This is the native evidence for issue #217: the same proof run as the VK-2
 records, now carrying VK-6's session, whose section is headed "VK-6: C-only
-validation capture" below. It ran through the `vulkan-proof` route of `.github/workflows/ci-image.yml` (run 35986903340), inside the published image the committed `tools/ci-image/descriptor.json` names, on the isolated X11 display `tools/display/x11.sh` starts and supplies its own consent for. No desktop session was entered.
+validation capture" below. It ran through the `vulkan-proof` route of `.github/workflows/ci-image.yml` (run 35990793657), inside the published image the committed `tools/ci-image/descriptor.json` names, on the isolated X11 display `tools/display/x11.sh` starts and supplies its own consent for. No desktop session was entered.
 
-It was produced from repository revision `fd3b3bdbf3b6989b9777ed30e248e4da88f71968` and source digest
-`77852ba0986a0a2af5b0e47a9254fcd163ee80d1e515b5bc2a0b9c225eb54250`, the same pair the other platform's VK-6 record carries; the digest
+It was produced from repository revision `675400b8345921bd93546b7245ea442672f28e53` and source digest
+`10fcb7ae4ded498b6b34240c877d188c13e290a349a03b19aba51a5d0c4f1249`, the same pair the other platform's VK-6 record carries; the digest
 covers the native backend package, the diagnostics package and their local
 closure as well as the harness. It identifies the tree the run was produced
 from, not this file's commit. The revision includes the fixes from the pull
-request's first review round, so the capture proved here is the one that keeps
-its header for the life of the process and counts in-flight records.
+request's first two review rounds, so the capture proved here is the one whose handshake and
+counters live in static slots and whose storage is reclaimed whole.
 
 What the VK-6 section shows, on this platform:
 
@@ -57,8 +57,8 @@ HETOIMASIA_NATIVE_SESSION=isolated-x11::0 \
 
 ## The environment
 
-- source digest: 77852ba0986a0a2af5b0e47a9254fcd163ee80d1e515b5bc2a0b9c225eb54250
-- repository revision: fd3b3bdbf3b6989b9777ed30e248e4da88f71968
+- source digest: 10fcb7ae4ded498b6b34240c877d188c13e290a349a03b19aba51a5d0c4f1249
+- repository revision: 675400b8345921bd93546b7245ea442672f28e53
 - platform: linux/x86_64
 - session authorization: the isolated X11 display :0
 - VK_DRIVER_FILES: /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
@@ -77,11 +77,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x00007f57d18873d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x00007f57d18873d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x00007f57d1887090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- GLFW's vkCreateDevice: 0x00007f57d1887090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- a device-level entry point: 0x00007f57affde850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+- the binding's vkGetInstanceProcAddr: 0x00007f3673b703d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x00007f3673b703d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x00007f3673b70090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- GLFW's vkCreateDevice: 0x00007f3673b70090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- a device-level entry point: 0x00007f36523ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
 - device API version: 1.4.318
 - driver: llvmpipe (DRIVER_ID_MESA_LLVMPIPE)
@@ -219,7 +219,7 @@ arrived inside it.
 
 - capture limits: 1024 queued records, 16384 bytes of text per record (the default is 4096; see the proof README), 16 objects per record
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
-- messenger callback: 0x000000000067a230 in /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
+- messenger callback: 0x000000000067a5d0 in /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
 - this executable: /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
 - unsafe imports this session declares: vkSubmitDebugUtilsMessageEXT, vkCmdSetViewport
 - binding safe-foreign-calls in binding.pin: on
@@ -309,7 +309,7 @@ the step whose reports it was.
 | vkCreateInstance | info | Loader Message |            Library:  /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so |
 | vkCreateInstance | info | Loader Message |      \|\| |
 | vkCreateInstance | info | Loader Message |    <Drivers> |
-| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x2303ac00, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| v... |
+| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x3bbc4a00, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| v... |
 | vkCreateInstance | info | Loader Message | linux_read_sorted_physical_devices: |
 | vkCreateInstance | info | Loader Message |      Original order: |
 | vkCreateInstance | info | Loader Message |            [0] llvmpipe (LLVM 20.1.2, 256 bits) |
@@ -381,24 +381,24 @@ such; no device loss was induced.
 ```
 ## The environment
 implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-proving repository revision fd3b3bdbf3b6989b9777ed30e248e4da88f71968
-proving source digest 77852ba0986a0a2af5b0e47a9254fcd163ee80d1e515b5bc2a0b9c225eb54250
+proving repository revision 675400b8345921bd93546b7245ea442672f28e53
+proving source digest 10fcb7ae4ded498b6b34240c877d188c13e290a349a03b19aba51a5d0c4f1249
 VK_DRIVER_FILES = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
 VK_LAYER_PATH = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x00007f57d18873d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+the binding dispatches through 0x00007f3673b703d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 the binding's loader is the recorded loader /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275
-GLFW resolves the same name to 0x00007f57d18873d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x00007f3673b703d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_KHR_xcb_surface
 ## The instance
 the loader reports instance version 1.3.275
-the binding resolves vkCreateDevice to 0x00007f57d1887090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x00007f57d1887090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+the binding resolves vkCreateDevice to 0x00007f3673b70090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x00007f3673b70090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
 ## The window and its surface
 ## The device profile
 llvmpipe (LLVM 20.1.2, 256 bits) advertises Vulkan 1.4.318
 selected llvmpipe (LLVM 20.1.2, 256 bits), advertising Vulkan 1.4.318
-the binding dispatches image release through 0x00007f57b00282e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+the binding dispatches image release through 0x00007f36523f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 4 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 320, height = 240}
