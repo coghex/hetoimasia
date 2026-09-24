@@ -1,15 +1,19 @@
--- The Vulkan project: the VK-2 proof harness and the native backend package,
--- and the only project file that names either.
+-- The Vulkan project: the VK-2 proof harness, the native backend package, and
+-- the GLFW package with its Vulkan interop component enabled — the only project
+-- file that names the first two or turns that component on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
--- `tools/vulkan-proof` or `packages/gpu-vulkan/native`, so neither resolves nor
--- links the Vulkan binding and neither `cabal build all` nor `cabal build all
+-- `tools/vulkan-proof` or `packages/gpu-vulkan/native`, and neither sets the
+-- GLFW package's manual `vulkan-interop` flag, so neither resolves nor links the
+-- Vulkan binding and neither `cabal build all` nor `cabal build all
 -- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
 -- mandatory validation group runs through one of those two, so the floor never
--- builds this. The other three packages here are the native package's local
--- dependency closure — the diagnostics package whose C capture it installs, the
--- GPU model, and the foundation — which the ordinary projects list too.
--- Selecting this project is an explicit act:
+-- builds this. The other packages here are the local dependency closure of the
+-- native package and of the interop component — the diagnostics package whose C
+-- capture the native package installs, the GPU model, the runtime the GLFW
+-- package's runtime integration uses, and the foundation — which the ordinary
+-- projects list too; `cabal.project` lists the GLFW package itself, with the
+-- flag off. Selecting this project is an explicit act:
 --
 --   bash tools/vulkan-proof/run-proof.sh
 --
@@ -23,9 +27,16 @@ import: cabal.project.common
 packages:
   tools/vulkan-proof
   packages/gpu-vulkan/native
+  packages/glfw
   packages/gpu-vulkan/diagnostics
   packages/gpu-vulkan/model
+  packages/runtime
   packages/foundation
+
+-- The GLFW package's Vulkan interop component: the shared loader capability and
+-- the surface bridge the proof's VK-5 cases exercise. Off everywhere else.
+package hetoimasia-glfw
+  flags: +vulkan-interop
 
 -- The flags docs/toolchain.md qualified, restated here because a constraint is
 -- what actually reaches the dependency: `safe-foreign-calls` so a Vulkan call

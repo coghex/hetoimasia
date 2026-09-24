@@ -109,9 +109,29 @@ has completed is the backend's own, and which mechanism proves it is an open
 question of the graphics design rather than of this package. See
 [docs/glfw.md](../../docs/glfw.md#the-public-attachment-contract).
 
+Window surfaces belong to the package's separate `vulkan-interop` sublibrary,
+`Hetoimasia.GLFW.Vulkan`, which only `cabal.project.vulkan` builds, through the
+package's manual `vulkan-interop` flag: an ordinary build, with either other
+project file, builds none of it, resolves no Vulkan binding, and links no loader.
+Its C shim is the one translation unit here that includes the Vulkan headers;
+the ordinary native library keeps `GLFW_INCLUDE_NONE`. It builds an opaque,
+single-use loader capability from the Vulkan binding's own
+`vkGetInstanceProcAddr`, which `Hetoimasia.GLFW.Session.allocIntegratedSession`
+— the additive constructor beside `allocSession`, with `SessionConfig`
+unchanged — hands GLFW between the initialization hints and `glfwInit` and
+resets to GLFW's default after termination or a failed initialization. A
+loader-aware session copies GLFW's required instance extensions, and a surface
+is created only inside a protected attachment's construction step or an
+admitted replacement on a live attachment, with the window's native pointer
+borrowed inside the bridge and never exposed; the caller receives the live
+surface or its owned destruction obligation, which holds the attachment and the
+instance until it destroys the surface through Vulkan. See
+[docs/glfw.md](../../docs/glfw.md#vulkan-interop).
+
 Its main library depends on `hetoimasia-foundation`, not on the runtime. Only
 the `runtime-glfw` sublibrary, among its libraries, depends on
-`hetoimasia-runtime`, and no library depends on it. No component imports a game, Lua, or rendering
+`hetoimasia-runtime`, and no library depends on it. Only the flag-gated `vulkan-interop` sublibrary
+depends on the Vulkan binding, and none on a GPU package. No component imports a game, Lua, or rendering
 module, and only the input feed's overflow warning and the wake path's
 degradation warning take a logger, injected by its owner. Its native handles, foreign imports,
 and C shim live in private sublibraries. The public `seam` sublibrary is the

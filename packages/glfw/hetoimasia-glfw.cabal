@@ -26,11 +26,22 @@ tested-with: GHC ==9.14.1
 extra-doc-files: README.md
 extra-source-files:
     native/cbits/hetoimasia_glfw.h
+    vulkan-interop/cbits/hetoimasia_glfw_vulkan.h
 
 source-repository head
     type: git
     location: https://github.com/coghex/hetoimasia.git
     subdir: packages/glfw
+
+-- Whether to build the Vulkan interop component. Only `cabal.project.vulkan`
+-- turns it on; with it off — the default, and what `cabal.project` and
+-- `cabal.project.cpu` leave it — that component is not buildable, contributes no
+-- dependency, and nothing in any build resolves the Vulkan binding, includes a
+-- Vulkan header, or links a loader. Every other component is the same either way.
+flag vulkan-interop
+    description: Build the Vulkan interop component (the shared loader and the surface bridge)
+    default: False
+    manual: True
 
 common language
     default-language: GHC2024
@@ -55,6 +66,7 @@ library model
         Hetoimasia.GLFW.Internal.Control
         Hetoimasia.GLFW.Internal.Demand
         Hetoimasia.GLFW.Internal.Input
+        Hetoimasia.GLFW.Internal.Interop
         Hetoimasia.GLFW.Internal.Notify
         Hetoimasia.GLFW.Internal.Mode
         Hetoimasia.GLFW.Internal.Monitor
@@ -148,6 +160,7 @@ library runtime-glfw-core
         Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
+        Hetoimasia.Runtime.GLFW.Internal.Surface
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
@@ -158,6 +171,42 @@ library runtime-glfw-core
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw,
         hetoimasia-glfw:model
+
+-- The Vulkan interop component: the loader integration capability made from the
+-- Vulkan binding's own loader entry point, the instance-extension query, and the
+-- surface bridge's production operations over the protected attachment. Its C
+-- shim is the one translation unit in this package that includes the Vulkan
+-- headers, before GLFW's; the ordinary native library above keeps
+-- GLFW_INCLUDE_NONE. It depends on no GPU package and no renderer. Built only
+-- with the `vulkan-interop` flag, which only `cabal.project.vulkan` sets, where
+-- `tools/vulkan-proof/run-proof.sh` passes the provisioned prefix's Vulkan
+-- include and library directories on the command line.
+library vulkan-interop
+    import: language
+    visibility: public
+    hs-source-dirs: vulkan-interop
+    exposed-modules:
+        Hetoimasia.GLFW.Vulkan
+        Hetoimasia.GLFW.Vulkan.Provenance
+    other-modules:
+        Hetoimasia.GLFW.Vulkan.Internal.Capability
+        Hetoimasia.GLFW.Vulkan.Internal.Native
+    if flag(vulkan-interop)
+        c-sources: vulkan-interop/cbits/hetoimasia_glfw_vulkan.c
+        include-dirs: vulkan-interop/cbits
+        cc-options: -std=c11 -Wall -Wextra -Werror
+        pkgconfig-depends: glfw3 >=3.4 && <3.5
+        build-depends:
+            base >=4.22 && <4.23,
+            bytestring >=0.12 && <0.13,
+            vulkan >=3.27 && <3.28,
+            hetoimasia-foundation ==0.1.0.0,
+            hetoimasia-glfw,
+            hetoimasia-glfw:model,
+            hetoimasia-glfw:native,
+            hetoimasia-glfw:runtime-glfw-core
+    else
+        buildable: False
 
 -- The private test seam: the real session model over a scripted native
 -- library, for CPU examples that must not initialize GLFW. It is public so the
@@ -219,6 +268,7 @@ test-suite glfw-tests
         Test.GLFW.Dynamic
         Test.GLFW.Host
         Test.GLFW.Input
+        Test.GLFW.Interop
         Test.GLFW.Linking
         Test.GLFW.Mode
         Test.GLFW.Monitor
@@ -231,6 +281,7 @@ test-suite glfw-tests
         Test.GLFW.Session
         Test.GLFW.Spec
         Test.GLFW.Support
+        Test.GLFW.Surface
         Test.GLFW.Trace
         Test.GLFW.Wake
         Test.GLFW.Window

@@ -15,8 +15,9 @@ description:
     the Vulkan binding.
     .
     VK-5 through VK-7 attach their own focused native cases here until VK-8
-    migrates them into the package-native fixture. Nothing here is a public
-    API, and the interop shim is deliberately throwaway.
+    migrates them into the package-native fixture; VK-5's run through the GLFW
+    package's production Vulkan interop component. Nothing here is a public
+    API, and the harness's own interop shim is deliberately throwaway.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -48,6 +49,8 @@ test-suite vulkan-proof
         -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
         -threaded -rtsopts
     other-modules:
+        Test.Vulkan.Proof.Bridge
+        Test.Vulkan.Proof.BridgeSpec
         Test.Vulkan.Proof.Consent
         Test.Vulkan.Proof.Construction
         Test.Vulkan.Proof.ConstructionSpec
@@ -89,5 +92,8 @@ test-suite vulkan-proof
         vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0

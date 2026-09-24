@@ -264,7 +264,8 @@
         "tools/validation/",
         "tools/vulkan-proof/",
         "tools/flake/",
-        "packages/gpu-vulkan/native/"
+        "packages/gpu-vulkan/native/",
+        "packages/glfw/hetoimasia-glfw.cabal"
       ],
       "framework": "hspec",
       "runner": "cpu",

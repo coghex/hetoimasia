@@ -33,6 +33,12 @@ module Hetoimasia.GLFW.Seam
   , defaultScript
   , seamSession
   , seamCalls
+
+    -- * Scripted loader integration
+  , IntegrationScript (..)
+  , defaultIntegrationScript
+  , seamIntegration
+  , seamIntegratedSession
   , seamLiveCallbacks
   , seamLiveWindowCallbacks
   , seamLiveMonitorCallbacks
@@ -64,7 +70,8 @@ module Hetoimasia.GLFW.Seam
   ) where
 
 import Hetoimasia.GLFW.Internal.Seam
-  ( MonitorQuery (..)
+  ( IntegrationScript (..)
+  , MonitorQuery (..)
   , MonitorTopology (..)
   , NativeCall (..)
   , NativeVideoMode (..)
@@ -75,6 +82,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , WindowAttribute (..)
   , WindowHint (..)
   , asProcessMainThread
+  , defaultIntegrationScript
   , defaultScript
   , designateProcessMainThread
   , featureUnavailableCode
@@ -88,6 +96,8 @@ import Hetoimasia.GLFW.Internal.Seam
   , seamLiveCallbacks
   , seamLiveMonitorCallbacks
   , seamLiveWindowCallbacks
+  , seamIntegratedSession
+  , seamIntegration
   , seamSession
   , scriptedMonitor
   )

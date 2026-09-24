@@ -6,7 +6,7 @@
 -- stopped still says what it had established before it stopped. The verdict
 -- line at the top is the run's own, and it is computed from the same values the
 -- Hspec examples assert over — not narrated separately.
-module Test.Vulkan.Proof.Record (renderRecord, renderRecordWith, diagnosticsSection, achievedFrom, matrixTable) where
+module Test.Vulkan.Proof.Record (renderRecord, renderRecordWith, diagnosticsSection, bridgeSection, achievedFrom, matrixTable) where
 
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -23,6 +23,11 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , verdictIssues
   )
 import Hetoimasia.GPU.Vulkan.Native.Diagnostics (describeFfiConfiguration)
+import Test.Vulkan.Proof.Bridge
+  ( BridgeFacts (..)
+  , BridgeOutcome (..)
+  , FailedInitialization (..)
+  )
 import Test.Vulkan.Proof.Diagnostics
   ( DiagnosticsFacts (..)
   , DiagnosticsOutcome (..)
@@ -369,6 +374,63 @@ matrixTable resolve =
 
 -- --------------------------------------------------------------------------
 -- Small renderers
+
+-- | VK-5's section: what the production loader capability and surface bridge
+-- did in a real session.
+bridgeSection ∷ BridgeOutcome → [Text]
+bridgeSection = \case
+  BridgeStopped reason →
+    [ ""
+    , "## VK-5: the loader-aware GLFW surface bridge"
+    , ""
+    , "The bridge session stopped: " <> reason
+    ]
+  BridgeProved facts →
+    [ ""
+    , "## VK-5: the loader-aware GLFW surface bridge"
+    , ""
+    , "A third session, through the GLFW package's own Vulkan interop component:"
+    , "the loader capability built from the binding's own `vkGetInstanceProcAddr`,"
+    , "the package's loader-aware session behind a protected window host, a surface"
+    , "created inside an attachment's construction step, and its obligation"
+    , "discharged on a thread that is not the owner. GLFW offers no way to read back"
+    , "its loader hint, so the setting reported is the value the interop shim last"
+    , "handed it; that shim is its only production writer, and the VK-2 run's"
+    , "throwaway shim, which also set it, was reset first."
+    , ""
+    ]
+      <> definitions
+        [ ("binding vkGetInstanceProcAddr", describeProvenance facts.factsBindingEntry)
+        , ("capability made from", describeProvenance facts.factsCapabilityEntry)
+        , ("shim setting while the session was live", describeProvenance facts.factsInstalledDuring)
+        , ("GLFW resolved vkGetInstanceProcAddr to", describeProvenance facts.factsGlfwEntry)
+        , ("capability while the session was live", tshow facts.factsUseDuring)
+        , ("binding vkCreateDevice", describeProvenance facts.factsBindingInstanceSample)
+        , ("GLFW vkCreateDevice", describeProvenance facts.factsGlfwInstanceSample)
+        , ("required instance extensions, as copied", listOrNone facts.factsExtensions)
+        , ("surface creation", facts.factsCreation)
+        , ("surface handle", tshow facts.factsSurfaceHandle)
+        , ("surface query", facts.factsSurfaceQuery)
+        , ("instance release while owed", facts.factsReleaseWhileOwed)
+        , ("disposal fact while owed", tshow facts.factsDisposedWhileOwed)
+        , ("discharge", facts.factsDischarge)
+        , ("discharged off the owner thread", yesNo facts.factsDischargedOffOwner)
+        , ("disposal fact afterwards", tshow facts.factsDisposedAfter)
+        , ("instance release afterwards", facts.factsReleaseAfter)
+        , ("shim setting after termination", tshow facts.factsInstalledAfterTermination)
+        , ("capability after termination", tshow facts.factsUseAfterTermination)
+        ]
+      <> failedLines facts.factsFailedInitialization
+  where
+    failedLines = \case
+      FailedInitializationObserved backend reason entry use →
+        definitions
+          [ ("failed initialization", "a " <> backend <> " session whose glfwInit failed: " <> Text.takeWhile (/= '\n') reason)
+          , ("shim setting after the failed initialization", tshow entry)
+          , ("capability after the failed initialization", tshow use)
+          ]
+      FailedInitializationUnreachable reason → definitions [("failed initialization", "not reachable on this platform: " <> reason)]
+      FailedInitializationSucceeded reason → definitions [("failed initialization", "not provoked: " <> reason)]
 
 definitions ∷ [(Text, Text)] → [Text]
 definitions entries = ["- " <> label <> ": " <> value | (label, value) ← entries]

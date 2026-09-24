@@ -228,6 +228,7 @@ module Hetoimasia.GLFW.Internal.Attachment
   , CompletionNotice
   , completionNotice
   , noticeTarget
+  , noticeAcknowledgement
   , noticeFact
   , NoticeAdmission (..)
   , offerCompletion
@@ -428,6 +429,10 @@ data AttachmentRefusal
     -- ^ A fact or disposal failure before retirement began.
   | ConstructionStillPending
   | ConstructionAlreadySettled !ConstructionState
+  | DependentsStillHeld !Natural
+    -- ^ 'DependentsDisposed' while this many owned dependents still hold the
+    -- attachment. The owning boundary answers it; the pure model keeps no
+    -- count of its own.
   deriving (Eq, Show)
 
 data Registered = Registered
@@ -813,6 +818,9 @@ completionNotice = CompletionNotice
 
 noticeTarget ∷ CompletionNotice → AttachmentId
 noticeTarget (CompletionNotice target _ _) = target
+
+noticeAcknowledgement ∷ CompletionNotice → Acknowledgement
+noticeAcknowledgement (CompletionNotice _ acknowledgement _) = acknowledgement
 
 noticeFact ∷ CompletionNotice → RetirementFact
 noticeFact (CompletionNotice _ _ fact) = fact

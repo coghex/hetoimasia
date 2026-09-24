@@ -96,6 +96,12 @@ module Hetoimasia.GLFW.Internal.Seam
   , defaultScript
   , seamSession
   , seamCalls
+
+    -- * Scripted loader integration
+  , IntegrationScript (..)
+  , defaultIntegrationScript
+  , seamIntegration
+  , seamIntegratedSession
   , seamLiveCallbacks
   , seamLiveWindowCallbacks
   , seamLiveMonitorCallbacks
@@ -163,6 +169,7 @@ import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Int (Int32)
 import Data.Text (Text)
+import Data.Word (Word64)
 import Foreign.C.Types (CFloat, CInt)
 import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
 import Hetoimasia.Foundation.Failure (operation)
@@ -196,17 +203,21 @@ import Hetoimasia.GLFW.Internal.Session
   ( Backend (..)
   , CallbackStorage (CallbackStorage)
   , Guard
+  , IntegrationNative (..)
   , Native (..)
   , NativeWindow
   , Session
   , SessionConfig
+  , SessionIntegration
   , WindowAttribute (..)
   , WindowCallbackStorage (WindowCallbackStorage)
   , WindowCallbacks (..)
   , WindowHint (..)
   , backendWindowCapabilities
   , newGuard
+  , newSessionIntegration
   , sessionAssembly
+  , sessionAssemblyWith
   , sessionNative
   )
 import Hetoimasia.GLFW.Internal.Window
@@ -279,6 +290,17 @@ data NativeCall
     -- position, the size, and the refresh rate.
   | SetWindowDecorated Int Bool
   | ClearWindowSizeLimits Int
+  | InstallVulkanLoader
+    -- ^ A loader integration capability handed GLFW its loader entry point.
+  | ResetVulkanLoader
+    -- ^ A capability restored GLFW's default loader search.
+  | QueryVulkanSupported
+  | QueryRequiredExtensions
+  | CreateWindowSurface Int
+    -- ^ A surface for the window with this key.
+  | DestroyWindowSurface Word64
+    -- ^ The surface with this handle, destroyed through the capability's
+    -- loader rather than GLFW, from whichever thread discharged it.
   deriving (Eq, Show)
 
 -- | Which monitor query was made.
@@ -460,6 +482,60 @@ defaultScript =
     , scriptWindowMonitor = \_ → pure ()
     , scriptTrackWindows = False
     }
+
+-- | How a scripted loader integration capability answers. Each step runs after
+-- its call is recorded, and may report errors through the 'Reporter' it is
+-- given, or throw.
+data IntegrationScript = IntegrationScript
+  { integrationInstall ∷ Reporter → IO ()
+  , integrationReset ∷ Reporter → IO ()
+  , integrationSupported ∷ Reporter → IO Bool
+  , integrationExtensions ∷ Reporter → IO (Maybe [ByteString])
+  , integrationCreate ∷ Int → Reporter → IO (Int, Word64)
+    -- ^ Given the window's key: the @VkResult@ and the handle.
+  , integrationDestroy ∷ Word64 → IO ()
+  }
+
+-- | A platform with a Vulkan loader whose every step succeeds silently: it
+-- requires the two extensions a Wayland surface would, and creates surface
+-- @1000 + key@ for the window with that key.
+defaultIntegrationScript ∷ IntegrationScript
+defaultIntegrationScript =
+  IntegrationScript
+    { integrationInstall = \_ → pure ()
+    , integrationReset = \_ → pure ()
+    , integrationSupported = \_ → pure True
+    , integrationExtensions = \_ → pure (Just ["VK_KHR_surface", "VK_KHR_wayland_surface"])
+    , integrationCreate = \key _ → pure (0, 1000 + fromIntegral key)
+    , integrationDestroy = \_ → pure ()
+    }
+
+-- | A loader integration capability for this seam's native table, answering
+-- from the script and recording each call beside the native ones.
+seamIntegration ∷ Seam → IntegrationScript → IO SessionIntegration
+seamIntegration seam script =
+  newSessionIntegration
+    (seamGuard seam)
+    IntegrationNative
+      { integrationInstallLoader = record InstallVulkanLoader >> integrationInstall script reporter
+      , integrationResetLoader = record ResetVulkanLoader >> integrationReset script reporter
+      , integrationVulkanSupported = record QueryVulkanSupported >> integrationSupported script reporter
+      , integrationRequiredExtensions = record QueryRequiredExtensions >> integrationExtensions script reporter
+      , integrationCreateSurface = \_ window → do
+          let key = windowKey window
+          record (CreateWindowSurface key)
+          integrationCreate script key reporter
+      , integrationDestroySurface = \_ handle → do
+          record (DestroyWindowSurface handle)
+          integrationDestroy script handle
+      }
+  where
+    reporter = Reporter seam
+    record call = atomicModifyIORef' (seamLog seam) (\calls → (call : calls, ()))
+
+-- | Enter a loader-aware session over this seam's native table.
+seamIntegratedSession ∷ Seam → SessionIntegration → SessionConfig → Scoped Session
+seamIntegratedSession seam integration config = allocComposite (sessionAssemblyWith (seamNative seam) config integration)
 
 -- | The code the scripted library reports for a property it cannot provide.
 featureUnavailableCode ∷ Int

@@ -50,9 +50,11 @@ import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import Test.Vulkan.Proof.Journal (entries, newJournal)
 import qualified Test.Vulkan.Proof.PublicationSpec as Publication
+import Test.Vulkan.Proof.Bridge (runBridge)
+import qualified Test.Vulkan.Proof.BridgeSpec as Bridge
 import Test.Vulkan.Proof.Diagnostics (runDiagnostics)
 import qualified Test.Vulkan.Proof.DiagnosticsSpec as Diagnostics
-import Test.Vulkan.Proof.Record (diagnosticsSection, renderRecordWith)
+import Test.Vulkan.Proof.Record (bridgeSection, diagnosticsSection, renderRecordWith)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
 import Test.Vulkan.Proof.Run (runProof)
 import qualified Test.Vulkan.Proof.Spec as Proof
@@ -113,9 +115,12 @@ native = do
   -- down, in the environment it established. Their capture lifetime has ended,
   -- and with it their last callback, before any verdict is computed.
   diagnostics ← runDiagnostics journal
+  -- VK-5's cases then run through the GLFW package's own Vulkan interop
+  -- component, in a production session of their own, on this same main thread.
+  bridge ← runBridge journal
   transcript ← entries journal
 
-  passed ← runCompleteSpec (Proof.spec outcome >> Diagnostics.spec diagnostics)
+  passed ← runCompleteSpec (Proof.spec outcome >> Diagnostics.spec diagnostics >> Bridge.spec bridge)
 
   invocation ← describeInvocation
   let record =
@@ -124,7 +129,7 @@ native = do
           invocation
           transcript
           outcome
-          (diagnosticsSection diagnostics)
+          (diagnosticsSection diagnostics <> bridgeSection bridge)
           passed
   destination ← lookupEnv recordVariable
   case destination of

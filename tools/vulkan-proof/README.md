@@ -14,25 +14,31 @@ Read that for what was proved. This file says how the harness is built and run.
 ## What it is not
 
 It is not a backend, not a library, and not a public API. Its GLFW/Vulkan
-interop shim in `cbits/` is deliberately throwaway: VK-5 designs the production
-surface bridge, and nothing here anticipates it. VK-5 through VK-7 attach their
-own focused native cases to this harness until VK-8 migrates them into the
+interop shim in `cbits/` is deliberately throwaway, and nothing production uses
+it: the production surface bridge is the GLFW package's own Vulkan interop
+component, which VK-5's cases here exercise directly. VK-5 through VK-7 attach
+their own focused native cases to this harness until VK-8 migrates them into the
 package-native fixture and retires it.
 
 It also adds no production component. `hetoimasia-vulkan-proof` exports no
 library; its only component is a test suite, and the only project file that
 names the package is the repository's `cabal.project.vulkan`. That project also
 names the native backend package `packages/gpu-vulkan/native`, whose production
-capture VK-6's cases exercise, and that package's local dependency closure — the
-diagnostics package, the GPU model and the foundation. Neither `cabal.project`
-nor `cabal.project.cpu` lists the proof or the native package, so neither
-`cabal build all` nor `cabal build all --project-file cabal.project.cpu`
-resolves or links the Vulkan binding. That used to be proved for free, because
+capture VK-6's cases exercise; the GLFW package `packages/glfw`, with its manual
+`vulkan-interop` flag on, whose production loader capability and surface bridge
+VK-5's cases exercise; and their local dependency closure — the diagnostics
+package, the GPU model, the runtime and the foundation. Neither `cabal.project`
+nor `cabal.project.cpu` lists the proof or the native package or sets that flag,
+so neither `cabal build all` nor `cabal build all --project-file
+cabal.project.cpu` resolves or links the Vulkan binding. That used to be proved for free, because
 the floor ran on a CI image with no loader at all; VK-4 provisioned one, so
 `tools/test/VulkanProof.hs` now asserts it directly — reading every package
 those two project files name and requiring that none depends on the binding —
 and holds the rest of that boundary honest besides, including that the Vulkan
-project names exactly those five packages.
+project names exactly those seven packages and that only it turns the GLFW
+interop component on. That check reads a flag-guarded block as Cabal configures
+it — the interop component's dependencies count only where its flag is on —
+and every other line of the GLFW package in full.
 
 ## How it is arranged
 
@@ -55,9 +61,11 @@ project names exactly those five packages.
 | `proof/Test/Vulkan/Proof/Matrix.hs` | The cited operation and result matrix, with each row labelled observed or specified. |
 | `proof/Test/Vulkan/Proof/Diagnostics.hs` | VK-6's native cases: a second session, on its own instance, whose only callback is the production C capture. |
 | `proof/Test/Vulkan/Proof/DiagnosticsSpec.hs` | Their verdict, asserted over what that session observed once its capture lifetime has ended. |
-| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record, with VK-6's section after the VK-2 findings. |
+| `proof/Test/Vulkan/Proof/Bridge.hs` | VK-5's native cases: a third session through the GLFW package's production Vulkan interop component — its loader capability, a loader-aware session behind a protected host, and a surface created and destroyed under an attachment. |
+| `proof/Test/Vulkan/Proof/BridgeSpec.hs` | Their verdict, asserted over what that session observed once it and its instance have ended. |
+| `proof/Test/Vulkan/Proof/Record.hs` | The Markdown record, with VK-6's and then VK-5's sections after the VK-2 findings. |
 | `cbits/` | The throwaway GLFW/Vulkan interop shim and the `dladdr` image provenance. |
-| `run-proof.sh` | The only thing that builds this package and the native backend package, and what establishes the project-local environment from the provisioned native prefix. |
+| `run-proof.sh` | The only thing that builds this package, the native backend package, and the GLFW package's Vulkan interop component, and what establishes the project-local environment from the provisioned native prefix. |
 
 The native run and the assertions are separate on purpose. The run tears its
 session down — including the instance, when it may — before Hspec starts, so the
@@ -299,6 +307,65 @@ The Linux record from the `vulkan-proof` route is retained as
 [`docs/vulkan/linux-vk6.md`](../../docs/vulkan/linux-vk6.md), and the record of a
 local macOS run under the human's explicit approval for that session as
 [`docs/vulkan/macos-vk6.md`](../../docs/vulkan/macos-vk6.md); both carry one
+source digest. VK-8 migrates these cases into the package-native fixture and
+retires this route for them.
+
+## VK-5: the loader-aware surface bridge
+
+After VK-6's session, the native run starts a third for
+[VK-5](../../docs/glfw.md#vulkan-interop), through the GLFW package's own
+`vulkan-interop` component and nothing of this harness's shim but its `dladdr`
+provenance. The VK-2 run handed GLFW the binding's entry point through the
+throwaway shim and never took it back, so this session first restores GLFW's
+default through that shim and says so; every loader setting it then observes is
+one the production shim made. It runs these cases against the production
+capability and bridge:
+
+- **One loader.** `allocLoaderIntegration` builds the capability from the
+  binding's own `vkGetInstanceProcAddr`. The session records that entry point's
+  address and image beside the binding's own, and — while a loader-aware session
+  is live — the setting the production shim handed GLFW, what GLFW itself
+  resolves `vkGetInstanceProcAddr` to through `glfwGetInstanceProcAddress`, and
+  the image each side resolves `vkCreateDevice` into for the instance it creates.
+- **Extensions.** `requiredInstanceExtensions` copies the platform's names, and
+  the instance is created with exactly those.
+- **A surface for an attached window.** A protected host over the loader-aware
+  session holds one hidden window. `attachWindowGraphicsWithSurfaces` attaches
+  a scripted owner whose construction step calls `createWindowSurface` against a
+  lease of that instance; the binding is then asked about the handle, and while
+  it is owed, the attachment's `DependentsDisposed` fact and the instance's
+  release are both recorded as refused. Another OS thread, not the owner,
+  discharges the obligation through Vulkan, after which both are recorded as
+  granted, and the instance is destroyed only once the host has exited.
+- **The reset after termination.** Once the session has ended, the setting the
+  shim holds, and the capability's own use.
+- **The reset after a failed initialization.** On Linux, a second capability's
+  session requests Wayland with `WAYLAND_DISPLAY` naming a display no compositor
+  serves, so `glfwInit` fails after the capability was installed, and the same
+  two readings are taken. GLFW 3.4's Cocoa initialization has no failure an
+  application can provoke, and Cocoa is the only backend macOS admits, so on
+  macOS this case records itself as not reachable and its example is pending;
+  the seam example `restores the default after a failed initialization` holds
+  that path headlessly on every platform.
+
+GLFW offers no way to read back the loader hint it was given, so "the setting"
+is the value the production shim last handed `glfwInitVulkanLoader`, which it
+records with each call; that shim is the hint's only production writer.
+`BridgeSpec.hs` requires that the capability's entry point is the binding's, by
+address and image; that GLFW holds and resolves exactly that address while the
+session is live, and resolves an instance entry point into the binding's image;
+that the copied names include `VK_KHR_surface` and the platform's surface
+extension; that the surface was created and accepted; that retirement and
+release were refused while it was owed and granted once another thread
+destroyed it; and that the shim holds null and the capability is restored after
+termination and, where reachable, after the failed initialization. The record's
+VK-5 section prints each of these.
+
+The record's source digest covers the GLFW package and the runtime as well, so a
+change to the bridge moves it. The Linux record from the `vulkan-proof` route is
+retained as [`docs/vulkan/linux-vk5.md`](../../docs/vulkan/linux-vk5.md), and the
+record of a local macOS run under the human's explicit approval for that session
+as [`docs/vulkan/macos-vk5.md`](../../docs/vulkan/macos-vk5.md); both carry one
 source digest. VK-8 migrates these cases into the package-native fixture and
 retires this route for them.
 
