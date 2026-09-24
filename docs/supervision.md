@@ -51,6 +51,8 @@ data WorkerStatus = WorkerLive | WorkerCompleted | WorkerStopped
 checkRuntime    ∷ RuntimeControl → IO ()
 awaitSupervised ∷ RuntimeControl → STM a → IO a
 
+workerGroupStatus ∷ RuntimeControl → STM GroupStatus   -- from Hetoimasia.Foundation.Worker
+
 newtype UnexpectedServiceExit       = UnexpectedServiceExit WorkerSummary
 newtype UnexpectedWorkerTermination = UnexpectedWorkerTermination WorkerSummary
 newtype WorkerCleanupFailed         = WorkerCleanupFailed WorkerSummary
@@ -71,10 +73,39 @@ optional warnings go through that lifetime while it is still open.
 
 The body receives a `RuntimeControl`. It manages and supervises workers and
 does nothing else: it looks up no engine or application service and carries no
-application state. It is owned by the application thread. Do not give it to a
-worker action; a worker receives its `StopToken` and the component handles its
+application state. It is owned by the application thread, with one read-only
+exception, [the drain status](#drain-status). Do not give it to a worker
+action; a worker receives its `StopToken` and the component handles its
 definition captured, under the [borrowing rules](resources.md#ownership-and-borrowing).
 The boundary needs no application runner and is usable on its own.
+
+## Drain status
+
+`workerGroupStatus control` reads the group's
+[drain status](workers.md#drain-status) — its phase and every worker the drain
+still waits for, with each one's label, startup acknowledgement, requests,
+confirmed cancellation delivery, terminal state, and pending helpers — in one
+transaction. It is `groupStatus` over the control's group and does nothing
+else: no checkpoint, classification, observation, latch delivery, warning, or
+report, and it neither marks nor consumes anything supervision reads.
+
+That makes it the one operation any thread may call. Application assembly may
+pass the control to a thread it started outside the supervised group, such as
+a quit watchdog, which may read the status at any time, including while
+`withSupervision` or the application runner is blocked in the protected drain
+on a worker that has not stopped. Every other operation stays the application
+thread's, and the handle stays opaque. Reading never changes when the drain
+completes, the report, the propagated failure, the retained evidence, or the
+application's managed report.
+
+The status is observed state only. It names no cause for a stall and claims
+nothing about whether resources are safe to release. `GroupClosed` means the
+foundation published its `GroupReport`; supervision's settlement of the
+drained outcomes, the dependency unwind, and the application's terminal report
+all come after it. While closing, the list can briefly be empty before the
+report is published. Elapsed time, sampling cadence, output, and any deadline
+belong to the observing application, as vision V-3's watchdog does; the runtime
+adds no deadline, timeout, detach, forced release, or process exit.
 
 ## Policies and who decides them
 
@@ -406,6 +437,10 @@ shared with or reused by another invocation.
 | Committed failures and the fatal latch | Commits append and latch; deliveries and the boundary read | Application thread | One invocation; append-only; the latch is set once and never cleared |
 | Warning attempt | Consumed by the commit that makes a worker unavailable, then attempted once | Application thread | At most one per worker; never repeated |
 
+The drain status adds no supervision state: `workerGroupStatus` reads the
+foundation group's own state, whose table is in
+[workers.md](workers.md#state).
+
 The logging lifetime's recorded reporting outcomes are the lifetime's state;
 supervision only reads and appends to them.
 
@@ -462,6 +497,17 @@ third client must compile, link, and run, reading a job's result through
 another, and reporting `completed`, `stopped`, and `stopped`. The inbox
 adapter's examples, its graceful finish examples, and its own package-boundary
 clients are listed in [messaging.md](messaging.md#verification).
+
+The drain-status example is in `packages/runtime/test/Test/Runtime/Composition.hs`,
+selected with `--test-options='--match "Drain status"'`. A managed run's
+required service waits uninterruptibly, so once its action fails the drain
+blocks on the service's cancellation. A thread started before the run receives
+the control from startup, waits for quiescence and for the calling thread to
+block in the drain, reads the status twice — closing, the service listed with
+cancellation requested, unconfirmed, and one helper pending — and then releases
+the service. After the run the status is closed and empty, and the propagated
+failure, the trace, the one terminal report, and the flush are identical to the
+same run without reads.
 
 The validation catalog covers them through the floor group `test.runtime`; see
 [validation.md](validation.md).
