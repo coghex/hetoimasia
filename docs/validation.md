@@ -778,12 +778,15 @@ the server *is* the observation: nothing is signalled to make it, nothing is
 read out of an exit status the server chose for itself, and the shell's job
 table, which notices an exit at its own pace and is what once let an immediate
 exit be called a timeout, is never asked. A status above 128 is not read as
-that outcome and is not taken to mean the server is still alive. It is either
-the saved status of a child this wait has already reaped — a later wait would
-only return it again and never finish — or an interruption that left the child
-unreaped. The child is still present only in the second case, which is the
-wait collected again. Presence is asked of the process table, not the job
-table, and nothing is signalled to ask it.
+that outcome and is not taken to mean the server is still alive. It is the
+saved status of a child this wait has already reaped — a later wait would only
+return it again and never finish — or the status of a wait a signal cut short.
+An interruption does not return to the wait: a signal this observer catches
+ends it in the handler, and one it does not catch ends it outright, so the
+child stays unreaped and no exit is reported. A wait that returns has reaped
+the child, so the exit is reported once and that status is not collected
+again. Once the child has been reaped its process id may already name someone
+else, so presence is not what decides that the wait finished.
 
 Being separate, the two observations are never ordered against each other, and
 the helper never asks which arrived first. It collects them until a display is
