@@ -23,13 +23,21 @@
 -- messenger reports after the explicit messenger is gone — before it returns
 -- or throws. The lifetime then, in this order and on every exit:
 --
--- 1. closes admission and waits for any producer still inside the callback;
+-- 1. closes admission and waits for any producer counted inside the callback;
 -- 2. asks the worker for its final drain and waits for its completion,
 --    explicitly, rather than relying on the worker group's default drain;
--- 3. accounts for every record the worker did not deliver;
--- 4. releases the storage — unless the body retained it with 'retainStorage'
---    because a messenger that names it may still report — and only then
---    returns, or rethrows the body's failure unchanged.
+-- 3. accounts for every admitted record the worker did not deliver, including
+--    one it had taken when it was cancelled;
+-- 4. frees the storage's records — unless the body retained them with
+--    'retainStorage' because a messenger that names them may still report —
+--    and only then returns, or rethrows the body's failure unchanged.
+--
+-- The storage's header — the producer's entry check, the close handshake, the
+-- latches and the counters — is never freed. A producer caught between entering
+-- the callback and announcing itself when admission closes therefore always
+-- finds live memory, sees admission closed, counts itself as a capture failure
+-- and never reaches the records, and 'captureStatus' reads the same live
+-- counters before, during and after the release.
 --
 -- The result is a 'DiagnosticVerdict' covering every record offered before
 -- step 1, including those delivered during instance destruction. A failed body
@@ -50,19 +58,19 @@
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | State              | Owner               | Writers                    | Readers                   | Lifetime and reset              |
 -- +====================+=====================+============================+===========================+=================================+
--- | C storage: queue,  | this lifetime       | producers (any thread),    | the worker; the lifetime  | allocated at entry; freed in    |
--- | latches, counters  |                     | the worker (consumption)   | after it; 'captureStatus' | step 4 unless retained; never   |
--- |                    |                     |                            |                           | reset                           |
+-- | C records: queue,  | this lifetime       | producers (any thread),    | the worker; the lifetime  | allocated at entry; freed in    |
+-- | objects, text      |                     | the worker (consumption)   | after it                  | step 4 unless retained          |
+-- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
+-- | C header: latches, | this lifetime, then | producers (any thread),    | the lifetime;             | allocated at entry; never freed |
+-- | counters, handshake| the process         | the lifetime (close)       | 'captureStatus'           | or reset                        |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | phase              | this lifetime       | the lifetime's thread      | any thread                | per lifetime; only advances     |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
--- | delivered count    | the worker          | the worker                 | any thread                | per lifetime; only grows        |
+-- | taken and          | the worker          | the worker                 | any thread; the lifetime  | per lifetime; only grow         |
+-- | delivered counts   |                     |                            | after the worker          |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | wake and final     | this lifetime       | 'requestDrain'; the        | the worker                | per lifetime; final is set once |
 -- | requests           |                     | lifetime (final)           |                           |                                 |
--- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
--- | status snapshot    | this lifetime       | step 4, once               | 'captureStatus' after     | taken before any release        |
--- |                    |                     |                            | release                   |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 module Hetoimasia.GPU.Vulkan.Diagnostics
   ( -- * Configuration
@@ -105,7 +113,6 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   ) where
 
 import Control.Concurrent (rtsSupportsBoundThreads)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, withMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -126,6 +133,7 @@ import Control.Exception
   , SomeException
   , fromException
   , mask
+  , mask_
   , rethrowIO
   , someExceptionContext
   , throwIO
@@ -185,7 +193,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , closeStorage
   , counterValue
   , createStorage
-  , destroyStorage
+  , freeRecords
   , latchSet
   , storageUserData
   , takeRecord
@@ -265,30 +273,33 @@ data CapturePhase
   | PhaseJoined
     -- ^ The worker has completed and its outcome has been read.
   | PhaseReleased
-    -- ^ The storage has been freed, or deliberately retained.
+    -- ^ The records have been freed, or deliberately retained.
   deriving (Eq, Ord, Show)
 
 -- | One diagnostic lifetime's handle. It is valid inside the body it was
 -- passed to; 'capturePhase', 'captureStatus' and 'deliveredCount' remain
 -- answerable after the lifetime has ended.
 data DiagnosticCapture = DiagnosticCapture
-  { handleStorage ∷ !(MVar (Maybe Storage))
-    -- ^ 'Nothing' once freed. Held across every read so a status query can
-    -- never race the release.
+  { handleStorage ∷ !Storage
+    -- ^ Its header, all a status read touches, is valid for the life of the
+    -- process.
   , handleUserData ∷ !(Ptr ())
   , handlePhase ∷ !(TVar CapturePhase)
+  , handleTaken ∷ !(TVar Word64)
+    -- ^ Records the worker has taken from the storage, delivered or not.
   , handleDelivered ∷ !(TVar Word64)
   , handleWake ∷ !(TVar Bool)
   , handleFinal ∷ !(TVar Bool)
   , handleRetained ∷ !(TVar Bool)
-  , handleSnapshot ∷ !(TVar (Maybe CaptureStatus))
   }
 
 -- | The user data to register beside 'captureCallback' on every messenger:
 -- the explicit one, and the one chained into @VkInstanceCreateInfo@.
 --
--- It stays valid until the lifetime's final step, which the body reaches only
--- after its last callback-producing destruction.
+-- The records it names stay valid until the lifetime's final step, which the
+-- body reaches only after its last callback-producing destruction; a report
+-- that still arrives after that is counted as a capture failure against the
+-- storage's header, which is never freed.
 captureUserData ∷ DiagnosticCapture → Ptr ()
 captureUserData = handleUserData
 
@@ -299,8 +310,8 @@ requestDrain capture = atomically (writeTVar (handleWake capture) True)
 -- | Declare that a native object which registered this capture's callback may
 -- outlive the body — a native owner that retained its instance, say, because
 -- the evidence that destroying it is safe never arrived. The lifetime then
--- never frees the storage: it is released by process exit, and the verdict says
--- so. Calling it more than once is harmless.
+-- never frees the storage's records: they are released by process exit, and
+-- the verdict says so. Calling it more than once is harmless.
 retainStorage ∷ DiagnosticCapture → IO ()
 retainStorage capture = atomically (writeTVar (handleRetained capture) True)
 
@@ -340,9 +351,13 @@ withDiagnosticCapture config logger body = do
             outcome ← trySome (restore (body capture))
             finish storage capture worker outcome
         )
-    -- The group has drained: nothing of the worker's runs any more. Anything
-    -- still queued was not delivered, and is counted before the release.
+    -- The group has drained: nothing of the worker's runs any more. What it
+    -- took and did not deliver — discarded after a sink failure, or in hand
+    -- when it was cancelled — and anything still queued were not delivered,
+    -- and all of it is counted before the release.
     remaining ← countRemaining storage
+    taken ← readTVarIO (handleTaken capture)
+    delivered ← readTVarIO (handleDelivered capture)
     status ← uninterruptibleMask_ (release storage capture)
     case grouped of
       Left failure → rethrowIO failure
@@ -351,8 +366,8 @@ withDiagnosticCapture config logger body = do
         let verdict =
               DiagnosticVerdict
                 { verdictStatus = status
-                , verdictDelivered = finishedDelivered finished
-                , verdictUndelivered = finishedDiscarded finished + remaining
+                , verdictDelivered = delivered
+                , verdictUndelivered = (taken - delivered) + remaining
                 , verdictConsumer = finishedConsumer finished
                 , verdictStorageRetained = retained
                 }
@@ -373,23 +388,19 @@ failedStartup completion = case completionResult completion of
 
 newCapture ∷ Storage → IO DiagnosticCapture
 newCapture storage =
-  DiagnosticCapture
-    <$> newMVar (Just storage)
-    <*> pure (storageUserData storage)
-    <*> newTVarIO PhaseCapturing
+  DiagnosticCapture storage (storageUserData storage)
+    <$> newTVarIO PhaseCapturing
+    <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO False
-    <*> newTVarIO Nothing
 
 -- | What steps 1 and 2 leave for the rest of the lifetime.
 data Finished a = Finished
   { finishedOutcome ∷ !(Either (ExceptionWithContext SomeException) a)
     -- ^ The body's own result or failure.
   , finishedConsumer ∷ !ConsumerOutcome
-  , finishedDelivered ∷ !Word64
-  , finishedDiscarded ∷ !Word64
   , finishedPending ∷ !(Maybe (ExceptionWithContext SomeException))
     -- ^ The first cancellation delivered while waiting for the worker.
   }
@@ -423,26 +434,14 @@ finish storage capture worker outcome = do
   completion ← await
   atomically (writeTVar (handlePhase capture) PhaseJoined)
   pending ← readIORef pendingRef
-  let (consumer, delivered, discarded) = case completionResult completion of
-        Succeeded report →
-          ( maybe ConsumerCompleted ConsumerSinkFailed (reportSinkFailure report)
-          , reportDelivered report
-          , reportDiscarded report
-          )
-        Failed failure → (ConsumerFailed failure, 0, 0)
-        Cancelled failure → (ConsumerCancelled failure, 0, 0)
-  -- A worker that failed or was cancelled published no report, so its own
-  -- progress is read from what it published as it went.
-  published ← readTVarIO (handleDelivered capture)
-  let delivered' = case completionResult completion of
-        Succeeded _ → delivered
-        _ → published
+  let consumer = case completionResult completion of
+        Succeeded report → maybe ConsumerCompleted ConsumerSinkFailed (reportSinkFailure report)
+        Failed failure → ConsumerFailed failure
+        Cancelled failure → ConsumerCancelled failure
   pure
     Finished
       { finishedOutcome = outcome
       , finishedConsumer = consumer
-      , finishedDelivered = delivered'
-      , finishedDiscarded = discarded
       , finishedPending = pending
       }
   where
@@ -459,20 +458,17 @@ countRemaining storage = go 0
         Just _ → go (counted + 1)
 
 -- | Step 4. Close (again, harmlessly, for an exit that never reached the first
--- close), snapshot the latches and counters, and free the storage unless the
--- body retained it. Bounded: it waits only for producers already inside the
--- callback.
+-- close), read the latches and counters the verdict reports, and free the
+-- records unless the body retained them. Bounded: it waits only for producers
+-- counted inside the callback. The header stays, so nothing that can still
+-- reach it — a late producer, a status read — can touch freed memory.
 release ∷ Storage → DiagnosticCapture → IO CaptureStatus
 release storage capture = do
   closeStorage storage
   status ← readStatus storage
   retained ← readTVarIO (handleRetained capture)
-  modifyMVar_ (handleStorage capture) $ \current → do
-    unless retained (destroyStorage storage)
-    pure (if retained then current else Nothing)
-  atomically $ do
-    writeTVar (handleSnapshot capture) (Just status)
-    writeTVar (handlePhase capture) PhaseReleased
+  unless retained (freeRecords storage)
+  atomically (writeTVar (handlePhase capture) PhaseReleased)
   pure status
 
 -- Observation ------------------------------------------------------------------
@@ -506,16 +502,12 @@ data CaptureStatus = CaptureStatus
   }
   deriving (Eq, Show)
 
--- | Read the latches and counters, with no worker involved. After the
--- lifetime has released the storage this answers the snapshot taken just
--- before.
+-- | Read the latches and counters, with no worker involved, at any time — the
+-- storage's header they live in is never freed. After the lifetime has ended
+-- this still answers the live values, so a report that arrived after the
+-- verdict was reached shows here as a capture failure.
 captureStatus ∷ DiagnosticCapture → IO CaptureStatus
-captureStatus capture =
-  withMVar (handleStorage capture) $ \case
-    Just storage → readStatus storage
-    Nothing →
-      readTVarIO (handleSnapshot capture)
-        >>= maybe (error "captureStatus: a released storage left no snapshot") pure
+captureStatus = readStatus . handleStorage
 
 readStatus ∷ Storage → IO CaptureStatus
 readStatus storage = do
@@ -654,11 +646,10 @@ severityLevel = \case
 scopedLogger ∷ Logger → Logger
 scopedLogger = withBreadcrumb "vulkan-diagnostics"
 
-data DrainReport = DrainReport
-  { reportDelivered ∷ !Word64
-  , reportDiscarded ∷ !Word64
-    -- ^ Taken after the sink failed, and so never delivered.
-  , reportSinkFailure ∷ !(Maybe (ExceptionWithContext SomeException))
+-- | How a worker that finished normally ended. Its progress is in the
+-- capture's taken and delivered counts, which a cancelled worker leaves too.
+newtype DrainReport = DrainReport
+  { reportSinkFailure ∷ Maybe (ExceptionWithContext SomeException)
   }
 
 -- | Drain the storage until the lifetime asks for the final drain, then drain
@@ -675,25 +666,29 @@ drainWorker config logger storage capture =
   workerDefinition "gpu.vulkan.diagnostics" (\_ → pure ()) (\token () → run token)
   where
     run token = do
-      state ← newIORef (DrainReport 0 0 Nothing)
+      state ← newIORef (DrainReport Nothing)
       let pass = do
-            next ← takeRecord storage
+            -- Taking a record and counting it as taken are one step, so a
+            -- cancellation cannot leave a record that is in neither the queue
+            -- nor the count. Nothing in it is interruptible.
+            next ← mask_ $ do
+              taken ← takeRecord storage
+              when (isJust taken) (atomically (modifyTVar' (handleTaken capture) (+ 1)))
+              pure taken
             case next of
               Nothing → pure ()
               Just record → do
                 current ← readIORef state
-                updated ← case reportSinkFailure current of
-                  Just _ → pure current {reportDiscarded = reportDiscarded current + 1}
+                case reportSinkFailure current of
+                  -- Taken, counted, and not delivered: accounted as undelivered.
+                  Just _ → pure ()
                   Nothing → do
                     delivered ← trySome (deliver logger record)
                     case delivered of
-                      Right () → do
-                        atomically (modifyTVar' (handleDelivered capture) (+ 1))
-                        pure current {reportDelivered = reportDelivered current + 1}
+                      Right () → atomically (modifyTVar' (handleDelivered capture) (+ 1))
                       Left failure@(ExceptionWithContext _ exception)
                         | isJust (fromException exception ∷ Maybe SomeAsyncException) → rethrowIO failure
-                        | otherwise → pure current {reportSinkFailure = Just failure, reportDiscarded = reportDiscarded current + 1}
-                writeIORef state updated
+                        | otherwise → writeIORef state (DrainReport (Just failure))
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

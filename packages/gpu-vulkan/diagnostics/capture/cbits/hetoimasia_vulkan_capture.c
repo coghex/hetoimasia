@@ -157,16 +157,20 @@ size_t hetoimasia_capture_object_size(void)
   return sizeof(capture_object);
 }
 
-void hetoimasia_capture_destroy(hetoimasia_capture_storage *storage)
+void hetoimasia_capture_free_records(hetoimasia_capture_storage *storage)
 {
   if (storage == NULL) {
     return;
   }
-  atomic_store(&storage->magic, 0);
+  /* Only a closed storage: a producer that announces itself from here on sees
+     `closed` and leaves before it could reach the records. */
+  atomic_store(&storage->closed, 1);
   free(storage->records);
   free(storage->objects);
   free(storage->text);
-  free(storage);
+  storage->records = NULL;
+  storage->objects = NULL;
+  storage->text = NULL;
 }
 
 static void saturating_increment(_Atomic uint64_t *counter)
@@ -271,6 +275,7 @@ uint32_t hetoimasia_capture_callback(
   void *user_data)
 {
   hetoimasia_capture_storage *storage = user_data;
+  /* The header is never freed, so reading it is safe however late this is. */
   if (storage == NULL || atomic_load(&storage->magic) != CAPTURE_MAGIC) {
     return 0;
   }
@@ -491,4 +496,24 @@ uint32_t hetoimasia_capture_offer(
     .objects = object_types == NULL ? NULL : objects,
   };
   return hetoimasia_capture_callback(severity, types, null_data ? NULL : &data, user_data);
+}
+
+uint32_t hetoimasia_capture_offer_held(
+  void *user_data, int *arrived, int *gate, uint32_t severity, const char *message)
+{
+  __atomic_store_n(arrived, 1, __ATOMIC_SEQ_CST);
+  while (__atomic_load_n(gate, __ATOMIC_SEQ_CST) == 0) {
+    sched_yield();
+  }
+  return hetoimasia_capture_offer(user_data, severity, 0x2, NULL, 0, message, 0, NULL, NULL, NULL, 0);
+}
+
+void hetoimasia_capture_flag_set(int *flag)
+{
+  __atomic_store_n(flag, 1, __ATOMIC_SEQ_CST);
+}
+
+int hetoimasia_capture_flag_get(int *flag)
+{
+  return __atomic_load_n(flag, __ATOMIC_SEQ_CST);
 }

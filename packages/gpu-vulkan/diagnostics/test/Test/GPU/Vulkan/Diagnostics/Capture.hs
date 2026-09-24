@@ -7,6 +7,7 @@
 module Test.GPU.Vulkan.Diagnostics.Capture (spec) where
 
 import Control.Concurrent (forkIO, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception (bracket)
 import Control.Monad (forM, forM_, replicateM_, when)
@@ -29,11 +30,15 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , closeStorage
   , counterValue
   , createStorage
-  , destroyStorage
+  , freeRecords
   , latchSet
   , offer
   , offerMissingData
   , plainOffer
+  , newHold
+  , offerHeld
+  , holdArrived
+  , releaseHold
   , presetCounter
   , storageUserData
   , takeRecord
@@ -42,7 +47,7 @@ import Test.Support.Bounded (bounded)
 
 -- | A storage for one example, closed and freed afterwards.
 withStorage ∷ Limits → (Storage → IO a) → IO a
-withStorage bounds = bracket (createStorage bounds) (\storage → closeStorage storage >> destroyStorage storage)
+withStorage bounds = bracket (createStorage bounds) (\storage → closeStorage storage >> freeRecords storage)
 
 limits ∷ Int → Int → Int → Limits
 limits capacity budget objects =
@@ -244,6 +249,25 @@ spec = describe "Capture" $ do
       -- returns rather than touching memory it was not given.
       offer nullPtr (plainOffer SeverityError "nowhere") `shouldReturn` ()
 
+    it "counts a producer held at the callback's entry across close and free as a capture failure" $ do
+      -- The window between a producer entering the callback and announcing
+      -- itself: closing cannot see it, so it must not matter that closing
+      -- returns and the records are freed while it is there. The header it
+      -- resumes into is never freed, and it finds admission closed.
+      storage ← createStorage (limits 4 64 2)
+      hold ← newHold
+      done ← newEmptyMVar
+      _ ← forkIO (offerHeld (storageUserData storage) hold SeverityError "held" >> putMVar done ())
+      bounded (untilM (holdArrived hold))
+      closeStorage storage
+      freeRecords storage
+      releaseHold hold
+      bounded (takeMVar done)
+      counterValue storage CaptureFailed `shouldReturn` 1
+      counterValue storage Admitted `shouldReturn` 0
+      latchSet storage CaptureFailureLatch `shouldReturn` True
+      latchSet storage ErrorLatch `shouldReturn` True
+
     it "refuses a record offered after closing, as a capture failure" $
       withStorage (limits 4 64 2) $ \storage → do
         closeStorage storage
@@ -292,6 +316,7 @@ spec = describe "Capture" $ do
         forM_ (Map.toList byProducer) $ \(producer, sequenceNumbers) →
           (producer, and (zipWith (<) sequenceNumbers (drop 1 sequenceNumbers))) `shouldBe` (producer, True)
   where
+    untilM condition = condition >>= \ok → if ok then pure () else yield >> untilM condition
     parse message = case Char8.split ':' message of
       [producer, n] → (,) <$> readInt producer <*> readInt n
       _ → Nothing

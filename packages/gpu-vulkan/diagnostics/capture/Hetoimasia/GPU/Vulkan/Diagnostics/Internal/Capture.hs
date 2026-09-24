@@ -23,7 +23,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Storage
   , CreateFailure (..)
   , createStorage
-  , destroyStorage
+  , freeRecords
   , closeStorage
   , storageClosed
   , storageUserData
@@ -51,6 +51,11 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , plainOffer
   , offer
   , offerMissingData
+  , Hold
+  , newHold
+  , offerHeld
+  , holdArrived
+  , releaseHold
   , presetCounter
   ) where
 
@@ -65,8 +70,9 @@ import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArray, withArrayLen)
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
-import Foreign.Storable (peek, pokeByteOff)
+import Foreign.Storable (peek, poke, pokeByteOff)
 
 -- Limits ---------------------------------------------------------------------
 
@@ -124,8 +130,9 @@ recordFootprint limits =
 
 data StorageT
 
--- | One C capture storage. A 'Storage' is only valid between 'createStorage'
--- and 'destroyStorage', and its owner guarantees that.
+-- | One C capture storage. Its records are valid between 'createStorage' and
+-- 'freeRecords'; its header, which is all a producer or a status read touches
+-- once admission has closed, is valid for the life of the process.
 newtype Storage = Storage (Ptr StorageT)
 
 -- | Why a storage could not be built.
@@ -157,9 +164,12 @@ createStorage limits = do
     -- Three uint32_t fields, and no padding between or after them.
     limitsSize = 12
 
--- | Free a storage. It must be closed, and nothing may touch it again.
-destroyStorage ∷ Storage → IO ()
-destroyStorage (Storage storage) = hetoimasia_capture_destroy storage
+-- | Free the records. The storage must be closed, and its consumer must not
+-- take a record again. The header — the producer's view, the latches and the
+-- counters — stays valid for the life of the process, so 'counterValue',
+-- 'latchSet' and a late producer remain safe.
+freeRecords ∷ Storage → IO ()
+freeRecords (Storage storage) = hetoimasia_capture_free_records storage
 
 -- | Stop admission and wait for every producer already inside the callback.
 closeStorage ∷ Storage → IO ()
@@ -431,6 +441,34 @@ withNames names continue = go names []
     go [] acquired = withArrayLen (reverse acquired) (\_ → continue)
     go (name : rest) acquired = withOptional name (\pointer → go rest (pointer : acquired))
 
+-- | A producer held between entering the callback and announcing itself.
+data Hold = Hold !(ForeignPtr CInt) !(ForeignPtr CInt)
+
+newHold ∷ IO Hold
+newHold = do
+  arrived ← mallocForeignPtr
+  gate ← mallocForeignPtr
+  withForeignPtr arrived (`poke` 0)
+  withForeignPtr gate (`poke` 0)
+  pure (Hold arrived gate)
+
+-- | Offer one plain record, held at the callback's entry until 'releaseHold'.
+-- Blocks the calling thread for as long as it is held; run it on its own.
+offerHeld ∷ Ptr () → Hold → Severity → ByteString → IO ()
+offerHeld userData (Hold arrived gate) severity message =
+  withForeignPtr arrived $ \arrivedPtr →
+    withForeignPtr gate $ \gatePtr →
+      ByteString.useAsCString message $ \text →
+        () <$ hetoimasia_capture_offer_held userData arrivedPtr gatePtr (severityBits severity) text
+
+-- | Whether the held producer has entered the callback.
+holdArrived ∷ Hold → IO Bool
+holdArrived (Hold arrived _) = withForeignPtr arrived (fmap (/= 0) . hetoimasia_capture_flag_get)
+
+-- | Let the held producer go on.
+releaseHold ∷ Hold → IO ()
+releaseHold (Hold _ gate) = withForeignPtr gate hetoimasia_capture_flag_set
+
 -- | Set a counter directly, so saturation can be shown.
 presetCounter ∷ Storage → Counter → Word64 → IO ()
 presetCounter (Storage storage) counter = hetoimasia_capture_preset_counter storage (counterIndex counter)
@@ -448,8 +486,17 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_obje
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_create"
   hetoimasia_capture_create ∷ Ptr () → Ptr (Ptr StorageT) → IO CInt
 
-foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_destroy"
-  hetoimasia_capture_destroy ∷ Ptr StorageT → IO ()
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_free_records"
+  hetoimasia_capture_free_records ∷ Ptr StorageT → IO ()
+
+foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer_held"
+  hetoimasia_capture_offer_held ∷ Ptr () → Ptr CInt → Ptr CInt → Word32 → CString → IO Word32
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_flag_set"
+  hetoimasia_capture_flag_set ∷ Ptr CInt → IO ()
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_flag_get"
+  hetoimasia_capture_flag_get ∷ Ptr CInt → IO CInt
 
 foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_close"
   hetoimasia_capture_close ∷ Ptr StorageT → IO ()

@@ -21,12 +21,19 @@
 ** the lifetime that owns the storage. It is not safe to peek or release from
 ** two threads at once. Everything else here — the latches, the counters, the
 ** producer itself — is safe from any thread at any time while the storage is
-** alive.
+** alive; the header parts of it are safe for the life of the process.
 **
 ** The storage is allocated with the C heap at construction and never grows.
-** Its lifetime is the Haskell diagnostic lifetime's: nothing may free it while
-** a messenger that names it can still call back, which is why closing waits
-** for producers already inside `hetoimasia_vulkan_capture` to leave.
+** It is two parts with two lifetimes. The records — the queue, the object
+** records and the text — belong to the Haskell diagnostic lifetime and are
+** freed at its end, after admission has closed and every producer counted
+** inside the callback has left. The header — the magic, the close handshake,
+** the latches and the counters, a few hundred bytes — is never freed. A
+** producer can be anywhere between entering the callback and announcing itself
+** when the lifetime closes; because the header outlives the process's every
+** use of it, that producer always finds live memory, sees admission closed,
+** counts itself as a capture failure, and never reaches the records. Keeping
+** the header is what makes closing a barrier rather than a hope.
 */
 #ifndef HETOIMASIA_VULKAN_CAPTURE_H
 #define HETOIMASIA_VULKAN_CAPTURE_H
@@ -103,10 +110,12 @@ size_t hetoimasia_capture_record_size(void);
 size_t hetoimasia_capture_object_size(void);
 
 /*
-** Free a storage. The caller must have closed it, and no producer and no
-** consumer may touch it again.
+** Free the records. The caller must have closed the storage, and the consumer
+** must not peek or release again. The header stays valid for the life of the
+** process: the producer, the latches and the counters remain safe to use, and a
+** report still reaching the producer is counted as a capture failure.
 */
-void hetoimasia_capture_destroy(hetoimasia_capture_storage *storage);
+void hetoimasia_capture_free_records(hetoimasia_capture_storage *storage);
 
 /*
 ** The production producer: a debug-utils messenger callback with this storage
@@ -205,5 +214,18 @@ uint32_t hetoimasia_capture_offer(
   const uint64_t *object_handles,
   const char *const *object_names,
   int null_data);
+
+/*
+** Test support: offer one plain record, but only once `*gate` is non-zero,
+** having first set `*arrived`. From the storage's side this is a producer that
+** has entered the callback and not yet announced itself, held there for as long
+** as the caller likes — across a close, and across freeing the records.
+*/
+uint32_t hetoimasia_capture_offer_held(
+  void *user_data, int *arrived, int *gate, uint32_t severity, const char *message);
+
+/* Test support: set a flag, and read one, with atomic ordering. */
+void hetoimasia_capture_flag_set(int *flag);
+int hetoimasia_capture_flag_get(int *flag);
 
 #endif

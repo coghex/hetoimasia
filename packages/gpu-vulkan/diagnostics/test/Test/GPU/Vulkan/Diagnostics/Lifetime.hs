@@ -10,7 +10,7 @@
 -- sees delivered came from an explicit wake-up or from the final drain.
 module Test.GPU.Vulkan.Diagnostics.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (forkIO, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception
@@ -60,8 +60,12 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   ( Offer (..)
   , Severity (..)
+  , holdArrived
+  , newHold
+  , offerHeld
   , offerMissingData
   , plainOffer
+  , releaseHold
   )
 import Test.GPU.Vulkan.Diagnostics.Support
 
@@ -345,9 +349,10 @@ spec = describe "Lifetime" $ do
             Nothing → expectationFailure "the cancellation carries no verdict"
             Just verdict → do
               consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
-              verdictUndelivered verdict `shouldBe` 1
-              verdictIssues verdict `shouldSatisfy` elem ConsumerUnsuccessful
-              verdictIssues verdict `shouldSatisfy` elem (RecordsUndelivered 1)
+              -- Both admitted records: the one the worker had taken and was
+              -- delivering when it was cancelled, and the one still queued.
+              verdictUndelivered verdict `shouldBe` 2
+              verdictIssues verdict `shouldBe` [RecordsUndelivered 2, ConsumerUnsuccessful]
 
     it "finalizes a body that is cancelled, then rethrows the cancellation" $ do
       (logger, recorded) ← recordingLogger everythingFilter
@@ -374,6 +379,51 @@ spec = describe "Lifetime" $ do
           fmap verdictDelivered (diagnosticVerdict failure) `shouldBe` Just 1
       length <$> recordedEntries recorded `shouldReturn` 1
 
+    it "answers status reads racing the release without failing" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      handle ← newEmptyMVar
+      reader ← newEmptyMVar
+      -- A reader that starts while the body runs and keeps reading until it
+      -- has seen the lifetime end, so some of its reads overlap the release.
+      _ ← forkIO $ do
+        capture ← readMVar handle
+        let loop seen = do
+              phase ← atomically (capturePhase capture)
+              _ ← captureStatus capture
+              if phase == PhaseReleased then pure (seen + 1) else loop (seen + 1 ∷ Int)
+        result ← try @SomeException (loop 0)
+        putMVar reader result
+      ((), verdict) ←
+        capturing logger $ \capture → do
+          putMVar handle capture
+          offerTo capture (plainOffer SeverityWarning "while reading")
+      result ← bounded (readMVar reader)
+      either (Left . show) (const (Right ())) result `shouldBe` Right ()
+      verdictClean verdict `shouldBe` True
+
+    it "counts a producer still entering the callback when the lifetime ends, without touching freed records" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      hold ← newHold
+      done ← newEmptyMVar
+      saved ← newIORef Nothing
+      ((), verdict) ←
+        capturing logger $ \capture → do
+          writeIORef saved (Just capture)
+          _ ← forkIO (offerHeld (captureUserData capture) hold SeverityWarning "late" >> putMVar done ())
+          bounded (untilM (holdArrived hold))
+      -- The body returned with a producer still between entering the callback
+      -- and announcing itself, which the verdict could not have seen.
+      verdictClean verdict `shouldBe` True
+      releaseHold hold
+      bounded (readMVar done)
+      readIORef saved >>= \case
+        Nothing → expectationFailure "the body never ran"
+        Just capture → do
+          atomically (capturePhase capture) `shouldReturn` PhaseReleased
+          status ← captureStatus capture
+          countCaptureFailed (statusCounters status) `shouldBe` 1
+          statusCaptureFailureLatched status `shouldBe` True
+
     it "never frees storage the body retained" $ do
       (logger, _) ← recordingLogger everythingFilter
       saved ← newIORef Nothing
@@ -390,6 +440,7 @@ spec = describe "Lifetime" $ do
           offerTo capture (plainOffer SeverityWarning "from a retained messenger")
           countCaptureFailed . statusCounters <$> captureStatus capture `shouldReturn` 1
   where
+    untilM condition = condition >>= \ok → if ok then pure () else yield >> untilM condition
     describeFailure failure =
       ( fromException failure
       , fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)

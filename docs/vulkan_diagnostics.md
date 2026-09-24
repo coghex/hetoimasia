@@ -123,8 +123,8 @@ count against a clean verdict, is VK-7's and VK-8's to settle.
 Every report the producer records is exactly one of admitted, dropped, or
 refused as a capture failure, so offered is their sum until a counter
 saturates. `captureStatus` reads all of them from the C storage at any time,
-from any thread, with no worker involved; after the lifetime has released the
-storage it answers the snapshot taken just before. No delivery, flush or later
+from any thread, with no worker involved — before, during and after the
+release, because the header they live in is never freed. No delivery, flush or later
 report clears any of them, and the logger's filter never sees them: an error
 the logger filters out entirely is still latched.
 
@@ -155,11 +155,14 @@ lifetime then:
    `safe` call;
 2. asks the worker for its final drain and waits for its completion explicitly,
    never relying on the worker group's default drain;
-3. counts every record still queued as undelivered;
-4. snapshots the latches and counters and frees the storage — unless the body
-   called `retainStorage` because a native object that registered the callback
-   may outlive it, in which case the storage is left for process exit and the
-   verdict says so;
+3. counts as undelivered every admitted record the worker did not deliver: the
+   ones it discarded after a sink failure, one it had taken and was delivering
+   when it was cancelled — the worker counts a record as taken in the same
+   masked step that takes it — and every one still queued;
+4. reads the latches and counters for the verdict and frees the storage's
+   records — unless the body called `retainStorage` because a native object
+   that registered the callback may outlive it, in which case they are left for
+   process exit and the verdict says so;
 5. returns the body's result with the verdict, or rethrows the body's failure
    with its own type, value and context and the verdict attached to it.
 
@@ -168,7 +171,18 @@ lifetime then:
 | `PhaseCapturing` | The body runs; producers report, and the worker drains when woken or polled. |
 | `PhaseClosed` | Admission is closed, every producer has left, and the final drain was requested. The storage and the logger are still borrowed. |
 | `PhaseJoined` | The worker is terminal and its outcome has been read. |
-| `PhaseReleased` | The storage is freed, or deliberately retained. |
+| `PhaseReleased` | The records are freed, or deliberately retained. |
+
+The storage is two parts with two lifetimes. The records — the queue, the
+object records and the text — are the lifetime's and are freed in step 4. The
+header — the producer's entry check, the close handshake, the latches and the
+counters, a few hundred bytes — is never freed. Closing waits for every
+producer that has announced itself inside the callback, but nothing can see a
+producer that has entered the callback and not yet announced itself. Because
+the header outlives every use of it, such a producer always resumes into live
+memory, finds admission closed, counts itself as a capture failure, and never
+reaches the records. Such a report arrives after the verdict, so the verdict
+cannot include it; `captureStatus` shows it.
 
 Draining may run while producers are still active: a record produced while an
 earlier one is being delivered is delivered after it. Final closure and release
@@ -283,11 +297,11 @@ proof checks the binding flags against the pin.
 
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
 | --- | --- | --- | --- | --- | --- |
-| C storage: queue, latches, counters | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it; `captureStatus` | any | allocated at entry, freed in step 4 unless retained; never reset |
+| C records: queue, objects, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
+| C header: latches, counters, close handshake | the lifetime, then the process | producers on any thread; the lifetime, closing | the lifetime; `captureStatus` | any | allocated at entry; never freed or reset |
 | Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
-| Delivered count | the worker | the worker | any thread | the worker's | per lifetime; only grows |
+| Taken and delivered counts | the worker | the worker | any thread; the lifetime once the worker is terminal | the worker's | per lifetime; only grow |
 | Wake and final requests | the lifetime | `requestDrain`; the lifetime, once, for final | the worker | any | per lifetime |
-| Status snapshot | the lifetime | step 4, once | `captureStatus` after release | the lifetime's | taken before any release |
 
 ## Testing
 
@@ -307,12 +321,15 @@ a Haskell stand-in. `Capture` drives the storage directly: bounded copying at
 each limit and one byte past it, the shared budget, saturation and the drop
 counter with the error latch surviving it, error latching ahead of admission,
 truncation counting, contained producer failures, counters saturating at their
-ceilings, and eight threads racing for positions while a consumer drains.
+ceilings, eight threads racing for positions while a consumer drains, and a
+producer held at the callback's entry across closing and freeing the records.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
 fields, the worker's own group, the verdict's issues, sink failure beside a
 preserved primary failure, a record produced while draining, the final drain,
-a blocked sink holding the storage, cancellation during finalization and of the
-body, and retention. Waits are explicit: a gated sink says when it is entered,
+a blocked sink holding the storage, cancellation during finalization — with the
+record in the worker's hands counted — and of the body, status reads racing the
+release, a producer still entering the callback when the lifetime ends, and
+retention. Waits are explicit: a gated sink says when it is entered,
 the delivered count says what the worker has done, and the poll is replaced by
 one no example reaches.
 
