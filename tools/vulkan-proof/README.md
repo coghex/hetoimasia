@@ -369,6 +369,19 @@ as [`docs/vulkan/macos-vk5.md`](../../docs/vulkan/macos-vk5.md); both carry one
 source digest. VK-8 migrates these cases into the package-native fixture and
 retires this route for them.
 
+## VK-9: the shader suite runs first
+
+`run-proof.sh` runs [`run-shaders.sh`](run-shaders.sh) before the harness, on
+the same prefix, build directory and Cabal flags: it regenerates the native
+package's shader toolchain fingerprint and runs
+`hetoimasia-gpu-vulkan-native:shader-tests`, and a failure stops the proof. That
+suite needs no display and no consent, so it is the same run whatever the
+harness is asked to do, including `--headless`. Until VK-8's
+`test.vulkan-headless` exists this route is where the suite is required to run;
+`run-shaders.sh` is also its standalone entry, and
+[the native package's README](../../packages/gpu-vulkan/native/README.md#shaders)
+is its contract.
+
 ## Running it
 
 The proof opens a visible window and presents to it. It therefore needs the same

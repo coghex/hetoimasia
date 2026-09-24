@@ -46,6 +46,7 @@ extra-source-files:
     tools/toolchain/qualify-binding.sh
     tools/toolchain/Dockerfile.linux-binding
     tools/vulkan-proof/run-proof.sh
+    tools/vulkan-proof/run-shaders.sh
     cabal.project.vulkan
     tools/docs_land_paths.py
     tools/native/glfw.pin

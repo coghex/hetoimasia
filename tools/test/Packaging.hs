@@ -68,6 +68,7 @@ consumed =
   , ("cabal.project.vulkan", "VulkanProof.hs reads the packages and constraints it declares")
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
   , ("tools/vulkan-proof/run-proof.sh", "VulkanProof.hs reads it to check it supplies no native-session consent")
+  , ("tools/vulkan-proof/run-shaders.sh", "VulkanProof.hs reads it to check the proof route runs the shader suite")
   , ("docs/vulkan/macos.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan/linux.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan_compatibility_record.md", "VulkanProof.hs checks it still quotes the records' own totals")

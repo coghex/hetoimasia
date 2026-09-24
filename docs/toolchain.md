@@ -173,9 +173,17 @@ loader into the private native prefix and writes
 whatever a distribution installed; and `native.py prepare` prints
 `HETOIMASIA_VULKAN_LIBDIR` and `HETOIMASIA_VULKAN_INCLUDEDIR`, which
 `tools/vulkan-proof/run-proof.sh` passes to Cabal as `--extra-lib-dirs` and
-`--extra-include-dirs` on the one command line. Those are configure flags, so
-unlike `--ghc-options` they reach a dependency the store builds. Nothing is
-generated on disk and nothing names a machine path.
+`--extra-include-dirs` on the one command line. Nothing is generated on disk.
+
+Those flags reach this project's own packages, and that is all they reach: the
+proof and the native package link against the prefix's loader through them.
+They do not reach the binding, which the store builds — like `--ghc-options`,
+Cabal applies a command-line package option to local packages only. VK-9
+established this rather than assuming it: the binding's unit id is the same
+whatever `--extra-lib-dirs` names, so the store builds it once, with no loader
+directory, and reuses it. On Linux that costs nothing, because the binding reads
+the prefix's `vulkan.pc`. On macOS it is why `cabal.project.vulkan` names the
+binding's loader directory itself; see below.
 
 Linking selects the loader's directory; it does not select the file loaded at
 run time. On Linux `-lvulkan` leaves a `libvulkan.so.1` dependency the dynamic
@@ -187,7 +195,7 @@ exports `HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader's path: the
 harness canonicalizes it and the image the binding's `vkGetInstanceProcAddr`
 was resolved from, and stops unless they are the same file.
 
-#### Why the loader is copied on macOS, and why there is no rpath
+#### Why the loader is copied on macOS, and where an rpath is still needed
 
 Naming a library directory is necessary but not sufficient, and the
 qualification is what found that. `vulkan-utils` runs Template Haskell against
@@ -196,23 +204,81 @@ dylib linked against the vendor SDK's loader records its dependency as
 `@rpath/libvulkan.1.dylib`. `extra-lib-dirs` is a link-time search path and
 contributes no rpath, so the compile-time load fails with
 `Library not loaded: @rpath/libvulkan.1.dylib` even though the link succeeded.
-An rpath cannot be supplied from the command line either, for the reason above:
-`--ghc-options` never reaches a dependency.
 
-So the recipe removes the `@rpath` rather than working around it. The qualified
-loader is copied into `<prefix>/vulkan/lib` and given an **absolute install
-name**, and the copy is re-signed ad hoc because editing a Mach-O invalidates
-its signature. Everything linked against it then records that absolute path, and
-no rpath, no generated project file, and no machine path is involved at any
-stage. `tools/toolchain/qualify-binding.sh` predates this and still emits its
-own `package vulkan` stanza against `MACOS_VULKAN_PREFIX`; that remains the
-qualification's own retained invocation, and the provisioned prefix satisfies
-the same shape — `<prefix>/vulkan/lib` holds the loader and
+For what this project links, the recipe removes the `@rpath` rather than
+working around it. The qualified loader is copied into `<prefix>/vulkan/lib`
+and given an **absolute install name**, and the copy is re-signed ad hoc
+because editing a Mach-O invalidates its signature. The proof and every other
+executable linked through `run-proof.sh`'s `--extra-lib-dirs` record that
+absolute path, with no rpath and no machine path involved.
+
+The binding itself is the exception, because the command line never reaches it
+(above): the store links it with no loader directory, so the linker's default
+search finds the SDK's loader in `/usr/local/lib` and the dylib records
+`@rpath/libvulkan.1.dylib` — which nothing can then resolve at compile time.
+VK-9's shader splices are the first Template Haskell here to load the binding,
+through `vulkan-utils`, and they found it. The owner chose on 2026-09-24 to name
+the binding's directory in `cabal.project.vulkan`, under `if os(darwin)`:
+
+```cabal
+if os(darwin)
+  package vulkan
+    extra-lib-dirs: /usr/local/lib
+    extra-include-dirs: /usr/local/include
+    ghc-options: -optl-Wl,-rpath,/usr/local/lib
+```
+
+That is the configuration `tools/toolchain/qualify-binding.sh` qualified, and
+the directory `MACOS_LOADER` and `MACOS_INCLUDE` in `tools/native/vulkan.pin`
+pin; `tools/test/VulkanProof.hs` holds the stanza to the pin, and
+`native.py prepare` verifies the loader there by digest before every build. It
+changes only the binding's own build: executables still link the prefix's copy,
+which `run-proof.sh` names on the command line, and the proof still refuses any
+loader image but the recorded one. Linux is untouched.
+
+`tools/toolchain/qualify-binding.sh` still emits its own `package vulkan` stanza
+against `MACOS_VULKAN_PREFIX`; that remains the qualification's own retained
+invocation, and the provisioned prefix satisfies the same shape —
+`<prefix>/vulkan/lib` holds the loader and
 `<prefix>/vulkan/lib/pkgconfig/vulkan.pc` describes it — so
 `HETOIMASIA_VULKAN_PREFIX` may be pointed at it.
 
 The `darwin-lib-dirs` default hid the whole problem by hard-coding a path that
 happened to hold a loader.
+
+### The shader compiler
+
+The Vulkan pin names one GLSL compiler per platform — glslang 15.0.0 on macOS,
+15.1.0 on Linux — and VK-4 provisions it behind a wrapper,
+`<prefix>/vulkan/bin/glslangValidator`, that runs it by absolute path.
+`native.py prepare` exports the wrapper as `HETOIMASIA_GLSLANG`. Shaders are
+compiled by VK-9's Template Haskell adapter while the native backend package
+builds (D-11, P-9), and the toolchain rules that make that reproducible are:
+
+- **The compiler is only ever the wrapper.** A splice runs the wrapper named by
+  the package's toolchain fingerprint, never a `glslangValidator` found on
+  `PATH`, and gives it a `PATH` of its own choosing: the wrapper's directory
+  ahead of `/usr/bin:/bin`. A missing wrapper, or one whose bytes, identity or
+  compiler differ from what the native manifest records, is refused with a
+  diagnosis naming the wrapper and the manifest identity it was held to.
+- **The compile configuration is explicit.** Every compile passes
+  `-V --target-env vulkan1.3`, declared once in the adapter.
+- **The toolchain is a rebuild input.** `hetoimasia-shader-fingerprint`, the
+  package's own executable, runs before every build: it checks the wrapper
+  against the native manifest and writes
+  `packages/gpu-vulkan/native/shaders/toolchain.fingerprint` — the target, the
+  flags, the wrapper and compiler by path, version and SHA-256, and the native
+  manifest by path and identity — only when it differs. Every splice registers
+  that file, its source file and every include the compiler resolved, and the
+  package lists them as source files so Cabal asks GHC to look at all. A
+  changed toolchain therefore recompiles exactly the modules that splice
+  shaders, and an unchanged one recompiles nothing, without relying on GHC to
+  notice a changed executable.
+
+`tools/vulkan-proof/run-shaders.sh` performs those steps and runs the shader
+suite; `run-proof.sh` runs it first. The adapter's contract, and what it
+refuses, is in
+[the native package's README](../packages/gpu-vulkan/native/README.md#shaders).
 
 ## Running the qualification
 

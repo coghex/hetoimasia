@@ -90,6 +90,7 @@ readByTheseExamples =
   , "tools/toolchain/binding.pin"
   , "tools/validation/catalog.json"
   , "tools/vulkan-proof/run-proof.sh"
+  , "tools/vulkan-proof/run-shaders.sh"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
   , glfwPackage </> "hetoimasia-glfw.cabal"
   , compatibilityRecord
@@ -123,8 +124,9 @@ interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
 -- | Everything the Vulkan project names: the proof, the native package, the
--- GLFW package whose interop component it enables, and the local dependency
--- closure of the native package and that component. All but the first two are
+-- GLFW package whose interop component it enables, the local dependency
+-- closure of the native package and that component, and the test-only support
+-- library the native package's shader suite uses. All but the first two are
 -- ordinary packages the other projects list too, and with the interop flag
 -- off none of them depends on the binding.
 vulkanProject ∷ [String]
@@ -136,6 +138,7 @@ vulkanProject =
   , "packages/gpu-vulkan/model"
   , "packages/runtime"
   , "packages/foundation"
+  , "tools/test-support"
   ]
 
 -- | The Hackage package that is the Vulkan binding. Nothing the mandatory floor
@@ -176,6 +179,48 @@ spec = describe "The Vulkan proof boundary" $ do
     -- as a quoted root.
     runner ← readFile "tools/vulkan-proof/run-proof.sh"
     [package | package ← vulkanProject, not (("\"" <> package <> "\"") `isInfixOf` runner)] `shouldBe` []
+
+  it "names the binding's macOS loader directory exactly where the pin puts the loader, and on macOS alone" $ do
+    -- `vulkan-utils` and every shader splice run Template Haskell against the
+    -- compiled binding, and on macOS its dylib records the loader as
+    -- `@rpath/libvulkan.1.dylib`. Command-line directories never reach the
+    -- binding the store builds, so the project names them; a directory that
+    -- drifted from the pin would load some other loader at compile time.
+    project ← map trim . lines <$> readFile "cabal.project.vulkan"
+    pin ← readFile "tools/native/vulkan.pin"
+    let stanza = takeWhile (not . null) (dropWhile (/= "if os(darwin)") project)
+        libdir = directoryOf . trim <$> settingOf pin "MACOS_LOADER="
+        include = trim <$> settingOf pin "MACOS_INCLUDE="
+    take 2 stanza `shouldBe` ["if os(darwin)", "package vulkan"]
+    libdir `shouldSatisfy` (/= Nothing)
+    include `shouldSatisfy` (/= Nothing)
+    forM_ ((,) <$> libdir <*> include) $ \(directory, headers) →
+      drop 2 stanza
+        `shouldBe` [ "extra-lib-dirs: " <> directory
+                   , "extra-include-dirs: " <> headers
+                   , "ghc-options: -optl-Wl,-rpath," <> directory
+                   ]
+    -- Once, and under the condition: an unconditional stanza would change the
+    -- Linux binding, which finds its loader through the prefix's `vulkan.pc`.
+    length (filter (== "package vulkan") project) `shouldBe` 1
+
+  it "runs the shader contract suite on the proof route, from the provisioned prefix" $ do
+    -- VK-9's suite is required to run on the proof route until VK-8's headless
+    -- group exists, and building its executable is not running it. It also has
+    -- to regenerate the toolchain fingerprint before Cabal decides anything is
+    -- up to date, or a replaced compiler would go unnoticed on a warm build.
+    proof ← map trim . lines <$> readFile "tools/vulkan-proof/run-proof.sh"
+    shaders ← map trim . lines <$> readFile "tools/vulkan-proof/run-shaders.sh"
+    let active = filter (not . ("#" `isPrefixOf`))
+        runsShaders = position' ("run-shaders.sh\"" `isInfixOf`) (active proof)
+        harness = position' ("exec cabal test" `isPrefixOf`) (active proof)
+    -- Both present, and the suite before the harness `exec`s away the shell.
+    (<) <$> runsShaders <*> harness `shouldBe` Just True
+    active shaders `shouldSatisfy` any ("native.py\" prepare --prefix" `isInfixOf`)
+    let fingerprint = position' ("hetoimasia-shader-fingerprint" `isInfixOf`) (active shaders)
+        suite = position' ("hetoimasia-gpu-vulkan-native:shader-tests" `isInfixOf`) (active shaders)
+    (<) <$> fingerprint <*> suite `shouldBe` Just True
+    [line | line ← active shaders, "HETOIMASIA_NATIVE_SESSION=" `isInfixOf` line] `shouldBe` []
 
   it "shares the qualified index with every other project" $ do
     text ← readFile "cabal.project.vulkan"
@@ -696,6 +741,14 @@ firstJust ∷ [Maybe a] → Maybe a
 firstJust values = case [value | Just value ← values] of
   (value : _) → Just value
   [] → Nothing
+
+-- | Where the first line satisfying a predicate is.
+position' ∷ (String → Bool) → [String] → Maybe Int
+position' predicate lines' = lookup True (zip (map predicate lines') [0 ∷ Int ..])
+
+-- | A path's directory, without depending on how the pin spells a file name.
+directoryOf ∷ FilePath → FilePath
+directoryOf = reverse . drop 1 . dropWhile (/= '/') . reverse
 
 -- | The first line beginning with a prefix, with that prefix removed. Serves
 -- both a shell-style @NAME=@ pin and a record's @- label:@ bullet, so the two

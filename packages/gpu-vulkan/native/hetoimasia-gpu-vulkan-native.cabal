@@ -7,7 +7,9 @@ description:
     currently holds VK-6's native integration: the debug-utils messengers that
     deliver validation diagnostics into a diagnostics-package lifetime through a
     C-only callback, and the record of this package's own FFI configuration.
-    VK-7 extends it with instance, device and target ownership.
+    It also holds VK-9's shader adapter: GLSL compiled during the build by the
+    pinned compiler, embedded as SPIR-V, with the compiler's identity a rebuild
+    input. VK-7 extends it with instance, device and target ownership.
     .
     It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
     nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a loader.
@@ -19,8 +21,23 @@ category: Game
 build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
+-- Every file a shader splice reads is a source file, because Cabal decides
+-- whether to run GHC at all from the files a package lists and never from
+-- the ones a splice registers: a changed shader, include or fingerprint that
+-- is not listed here leaves the build "Up to date".
+--
+-- `**/*.fingerprint` covers `shaders/toolchain.fingerprint`, which
+-- `hetoimasia-shader-fingerprint` generates before every build and Git
+-- ignores. A glob that matches nothing makes `cabal sdist` fail, so the
+-- tracked test fixture `test/fixtures/foreign.fingerprint` keeps it
+-- non-empty in a tree that has not generated one. A distribution made from a
+-- tree that has carries that tree's fingerprint; it is never trusted there,
+-- because the generator rewrites it and every splice checks it.
 extra-source-files:
     cbits/hetoimasia_vulkan_native.h
+    **/*.fingerprint
+    test/shaders/*.frag
+    test/shaders/**/*.glsl
 
 source-repository head
     type: git
@@ -34,6 +51,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
+        Hetoimasia.GPU.Vulkan.Native.Shader
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
     -- from the provisioned Vulkan prefix `tools/vulkan-proof/run-proof.sh`
@@ -43,8 +61,78 @@ library
     cc-options: -std=c11 -Wall -Wextra -Werror
     build-depends:
         base >=4.22 && <4.23,
+        directory >=1.3 && <1.4,
+        template-haskell >=2.24 && <2.25,
         text >=2.1 && <2.2,
         vulkan >=3.27 && <3.28,
+        vulkan-utils ==0.5.11.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
-        hetoimasia-gpu-vulkan-model ==0.1.0.0
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native:shader-toolchain
+
+-- The compile configuration, the fingerprint, the checks that decide whether
+-- the toolchain is trusted, and the compile itself. It depends on neither the
+-- binding nor Template Haskell, so the fingerprint generator below builds
+-- without a loader and the runtime compile entry is ordinary IO.
+library shader-toolchain
+    visibility: private
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: shader-toolchain
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain
+    other-modules:
+        Hetoimasia.GPU.Vulkan.Native.Shader.Json
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        cryptohash-sha256 >=0.11.102 && <0.12,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        process >=1.6 && <1.7,
+        temporary >=1.3 && <1.4,
+        transformers >=0.6 && <0.7
+
+-- Run before every build that splices shaders: it validates the wrapper and
+-- the native manifest and rewrites the fingerprint only when it changed.
+-- `tools/vulkan-proof/run-shaders.sh` runs it; see README.md.
+executable hetoimasia-shader-fingerprint
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: fingerprint
+    main-is: Main.hs
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-gpu-vulkan-native:shader-toolchain
+
+-- VK-9's shader contract. It needs the provisioned compiler, because its
+-- verification pair is compiled while it is built, and nothing else native:
+-- it creates no Vulkan object, opens no window and reads no consent.
+test-suite shader-tests
+    type: exitcode-stdio-1.0
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options:
+        -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+        -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Shader.Constants
+        Test.Shader.Fragment
+        Test.Shader.Spec
+        Test.Shader.Vertex
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        cryptohash-sha256 >=0.11.102 && <0.12,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        temporary >=1.3 && <1.4,
+        hetoimasia-gpu-vulkan-native,
+        hetoimasia-gpu-vulkan-native:shader-toolchain,
+        hetoimasia-test-support ==0.1.0.0
