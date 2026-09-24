@@ -15,7 +15,7 @@ module Test.GPU.Vulkan.GLFW.Controller (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
 import Control.Monad (forM_, replicateM_, void)
 import Data.List (isSubsequenceOf, nub)
@@ -31,6 +31,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetReje
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..))
 import Hetoimasia.Runtime.GLFW
   ( CloseStart (..)
+  , EventAdmission (..)
   , GraphicsService
   , OwnerStatus (..)
   , ReleaseAnswer (..)
@@ -85,6 +86,10 @@ spec = describe "Vulkan controller" $ do
     it "during the handoff's surface creation leaves the attachment announced and the instance retained until the owner settles it" (bounded testCancelledHandoff)
     it "delivered repeatedly during the exit changes neither the destruction order nor the join" (bounded testRepeatedCancellation)
 
+  describe "a full owner port" $ do
+    it "leaves a deferred attachment the owner destroys on its own thread once it is released" (bounded testDeferredReleased)
+    it "lets a deferred attachment be announced again and admitted" (bounded testDeferredAnnounced)
+
   describe "close and exit" $ do
     it "closing the first-created window retires its target alone, leaving the shared roots and the second target live" (bounded testCloseFirst)
     it "releasing one target destroys its surface before its terminal record, with the owner and the other target live" (bounded testRelease)
@@ -97,7 +102,7 @@ spec = describe "Vulkan controller" $ do
     it "treats an unknown outcome as neither device loss nor destruction" (bounded testUnknownOutcome)
 
   describe "progress" $
-    it "reports no work and no deadline, since nothing is recorded or submitted" (bounded testNoDemand)
+    it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
 
 -- ---------------------------------------------------------------------------
 -- Handing targets over
@@ -383,6 +388,71 @@ testRepeatedCancellation = do
                , WindowGone True
                , SessionEnded
                ]
+
+-- ---------------------------------------------------------------------------
+-- A full owner port
+
+-- | Three windows, an owner port of one event, and the owner held inside the
+-- first window's construction: the second window's announcement fills the
+-- port, and the third's is refused. Answers the third's service, with the
+-- gate that releases the owner.
+deferredThird ∷ Rig → VulkanHost Scene → IO (GraphicsService, TVar Bool, [GraphicsService])
+deferredThird rig host = do
+  gate ← newTVarIO False
+  scriptNative rig AtQueryDevices (HoldsUntil gate)
+  [first, second, third] ← windowsOf host
+  one ← handedOver host first RequiredTarget
+  -- The owner has taken the first announcement and is inside its
+  -- construction, so the port is empty and stays so until it is released.
+  atomically (custodyOf (vulkanGraphicsOwner host) (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+  two ← handedOver host second RequiredTarget
+  deferred ←
+    handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) third RequiredTarget >>= \case
+      VulkanAnnouncementDeferred service → pure service
+      other → failWith ("the third window was not deferred: " <> show other)
+  pure (deferred, gate, [one, two])
+
+testDeferredReleased ∷ IO ()
+testDeferredReleased = do
+  base ← newRigOf 3
+  let rig = base {rigPortCapacity = Just 1}
+  (slot, destroyedWhileRunning) ← runRig rig $ \host control → do
+    (deferred, gate, _) ← deferredThird rig host
+    flip finally (atomically (writeTVar gate True)) $ do
+      _ ← releaseGraphicsTarget (vulkanWindowHost host) (vulkanGraphicsOwner host) deferred
+      atomically (writeTVar gate True)
+      -- The owner, not the exit, destroys it: nothing else ever told the owner
+      -- about this attachment.
+      pumpUntil host control "the deferred surface's destruction" (elem (SurfaceDestroyed 102) <$> journal rig)
+      pumpUntil host control "the deferred attachment's retirement" $
+        (== SlotFree) . observedSlot <$> atomically (readGraphicsService deferred)
+      roots ← atomically (readVulkanRoots (vulkanController host))
+      events ← journal rig
+      pure (SlotFree, (viewInstance roots, takeWhile (/= DeviceDestroyed) events))
+  slot `shouldBe` SlotFree
+  fst destroyedWhileRunning `shouldBe` RootLive
+  snd destroyedWhileRunning `shouldSatisfy` elem (SurfaceDestroyed 102)
+  owner ← threadsOf rig (== InstanceCreated)
+  destroyer ← threadsOf rig (== SurfaceDestroyed 102)
+  destroyer `shouldBe` owner
+
+testDeferredAnnounced ∷ IO ()
+testDeferredAnnounced = do
+  base ← newRigOf 3
+  let rig = base {rigPortCapacity = Just 1}
+  (standing, earlyDestruction) ← runRig rig $ \host _ → do
+    (deferred, gate, earlier) ← deferredThird rig host
+    atomically (writeTVar gate True)
+    mapM_ (awaitStanding host) earlier
+    admitted ← announceVulkanTarget (vulkanController host) (vulkanGraphicsOwner host) deferred
+    case admitted of
+      EventAdmitted → pure ()
+      other → failWith ("the deferred window was not announced: " <> show other)
+    standing ← awaitStanding host deferred
+    events ← journal rig
+    pure (standing, SurfaceDestroyed 102 `elem` events)
+  standing `shouldBe` TargetUsable
+  earlyDestruction `shouldBe` False
 
 -- ---------------------------------------------------------------------------
 -- Close and exit

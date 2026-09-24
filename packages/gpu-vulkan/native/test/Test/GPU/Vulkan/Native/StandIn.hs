@@ -25,6 +25,8 @@ module Test.GPU.Vulkan.Native.StandIn
     -- * Surfaces
   , surfaceNumbered
   , surfaceFailing
+  , surfaceThrowing
+  , surfaceWaiting
   , unsupportedSurface
 
     -- * Roots over it
@@ -227,6 +229,22 @@ surfaceFailing standIn handle =
   TargetSurface handle $ do
     record standIn (DestroyedSurface handle)
     either SurfaceDestructionUncertain (\() → SurfaceDestroyed) <$> tryWithContext (throwIO (StandInFailure AtDestroyDevice))
+
+-- | A surface whose destruction the stand-in records and which then raises
+-- outright, rather than answering that it was uncertain.
+surfaceThrowing ∷ StandIn → Word64 → TargetSurface
+surfaceThrowing standIn handle =
+  TargetSurface handle (record standIn (DestroyedSurface handle) >> throwIO (StandInFailure AtDestroyDevice))
+
+-- | A surface whose destruction the stand-in records and which then waits,
+-- interruptibly, until the variable is true — so a cancellation can end it
+-- part-way, leaving its outcome unknown.
+surfaceWaiting ∷ StandIn → Word64 → TVar Bool → TargetSurface
+surfaceWaiting standIn handle gate =
+  TargetSurface handle $ do
+    record standIn (DestroyedSurface handle)
+    atomically (readTVar gate >>= check)
+    pure SurfaceDestroyed
 
 type StandInRoots = Roots () Int Int Text Int
 

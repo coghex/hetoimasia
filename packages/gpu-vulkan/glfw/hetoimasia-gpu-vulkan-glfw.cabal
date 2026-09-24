@@ -66,6 +66,7 @@ library
         base >=4.22 && <4.23,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,

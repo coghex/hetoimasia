@@ -75,6 +75,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
     -- * Handing targets over
   , VulkanHandover (..)
   , handOverVulkanTarget
+  , announceVulkanTarget
 
     -- * Observation
   , VulkanRejection (..)
@@ -112,7 +113,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (unless, void, when)
+import Control.Monad (forM, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
@@ -130,7 +131,17 @@ import Numeric (showHex)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.Resource (Scoped)
-import Hetoimasia.Foundation.Time (MonotonicSource)
+import Hetoimasia.Foundation.Time
+  ( Duration
+  , DurationRequirement (RequirePositive)
+  , MonotonicSource
+  , SecondsConversion (convertedDuration)
+  , addDuration
+  , durationFromNanoseconds
+  , durationFromSeconds
+  , minimumPositiveDuration
+  , readInstant
+  )
 import Hetoimasia.GLFW.Session (Session, SessionConfig)
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Model (GpuModel)
@@ -186,7 +197,9 @@ import Hetoimasia.Runtime.GLFW
   , OwnerRetire (..)
   , OwnerRetired
   , RolledBack
-  , Stage (CustodyRegistered)
+  , SlotState (SlotAttached)
+  , StepReport (..)
+  , Stage (CustodyRegistered, CustodySettling)
   , TargetHandoff (..)
   , TargetRetire (..)
   , TargetRetired
@@ -198,10 +211,12 @@ import Hetoimasia.Runtime.GLFW
   , graphicsOwnerConfig
   , graphicsTargetProtocol
   , noStepWork
+  , observedSlot
   , ownerDestroyed
   , ownerHandoff
   , ownerReady
   , ownerRetired
+  , readGraphicsService
   , rollbackEvidence
   , targetEventsOpen
   , targetEvidence
@@ -234,6 +249,21 @@ data State inst msgr phys dev lease obligation = State
   , stateTargets ∷ !(TVar (Map AttachmentId TargetId))
     -- ^ The owner thread's alone: which roots target each attachment is.
   , stateRejections ∷ !(TVar (Map AttachmentId VulkanRejection))
+  , stateUnannounced ∷ !(TVar (Map AttachmentId Unannounced))
+    -- ^ Attachments whose surface was created and deposited but whose
+    -- announcement the owner's full port refused. Written by the main
+    -- thread's handover; the owner's step settles each once its slot has
+    -- begun retiring.
+  , stateClock ∷ !MonotonicSource
+  , statePoll ∷ !Duration
+    -- ^ How soon the owner looks at them again, while any exist.
+  }
+
+-- | An attachment the owner was never told about, and how to tell whether it
+-- still has not been: its custody stage, as the owner's ledger holds it.
+data Unannounced = Unannounced
+  { unannouncedService ∷ !GraphicsService
+  , unannouncedStage ∷ STM (Maybe Stage)
   }
 
 data Lease lease
@@ -248,8 +278,9 @@ data Deposit obligation = Deposit !TargetClass !(Created obligation)
 -- | A controller over a native layer and a surface bridge.
 --
 -- The layers are the ones the instance is asked to enable, each of which the
--- loader must offer. The clock is the one the roots' model reads, which must
--- be the host's.
+-- loader must offer. The clock is the one the roots' model and the owner's
+-- deadlines read, which must be the host's; the period is how soon the owner
+-- looks again at an attachment whose announcement its port refused.
 newVulkanController
   ∷ RootOps Quiesced inst msgr phys dev
   → (inst → Ptr ())
@@ -257,8 +288,9 @@ newVulkanController
   → [ByteString]
   → Budgets
   → MonotonicSource
+  → Duration
   → IO VulkanController
-newVulkanController ops pointer bridge layers budgets clock = do
+newVulkanController ops pointer bridge layers budgets clock poll = do
   roots ← newRoots ops budgets clock
   fmap VulkanController $
     State roots pointer bridge layers
@@ -267,6 +299,9 @@ newVulkanController ops pointer bridge layers budgets clock = do
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
+      <*> newTVarIO Map.empty
+      <*> pure clock
+      <*> pure poll
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -326,20 +361,73 @@ readReadiness (VulkanController state) =
 
 -- | The operations the graphics owner runs, on its own thread.
 --
--- The progress step raises a latched device loss and otherwise reports no
--- work and no demand: this slice records and submits nothing.
+-- The progress step raises a latched device loss, and otherwise does one
+-- piece of housekeeping and no rendering work: it destroys the surface of any
+-- attachment whose announcement the port refused and whose slot has since
+-- begun retiring. It asks for a round only while such attachments exist, and
+-- otherwise names no deadline: this slice records and submits nothing.
 controllerOperations ∷ VulkanController → GraphicsOperations scene
 controllerOperations (VulkanController state) =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
-    , graphicsStep = \_ → noStepWork <$ checkRoots (stateRoots state)
-    , graphicsNextDeadline = pure NoOwnerDemand
+    , graphicsStep = \_ → do
+        checkRoots (stateRoots state)
+        settled ← settleUnannounced state
+        pure (if settled then noStepWork {stepAdvanced = True} else noStepWork)
+    , graphicsNextDeadline = unannouncedDeadline state
     , graphicsRetireTarget = retireTarget state
     , graphicsRetireOwner = retireOwner state
     , graphicsDestroyOwner = \_ → destroyOwner state
     }
 
+
+-- | Destroy, on the owner's thread, the surface of every attachment the owner
+-- was never told about whose slot has begun retiring — released, or its window
+-- closing — and forget it. An attachment still attached may yet be announced,
+-- and one whose announcement was admitted is the owner's ordinary target, so
+-- neither is touched. Each is settled once: a destruction that was uncertain
+-- stays on the lease, retaining the instance, and is not offered again.
+settleUnannounced ∷ State inst msgr phys dev lease obligation → IO Bool
+settleUnannounced state = do
+  entries ← Map.toList <$> readTVarIO (stateUnannounced state)
+  settled ← forM entries $ \(attachment, entry) → do
+    ready ← atomically $ do
+      observation ← readGraphicsService (unannouncedService entry)
+      stage ← unannouncedStage entry
+      let retiring = observedSlot observation /= SlotAttached
+          announced = stage `notElem` [Nothing, Just CustodyRegistered, Just CustodySettling]
+      pure (if announced then Just False else if retiring then Just True else Nothing)
+    case ready of
+      Nothing → pure False
+      -- Announced after all: it is the owner's ordinary target now.
+      Just False → False <$ atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
+      Just True → mask_ $ do
+        deposit ← atomically (stateTVar (stateDeposits state) (\held → (Map.lookup attachment held, Map.delete attachment held)))
+        listed ← readTVarIO (stateLease state) >>= \case
+          LeaseReady lease → atomically (obligationsOf bridge lease attachment)
+          _ → pure []
+        let deposited = case deposit of
+              Just (Deposit _ (CreatedLive obligation)) → [obligation]
+              Just (Deposit _ (CreatedUnusable obligation _)) → [obligation]
+              _ → []
+        mapM_ (bridgeDischarge bridge) (nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed))
+        atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
+        pure True
+  pure (or settled)
+  where
+    bridge = stateBridge state
+
+-- | A round soon, while an unannounced attachment is being watched; otherwise
+-- none.
+unannouncedDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+unannouncedDeadline state = do
+  watching ← not . Map.null <$> readTVarIO (stateUnannounced state)
+  if not watching
+    then pure NoOwnerDemand
+    else do
+      now ← readInstant (stateClock state)
+      pure (either (const NoOwnerDemand) OwnerDeadline (addDuration now (statePoll state)))
 
 startOwner ∷ State inst msgr phys dev lease obligation → IO OwnerReady
 startOwner state = do
@@ -472,7 +560,9 @@ retireOwner state retiring = do
       when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
       pure (length orphans)
     _ → pure 0
-  atomically (writeTVar (stateDeposits state) Map.empty)
+  atomically $ do
+    writeTVar (stateDeposits state) Map.empty
+    writeTVar (stateUnannounced state) Map.empty
   device ← retireRoots (stateRoots state)
   pure . ownerRetired $
     (if orphaned > 0 then "destroyed " <> plural orphaned "surface" <> " no target held; " else "") <> device
@@ -528,8 +618,10 @@ data VulkanHandover
     -- when it was rolled back.
   | VulkanAnnouncementDeferred !GraphicsService
     -- ^ Attached, with its surface deposited, but the owner's bounded port was
-    -- full. It is backpressure: announce it again with
-    -- 'Hetoimasia.Runtime.GLFW.announceGraphicsTarget', or release it.
+    -- full. It is backpressure: announce it again with 'announceVulkanTarget',
+    -- or release it. Until it is announced the owner watches it, and if it is
+    -- released or its window closes first, the owner destroys its surface on
+    -- its own thread so its retirement can finish.
   | VulkanRootsNotReady !Readiness
     -- ^ The owner has not leased an instance to the bridge, so nothing was
     -- attached.
@@ -617,13 +709,29 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
     announce service =
       announceGraphicsTarget owner service >>= \case
         EventAdmitted → pure (VulkanTargetHandedOver service)
-        EventRefusedFull → pure (VulkanAnnouncementDeferred service)
+        EventRefusedFull → do
+          atomically $
+            modifyTVar' (stateUnannounced state) $
+              Map.insert (graphicsAttachment service) (Unannounced service (custodyOf owner (graphicsAttachment service)))
+          pure (VulkanAnnouncementDeferred service)
         EventPortClosed → pure (VulkanOwnerClosed (Just service))
     recover = do
       found ← atomically (windowGraphicsService host window)
       for_ found $ \service → do
         stage ← atomically (custodyOf owner (graphicsAttachment service))
         when (stage == Just CustodyRegistered) (void (announceGraphicsTarget owner service))
+
+-- | Announce an attachment whose handover answered
+-- 'VulkanAnnouncementDeferred' again, now that the owner's port may have room.
+-- Once admitted, the owner constructs it as any other target; until then the
+-- owner keeps watching it, and destroys its surface itself if it is released
+-- or its window closes first.
+announceVulkanTarget ∷ VulkanController → GraphicsOwner scene → GraphicsService → IO EventAdmission
+announceVulkanTarget (VulkanController state) owner service = do
+  admitted ← announceGraphicsTarget owner service
+  when (admitted == EventAdmitted) $
+    atomically (modifyTVar' (stateUnannounced state) (Map.delete (graphicsAttachment service)))
+  pure admitted
 
 type ExceptionWithContextSome = ExceptionWithContext SomeException
 
@@ -794,6 +902,7 @@ withVulkanOwnerHostOver logger layer pointer bridge enter extensions config use 
         (vulkanLayers config)
         (vulkanBudgets config)
         (hostClock host)
+        (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)
@@ -819,6 +928,12 @@ withVulkanOwnerHostOver logger layer pointer bridge enter extensions config use 
         pure (result, quiesced)
   where
     host = vulkanHost config
+
+-- | The period the owner watches an unannounced attachment at when the host's
+-- idle bound cannot be converted, which a validated host configuration rules
+-- out.
+fallbackPoll ∷ Duration
+fallbackPoll = either (const minimumPositiveDuration) id (durationFromNanoseconds RequirePositive 10000000)
 
 -- ---------------------------------------------------------------------------
 -- Descriptions

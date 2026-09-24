@@ -9,7 +9,7 @@ module Test.GPU.Vulkan.Native.Roots (spec) where
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
-import Control.Exception (Exception, SomeException, fromException, try)
+import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
 import Control.Monad (void)
 import Data.Either (isRight)
 import Data.Maybe (isJust)
@@ -184,6 +184,32 @@ spec = describe "Roots" $ do
       times standIn DestroyedInstance `shouldReturn` 0
       targets ← atomically (readRootTargets roots)
       map targetViewUncertain targets `shouldSatisfy` all isJust
+
+    it "records a surface destruction that raised outright as uncertain, and never runs it again" $ do
+      (standIn, roots) ← started
+      target ← admitted roots RequiredTarget (surfaceThrowing standIn 10)
+      raised @SurfaceDestructionFailed (retireRootTarget roots target) `shouldReturn` True
+      raised @SurfaceDestructionFailed (retireRootTarget roots target) `shouldReturn` True
+      surfacesDestroyed standIn `shouldReturn` [10]
+      targets ← atomically (readRootTargets roots)
+      map targetViewUncertain targets `shouldSatisfy` all isJust
+      raised @RootsRetained (retireRoots roots) `shouldReturn` True
+
+    it "records a surface destruction a cancellation ended part-way as uncertain, and never runs it again" $ do
+      (standIn, roots) ← started
+      gate ← newTVarIO False
+      target ← admitted roots RequiredTarget (surfaceWaiting standIn 10 gate)
+      finished ← newEmptyMVar
+      retiring ← forkIO (try @SomeException (retireRootTarget roots target) >>= putMVar finished)
+      awaitCall standIn (DestroyedSurface 10)
+      killThread retiring
+      outcome ← takeMVar finished
+      outcome `shouldSatisfy` either (isJust . fromException @AsyncException) (const False)
+      targets ← atomically (readRootTargets roots)
+      map targetViewUncertain targets `shouldSatisfy` all isJust
+      atomically (writeTVar gate True)
+      raised @SurfaceDestructionFailed (retireRootTarget roots target) `shouldReturn` True
+      surfacesDestroyed standIn `shouldReturn` [10]
 
     it "retains the messenger and the instance behind a device whose destruction failed, and never retries it" $ do
       (standIn, roots) ← started

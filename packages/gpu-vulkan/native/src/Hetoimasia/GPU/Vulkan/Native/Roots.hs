@@ -468,33 +468,46 @@ admitRootTarget roots classification surface = do
 
 -- | Destroy one target's surface and forget the target.
 --
--- The destroy action runs once. If it raised, the record stays, marked
--- uncertain, and 'SurfaceDestructionFailed' is raised; asking again raises the
--- same without running it, because an action that failed once may have
--- destroyed part of what it owned. Only a destruction that returned removes the
--- record, and with it the model's target.
+-- The destroy action runs once. Running it and recording what it did are one
+-- masked step, so no cancellation can land between the two: a destruction
+-- that returned always removes the record, and one that did not — it answered
+-- uncertain, or it raised, synchronously or with a cancellation of its own —
+-- always leaves the record marked uncertain. Only then is
+-- 'SurfaceDestructionFailed' raised, or the cancellation re-raised. Asking
+-- again raises without running the action, because an action that failed
+-- once may have destroyed part of what it owned. Only a destruction that
+-- returned removes the record, and with it the model's target.
 retireRootTarget ∷ Roots q inst msgr phys dev → TargetId → IO ()
 retireRootTarget roots target =
   readTVarIO (rootsTargets roots) >>= \records → case Map.lookup target records of
     Nothing → throwIO (UnknownRootTarget target)
     Just record → case recordUncertain record of
       Just reason → throwIO (SurfaceDestructionFailed target reason)
-      Nothing →
-        mask_ (recordDestroy record) >>= \case
-          SurfaceDestroyed → do
-            now ← readInstant (rootsClock roots)
-            atomically $ do
-              modifyTVar' (rootsTargets roots) (Map.delete target)
-              modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
-                -- The model forgets a retiring target with nothing left at its
-                -- next progress turn, which frees its record for a later one.
-                Admitted closed → fst (runProgressTurn silentEvidence now closed)
-                _ → model
-          SurfaceDestructionUncertain (ExceptionWithContext _ failure) → do
-            let reason = Text.pack (displayException failure)
-            atomically $
-              modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
-            throwIO (SurfaceDestructionFailed target reason)
+      Nothing → do
+        -- Read before the destruction, so nothing that can fail stands
+        -- between a destruction that returned and its record.
+        now ← readInstant (rootsClock roots)
+        mask_ $
+          tryWithContext (recordDestroy record) >>= \case
+            Right SurfaceDestroyed →
+              atomically $ do
+                modifyTVar' (rootsTargets roots) (Map.delete target)
+                modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
+                  -- The model forgets a retiring target with nothing left at
+                  -- its next progress turn, which frees its record for a later
+                  -- one.
+                  Admitted closed → fst (runProgressTurn silentEvidence now closed)
+                  _ → model
+            Right (SurfaceDestructionUncertain failure) → settleUncertain failure
+            Left failure → settleUncertain failure
+  where
+    settleUncertain failure@(ExceptionWithContext _ exception) = do
+      let reason = Text.pack (displayException exception)
+      atomically $
+        modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
+      if isAsynchronous exception
+        then rethrowIO failure
+        else throwIO (SurfaceDestructionFailed target reason)
 
 -- ---------------------------------------------------------------------------
 -- Device loss

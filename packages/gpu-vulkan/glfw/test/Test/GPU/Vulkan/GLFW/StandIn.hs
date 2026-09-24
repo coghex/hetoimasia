@@ -121,6 +121,7 @@ import Hetoimasia.Runtime.GLFW
   ( AttachmentId
   , AttachmentProtocol (..)
   , GraphicsOwner
+  , GraphicsOwnerConfig (..)
   , GraphicsService
   , HostConfig (..)
   , LoopHooks (..)
@@ -447,6 +448,8 @@ data Rig = Rig
   , rigHostConfig ∷ !HostConfig
   , rigOwner ∷ !(TVar (Maybe (GraphicsOwner Scene)))
   , rigVerdict ∷ !(TVar (Maybe DiagnosticVerdict))
+  , rigPortCapacity ∷ !(Maybe Int)
+    -- ^ The owner's lifetime port capacity, when an example narrows it.
   }
 
 -- | A rig over one hidden window.
@@ -505,6 +508,7 @@ newRigWith windows = do
       , rigHostConfig = (defaultHostConfig windows) {hostIdleWait = 0.005}
       , rigOwner = owner
       , rigVerdict = verdict
+      , rigPortCapacity = Nothing
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -534,7 +538,7 @@ runRigHere rig body = do
             (surfaceBridge (rigJournal rig) (rigBridge rig))
             (seamIntegratedSession (rigSeam rig) integration)
             requiredInstanceExtensions
-            config {vulkanOwner = id}
+            config {vulkanOwner = \owner → maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig)}
             (\host → atomically (writeTVar (rigOwner rig) (Just (vulkanGraphicsOwner host))) >> use host)
         atomically (writeTVar (rigVerdict rig) (Just verdict))
         pure result

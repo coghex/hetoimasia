@@ -11,7 +11,8 @@
 -- hands it over with 'handOverVulkanTarget'. See @docs/gpu_backend.md@.
 --
 -- Nothing is recorded, submitted or presented yet: there is no swapchain, and
--- the owner's progress step reports no demand. Those are later slices'.
+-- the owner's progress step reports no render demand. Those are later
+-- slices'.
 module Hetoimasia.GPU.Vulkan.GLFW
   ( -- * The composition
     withVulkanOwnerHost
@@ -23,6 +24,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
 
     -- * Handing targets over
   , handOverVulkanTarget
+  , announceVulkanTarget
   , VulkanHandover (..)
 
     -- * Observation
@@ -46,6 +48,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration, allocLoaderSession, requiredInstanceExtensions)
 import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (vulkanSurfaceBridge)
@@ -95,3 +98,8 @@ withVulkanOwnerHost logger integration =
 handOverVulkanTarget ∷ VulkanHost scene → WindowId → TargetClass → IO VulkanHandover
 handOverVulkanTarget host =
   Controller.handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host)
+
+-- | Announce a handed-over window whose announcement the owner's full port
+-- deferred, now that it may have room.
+announceVulkanTarget ∷ VulkanHost scene → GraphicsService → IO EventAdmission
+announceVulkanTarget host = Controller.announceVulkanTarget (vulkanController host) (vulkanGraphicsOwner host)

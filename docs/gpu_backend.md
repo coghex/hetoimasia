@@ -10,7 +10,9 @@ P-8 and P-14 as far as this slice reaches.
 
 Nothing is recorded, submitted or presented yet: there is no swapchain, no
 command buffer and no queue submission, and the owner's progress step reports
-no work and no deadline. Those are VK-10 through VK-13's. Acting on a target
+no rendering work and no render demand — its only deadline is the brief
+self-scheduled watch over an attachment whose announcement a full port
+deferred, described below. Those are VK-10 through VK-13's. Acting on a target
 policy's exhaustion is VK-14's, and completing device-loss teardown across
 submitted work is VK-15's.
 
@@ -156,9 +158,21 @@ is published and announced, so the caller loses the answer rather than the
 target. A synchronous failure is the construction's own. The handover then
 announces the attachment to the owner through its bounded port:
 `VulkanTargetHandedOver` when the port took it, `VulkanAnnouncementDeferred`
-when the port was full (the attachment stays; announce it again or release
-it), and `VulkanOwnerClosed` once the owner's admission has ended.
-`VulkanRootsNotReady` attaches nothing.
+when the port was full, and `VulkanOwnerClosed` once the owner's admission has
+ended. `VulkanRootsNotReady` attaches nothing.
+
+A deferred attachment stays attached, with its surface deposited. The caller
+may announce it again with `announceVulkanTarget`, after which the owner
+constructs it as any other target, or release it. Until it is announced the
+owner watches it: while any deferred attachment exists, the owner names its
+own next deadline one host idle bound ahead, so it takes rounds without being
+woken, and its progress step destroys — on its own thread — the surface of any
+deferred attachment whose slot has begun retiring, because it was released or
+its window closed. That destruction is what lets the attachment's retirement
+finish while the session runs; nothing else would ever tell the owner about
+it. An attachment that is still attached may yet be announced, and one whose
+announcement was admitted is the owner's ordinary target, so neither is
+touched.
 
 The owner's construction takes the deposit:
 
@@ -201,9 +215,13 @@ attachment, with its model identity, designation and surface.
 
 Each step is refused rather than reordered when something that must go first
 has not verifiably gone. A destruction that raised is uncertain: it is recorded,
-never attempted again, and it retains every parent above it —
-`SurfaceDestructionFailed`, `RootDestructionFailed` and `RootsRetained` name
-which. The owner then produces no evidence for what is retained, so the host
+never attempted again, and it retains every parent above it. Running a
+destruction and recording what it did are one masked step, so a destruction
+that returned always removes its record and one that raised — synchronously or
+with a cancellation of its own — always leaves it marked uncertain; a
+cancellation is re-raised only after that record exists. The failures are
+`SurfaceDestructionFailed`, `RootDestructionFailed` and `RootsRetained`, which
+name what was retained. The owner then produces no evidence for what is retained, so the host
 keeps the window, the session and every parent, as VK-18's contract requires;
 only independent evidence ends that wait. The instance is destroyed only once
 the surface bridge's lease is releasable. No timeout, cancellation or cleanup
@@ -238,6 +256,7 @@ retains its parents.
 | Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
 | Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
 | Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
+| Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 
 ## Evidence
 
@@ -250,13 +269,16 @@ examples:
   creation's handoff, targets keyed by model identity with their designations,
   the incompatible-target rejection with no second device, the bootstrap
   target owning nothing, the full destruction order, every refused step behind
-  an uncertain destruction without a retry, and device loss closing admission
+  an uncertain destruction without a retry — including a destruction that
+  raised outright and one a cancellation ended part-way — and device loss closing admission
   with the model failed while an unknown outcome is neither loss nor success;
 - `hetoimasia-gpu-vulkan-glfw:integration-tests` — whole graphics hosts over the
   GLFW package's scripted seam, driven through the real owner machinery and
   controller with a stand-in native layer and surface bridge, journalling every
   native call with its thread: thread placement, the shared device, readiness,
-  incompatible, unusable and failed surfaces, rollback at every startup and
+  incompatible, unusable and failed surfaces, a full owner port — a deferred
+  attachment released and its surface destroyed by the owner while the host
+  runs, and one announced again and admitted — rollback at every startup and
   bootstrap step, a cancellation during the handoff's surface creation,
   repeated cancellation during the exit, a first window's close, an individual
   release, the exit order with the owner joined before any window goes, a
