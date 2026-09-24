@@ -162,6 +162,8 @@ refused while a competing `glslangValidator` first on `PATH` never runs; and
 that the source distribution builds, from two extraction directories, to the
 same embedded bytes. Its retained transcript is
 [docs/vulkan/shader-rebuilds-macos.md](../../../docs/vulkan/shader-rebuilds-macos.md).
+The Linux proof route's run of the suite, with the compiler identity it named,
+is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.md).
 
 [`docs/vulkan_diagnostics.md`](../../../docs/vulkan_diagnostics.md) is the
 contract in prose.
