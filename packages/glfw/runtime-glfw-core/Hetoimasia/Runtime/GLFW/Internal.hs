@@ -632,6 +632,14 @@ data HostHooks = HostHooks
     -- is the only way to observe that window, and an example may only look
     -- from it: anything that blocks here would /create/ the interruption
     -- point the mask exists to keep out.
+  , afterDestructionSnapshot ∷ IO ()
+    -- ^ Runs on the protected exit's main thread, on every turn of the wait
+    -- for the graphics owner's destruction: after that turn's one coherent
+    -- snapshot of the owner's terminal record and targets has been read, and
+    -- before the exit acts on it. An example may block here — via STM, never
+    -- on the owner's thread — until the owner has published more than the
+    -- snapshot holds, which is how it shows that the turn decides from the
+    -- snapshot alone rather than from a later, mixed read.
   , beforeConsumer ∷ WindowHost → IO ()
     -- ^ Runs on the protected lifetime's own consumer path: after its exit
     -- handler is installed and before the consumer it was given is entered, so
@@ -641,7 +649,7 @@ data HostHooks = HostHooks
   }
 
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ()) (pure ()) (pure ()) (pure ()) (\_ → pure ())
+noHostHooks = HostHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol

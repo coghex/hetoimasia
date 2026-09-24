@@ -45,7 +45,7 @@ import Control.Exception
   , try
   )
 import Control.Exception (finally)
-import Control.Monad (forM, forM_, unless, void)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -188,6 +188,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testWholeOwnerWithoutTargets)
     it "retires and destroys it after the last target has already detached"
       (boundedExample testWholeOwnerAfterLastTarget)
+    it "reads a destruction and completion that both land inside its wait as verified, declaring nothing"
+      (boundedExample testCoherentDestructionSnapshot)
 
   describe "failure" $ do
     it "drains a failed startup through the same retirement, and says startup never returned"
@@ -1191,6 +1193,65 @@ testWholeOwnerAfterLastTarget = do
   notes ← journalled (rigJournal rig)
   map retiringUnverified requests `shouldBe` [[]]
   ordered notes [TargetRetirement (Text.pack "WindowId 1"), OwnerRetirement, OwnerDestruction]
+
+-- | A successful teardown whose evidence and completion are both committed
+-- between the exit reading its snapshot and acting on it is still verified.
+--
+-- The owner's destruction waits until the exit has read its first snapshot,
+-- and the exit's private hook then holds it, before it acts, until the owner
+-- has published both its evidence and its run's end. An exit that decided from
+-- any read after that snapshot would see the run ended and the evidence
+-- missing, and would declare 'OwnerDestructionUnverified' for an owner that
+-- destroyed everything: one that decides from the snapshot alone only waits,
+-- and its next turn finds the evidence.
+testCoherentDestructionSnapshot ∷ IO ()
+testCoherentDestructionSnapshot = do
+  rig ← newRig
+  trace ← newSinkTrace
+  let recording = sinkFailingOn (Text.pack "never") trace
+  held ← newTVarIO Nothing
+  snapshotRead ← newTVarIO False
+  turns ← newTVarIO (0 ∷ Int)
+  releasedWhileHeld ← newTVarIO Nothing
+  script (fakeDestroy (rigFake rig)) $ \_ → do
+    atomically (readTVar snapshotRead >>= check)
+    pure (ownerDestroyed "destroyed")
+  let hooks =
+        Private.noHostHooks
+          { Private.afterDestructionSnapshot = do
+              first ← atomically (stateTVar turns (\n → (n == 0, n + 1)))
+              when first $ do
+                owner ← atomically (readTVar held >>= maybe retry pure)
+                atomically (writeTVar snapshotRead True)
+                atomically $ do
+                  terminal ← readOwnerTerminalNow owner
+                  check (isJust (ownerDestroyedEvidence terminal) && ownerRunEnded terminal)
+                notes ← journalled (rigJournal rig)
+                atomically (writeTVar releasedWhileHeld (Just (filter released notes)))
+          }
+  outcome ← try @SomeException $
+    ownedHostHooked hooks recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+      atomically (writeTVar held (Just owner))
+      void (awaitRound owner 0)
+  case outcome of
+    Right () → pure ()
+    Left failure → unexpected ("the exit failed after a successful teardown: " <> show failure)
+  -- The forced ordering really happened: the snapshot the hook held was read
+  -- before the destruction could answer, and a later turn followed it.
+  readTVarIO snapshotRead `shouldReturn` True
+  readTVarIO turns >>= (`shouldSatisfy` (>= 2))
+  components ← traced trace
+  components `shouldSatisfy` notElem (Text.pack "glfw.graphics-owner")
+  -- Nothing was released until the evidence existed, and everything was
+  -- released after it.
+  readTVarIO releasedWhileHeld `shouldReturn` Just []
+  notes ← journalled (rigJournal rig)
+  ordered notes [OwnerDestruction, SessionEnded]
+  where
+    released = \case
+      WindowGone _ → True
+      SessionEnded → True
+      _ → False
 
 -- ---------------------------------------------------------------------------
 -- Failure

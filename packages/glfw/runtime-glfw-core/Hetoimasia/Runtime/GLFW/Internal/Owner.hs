@@ -1766,7 +1766,7 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   let exit =
         ProtectedExit
           { exitBeforeDrain = \_ _ → readIORef pending >>= traverse_ beginOwnerExit
-          , exitAfterDrain = \host restore → readIORef pending >>= traverse_ (finishOwnerExit restore logger host)
+          , exitAfterDrain = \host restore → readIORef pending >>= traverse_ (finishOwnerExit (afterDestructionSnapshot hooks) restore logger host)
           }
   -- The group's own scope sits outside the protected host lifetime
   -- deliberately: D-33 forbids an automatic join that could run before the
@@ -1866,9 +1866,12 @@ beginOwnerExit owner = atomically $ do
 -- still owed is the owner's own: its shared state was acquired before any
 -- target existed and outlives the last one, so an empty target set proves
 -- nothing here, and neither does the worker ending.
-finishOwnerExit ∷ (∀ a. IO a → IO a) → Logger → WindowHost → GraphicsOwner scene → IO ()
-finishOwnerExit restore logger host owner = do
-  awaited ← awaitOwnerDestruction restore logger host owner
+--
+-- @observed@ is the private examples' seam, 'afterDestructionSnapshot'; see
+-- 'awaitOwnerDestruction'.
+finishOwnerExit ∷ IO () → (∀ a. IO a → IO a) → Logger → WindowHost → GraphicsOwner scene → IO ()
+finishOwnerExit observed restore logger host owner = do
+  awaited ← awaitOwnerDestruction observed restore logger host owner
   -- The join, after verified destruction and before the host releases a single
   -- window. It is reached only once the evidence exists, so it can never be
   -- what lets an unverified owner's parents go — and it absorbs cancellation,
@@ -1988,6 +1991,19 @@ drainFailuresOf report =
 -- after that, and operator process termination remains the escape. No timeout
 -- grants the authority, because a timeout is not evidence.
 --
+-- __Each turn decides from one coherent snapshot.__ Whether the destruction is
+-- verified, whether the owner's run has ended, and every field the diagnostic
+-- and its typed failure report are all read in a single transaction over the
+-- owner's terminal record and its targets. Read separately, a successful
+-- teardown could commit its evidence and then its completion between the two
+-- reads, and the exit would declare unverified an owner that destroyed
+-- everything it held. The owner commits its evidence before its completion, so
+-- no snapshot of a successful teardown shows the run ended without the
+-- evidence. One taken earlier either already holds the evidence or holds
+-- neither, and then the turn only waits: the owner's own wake brings a later
+-- turn to a snapshot that holds both. @observed@ runs after each snapshot is
+-- read and before the turn acts on it; production passes @pure ()@.
+--
 -- It raises nothing. A native pump that fails withdraws itself, its failure
 -- kept once rather than repeated every turn, and the wait then runs under a
 -- finite timer of the same bound. A cancellation is absorbed and handed back
@@ -1995,12 +2011,13 @@ drainFailuresOf report =
 -- exactly the early release D-33 forbids, and repeated cancellation may not
 -- achieve it either.
 awaitOwnerDestruction
-  ∷ (∀ a. IO a → IO a)
+  ∷ IO ()
+  → (∀ a. IO a → IO a)
   → Logger
   → WindowHost
   → GraphicsOwner scene
   → IO [ExceptionWithContext SomeException]
-awaitOwnerDestruction restore logger host owner = loop True False []
+awaitOwnerDestruction observed restore logger host owner = loop True False []
   where
     environment = retirementEnvironmentOf logger host
     bound = max 1 (round (environmentBound environment * 1e6))
@@ -2011,19 +2028,19 @@ awaitOwnerDestruction restore logger host owner = loop True False []
           | isAsynchronous failure → pure (True, found <> [caught])
           | otherwise → pure (False, found <> [caught])
     loop pumping declared found = do
-      verified ← atomically (ownerDestructionVerified (ownerHandoff' owner))
-      if verified
-        then pure found
+      snapshot ← atomically (destructionSnapshot owner)
+      (_, seen) ← attempt found (restore observed)
+      if isJust (ownerDestroyedEvidence (snapshotTerminal snapshot))
+        then pure seen
         else do
           -- Said once, the first turn the owner is known to have ended with
           -- nothing established. It is a diagnostic and never an authority:
           -- the wait continues after it, and its own failure is retained
           -- rather than allowed to unwind what the wait is retaining.
-          ended ← atomically (ownerRunEnded <$> ownerTerminal (ownerHandoff' owner))
           (declared', afterReport) ←
-            if declared || not ended
-              then pure (declared, found)
-              else (,) True . snd <$> attempt found (restore (declareUnverified owner logger))
+            if declared || not (ownerRunEnded (snapshotTerminal snapshot))
+              then pure (declared, seen)
+              else (,) True . snd <$> attempt seen (restore (declareUnverified logger snapshot))
           if pumping
             then do
               (keeps, waited) ← attempt afterReport (restore (environmentAwait environment >>= evaluate))
@@ -2037,6 +2054,20 @@ awaitOwnerDestruction restore logger host owner = loop True False []
                   (restore (atomically (readTVar expired >>= \elapsed → check elapsed)))
               loop False declared' timed
 
+-- | One coherent reading of everything a turn of 'awaitOwnerDestruction'
+-- decides and reports on: the owner's terminal record and how many targets it
+-- still holds, taken together.
+data DestructionSnapshot = DestructionSnapshot
+  { snapshotTerminal ∷ !OwnerTerminal
+  , snapshotTargets ∷ !Int
+  }
+
+destructionSnapshot ∷ GraphicsOwner scene → STM DestructionSnapshot
+destructionSnapshot owner =
+  DestructionSnapshot
+    <$> ownerTerminal (ownerHandoff' owner)
+    <*> (Map.size <$> readTVar (ownerTargets owner))
+
 -- | The one diagnostic an unverified owner destruction owes, and the typed
 -- failure it records.
 --
@@ -2045,19 +2076,23 @@ awaitOwnerDestruction restore logger host owner = loop True False []
 -- destroy its own state reports that even when independent evidence later let
 -- the boundary finish. It is never authority: it is raised into the wait's own
 -- accumulator, the wait continues, and nothing is released because of it.
-declareUnverified ∷ GraphicsOwner scene → Logger → IO ()
-declareUnverified owner logger = do
-  terminal ← atomically (ownerTerminal (ownerHandoff' owner))
-  unverified ← readTVarIO (ownerTargets owner)
+--
+-- Both report the snapshot the decision was made from, and read nothing again:
+-- a later read could describe an owner the decision never saw.
+declareUnverified ∷ Logger → DestructionSnapshot → IO ()
+declareUnverified logger snapshot = do
   logWarning
     logger
     graphicsOwnerComponent
     "The graphics owner ended without verified destruction; its shared state, the windows, the session and every parent are retained"
-    [ ("retired", Text.pack (show (isJust (ownerRetiredEvidence terminal))))
-    , ("unverified-targets", Text.pack (show (Map.size unverified)))
+    [ ("retired", Text.pack (show retired))
+    , ("unverified-targets", Text.pack (show unverified))
     ]
     >>= evaluate
-  throwIO (OwnerDestructionUnverified (isJust (ownerRetiredEvidence terminal)) (Map.size unverified))
+  throwIO (OwnerDestructionUnverified retired unverified)
+  where
+    retired = isJust (ownerRetiredEvidence (snapshotTerminal snapshot))
+    unverified = snapshotTargets snapshot
 
 -- | Publish whole-owner retirement evidence a thread other than the owner
 -- established.
