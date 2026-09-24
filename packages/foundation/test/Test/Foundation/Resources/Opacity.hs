@@ -199,9 +199,12 @@ collectionSpec =
             expectationFailure
               ("the client compiled, so a member's release is reachable:\n" <> clientOutput outcome)
         -- The one environment-looking diagnostic this case expects: the
-        -- module is found in the built package and refused as hidden.
-        clientOutput outcome `shouldContain` "hidden module"
-        clientOutput outcome `shouldContain` "hetoimasia-foundation"
+        -- module is found in the package's private implementation library,
+        -- which a client cannot expose, and refused as hidden. Naming that
+        -- library's unit is what tells this apart from a missing package.
+        clientOutput outcome `shouldContain` "GHC-87110"
+        clientOutput outcome `shouldContain` "hidden package"
+        clientOutput outcome `shouldContain` "hetoimasia-foundation-0.1.0.0:internal"
         clientOutput outcome `shouldNotContain` "cannot satisfy"
 
     it "accepts and runs a client using only the public collection operations" $
@@ -553,7 +556,8 @@ memberCoercionClient =
 
 -- | A client that reaches for the ledger release primitive a member's release
 -- is stored with. The public module exports no release, so the only route to
--- one is the implementation module, which the package hides.
+-- one is the implementation module, which lives in the package's private
+-- library.
 releaseExtractionClient ∷ String
 releaseExtractionClient =
   unlines

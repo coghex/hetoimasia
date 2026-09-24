@@ -1,9 +1,10 @@
 -- | The representations behind "Hetoimasia.Foundation.Resource", shared inside
--- the foundation library and nowhere else.
+-- the foundation package and nowhere else.
 --
--- This module is listed under @other-modules@, so no client of the package can
--- import it. It exists so that a scoped constructor defined in another module
--- of this library — 'Hetoimasia.Foundation.Recovery.allocComponent',
+-- This module belongs to the package's private @internal@ sublibrary, so no
+-- client of the package can import it. It exists so that a scoped constructor
+-- defined in another foundation module —
+-- 'Hetoimasia.Foundation.Recovery.allocComponent',
 -- 'Hetoimasia.Foundation.Worker.allocWorkerGroup', and the member ledger of
 -- "Hetoimasia.Foundation.Resource.Collection" — can build a 'Scoped' value and
 -- drive a composite's part ledger without the public module exporting either
@@ -25,6 +26,7 @@ module Hetoimasia.Foundation.Resource.Internal
   , cleanupFailureLabel
   , cleanupFailureException
   , displayCleanupFailure
+  , cleanupFailuresInContext
 
     -- * Release primitives
   , tryScope
@@ -56,17 +58,21 @@ module Hetoimasia.Foundation.Resource.Internal
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , WhileHandling (WhileHandling)
   , displayException
   , evaluate
   , rethrowIO
+  , someExceptionContext
   , tryWithContext
   , uninterruptibleMask_
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
-import Control.Exception.Context (addExceptionAnnotation)
+import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (sortOn)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import System.IO.Unsafe (unsafePerformIO)
@@ -89,9 +95,9 @@ newtype CleanupFailureId = CleanupFailureId Integer
 -- backtrace.
 --
 -- The representation is closed to clients: "Hetoimasia.Foundation.Resource"
--- exports the type without its constructor, this module is hidden, and none of
--- the three carried values is a record field, so no field label reaches a
--- client either. A client of the package cannot build a 'CleanupFailure'
+-- exports the type without its constructor, this module is private to the
+-- package, and none of the three carried values is a record field, so no field
+-- label reaches a client either. A client of the package cannot build a 'CleanupFailure'
 -- of its own and cannot rewrite one it was handed, because record
 -- construction and record-update syntax both need a field label in scope and
 -- this type declares none. Entries are therefore read-only evidence: they are
@@ -150,6 +156,62 @@ displayCleanupFailure failure =
         <> Text.unpack (cleanupFailureLabel failure)
         <> ": "
         <> displayException exception
+
+-- | 'Hetoimasia.Foundation.Resource.cleanupFailures' for a caller holding an exception's context directly,
+-- such as one from 'tryWithContext' or 'Control.Exception.catchNoPropagate'.
+cleanupFailuresInContext ∷ ExceptionContext → [CleanupFailure]
+cleanupFailuresInContext context = Map.elems (gatherFailures [context] Map.empty)
+
+-- | Collect every reachable cleanup failure, following the two ways evidence
+-- can sit below the context being inspected.
+--
+-- The accumulator is keyed by 'CleanupFailureId', so it is at once the record
+-- of which failures have already been expanded and the deduplicated result:
+-- 'Map.elems' returns entries in increasing key order, which is the order the
+-- failures were observed. Expanding each distinct failure's own context at
+-- most once is what keeps the cost proportional to the evidence retained
+-- rather than to the number of routes that reach it; nested releases each
+-- carrying the prior cleanup context offer exponentially many such routes.
+--
+-- Skipping an identity already in the accumulator is sound because a
+-- 'CleanupFailure' is read-only outside this module: an identity reached a
+-- second time carries the same label and the same exception, and therefore the
+-- same context, as the first time it was expanded. 'CleanupFailure' records
+-- why no client can break that correspondence.
+--
+-- The traversal is a worklist rather than a recursion so that the record of
+-- expanded failures is shared by every branch instead of being rebuilt per
+-- route. Pending contexts are expanded in no particular order, which the
+-- ordering by identity above makes irrelevant to the result.
+gatherFailures
+  ∷ [ExceptionContext]
+  → Map CleanupFailureId CleanupFailure
+  → Map CleanupFailureId CleanupFailure
+gatherFailures [] found = found
+gatherFailures (context : pending) found =
+  gatherFailures (handled <> below <> pending) found'
+  where
+    -- Both kinds of nesting below this context are followed even when every
+    -- failure attached to it has been seen already: one repeated identity
+    -- must not hide the new evidence standing beside it.
+    handled =
+      [ someExceptionContext handled'
+      | WhileHandling handled' ← getExceptionAnnotations context
+      ]
+
+    (found', below) = foldl' expandOnce (found, []) (getExceptionAnnotations context)
+
+    expandOnce (seen, contexts) failure
+      | Map.member identifier seen = (seen, contexts)
+      | otherwise =
+          ( Map.insert identifier failure seen
+          , failureContext failure : contexts
+          )
+      where
+        identifier = cleanupFailureId failure
+
+    failureContext failure = case cleanupFailureException failure of
+      ExceptionWithContext carried _ → carried
 
 -- | Issues 'CleanupFailureId's.
 --
