@@ -10,16 +10,16 @@
 This is the native evidence for issue #219: the same proof run as the VK-2,
 VK-6 and VK-5 records, now carrying VK-7's session, whose section is headed
 "VK-7: the Vulkan roots under the graphics owner" below. It ran through the
-`vulkan-proof` route of `.github/workflows/ci-image.yml` (run 36039857374),
+`vulkan-proof` route of `.github/workflows/ci-image.yml` (run 36043357167),
 inside the published image the committed `tools/ci-image/descriptor.json`
 names, on the isolated X11 display `tools/display/x11.sh` starts and supplies
 its own consent for. No desktop session was entered. No macOS record is retained
 beside it: the local macOS run needs the human's explicit approval for that
 session, and none was given for this slice.
 
-It was produced from repository revision `ac505e5e8be36f6ae351f24bc28682d0d0fc4140`
+It was produced from repository revision `2353b230d0437ee6bee228cc917001dbf44ff474`
 and source digest
-`3a69569b4cbf1cacb408cfbfdad6b5b5dcc6a3bfd08abe337a6d0a2229a27adc`; the digest
+`fb3750c15066e3d9c8258d9312f99bfad6cedc7a56cc505bc28358cafda297bf`; the digest
 covers the native backend package, the window integration package, the GLFW
 package, the diagnostics package and their local closure as well as the
 harness. It identifies the tree the run was produced from, not this file's
@@ -66,8 +66,8 @@ HETOIMASIA_NATIVE_SESSION=isolated-x11::0 \
 
 ## The environment
 
-- source digest: 3a69569b4cbf1cacb408cfbfdad6b5b5dcc6a3bfd08abe337a6d0a2229a27adc
-- repository revision: ac505e5e8be36f6ae351f24bc28682d0d0fc4140
+- source digest: fb3750c15066e3d9c8258d9312f99bfad6cedc7a56cc505bc28358cafda297bf
+- repository revision: 2353b230d0437ee6bee228cc917001dbf44ff474
 - platform: linux/x86_64
 - session authorization: the isolated X11 display :0
 - VK_DRIVER_FILES: /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
@@ -86,11 +86,11 @@ GLFW was handed the Haskell binding's own `vkGetInstanceProcAddr` before
 `glfwInit`, so the two cannot be independently found libraries that happen to
 agree. The addresses and images below are what each side actually resolves.
 
-- the binding's vkGetInstanceProcAddr: 0x00007f02b568d3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- GLFW's vkGetInstanceProcAddr: 0x00007f02b568d3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
-- the binding's vkCreateDevice: 0x00007f02b568d090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- GLFW's vkCreateDevice: 0x00007f02b568d090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-- a device-level entry point: 0x00007f02923ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+- the binding's vkGetInstanceProcAddr: 0x00007f381f38c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- GLFW's vkGetInstanceProcAddr: 0x00007f381f38c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+- the binding's vkCreateDevice: 0x00007f381f38c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- GLFW's vkCreateDevice: 0x00007f381f38c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+- a device-level entry point: 0x00007f37fa3ab850 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
 - device API version: 1.4.318
 - driver: llvmpipe (DRIVER_ID_MESA_LLVMPIPE)
@@ -228,7 +228,7 @@ arrived inside it.
 
 - capture limits: 1024 queued records, 16384 bytes of text per record (the default is 4096; see the proof README), 16 objects per record
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
-- messenger callback: 0x00000000006fc860 in /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
+- messenger callback: 0x00000000006fd950 in /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
 - this executable: /candidate/dist-vulkan-proof/build/x86_64-linux/ghc-9.14.1/hetoimasia-vulkan-proof-0.1.0.0/t/vulkan-proof/opt/build/vulkan-proof/vulkan-proof
 - unsafe imports this session declares: vkSubmitDebugUtilsMessageEXT, vkCmdSetViewport
 - binding safe-foreign-calls in binding.pin: on
@@ -318,7 +318,7 @@ the step whose reports it was.
 | vkCreateInstance | info | Loader Message |            Library:  /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so |
 | vkCreateInstance | info | Loader Message |      \|\| |
 | vkCreateInstance | info | Loader Message |    <Drivers> |
-| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x170e5170, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| v... |
+| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x3d567b60, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| v... |
 | vkCreateInstance | info | Loader Message | linux_read_sorted_physical_devices: |
 | vkCreateInstance | info | Loader Message |      Original order: |
 | vkCreateInstance | info | Loader Message |            [0] llvmpipe (LLVM 20.1.2, 256 bits) |
@@ -370,16 +370,16 @@ its loader hint, so the setting reported is the value the interop shim last
 handed it; that shim is its only production writer, and the VK-2 run's
 throwaway shim, which also set it, was reset first.
 
-- binding vkGetInstanceProcAddr: 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
-- capability made from: 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
-- shim setting while the session was live: 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
-- GLFW resolved vkGetInstanceProcAddr to: 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+- binding vkGetInstanceProcAddr: 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+- capability made from: 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+- shim setting while the session was live: 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+- GLFW resolved vkGetInstanceProcAddr to: 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
 - capability while the session was live: IntegrationInstalled
-- binding vkCreateDevice: 0x00007f02b568d090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
-- GLFW vkCreateDevice: 0x00007f02b568d090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
+- binding vkCreateDevice: 0x00007f381f38c090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
+- GLFW vkCreateDevice: 0x00007f381f38c090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
 - required instance extensions, as copied: VK_KHR_surface, VK_KHR_xcb_surface
-- surface creation: SurfaceCreated (WindowSurface (SurfaceObligation (AttachmentId (WindowId 1) 1) 386431360))
-- surface handle: 386431360
+- surface creation: SurfaceCreated (WindowSurface (SurfaceObligation (AttachmentId (WindowId 1) 1) 1029619296))
+- surface handle: 1029619296
 - surface query: presentation support on queue family 0 of the first device: True
 - instance release while owed: InstanceRetained (LeaseStanding {standingAdmitting = False, standingConstructing = 0, standingOwed = 1, standingUncertain = 0})
 - disposal fact while owed: Nothing
@@ -409,7 +409,7 @@ messenger alone. Their counts are platform-dependent and are recorded, not
 required.
 
 - capture limits: 1024 queued records, 16384 bytes of text per record (the default is 4096; see the proof README), 16 objects per record
-- main thread: OS thread 0x7f02b53c4080, ThreadId 4
+- main thread: OS thread 0x7f381f0c3080, ThreadId 4
 - readiness: RootsReady
 - device: llvmpipe (LLVM 20.1.2, 256 bits)
 - queue family: 0
@@ -435,19 +435,19 @@ required.
 
 | Native call | OS thread | Main thread | Haskell thread | Reports during it | Raised |
 | --- | --- | --- | --- | --- | --- |
-| vkEnumerateInstanceExtensionProperties | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkCreateInstance | 0x7f02b1f0b6c0 | no | ThreadId 89 | 51 | no |
-| vkCreateDebugUtilsMessengerEXT | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| glfwCreateWindowSurface | 0x7f02b53c4080 | yes | ThreadId 4 | 0 | no |
-| vkEnumeratePhysicalDevices | 0x7f02b1f0b6c0 | no | ThreadId 89 | 12 | no |
-| vkCreateDevice | 0x7f02b1f0b6c0 | no | ThreadId 89 | 13 | no |
-| glfwCreateWindowSurface | 0x7f02b53c4080 | yes | ThreadId 4 | 0 | no |
-| vkGetPhysicalDeviceSurfaceSupportKHR | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkDestroySurfaceKHR | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkDestroySurfaceKHR | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkDestroyDevice | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkDestroyDebugUtilsMessengerEXT | 0x7f02b1f0b6c0 | no | ThreadId 89 | 0 | no |
-| vkDestroyInstance | 0x7f02b1f0b6c0 | no | ThreadId 89 | 1 | no |
+| vkEnumerateInstanceExtensionProperties | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkCreateInstance | 0x7f3816ffe6c0 | no | ThreadId 89 | 51 | no |
+| vkCreateDebugUtilsMessengerEXT | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| glfwCreateWindowSurface | 0x7f381f0c3080 | yes | ThreadId 4 | 0 | no |
+| vkEnumeratePhysicalDevices | 0x7f3816ffe6c0 | no | ThreadId 89 | 12 | no |
+| vkCreateDevice | 0x7f3816ffe6c0 | no | ThreadId 89 | 13 | no |
+| glfwCreateWindowSurface | 0x7f381f0c3080 | yes | ThreadId 4 | 0 | no |
+| vkGetPhysicalDeviceSurfaceSupportKHR | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkDestroySurfaceKHR | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkDestroySurfaceKHR | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkDestroyDevice | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkDestroyDebugUtilsMessengerEXT | 0x7f3816ffe6c0 | no | ThreadId 89 | 0 | no |
+| vkDestroyInstance | 0x7f3816ffe6c0 | no | ThreadId 89 | 1 | no |
 
 ## Operation and result matrix
 
@@ -480,24 +480,24 @@ such; no device loss was induced.
 ```
 ## The environment
 implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-proving repository revision ac505e5e8be36f6ae351f24bc28682d0d0fc4140
-proving source digest 3a69569b4cbf1cacb408cfbfdad6b5b5dcc6a3bfd08abe337a6d0a2229a27adc
+proving repository revision 2353b230d0437ee6bee228cc917001dbf44ff474
+proving source digest fb3750c15066e3d9c8258d9312f99bfad6cedc7a56cc505bc28358cafda297bf
 VK_DRIVER_FILES = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
 VK_LAYER_PATH = /opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 ## The shared loader
-the binding dispatches through 0x00007f02b568d3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+the binding dispatches through 0x00007f381f38c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 the binding's loader is the recorded loader /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275
-GLFW resolves the same name to 0x00007f02b568d3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
+GLFW resolves the same name to 0x00007f381f38c3d0 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkGetInstanceProcAddr
 GLFW requires VK_KHR_surface, VK_KHR_xcb_surface
 ## The instance
 the loader reports instance version 1.3.275
-the binding resolves vkCreateDevice to 0x00007f02b568d090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x00007f02b568d090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+the binding resolves vkCreateDevice to 0x00007f381f38c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x00007f381f38c090 in /lib/x86_64-linux-gnu/libvulkan.so.1 as vkCreateDevice
 ## The window and its surface
 ## The device profile
 llvmpipe (LLVM 20.1.2, 256 bits) advertises Vulkan 1.4.318
 selected llvmpipe (LLVM 20.1.2, 256 bits), advertising Vulkan 1.4.318
-the binding dispatches image release through 0x00007f02923f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
+the binding dispatches image release through 0x00007f37fa3f52e0 in /usr/lib/x86_64-linux-gnu/libVkLayer_khronos_validation.so
 the validation layer is in the loaded chain, by the image a device entry point resolves into
 ## The presentation profile
 presenting 4 images of FORMAT_B8G8R8A8_UNORM at Extent2D {width = 320, height = 240}
@@ -529,13 +529,13 @@ the device and its pool are gone; the explicit messenger is destroyed next, then
 the lifetime delivered 79 records to the logger
 ## VK-5: the loader-aware GLFW surface bridge
 restored GLFW's default loader through the VK-2 shim, which had left the binding's entry point installed
-the capability was made from 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
-while the session is live the shim holds 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
-GLFW resolves vkGetInstanceProcAddr to 0x00007f02b568d3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+the capability was made from 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+while the session is live the shim holds 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
+GLFW resolves vkGetInstanceProcAddr to 0x00007f381f38c3d0 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkGetInstanceProcAddr
 the session copied the required extensions VK_KHR_surface, VK_KHR_xcb_surface
-the binding resolves vkCreateDevice to 0x00007f02b568d090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
-GLFW resolves vkCreateDevice to 0x00007f02b568d090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
-created surface 386431360 for the attached window
+the binding resolves vkCreateDevice to 0x00007f381f38c090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
+GLFW resolves vkCreateDevice to 0x00007f381f38c090 in /usr/lib/x86_64-linux-gnu/libvulkan.so.1.3.275 as vkCreateDevice
+created surface 1029619296 for the attached window
 the binding answered a query about it: presentation support on queue family 0 of the first device: True
 while it was owed, the disposal fact answered Nothing and the instance release InstanceRetained (LeaseStanding {standingAdmitting = False, standingConstructing = 0, standingOwed = 1, standingUncertain = 0})
 another thread discharged it: SurfaceDestroyed
