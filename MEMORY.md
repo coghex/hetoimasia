@@ -55,6 +55,16 @@ is posted; its X11 repair remains open. Next audit starts after `68ddbbc`, plus
 changed effective issue specs. Separate report queues and qualification gates
 remain open; completed coverage is not their resolution.
 
+The [2026-09-24 guide review](docs/guide/2026-09-24T140902Z-425e97b.md) extends
+complete coverage through `425e97b`: PRs #247/#248/#249/#252 and the direct
+documentation landing. #246/#237/#217/#216 are closed and the footprint wording
+is published. One new repair is reproduced: diagnostic finalization can replace
+an earlier body failure with a later cancellation. Resume its GUIDE-1 before
+composing the diagnostics into #219. #251 and #221 are independent next work;
+#220 needs a fresh canonical gate after its synchronization-validation amendment.
+The report records exact issue fingerprints and checks; no issue was drafted
+or filed. Next audit starts after `425e97b`, plus changed specs/docs.
+
 ## Direction and owner preferences
 
 - On 2026-09-23 the owner requested documentation-only tracing design, with no
@@ -78,7 +88,11 @@ remain open; completed coverage is not their resolution.
     gameplay VM owners with direct bindings. Mods keep the confined-process
     pipeline, and both share one registration layer
     ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process)).
-    Q-8 is open: whether in-process slices can resume before Q-5.
+    Owner decisions D-13/D-14 on 2026-09-24 resolve Q-8: trusted slices may
+    proceed independently of Q-5 after renewed readiness, with explicit binding
+    eligibility and no mod exposure by default. The reconciled local design
+    remains `exploring`; confined integration/acceptance (LUA-16/LUA-17) still
+    require successful platform qualification and remain part of epic completion.
   - Quit may be bounded by an application-level watchdog. It names the stuck
     owner, makes a bounded best-effort flush, and exits the process without
     unwinding. Foundation keeps its no-deadline drain
@@ -114,11 +128,10 @@ remain open; completed coverage is not their resolution.
 - Logging, CPU scopes/collections, structured failures and bounded recovery,
   application composition, workers/supervision, bounded channels/snapshots,
   supervised inboxes, and GLFW dynamic windows/controls/monitors/input exist.
-- Seven Cabal packages are active: root, foundation, runtime, GLFW, the Lua host
-  `hetoimasia-scripting-lua`, the test-only `hetoimasia-test-support`, and
-  `hetoimasia-gpu-vulkan-model` (VK-3). The native Vulkan backend package,
-  fonts and renderers are still plans/ownership notes, not implemented
-  packages.
+- In addition to root, foundation, runtime, GLFW, Lua, test support and the GPU
+  model, #217 now supplies portable Vulkan diagnostics and a native diagnostics
+  package. #216 supplies GLFW's optional Vulkan interop component. Native
+  instance/device ownership remains #219; fonts and renderers remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.

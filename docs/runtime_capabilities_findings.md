@@ -83,7 +83,7 @@ finding needs one; they do not block recording or processing this report.
 ## Status
 
 - [ ] RTC-1. Runtime performance evidence lacks a correlated engine timeline
-- [ ] RTC-2. Protected shutdown can outlast the available terminal diagnostics
+- [x] RTC-2. Protected shutdown can outlast the available terminal diagnostics — [#251]
 - [ ] RTC-3. Finite worker jobs lack a bounded workload-execution service
 - [ ] RTC-4. Content loading lacks asynchronous request ownership and memory budgets
 - [ ] RTC-5. Timing primitives lack a worked simulation/input/render composition
@@ -148,7 +148,7 @@ That limits the evidence available to explain an observed execution spike.
   an unapproved candidate. RTS tuning follows workload evidence, not a
   preset optimization claim.
 
-### RTC-2. Protected shutdown can outlast the available terminal diagnostics
+### [#251] RTC-2. Protected shutdown can outlast the available terminal diagnostics
 
 **Verification: Verified ordering and diagnostic gap; no production hang was
 reproduced by this review.**

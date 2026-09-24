@@ -159,6 +159,16 @@ domains, calling bindings directly without IPC (owner decision 2026-09-22,
 Lua D-12). Mods keep the confined pipeline. Both share one module and
 capability registration layer, and the trusted path is never a mod fallback.
 
+Owner decisions on 2026-09-24 (Lua D-13/D-14) permit trusted delivery
+independently of confinement qualification, after renewed design readiness.
+Binding registration defaults to no mod exposure: a confined binding needs an
+explicit grant and supported bounded transport semantics. Direct bindings need
+no IPC equivalent and cannot synchronously enter another VM owner. Trusted
+scripts may hang or exhaust application memory; cooperative budgets are not
+hard limits, and their dependencies remain held until actual completion.
+Confined integration and adversarial acceptance remain required for the full
+Lua arc, behind successful qualification on both platforms.
+
 Cooperative scheduling is not hostile-code containment. A merged probe with an
 inconclusive verdict does not qualify deployment or release its dependent gates.
 Callback threads are runtime machinery, not cancellation endpoints; limits and

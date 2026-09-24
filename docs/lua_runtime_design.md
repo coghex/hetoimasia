@@ -26,8 +26,9 @@ has established the binding boundary and LUA-4/#149 has delivered the pure
 protocol model. LUA-14/#147 and LUA-15/#148 both delivered **inconclusive**
 confinement verdicts. D-11 therefore returns this document to `exploring`.
 LUA-9 through LUA-13 and their dependent integration slices remain blocked;
-closing the proof issues did not prove supported confinement. Resolve Q-5 and
-renew readiness before resuming issue processing. The
+closing the proof issues did not prove supported confinement. D-13 now permits
+trusted delivery independently of Q-5 after renewed readiness; the process
+branch still requires Q-5's successful verdicts. The
 [review ledger](project_review/ledger.md) also records implementation
 follow-ups; processing completion is not a clean implementation verdict. The
 [binding review](project_review/173.md) records stale source comments, and the
@@ -35,6 +36,12 @@ follow-ups; processing completion is not a clean implementation verdict. The
 failure-detail defects. Those repairs (#193/#194) are closed at the 2026-09-22
 review baseline. PR #241 subsequently corrected the binding comments. Neither
 those repairs nor closed proof issues clear Q-5's confinement gate.
+
+Owner reconciliation, 2026-09-24: D-13 permits independent trusted delivery;
+D-14 fixes binding exposure for both paths. Q-8 is resolved. LUA-5 through
+LUA-8 deliver trusted execution and reusable machinery; LUA-16/LUA-17 retain
+confined integration and adversarial acceptance behind Q-5. This decision
+approval does not renew design readiness. The document remains `exploring`.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -49,20 +56,23 @@ concrete precondition
 - [ ] LUA-2. Own the VM through a protected IO lifetime
 - [ ] LUA-3. Add application-owned modules and bounded value bindings
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
+- [ ] LUA-5. Integrate trusted VM owners with runtime supervision
+- [ ] LUA-6. Schedule cooperative tasks with bounded service turns
+- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions
+- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime
 - [ ] LUA-10. Establish Linux mod-process confinement
 - [ ] LUA-11. Establish macOS mod-process confinement
 - [ ] LUA-12. Enforce parent-owned execution and resource budgets
 - [ ] LUA-13. Broker scoped mod capabilities in the parent
-- [ ] LUA-5. Integrate VM owners with runtime supervision
-- [ ] LUA-6. Schedule cooperative tasks with bounded service turns
-- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions
-- [ ] LUA-8. Prove independent UI and gameplay execution headlessly
+- [ ] LUA-16. Integrate confined mod owners with the runtime
+- [ ] LUA-17. Prove confined execution and adversarial isolation headlessly
 
 The ledger records processing, not implementation. Keep it synchronized with
 the delivery plan; do not infer issue numbers from these local slice IDs.
 LUA-2's former #146 merge prerequisite is satisfied; its unchecked entry still
-means no issue has been processed, and the document-wide D-11 pause applies.
+means no issue has been processed. Renewed readiness gates trusted processing;
+Q-5 additionally gates the process branch under D-11/D-13.
 
 Dependency reconciliation, 2026-09-18: the owner selected the shared-toolchain
 qualification VK-1/#157 before LUA-1/#146. The amended and reapproved #146 and
@@ -73,9 +83,10 @@ source observations below remain historical.
 
 ## Epic contract
 
-- **Goal:** a reusable Lua host and runtime adapter run UI and gameplay on
-  independent VM owners, with untrusted execution confined per mod and domain
-  in separate sandboxed processes, without a window, renderer, or concrete game.
+- **Goal:** a reusable Lua host and runtime adapter run trusted first-party UI
+  and gameplay on independent in-process VM owners, with untrusted execution
+  confined per mod and domain in separate sandboxed processes, without a window,
+  renderer, or concrete game.
 - **Done when:** a headless consumer loads application-owned Lua behavior in
   both domains; UI handles input against the last completed gameplay snapshot
   while gameplay is busy; cooperative tasks yield/wait/resume; overload is
@@ -83,6 +94,8 @@ source observations below remain historical.
   checks or configured resource limits; failure and cancellation preserve
   parent-owned resource lifetime. Linux CI and local macOS verify both the
   binding and actual confinement, including denied-access tests.
+  LUA-8 establishes the trusted milestone; LUA-17 establishes confined system
+  acceptance. Both are required to complete the epic.
 - **Users and operators:** authors of Lua-driven games/tools, engine component
   authors registering capabilities, and agents maintaining focused tests.
 - **Arc label:** propose `scripting`, description “Lua hosting, execution, and
@@ -277,11 +290,14 @@ open for those proofs; it is no longer a prerequisite to processing the epic,
 binding proof, or feasibility slices themselves.
 
 Each proof is one PR containing its probe, tests, retained evidence, and platform
-verdict. A failed or inconclusive verdict returns the design to `exploring` and
-stops process-branch drafting; it cannot weaken the accepted isolation or limit
+verdict. The initial gate returned the design to `exploring` on a failed or
+inconclusive verdict. D-13 supersedes that document-wide pause: such verdicts
+continue to stop process-branch drafting while separately approved trusted
+delivery can proceed. They cannot weaken the accepted isolation or limit
 contracts. Any required change to scope, trust boundary, supported deployment,
-or public lifetime contract returns to the owner for a design decision. Routine
-mechanism selection within the accepted contracts is the proof's responsibility.
+or public lifetime contract returns to the owner for a design decision and
+renewed readiness. Routine mechanism selection within the accepted contracts
+is the proof's responsibility.
 
 ### D-12. Run first-party scripts trusted and in-process
 
@@ -292,11 +308,48 @@ without IPC serialization. Untrusted mods keep the confined-process pipeline of
 D-6, D-8 and D-9 unchanged. Both paths share one module and capability
 registration layer: a binding is defined once, and each path exposes the subset
 its trust level permits. The trusted path is never a fallback for a mod whose
-confinement cannot be installed. Q-8 records what this leaves open.
+confinement cannot be installed. D-13/D-14 resolve the delivery and binding
+exposure questions recorded in Q-8.
+
+### D-13. Deliver trusted execution independently of confinement qualification
+
+Owner approved this explicitly on 2026-09-24. LUA-2, LUA-3, and the trusted
+in-process portions of LUA-5 through LUA-8 may proceed before Q-5 is resolved,
+after their design/dependencies are reconciled and readiness is explicitly
+renewed. LUA-5 through LUA-8 deliver the trusted path and reusable machinery;
+LUA-16/LUA-17 preserve confined runtime integration and adversarial system
+acceptance as required later slices.
+
+Q-5 still blocks LUA-9 through LUA-13, LUA-16, and LUA-17 until both platform
+verdicts are successful. Required mod isolation remains in this epic; trusted
+completion neither completes the epic nor permits mod admission. A failed
+confinement setup never selects the trusted path. This supersedes the earlier
+document-wide processing pause without weakening D-6, D-8, or D-9.
+
+Trusted scripts can hang or exhaust application memory. Cooperative service
+budgets are not hard execution or memory limits. Protected teardown retains
+dependencies until the VM actually finishes; a stuck owner cannot be detached.
+Direct bindings preserve service ownership, coherent snapshots, and bounded
+intentions; they do not permit synchronous calls into another VM owner.
+
+### D-14. Register once with explicit exposure for each execution path
+
+Owner approved this explicitly on 2026-09-24. Both paths share one binding
+definition with explicit eligibility for each execution path. Registration
+defaults to no mod exposure. A confined binding requires an explicit grant
+and supported bounded transport semantics; not every direct binding needs an
+IPC equivalent. P-4 records the permitted behavior by binding kind.
+
+On the confined path, snapshot queries read granted local snapshots. Owned state operations mutate
+only child-owned state; changes to parent state use validated commands.
+Commands and UI intentions use bounded authorized requests, asynchronous
+native requests use brokered admission and result delivery, and lifecycle
+operations request permitted transitions while the parent retains authority.
 
 ## Design
 
-P-1 through P-13 record the accepted contracts, subject to Q-3/Q-5's proof gates.
+P-1 through P-13 record the accepted contracts, with proof and delivery gates
+scoped by D-13. Q-3 is resolved; Q-5 gates the confined process branch.
 Symbol and component names below are descriptive until their owning slice fixes
 the API.
 
@@ -308,7 +361,8 @@ Use `packages/scripting-lua/` for a `hetoimasia-scripting-lua` package:
   local task contracts. It depends on foundation and the selected binding, with
   no dependency on runtime, GLFW, Vulkan, or game packages.
 - A `runtime-lua` sublibrary, in a separate source directory, depends on the
-  host and runtime. It composes parent worker/process ownership, readiness,
+  host and runtime. It composes trusted VM worker ownership and, once qualified,
+  confined parent worker/process ownership, readiness,
   transport, and task service. Keeping integration in the same package avoids
   a package dependency cycle when tests exercise both layers, a lesson from GLFW.
 - Host and adapter suites have separate source directories and targets. Pure
@@ -348,15 +402,20 @@ execution or trust model returns to design; it is not an incidental solver choic
 
 ```mermaid
 flowchart LR
-    Main[Main thread: platform input and windows] --> Broker[Parent capability broker]
-    Broker -->|bounded validated IPC| UI[UI mod process and Lua VM]
-    UI -->|presentation proposal| Broker
-    UI -->|intentions| Broker
-    Broker -->|admitted intentions and grants| Game[Gameplay mod process and Lua VM]
-    Game -->|untrusted result proposal| Broker
-    Broker -->|validated completed snapshot| UI
-    Broker -->|validated completed snapshot| Main
-    Broker -->|validated presentation snapshot| Graphics[Supervised graphics owner]
+    subgraph Engine[Engine process]
+      Main[Main thread: platform input and windows] --> UI[Trusted first-party UI VM owner]
+      UI -->|bounded intentions| Game[Trusted first-party gameplay VM owner]
+      Game -->|completed gameplay snapshot| UI
+      UI -->|direct registered bindings| Services[Application services and publication policy]
+      Game -->|direct registered bindings| Services
+      Services -->|completed presentation snapshot| Graphics[Supervised graphics owner]
+      Broker[Parent capability broker] -->|validated requests and proposals| Services
+      Services -->|granted snapshots and results| Broker
+    end
+    Broker -->|bounded validated IPC| ModUI[Confined mod UI process and VM]
+    ModUI -->|requests and proposals| Broker
+    Broker -->|bounded validated IPC| ModGame[Confined mod gameplay process and VM]
+    ModGame -->|requests and proposals| Broker
 ```
 
 Graphics consumes application-published presentation data on its separate owner;
@@ -366,8 +425,12 @@ presentation consumers establish the same boundary there. Simulation and the
 commit policy remain application-owned. This follows the accepted
 [V-5 ownership boundary](vision.md#v-5-bounded-communication-and-responsive-ownership).
 
-This illustrates one mod's two roles; repeat the child boundaries per admitted
-mod/domain. All cross-mod communication is brokered by the parent. A child
+The trusted owners use direct application-registered bindings under D-12/D-14;
+this does not allow a callback to access another owner's mutable state or call
+its VM synchronously. UI reads completed snapshots and submits bounded intentions.
+The confined branch illustrates one mod's two roles; repeat the child boundaries
+per admitted mod/domain. No mod shares a first-party VM. All cross-mod
+communication is brokered by the parent. A child
 report is untrusted input, not authority to commit a game step or allocate an
 unbounded presentation tree. The parent validates schema, quota, identity,
 permissions, and the application's commit rule before publication.
@@ -394,8 +457,9 @@ The host offers a bracket-shaped **IO lifetime**, not an ordinary
 resources underneath it may still use the existing resource primitives.
 
 The following is the **local VM boundary**, inside the confined child or a
-trusted embedding. The engine's supervised worker instead owns the child
-process and its IPC, as specified in P-13; it never owns an untrusted Lua heap.
+trusted embedding. A trusted supervised worker owns its local VM lifetime.
+For confined execution, the engine's supervised worker owns the child process
+and its IPC, as specified in P-13; it never owns an untrusted Lua heap.
 The local execution owner covers the complete managed VM lifetime:
 
 1. Initial construction creates only bounded control/transport resources.
@@ -412,8 +476,8 @@ The local execution owner covers the complete managed VM lifetime:
    dependencies and reports normal interpreter completion. A forced child exit
    follows P-13 instead and never claims that finalizers ran.
 
-The parent's worker startup acknowledgement means its `Scoped` construction
-finished; it does **not** mean the child is confined or its interpreter ready.
+The worker startup acknowledgement means its `Scoped` construction finished;
+it does **not** mean the interpreter is ready or, for a child, confined.
 `startSupervised`
 does not accept a caller-composed startup wait. The adapter therefore needs one
 explicit component-readiness wait through `awaitSupervised`, composing readiness
@@ -481,6 +545,20 @@ Classify each registered binding:
 | Command or UI intention | Validate and admit to a bounded owner queue; return acceptance/rejection |
 | Asynchronous native request | Reserve bounded result capacity, enqueue, return a request identity |
 | Lifecycle operation | Request a controlled boundary transition; no recursive scheduler entry |
+
+D-14 adds explicit execution-path eligibility to that shared definition.
+Registration defaults to no mod exposure. Direct bindings need no IPC
+equivalent; exposure to a mod requires both a supported bounded representation
+and an explicit grant. LUA-3 defines this metadata and the trusted bindings;
+LUA-13 implements broker enforcement and transport exposure.
+
+| Binding kind | Confined-path behavior |
+| --- | --- |
+| Snapshot query | Read a granted, bounded local snapshot; no synchronous parent query |
+| Owned state operation | Mutate child-owned state only; parent state changes require validated commands |
+| Command or UI intention | Submit a bounded, authorized request |
+| Asynchronous native request | Use brokered admission and result delivery |
+| Lifecycle operation | Request a permitted transition; the parent retains authority |
 
 The parent authorizes every wire request using its launch-bound mod/domain
 identity and explicit grants; a fabricated child-side handle grants nothing.
@@ -985,22 +1063,25 @@ for backend selection and verified enforcement. Record any required signing
 account, installation privilege, or CI host setup before accepting that platform
 profile; the packaging answer alone does not establish those requirements.
 
-#### Readiness and processing gates after D-11
+#### Readiness and processing gates after D-13
 
 Q-3's binding selection and Q-4's external clock prerequisite are recorded
 above. Q-5 remains open under D-11: LUA-14/LUA-15 delivered evidence, but both
-verdicts are inconclusive. There are fifteen slices and no accepted production
-confinement profile. The document is exploring; ordinary issue processing
-cannot resume until the design is made ready again.
+verdicts are inconclusive. There are seventeen slices and no accepted production
+confinement profile. The document is exploring; issue processing cannot resume
+until the owner renews readiness. D-13 permits readiness for trusted delivery
+with Q-5 deliberately open and the process branch explicitly blocked.
 
 Once readiness is renewed, resume the existing ledger one child per invocation.
 Keep the completed preliminary issues linked and scope any follow-up proof to
 its remaining obstacle. Do not draft LUA-9 through LUA-13 or dependent
-integration slices until both platform verdicts are successful and recorded
-here with their evidence references. Completing or closing a feasibility issue
+integration/acceptance slices LUA-16/LUA-17 until both platform verdicts are
+successful and recorded here with their evidence references. Completing or closing a feasibility issue
 alone is not a successful verdict. If either proof fails or remains inconclusive,
-reset the design to `exploring` and return the concrete obstacle to the owner;
-do not silently defer required containment or weaken D-6/D-8/D-9. A successful
+keep process drafting blocked and return the concrete obstacle to the owner.
+That does not revoke separately approved trusted readiness. A material change
+to the design returns it to `exploring`; do not silently defer required
+containment or weaken D-6/D-8/D-9. A successful
 mechanism selection within the agreed contract resolves Q-5 without reopening
 settled preferences; a material design change requires fresh readiness signoff.
 
@@ -1018,16 +1099,23 @@ verified mechanisms; P-13 distinguishes child termination from parent cleanup.
 
 ### Q-8. Reconciling the trusted in-process path
 
-Open after D-12. P-2 draws both domains as mod processes and does not yet show
-first-party domains. Still to decide: whether D-12 lets the in-process slices
-(LUA-2, LUA-3, LUA-5 through LUA-8) resume before Q-5's confinement gate while
-LUA-9 through LUA-13 stay paused; and which binding kinds the confined path
-exposes over IPC. D-6 already settles that a mod never shares a first-party
-in-process VM. Stop and ask the owner; do not resolve these during processing.
+Resolved by D-13 and D-14, explicitly approved on 2026-09-24. Trusted delivery
+(LUA-2, LUA-3, LUA-5 through LUA-8) may proceed independently of Q-5 after
+renewed readiness. LUA-9 through LUA-13 and confined integration/acceptance
+(LUA-16/LUA-17) remain gated on both successful platform verdicts. P-2 now
+shows first-party VM owners as well as separate mod processes. P-4 records
+binding eligibility and the confined subset, with no mod exposure by default.
+Required confinement remains part of epic completion. Approval of these choices
+does not itself renew readiness or approve issue processing.
 
 ## Verification strategy
 
 The design requires observable contracts rather than one happy-path Lua call:
+
+LUA-8 proves the trusted milestone using the applicable binding, protocol,
+failure, and two-domain checks below. LUA-17 adds confined system and
+adversarial acceptance after Q-5; trusted evidence cannot satisfy containment.
+Both milestones are required for epic completion.
 
 1. **Binding/lifetime:** creation and partial-initialization faults; repeated
    loading/calling without stack/ref growth; callback exceptions in both
@@ -1147,9 +1235,9 @@ and verified policy, with adversarial regression coverage.
 ### LUA-2. Own the VM through a protected IO lifetime
 
 > The former Q-3/#146 prerequisite is satisfied. Reuse the selected binding's
-> package contract rather than repeating its proof. The document-wide D-11
-> pause still applies: resolve Q-5 and renew readiness before processing this
-> slice. LUA-4 has already been processed and implemented independently.
+> package contract rather than repeating its proof. D-13 permits this slice
+> independently of Q-5 after renewed readiness. LUA-4 has already been
+> processed and implemented independently.
 
 - **Outcome:** one owner constructs, uses, and closes a VM while preserving
   primary/cleanup evidence and callback dependencies on every supported exit.
@@ -1159,12 +1247,13 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** host ownership.
 - **Depends on:** LUA-1.
 - **Ordering:** critical path after readiness resumes; the independent LUA-4 model is already delivered.
-- **Relevant decisions:** D-1, D-2, D-4.
+- **Relevant decisions:** D-1, D-2, D-4, D-12, D-13.
 - **Acceptance signals:** failure/cancellation matrix including close callbacks;
   no ordinary uninterruptible Lua release; no leaked/public native handles;
   cleanup evidence still classifiable by runtime.
 - **Out of scope:** module namespaces, worker adapter, scheduler, hard deadlines.
-- **Open questions:** Q-3 is resolved; Q-5 and renewed document readiness remain the processing gate.
+- **Open questions:** Q-3 is resolved; renewed document readiness remains the
+  processing gate. Q-5 does not gate this trusted slice.
 
 ### LUA-3. Add application-owned modules and bounded value bindings
 
@@ -1172,16 +1261,20 @@ and verified policy, with adversarial regression coverage.
   module, and calls it through bounded values and attributable results.
 - **Scope:** P-4 public API, required/optional entry points, stack/ref discipline,
   marshalling limits and invalid handles, module identity, error formatting, and
-  per-domain namespace/library policy. Tests live beside the host.
+  per-domain namespace/library policy. Define shared registration with explicit
+  execution-path eligibility and no mod exposure by default (D-14); implement
+  trusted direct bindings here. Tests live beside the host.
 - **Phase:** host consumer boundary.
 - **Depends on:** LUA-2.
-- **Ordering:** critical path; can run alongside LUA-4 after LUA-2.
-- **Relevant decisions:** D-1, D-2, D-4, D-6, D-9.
+- **Ordering:** trusted critical path after LUA-2; LUA-4 is already delivered.
+- **Relevant decisions:** D-1, D-2, D-4, D-6, D-9, D-12, D-13, D-14.
 - **Acceptance signals:** independent module state; no concrete game imports;
   bounded validation/copying; missing versus failed calls distinct; no reentrant
-  native owner access or leaked stack/registry references.
-- **Out of scope:** asynchronous providers, live reload, coroutine scheduler.
-- **Open questions:** None once LUA-1's gate is satisfied.
+  native owner access or leaked stack/registry references; default registration
+  exposes nothing to mods and a direct binding need not have an IPC equivalent.
+- **Out of scope:** asynchronous providers, live reload, coroutine scheduler,
+  IPC implementation and mod admission (LUA-13/LUA-16).
+- **Open questions:** None; Q-8 is resolved. Renewed readiness still gates processing.
 
 ### LUA-4. Model bounded script tasks and execution protocols
 
@@ -1199,6 +1292,95 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** ready-queue selection policy, VM workers, native providers.
 - **Open questions:** None; D-7 fixes failure policy and D-8 scopes identities.
 
+### LUA-5. Integrate trusted VM owners with runtime supervision
+
+- **Outcome:** a supervised in-process owner exposes a ready trusted Lua endpoint
+  and retains VM/callback dependencies through close without a new supervisor.
+- **Scope:** public runtime sublibrary integration and its Hspec/CI target;
+  P-3 component readiness, bounded admission, P-8 failure composition, and P-9
+  shutdown evidence. Readiness includes registration and VM initialization.
+  Reuse LUA-4's protocol model with explicit first-party owner identity; identity
+  alone must never confer trust or grants. Start with finite call dispatch.
+- **Phase:** trusted runtime ownership.
+- **Depends on:** LUA-3, LUA-4.
+- **Ordering:** trusted critical path, independent of Q-5.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
+- **Acceptance signals:** readiness cannot hang on dead initialization;
+  abandoned startup remains owned; full backlog then stop; original failure and
+  cleanup preserved; fatal host failures follow normal supervision;
+  a stuck VM retains its dependencies; VM ready
+  is not confused with the worker's earlier startup acknowledgement.
+- **Out of scope:** deadline scheduling, request/subscription providers, UI/game
+  composition, confined process integration (LUA-16), replacement of
+  Runtime.Inbox or the application runner.
+- **Open questions:** None once predecessor gates are satisfied.
+
+### LUA-6. Schedule cooperative tasks with bounded service turns
+
+- **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
+  events/deadlines, and reports real budget overruns without fake preemption.
+- **Scope:** P-5/P-6 ready classes, finite quanta, coroutine/explicit-segment
+  integration, owned cancellable timer adapter, injected-clock tests, and P-11
+  aggregate scheduling diagnostics. Keep existing task/disposition contracts
+  and reusable scheduling machinery independent of process transport.
+- **Phase:** execution policy.
+- **Depends on:** LUA-5; external TIME-1 (Q-4).
+- **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13.
+- **Acceptance signals:** peers get bounded opportunities at safe yields;
+  paused/event-only work does not spin; stop wakes waits; logical time advances
+  only on explicit completion; elapsed budget cannot be sold as a hard limit.
+- **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
+  coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
+- **Open questions:** Q-4 before processing.
+
+### LUA-7. Add bounded asynchronous requests and owned subscriptions
+
+- **Outcome:** scripts can wait for an engine operation or event without
+  blocking the owner or invoking Lua from a producer thread.
+- **Scope:** P-7 reserved result slots, admission/status protocol, subscription
+  ownership, epoch invalidation, bounded overload, and fake providers; expose
+  readiness/resumption through LUA-4's protocol for LUA-6 to consume. Deliver
+  trusted in-process dispatch and reusable provider bookkeeping here;
+  LUA-13/LUA-16 supply broker enforcement and confined integration.
+- **Phase:** component integration protocol.
+- **Depends on:** LUA-5.
+- **Ordering:** independent of LUA-6 and Q-5; no clock prerequisite. Parallel
+  modules share LUA-4's model and LUA-3's registration contract.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14.
+- **Acceptance signals:** full output paths never block provider completion;
+  duplicate/late results harmless; unsubscribe and stop races settle once;
+  provider dependency lifetime extends to actual completion, not cancellation
+  of interest; callbacks execute only on their VM owner.
+- **Out of scope:** actual pathfinding/assets/graphics services, general RPC or
+  broadcast, automatic restart, mandatory draining of infinite subscriptions.
+- **Open questions:** None once predecessor gates are satisfied.
+
+### LUA-8. Prove independent trusted UI and gameplay execution headlessly
+
+- **Outcome:** the trusted system milestone demonstrates responsive first-party
+  Lua UI during busy finite gameplay, with independent in-process VMs, coherent
+  state, and protected VM/dependency lifetime.
+- **Scope:** a small application-owned consumer with two domains, intentions,
+  explicit gameplay grants and staged snapshot commit; P-2/P-8 policy and P-12
+  real-interpreter acceptance; reproduction commands and bounded optional
+  profiling workloads delivered in the same PR.
+- **Phase:** trusted integrated acceptance.
+- **Depends on:** LUA-6, LUA-7.
+- **Ordering:** after LUA-6/LUA-7, independent of Q-5; no Vulkan or GLFW dependency.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
+- **Acceptance signals:** UI makes progress before gameplay completes; no shared
+  VM/global state; coherent old/new views and exactly-once accepted intentions;
+  explicit overload, gameplay-session failure, and cleanup evidence. Demonstrate
+  direct registration without weakening cross-owner boundaries. Record
+  Linux and local macOS execution with the supported threaded RTS/binding.
+- **Out of scope:** real game/UI rendering, sharding one gameplay domain, save/load,
+  new game architecture, hard latency promises or a broad benchmark framework,
+  mod admission and confinement proof (LUA-17). This milestone does not complete
+  the epic.
+- **Open questions:** None once predecessor gates are satisfied; D-7 fixes
+  gameplay failure, not an implicit new transaction or save policy.
+
 ### LUA-9. Add bounded child-process transport and owned process lifetime
 
 - **Outcome:** a parent owns a child and bounded private IPC through launch,
@@ -1208,7 +1390,7 @@ and verified policy, with adversarial regression coverage.
   and trusted test peers. Bind protocol task/result types to LUA-4. Document
   normal versus killed exit evidence and parent resource ownership.
   Introduce private process-support modules and their package-owned Hspec
-  target/affected CI group; LUA-5 adds the public runtime integration.
+  target/affected CI group; LUA-16 adds the public confined runtime integration.
 - **Phase:** process foundation.
 - **Depends on:** LUA-3, LUA-4, LUA-14, LUA-15 (both successful verdicts).
 - **Ordering:** prerequisite for platform and broker branches.
@@ -1285,122 +1467,97 @@ and verified policy, with adversarial regression coverage.
 - **Scope:** P-4/P-13 launch-bound grant set, checked handles and epochs, bounded
   bundle/module resolution, parent validation of proposed output, and ownership
   of provider requests/leases through revocation and child death. Use fake
-  application providers; do not implement game rules in the engine.
+  application providers; do not implement game rules in the engine. Enforce
+  LUA-3's shared registration eligibility and D-14's binding subset; expose
+  only explicitly granted bindings with supported bounded transport semantics.
 - **Phase:** authorization boundary.
 - **Depends on:** LUA-9.
 - **Ordering:** can run alongside both platform branches and LUA-12.
-- **Relevant decisions:** D-2, D-4, D-6, D-7, D-8, D-9.
+- **Relevant decisions:** D-2, D-4, D-6, D-7, D-8, D-9, D-14.
 - **Acceptance signals:** forged/stale/cross-mod capabilities and traversal
   requests rejected; quotas before allocation/effect; authoritative commit
   requires application validation; leases survive child exit until actual
-  provider completion; every outcome retains the originating mod/domain.
+  provider completion; every outcome retains the originating mod/domain;
+  a direct-only binding cannot be reached by a forged wire request.
 - **Out of scope:** global game environment, general permission UI, filesystem/
   network permission grants, arbitrary native callbacks into the parent.
 - **Open questions:** Q-5's threat boundary must be resolved before processing.
 
-### LUA-5. Integrate VM owners with runtime supervision
+### LUA-16. Integrate confined mod owners with the runtime
 
-- **Outcome:** a supervised parent owner exposes a ready, confined Lua endpoint
+- **Outcome:** a supervised parent owner exposes a ready confined Lua endpoint
   and retains process/provider dependencies through exit without a new supervisor.
-- **Scope:** public runtime sublibrary integration and its Hspec/CI target;
-  P-3 component readiness, bounded admission, P-8 failure composition, P-9/P-13
-  shutdown/exit evidence. Readiness includes verified confinement, limits,
-  grants, and VM initialization. Start with finite call dispatch.
-- **Phase:** runtime ownership.
-- **Depends on:** LUA-12, LUA-13.
-- **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-6, D-7, D-8, D-9.
-- **Acceptance signals:** readiness cannot hang on dead initialization;
-  abandoned startup remains owned; full backlog then stop; original failure and
-  parent cleanup preserved; fatal parent failures follow normal supervision;
-  child faults stay attributed component outcomes; VM ready
-  is not confused with the worker's earlier startup acknowledgement.
-- **Out of scope:** deadline scheduling, request/subscription providers, UI/game
-  composition, replacement of Runtime.Inbox or the application runner.
-- **Open questions:** None once predecessor gates are satisfied.
+- **Scope:** extend the runtime adapter with P-13 process ownership, bounded
+  transport, parent-verified confinement/limits/grants, and component readiness.
+  Connect LUA-6's reusable task service and LUA-7's request/subscription protocol
+  to the confined child and LUA-13's broker. Reuse registration under D-14.
+  Include package-owned integration tests and the public lifetime contract.
+- **Phase:** confined runtime integration.
+- **Depends on:** LUA-6, LUA-7, LUA-12, LUA-13.
+- **Ordering:** joins the shared runtime and qualified process branches.
+- **Relevant decisions:** D-1, D-4, D-6, D-7, D-8, D-9, D-12, D-13, D-14.
+- **Acceptance signals:** child readiness alone cannot admit work; failed or
+  abandoned initialization remains owned; missing confinement refuses admission
+  without trusted fallback; attributed child faults and parent cleanup evidence
+  remain distinct; forced exit is observed before process quota release, while
+  provider dependencies remain live until actual provider completion; no new
+  work enters during stop and no helper or borrowed resource is abandoned.
+- **Out of scope:** new sandbox mechanisms, a replacement supervisor, real game
+  services, and the full adversarial system acceptance (LUA-17).
+- **Open questions:** Q-5 must be resolved by both successful platform verdicts
+  before processing; predecessor gates and renewed readiness also apply.
 
-### LUA-6. Schedule cooperative tasks with bounded service turns
+### LUA-17. Prove confined execution and adversarial isolation headlessly
 
-- **Outcome:** one child VM owner services resumable tasks fairly, wakes for
-  events/deadlines, and reports real budget overruns without fake preemption.
-- **Scope:** P-5/P-6 ready classes, finite quanta, coroutine/explicit-segment
-  integration, owned cancellable timer adapter, injected-clock tests, and P-11
-  aggregate scheduling diagnostics. Keep existing task/disposition contracts.
-- **Phase:** execution policy.
-- **Depends on:** LUA-5; external TIME-1 (Q-4).
-- **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4.
-- **Acceptance signals:** peers get bounded opportunities at safe yields;
-  paused/event-only work does not spin; stop wakes waits; logical time advances
-  only on explicit completion; elapsed budget cannot be sold as a hard limit.
-- **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
-  coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-4 before processing.
-
-### LUA-7. Add bounded asynchronous requests and owned subscriptions
-
-- **Outcome:** scripts can wait for an engine operation or event without
-  blocking the owner or invoking Lua from a producer thread.
-- **Scope:** P-7 reserved result slots, admission/status protocol, subscription
-  ownership, epoch invalidation, bounded overload, and fake providers; expose
-  readiness/resumption through LUA-4's protocol for LUA-6 to consume.
-- **Phase:** component integration protocol.
-- **Depends on:** LUA-5.
-- **Ordering:** independent of LUA-6; no additional clock work. Parallel
-  modules share the already-reviewed LUA-4/LUA-13 contracts. TIME-1 is already
-  a transitive prerequisite through LUA-12/LUA-5.
-- **Relevant decisions:** D-1, D-2, D-3, D-4.
-- **Acceptance signals:** full output paths never block provider completion;
-  duplicate/late results harmless; unsubscribe and stop races settle once;
-  provider dependency lifetime extends to actual completion, not cancellation
-  of interest; callbacks execute only on their VM owner.
-- **Out of scope:** actual pathfinding/assets/graphics services, general RPC or
-  broadcast, automatic restart, mandatory draining of infinite subscriptions.
-- **Open questions:** None once predecessor gates are satisfied.
-
-### LUA-8. Prove independent UI and gameplay execution headlessly
-
-- **Outcome:** the first system milestone demonstrates responsive Lua UI
-  during busy/misbehaving gameplay, with per-mod/domain confinement, coherent
-  state, and safe parent resource retirement.
-- **Scope:** a small application-owned consumer with two domains, intentions,
-  explicit gameplay grants and staged snapshot commit; P-2/P-8 policy and P-12
-  real-interpreter and P-13 adversarial acceptance; reproduction commands and bounded optional
-  profiling workloads delivered in the same PR.
-- **Phase:** integrated acceptance.
-- **Depends on:** LUA-6, LUA-7.
-- **Ordering:** after both branches; no Vulkan or GLFW dependency.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-6, D-7, D-8, D-9.
-- **Acceptance signals:** UI makes progress before gameplay completes; no shared
-  VM/global state; coherent old/new views and exactly-once accepted intentions;
-  explicit overload, gameplay-session failure, enforced child limits, another
-  mod's continued isolation, and parent cleanup evidence. Record
-  Linux and local macOS execution with the supported threaded RTS/binding.
-- **Out of scope:** real game/UI rendering, sharding one gameplay domain, save/load,
-  new game architecture, hard latency promises or a broad benchmark framework.
-- **Open questions:** None once predecessor gates are satisfied; D-7 fixes
-  gameplay failure, not an implicit new transaction or save policy.
+- **Outcome:** the confined system milestone demonstrates independent mod/domain
+  execution alongside trusted first-party owners, with enforced permissions and
+  limits, coherent publication, and safe parent resource retirement.
+- **Scope:** extend LUA-8's headless consumer with confined mod roles and P-13
+  adversarial acceptance. Retain reproducible Linux and local macOS evidence,
+  supported deployment prerequisites, contracts, and verdicts in this code PR.
+- **Phase:** confined integrated acceptance and epic completion evidence.
+- **Depends on:** LUA-8, LUA-16.
+- **Ordering:** after both system branches; no Vulkan or GLFW dependency.
+- **Relevant decisions:** D-1, D-4, D-6, D-7, D-8, D-9, D-12, D-13, D-14.
+- **Acceptance signals:** forbidden access and forged/stale/cross-mod requests
+  are refused; malformed/oversized/flooded transport stays bounded; execution,
+  memory, and hanging-close violations terminate the offending child; other
+  mod/domain and trusted UI owners continue making progress; output is committed
+  only after parent validation; missing prerequisites refuse admission; no mod
+  shares a first-party VM or gains a direct-only binding; parent cleanup and
+  provider retirement preserve their distinct completion evidence.
+- **Out of scope:** real game/UI rendering, broader mod permissions, automatic
+  restart/replay, hard latency guarantees, or treating child death as completion
+  of outstanding parent provider/GPU work.
+- **Open questions:** Q-5 must be resolved before processing. Completion requires
+  successful evidence on both platforms; passing trusted tests is insufficient.
 
 ## Deferred extensions and next-session handoff
 
-The dependency order remains external VK-1/#157, then LUA-1,
-then LUA-14/LUA-15 and LUA-2/LUA-4 independently; LUA-3 after LUA-2; LUA-9 after LUA-3/LUA-4 and both
-successful platform proofs; LUA-10,
-LUA-11, and LUA-13 in parallel; LUA-12 after both platform slices and TIME-1;
-LUA-5 after LUA-12/LUA-13; LUA-6 and LUA-7 in parallel; then LUA-8. Stable IDs
-are preserved as the containment branch was added. All of this can run alongside
+The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
+LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; LUA-6 and LUA-7 in parallel;
+then LUA-8. LUA-6 retains external TIME-1; LUA-7 has no clock prerequisite.
+The shared VK-1 toolchain prerequisite remains satisfied.
+
+The confined branch remains LUA-9 after LUA-3/LUA-4 and both successful
+platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
+platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-12/LUA-13; then
+LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
+retaining the confined integration and acceptance removed from LUA-5/LUA-8.
+There are seventeen delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
 
-The next handoff is design reconciliation of Q-5 using the two merged verdicts,
-not `process-design-doc`. Resolve the deployment obstacles and record any
-owner decision before renewing readiness. Once ready, resume the existing
-epic/ledger one child per invocation; do not recreate #145 or #146–#149.
-Respect D-11's two successful platform verdicts before dependent process
-drafting. Q-1/Q-2/Q-6/Q-7 are already answered by D-6 through D-9; the current
-evidence does not itself authorize changing them or returning to a single
-scripting worker. Keep required untrusted-mod isolation in this arc.
+Q-8 is resolved by D-13/D-14. The next checkpoint is explicit readiness
+signoff for this reconciled design, with Q-5 deliberately open and the confined
+branch blocked. Decision approval alone does not authorize issue processing.
+Once readiness is approved, resume the existing epic/ledger one child per
+invocation, starting with LUA-2; do not recreate #145 or #146–#149.
+Resolve Q-5's deployment obstacles and record both successful platform verdicts
+before drafting LUA-9 through LUA-13 or LUA-16/LUA-17. Neither trusted delivery
+nor completed feasibility issues discharge that gate. Required untrusted-mod
+isolation remains part of epic completion; D-6 through D-9 still apply.
 
 Further arcs require their own evidence and scope: a sharded authoritative
 simulation; durable saves/hot reload; broader mod permissions/distribution;
