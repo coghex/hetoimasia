@@ -60,6 +60,14 @@ LINUX_LAYER_MANIFEST=/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validati
 LINUX_LAYER_MANIFEST_SHA256=1c3625d8a05576ea7470377ada95825d80c09ed6a9e25128b9d9d7901144f50c
 LINUX_LAYER_NAME=VK_LAYER_KHRONOS_validation
 LINUX_LAYER_VERSION=1.3.275
+# The validation features every validation-enabled instance turns on through
+# its own create info, and which the layer's manifest must therefore offer the
+# extension for. `synchronization` is the Khronos layer's synchronization
+# validation (VK_EXT_validation_features); the layer leaves it off otherwise,
+# so a clean verdict without it says nothing about barriers. It is part of the
+# layer's identity: `vulkan-layers` names it, and changing it moves every
+# identity this pin feeds.
+LINUX_LAYER_FEATURES=synchronization
 
 # Both Linux manifests name their library by bare filename, which the loader
 # resolves through the dynamic linker's own search path rather than against the
@@ -110,6 +118,8 @@ MACOS_LAYER_MANIFEST=/usr/local/share/vulkan/explicit_layer.d/VkLayer_khronos_va
 MACOS_LAYER_MANIFEST_SHA256=ed025f0d871a2ef3b21d845dc7572d621f78dd178b73e7e5c446604812264985
 MACOS_LAYER_NAME=VK_LAYER_KHRONOS_validation
 MACOS_LAYER_VERSION=1.3.296
+# As on Linux: synchronization validation, through the create info.
+MACOS_LAYER_FEATURES=synchronization
 MACOS_LAYER_LIBRARY_SHA256=dc6b9c2fd7b6e19c2b1d66fbc837bceaca72e62ea63114de17bd86b4e2d49d95
 
 MACOS_GLSLANG=/usr/local/bin/glslangValidator

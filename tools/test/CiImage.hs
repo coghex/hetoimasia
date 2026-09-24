@@ -16,7 +16,7 @@ module CiImage (spec) where
 import Control.Exception (evaluate, finally)
 import Control.Monad (forM_, void, when)
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, sort, stripPrefix)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, sort, stripPrefix)
 import Json (asArray, asString, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
 import System.Directory
@@ -804,6 +804,54 @@ spec = describe "CI image" $ do
           lookup "vulkan-loader" identities `shouldSatisfy` maybe False (fixtureLoaderVersion `isPrefixOf`)
           lookup "vulkan-layers" identities `shouldSatisfy` maybe False (fixtureLayerName `isPrefixOf`)
           lookup "glslang" identities `shouldSatisfy` maybe False (fixtureGlslangVersion `isPrefixOf`)
+
+      it "qualifies the layer for the validation features the pin names, and names them in its identity" $
+        withNative $ \native → do
+          let pin = nativeRecipe native </> "vulkan.pin"
+          appendFile pin "MACOS_LAYER_FEATURES=synchronization\n"
+          nativeOk native [] ["record", "--prefix", nativePrefix native]
+          identities ← nativeIdentities native
+          lookup "vulkan-layers" identities `shouldSatisfy` maybe False (" +synchronization" `isSuffixOf`)
+          (prepared, discovery, prepareErrors) ←
+            nativeTool native [] ["prepare", "--prefix", nativePrefix native, "--build-dir", nativeBuild native]
+          (prepared, prepareErrors) `shouldBe` (ExitSuccess, "")
+          lines discovery `shouldContain` ["export HETOIMASIA_VULKAN_VALIDATION_FEATURES=synchronization"]
+          -- A feature the recipe does not know is a configuration error, not
+          -- a layer to qualify.
+          appendFile pin "MACOS_LAYER_FEATURES=telepathy\n"
+          (unknown, _, unknownErrors) ← nativeTool native [] ["record", "--prefix", nativePrefix native]
+          unknown `shouldBe` ExitFailure 2
+          unknownErrors `shouldContain` "names validation features telepathy"
+          appendFile pin "MACOS_LAYER_FEATURES=synchronization\n"
+          -- A layer whose own manifest does not offer the extension the
+          -- feature's create info needs cannot be asked for it, and is refused
+          -- before anything is provisioned rather than at a run's first
+          -- instance. The pin still qualifies the manifest by digest, so the
+          -- stripped manifest is pinned too.
+          (stripped, _, strippedErrors) ←
+            run
+              (nativeEnvironment native)
+              (nativeDirectory native)
+              (nativePython native)
+              [ "-c"
+              , unlines
+                  [ "import hashlib, json, sys"
+                  , "manifest, pin = sys.argv[1:3]"
+                  , "document = json.load(open(manifest, encoding='utf-8'))"
+                  , "document['layer']['instance_extensions'] = [{'name': 'VK_EXT_debug_utils', 'spec_version': '2'}]"
+                  , "open(manifest, 'w', encoding='utf-8').write(json.dumps(document))"
+                  , "digest = hashlib.sha256(open(manifest, 'rb').read()).hexdigest()"
+                  , "lines = [('MACOS_LAYER_MANIFEST_SHA256=' + digest) if line.startswith('MACOS_LAYER_MANIFEST_SHA256=') else line"
+                  , "         for line in open(pin, encoding='utf-8').read().splitlines()]"
+                  , "open(pin, 'w', encoding='utf-8').write(chr(10).join(lines) + chr(10))"
+                  ]
+              , nativeInputs native </> ("share/vulkan/explicit_layer.d/" ++ fixtureLayerName ++ ".json")
+              , pin
+              ]
+          (stripped, strippedErrors) `shouldBe` (ExitSuccess, "")
+          (refused, _, errors) ← nativeTool native [] ["record", "--prefix", nativePrefix native]
+          refused `shouldBe` ExitFailure 1
+          errors `shouldContain` "not VK_EXT_validation_features, so the pinned synchronization validation cannot be enabled"
 
       forM_ substitutions $ \substitution →
         it ("refuses a prefix whose " ++ substitutionLabel substitution ++ " was replaced, manifest and all") $
@@ -2147,6 +2195,7 @@ fixtureLayer directory =
     , "    \"api_version\": \"" ++ fixtureLoaderVersion ++ "\","
     , "    \"implementation_version\": \"1\","
     , "    \"description\": \"A fixture standing in for the validation layer\","
+    , "    \"instance_extensions\": [{\"name\": \"VK_EXT_debug_utils\", \"spec_version\": \"2\"}, {\"name\": \"VK_EXT_validation_features\", \"spec_version\": \"2\"}],"
     , "    \"library_path\": \"" ++ (directory </> "lib/libVkLayer_fixture.dylib") ++ "\""
     , "  }"
     , "}"
