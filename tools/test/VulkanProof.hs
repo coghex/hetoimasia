@@ -65,6 +65,11 @@ provisionedRecords =
 captureRecords ∷ [(String, FilePath)]
 captureRecords = [("macOS", "docs/vulkan/macos-vk6.md"), ("Linux", "docs/vulkan/linux-vk6.md")]
 
+-- | The records VK-5's native cases produced: the same proof run, retained for
+-- its production surface bridge section.
+bridgeRecords ∷ [(String, FilePath)]
+bridgeRecords = [("macOS", "docs/vulkan/macos-vk5.md"), ("Linux", "docs/vulkan/linux-vk5.md")]
+
 compatibilityRecord ∷ FilePath
 compatibilityRecord = "docs/vulkan_compatibility_record.md"
 
@@ -92,6 +97,7 @@ readByTheseExamples =
     <> map snd retainedRecords
     <> map snd provisionedRecords
     <> map snd captureRecords
+    <> map snd bridgeRecords
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -421,6 +427,40 @@ spec = describe "The Vulkan proof boundary" $ do
 
   it "proved the VK-6 capture on both platforms from one tree" $ do
     digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") captureRecords
+    map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
+    length (nub (map (fmap trim) digests)) `shouldBe` 1
+
+  it "retains a VK-5 record for each platform, each a pass that restored GLFW's default after the bridge's session" $
+    mapM_
+      ( \(platform, path) → do
+          record ← readFile path
+          take 1 (lines record) `shouldBe` ["# The VK-5 surface bridge record, " <> platform]
+          let marked = [number | (number, line) ← zip [0 ∷ Int ..] (lines record), line == capturedMarker]
+          case marked of
+            [only] →
+              take 1 (dropWhile null (drop (only + 1) (lines record)))
+                `shouldBe` ["Verdict: **pass**."]
+            _ → expectationFailure (platform <> "'s VK-5 record marks its captured output " <> show (length marked) <> " times, not once")
+          -- The bridge section's own readings: the surface was refused its
+          -- retirement while owed and destroyed off the owner, and the loader
+          -- setting was restored once the session ended.
+          fmap trim (settingOf record "- disposal fact while owed:") `shouldBe` Just "Nothing"
+          fmap trim (settingOf record "- discharge:") `shouldBe` Just "SurfaceDestroyed"
+          fmap trim (settingOf record "- discharged off the owner thread:") `shouldBe` Just "yes"
+          fmap trim (settingOf record "- shim setting after termination:") `shouldBe` Just "0x0000000000000000"
+          fmap trim (settingOf record "- capability after termination:") `shouldBe` Just "IntegrationRestored"
+      )
+      bridgeRecords
+
+  it "observed the reset after a failed initialization in the Linux VK-5 record" $ do
+    -- Cocoa offers no initialization failure an application can provoke, so
+    -- the native observation of this path is Linux's alone.
+    record ← readFile "docs/vulkan/linux-vk5.md"
+    fmap trim (settingOf record "- shim setting after the failed initialization:") `shouldBe` Just "0x0000000000000000"
+    fmap trim (settingOf record "- capability after the failed initialization:") `shouldBe` Just "IntegrationRestored"
+
+  it "proved the VK-5 bridge on both platforms from one tree" $ do
+    digests ← mapM (\(_, path) → (settingOf <$> readFile path) <*> pure "- source digest:") bridgeRecords
     map (fmap trim) digests `shouldSatisfy` all (/= Nothing)
     length (nub (map (fmap trim) digests)) `shouldBe` 1
 

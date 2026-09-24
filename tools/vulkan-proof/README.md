@@ -363,9 +363,11 @@ VK-5 section prints each of these.
 
 The record's source digest covers the GLFW package and the runtime as well, so a
 change to the bridge moves it. The Linux record from the `vulkan-proof` route is
-retained as [`docs/vulkan/linux-vk5.md`](../../docs/vulkan/linux-vk5.md); a
-macOS record is retained beside it only for a local run under the human's
-explicit approval for that session.
+retained as [`docs/vulkan/linux-vk5.md`](../../docs/vulkan/linux-vk5.md), and the
+record of a local macOS run under the human's explicit approval for that session
+as [`docs/vulkan/macos-vk5.md`](../../docs/vulkan/macos-vk5.md); both carry one
+source digest. VK-8 migrates these cases into the package-native fixture and
+retires this route for them.
 
 ## Running it
 
