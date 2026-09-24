@@ -9,7 +9,8 @@
 -- quiescence examples add a counter, whose dependency is a reply desk a worker
 -- may be left waiting on. The managed-lifetime examples add a hub, a scripted
 -- component built on a parent whose lifetime encloses every borrower and
--- drains in its release.
+-- drains in its release. The drain-status example reads the group's status
+-- from a thread outside supervision while a managed run drains.
 --
 -- The examples prove the composition, not the matrices it reuses: supervision's
 -- classification and closing are proven by "Test.Runtime.Supervision",
@@ -25,6 +26,7 @@ import Control.Exception
   ( AsyncException (ThreadKilled)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , finally
   , fromException
   , throwIO
   , try
@@ -67,7 +69,18 @@ import Hetoimasia.Foundation.Resource
   , withResourceLabelled
   , withScoped
   )
-import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, stopRequested, workerDefinition)
+import Hetoimasia.Foundation.Worker
+  ( GroupPhase (..)
+  , GroupStatus (..)
+  , Outstanding (..)
+  , OutstandingWorker (..)
+  , Requested (..)
+  , StopToken
+  , WorkerDefinition
+  , awaitStopRequest
+  , stopRequested
+  , workerDefinition
+  )
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadFinished), threadStatus)
 import Hetoimasia.Runtime.Application (runManagedApplication, runScopedApplication, runScopedApplicationWithQuiescence)
 import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
@@ -81,6 +94,7 @@ import Hetoimasia.Runtime.Supervision
   , awaitSupervised
   , startSupervised
   , supervisedWorker
+  , workerGroupStatus
   , workerStatus
   )
 import System.IO.Error (ioeGetErrorString)
@@ -192,6 +206,9 @@ spec = describe "Application lifecycle" $ do
       testManagedReleaseFailureAfterSuccess
     it "leaves the Scoped entry points identical to the managed runner over withScoped"
       testScopedIdenticalToManaged
+  describe "Drain status" $ do
+    it "lets a thread outside supervision read a held worker while the managed run drains, changing nothing"
+      testStatusDuringManagedDrain
 
 -- Harness ----------------------------------------------------------------------
 
@@ -1205,3 +1222,95 @@ testScopedIdenticalToManaged = boundedSupervision $ do
     viaManaged ← scenario managed failing
     scenario runIn failing `shouldReturn` viaManaged
     scenario quiescent failing `shouldReturn` viaManaged
+
+-- Drain status -------------------------------------------------------------------
+
+-- | What one drain-status run left for a caller: whether the action's failure
+-- stayed primary, the trace, the managed report messages, the flush count, and
+-- what the outside thread read.
+data DrainRun = DrainRun
+  { drainPrimary ∷ Bool
+  , drainTrace ∷ [Text]
+  , drainReports ∷ [Text]
+  , drainFlushes ∷ Int
+  , drainReads ∷ [GroupStatus]
+  , drainAfter ∷ GroupStatus
+  }
+  deriving (Eq, Show)
+
+-- | A managed run whose required service holds an uninterruptible wait, so the
+-- drain after the action fails blocks on its cancellation. Application
+-- assembly hands the control to a thread started outside supervision, which
+-- waits for the drain, reads the status twice when @observe@ says so, and then
+-- releases the service. The coordination is the same either way.
+drainRun ∷ Bool → IO DrainRun
+drainRun observe = do
+  harness ← newHarness ignoreWrites (pure ())
+  let trace = harnessTrace harness
+  hub ← newHub trace
+  caller ← myThreadId
+  handed ← newEmptyMVar
+  release ← newEmptyMVar
+  readings ← newEmptyMVar
+  _ ← forkIO $ do
+    control ← readMVar handed
+    let observed = do
+          atomically (readTVar (hubQuiesced hub) >>= \quiesced → if quiesced then pure () else retry)
+          -- Quiescence precedes supervision's exit, so the caller's next STM
+          -- wait is the protected drain.
+          awaitBlockedOnSTM caller
+          if observe
+            then do
+              first ← atomically (workerGroupStatus control)
+              awaitBlockedOnSTM caller
+              second ← atomically (workerGroupStatus control)
+              pure [first, second]
+            else pure []
+    (observed >>= putMVar readings) `finally` putMVar release ()
+  let startup h control = do
+        record trace "startup"
+        expectLive h
+        _ ←
+          startSupervised control (required Service)
+            (workerDefinition "held" (\_ → owned trace "held") (\_ () → uninterruptibleMask_ (readMVar release)))
+            >>= expectStarted
+        putMVar handed control
+        pure h
+      action h _ = hubAction h >> throwIO (Broken "action failed")
+  failure ← expectFailure (runManagedIn harness (managedHub hub plainHub) quiesceHub startup action)
+  control ← readMVar handed
+  DrainRun (brokenIs "action failed" failure)
+    <$> traced trace
+    <*> (map entryMessage <$> errorEntries harness)
+    <*> flushes harness
+    <*> takeMVar readings
+    <*> atomically (workerGroupStatus control)
+
+testStatusDuringManagedDrain ∷ Expectation
+testStatusDuringManagedDrain = boundedSupervision $ do
+  observed ← drainRun True
+  unobserved ← drainRun False
+  observed {drainReads = []} `shouldBe` unobserved
+  drainPrimary observed `shouldBe` True
+  drainTrace observed
+    `shouldBe` ["acquire parent", "acquire hub", "enter hub", "startup", "acquire held", "action"]
+      <> ["release held", "drain hub after quiescence", "release parent", "write Application failed", "flush"]
+  drainReports observed `shouldBe` ["Application failed"]
+  drainAfter observed `shouldBe` GroupStatus GroupClosed []
+  case drainReads observed of
+    [first, second] → do
+      first `shouldBe` second
+      statusPhase first `shouldBe` GroupClosing
+      map
+        ( \entry →
+            ( outstandingLabel entry
+            , outstandingAcknowledged entry
+            , outstandingRequested entry
+            , outstandingCancelDelivered entry
+            , outstandingState entry
+            , outstandingHelpers entry
+            )
+        )
+        (statusOutstanding first)
+        `shouldBe` [("held", True, CancelWasRequested, False, AwaitingTerminal, 1)]
+    other → expectationFailure ("expected two reads during the drain, found " <> show (length other))

@@ -101,19 +101,11 @@ module Hetoimasia.Foundation.Resource
   ) where
 
 import Control.Exception
-  ( ExceptionWithContext (ExceptionWithContext)
-  , SomeException
-  , WhileHandling (WhileHandling)
+  ( SomeException
   , mask
   , rethrowIO
   , someExceptionContext
   )
-import Control.Exception.Context
-  ( ExceptionContext
-  , getExceptionAnnotations
-  )
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Hetoimasia.Foundation.Resource.Internal
   ( Assembly
@@ -127,6 +119,7 @@ import Hetoimasia.Foundation.Resource.Internal
   , cleanupFailureException
   , cleanupFailureId
   , cleanupFailureLabel
+  , cleanupFailuresInContext
   , displayCleanupFailure
   , lendAssembled
   , releaseRank
@@ -196,62 +189,6 @@ withResourceLabelled label acquire release body = mask $ \restore → do
 -- identity, not a re-expansion per route.
 cleanupFailures ∷ SomeException → [CleanupFailure]
 cleanupFailures = cleanupFailuresInContext . someExceptionContext
-
--- | 'cleanupFailures' for a caller holding an exception's context directly,
--- such as one from 'tryWithContext' or 'Control.Exception.catchNoPropagate'.
-cleanupFailuresInContext ∷ ExceptionContext → [CleanupFailure]
-cleanupFailuresInContext context = Map.elems (gatherFailures [context] Map.empty)
-
--- | Collect every reachable cleanup failure, following the two ways evidence
--- can sit below the context being inspected.
---
--- The accumulator is keyed by 'CleanupFailureId', so it is at once the record
--- of which failures have already been expanded and the deduplicated result:
--- 'Map.elems' returns entries in increasing key order, which is the order the
--- failures were observed. Expanding each distinct failure's own context at
--- most once is what keeps the cost proportional to the evidence retained
--- rather than to the number of routes that reach it; nested releases each
--- carrying the prior cleanup context offer exponentially many such routes.
---
--- Skipping an identity already in the accumulator is sound because a
--- 'CleanupFailure' is read-only outside this module: an identity reached a
--- second time carries the same label and the same exception, and therefore the
--- same context, as the first time it was expanded. 'CleanupFailure' records
--- why no client can break that correspondence.
---
--- The traversal is a worklist rather than a recursion so that the record of
--- expanded failures is shared by every branch instead of being rebuilt per
--- route. Pending contexts are expanded in no particular order, which the
--- ordering by identity above makes irrelevant to the result.
-gatherFailures
-  ∷ [ExceptionContext]
-  → Map CleanupFailureId CleanupFailure
-  → Map CleanupFailureId CleanupFailure
-gatherFailures [] found = found
-gatherFailures (context : pending) found =
-  gatherFailures (handled <> below <> pending) found'
-  where
-    -- Both kinds of nesting below this context are followed even when every
-    -- failure attached to it has been seen already: one repeated identity
-    -- must not hide the new evidence standing beside it.
-    handled =
-      [ someExceptionContext handled'
-      | WhileHandling handled' ← getExceptionAnnotations context
-      ]
-
-    (found', below) = foldl' expandOnce (found, []) (getExceptionAnnotations context)
-
-    expandOnce (seen, contexts) failure
-      | Map.member identifier seen = (seen, contexts)
-      | otherwise =
-          ( Map.insert identifier failure seen
-          , failureContext failure : contexts
-          )
-      where
-        identifier = cleanupFailureId failure
-
-    failureContext failure = case cleanupFailureException failure of
-      ExceptionWithContext carried _ → carried
 
 -- | Construct a composite value in stages, lend it to a body, and release
 -- every part it acquired in the constructor's declared order.

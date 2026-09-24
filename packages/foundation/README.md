@@ -85,7 +85,8 @@ with its own part ledger, rolled back before the classifier chooses another
 alternative; the selected attempt's parts are released when the scope exits,
 and the consumer runs once against an immutable `Available` or `Unavailable`
 value. The `Scoped` representation and the part ledger it shares with the
-resource module live in a hidden module that no client can import. See
+resource module live in the package's private `internal` sublibrary, which no
+client can import. See
 [Component construction](../../docs/resources.md#component-construction).
 
 `Hetoimasia.Foundation.Worker` owns CPU worker threads. `withWorkerGroup` is an
@@ -97,7 +98,9 @@ terminal observation are distinct operations, observed through STM. Every exit
 from the group requests all stops before waiting for any and drains every
 worker and helper before the enclosing dependencies unwind; a worker that never
 stops keeps them alive. The module publishes raw outcomes, run-exit ordering,
-and cleanup evidence, and classifies none of them. See
+and cleanup evidence, and classifies none of them. `groupStatus` reads one
+coherent snapshot of the group's phase and the workers its drain still waits
+for, without waiting or changing anything. See
 [docs/workers.md](../../docs/workers.md).
 
 `Hetoimasia.Foundation.Messaging.Payload` is the boundary later messaging

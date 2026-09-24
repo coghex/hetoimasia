@@ -10,7 +10,7 @@ this document describes what the code does today.
 Scope: the group lifetime boundary and its `Scoped` adapter, the fork and
 registration handoff, startup, the four worker operations and their races, the
 run-exit record and terminal publication, the drain on every exit path,
-retirement, and the evidence all of it leaves. Supervision — services versus
+retirement, the drain status, and the evidence all of it leaves. Supervision — services versus
 finite jobs, required versus optional workers, checkpoints, supervised waits,
 and failure classification — belongs to the runtime and is not part of it.
 
@@ -25,6 +25,15 @@ withWorkerGroup   ∷ (WorkerGroup → IO a) → IO a
 allocWorkerGroup  ∷ Scoped WorkerGroup
 closeWorkerGroup  ∷ WorkerGroup → IO GroupReport
 activeWorkerCount ∷ WorkerGroup → STM Int
+
+groupStatus ∷ WorkerGroup → STM GroupStatus
+data GroupStatus = GroupStatus { statusPhase ∷ GroupPhase, statusOutstanding ∷ [OutstandingWorker] }
+data GroupPhase  = GroupOpen | GroupClosing | GroupClosed
+data OutstandingWorker = OutstandingWorker
+  { outstandingWorker ∷ WorkerId, outstandingLabel ∷ Text, outstandingAcknowledged ∷ Bool
+  , outstandingRequested ∷ Requested, outstandingCancelDelivered ∷ Bool
+  , outstandingState ∷ Outstanding, outstandingHelpers ∷ Int }
+data Outstanding = AwaitingTerminal | AwaitingHelpers
 
 workerDefinition ∷ Text → (StopToken → Scoped s) → (StopToken → s → IO r) → WorkerDefinition r
 stopRequested    ∷ StopToken → STM Bool
@@ -81,8 +90,8 @@ apply.
 `allocWorkerGroup` is the same boundary composed in `Scoped`. Allocations made
 before that line outlive the drain; allocations made after it are released
 before the drain begins and must not be lent to the group's workers. It is
-built through the foundation library's
-[hidden implementation seam](resources.md#the-implementation-seam), so the
+built through the foundation package's
+[private implementation seam](resources.md#the-implementation-seam), so the
 `Scoped` constructor stays unexported and no catch instance is added to
 `Scoped`.
 
@@ -171,7 +180,11 @@ These are distinct operations.
   uninterruptible region or a foreign call, so it never runs on the requesting
   thread and never inside a resource release. The helper is registered before
   it is forked and joined by the drain; it is never detached. Repeated requests,
-  and a request of a terminal worker, fork nothing.
+  and a request of a terminal worker, fork nothing. When the helper's `throwTo`
+  returns, the exception has been raised in the worker's thread: the helper
+  records that delivery in the same transaction that deregisters it, and the
+  record is never cleared. A helper that found the worker already terminal, or
+  whose attempt failed, records none.
 - **Observe.** `awaitCompletion` and `pollCompletion` are raw reads: any number
   of readers, nothing consumed, and no effect on the worker. A reader cancelled
   while waiting leaves the worker running and not stopped. `observeCompletion`
@@ -265,12 +278,77 @@ handle still exposes the same immutable completion. Retirement never discards a
 running worker or an unobserved outcome, and raw readers never retire anything.
 `activeWorkerCount` reports how many workers are not yet retired.
 
+## Drain status
+
+`groupStatus` reads, in one STM transaction, the group's phase and every worker
+its drain would still wait for, so one snapshot is always coherent: no worker
+appears with state from two different moments. A worker is **outstanding**
+while it has not published its terminal outcome or while a cancellation helper
+still targets it. Outstanding workers are listed in registration order with:
+
+| Field | Meaning |
+|---|---|
+| `outstandingWorker`, `outstandingLabel` | Identity and the label the worker was defined with |
+| `outstandingAcknowledged` | Startup was acknowledged |
+| `outstandingRequested` | The strongest request so far; `CancelWasRequested` is also a stop |
+| `outstandingCancelDelivered` | A helper's `throwTo` returned; see below |
+| `outstandingState` | `AwaitingTerminal` before the terminal outcome; `AwaitingHelpers` once terminal while a helper still targets it |
+| `outstandingHelpers` | Cancellation helpers still targeting the worker |
+
+The same membership applies while the group is open and while it is closing.
+A worker that is terminal with no helper pending is settled and omitted, even
+when it is still in active bookkeeping unobserved or kept for
+`reportObservedFailures`, so `activeWorkerCount` and the status can differ. A
+worker that was already terminal when closing began stays listed while a
+helper targeting it is pending, because the drain waits for that helper too.
+Once the report is published the phase is `GroupClosed` and nothing is listed.
+While closing, the list can be empty for a moment before the report is
+published; an observer must not treat that as the drain having finished.
+
+Confirmed delivery is narrow evidence. A reserved attempt, a helper still
+blocked in `throwTo` — while the worker is inside an uninterruptible region or
+a foreign call, for instance — a helper that found the worker already terminal,
+and a failed attempt are not delivery. Delivery does not mean the worker's code
+handled the exception or that the worker terminated: a worker that catches the
+cancellation and keeps running stays listed with delivery confirmed and no
+helper pending.
+
+The query only reads. It never retries or waits for lifecycle progress, writes
+no group state, and changes neither when the drain completes nor its report,
+the propagated primary failure, or the retained cleanup failures, whatever
+thread reads it and however often. Like any STM transaction it can restart on
+a conflicting write, so it promises no bound on its own running time. It
+reports observed state only: it names no cause for a stall, and it says nothing
+about whether a worker's resources are safe to release. Elapsed time, sampling
+cadence, output, and any deadline belong to the observing application, such
+as the quit watchdog vision V-3 allows; nothing here adds a deadline, detach,
+forced release, or process exit.
+
+## The coordination probe
+
+The worker group's implementation is `Hetoimasia.Foundation.Worker.Internal`,
+in the foundation package's private `internal` sublibrary beside the resource
+seam. `Hetoimasia.Foundation.Worker` re-exports all of it except the
+coordination probe: `GroupProbe`, `noProbe`, and `withWorkerGroupProbed`.
+`withWorkerGroup` is `withWorkerGroupProbed noProbe`, so there is one
+implementation, and a probe is installed per group rather than through any
+global switch.
+
+The probe's one point runs on a cancellation helper after its delivery attempt
+has ended and before the helper records it and deregisters. A terminal worker
+with a helper still pending otherwise lasts only as long as the scheduler takes
+to run the helper's next transaction; holding the helper there lets the
+foundation's own examples observe that state, and the drain waiting on it, with
+explicit coordination. A production group's probe does nothing, and no client
+can install one: a private sublibrary is visible only to the package's own
+components.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime and reset |
 |---|---|---|---|---|
-| Group phase (open, closing, closed) | The group | Registration reads; closing and the final report write | Any thread holding the group, in STM | One `withWorkerGroup` invocation; closes once, never reopens |
-| Registration order and active set | The group | Registration inserts; retirement deletes; closing and the report read | Starter, owner, helpers, observers, in STM | One invocation; emptied when the group closes |
+| Group phase (open, closing, closed) | The group | Registration and `groupStatus` read; closing and the final report write | Any thread holding the group, in STM | One `withWorkerGroup` invocation; closes once, never reopens |
+| Registration order and active set | The group | Registration inserts; retirement deletes; closing, the report, and `groupStatus` read | Starter, owner, helpers, observers, in STM | One invocation; emptied when the group closes |
 | Retained observed failures | The group | Retirement inserts; closing reads | Observer and helpers, in STM | One invocation; emptied when the group closes |
 | Closing snapshot and report | The group | Closing writes the snapshot; the drain writes the report once | Owner or `closeWorkerGroup` caller | Written once; the report never changes |
 | Worker thread identity | The group | Starter writes after the fork; helpers read | Starter, helpers | One worker; set once |
@@ -279,7 +357,9 @@ running worker or an unobserved outcome, and raw readers never retire anything.
 | Startup acknowledgement | The worker | Child writes inside its startup scope; starter and observers read | Child, in STM | One startup; set once; independent of completion |
 | Run-exit record | The worker | Child writes before cleanup, reading the requests in the same transaction; publication reads | Child | One worker; written at most once |
 | Terminal completion and evidence | The worker | Child publishes once; any number of readers | Child, in STM | Never taken, never reset; kept by every retained handle |
-| Observed flag, helper count, helper sent flag | The worker's entry | `observeCompletion`, `requestCancel`, and helpers write; retirement and the drain read | Owner, helpers, in STM | One worker; the helper count returns to zero when its helper finishes |
+| Observed flag, helper count, helper sent flag | The worker's entry | `observeCompletion`, `requestCancel`, and helpers write; retirement, the drain, and `groupStatus` read | Owner, helpers, in STM | One worker; the helper count returns to zero when its helper finishes |
+| Cancellation delivered flag | The worker's entry | The helper writes it when its `throwTo` returned, in the transaction that deregisters it; `groupStatus` reads | Helper, in STM; any reader | One worker; set at most once, never cleared |
+| Coordination probe | The group | Fixed when the group is created; helpers run it | Helpers | One invocation; `noProbe` in every production group |
 
 ## What the contract does not promise
 
@@ -355,7 +435,29 @@ assertion, and cover:
 - a stuck worker and a blocking cancellation delivery each keeping their parent
   alive until explicitly released, then settling with their evidence;
 - retirement that keeps retained handles' results, and an observed failure kept
-  through retirement and an exceptional group exit.
+  through retirement and an exceptional group exit;
+- the drain status following a worker held after closing began: listed with
+  its stop request, then with cancellation requested after the owner fails,
+  then terminal with its helper held by the probe while the drain stays
+  incomplete, and finally closed and empty, with the report, the owner's
+  primary failure, the retained cleanup labels, and the trace identical to the
+  same run without reads;
+- a worker already terminal with a helper held when closing begins, listed
+  both before and after closing until the helper settles, while the drain
+  stays incomplete;
+- unacknowledged startup reported as such, and a settled but unobserved worker
+  omitted while still counted by `activeWorkerCount`;
+- a cancellation left unconfirmed while the worker, inside an uninterruptible
+  region, cannot receive it, and a
+  confirmed delivery that stays visible, with no helper pending, for a worker
+  that caught its cancellation and kept running.
+
+`packages/foundation/test/Test/Foundation/Workers/Opacity.hs`, in the same
+group, compiles three clients against the built package, as the resource
+opacity examples do: one importing the probe from the public module, rejected
+with `does not export`; one importing it from the implementation module,
+rejected with `GHC-87110` naming the hidden `internal` unit; and one that must
+build and run, reading `groupStatus` through the public module alone.
 
 The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

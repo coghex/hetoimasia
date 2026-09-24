@@ -794,15 +794,21 @@ A component that owns resources follows these conventions. They are
 
 ### The implementation seam
 
-`Scoped`, the composite ledger, and the cleanup-failure primitives are defined
-in `Hetoimasia.Foundation.Resource.Internal`, which the foundation library lists
-under `other-modules`. `Hetoimasia.Foundation.Resource` re-exports only the
-closed types and the operations over them, and `allocComponent` builds its
-scope through the hidden module from inside the same library. No client can
-import that module, so the opacity described under
+`Scoped`, the composite ledger, the cleanup-failure primitives, and the
+evidence traversal behind `cleanupFailuresInContext` are defined in
+`Hetoimasia.Foundation.Resource.Internal`, which lives in the foundation
+package's private `internal` sublibrary (`packages/foundation/internal/`).
+`Hetoimasia.Foundation.Resource` re-exports only the closed types and the
+operations over them, and `allocComponent` builds its scope through the private
+module from inside the same package. The worker group's implementation lives in
+the same sublibrary, because its types carry `Scoped` and `CleanupFailure`; see
+[workers.md](workers.md#the-coordination-probe). A private sublibrary is
+visible to the package's own components and to no client, so no client can
+import either module, and the opacity described under
 [The continuation facade](#the-continuation-facade) and
-[The evidence boundary](#the-evidence-boundary) is unchanged, and the opacity
-examples are unchanged.
+[The evidence boundary](#the-evidence-boundary) is unchanged. A client that
+tries is refused with `GHC-87110`, naming the hidden
+`hetoimasia-foundation-0.1.0.0:internal` unit.
 
 ## Inspecting secondary failures
 
@@ -1608,7 +1614,7 @@ constructors, one each rewriting a collection through `liveMemberCount` and a
 token through `memberStatus` with record update, one coercing a `Member
 Celsius` to a `Member Double`, which the nominal role refuses, and one
 importing the ledger release primitive from the implementation module, which
-the package hides. One must be accepted, linked, and run: it uses only the
+the package's private sublibrary hides. One must be accepted, linked, and run: it uses only the
 public operations to acquire three members, borrow two together, observe
 `RetirementInUse`, `Retired`, and `AlreadyRetired`, release the rest at exit in
 reverse order, and read both retained tokens' terminal states afterwards.
