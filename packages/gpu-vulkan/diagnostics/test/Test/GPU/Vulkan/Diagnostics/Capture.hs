@@ -7,9 +7,9 @@
 module Test.GPU.Vulkan.Diagnostics.Capture (spec) where
 
 import Control.Concurrent (forkIO, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (bracket)
+import Control.Exception (bracket, finally)
 import Control.Monad (forM, forM_, replicateM_, when)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
@@ -30,13 +30,16 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , closeStorage
   , counterValue
   , createStorage
-  , freeRecords
+  , storageClosed
+  , freeStorage
   , latchSet
   , offer
   , offerMissingData
   , plainOffer
   , newHold
+  , offerAnnounced
   , offerHeld
+  , slotStatus
   , holdArrived
   , releaseHold
   , presetCounter
@@ -47,7 +50,7 @@ import Test.Support.Bounded (bounded)
 
 -- | A storage for one example, closed and freed afterwards.
 withStorage ∷ Limits → (Storage → IO a) → IO a
-withStorage bounds = bracket (createStorage bounds) (\storage → closeStorage storage >> freeRecords storage)
+withStorage bounds = bracket (createStorage bounds) freeStorage
 
 limits ∷ Int → Int → Int → Limits
 limits capacity budget objects =
@@ -249,24 +252,67 @@ spec = describe "Capture" $ do
       -- returns rather than touching memory it was not given.
       offer nullPtr (plainOffer SeverityError "nowhere") `shouldReturn` ()
 
-    it "counts a producer held at the callback's entry across close and free as a capture failure" $ do
-      -- The window between a producer entering the callback and announcing
-      -- itself: closing cannot see it, so it must not matter that closing
-      -- returns and the records are freed while it is there. The header it
-      -- resumes into is never freed, and it finds admission closed.
+    it "counts a report that begins only after close and free as a capture failure, in memory that is still live" $ do
+      -- A report not yet begun when the storage closes: closing cannot see
+      -- it, and the storage is freed while it waits. What it touches first is
+      -- the storage's static slot, which is never freed, and it finds
+      -- admission closed there.
       storage ← createStorage (limits 4 64 2)
       hold ← newHold
       done ← newEmptyMVar
       _ ← forkIO (offerHeld (storageUserData storage) hold SeverityError "held" >> putMVar done ())
       bounded (untilM (holdArrived hold))
       closeStorage storage
-      freeRecords storage
+      freeStorage storage
       releaseHold hold
       bounded (takeMVar done)
       counterValue storage CaptureFailed `shouldReturn` 1
       counterValue storage Admitted `shouldReturn` 0
       latchSet storage CaptureFailureLatch `shouldReturn` True
       latchSet storage ErrorLatch `shouldReturn` True
+
+    it "makes closing wait for a producer that has announced itself" $
+      withStorage (limits 4 64 2) $ \storage → do
+        hold ← newHold
+        producerDone ← newEmptyMVar
+        closed ← newEmptyMVar
+        _ ← forkIO (offerAnnounced (storageUserData storage) hold SeverityWarning "announced" >> putMVar producerDone ())
+        bounded (untilM (holdArrived hold))
+        _ ← forkIO (closeStorage storage >> putMVar closed ())
+        -- Once the closer has set the flag it is waiting for the producer.
+        bounded (untilM (storageClosed storage))
+        tryTakeMVar closed `shouldReturn` Nothing
+        releaseHold hold
+        bounded (takeMVar producerDone)
+        bounded (takeMVar closed)
+        -- Admission closed while it waited, so it counted itself as refused.
+        counterValue storage CaptureFailed `shouldReturn` 1
+        counterValue storage Admitted `shouldReturn` 0
+
+    it "reclaims every storage, so more lifetimes than the table has slots never run out" $
+      forM_ [1 .. 3 * 64 ∷ Int] $ \_ → do
+        storage ← createStorage (limits 1 16 1)
+        offerInto storage (plainOffer SeverityInfo "one")
+        freeStorage storage
+
+    it "names nothing through a stale user data once its slot serves another storage" $ do
+      first ← createStorage (limits 1 16 1)
+      let stale = storageUserData first
+      freeStorage first
+      -- Claim slots until the first one is reused.
+      let claim acquired = do
+            storage ← createStorage (limits 1 16 1)
+            reused ← (== Nothing) <$> slotStatus stale
+            if reused || length acquired >= 64
+              then pure (storage : acquired)
+              else claim (storage : acquired)
+      reclaimed ← claim []
+      ( do
+          slotStatus stale `shouldReturn` Nothing
+          offer stale (plainOffer SeverityError "stale")
+          mapM_ (\storage → counterValue storage Offered `shouldReturn` 0) reclaimed
+        )
+        `finally` mapM_ freeStorage reclaimed
 
     it "refuses a record offered after closing, as a capture failure" $
       withStorage (limits 4 64 2) $ \storage → do

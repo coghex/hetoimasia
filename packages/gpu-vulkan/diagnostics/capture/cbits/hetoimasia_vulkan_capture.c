@@ -1,32 +1,54 @@
 /*
 ** The capture storage and its producer. See the header for the contract.
 **
-** The queue is a bounded multi-producer, single-consumer ring in which every
-** slot carries a sequence number (after Vyukov's bounded queue). A producer
-** claims the next position with one compare-and-swap, copies into the slot it
-** claimed, and publishes it by advancing the slot's sequence; a producer that
-** finds the slot at the head still holding an unconsumed record has found the
-** queue full, counts the loss, and returns. Nothing waits for space, and a
-** producer that loses a race for a position only retries against the position
-** that beat it.
+** Two kinds of memory, with two lifetimes.
 **
-** A slot's sequence says, for position p: free for p is 2p, published for p is
-** 2p + 1, and consuming p frees the slot for p + capacity, 2(p + capacity).
-** Vyukov's own encoding (p, p + 1, p + capacity) cannot tell a record published
-** for p from a slot free for p + 1 when the capacity is one, and a one-record
+** A slot, in a fixed static table, holds what a producer touches before it
+** knows whether admission is open: the announcement count, the closed flag, the
+** generation, the latches and the counters. Static memory is never freed, so a
+** producer that is arbitrarily late — one that entered the callback before a
+** lifetime closed and has not yet run a single instruction — always lands on
+** live memory. A slot is reused only after every producer announced against it
+** has left and its generation has moved on, so a straggler from an earlier
+** lifetime can never count itself against a later one.
+**
+** The storage, on the C heap, holds the queue: the records, their object
+** records and their text. Only a producer that announced itself and then found
+** admission open touches it, and closing waits for every such producer before
+** the storage can be freed. It is freed whole.
+**
+** The user data a messenger carries is not a pointer. It encodes the slot's
+** index and the generation the storage was created in, so a stale or foreign
+** value names nothing and is ignored.
+**
+** Announcing is the callback's first memory operation. Closing is a Dekker
+** handshake between `closed` and `active`: a producer increments `active`
+** before it reads anything else and decrements it only after it has published
+** or given up; the closer sets `closed` before it reads `active`. Both use
+** sequentially consistent operations, so either the producer sees the slot
+** closed, or the closer sees the producer and waits for it. Reuse is the same
+** handshake between the generation and `active`.
+**
+** The queue is a bounded multi-producer, single-consumer ring in which every
+** record carries a sequence number (after Vyukov's bounded queue). A producer
+** claims the next position with one compare-and-swap, copies into the record it
+** claimed, and publishes it by advancing its sequence; a producer that finds the
+** record at the head still holding an unconsumed report has found the queue
+** full, counts the loss, and returns. Nothing waits for space, and a producer
+** that loses a race for a position only retries against the position that beat
+** it.
+**
+** A record's sequence says, for position p: free for p is 2p, published for p
+** is 2p + 1, and consuming p frees it for p + capacity, 2(p + capacity).
+** Vyukov's own encoding (p, p + 1, p + capacity) cannot tell a report published
+** for p from a record free for p + 1 when the capacity is one, and a one-record
 ** queue is a valid configuration here.
 **
-** Every record's storage is carved out of three arrays allocated once: the
-** slots, `queue_capacity * object_limit` object records, and
+** Every record's space is carved out of three arrays allocated once: the
+** records, `queue_capacity * object_limit` object records, and
 ** `queue_capacity * text_budget` bytes of text. A record's text budget is
 ** shared by its message id name, its message and every object name, in that
 ** order, so a record never copies more than the budget in total.
-**
-** Closing is a Dekker handshake between `closed` and `active`. A producer
-** increments `active` before it reads `closed` and decrements it only after it
-** has published or given up; the closer sets `closed` before it reads `active`.
-** Both use sequentially consistent operations, so either the producer sees the
-** storage closed, or the closer sees the producer and waits for it.
 */
 #include "hetoimasia_vulkan_capture.h"
 
@@ -34,9 +56,6 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Distinguishes a live storage from anything else a user data might name. */
-#define CAPTURE_MAGIC UINT64_C(0x6865746f696d7663)
 
 typedef struct capture_object {
   int32_t type;
@@ -64,7 +83,8 @@ struct hetoimasia_capture_record {
 };
 
 struct hetoimasia_capture_storage {
-  _Atomic uint64_t magic;
+  uint32_t slot;
+  uint64_t generation;
   hetoimasia_capture_limits limits;
   struct hetoimasia_capture_record *records;
   capture_object *objects;
@@ -72,11 +92,38 @@ struct hetoimasia_capture_storage {
   _Atomic uint64_t enqueue;
   /* The consumer's position. Only the single consumer reads or writes it. */
   uint64_t dequeue;
-  _Atomic int closed;
+};
+
+typedef struct capture_slot {
+  _Atomic int in_use;
+  _Atomic uint64_t generation;
   _Atomic uint64_t active;
+  _Atomic int closed;
+  _Atomic(hetoimasia_capture_storage *) storage;
   _Atomic int latches[2];
   _Atomic uint64_t counters[HETOIMASIA_CAPTURE_COUNTERS];
-};
+} capture_slot;
+
+/* Zero-initialized: every slot free, closed with no storage, generation 0. */
+static capture_slot slots[HETOIMASIA_CAPTURE_SLOTS];
+
+/* The user data for a slot and generation. Never NULL: the index is biased. */
+static void *encode_user_data(uint32_t slot, uint64_t generation)
+{
+  return (void *) (uintptr_t) ((generation << 8) | (uint64_t) (slot + 1));
+}
+
+/* The slot a user data names, or NULL; its generation in *generation. */
+static capture_slot *decode_user_data(const void *user_data, uint64_t *generation)
+{
+  uintptr_t value = (uintptr_t) user_data;
+  uint64_t index = value & 0xff;
+  if (index == 0 || index > HETOIMASIA_CAPTURE_SLOTS) {
+    return NULL;
+  }
+  *generation = (uint64_t) value >> 8;
+  return &slots[index - 1];
+}
 
 /* a * b, or 0 with *overflow set when it does not fit in a size_t. */
 static size_t checked_multiply(size_t a, size_t b, int *overflow)
@@ -86,6 +133,13 @@ static size_t checked_multiply(size_t a, size_t b, int *overflow)
     return 0;
   }
   return a * b;
+}
+
+static void wait_for_producers(capture_slot *slot)
+{
+  while (atomic_load(&slot->active) != 0) {
+    sched_yield();
+  }
 }
 
 int hetoimasia_capture_create(
@@ -120,29 +174,54 @@ int hetoimasia_capture_create(
     return HETOIMASIA_CAPTURE_OUT_OF_MEMORY;
   }
 
+  /* Claim a free slot. */
+  capture_slot *slot = NULL;
+  uint32_t index = 0;
+  for (; index < HETOIMASIA_CAPTURE_SLOTS; index++) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&slots[index].in_use, &expected, 1)) {
+      slot = &slots[index];
+      break;
+    }
+  }
+  if (slot == NULL) {
+    free(storage);
+    free(records);
+    free(objects);
+    free(text);
+    return HETOIMASIA_CAPTURE_NO_SLOT;
+  }
+
+  /* Move the generation on first, then wait for stragglers: a producer from
+     the slot's previous lifetime either sees the new generation and leaves, or
+     is seen here and finishes counting against the old one before the reset. */
+  uint64_t generation = atomic_fetch_add(&slot->generation, 1) + 1;
+  wait_for_producers(slot);
+  for (int latch = 0; latch < 2; latch++) {
+    atomic_store(&slot->latches[latch], 0);
+  }
+  for (int counter = 0; counter < HETOIMASIA_CAPTURE_COUNTERS; counter++) {
+    atomic_store(&slot->counters[counter], 0);
+  }
+
+  storage->slot = index;
+  storage->generation = generation;
   storage->limits = *limits;
   storage->records = records;
   storage->objects = objects;
   storage->text = text;
   storage->dequeue = 0;
   atomic_init(&storage->enqueue, 0);
-  atomic_init(&storage->closed, 0);
-  atomic_init(&storage->active, 0);
-  for (int latch = 0; latch < 2; latch++) {
-    atomic_init(&storage->latches[latch], 0);
-  }
-  for (int counter = 0; counter < HETOIMASIA_CAPTURE_COUNTERS; counter++) {
-    atomic_init(&storage->counters[counter], 0);
-  }
-  for (size_t index = 0; index < capacity; index++) {
-    struct hetoimasia_capture_record *record = &records[index];
+  for (size_t position = 0; position < capacity; position++) {
+    struct hetoimasia_capture_record *record = &records[position];
     memset(record, 0, sizeof *record);
-    atomic_init(&record->sequence, 2 * (uint64_t) index);
-    record->text = text + index * limits->text_budget;
-    record->objects = objects + index * limits->object_limit;
+    atomic_init(&record->sequence, 2 * (uint64_t) position);
+    record->text = text + position * limits->text_budget;
+    record->objects = objects + position * limits->object_limit;
   }
-  /* Published last: a user data is only ever a live storage once it is whole. */
-  atomic_store(&storage->magic, CAPTURE_MAGIC);
+  /* Published last: admission opens only once the storage is whole. */
+  atomic_store(&slot->storage, storage);
+  atomic_store(&slot->closed, 0);
   *out = storage;
   return HETOIMASIA_CAPTURE_CREATED;
 }
@@ -157,20 +236,28 @@ size_t hetoimasia_capture_object_size(void)
   return sizeof(capture_object);
 }
 
-void hetoimasia_capture_free_records(hetoimasia_capture_storage *storage)
+void *hetoimasia_capture_user_data(const hetoimasia_capture_storage *storage)
+{
+  return encode_user_data(storage->slot, storage->generation);
+}
+
+void hetoimasia_capture_free(hetoimasia_capture_storage *storage)
 {
   if (storage == NULL) {
     return;
   }
-  /* Only a closed storage: a producer that announces itself from here on sees
-     `closed` and leaves before it could reach the records. */
-  atomic_store(&storage->closed, 1);
+  capture_slot *slot = &slots[storage->slot];
+  /* Closing again is harmless and makes this safe on its own: nothing that
+     announces itself from here on reaches the storage. */
+  hetoimasia_capture_close(storage);
+  atomic_store(&slot->storage, NULL);
   free(storage->records);
   free(storage->objects);
   free(storage->text);
-  storage->records = NULL;
-  storage->objects = NULL;
-  storage->text = NULL;
+  free(storage);
+  /* The slot keeps its latches and counters until it is claimed again, so a
+     status read by user data still answers until then. */
+  atomic_store(&slot->in_use, 0);
 }
 
 static void saturating_increment(_Atomic uint64_t *counter)
@@ -180,11 +267,6 @@ static void saturating_increment(_Atomic uint64_t *counter)
          && !atomic_compare_exchange_weak_explicit(
            counter, &current, current + 1, memory_order_relaxed, memory_order_relaxed)) {
   }
-}
-
-static void latch(hetoimasia_capture_storage *storage, int which)
-{
-  atomic_store(&storage->latches[which], 1);
 }
 
 /*
@@ -268,32 +350,52 @@ static int fill(
   return truncated;
 }
 
-uint32_t hetoimasia_capture_callback(
+/*
+** The producer, with an optional pause just after the announcement for the
+** package's own tests. Production passes NULL and never pauses.
+*/
+static uint32_t capture(
   uint32_t severity,
   uint32_t types,
   const hetoimasia_capture_callback_data *data,
-  void *user_data)
+  void *user_data,
+  int *paused,
+  int *resume)
 {
-  hetoimasia_capture_storage *storage = user_data;
-  /* The header is never freed, so reading it is safe however late this is. */
-  if (storage == NULL || atomic_load(&storage->magic) != CAPTURE_MAGIC) {
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL) {
     return 0;
   }
 
-  atomic_fetch_add(&storage->active, 1);
-  saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_OFFERED]);
+  /* The announcement: the first thing done to anything. */
+  atomic_fetch_add(&slot->active, 1);
+  if (resume != NULL) {
+    __atomic_store_n(paused, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(resume, __ATOMIC_SEQ_CST) == 0) {
+      sched_yield();
+    }
+  }
+  if (atomic_load(&slot->generation) != generation) {
+    /* A user data from a lifetime this slot no longer serves. */
+    atomic_fetch_sub(&slot->active, 1);
+    return 0;
+  }
+
+  saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_OFFERED]);
 
   /* Before anything else can fail or be dropped: a full queue, a closed
      storage and a missing payload must none of them hide an error. */
   if (severity & HETOIMASIA_CAPTURE_SEVERITY_ERROR) {
-    latch(storage, HETOIMASIA_CAPTURE_ERROR_LATCH);
-    saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_ERRORS]);
+    atomic_store(&slot->latches[HETOIMASIA_CAPTURE_ERROR_LATCH], 1);
+    saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_ERRORS]);
   }
 
-  if (atomic_load(&storage->closed) || data == NULL) {
-    latch(storage, HETOIMASIA_CAPTURE_FAILURE_LATCH);
-    saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_FAILED]);
-    atomic_fetch_sub(&storage->active, 1);
+  hetoimasia_capture_storage *storage = atomic_load(&slot->storage);
+  if (atomic_load(&slot->closed) || storage == NULL || data == NULL) {
+    atomic_store(&slot->latches[HETOIMASIA_CAPTURE_FAILURE_LATCH], 1);
+    saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_FAILED]);
+    atomic_fetch_sub(&slot->active, 1);
     return 0;
   }
 
@@ -310,8 +412,8 @@ uint32_t hetoimasia_capture_callback(
         break;
       }
     } else if (difference < 0) {
-      saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_DROPPED]);
-      atomic_fetch_sub(&storage->active, 1);
+      saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_DROPPED]);
+      atomic_fetch_sub(&slot->active, 1);
       return 0;
     } else {
       position = atomic_load_explicit(&storage->enqueue, memory_order_relaxed);
@@ -319,25 +421,33 @@ uint32_t hetoimasia_capture_callback(
   }
 
   if (fill(record, &storage->limits, severity, types, data)) {
-    saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_TRUNCATED]);
+    saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_TRUNCATED]);
   }
   atomic_store_explicit(&record->sequence, 2 * position + 1, memory_order_release);
-  saturating_increment(&storage->counters[HETOIMASIA_CAPTURE_ADMITTED]);
-  atomic_fetch_sub(&storage->active, 1);
+  saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_ADMITTED]);
+  atomic_fetch_sub(&slot->active, 1);
   return 0;
+}
+
+uint32_t hetoimasia_capture_callback(
+  uint32_t severity,
+  uint32_t types,
+  const hetoimasia_capture_callback_data *data,
+  void *user_data)
+{
+  return capture(severity, types, data, user_data, NULL, NULL);
 }
 
 void hetoimasia_capture_close(hetoimasia_capture_storage *storage)
 {
-  atomic_store(&storage->closed, 1);
-  while (atomic_load(&storage->active) != 0) {
-    sched_yield();
-  }
+  capture_slot *slot = &slots[storage->slot];
+  atomic_store(&slot->closed, 1);
+  wait_for_producers(slot);
 }
 
 int hetoimasia_capture_closed(const hetoimasia_capture_storage *storage)
 {
-  return atomic_load(&((hetoimasia_capture_storage *) storage)->closed);
+  return atomic_load(&slots[storage->slot].closed);
 }
 
 const hetoimasia_capture_record *hetoimasia_capture_peek(hetoimasia_capture_storage *storage)
@@ -437,26 +547,32 @@ uint32_t hetoimasia_capture_record_object_name_length(const hetoimasia_capture_r
   return record->objects[index].name_length;
 }
 
-uint64_t hetoimasia_capture_counter(const hetoimasia_capture_storage *storage, int which)
+int hetoimasia_capture_status(void *user_data, uint64_t *counters, int *latches)
 {
-  if (which < 0 || which >= HETOIMASIA_CAPTURE_COUNTERS) {
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL) {
     return 0;
   }
-  return atomic_load(&((hetoimasia_capture_storage *) storage)->counters[which]);
-}
-
-int hetoimasia_capture_latch(const hetoimasia_capture_storage *storage, int which)
-{
-  if (which < 0 || which > 1) {
+  /* A slot's latches and counters change owner only when it is claimed again,
+     and claiming moves the generation first; the same generation on both sides
+     of the read means every value read was this lifetime's. */
+  if (atomic_load(&slot->generation) != generation) {
     return 0;
   }
-  return atomic_load(&((hetoimasia_capture_storage *) storage)->latches[which]);
+  for (int counter = 0; counter < HETOIMASIA_CAPTURE_COUNTERS; counter++) {
+    counters[counter] = atomic_load(&slot->counters[counter]);
+  }
+  for (int latch = 0; latch < 2; latch++) {
+    latches[latch] = atomic_load(&slot->latches[latch]);
+  }
+  return atomic_load(&slot->generation) == generation;
 }
 
 void hetoimasia_capture_preset_counter(hetoimasia_capture_storage *storage, int which, uint64_t value)
 {
   if (which >= 0 && which < HETOIMASIA_CAPTURE_COUNTERS) {
-    atomic_store(&storage->counters[which], value);
+    atomic_store(&slots[storage->slot].counters[which], value);
   }
 }
 
@@ -506,6 +622,26 @@ uint32_t hetoimasia_capture_offer_held(
     sched_yield();
   }
   return hetoimasia_capture_offer(user_data, severity, 0x2, NULL, 0, message, 0, NULL, NULL, NULL, 0);
+}
+
+uint32_t hetoimasia_capture_offer_announced(
+  void *user_data, int *arrived, int *gate, uint32_t severity, const char *message)
+{
+  hetoimasia_capture_callback_data data = {
+    .s_type = 0,
+    .next = NULL,
+    .flags = 0,
+    .message_id_name = NULL,
+    .message_id_number = 0,
+    .message = message,
+    .queue_label_count = 0,
+    .queue_labels = NULL,
+    .cmd_buf_label_count = 0,
+    .cmd_buf_labels = NULL,
+    .object_count = 0,
+    .objects = NULL,
+  };
+  return capture(severity, 0x2, &data, user_data, arrived, gate);
 }
 
 void hetoimasia_capture_flag_set(int *flag)

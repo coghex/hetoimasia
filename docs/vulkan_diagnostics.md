@@ -44,8 +44,9 @@ the `PFN_vkDebugUtilsMessengerCallbackEXT` every capture messenger registers: a
 C function with Vulkan's exact type that passes its arguments straight to it.
 Nothing on that path is Haskell. For each report it:
 
-1. ignores it if the user data is not a live storage, since there is nowhere to
-   record anything;
+1. announces itself in the storage's slot — its first memory operation — and
+   ignores the report if the user data names no slot or a slot now serving
+   another storage, since there is nowhere to record it;
 2. counts it as offered;
 3. **latches the error state if the severity has the error bit**, and counts
    the error — before anything below can drop or refuse the report;
@@ -123,8 +124,10 @@ count against a clean verdict, is VK-7's and VK-8's to settle.
 Every report the producer records is exactly one of admitted, dropped, or
 refused as a capture failure, so offered is their sum until a counter
 saturates. `captureStatus` reads all of them from the C storage at any time,
-from any thread, with no worker involved — before, during and after the
-release, because the header they live in is never freed. No delivery, flush or later
+from any thread, with no worker involved, before, during and after the
+release: they live in the storage's static slot, which is never freed, and
+once the slot serves another lifetime the query answers the snapshot taken just
+before the storage was freed. No delivery, flush or later
 report clears any of them, and the logger's filter never sees them: an error
 the logger filters out entirely is still latched.
 
@@ -150,19 +153,19 @@ destruction — `vkDestroyInstance`, where the create-info messenger reports aft
 the explicit messenger is gone — before it returns or throws. On every exit the
 lifetime then:
 
-1. closes admission and waits for any producer still inside the callback — the
-   wait is bounded by a producer's own copy, and is the reason closing is a
-   `safe` call;
+1. closes admission and waits for every producer that has announced itself
+   inside the callback — the wait is bounded by a producer's own copy, and is
+   the reason closing is a `safe` call;
 2. asks the worker for its final drain and waits for its completion explicitly,
    never relying on the worker group's default drain;
 3. counts as undelivered every admitted record the worker did not deliver: the
    ones it discarded after a sink failure, one it had taken and was delivering
    when it was cancelled — the worker counts a record as taken in the same
    masked step that takes it — and every one still queued;
-4. reads the latches and counters for the verdict and frees the storage's
-   records — unless the body called `retainStorage` because a native object
-   that registered the callback may outlive it, in which case they are left for
-   process exit and the verdict says so;
+4. reads the latches and counters for the verdict, keeps them as the status
+   snapshot, and frees the storage — unless the body called `retainStorage`
+   because a native object that registered the callback may outlive it, in
+   which case it is left for process exit and the verdict says so;
 5. returns the body's result with the verdict, or rethrows the body's failure
    with its own type, value and context and the verdict attached to it.
 
@@ -171,18 +174,28 @@ lifetime then:
 | `PhaseCapturing` | The body runs; producers report, and the worker drains when woken or polled. |
 | `PhaseClosed` | Admission is closed, every producer has left, and the final drain was requested. The storage and the logger are still borrowed. |
 | `PhaseJoined` | The worker is terminal and its outcome has been read. |
-| `PhaseReleased` | The records are freed, or deliberately retained. |
+| `PhaseReleased` | The storage is freed, or deliberately retained. |
 
-The storage is two parts with two lifetimes. The records — the queue, the
-object records and the text — are the lifetime's and are freed in step 4. The
-header — the producer's entry check, the close handshake, the latches and the
-counters, a few hundred bytes — is never freed. Closing waits for every
-producer that has announced itself inside the callback, but nothing can see a
-producer that has entered the callback and not yet announced itself. Because
-the header outlives every use of it, such a producer always resumes into live
-memory, finds admission closed, counts itself as a capture failure, and never
-reaches the records. Such a report arrives after the verdict, so the verdict
-cannot include it; `captureStatus` shows it.
+A capture is two kinds of memory. The **storage** — the queue, its object
+records and its text — is on the C heap, is the lifetime's, and is freed whole
+in step 4. Its **slot** — the announcement count, the closed flag, a
+generation, the latches and the counters — is one entry of a fixed static table
+of 64, so it is never freed. The user data a messenger carries encodes the
+slot's index and the storage's generation rather than pointing at anything.
+
+Announcing is the first thing the producer does, so every report that has
+begun is one closing waits for, and the verdict includes it: a report that
+announced itself before admission closed and was still copying when the body
+returned is admitted or refused before the verdict is read. The only report
+closing cannot see is one that has not begun at all — a Vulkan call still
+running after the body returned, which the lifetime's contract rules out.
+Because what such a report touches first is static, it is still memory-safe:
+it finds admission closed and counts itself as a capture failure in the slot,
+outside the verdict, where `captureStatus` shows it. A slot is claimed again
+only after its generation has moved on and every producer announced against it
+has left, so a straggler never counts against a later lifetime; its stale user
+data names nothing. Sixty-four storages may be live at once in one process, and
+a lifetime asking for a sixty-fifth is refused with `StorageSlotsExhausted`.
 
 Draining may run while producers are still active: a record produced while an
 earlier one is being delivered is delivered after it. Final closure and release
@@ -226,6 +239,11 @@ Every record has the component `gpu.vulkan.diagnostics`, the constant message
 | `objects` | how many objects the callback carried, when any |
 | `object.<n>`, `object.<n>.name` | each copied object's `type:0xhandle`, and its name when present |
 | `truncated` | `true` when the record was cut |
+
+Delivering a record and counting it delivered are one masked step: the sink's
+own blocking stays interruptible, so a cancellation still reaches a stuck sink,
+but none can land between a write that completed and its count, and the
+verdict's delivered count is exactly what the sink received.
 
 A synchronous failure writing a record is the sink's. Delivery stops; the
 worker keeps taking records and counts them as undelivered, so the accounting
@@ -297,8 +315,9 @@ proof checks the binding flags against the pin.
 
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
 | --- | --- | --- | --- | --- | --- |
-| C records: queue, objects, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
-| C header: latches, counters, close handshake | the lifetime, then the process | producers on any thread; the lifetime, closing | the lifetime; `captureStatus` | any | allocated at entry; never freed or reset |
+| C storage: queue, objects, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
+| C slot: announcements, close flag, generation, latches, counters | the lifetime, then its slot's next claimant | producers on any thread; the lifetime, closing | the lifetime; `captureStatus` | any | static; claimed at entry, reset only when claimed again |
+| Status snapshot | the lifetime | step 4, once, before the free | `captureStatus` once the slot serves another lifetime | the lifetime's | per lifetime |
 | Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
 | Taken and delivered counts | the worker | the worker | any thread; the lifetime once the worker is terminal | the worker's | per lifetime; only grow |
 | Wake and final requests | the lifetime | `requestDrain`; the lifetime, once, for final | the worker | any | per lifetime |
@@ -321,14 +340,18 @@ a Haskell stand-in. `Capture` drives the storage directly: bounded copying at
 each limit and one byte past it, the shared budget, saturation and the drop
 counter with the error latch surviving it, error latching ahead of admission,
 truncation counting, contained producer failures, counters saturating at their
-ceilings, eight threads racing for positions while a consumer drains, and a
-producer held at the callback's entry across closing and freeing the records.
+ceilings, eight threads racing for positions while a consumer drains, closing
+waiting for a producer that has announced itself, a report that begins only
+after closing and freeing, slot reclamation beyond the table's size, and a
+stale user data naming nothing.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
 fields, the worker's own group, the verdict's issues, sink failure beside a
 preserved primary failure, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, status reads racing the
-release, a producer still entering the callback when the lifetime ends, and
+release, a producer that announced itself before the body returned counted in
+the verdict, a report not yet begun counted outside it, the verdict's delivered
+count matching what the sink received across 300 cancellations, and
 retention. Waits are explicit: a gated sink says when it is entered,
 the delivered count says what the worker has done, and the poll is replaced by
 one no example reaches.

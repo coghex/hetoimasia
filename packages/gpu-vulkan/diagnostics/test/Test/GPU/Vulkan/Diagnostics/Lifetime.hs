@@ -11,8 +11,10 @@
 module Test.GPU.Vulkan.Diagnostics.Lifetime (spec) where
 
 import Control.Concurrent (forkIO, killThread, yield)
+import Control.Monad (forM_, replicateM_, when)
+import Data.Word (Word64)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
@@ -21,7 +23,7 @@ import Control.Exception
   , throwIO
   , try
   )
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Test.Hspec
   ( Spec
@@ -30,6 +32,7 @@ import Test.Hspec
   , it
   , shouldBe
   , shouldReturn
+  , shouldNotReturn
   , shouldSatisfy
   )
 
@@ -37,6 +40,8 @@ import Hetoimasia.Foundation.Log
   ( LogEntry (..)
   , LogFilter (..)
   , LogLevel (..)
+  , callbackSink
+  , mkLogger
   )
 import Hetoimasia.Foundation.Worker (activeWorkerCount, withWorkerGroup)
 import Hetoimasia.GPU.Vulkan.Diagnostics
@@ -62,6 +67,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Severity (..)
   , holdArrived
   , newHold
+  , offerAnnounced
   , offerHeld
   , offerMissingData
   , plainOffer
@@ -401,7 +407,34 @@ spec = describe "Lifetime" $ do
       either (Left . show) (const (Right ())) result `shouldBe` Right ()
       verdictClean verdict `shouldBe` True
 
-    it "counts a producer still entering the callback when the lifetime ends, without touching freed records" $ do
+    it "includes in its verdict a producer that had announced itself when the body returned" $ do
+      (logger, _) ← recordingLogger everythingFilter
+      hold ← newHold
+      done ← newEmptyMVar
+      lifetime ← newEmptyMVar
+      handle ← newEmptyMVar
+      _ ← forkIO $ do
+        result ←
+          try @SomeException $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+              _ ← forkIO (offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ())
+              bounded (untilM (holdArrived hold))
+              putMVar handle capture
+        putMVar lifetime result
+      capture ← readMVar handle
+      -- The lifetime cannot get past closing while the producer is announced.
+      atomically (capturePhase capture) `shouldReturn` PhaseCapturing
+      releaseHold hold
+      bounded (readMVar done)
+      result ← bounded (readMVar lifetime)
+      case result of
+        Left failure → expectationFailure ("the lifetime failed: " <> show failure)
+        Right ((), verdict) →
+          -- Closing had begun, so it counted itself as refused, and the verdict
+          -- saw it.
+          verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
+
+    it "counts a report not yet begun when the lifetime ends, in memory that is still live" $ do
       (logger, _) ← recordingLogger everythingFilter
       hold ← newHold
       done ← newEmptyMVar
@@ -411,8 +444,9 @@ spec = describe "Lifetime" $ do
           writeIORef saved (Just capture)
           _ ← forkIO (offerHeld (captureUserData capture) hold SeverityWarning "late" >> putMVar done ())
           bounded (untilM (holdArrived hold))
-      -- The body returned with a producer still between entering the callback
-      -- and announcing itself, which the verdict could not have seen.
+      -- The body returned before the report began — a Vulkan call still running
+      -- after the body, which the lifetime's contract rules out. The verdict
+      -- cannot have seen it; the storage's slot counts it.
       verdictClean verdict `shouldBe` True
       releaseHold hold
       bounded (readMVar done)
@@ -423,6 +457,44 @@ spec = describe "Lifetime" $ do
           status ← captureStatus capture
           countCaptureFailed (statusCounters status) `shouldBe` 1
           statusCaptureFailureLatched status `shouldBe` True
+
+    it "counts every delivery the sink received, however a cancellation lands" $ do
+      -- Delivering and counting are one step, so the verdict's delivered
+      -- count is exactly what the sink received wherever the cancellation
+      -- falls: during a write, between writes, or after the last. A
+      -- cancellation that lands only once the lifetime has returned reaches
+      -- the caller bare, with the lifetime's result discarded; there is nothing
+      -- to check then, and the rounds are counted to show the others ran.
+      cancelled ← newIORef (0 ∷ Int)
+      forM_ [1 .. 300 ∷ Int] $ \attempt → do
+        received ← newTVarIO (0 ∷ Word64)
+        let sink = callbackSink (\_ → atomically (modifyTVar' received (+ 1)))
+            logger = mkLogger everythingFilter sink
+        done ← newEmptyMVar
+        started ← newEmptyMVar
+        thread ← forkIO $ do
+          result ←
+            try @SomeException $
+              withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+                mapM_ (\n → offerTo capture (plainOffer SeverityInfo n)) ["1", "2", "3", "4"]
+                putMVar started ()
+          putMVar done result
+        readMVar started
+        -- Vary where the cancellation lands relative to the final drain.
+        replicateM_ (attempt `mod` 7) yield
+        killThread thread
+        result ← bounded (readMVar done)
+        sunk ← readTVarIO received
+        let verdictOf = either diagnosticVerdict (Just . snd) result
+        case verdictOf of
+          Nothing → either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (pure ())) result
+          Just verdict → do
+            when (either (const True) (const False) result) (modifyIORef' cancelled (+ 1))
+            (attempt, verdictDelivered verdict) `shouldBe` (attempt, sunk)
+            (attempt, verdictDelivered verdict + verdictUndelivered verdict) `shouldBe` (attempt, 4)
+      -- Locally about one round in eight is cancelled mid-lifetime; none at all
+      -- would mean the example had stopped exercising what it is for.
+      readIORef cancelled `shouldNotReturn` 0
 
     it "never frees storage the body retained" $ do
       (logger, _) ← recordingLogger everythingFilter

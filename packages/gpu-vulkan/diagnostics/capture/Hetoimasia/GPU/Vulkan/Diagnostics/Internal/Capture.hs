@@ -23,7 +23,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Storage
   , CreateFailure (..)
   , createStorage
-  , freeRecords
+  , freeStorage
   , closeStorage
   , storageClosed
   , storageUserData
@@ -42,8 +42,10 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
 
     -- * Latches and counters
   , Counter (..)
-  , counterValue
   , Latch (..)
+  , SlotStatus (..)
+  , slotStatus
+  , counterValue
   , latchSet
 
     -- * Test support
@@ -54,6 +56,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Hold
   , newHold
   , offerHeld
+  , offerAnnounced
   , holdArrived
   , releaseHold
   , presetCounter
@@ -69,9 +72,9 @@ import Data.Word (Word32, Word64)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.Marshal.Array (withArray, withArrayLen)
+import Foreign.Marshal.Array (allocaArray, peekArray, withArray, withArrayLen)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
-import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
+import Foreign.Ptr (FunPtr, Ptr, nullPtr)
 import Foreign.Storable (peek, poke, pokeByteOff)
 
 -- Limits ---------------------------------------------------------------------
@@ -130,16 +133,20 @@ recordFootprint limits =
 
 data StorageT
 
--- | One C capture storage. Its records are valid between 'createStorage' and
--- 'freeRecords'; its header, which is all a producer or a status read touches
--- once admission has closed, is valid for the life of the process.
-newtype Storage = Storage (Ptr StorageT)
+-- | One C capture storage and the user data its messengers carry. The storage
+-- is valid between 'createStorage' and 'freeStorage'. The user data stays safe
+-- to hand the producer and to read status by forever: it names a slot of a
+-- static table rather than the storage, and answers nothing once that slot
+-- serves another storage.
+data Storage = Storage !(Ptr StorageT) !(Ptr ())
 
 -- | Why a storage could not be built.
 data CreateFailure
   = InvalidLimits !LimitError
   | StorageSizeOverflow
   | StorageOutOfMemory
+  | StorageSlotsExhausted
+    -- ^ Every slot of the process's static table serves a live storage.
   deriving (Eq, Show)
 
 instance Exception CreateFailure
@@ -156,32 +163,35 @@ createStorage limits = do
     alloca $ \out → do
       status ← hetoimasia_capture_create cLimits out
       case status of
-        0 → Storage <$> peek out
+        0 → do
+          storage ← peek out
+          pure (Storage storage (hetoimasia_capture_user_data storage))
         1 → throwIO (InvalidLimits (QueueCapacityRejected (limitQueueCapacity checked)))
         2 → throwIO StorageSizeOverflow
+        4 → throwIO StorageSlotsExhausted
         _ → throwIO StorageOutOfMemory
   where
     -- Three uint32_t fields, and no padding between or after them.
     limitsSize = 12
 
--- | Free the records. The storage must be closed, and its consumer must not
--- take a record again. The header — the producer's view, the latches and the
--- counters — stays valid for the life of the process, so 'counterValue',
--- 'latchSet' and a late producer remain safe.
-freeRecords ∷ Storage → IO ()
-freeRecords (Storage storage) = hetoimasia_capture_free_records storage
+-- | Close the storage if it is not closed, and free it; its consumer must not
+-- take a record again. Its slot's latches and counters stay readable through
+-- 'slotStatus' until another storage claims the slot, and a report still
+-- reaching the producer is counted there as a capture failure.
+freeStorage ∷ Storage → IO ()
+freeStorage (Storage storage _) = hetoimasia_capture_free storage
 
 -- | Stop admission and wait for every producer already inside the callback.
 closeStorage ∷ Storage → IO ()
-closeStorage (Storage storage) = hetoimasia_capture_close storage
+closeStorage (Storage storage _) = hetoimasia_capture_close storage
 
 -- | Whether admission has been closed.
 storageClosed ∷ Storage → IO Bool
-storageClosed (Storage storage) = (/= 0) <$> hetoimasia_capture_closed storage
+storageClosed (Storage storage _) = (/= 0) <$> hetoimasia_capture_closed storage
 
 -- | The user data a messenger registers with the producer.
 storageUserData ∷ Storage → Ptr ()
-storageUserData (Storage storage) = castPtr storage
+storageUserData (Storage _ userData) = userData
 
 -- The producer -------------------------------------------------------------
 
@@ -255,7 +265,7 @@ data CapturedRecord = CapturedRecord
 -- | Take the oldest published record, if there is one. Only the storage's one
 -- consumer may call this.
 takeRecord ∷ Storage → IO (Maybe CapturedRecord)
-takeRecord (Storage storage) = do
+takeRecord (Storage storage _) = do
   record ← hetoimasia_capture_peek storage
   if record == nullPtr
     then pure Nothing
@@ -338,14 +348,6 @@ data Counter
     -- ^ Error-severity records, whatever became of them.
   deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | A counter's current value. Readable at any time the storage is alive,
--- from any thread, with no consumer running.
-counterValue ∷ Storage → Counter → IO Word64
-counterValue (Storage storage) counter = hetoimasia_capture_counter storage (counterIndex counter)
-
-counterIndex ∷ Counter → CInt
-counterIndex = fromIntegral . fromEnum
-
 -- | The storage's latches, which are set once and never cleared.
 data Latch
   = ErrorLatch
@@ -354,8 +356,44 @@ data Latch
     -- ^ A producer-side capture failed.
   deriving (Eq, Ord, Show, Enum, Bounded)
 
+-- | Every counter, indexed by 'Counter', and both latches, indexed by 'Latch'.
+data SlotStatus = SlotStatus
+  { slotCounters ∷ ![Word64]
+  , slotLatches ∷ ![Bool]
+  }
+  deriving (Eq, Show)
+
+-- | The latches and counters of the storage this user data was issued for, or
+-- 'Nothing' once its slot serves another. Safe at any time, from any thread,
+-- with no consumer running, before and after the storage is freed.
+slotStatus ∷ Ptr () → IO (Maybe SlotStatus)
+slotStatus userData =
+  allocaArray countersLength $ \counters →
+    allocaArray 2 $ \latches → do
+      current ← hetoimasia_capture_status userData counters latches
+      if current == 0
+        then pure Nothing
+        else do
+          values ← peekArray countersLength counters
+          flags ← peekArray 2 latches
+          pure (Just (SlotStatus values (map (/= 0) flags)))
+  where
+    countersLength = fromEnum (maxBound ∷ Counter) + 1
+
+-- | One counter, for the package's own examples, which never outlive their
+-- storage's slot.
+counterValue ∷ Storage → Counter → IO Word64
+counterValue storage counter =
+  slotStatus (storageUserData storage) >>= \case
+    Just status → pure (slotCounters status !! fromEnum counter)
+    Nothing → ioError (userError "counterValue: the storage's slot serves another storage")
+
+-- | One latch, likewise.
 latchSet ∷ Storage → Latch → IO Bool
-latchSet (Storage storage) which = (/= 0) <$> hetoimasia_capture_latch storage (fromIntegral (fromEnum which))
+latchSet storage which =
+  slotStatus (storageUserData storage) >>= \case
+    Just status → pure (slotLatches status !! fromEnum which)
+    Nothing → ioError (userError "latchSet: the storage's slot serves another storage")
 
 -- Test support ---------------------------------------------------------------
 
@@ -461,6 +499,15 @@ offerHeld userData (Hold arrived gate) severity message =
       ByteString.useAsCString message $ \text →
         () <$ hetoimasia_capture_offer_held userData arrivedPtr gatePtr (severityBits severity) text
 
+-- | Offer one plain record through the production producer, held just after it
+-- has announced itself until 'releaseHold'. Closing waits for it there.
+offerAnnounced ∷ Ptr () → Hold → Severity → ByteString → IO ()
+offerAnnounced userData (Hold arrived gate) severity message =
+  withForeignPtr arrived $ \arrivedPtr →
+    withForeignPtr gate $ \gatePtr →
+      ByteString.useAsCString message $ \text →
+        () <$ hetoimasia_capture_offer_announced userData arrivedPtr gatePtr (severityBits severity) text
+
 -- | Whether the held producer has entered the callback.
 holdArrived ∷ Hold → IO Bool
 holdArrived (Hold arrived _) = withForeignPtr arrived (fmap (/= 0) . hetoimasia_capture_flag_get)
@@ -471,7 +518,7 @@ releaseHold (Hold _ gate) = withForeignPtr gate hetoimasia_capture_flag_set
 
 -- | Set a counter directly, so saturation can be shown.
 presetCounter ∷ Storage → Counter → Word64 → IO ()
-presetCounter (Storage storage) counter = hetoimasia_capture_preset_counter storage (counterIndex counter)
+presetCounter (Storage storage _) counter = hetoimasia_capture_preset_counter storage (fromIntegral (fromEnum counter))
 
 -- Imports --------------------------------------------------------------------
 
@@ -486,8 +533,17 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_obje
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_create"
   hetoimasia_capture_create ∷ Ptr () → Ptr (Ptr StorageT) → IO CInt
 
-foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_free_records"
-  hetoimasia_capture_free_records ∷ Ptr StorageT → IO ()
+foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_free"
+  hetoimasia_capture_free ∷ Ptr StorageT → IO ()
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_user_data"
+  hetoimasia_capture_user_data ∷ Ptr StorageT → Ptr ()
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_status"
+  hetoimasia_capture_status ∷ Ptr () → Ptr Word64 → Ptr CInt → IO CInt
+
+foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer_announced"
+  hetoimasia_capture_offer_announced ∷ Ptr () → Ptr CInt → Ptr CInt → Word32 → CString → IO Word32
 
 foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer_held"
   hetoimasia_capture_offer_held ∷ Ptr () → Ptr CInt → Ptr CInt → Word32 → CString → IO Word32
@@ -560,12 +616,6 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_reco
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_object_name_length"
   hetoimasia_capture_record_object_name_length ∷ Ptr RecordT → Word32 → IO Word32
-
-foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_counter"
-  hetoimasia_capture_counter ∷ Ptr StorageT → CInt → IO Word64
-
-foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_latch"
-  hetoimasia_capture_latch ∷ Ptr StorageT → CInt → IO CInt
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_preset_counter"
   hetoimasia_capture_preset_counter ∷ Ptr StorageT → CInt → Word64 → IO ()

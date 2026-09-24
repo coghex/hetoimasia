@@ -19,21 +19,24 @@
 **
 ** There is exactly one consumer: the drain worker, or after it has finished,
 ** the lifetime that owns the storage. It is not safe to peek or release from
-** two threads at once. Everything else here — the latches, the counters, the
-** producer itself — is safe from any thread at any time while the storage is
-** alive; the header parts of it are safe for the life of the process.
+** two threads at once.
 **
-** The storage is allocated with the C heap at construction and never grows.
-** It is two parts with two lifetimes. The records — the queue, the object
-** records and the text — belong to the Haskell diagnostic lifetime and are
-** freed at its end, after admission has closed and every producer counted
-** inside the callback has left. The header — the magic, the close handshake,
-** the latches and the counters, a few hundred bytes — is never freed. A
-** producer can be anywhere between entering the callback and announcing itself
-** when the lifetime closes; because the header outlives the process's every
-** use of it, that producer always finds live memory, sees admission closed,
-** counts itself as a capture failure, and never reaches the records. Keeping
-** the header is what makes closing a barrier rather than a hope.
+** What a producer touches before it knows admission is open — its
+** announcement, the close handshake, the latches and the counters — lives in a
+** slot of a fixed static table, never on the heap, so a producer that is late
+** by any amount always lands on live memory. The queue itself is a heap storage
+** that only an announced producer finding admission open ever reaches, and
+** closing waits for every such producer, so the storage can be freed whole once
+** it is closed. A slot is reused only after every producer announced against it
+** has left and its generation has moved on. The user data a messenger carries
+** encodes the slot and the generation rather than pointing anywhere, so a stale
+** or foreign one names nothing and is ignored.
+**
+** Announcing is the callback's first memory operation. A report that has not
+** even begun when the storage closes — a Vulkan call still running when the
+** lifetime that owns the storage ended, which the lifetime's contract rules
+** out — is outside the verdict, but still counted: as a capture failure, in
+** the slot the status query reads until the slot is claimed again.
 */
 #ifndef HETOIMASIA_VULKAN_CAPTURE_H
 #define HETOIMASIA_VULKAN_CAPTURE_H
@@ -93,6 +96,10 @@ typedef struct hetoimasia_capture_record hetoimasia_capture_record;
 #define HETOIMASIA_CAPTURE_INVALID_LIMIT 1
 #define HETOIMASIA_CAPTURE_SIZE_OVERFLOW 2
 #define HETOIMASIA_CAPTURE_OUT_OF_MEMORY 3
+#define HETOIMASIA_CAPTURE_NO_SLOT 4
+
+/* How many storages can be live at once in one process. */
+#define HETOIMASIA_CAPTURE_SLOTS 64
 
 /*
 ** Build a storage with these limits, or answer why not. On success `*out` is
@@ -109,21 +116,24 @@ int hetoimasia_capture_create(
 size_t hetoimasia_capture_record_size(void);
 size_t hetoimasia_capture_object_size(void);
 
+/* The user data every messenger registering this storage carries. */
+void *hetoimasia_capture_user_data(const hetoimasia_capture_storage *storage);
+
 /*
-** Free the records. The caller must have closed the storage, and the consumer
-** must not peek or release again. The header stays valid for the life of the
-** process: the producer, the latches and the counters remain safe to use, and a
-** report still reaching the producer is counted as a capture failure.
+** Close the storage if it is not closed, and free it. The consumer must not
+** touch it again. Its slot keeps its latches and counters, readable through
+** `hetoimasia_capture_status`, until another storage claims it; a report still
+** reaching the producer is counted there as a capture failure.
 */
-void hetoimasia_capture_free_records(hetoimasia_capture_storage *storage);
+void hetoimasia_capture_free(hetoimasia_capture_storage *storage);
 
 /*
 ** The production producer: a debug-utils messenger callback with this storage
 ** as its user data. The parameters are the callback's, with the Vulkan types
 ** spelled by their width. Always answers 0, `VK_FALSE`.
 **
-** A NULL user data, or one that is not a live storage, is ignored: there is
-** nowhere to record it. A NULL callback data is a producer-side failure and
+** A user data that names no slot, or a slot now serving another storage, is
+** ignored: there is nowhere to record it. A NULL callback data is a producer-side failure and
 ** latches capture failure. A record offered after the storage was closed is
 ** one too, because it can no longer be delivered.
 */
@@ -180,14 +190,18 @@ uint32_t hetoimasia_capture_record_object_name_length(const hetoimasia_capture_r
 #define HETOIMASIA_CAPTURE_ERRORS 5
 #define HETOIMASIA_CAPTURE_COUNTERS 6
 
-/* A counter's value, or 0 for an index that names none. */
-uint64_t hetoimasia_capture_counter(const hetoimasia_capture_storage *storage, int which);
-
 /* The latches, which only ever go from 0 to 1. */
 #define HETOIMASIA_CAPTURE_ERROR_LATCH 0
 #define HETOIMASIA_CAPTURE_FAILURE_LATCH 1
 
-int hetoimasia_capture_latch(const hetoimasia_capture_storage *storage, int which);
+/*
+** Read the counters and latches of the storage this user data was issued for,
+** into `counters[HETOIMASIA_CAPTURE_COUNTERS]` and `latches[2]`. Answers 1 when
+** every value read was that storage's, and 0 when its slot has since been
+** claimed by another — before or after the storage was freed makes no
+** difference until then.
+*/
+int hetoimasia_capture_status(void *user_data, uint64_t *counters, int *latches);
 
 /*
 ** Test support: set a counter to a value, so saturation can be shown without
@@ -217,11 +231,20 @@ uint32_t hetoimasia_capture_offer(
 
 /*
 ** Test support: offer one plain record, but only once `*gate` is non-zero,
-** having first set `*arrived`. From the storage's side this is a producer that
-** has entered the callback and not yet announced itself, held there for as long
-** as the caller likes — across a close, and across freeing the records.
+** having first set `*arrived`. From the storage's side this is a report that has
+** not yet begun, held for as long as the caller likes — across a close, and
+** across freeing the storage.
 */
 uint32_t hetoimasia_capture_offer_held(
+  void *user_data, int *arrived, int *gate, uint32_t severity, const char *message);
+
+/*
+** Test support: offer one plain record through the production producer, pausing
+** just after the producer has announced itself — the earliest point anything
+** about the report is visible — until `*gate` is non-zero, having set
+** `*arrived`. Closing waits for it there.
+*/
+uint32_t hetoimasia_capture_offer_announced(
   void *user_data, int *arrived, int *gate, uint32_t severity, const char *message);
 
 /* Test support: set a flag, and read one, with atomic ordering. */

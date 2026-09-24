@@ -23,21 +23,24 @@
 -- messenger reports after the explicit messenger is gone — before it returns
 -- or throws. The lifetime then, in this order and on every exit:
 --
--- 1. closes admission and waits for any producer counted inside the callback;
+-- 1. closes admission and waits for every producer that has announced itself
+--    inside the callback — announcing is the callback's first memory operation;
 -- 2. asks the worker for its final drain and waits for its completion,
 --    explicitly, rather than relying on the worker group's default drain;
 -- 3. accounts for every admitted record the worker did not deliver, including
 --    one it had taken when it was cancelled;
--- 4. frees the storage's records — unless the body retained them with
---    'retainStorage' because a messenger that names them may still report —
---    and only then returns, or rethrows the body's failure unchanged.
+-- 4. frees the storage — unless the body retained it with 'retainStorage'
+--    because a messenger that names it may still report — and only then
+--    returns, or rethrows the body's failure unchanged.
 --
--- The storage's header — the producer's entry check, the close handshake, the
--- latches and the counters — is never freed. A producer caught between entering
--- the callback and announcing itself when admission closes therefore always
--- finds live memory, sees admission closed, counts itself as a capture failure
--- and never reaches the records, and 'captureStatus' reads the same live
--- counters before, during and after the release.
+-- What a producer touches before it knows admission is open — its
+-- announcement, the close handshake, the latches and the counters — lives in a
+-- slot of a fixed static table in the C capture, never on the heap, and the
+-- user data names that slot and a generation rather than the storage. So a
+-- report that has not even begun when admission closes, which the body's
+-- contract rules out, is still memory-safe: it finds admission closed and
+-- counts itself as a capture failure, outside the verdict, and 'captureStatus'
+-- shows it until the slot serves another lifetime.
 --
 -- The result is a 'DiagnosticVerdict' covering every record offered before
 -- step 1, including those delivered during instance destruction. A failed body
@@ -58,11 +61,14 @@
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | State              | Owner               | Writers                    | Readers                   | Lifetime and reset              |
 -- +====================+=====================+============================+===========================+=================================+
--- | C records: queue,  | this lifetime       | producers (any thread),    | the worker; the lifetime  | allocated at entry; freed in    |
+-- | C storage: queue,  | this lifetime       | producers (any thread),    | the worker; the lifetime  | allocated at entry; freed in    |
 -- | objects, text      |                     | the worker (consumption)   | after it                  | step 4 unless retained          |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
--- | C header: latches, | this lifetime, then | producers (any thread),    | the lifetime;             | allocated at entry; never freed |
--- | counters, handshake| the process         | the lifetime (close)       | 'captureStatus'           | or reset                        |
+-- | C slot: latches,   | this lifetime, then | producers (any thread),    | the lifetime;             | static; claimed at entry, reset |
+-- | counters, handshake| the next claimant   | the lifetime (close)       | 'captureStatus'           | only when claimed again         |
+-- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
+-- | status snapshot    | this lifetime       | step 4, once, before free  | 'captureStatus' once the  | per lifetime                    |
+-- |                    |                     |                            | slot serves another       |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | phase              | this lifetime       | the lifetime's thread      | any thread                | per lifetime; only advances     |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
@@ -146,6 +152,7 @@ import Control.Monad (unless, when)
 import Data.Bits (testBit, (.&.))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intercalate)
+import Data.Either (isRight)
 import Data.Maybe (isJust, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -191,10 +198,10 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , captureCallback
   , checkLimits
   , closeStorage
-  , counterValue
+  , SlotStatus (..)
   , createStorage
-  , freeRecords
-  , latchSet
+  , freeStorage
+  , slotStatus
   , storageUserData
   , takeRecord
   )
@@ -280,10 +287,11 @@ data CapturePhase
 -- passed to; 'capturePhase', 'captureStatus' and 'deliveredCount' remain
 -- answerable after the lifetime has ended.
 data DiagnosticCapture = DiagnosticCapture
-  { handleStorage ∷ !Storage
-    -- ^ Its header, all a status read touches, is valid for the life of the
-    -- process.
-  , handleUserData ∷ !(Ptr ())
+  { handleUserData ∷ !(Ptr ())
+    -- ^ Names the storage's slot; safe to read status by at any time.
+  , handleSnapshot ∷ !(TVar (Maybe CaptureStatus))
+    -- ^ Written in step 4 before the storage is freed, and so before its slot
+    -- can serve another lifetime.
   , handlePhase ∷ !(TVar CapturePhase)
   , handleTaken ∷ !(TVar Word64)
     -- ^ Records the worker has taken from the storage, delivered or not.
@@ -296,10 +304,10 @@ data DiagnosticCapture = DiagnosticCapture
 -- | The user data to register beside 'captureCallback' on every messenger:
 -- the explicit one, and the one chained into @VkInstanceCreateInfo@.
 --
--- The records it names stay valid until the lifetime's final step, which the
--- body reaches only after its last callback-producing destruction; a report
--- that still arrives after that is counted as a capture failure against the
--- storage's header, which is never freed.
+-- It names a slot and a generation rather than memory, so it is safe to hand
+-- the callback at any time; the storage behind it lives until the lifetime's
+-- final step, which the body reaches only after its last callback-producing
+-- destruction.
 captureUserData ∷ DiagnosticCapture → Ptr ()
 captureUserData = handleUserData
 
@@ -340,6 +348,7 @@ withDiagnosticCapture config logger body = do
   mask $ \restore → do
     storage ← createStorage (limitsOf valid)
     capture ← newCapture storage
+    finishedRef ← newIORef Nothing
     grouped ←
       trySome
         ( withWorkerGroup $ \group → do
@@ -349,7 +358,10 @@ withDiagnosticCapture config logger body = do
               StartupFailed _ completion → failedStartup completion
               StartRejected _ → error "withDiagnosticCapture: a group it just created refused a worker"
             outcome ← trySome (restore (body capture))
-            finish storage capture worker outcome
+            finished ← finish storage capture worker outcome
+            -- Kept outside the group: a cancellation during the group's own
+            -- closing still leaves the lifetime a verdict to attach.
+            writeIORef finishedRef (Just finished)
         )
     -- The group has drained: nothing of the worker's runs any more. What it
     -- took and did not deliver — discarded after a sink failure, or in hand
@@ -359,9 +371,12 @@ withDiagnosticCapture config logger body = do
     taken ← readTVarIO (handleTaken capture)
     delivered ← readTVarIO (handleDelivered capture)
     status ← uninterruptibleMask_ (release storage capture)
-    case grouped of
-      Left failure → rethrowIO failure
-      Right finished → do
+    reached ← readIORef finishedRef
+    case reached of
+      -- The body never ran, or finalization never completed: there is no
+      -- verdict to give.
+      Nothing → either rethrowIO (\() → error "withDiagnosticCapture: finalization left no result") grouped
+      Just finished → do
         retained ← readTVarIO (handleRetained capture)
         let verdict =
               DiagnosticVerdict
@@ -373,10 +388,13 @@ withDiagnosticCapture config logger body = do
                 }
             attach (ExceptionWithContext context failure) =
               ExceptionWithContext (addExceptionAnnotation (VerdictAnnotation verdict) context) failure
-        case (finishedPending finished, finishedOutcome finished) of
-          (Just cancellation, _) → rethrowIO (attach cancellation)
-          (Nothing, Left failure) → rethrowIO (attach failure)
-          (Nothing, Right result) → pure (result, verdict)
+        -- A cancellation during finalization, then one during the group's
+        -- closing, then the body's own failure, then its result.
+        case (finishedPending finished, either Just (const Nothing) grouped, finishedOutcome finished) of
+          (Just cancellation, _, _) → rethrowIO (attach cancellation)
+          (Nothing, Just late, _) → rethrowIO (attach late)
+          (Nothing, Nothing, Left failure) → rethrowIO (attach failure)
+          (Nothing, Nothing, Right result) → pure (result, verdict)
 
 -- | The worker's startup is trivial, so this is a failure to fork or an
 -- asynchronous exception; either is rethrown as itself.
@@ -388,8 +406,9 @@ failedStartup completion = case completionResult completion of
 
 newCapture ∷ Storage → IO DiagnosticCapture
 newCapture storage =
-  DiagnosticCapture storage (storageUserData storage)
-    <$> newTVarIO PhaseCapturing
+  DiagnosticCapture (storageUserData storage)
+    <$> newTVarIO Nothing
+    <*> newTVarIO PhaseCapturing
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO False
@@ -458,16 +477,16 @@ countRemaining storage = go 0
         Just _ → go (counted + 1)
 
 -- | Step 4. Close (again, harmlessly, for an exit that never reached the first
--- close), read the latches and counters the verdict reports, and free the
--- records unless the body retained them. Bounded: it waits only for producers
--- counted inside the callback. The header stays, so nothing that can still
--- reach it — a late producer, a status read — can touch freed memory.
+-- close), read the latches and counters the verdict reports and keep them as the
+-- snapshot, then free the storage unless the body retained it. Bounded: it
+-- waits only for producers that have announced themselves.
 release ∷ Storage → DiagnosticCapture → IO CaptureStatus
 release storage capture = do
   closeStorage storage
-  status ← readStatus storage
+  status ← readStatus (storageUserData storage) >>= maybe (fail "release: a live storage's slot served another") pure
+  atomically (writeTVar (handleSnapshot capture) (Just status))
   retained ← readTVarIO (handleRetained capture)
-  unless retained (freeRecords storage)
+  unless retained (freeStorage storage)
   atomically (writeTVar (handlePhase capture) PhaseReleased)
   pure status
 
@@ -502,31 +521,41 @@ data CaptureStatus = CaptureStatus
   }
   deriving (Eq, Show)
 
--- | Read the latches and counters, with no worker involved, at any time — the
--- storage's header they live in is never freed. After the lifetime has ended
--- this still answers the live values, so a report that arrived after the
--- verdict was reached shows here as a capture failure.
+-- | Read the latches and counters, with no worker involved, at any time. They
+-- live in the storage's static slot, which is never freed: after the lifetime
+-- has ended this still answers the live values — so a report that arrived after
+-- the verdict was reached shows here as a capture failure — until the slot
+-- serves another lifetime, and then the snapshot taken just before the free.
 captureStatus ∷ DiagnosticCapture → IO CaptureStatus
-captureStatus = readStatus . handleStorage
+captureStatus capture =
+  readStatus (handleUserData capture) >>= \case
+    Just status → pure status
+    Nothing →
+      -- The slot moved on, which it can only do after the free, which follows
+      -- the snapshot.
+      readTVarIO (handleSnapshot capture)
+        >>= maybe (fail "captureStatus: a reclaimed slot left no snapshot") pure
 
-readStatus ∷ Storage → IO CaptureStatus
-readStatus storage = do
-  counters ←
-    CaptureCounters
-      <$> counterValue storage Offered
-      <*> counterValue storage Admitted
-      <*> counterValue storage Dropped
-      <*> counterValue storage Truncated
-      <*> counterValue storage CaptureFailed
-      <*> counterValue storage Errors
-  errorLatched ← latchSet storage ErrorLatch
-  failureLatched ← latchSet storage CaptureFailureLatch
-  pure
-    CaptureStatus
-      { statusErrorLatched = errorLatched
-      , statusCaptureFailureLatched = failureLatched
-      , statusCounters = counters
-      }
+readStatus ∷ Ptr () → IO (Maybe CaptureStatus)
+readStatus userData =
+  fmap describe <$> slotStatus userData
+  where
+    describe status =
+      let counter which = slotCounters status !! fromEnum which
+          latched which = slotLatches status !! fromEnum which
+       in CaptureStatus
+            { statusErrorLatched = latched ErrorLatch
+            , statusCaptureFailureLatched = latched CaptureFailureLatch
+            , statusCounters =
+                CaptureCounters
+                  { countOffered = counter Offered
+                  , countAdmitted = counter Admitted
+                  , countDropped = counter Dropped
+                  , countTruncated = counter Truncated
+                  , countCaptureFailed = counter CaptureFailed
+                  , countErrors = counter Errors
+                  }
+            }
 
 -- The verdict -------------------------------------------------------------------
 
@@ -683,9 +712,16 @@ drainWorker config logger storage capture =
                   -- Taken, counted, and not delivered: accounted as undelivered.
                   Just _ → pure ()
                   Nothing → do
-                    delivered ← trySome (deliver logger record)
+                    -- Delivering and counting the delivery are one step: the
+                    -- sink's own blocking stays interruptible, so a cancellation
+                    -- still reaches a stuck sink, but none can land between a
+                    -- write that completed and its count.
+                    delivered ← mask_ $ do
+                      result ← trySome (deliver logger record)
+                      when (isRight result) (atomically (modifyTVar' (handleDelivered capture) (+ 1)))
+                      pure result
                     case delivered of
-                      Right () → atomically (modifyTVar' (handleDelivered capture) (+ 1))
+                      Right () → pure ()
                       Left failure@(ExceptionWithContext _ exception)
                         | isJust (fromException exception ∷ Maybe SomeAsyncException) → rethrowIO failure
                         | otherwise → writeIORef state (DrainReport (Just failure))
