@@ -3931,6 +3931,16 @@ model already has for a fact a thread other than the owner certified. Operator
 process termination remains the escape, and no timeout grants the authority,
 because a timeout is not evidence.
 
+Each turn of that wait decides from one coherent snapshot: whether the
+destruction is verified, whether the owner's run has ended, and the `retired`
+and `unverified-targets` fields the diagnostic and `OwnerDestructionUnverified`
+report are all read in a single transaction over the owner's terminal record
+and its targets. The owner commits its evidence before its completion, so no
+such snapshot of a successful teardown shows the run ended without the
+evidence. Separate reads could: a teardown that committed both between them
+would be declared unverified, with a false warning and a failed exit, although
+it destroyed everything it held.
+
 An individual close or detach is not that. `releaseGraphicsTarget` retires one
 target, the owner publishes that target's exact evidence, the main thread
 acknowledges it and its window is released, and the owner and every other
@@ -4081,7 +4091,10 @@ manufactures no acknowledgement. The owner's borrowed parents are released only
 against the injected whole-owner destruction's evidence; an owner that ends
 without it answers `OwnerDestructionUnverified`, which retains that fact, writes
 one diagnostic under `glfw.graphics-owner`, and authorizes nothing — not a
-disposal, and not a replay of the work that failed.
+disposal, and not a replay of the work that failed. That the owner ended without
+it is decided from the same snapshot that found the evidence missing, never
+from a later read, so a completion recorded after successful destruction is
+never mistaken for one recorded without it.
 
 #### Examples
 
