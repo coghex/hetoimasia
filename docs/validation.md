@@ -234,7 +234,11 @@ describes.
 `test.workflow` runs only when affected or requested. It contains workflow,
 planner, receipt, packaging, and runner contracts, including short one-second
 fixtures proving that the runner enforces its deadline and reaps children. It
-contains no display-helper examples.
+contains no display-helper examples. It declares `packages/gpu-vulkan/native/`
+among its inputs, as it declares `tools/vulkan-proof/`: no CPU group can build
+the native backend package, whose only build is the proof route, and this
+group's Vulkan boundary examples are what hold that package out of the ordinary
+projects and read its dependencies.
 
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
