@@ -28,6 +28,12 @@ package hetoimasia-glfw
 package hetoimasia-gpu-vulkan-model
   ghc-options: -Werror -j
 
+package hetoimasia-gpu-vulkan-diagnostics
+  ghc-options: -Werror -j
+
+package hetoimasia-gpu-vulkan-native
+  ghc-options: -Werror -j
+
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 

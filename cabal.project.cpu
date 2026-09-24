@@ -10,4 +10,5 @@ packages:
   packages/runtime
   packages/scripting-lua
   packages/gpu-vulkan/model
+  packages/gpu-vulkan/diagnostics
   tools/test-support

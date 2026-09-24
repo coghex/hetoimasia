@@ -1,0 +1,99 @@
+cabal-version: 3.16
+name: hetoimasia-gpu-vulkan-diagnostics
+version: 0.1.0.0
+synopsis: Bounded C-only capture of Vulkan validation diagnostics for Hetoimasia
+description:
+    The Vulkan backend's diagnostic lifetime: bounded storage a debug-utils
+    messenger's C callback copies capped records into, with error and
+    capture-failure latches and saturating drop, truncation and failure counts
+    observable at any time; and a drain worker, in a foundation worker group the
+    lifetime owns, that delivers those records through the caller's existing
+    logger and is joined explicitly after the last callback-producing
+    destruction.
+    .
+    The callback is C so it can be reached from an @unsafe@ Vulkan import with
+    no Haskell re-entry. This package includes no Vulkan header and depends on
+    no Vulkan binding or loader: it knows the callback's data layout by a mirror
+    the native backend package checks at compile time. It builds and its suite
+    runs with no Vulkan SDK present.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/gpu-vulkan/diagnostics
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The C storage, its producer, and the Haskell view of both. Private, so the
+-- public library and this package's own suite share it and no client sees a
+-- storage, a record pointer, or the package-local producer entry. The native
+-- backend package reaches the header through `install-includes`.
+library capture
+    import: language
+    visibility: private
+    hs-source-dirs: capture
+    c-sources: capture/cbits/hetoimasia_vulkan_capture.c
+    include-dirs: capture/cbits
+    install-includes: hetoimasia_vulkan_capture.h
+    -- The producer reads the callback data through a layout mirror of the
+    -- Vulkan structures; strict aliasing must not let that read be reordered
+    -- or elided.
+    cc-options: -std=c11 -fno-strict-aliasing -Wall -Wextra -Werror
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.Diagnostics
+    build-depends:
+        base >=4.22 && <4.23,
+        stm >=2.5 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics:capture
+
+-- This package's own contracts. The examples offer records through the
+-- package-local producer entry, which builds the callback data on a C frame and
+-- calls the production producer with it, so they exercise the C capture itself
+-- rather than a Haskell stand-in. The suite depends on no Vulkan SDK and is
+-- registered as the CPU validation group `test.vulkan-diagnostics`.
+test-suite diagnostics-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N4"
+    other-modules:
+        Test.GPU.Vulkan.Diagnostics.Capture
+        Test.GPU.Vulkan.Diagnostics.Config
+        Test.GPU.Vulkan.Diagnostics.Lifetime
+        Test.GPU.Vulkan.Diagnostics.Spec
+        Test.GPU.Vulkan.Diagnostics.Support
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        stm >=2.5 && <2.6,
+        text >=2.1 && <2.2,
+        time >=1.15 && <1.16,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics,
+        hetoimasia-gpu-vulkan-diagnostics:capture,
+        hetoimasia-test-support ==0.1.0.0
