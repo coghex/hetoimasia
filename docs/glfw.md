@@ -60,7 +60,8 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the notification policy over the session's wake capability and the bounded demand slots, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, the CPU-only render demand helper that composes the runtime's simulation demand with each window's, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
-| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration; `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper; and `Hetoimasia.Runtime.GLFW.Internal.Owner` with its `.Handoff`, the supervised graphics owner and the cross-thread state it runs over |
+| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`: the window host's implementation, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration; `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper; `Hetoimasia.Runtime.GLFW.Internal.Owner` with its `.Handoff`, the supervised graphics owner and the cross-thread state it runs over; and `Hetoimasia.Runtime.GLFW.Internal.Surface`, the Vulkan-free surface bridge over the protected attachment |
+| `hetoimasia-glfw:vulkan-interop` | public, flag-gated | `Hetoimasia.GLFW.Vulkan` and `Hetoimasia.GLFW.Vulkan.Provenance`: the loader integration capability made from the Vulkan binding's own loader entry point, the instance-extension query, and the surface bridge's production operations, over `vulkan-interop/cbits`, the one translation unit in the package that includes the Vulkan headers. Built only with the manual `vulkan-interop` flag, which only `cabal.project.vulkan` sets; see [Vulkan interop](#vulkan-interop). |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
 | `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the supervised graphics owner examples over injected fake backend operations, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
@@ -68,6 +69,9 @@ There is no default close policy or rendering operation.
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
+The `vulkan-interop` sublibrary is the only component that depends on the
+Vulkan binding, and with its flag off — everywhere but `cabal.project.vulkan` —
+it is not buildable and contributes no dependency at all.
 `runtime-glfw` depends on both, and no library depends on it; only the
 package's own `glfw-tests` and `glfw-native-tests` use it. The runtime integration therefore inverts no
 dependency. It is a sublibrary with its own source root rather than a separate
@@ -4592,6 +4596,189 @@ retention until taken; and a notice queued for a replaced attachment refused
 when folded. The opacity examples compile an external client that imports the
 model and is refused because its module belongs to a hidden private sublibrary.
 
+## Vulkan interop
+
+The GLFW package's Vulkan-specific code is one separate component,
+`hetoimasia-glfw:vulkan-interop`, and a Vulkan-free half that the rest of the
+package owns: the session's loader capability in the `model` sublibrary and the
+surface bridge in `runtime-glfw-core`. It is VK-5 of
+[the Vulkan backend design](vulkan_backend_design.md) (P-1's package boundary,
+P-7, D-5, D-7, D-14, D-29, D-33) and depends on no GPU package and no renderer.
+
+### The component and its build
+
+`vulkan-interop/cbits/hetoimasia_glfw_vulkan.c` includes `<vulkan/vulkan.h>`
+before `<GLFW/glfw3.h>` with `GLFW_INCLUDE_NONE`: GLFW 3.4 declares
+`glfwInitVulkanLoader`, `glfwGetInstanceProcAddress`, and
+`glfwCreateWindowSurface` only when `VK_VERSION_1_0` is defined. Its header
+names no Vulkan or GLFW type, so the Haskell imports see an instance as an
+untyped pointer, a window as the model's opaque `NativeWindow`, and a surface as
+a `Word64`; the source statically asserts that `VkSurfaceKHR` is 64 bits wide,
+the handle ABI the VK-2 proof established. Every import is `safe`, because a
+GLFW call that reaches the loader can reach its layers.
+
+The ordinary native library, `native/cbits`, keeps `GLFW_INCLUDE_NONE` and gains
+no Vulkan declaration, header, or link input. The component is gated by the
+package's manual `vulkan-interop` flag, off by default: `cabal build all` and
+`cabal build all --project-file cabal.project.cpu` build none of it, resolve no
+Vulkan binding, and link no loader, and every existing public module,
+`allocSession`, and every window-only constructor keep their signatures and
+behaviour. `cabal.project.vulkan` lists the package and sets the flag, and
+[`tools/vulkan-proof/run-proof.sh`](../tools/vulkan-proof/README.md) passes the
+provisioned prefix's Vulkan include and library directories on its command
+line; the workflow suite's Vulkan proof boundary examples check that only that
+project turns the flag on and that, with it off, no ordinary package resolves
+the binding.
+
+### The loader integration capability
+
+`allocLoaderIntegration` builds a `LoaderIntegration`: an opaque, single-use
+capability made from the loader entry point the Vulkan binding already
+dispatches through — the binding's own linked `vkGetInstanceProcAddr`, asked for
+its own address — for the production GLFW library's guard. A session takes it
+through `Hetoimasia.GLFW.Session.allocIntegratedSession` (or the interop's
+`allocLoaderSession`), the additive constructor beside `allocSession`.
+`SessionConfig` is unchanged: it stays a pure `Eq`/`Show` window configuration,
+and the capability is a separate argument, never an action inside it.
+
+In the session's construction the capability is:
+
+1. **admitted** right after the guard is claimed and before the support query,
+   the first native call. A capability whose scope has ended is
+   `IntegrationStale`, one made for another native library's guard is
+   `IntegrationForeign`, and one another entry already took is
+   `IntegrationAlreadyUsed`; each is refused there, before any native effect,
+   leaves the capability as it was, and vacates the guard as any refusal before
+   initialization does;
+2. **installed** after `nativeSetInitHints` and before `nativeInitialize`, as
+   GLFW's pre-init loader hint. It is marked installed before the call, so
+   whatever the call does, the release below resets it; a capability whose
+   install raises leaves GLFW uninitialized, is reset, and vacates the guard;
+3. **reset** by its own release — rank four, after termination and before the
+   error callback's detach and the guard's settlement — to GLFW's default
+   loader search. That release runs after a normal termination, after a failed
+   initialization, and after an entry that failed before initialization, so the
+   default is always restored before the capability's own scope — the borrowed
+   loader ownership — can end.
+
+When the reset raises, or termination already could not be established, what
+GLFW holds is unknown: the capability is retained as `IntegrationUncertain`,
+never ends, and the guard is poisoned, so no later session — window-only or not
+— initializes GLFW beside a loader setting nobody can vouch for. A capability's
+scope that ends while its session still holds it fails with
+`IntegrationStillInstalled` and keeps it until the session restores the default.
+A window-only session makes no loader call at all, so the header-free path makes
+no Vulkan-typed reset call; the loader setting it would find is always GLFW's
+default, because every interop session restores it before its guard is vacated.
+
+### Instance extensions
+
+`Hetoimasia.GLFW.Vulkan.requiredInstanceExtensions` answers the instance
+extensions GLFW requires for this platform's window surfaces. It is an owner
+operation: another thread is `NotSessionOwner` and an ended session
+`SessionEnded`, each before any native call. A window-only session is refused
+with `SessionNotLoaderAware` without asking GLFW, which would otherwise search
+for a loader of its own. GLFW is first asked whether it has a Vulkan loader at
+all — `VulkanUnsupported` carries what it reported if not — and then for the
+names, every one of which is copied whole into Haskell-owned storage and forced
+before the query returns, so none points into storage termination frees and
+none is cut to a fixed length.
+
+### The surface bridge
+
+`Hetoimasia.Runtime.GLFW.Internal.Surface` is the bridge, written over the
+capability's two surface operations, so the model and the seam stay header-free;
+`Hetoimasia.GLFW.Vulkan` is its public face.
+
+**Where a surface may be created.** Only through a `SurfaceAccess`, which is
+open only while one of two things runs on the owner thread: the construction
+step of an attachment made by `attachWindowGraphicsWithSurfaces` — which is
+`attachWindowGraphics`, unchanged in every answer, with the protocol built from
+the access — for exactly that attachment while it is registering; or an
+admitted replacement, `replaceWindowSurface`, on that same attachment while it
+is active and its window is not closing. A replacement decides nothing about
+when one is wanted, how the surface it replaces retires, or how often to retry;
+that is VK-14's policy. Every other request — a step that has returned, a
+retiring or replaced attachment, a closing or ended window, a session with no
+capability, an instance leased through another capability, an instance whose
+lease is releasing — is a `SurfaceRefusal` before any native effect.
+
+**The handoff record.** The instance's owner leases it to the bridge with
+`leaseSurfaceInstance`, as its dispatchable handle. Admission and the
+reservation are one transaction: it counts a hold on the exact attachment and a
+construction on the lease before the native call. The window's native pointer
+is borrowed inside the bridge, through the host's own window borrow, for that
+call alone, and never leaves it. The call is made with asynchronous exceptions
+held off, as a native call is uninterruptible anyway, and its result is always
+recorded:
+
+| What the native call did | What the caller receives | Holds |
+|---|---|---|
+| Created a surface, nothing changed since admission, and GLFW reported nothing | `SurfaceCreated`: a live `WindowSurface` carrying its one `SurfaceObligation` | The obligation holds the attachment and the lease |
+| Created a surface, but the window began closing, the attachment began retiring, the step ended, GLFW reported errors, or the bridge raised after it | `SurfaceUnpublished`: the obligation alone, with the reason; the surface must not be used | The obligation holds both |
+| Returned a failing `VkResult` and created nothing | `SurfaceCreationFailed` with that `VkResult` and GLFW's reports | Released |
+| Raised before any native result existed | That exception, as itself — never a fabricated `VkResult` | Released |
+
+A cancellation that arrives during the call is delivered only after its result
+is recorded. A caller that loses the answer to it has not lost the surface:
+every obligation not yet confirmed destroyed stays listed on its lease
+(`leasedObligations`), still holding the attachment, so the owned rollback or the
+instance's owner can find and discharge it. A full ordinary command queue plays
+no part: surface creation is not a command.
+
+**Obligations.** `dischargeSurfaceObligation` destroys the surface through the
+capability's `vkDestroySurfaceKHR`, resolved through the capability's own loader
+entry point — a Vulkan call, never a GLFW one — from whichever thread holds the
+obligation, and only once: a second discharge is `DischargeRefused
+AlreadyDischarged`. Only a destruction that returned releases the attachment and
+lease holds. One that raised is `DestructionUncertain`, keeps both holds for
+good, and is never retried.
+
+**Retirement and release wait for it.** While any surface construction or
+undischarged or uncertain obligation holds an attachment, the retirement
+boundary refuses its `DependentsDisposed` fact — certified on the owner thread
+or folded from a notice — and treats a failed construction's `RollbackSafe` as
+`RollbackUnsafe`. So no cancellation, timeout, or cleanup error can certify the
+attachment's terminal retirement while a surface of it may exist, and a second
+obligation or a replacement still in its native call keeps the attachment held
+after the first is discharged. `releaseSurfaceInstance` closes the lease to new
+constructions and answers `InstanceReleasable` only when nothing is in flight or
+owed against it; until then it is `InstanceRetained`, and the instance must not
+be destroyed. The graphics owner that will receive the surface, own the
+instance, and discharge the obligation on its own thread is VK-7's; this slice's
+examples discharge from a scripted owner.
+
+`Hetoimasia.GLFW.Vulkan.Provenance` answers what the native proof needs to hold
+the one-loader claim to addresses and images — the entry point a capability was
+made from, the value the shim last handed GLFW's loader hint (GLFW offers no way
+to read the hint back, and the shim is its only production writer), and what
+GLFW resolves a name to — and nothing an application needs.
+
+### Examples and native evidence
+
+`glfw-tests` covers the capability and the bridge headlessly through the seam's
+scripted capability (`seamIntegration`, `seamIntegratedSession`), which records
+each loader and surface call beside the native ones. The `GLFW loader
+integration` group holds the install's order between the hints and `glfwInit`;
+the refusal of a stale, foreign, or already-used capability before any native
+call; the reset after termination, after a failed initialization, and after a
+capability that fails; and the retained, poisoned outcome when the reset or
+termination is uncertain. `GLFW required instance extensions` holds the copied
+names past termination, the owner-thread and liveness refusals, and the
+diagnoses for a window-only session and for a platform with no loader or no
+extensions. `GLFW surface bridge` holds creation inside a construction step,
+refusal outside a running step and for a foreign or releasing instance, admitted
+and refused replacements, a native failure's `VkResult` and reports, an
+exception before a result, a cancellation that loses the answer with the
+obligation kept and the rollback's claim of safety refused, a rollback that
+discharges it, a window closing during creation, creation while the command
+queue is full, a double discharge, an uncertain destruction, and a second
+obligation or an in-flight construction keeping the attachment and the lease.
+
+The native evidence runs through the production capability and bridge in the
+VK-2 harness until VK-8 migrates it; see
+[the proof harness](../tools/vulkan-proof/README.md#vk-5-the-loader-aware-surface-bridge).
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
@@ -4666,6 +4853,12 @@ model and is refused because its module belongs to a hidden private sublibrary.
 | The settlement ledger | The graphics owner composition | The main thread writes at registration and at its own settlements; the owner writes when it takes and when it settles; any thread reads | Any; STM | Until its attachment has validated its facts, or is gone without ever reaching the owner | One entry per incarnation the protocol registered, so at most one live per window the host may hold; a settled entry is forgotten once the host's model no longer has that attachment pending, and one whose attach left nothing is forgotten by the handover's own settlement — which is what bounds it for an owner that takes no rounds at all, held in its startup or its step |
 | Retained owner failures | The graphics owner composition | The owner writes; the exit and any thread read | Any; STM | The owner worker's lifetime | Oldest first and bounded, so a backend that fails every round cannot grow what it reports through; the latch beside it keeps only the first, for notification |
 | Graphics owner fatal latch | The graphics owner composition | The owner writes it once; the supervision sentinel and the exit read it | Any; STM | The owner worker | Never cleared; a cancellation is never latched in it |
+| Loader integration capability use | Its scope, lent to the one session that takes it | Entry admits and installs it; the session's release restores GLFW's default; its scope ends it | Owner; the scope's end on any thread | Its scope; one session's use in between | Ended once restored or unused; retained for good when uncertain, with the guard poisoned |
+| The interop shim's installed-loader record | The Vulkan interop component | The shim writes it with each loader hint it sets; the provenance query reads it | Owner | The process | Null whenever GLFW's default search is in force |
+| Attachment surface holds | The protected host lifetime | Surface admission raises one; a failed construction or a confirmed destruction lowers it; certification, notice folding, and rollback read it | Any; STM | Until each held attachment's surfaces are confirmed destroyed | Removed at zero; an uncertain destruction's hold is never released |
+| Instance leases and their obligations | The instance's owner | Creation reserves and settles; discharge settles; release requests close admission and read what is outstanding | Any; STM | Until the owner takes the instance back | Releasable only with nothing in flight, owed, or uncertain |
+| Surface access phase | The attach or replacement that made the access | Opened and closed around its step; creation reads it | Owner | The access value | Closed when its step ends, however it ends |
+| Surface obligation state | Whoever holds the obligation | Creation makes it owed; one discharge settles it | Any; STM | Until discharged, or for good | Discharged once; uncertain is retained for good |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
 
 The guard holds only occupancy and poison. None of this is application state.
