@@ -52,12 +52,17 @@
 -- The result is a 'DiagnosticVerdict' covering every record offered before
 -- step 1, including those delivered during instance destruction. A failed body
 -- carries the verdict on its exception's context, readable with
--- 'diagnosticVerdict'; the body's failure is never replaced by a diagnostic
--- one. A sink failure is the consumer's own terminal status in the verdict,
--- never a replacement for the body's failure and never a reason to release
--- anything early. A sink that blocks forever keeps the lifetime in step 2 with
--- the storage and the logger still borrowed: there is no deadline and no
--- detach, and the process's external termination is the escape.
+-- 'diagnosticVerdict'; the body's failure — a body cancellation included — is
+-- never replaced by a diagnostic one, nor by a cancellation or a worker-group
+-- closing failure that arrives while the lifetime finalizes. Those stay
+-- inspectable beside it with 'finalizationEvidence'. Only a body that
+-- succeeded lets a finalization cancellation, or failing that a group-closing
+-- failure, become the lifetime's failure. A sink failure is the consumer's own
+-- terminal status in the verdict, never a replacement for the body's failure
+-- and never a reason to release anything early. A cancellation never releases
+-- anything early either, and a sink that blocks forever keeps the lifetime in
+-- step 2 with the storage and the logger still borrowed: there is no deadline
+-- and no detach, and the process's external termination is the escape.
 --
 -- The logger is borrowed. This lifetime derives its own context from it,
 -- writes to it only from the worker, and never flushes or closes it; it must
@@ -120,6 +125,9 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , verdictClean
   , diagnosticVerdict
   , diagnosticVerdictInContext
+  , FinalizationEvidence (..)
+  , finalizationEvidence
+  , finalizationEvidenceInContext
 
     -- * Delivery
   , diagnosticsComponent
@@ -214,6 +222,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , storageUserData
   , takeRecord
   )
+import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Outcome (FinalizationEvidence (..), selectOutcome)
 
 -- Configuration --------------------------------------------------------------
 
@@ -369,6 +378,14 @@ deliveredCount = readTVar . handleDelivered
 -- with its own type, value and context, and the verdict attached to that
 -- context.
 --
+-- A body failure stays primary whatever finalization observes. The first
+-- cancellation delivered while the lifetime waits for its worker, and a failure
+-- raised while its worker group closes, are added to the body failure's context
+-- as 'FinalizationEvidence' rather than rethrown in its place. When the body
+-- succeeded, the finalization cancellation is rethrown, or failing that the
+-- group-closing failure, each with the verdict attached; a cancellation never
+-- becomes a successful return.
+--
 -- The configuration is validated first, so a rejected one raises
 -- 'CaptureConfigError' before anything is allocated.
 withDiagnosticCapture
@@ -426,13 +443,12 @@ withDiagnosticCapture config logger body = do
                 }
             attach (ExceptionWithContext context failure) =
               ExceptionWithContext (addExceptionAnnotation (VerdictAnnotation verdict) context) failure
-        -- A cancellation during finalization, then one during the group's
-        -- closing, then the body's own failure, then its result.
-        case (finishedPending finished, either Just (const Nothing) grouped, finishedOutcome finished) of
-          (Just cancellation, _, _) → rethrowIO (attach cancellation)
-          (Nothing, Just late, _) → rethrowIO (attach late)
-          (Nothing, Nothing, Left failure) → rethrowIO (attach failure)
-          (Nothing, Nothing, Right (result, _)) → pure (result, verdict)
+        -- The body's own failure, with anything finalization observed kept
+        -- beside it; otherwise a cancellation during finalization, then one
+        -- during the group's closing, then the body's result.
+        case selectOutcome (finishedPending finished) (either Just (const Nothing) grouped) (finishedOutcome finished) of
+          Left failure → rethrowIO (attach failure)
+          Right (result, _) → pure (result, verdict)
 
 -- | The worker's startup is trivial, so this is a failure to fork or an
 -- asynchronous exception; either is rethrown as itself.
@@ -700,6 +716,17 @@ diagnosticVerdict = diagnosticVerdictInContext . someExceptionContext
 diagnosticVerdictInContext ∷ ExceptionContext → Maybe DiagnosticVerdict
 diagnosticVerdictInContext context =
   listToMaybe [verdict | VerdictAnnotation verdict ← getExceptionAnnotations context]
+
+-- | What finalization observed beside a body failure it did not replace: the
+-- first cancellation delivered while the lifetime waited for its worker, and a
+-- failure raised while its worker group closed. 'Nothing' when the exception
+-- is not a failed body's, or finalization observed neither.
+finalizationEvidence ∷ SomeException → Maybe FinalizationEvidence
+finalizationEvidence = finalizationEvidenceInContext . someExceptionContext
+
+-- | The same, from an exception's context.
+finalizationEvidenceInContext ∷ ExceptionContext → Maybe FinalizationEvidence
+finalizationEvidenceInContext context = listToMaybe (getExceptionAnnotations context)
 
 -- The worker ----------------------------------------------------------------------
 

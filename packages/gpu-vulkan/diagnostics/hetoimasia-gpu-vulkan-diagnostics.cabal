@@ -56,6 +56,18 @@ library capture
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13
 
+-- The lifetime's pure outcome selection: which failure is primary, and the
+-- finalization evidence kept beside it. Private, so the suite drives
+-- combinations no public interleaving can coordinate without timing.
+library outcome
+    import: language
+    visibility: private
+    hs-source-dirs: outcome
+    exposed-modules:
+        Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Outcome
+    build-depends:
+        base >=4.22 && <4.23
+
 library
     import: language
     hs-source-dirs: src
@@ -66,7 +78,8 @@ library
         stm >=2.5 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
-        hetoimasia-gpu-vulkan-diagnostics:capture
+        hetoimasia-gpu-vulkan-diagnostics:capture,
+        hetoimasia-gpu-vulkan-diagnostics:outcome
 
 -- This package's own contracts. The examples offer records through the
 -- package-local producer entry, which builds the callback data on a C frame and
@@ -83,6 +96,7 @@ test-suite diagnostics-tests
         Test.GPU.Vulkan.Diagnostics.Capture
         Test.GPU.Vulkan.Diagnostics.Config
         Test.GPU.Vulkan.Diagnostics.Lifetime
+        Test.GPU.Vulkan.Diagnostics.Outcome
         Test.GPU.Vulkan.Diagnostics.Spec
         Test.GPU.Vulkan.Diagnostics.Support
     build-depends:
@@ -96,4 +110,5 @@ test-suite diagnostics-tests
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics,
         hetoimasia-gpu-vulkan-diagnostics:capture,
+        hetoimasia-gpu-vulkan-diagnostics:outcome,
         hetoimasia-test-support ==0.1.0.0

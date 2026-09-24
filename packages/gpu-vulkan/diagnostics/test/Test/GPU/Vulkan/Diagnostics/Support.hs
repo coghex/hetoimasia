@@ -15,6 +15,10 @@ module Test.GPU.Vulkan.Diagnostics.Support
   , failingLogger
   , SinkFailure (..)
 
+    -- * Failures
+  , TaggedFailure (..)
+  , BodyMarker (..)
+
     -- * Configuration
   , smallConfig
   , quietConfig
@@ -42,6 +46,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (Exception, throwIO)
+import Control.Exception.Annotation (ExceptionAnnotation)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 
@@ -146,6 +151,18 @@ failingLogger = do
         atomically (modifyTVar' attempts (+ 1))
         throwIO SinkFailure
   pure (mkLoggerWith everythingFilter fixedMetadata sink, attempts)
+
+-- | A body failure whose payload an example can identify.
+newtype TaggedFailure = TaggedFailure Int
+  deriving (Eq, Show)
+
+instance Exception TaggedFailure
+
+-- | Context a failure already carried before the lifetime saw it.
+newtype BodyMarker = BodyMarker String
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation BodyMarker
 
 -- | A four-record queue, a 64-byte budget and two objects.
 smallConfig ∷ CaptureConfig

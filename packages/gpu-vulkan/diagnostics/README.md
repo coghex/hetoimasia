@@ -22,6 +22,7 @@ headers at compile time.
 | Component | What it is |
 | --- | --- |
 | `library capture` (private) | `capture/cbits/`: the C storage and producer; `Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture`, the Haskell view of both and the package-local producer entry its suite uses |
+| `library outcome` (private) | `Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Outcome`: the lifetime's pure precedence between a body failure, a finalization cancellation and a worker-group closing failure, and the evidence kept beside the primary; private so its suite can drive it directly |
 | `library` | `Hetoimasia.GPU.Vulkan.Diagnostics`: configuration, the lifetime, status, the verdict |
 | `test-suite diagnostics-tests` | The `Vulkan diagnostics` group |
 
