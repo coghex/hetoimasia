@@ -279,6 +279,16 @@ package's recorded FFI configuration matches `tools/toolchain/binding.pin`. The
 record's VK-6 section prints each step's reports, every delivered record, the
 verdict, and that configuration.
 
+The session runs the design's capture defaults except for the text budget,
+which it raises from 4 KiB to 16 KiB and prints in its record. The first macOS
+run at the default budget cut exactly one record — MoltenVK's routine info
+report listing its 145 supported extensions, during `vkCreateInstance` — and the
+truncation rightly made that verdict not clean; Lavapipe's reports all fit. The
+default stays as P-11 set it. What it should be, or whether routine driver
+commentary should count against a clean verdict, is left to VK-7 and VK-8, which
+run production sessions under it; this session only needs every report to
+arrive whole.
+
 The record's source digest covers the production packages this session builds
 against as well as the harness: `run-proof.sh` hashes the native backend
 package, the diagnostics package, the GPU model and the foundation beside its

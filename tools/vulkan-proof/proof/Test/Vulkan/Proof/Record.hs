@@ -15,7 +15,8 @@ import qualified Data.Map.Strict as Map
 
 import Hetoimasia.Foundation.Log (LogEntry (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics
-  ( CaptureCounters (..)
+  ( CaptureConfig (..)
+  , CaptureCounters (..)
   , CaptureStatus (..)
   , ConsumerOutcome (..)
   , DiagnosticVerdict (..)
@@ -26,6 +27,7 @@ import Test.Vulkan.Proof.Diagnostics
   ( DiagnosticsFacts (..)
   , DiagnosticsOutcome (..)
   , PhaseReports (..)
+  , sessionConfig
   )
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop (describeProvenance)
@@ -424,7 +426,8 @@ diagnosticsSection = \case
     , ""
     ]
       <> definitions
-        ( [ ("device", facts.factsDevice)
+        ( [ ("capture limits", describeConfig sessionConfig)
+          , ("device", facts.factsDevice)
           , ("messenger callback", describeProvenance facts.factsCallback)
           , ("this executable", facts.factsExecutable)
           , ("unsafe imports this session declares", listOrNone facts.factsUnsafeImports)
@@ -437,6 +440,15 @@ diagnosticsSection = \case
       <> verdictLines facts.factsVerdict
       <> phaseTable facts.factsPhases
       <> deliveredTable facts.factsPhases
+
+describeConfig ∷ CaptureConfig → Text
+describeConfig config =
+  tshow config.captureQueueCapacity
+    <> " queued records, "
+    <> tshow config.captureTextBudget
+    <> " bytes of text per record (the default is 4096; see the proof README), "
+    <> tshow config.captureObjectLimit
+    <> " objects per record"
 
 verdictLines ∷ DiagnosticVerdict → [Text]
 verdictLines verdict =

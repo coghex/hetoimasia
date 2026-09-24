@@ -104,6 +104,14 @@ and `withDiagnosticCapture` runs it first, so a rejected configuration raises
 - the poll interval must be positive;
 - the process must run the threaded runtime.
 
+The default budget does not fit everything a driver routinely says. On macOS,
+MoltenVK's info report of its supported extensions during `vkCreateInstance`
+runs past 4 KiB, so a session at the default budget with info reports enabled
+records one truncation and a verdict that is not clean; Lavapipe's reports all
+fit. VK-6's native proof session runs with a 16 KiB budget for that reason. The
+default is unchanged: what it should be, or whether routine commentary should
+count against a clean verdict, is VK-7's and VK-8's to settle.
+
 ## Latches and counters
 
 | State | Set by | Cleared by |

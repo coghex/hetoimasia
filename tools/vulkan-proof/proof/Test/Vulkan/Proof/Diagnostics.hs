@@ -41,6 +41,7 @@ module Test.Vulkan.Proof.Diagnostics
   , submitPhase
   , recordingPhase
   , creationPhase
+  , sessionConfig
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
@@ -81,7 +82,8 @@ import Hetoimasia.Foundation.Log
   )
 import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.GPU.Vulkan.Diagnostics
-  ( CaptureCounters (..)
+  ( CaptureConfig (..)
+  , CaptureCounters (..)
   , CaptureStatus (..)
   , DiagnosticCapture
   , DiagnosticVerdict (..)
@@ -133,6 +135,18 @@ data DiagnosticsOutcome
   | DiagnosticsStopped Text (Maybe DiagnosticVerdict) [PhaseReports]
     -- ^ Why, the verdict the lifetime still reached, and what had been seen.
   deriving (Show)
+
+-- | The capture configuration this session runs under: the design's defaults
+-- with a 16 KiB text budget in place of 4 KiB.
+--
+-- The first macOS run at the default budget cut exactly one record, MoltenVK's
+-- routine info report of its 145 supported extensions during
+-- vkCreateInstance, and the truncation rightly made that verdict not clean.
+-- The default stays as P-11 set it; the finding is VK-7's and VK-8's to settle.
+-- This session is about where reports come from and that each is delivered, so
+-- it gives each one the room to arrive whole, and says so in its record.
+sessionConfig ∷ CaptureConfig
+sessionConfig = defaultCaptureConfig {captureTextBudget = 16384}
 
 -- | The id the submitted message carries, so its delivery can be found.
 submittedMessageId ∷ Text
@@ -198,7 +212,7 @@ runDiagnostics journal = do
   cursor ← newIORef (0, 0)
   outcome ←
     try @SomeException $
-      withDiagnosticCapture defaultCaptureConfig logger (session journal phases cursor)
+      withDiagnosticCapture sessionConfig logger (session journal phases cursor)
   entries ← reverse <$> readTVarIO logged
   seen ← attribute entries . reverse <$> readIORef phases
   case outcome of
