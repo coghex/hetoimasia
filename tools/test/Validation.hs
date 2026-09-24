@@ -78,13 +78,43 @@ spec = describe "Validation planner" $ do
         -- probe look identical to a tree that never touched it.
         selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
 
-    it "rejects a conditional on anything but the operating system" $
+    it "rejects a conditional on anything but the operating system or a declared manual flag" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal"
+          (alphaPackage ++ unlines ["    if impl(ghc >= 9)", "        extra-libraries: m"])
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "conditional or brace-delimited Cabal syntax is not supported"
+
+    it "rejects a conditional on a flag the package description does not declare" $
       withFixture $ \fixture → do
         change fixture "packages/alpha/alpha.cabal"
           (alphaPackage ++ unlines ["    if flag(fast)", "        extra-libraries: m"])
         (result, _, errors) ← planRaw fixture (seeded fixture) []
         result `shouldBe` ExitFailure 2
-        errors `shouldContain` "conditional or brace-delimited Cabal syntax is not supported"
+        errors `shouldContain` "names a flag this package description does not declare"
+
+    it "rejects a conditional on an automatic flag, whose branch the solver may choose" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ flaggedLibrary "False" [])
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "is not declared `manual: True`"
+
+    it "reads a manual flag's conditional as if both branches applied, following its dependencies" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "packages/alpha/extra/Extra.hs" (extraModule 1)
+        writeFixtureFile (root fixture) "packages/alpha/flagged/Flagged.hs" "module Flagged where\n"
+        change fixture "packages/alpha/alpha.cabal" (alphaPackage ++ extraLibrary ++ flaggedLibrary "True" ["alpha:extra"])
+        change fixture "demo.cabal" flaggedDemoPackage
+        base ← revision fixture "HEAD"
+        -- The only path from the harness to the extra sublibrary runs through
+        -- a dependency declared inside the flag's block, whose flag is off by
+        -- default; it is counted all the same, whatever a project turns on.
+        change fixture "packages/alpha/extra/Extra.hs" (extraModule 2)
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.harness" `shouldBe` Just (Selection "affected" True True)
+        selectionOf plan "test.demo" `shouldBe` Just (Selection "unaffected" False False)
 
     it "follows a component's native sources and include directories" $
       withFixture $ \fixture → do
@@ -720,6 +750,36 @@ platformOnlyLibrary =
     , "    else"
     , "        buildable: False"
     ]
+
+-- | A sublibrary built only with a flag that defaults off, declared manual or
+-- automatic, with the given dependencies inside its flag block.
+flaggedLibrary ∷ String → [String] → String
+flaggedLibrary manual dependencies =
+  unlines $
+    [ ""
+    , "flag interop"
+    , "    default: False"
+    , "    manual: " ++ manual
+    , ""
+    , "library flagged"
+    , "    visibility: public"
+    , "    exposed-modules: Flagged"
+    , "    hs-source-dirs: flagged"
+    , "    default-language: GHC2024"
+    , "    if flag(interop)"
+    , "        build-depends:"
+    , "            base"
+    ]
+      ++ ["            , " ++ dependency | dependency ← dependencies]
+      ++ [ "    else"
+         , "        buildable: False"
+         ]
+
+-- | The fixture package with the harness suite depending on the flagged
+-- sublibrary alone.
+flaggedDemoPackage ∷ String
+flaggedDemoPackage =
+  unlines (init (lines demoPackage) ++ ["        base,", "        alpha:flagged"])
 
 platformModule ∷ Int → String
 platformModule value =

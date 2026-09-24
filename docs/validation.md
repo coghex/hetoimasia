@@ -324,6 +324,16 @@ component that this platform does not build still has its sources, its package
 description, and its declared inputs counted. Everything else inside such a
 block is still rejected, because it could change dependencies silently.
 
+The one other conditional the reader accepts is `if flag(name)`, with an
+optional `else`, on a flag the same package description declares earlier as
+`manual: True`: the GLFW package's `vulkan-interop` component is gated this way,
+and only `cabal.project.vulkan` turns it on. Such a block is read as if both of
+its branches applied — every source, directory, and dependency either declares
+is counted, whatever the flag's default and whichever project sets it — so a
+candidate's inputs never depend on the configuration a project chooses. A
+conditional on an undeclared flag, or on an automatic one whose branch the
+solver may choose, is still rejected.
+
 Its receipt is local evidence only, exactly as the GLFW arc's Cocoa evidence is;
 [the local run](#a-local-run-and-its-receipt) below produces it.
 

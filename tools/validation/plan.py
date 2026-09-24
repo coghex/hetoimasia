@@ -70,6 +70,7 @@ FIELD_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)$")
 STANZA_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)(?:\s+(\S+))?\s*$")
 CONDITIONAL_PATTERN = re.compile(r"^(if|elif|else)\b")
 OS_CONDITIONAL_PATTERN = re.compile(r"^if\s+os\(\s*[A-Za-z][A-Za-z0-9_-]*\s*\)$")
+FLAG_CONDITIONAL_PATTERN = re.compile(r"^if\s+flag\(\s*([A-Za-z][A-Za-z0-9_-]*)\s*\)$")
 PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 
 # The only fields an operating-system conditional may declare. None of them
@@ -85,6 +86,14 @@ PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 # That is the point: what a candidate's inputs are
 # must not depend on which machine planned it, or the same candidate would mean
 # two things.
+# A conditional on a manual flag the same package description declares is read
+# as if both of its branches applied: every field either branch declares is
+# counted, whatever the flag's default and whichever project turns it on. That
+# over-approximates a component's sources and dependencies rather than letting
+# the configuration a project chooses change what a candidate's inputs are, for
+# the reason `buildable` is invisible above. A manual flag is required, because
+# only a manual flag is never flipped by the solver; an automatic one could
+# choose a branch on its own.
 LINK_ONLY_FIELDS = frozenset({"extra-libraries", "frameworks"})
 CONDITIONAL_FIELDS = LINK_ONLY_FIELDS | frozenset({"buildable"})
 
@@ -255,10 +264,12 @@ class WorkTree:
 # layout-style stanzas, ``common``/``import``, multiline fields, package
 # relative ``hs-source-dirs``, ``main-is``, ``c-sources``/``cxx-sources`` and
 # ``include-dirs``, ``build-depends`` (including a
-# ``package:library`` sublibrary dependency) and ``build-tool-depends``, and an
+# ``package:library`` sublibrary dependency) and ``build-tool-depends``, an
 # ``if os(...)``/``else`` block inside a stanza that declares only link fields or
-# ``buildable``. Any other conditional, and brace-delimited syntax, can change
-# dependencies, so it is rejected with a diagnostic rather than ignored.
+# ``buildable``, and an ``if flag(...)``/``else`` block on a manual flag the file
+# declares, read as if both branches applied. Any other conditional, and
+# brace-delimited syntax, can change dependencies, so it is rejected with a
+# diagnostic rather than ignored.
 
 
 class Package:
@@ -278,6 +289,7 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
     """Parse one package description into its name and its components' fields."""
     package_name = ""
     commons: dict[str, dict[str, list[str]]] = {}
+    flags: dict[str, dict[str, list[str]]] = {}
     components: dict[tuple[str, str], dict[str, list[str]]] = {}
     top_level: dict[str, list[str]] = {}
 
@@ -289,6 +301,9 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
     conditional_indent: int | None = None
     conditional_is_if = False
     conditional_field_indent: int | None = None
+    # An open manual-flag `if` whose `else` may follow, by indentation. Its
+    # body is not a separate region: its fields are the stanza's own.
+    flag_if_indents: set[int] = set()
 
     for number, line in enumerate(text.splitlines(), start=1):
         without_comment = line.split("--", 1)[0] if line.lstrip().startswith("--") else line
@@ -315,7 +330,31 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
             conditional_indent = None
             conditional_field_indent = None
 
+        if stanza is not top_level:
+            flag_if_indents = {opened for opened in flag_if_indents if opened <= indent}
         if CONDITIONAL_PATTERN.match(content) or content in ("{", "}") or content.endswith("{"):
+            flag_match = FLAG_CONDITIONAL_PATTERN.fullmatch(content)
+            if indent > 0 and stanza is not top_level and flag_match is not None:
+                name = flag_match.group(1)
+                declared = flags.get(name)
+                if declared is None:
+                    raise PlannerError(
+                        f"{path}:{number}: `if flag({name})` names a flag this package description "
+                        "does not declare before it; the validation planner reads only a declared "
+                        "manual flag's conditional"
+                    )
+                if [value.lower() for value in declared.get("manual", [])] != ["true"]:
+                    raise PlannerError(
+                        f"{path}:{number}: flag {name!r} is not declared `manual: True`, so the "
+                        "solver may choose its branch and change dependencies silently"
+                    )
+                flag_if_indents.add(indent)
+                field = None
+                continue
+            if content == "else" and indent in flag_if_indents:
+                flag_if_indents.discard(indent)
+                field = None
+                continue
             opens_if = OS_CONDITIONAL_PATTERN.fullmatch(content) is not None
             opens_else = content == "else" and closed_if == indent
             if indent > 0 and stanza is not top_level and (opens_if or opens_else):
@@ -340,8 +379,11 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
             label = stanza_match.group(2) or ""
             stanza = {}
             field = None
+            flag_if_indents = set()
             if keyword == "common":
                 commons[label] = stanza
+            elif keyword == "flag":
+                flags[label] = stanza
             elif keyword == "library":
                 components[("lib", label or "@package")] = stanza
             elif keyword == "executable":
