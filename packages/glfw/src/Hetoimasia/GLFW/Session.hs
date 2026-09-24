@@ -33,6 +33,15 @@ module Hetoimasia.GLFW.Session
   , sessionBackend
   , takeAsynchronousReports
 
+    -- * Loader-aware sessions
+  , SessionIntegration
+  , allocIntegratedSession
+  , withIntegratedSession
+  , IntegrationUse (..)
+  , readIntegrationUse
+  , IntegrationRefused (..)
+  , IntegrationStillInstalled (..)
+
     -- * Waking the owner
   , SessionWake
   , sessionWake
@@ -77,8 +86,12 @@ import Hetoimasia.GLFW.Internal.Session
   , NativeOutcome (..)
   , ReportingThread (..)
   , Reports (..)
+  , IntegrationRefused (..)
+  , IntegrationStillInstalled (..)
+  , IntegrationUse (..)
   , Session
   , SessionConfig (..)
+  , SessionIntegration
   , SessionMisuse (..)
   , SessionWake
   , UnsupportedBackend (..)
@@ -88,7 +101,9 @@ import Hetoimasia.GLFW.Internal.Session
   , errorDescriptionLimit
   , errorEvidenceCapacity
   , glfwComponent
+  , readIntegrationUse
   , sessionAssembly
+  , sessionAssemblyWith
   , sessionBackend
   , sessionWake
   , takeAsynchronousReports
@@ -106,3 +121,25 @@ allocSession = allocComposite . sessionAssembly productionNative
 -- | Enter a GLFW session, lend it to the body, and end it.
 withSession ∷ SessionConfig → (Session → IO r) → IO r
 withSession config = withScoped (allocSession config)
+
+-- | Enter a loader-aware GLFW session for the rest of the enclosing scope: the
+-- additive constructor beside 'allocSession'.
+--
+-- The capability is opaque and single-use, and only the package's Vulkan
+-- interop component constructs one, from the loader entry point the Vulkan
+-- binding dispatches through. It is admitted after the session's guard is
+-- claimed and before any native call — a stale, foreign, or already-used one is
+-- refused there with 'IntegrationRefused' — handed to GLFW between the
+-- initialization hints and @glfwInit@, and GLFW's default loader search is
+-- restored after termination or a failed initialization, before the guard is
+-- settled. 'SessionConfig' is unchanged and carries no part of it; a
+-- window-only session makes no loader call at all. See
+-- "Hetoimasia.GLFW.Internal.Session"'s /Loader-aware sessions/ section and
+-- @docs/glfw.md@.
+allocIntegratedSession ∷ SessionIntegration → SessionConfig → Scoped Session
+allocIntegratedSession integration config =
+  allocComposite (sessionAssemblyWith productionNative config integration)
+
+-- | Enter a loader-aware GLFW session, lend it to the body, and end it.
+withIntegratedSession ∷ SessionIntegration → SessionConfig → (Session → IO r) → IO r
+withIntegratedSession integration config = withScoped (allocIntegratedSession integration config)

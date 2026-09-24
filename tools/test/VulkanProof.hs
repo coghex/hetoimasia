@@ -86,6 +86,7 @@ readByTheseExamples =
   , "tools/validation/catalog.json"
   , "tools/vulkan-proof/run-proof.sh"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
+  , glfwPackage </> "hetoimasia-glfw.cabal"
   , compatibilityRecord
   ]
     <> map snd retainedRecords
@@ -105,16 +106,29 @@ proofPackage = "tools/vulkan-proof"
 nativePackage ∷ String
 nativePackage = "packages/gpu-vulkan/native"
 
--- | Everything the Vulkan project names: the proof, the native package, and
--- the native package's local dependency closure. The last three are ordinary
--- packages the other two projects list too; none of them depends on the
--- binding.
+-- | The GLFW package. The ordinary projects list it with its Vulkan interop
+-- component switched off; the Vulkan project lists it with that component on.
+glfwPackage ∷ String
+glfwPackage = "packages/glfw"
+
+-- | The manual flag that switches the GLFW package's Vulkan interop component
+-- on. Off by default, and set by the Vulkan project alone.
+interopFlag ∷ String
+interopFlag = "vulkan-interop"
+
+-- | Everything the Vulkan project names: the proof, the native package, the
+-- GLFW package whose interop component it enables, and the local dependency
+-- closure of the native package and that component. All but the first two are
+-- ordinary packages the other projects list too, and with the interop flag
+-- off none of them depends on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ proofPackage
   , nativePackage
+  , glfwPackage
   , "packages/gpu-vulkan/diagnostics"
   , "packages/gpu-vulkan/model"
+  , "packages/runtime"
   , "packages/foundation"
   ]
 
@@ -128,6 +142,26 @@ spec = describe "The Vulkan proof boundary" $ do
   it "names the proof and the native package, with its local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
     declared `shouldBe` vulkanProject
+
+  it "turns the GLFW interop component on in the Vulkan project, and nowhere else" $ do
+    project ← map trim . lines <$> readFile "cabal.project.vulkan"
+    -- The flag is set on the GLFW package's own stanza, where Cabal applies it.
+    dropWhile (/= "package hetoimasia-glfw") project `shouldSatisfy` \case
+      (_ : setting : _) → setting == "flags: +" <> interopFlag
+      _ → False
+    present ← mapM doesFileExist ordinaryProjects
+    if not (or present)
+      then
+        pendingWith
+          "cabal.project and cabal.project.cpu are checkout-only and absent here, as in an unpacked source \
+          \distribution; this check runs from a checkout, which is where the mandatory floor runs it"
+      else do
+        forM_ ordinaryProjects $ \path → do
+          text ← readFile path
+          (path, interopFlag `isInfixOf` text) `shouldBe` (path, False)
+        -- And off by default, so a project that says nothing leaves it off.
+        cabal ← readFile (glfwPackage </> "hetoimasia-glfw.cabal")
+        flagDefaults cabal `shouldBe` [(interopFlag, (False, True))]
 
   it "hashes every package the Vulkan project builds into the proof's source digest" $ do
     -- A record's digest has to move when production capture code moves, not
@@ -213,13 +247,47 @@ spec = describe "The Vulkan proof boundary" $ do
         -- the dependency check below is what holds it free of the binding.
         (path, filter (== "packages/gpu-vulkan/diagnostics") declared)
           `shouldBe` (path, ["packages/gpu-vulkan/diagnostics"])
-        resolved ← mapM packageDependencies declared
+        -- The GLFW package is in it too, with its interop component off; only
+        -- that component's own flag-guarded block is set aside, as Cabal sets
+        -- it aside, and every other component is read in full.
+        (path, filter (== glfwPackage) declared) `shouldBe` (path, [glfwPackage | path == "cabal.project"])
+        resolved ← mapM (packageDependenciesWith []) declared
         (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
         -- And the packages that do resolve it, to show the check would notice.
         proofDependencies ← packageDependencies proofPackage
         proofDependencies `shouldContain` [bindingPackage]
         nativeDependencies ← packageDependencies nativePackage
         nativeDependencies `shouldContain` [bindingPackage]
+        interopDependencies ← packageDependenciesWith [interopFlag] glfwPackage
+        interopDependencies `shouldContain` [bindingPackage]
+
+  it "sets aside only a disabled flag's own block when it reads a package's dependencies" $ do
+    -- The rule above must not become an exemption: a dependency outside the
+    -- guarded block, in the same component or another, is still read, and the
+    -- flag's else-branch is read too.
+    let cabal =
+          unlines
+            [ "flag vulkan-interop"
+            , "    default: False"
+            , "    manual: True"
+            , ""
+            , "library"
+            , "    build-depends:"
+            , "        base,"
+            , "        vulkan"
+            , ""
+            , "library vulkan-interop"
+            , "    build-depends: text"
+            , "    if flag(vulkan-interop)"
+            , "        build-depends:"
+            , "            bytestring,"
+            , "            vulkan"
+            , "    else"
+            , "        buildable: False"
+            , "        build-depends: containers"
+            ]
+    dependencyNamesWith [] cabal `shouldBe` ["base", "vulkan", "text", "containers"]
+    dependencyNamesWith [interopFlag] cabal `shouldBe` ["base", "vulkan", "text", "bytestring", "vulkan"]
 
   it "takes the runner's discovery from the provisioned prefix, not a pinned environment" $ do
     -- VK-4 retired `tools/vulkan-proof/environment.pin`; the prefix's own
@@ -515,6 +583,54 @@ packageDependencies directory = do
   where
     normalisedPackage entry = if entry == "." then "." else entry
 
+-- | 'packageDependencies' as a project would configure the package: a block
+-- guarded by @if flag(name)@ is read only when that flag would be on — named
+-- here, or on by default — and its @else@ block only when it would be off.
+-- Every other line of every component is read exactly as before.
+packageDependenciesWith ∷ [String] → FilePath → IO [String]
+packageDependenciesWith enabled directory = do
+  files ← filter (".cabal" `isSuffixOf`) <$> listDirectory directory
+  concat <$> mapM (\file → dependencyNamesWith enabled <$> readFile (directory </> file)) files
+
+-- | Each flag a package declares, with its default and whether it is manual.
+flagDefaults ∷ String → [(String, (Bool, Bool))]
+flagDefaults text = go (map (dropWhileEnd isSpace) (lines text))
+  where
+    go [] = []
+    go (line : rest)
+      | Just name ← stripPrefix "flag " line =
+          let (body, following) = span (all isSpace . take 1) rest
+              setting key = [trim value | entry ← body, Just value ← [stripPrefix key (trim entry)]]
+              isTrue values = map (map toLower') values == ["true"]
+           in (trim name, (isTrue (setting "default:"), isTrue (setting "manual:"))) : go following
+      | otherwise = go rest
+    toLower' c = if c >= 'A' && c <= 'Z' then toEnum (fromEnum c + 32) else c
+
+-- | 'dependencyNames' over only the lines a configuration with these flags on
+-- would keep.
+dependencyNamesWith ∷ [String] → String → [String]
+dependencyNamesWith enabled text = dependencyNames (unlines (configured (lines text)))
+  where
+    defaults = flagDefaults text
+    on name = name `elem` enabled || maybe False fst (lookup name defaults)
+    indentOf = length . takeWhile isSpace
+    configured [] = []
+    configured (line : rest)
+      | Just name ← guardedFlag line =
+          let depth = indentOf line
+              (guarded, afterGuard) = span (\entry → null (trim entry) || indentOf entry > depth) rest
+              (elseBranch, following) = case afterGuard of
+                (entry : more)
+                  | indentOf entry == depth && trim entry == "else" →
+                      span (\next → null (trim next) || indentOf next > depth) more
+                _ → ([], afterGuard)
+           in (if on name then configured guarded else configured elseBranch) <> configured following
+      | otherwise = line : configured rest
+    guardedFlag line = do
+      remainder ← stripPrefix "if flag(" (trim line)
+      let (name, closing) = break (== ')') remainder
+      if closing == ")" then Just name else Nothing
+
 dependencyNames ∷ String → [String]
 dependencyNames text = concatMap entries (stanzas (map (dropWhileEnd isSpace) (lines text)))
   where
@@ -530,7 +646,7 @@ dependencyNames text = concatMap entries (stanzas (map (dropWhileEnd isSpace) (l
       [] → False
     -- A continuation is indented, and so is every field inside a component, so
     -- the run has to end at the next field rather than at the next blank line.
-    sectionStarts = ["build-depends:", "if ", "else", "ghc-options:", "hs-source-dirs:", "other-modules:", "default-language:", "exposed-modules:", "type:", "main-is:", "import:", "c-sources:", "include-dirs:", "frameworks:", "extra-libraries:", "default-extensions:", "build-tool-depends:"]
+    sectionStarts = ["build-depends:", "pkgconfig-depends:", "if ", "else", "ghc-options:", "hs-source-dirs:", "other-modules:", "default-language:", "exposed-modules:", "type:", "main-is:", "import:", "c-sources:", "include-dirs:", "frameworks:", "extra-libraries:", "default-extensions:", "build-tool-depends:"]
     entries block = [name | piece ← splitOn ',' (unwords (map trim block)), Just name ← [firstWord piece]]
     firstWord piece = case words (trim piece) of
       (name : _) → Just name

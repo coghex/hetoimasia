@@ -36,6 +36,20 @@
 -- callback, set the initialization hints, initialize, and confirm that the
 -- initialized platform is the selected backend.
 --
+-- = Loader-aware sessions
+--
+-- 'sessionAssemblyWith' is the additive constructor beside 'sessionAssembly'.
+-- It takes an opaque 'SessionIntegration' — made by the Vulkan interop
+-- component from the loader entry point the Vulkan binding dispatches through,
+-- or scripted by the test seam — separately from 'SessionConfig', which stays a
+-- pure window configuration that carries no action. The capability is admitted
+-- right after the guard is claimed, before any native call: a stale, foreign, or
+-- already-used capability is refused there. It is applied after the
+-- initialization hints and before @glfwInit@, and its release restores GLFW's
+-- default loader search after termination, after a failed initialization, and
+-- after an entry that never reached initialization, always before the guard is
+-- settled. A window-only session makes no loader call at all.
+--
 -- = Owner-only operations
 --
 -- 'takeAsynchronousReports', the monitor operations below, and the window
@@ -99,8 +113,11 @@
 --
 -- Release order is declared, not reversed: close the wake gate and wait for
 -- admitted wake calls, close the monitor inventory, detach
--- the monitor callback, terminate, detach the error callback and free its
--- storage, free the monitor callback's storage, then settle the guard. A release reads native
+-- the monitor callback, terminate, restore GLFW's default loader search for a
+-- loader-aware session, detach the error callback and free its
+-- storage, free the monitor callback's storage, then settle the guard. A reset
+-- that raises, or one following a termination that raised, poisons the guard
+-- and retains the capability as 'IntegrationUncertain'. A release reads native
 -- errors after its call returns, logs nothing, pumps no events, and waits for no
 -- other thread, so each has the controlled blocking duration an uninterruptible
 -- release requires: its native calls are bounded GLFW calls on the owner thread,
@@ -169,6 +186,11 @@
 -- |                    |                   | OS thread; the call  | take: the   |                    |                       |
 -- |                    |                   | takes them           | wake's      |                    |                       |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Loader capability  | Its scope, lent   | Entry admits it and  | Owner; its  | Its scope; a       | Restored by the       |
+-- | use                | to one session    | installs it; the     | scope's end | session's use in   | session's release;    |
+-- |                    |                   | session's release    | on any      | between            | retained for good     |
+-- |                    |                   | restores it          | thread      |                    | when uncertain        |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 -- | Interaction trace  | The session       | An activated probe   | Owner, and  | Stopped unless a   | Emptied by each take; |
 -- |                    | ('Trace')         | starts, takes, and   | callbacks   | probe starts it;   | stopped storage holds |
 -- |                    |                   | stops it; the pump,  | inside its  | never started by   | nothing               |
@@ -199,8 +221,22 @@ module Hetoimasia.GLFW.Internal.Session
     -- * Sessions
   , Session
   , sessionAssembly
+  , sessionAssemblyWith
   , sessionBackend
   , takeAsynchronousReports
+
+    -- * The loader integration capability
+  , SessionIntegration
+  , IntegrationNative (..)
+  , IntegrationUse (..)
+  , IntegrationRefused (..)
+  , IntegrationStillInstalled (..)
+  , newSessionIntegration
+  , endSessionIntegration
+  , integrationIdentity
+  , integrationNativeOperations
+  , readIntegrationUse
+  , sessionIntegration
 
     -- * Waking the owner
   , SessionWake
@@ -270,6 +306,7 @@ import Control.Exception (Exception, ExceptionWithContext, SomeException, finall
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import qualified Data.Map.Strict as Map
+import Data.ByteString (ByteString)
 import Data.Int (Int32)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -339,6 +376,7 @@ import Hetoimasia.GLFW.Internal.Monitor
   , synchronizeInventory
   , takeMonitorFault
   )
+import Data.Word (Word64)
 import Numeric.Natural (Natural)
 
 -- | A GLFW platform backend.
@@ -530,6 +568,123 @@ data Occupancy = Vacant | Occupied | Poisoned
 newGuard ∷ IO Guard
 newGuard = Guard <$> newIORef Vacant
 
+-- | The operations a loader integration capability performs, as the session
+-- model sees them.
+--
+-- Nothing here names a Vulkan type, so the model and the test seam stay
+-- header-free: the production table lives in the GLFW package's separate
+-- Vulkan interop component, whose shim includes the Vulkan headers before
+-- GLFW's, and the seam scripts one. A dispatchable instance crosses as the
+-- untyped pointer it is and a surface as the 64-bit value every supported
+-- Vulkan ABI gives a non-dispatchable handle.
+data IntegrationNative = IntegrationNative
+  { integrationInstallLoader ∷ IO ()
+    -- ^ Hand GLFW the capability's loader entry point, as the pre-init hint
+    -- @glfwInitVulkanLoader@ sets it. It changes nothing GLFW has initialized.
+  , integrationResetLoader ∷ IO ()
+    -- ^ Restore GLFW's default loader search: the same hint, set to null.
+  , integrationVulkanSupported ∷ IO Bool
+    -- ^ @glfwVulkanSupported@, on the owner thread of a live session.
+  , integrationRequiredExtensions ∷ IO (Maybe [ByteString])
+    -- ^ @glfwGetRequiredInstanceExtensions@, with every name already copied out
+    -- of GLFW's storage; 'Nothing' when GLFW answered none.
+  , integrationCreateSurface ∷ Ptr () → Ptr NativeWindow → IO (Int, Word64)
+    -- ^ @glfwCreateWindowSurface@ for a dispatchable instance and a live
+    -- window, answering the @VkResult@ and the handle it wrote.
+  , integrationDestroySurface ∷ Ptr () → Word64 → IO ()
+    -- ^ @vkDestroySurfaceKHR@, resolved through the capability's own loader
+    -- entry point. It is a Vulkan call, never a GLFW one, and any thread may
+    -- make it.
+  }
+
+-- | Where one capability is in its single use.
+data IntegrationUse
+  = IntegrationReady
+    -- ^ Constructed, and not yet admitted by any session entry.
+  | IntegrationAdmitted
+    -- ^ A session entry has taken it, and nothing has been handed to GLFW yet.
+  | IntegrationInstalled
+    -- ^ GLFW may hold its loader entry point.
+  | IntegrationRestored
+    -- ^ Its session has ended with GLFW's default loader search restored, or
+    -- without ever handing the loader to GLFW. It cannot be used again.
+  | IntegrationUncertain
+    -- ^ A reset or a termination could not establish what GLFW holds. The
+    -- capability's loader stays retained for good, and the session's guard is
+    -- poisoned, so no later session — window-only or not — initializes GLFW
+    -- beside a setting nobody can vouch for.
+  | IntegrationEnded
+    -- ^ Its scope has ended. Every later entry refuses it as stale.
+  deriving (Eq, Show)
+
+-- | An opaque, single-use capability that makes a session loader-aware.
+--
+-- The Vulkan interop component constructs it from the loader entry point the
+-- Vulkan binding already dispatches through; the test seam constructs scripted
+-- ones. It is not part of 'SessionConfig', which stays a pure window
+-- configuration: 'sessionAssemblyWith' accepts it beside one.
+--
+-- It is bound to the native library it was made for, so a capability made for
+-- another library's guard is foreign, and it records its own single use, so a
+-- second entry is refused. Both refusals, and a capability whose scope has
+-- ended, are answered before any native effect.
+data SessionIntegration = SessionIntegration
+  { integrationIdentity ∷ !Unique
+    -- ^ Distinguishes this capability, and the loader ownership it borrows,
+    -- from every other.
+  , integrationGuard ∷ !Guard
+  , integrationState ∷ !(IORef IntegrationUse)
+  , integrationNativeOperations ∷ !IntegrationNative
+  }
+
+-- | A fresh capability for the native library behind this guard.
+newSessionIntegration ∷ Guard → IntegrationNative → IO SessionIntegration
+newSessionIntegration guard operations = do
+  identity ← newUnique
+  state ← newIORef IntegrationReady
+  pure (SessionIntegration identity guard state operations)
+
+-- | Where the capability is in its single use.
+readIntegrationUse ∷ SessionIntegration → IO IntegrationUse
+readIntegrationUse = readIORef . integrationState
+
+-- | Why a session entry refused a capability. Each is answered before any
+-- native effect, and leaves the capability as it found it.
+data IntegrationRefused
+  = IntegrationStale
+    -- ^ The capability's scope has ended.
+  | IntegrationForeign
+    -- ^ The capability was made for another native library.
+  | IntegrationAlreadyUsed !IntegrationUse
+    -- ^ Another entry has already taken it; carries where it is now.
+  deriving (Eq, Show)
+
+instance Exception IntegrationRefused
+
+-- | A capability's scope ended while GLFW may still hold its loader: the
+-- session that took it has not restored the default, or could not establish
+-- that it had. The capability keeps its loader rather than ending.
+newtype IntegrationStillInstalled = IntegrationStillInstalled IntegrationUse
+  deriving (Eq, Show)
+
+instance Exception IntegrationStillInstalled
+
+-- | End a capability's scope. A capability no session took, and one whose
+-- session restored GLFW's default, end, and every later entry refuses them as
+-- stale. One GLFW may still hold is retained instead — it never ends — and a
+-- scope that ends while its session is still using it fails with
+-- 'IntegrationStillInstalled'; one already found uncertain stays retained, as
+-- its session already reported and its guard is already poisoned.
+endSessionIntegration ∷ SessionIntegration → IO ()
+endSessionIntegration integration = do
+  refused ← atomicModifyIORef' (integrationState integration) $ \case
+    IntegrationReady → (IntegrationEnded, Nothing)
+    IntegrationRestored → (IntegrationEnded, Nothing)
+    IntegrationEnded → (IntegrationEnded, Nothing)
+    IntegrationUncertain → (IntegrationUncertain, Nothing)
+    held → (held, Just held)
+  mapM_ (throwFailure glfwComponent endIntegrationOperation [] . IntegrationStillInstalled) refused
+
 -- | The one live GLFW session. Its representation is private to this package.
 data Session = Session
   { sessionNative ∷ !Native
@@ -565,7 +720,15 @@ data Session = Session
     -- ^ Notifications of "Hetoimasia.GLFW.Internal.Notify" that have entered
     -- their wake call and not yet recorded what it left. A boundary that finds
     -- this at zero has seen every degradation the notifications so far caused.
+  , sessionIntegrated ∷ !(Maybe SessionIntegration)
+    -- ^ The loader integration capability this session took at entry, if it
+    -- was entered through 'sessionAssemblyWith'.
   }
+
+-- | The loader integration capability the session took at entry, or 'Nothing'
+-- for a window-only session.
+sessionIntegration ∷ Session → Maybe SessionIntegration
+sessionIntegration = sessionIntegrated
 
 -- | The capability to wake one session's owner from any thread. It holds no
 -- native handle and no way back to the session; once its session has closed it
@@ -748,6 +911,10 @@ resolveMonitorOperation = operation "resolve monitor"
 wakeOperation ∷ Operation
 wakeOperation = operation "wake session"
 
+resetLoaderOperation, endIntegrationOperation ∷ Operation
+resetLoaderOperation = operation "reset vulkan loader"
+endIntegrationOperation = operation "end loader integration"
+
 takeReportsOperation, createWindowOperation, destroyWindowOperation ∷ Operation
 takeReportsOperation = operation "take asynchronous reports"
 createWindowOperation = operation "create window"
@@ -778,18 +945,23 @@ backendIdentifiers backend = [("backend", backendText backend)]
 -- | Resolve backend, check      | none                         |               |
 -- | thread                      |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Claim the guard             | Vacate, or poison            | seventh       |
+-- | Claim the guard             | Vacate, or poison            | eighth        |
+-- +-----------------------------+------------------------------+---------------+
+-- | Admit the loader capability,| Restore GLFW's default       | fifth         |
+-- | if one was given            | loader, or poison            |               |
 -- +-----------------------------+------------------------------+---------------+
 -- | Query platform support      | none                         |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Install the error callback  | Detach, then free if safe    | fifth         |
+-- | Install the error callback  | Detach, then free if safe    | sixth         |
 -- +-----------------------------+------------------------------+---------------+
--- | Set hints and initialize    | Terminate                    | fourth        |
+-- | Set hints, hand GLFW the    | Terminate                    | fourth        |
+-- | capability's loader if one  |                              |               |
+-- | was given, and initialize   |                              |               |
 -- +-----------------------------+------------------------------+---------------+
 -- | Raise initialization        | none                         |               |
 -- | reports; verify the backend |                              |               |
 -- +-----------------------------+------------------------------+---------------+
--- | Allocate the monitor        | Free if safe                 | sixth         |
+-- | Allocate the monitor        | Free if safe                 | seventh       |
 -- | callback's storage          |                              |               |
 -- +-----------------------------+------------------------------+---------------+
 -- | Attach the monitor callback | Take a latched fault; detach | third         |
@@ -804,8 +976,32 @@ backendIdentifiers backend = [("backend", backendText backend)]
 -- | Open the wake gate          | Close it; wait for admitted  | first         |
 -- |                             | wake calls to leave          |               |
 -- +-----------------------------+------------------------------+---------------+
+--
+-- A window-only session is this with no capability: it makes no loader call of
+-- any kind, and its release order is the same with the fifth release absent.
 sessionAssembly ∷ Native → SessionConfig → Assembly Session
-sessionAssembly native config = do
+sessionAssembly native config = assembleSession native config Nothing
+
+-- | Construct a loader-aware session: 'sessionAssembly' with a loader
+-- integration capability applied between the initialization hints and
+-- @glfwInit@.
+--
+-- The capability is admitted once the guard is claimed and before any native
+-- call: a stale one, one made for another native library, and one another entry
+-- already took are refused there, with 'IntegrationRefused', and the guard is
+-- vacated exactly as for any other refusal before initialization. An admitted
+-- capability is the session's: its release restores GLFW's default loader
+-- search after termination — or after an initialization that failed, or never
+-- ran — and before the guard is settled, so it always precedes the end of the
+-- borrowed loader ownership. When the reset raises, or termination could not be
+-- established, the capability is retained as 'IntegrationUncertain' and the
+-- guard is poisoned rather than letting a later session initialize beside a
+-- loader setting nobody can vouch for.
+sessionAssemblyWith ∷ Native → SessionConfig → SessionIntegration → Assembly Session
+sessionAssemblyWith native config = assembleSession native config . Just
+
+assembleSession ∷ Native → SessionConfig → Maybe SessionIntegration → Assembly Session
+assembleSession native config integration = do
   backend ← restoredStep (admit native config)
   owner ← restoredStep myThreadId
   teardown ← restoredStep (newIORef True)
@@ -819,21 +1015,32 @@ sessionAssembly native config = do
   notifying ← restoredStep (newTVarIO 0)
   acquirePart
     "glfw session occupancy"
-    (releaseRank 6)
+    (releaseRank 7)
     (claimGuard (nativeGuard native) backend)
     (\() → settleGuard (nativeGuard native) teardown)
+  -- Admitted after the claim, so a refused entry leaves the capability as it
+  -- found it, and before the support query, the first native call.
+  mapM_
+    ( \taken →
+        acquirePart
+          "glfw vulkan loader"
+          (releaseRank 4)
+          (admitIntegration native backend taken)
+          (\() → restoreLoader owner teardown taken)
+    )
+    integration
   restoredStep (requireSupported native backend)
   _ ←
     acquirePart
       "glfw error callback"
-      (releaseRank 4)
+      (releaseRank 5)
       (attachCallback native capture teardown)
       (detachCallback native capture owner teardown)
   initialized ←
     acquirePart
       "glfw terminate"
       (releaseRank 3)
-      (initialize native capture teardown backend)
+      (initialize native capture teardown backend integration)
       (\_ → terminate native capture owner teardown live backend)
   restoredStep $ do
     raiseReported initializeOperation (backendIdentifiers backend) NativeCallReturned initialized
@@ -843,7 +1050,7 @@ sessionAssembly native config = do
   storage ←
     acquirePart
       "glfw monitor callback storage"
-      (releaseRank 5)
+      (releaseRank 6)
       (nativeNewMonitorCallback (nativeMonitor native) (monitorCallback source))
       (freeMonitorCallback native teardown)
   -- The detach is registered before the callback is attached, so an attachment
@@ -886,6 +1093,7 @@ sessionAssembly native config = do
       , sessionWakes = SessionWake native capture gate
       , sessionWakeHealth = health
       , sessionNotifying = notifying
+      , sessionIntegrated = integration
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -949,10 +1157,11 @@ attachCallback native capture teardown = do
   nativeAttachErrorCallback native storage `onException` atomicWriteIORef teardown False
   pure storage
 
-initialize ∷ Native → Capture → IORef Bool → Backend → IO Reports
-initialize native capture teardown backend = do
+initialize ∷ Native → Capture → IORef Bool → Backend → Maybe SessionIntegration → IO Reports
+initialize native capture teardown backend integration = do
   settleStrayOwnerReports capture
   nativeSetInitHints native backend
+  mapM_ installLoader integration
   -- An initialization that raises leaves GLFW's state unknown; nothing is
   -- registered to terminate it, so the guard is poisoned instead.
   initialized ← nativeInitialize native `onException` atomicWriteIORef teardown False
@@ -964,6 +1173,54 @@ initialize native capture teardown backend = do
       (backendIdentifiers backend)
       (NativeFailure NativeCallFailed reports)
   pure reports
+
+-- | Take a capability for this entry, before any native effect. It is marked
+-- admitted in the same update that checks it, so no two entries can both take
+-- it.
+admitIntegration ∷ Native → Backend → SessionIntegration → IO ()
+admitIntegration native backend integration
+  | integrationGuard integration /= nativeGuard native =
+      throwFailure glfwComponent enterSession (backendIdentifiers backend) IntegrationForeign
+  | otherwise = do
+      refused ← atomicModifyIORef' (integrationState integration) $ \case
+        IntegrationReady → (IntegrationAdmitted, Nothing)
+        IntegrationEnded → (IntegrationEnded, Just IntegrationStale)
+        taken → (taken, Just (IntegrationAlreadyUsed taken))
+      mapM_ (throwFailure glfwComponent enterSession (backendIdentifiers backend)) refused
+
+-- | Hand GLFW the capability's loader, between the hints and @glfwInit@. The
+-- capability is marked installed before the call, so whatever the call does —
+-- return, raise, or be interrupted around — the release that follows resets it.
+--
+-- A pre-init hint reports no error and changes nothing initialized, so there is
+-- no evidence for it to take; a failure it raises propagates as the entry's own.
+installLoader ∷ SessionIntegration → IO ()
+installLoader integration = do
+  atomicWriteIORef (integrationState integration) IntegrationInstalled
+  integrationInstallLoader (integrationNativeOperations integration)
+
+-- | Restore GLFW's default loader search once the session's native state has
+-- ended, on the owner thread. A capability that was admitted and never handed to
+-- GLFW needs no native call. Anything that leaves what GLFW holds unknown — the
+-- reset raising, or a termination that already could not be established —
+-- retains the capability as uncertain and poisons the guard.
+restoreLoader ∷ ThreadId → IORef Bool → SessionIntegration → IO ()
+restoreLoader owner teardown integration =
+  ownerRelease owner teardown resetLoaderOperation $ do
+    use ← readIORef (integrationState integration)
+    case use of
+      IntegrationInstalled → do
+        integrationResetLoader (integrationNativeOperations integration)
+          `onException` uncertain
+        safe ← readIORef teardown
+        atomicWriteIORef (integrationState integration) (if safe then IntegrationRestored else IntegrationUncertain)
+      IntegrationAdmitted → atomicWriteIORef (integrationState integration) IntegrationRestored
+      _ → pure ()
+  `onException` uncertain
+  where
+    uncertain = do
+      atomicWriteIORef teardown False
+      atomicWriteIORef (integrationState integration) IntegrationUncertain
 
 verifySelected ∷ Native → Capture → Backend → IO ()
 verifySelected native capture backend = do

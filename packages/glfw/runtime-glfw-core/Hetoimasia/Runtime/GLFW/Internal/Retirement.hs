@@ -134,6 +134,11 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , anyRetiring
   , retirementStanding
 
+    -- * Dependents that hold an attachment
+  , holdAttachment
+  , releaseAttachmentHold
+  , attachmentHoldCount
+
     -- * Completion notices from other threads
   , CompletionPublisher
   , CompletionPublication (..)
@@ -154,6 +159,7 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , registerDelay
@@ -174,6 +180,8 @@ import Control.Exception
 import Control.Monad (unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -220,14 +228,15 @@ import Hetoimasia.GLFW.Internal.Attachment
   , constructionFailed
   , constructionSucceeded
   , FactAnswer (..)
-  , RetirementFact
+  , RetirementFact (DependentsDisposed)
   , recordRetirementFact
-  , foldCompletions
   , forgetWindow
   , hostIdentity
   , markWindowClosing
   , newAttachmentModel
   , newCompletionInbox
+  , noticeAcknowledgement
+  , noticeFact
   , noticeTarget
   , offerCompletion
   , recordDisposalFailure
@@ -263,6 +272,11 @@ data HostRetirement = HostRetirement
   , retirementRegistrations ∷ !(TVar [Registration])
     -- ^ In registration order, at most one per window the host may hold.
   , retirementDiagnosed ∷ !(IORef Bool)
+  , retirementHolds ∷ !(TVar (Map AttachmentId Natural))
+    -- ^ Owned dependents that still hold each attachment: a surface under
+    -- construction, or one whose destruction obligation is undischarged or
+    -- uncertain. Any thread may release one; an entry is removed at zero, so it
+    -- is bounded by the live attachments and what they created.
   }
 
 -- | One attachment's registered protocol, whether it still has a progress path
@@ -372,6 +386,7 @@ newHostRetirement session limit = do
     <*> newTVarIO True
     <*> newTVarIO []
     <*> newIORef False
+    <*> newTVarIO Map.empty
   where
     rejected ∷ Show rejection ⇒ rejection → IO a
     rejected _ = throwFailure retirementComponent retirementOperation [] (WindowLimitUnusable limit)
@@ -768,10 +783,14 @@ settleFailed retirement restore protocol target acknowledgement caught@(Exceptio
   -- rather than left pending, where no fact could ever be recorded and the
   -- drain could never finish.
   attempted ← tryWithContext (restore (protocolRollback protocol >>= evaluate))
-  let outcome = either (const RollbackUnsafe) id attempted
+  let declared = either (const RollbackUnsafe) id attempted
       rolledBack = either Just (const Nothing) attempted
-  atomically $ do
+  outcome ← atomically $ do
     model ← readTVar (retirementState retirement)
+    -- A rollback cannot establish safety while an owned dependent it did not
+    -- discharge — a created surface's obligation — still holds the attachment.
+    held ← attachmentHoldCount retirement target
+    let outcome = if held > 0 then RollbackUnsafe else declared
     case constructionFailed (retirementOwner retirement) target acknowledgement caught outcome model of
       Left _ → pure ()
       Right (_, next) → writeTVar (retirementState retirement) next
@@ -780,6 +799,7 @@ settleFailed retirement restore protocol target acknowledgement caught@(Exceptio
     -- answer below carries both failures instead.
     mapM_ (recordFailure retirement target acknowledgement) rolledBack
     pruneRegistrations retirement
+    pure outcome
   let settled = RolledBack target outcome caught rolledBack
   case (cancelled, rolledBack) of
     -- The construction's own cancellation stays primary; a rollback failure of
@@ -884,7 +904,8 @@ certifyRetirementFact
   → STM (Either AttachmentRefusal FactAnswer)
 certifyRetirementFact retirement target acknowledgement fact = do
   model ← readTVar (retirementState retirement)
-  case recordRetirementFact (retirementOwner retirement) target acknowledgement fact model of
+  held ← attachmentHoldCount retirement target
+  case withheld held fact (recordRetirementFact (retirementOwner retirement) target acknowledgement fact model) of
     Left refusal → pure (Left refusal)
     Right (answer, next) → do
       writeTVar (retirementState retirement) next
@@ -1343,12 +1364,68 @@ fold retirement = do
     then pure False
     else do
       model ← readTVar (retirementState retirement)
-      let (answers, next) = foldCompletions (retirementOwner retirement) notices model
+      holds ← readTVar (retirementHolds retirement)
+      let (answers, next) = foldHeld (retirementOwner retirement) holds notices model
           recorded = [notice | (notice, Right answer) ← answers, established answer]
       writeTVar (retirementState retirement) next
       mapM_ (reviveRegistration retirement . noticeTarget) recorded
       pruneRegistrations retirement
       pure (not (null recorded))
+
+-- | Fold notices in order, as 'foldCompletions' does, with every
+-- 'DependentsDisposed' that would record new evidence for an attachment a
+-- dependent still holds refused instead. A refused notice changes nothing, so a
+-- later one in the same batch sees the model exactly as it was.
+foldHeld
+  ∷ OwnerAuthority
+  → Map AttachmentId Natural
+  → [CompletionNotice]
+  → AttachmentModel Evidence
+  → ([(CompletionNotice, Either AttachmentRefusal FactAnswer)], AttachmentModel Evidence)
+foldHeld authority holds notices model0 = go model0 notices
+  where
+    go model [] = ([], model)
+    go model (notice : rest) =
+      let target = noticeTarget notice
+          acknowledgement = noticeAcknowledgement notice
+          fact = noticeFact notice
+          held = Map.findWithDefault 0 target holds
+       in case withheld held fact (recordRetirementFact authority target acknowledgement fact model) of
+            Left refusal → first ((notice, Left refusal) :) (go model rest)
+            Right (answer, next) → first ((notice, Right answer) :) (go next rest)
+    first f (answers, model) = (f answers, model)
+
+-- | Refuse a 'DependentsDisposed' that would record new evidence while owned
+-- dependents still hold the attachment. A refusal the model already made, a
+-- duplicate, and a report after retirement pass through unchanged: only a fact
+-- that would establish something is withheld.
+withheld
+  ∷ Natural
+  → RetirementFact
+  → Either AttachmentRefusal (FactAnswer, AttachmentModel Evidence)
+  → Either AttachmentRefusal (FactAnswer, AttachmentModel Evidence)
+withheld held fact answered = case answered of
+  Right (answer, _)
+    | fact == DependentsDisposed && held > 0 && established answer → Left (DependentsStillHeld held)
+  _ → answered
+
+-- | Record one more owned dependent holding an attachment. The caller has
+-- already admitted it; this only counts it.
+holdAttachment ∷ HostRetirement → AttachmentId → STM ()
+holdAttachment retirement target =
+  modifyTVar' (retirementHolds retirement) (Map.insertWith (+) target 1)
+
+-- | Release one owned dependent's hold, from any thread. The attachment's
+-- withdrawn progress path is revived, since the release is evidence its next
+-- step may now certify what it could not before.
+releaseAttachmentHold ∷ HostRetirement → AttachmentId → STM ()
+releaseAttachmentHold retirement target = do
+  modifyTVar' (retirementHolds retirement) (Map.update (\held → if held > 1 then Just (held - 1) else Nothing) target)
+  reviveRegistration retirement target
+
+-- | How many owned dependents hold an attachment now. Any thread may read it.
+attachmentHoldCount ∷ HostRetirement → AttachmentId → STM Natural
+attachmentHoldCount retirement target = Map.findWithDefault 0 target <$> readTVar (retirementHolds retirement)
 
 -- | Whether one certified fact established evidence the model did not already
 -- hold, however it reached the owner thread.

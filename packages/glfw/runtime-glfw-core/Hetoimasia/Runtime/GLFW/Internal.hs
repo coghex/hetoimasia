@@ -83,6 +83,11 @@ module Hetoimasia.Runtime.GLFW.Internal
   , hostConfiguration
   , hostWakeNotifier
 
+    -- * What the surface bridge reads of a host
+  , hostSessionOf
+  , hostRetirementOf
+  , hostWindowClosing
+
     -- * The private attachment seam
   , hostAttachmentIdentity
   , attachHostWindow
@@ -2211,6 +2216,24 @@ newtype RetirementFailuresElided = RetirementFailuresElided Natural
   deriving (Eq, Show)
 
 instance Exception RetirementFailuresElided
+
+-- ---------------------------------------------------------------------------
+-- What the surface bridge reads of a host
+
+-- | The session the host owns, for the surface bridge beside this module. It
+-- is never exported by a public module.
+hostSessionOf ∷ WindowHost → Session
+hostSessionOf = hostSession
+
+-- | The host's retirement state, or 'Nothing' for a host built by the
+-- @Scoped@ constructors, for the surface bridge beside this module.
+hostRetirementOf ∷ WindowHost → Maybe HostRetirement
+hostRetirementOf = hostRetirementState
+
+-- | Whether a window the host holds has begun closing; 'Nothing' for one it
+-- does not hold. Any thread may read it.
+hostWindowClosing ∷ WindowHost → WindowId → STM (Maybe Bool)
+hostWindowClosing host target = fmap entryClosing . Map.lookup target <$> readTVar (hostEntries host)
 
 -- ---------------------------------------------------------------------------
 -- The private attachment seam

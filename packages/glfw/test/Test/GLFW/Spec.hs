@@ -2,7 +2,9 @@
 --
 -- None of them initializes GLFW, opens a window, or needs a display. The
 -- session examples in "Test.GLFW.Session" and the wake examples in
--- "Test.GLFW.Wake" drive the production session model through the test seam; the window model, window command, window control,
+-- "Test.GLFW.Wake" drive the production session model through the test seam, and
+-- "Test.GLFW.Interop" drives its loader integration capability and extension
+-- query through a scripted capability; the window model, window command, window control,
 -- window host, scheduled owner turn, interaction trace, render demand, dynamic
 -- window, monitor
 -- inventory, input feed, and window mode
@@ -10,7 +12,8 @@
 -- runtime integration's private host hooks, which this suite may name because it
 -- belongs to the package; "Test.GLFW.Attachments" drives the public attachment
 -- contract over that same seam, on running owner turns rather than only on the
--- exit drain; "Test.GLFW.Owner" drives the supervised graphics owner over that
+-- exit drain; "Test.GLFW.Surface" drives the surface bridge's admission,
+-- handoff, and obligations over a loader-aware seam session; "Test.GLFW.Owner" drives the supervised graphics owner over that
 -- seam with its backend operations injected as fakes, which hold no GLFW
 -- capability at all; "Test.GLFW.Linking" checks the package's link
 -- declarations against the native manifest; and "Test.GLFW.Opacity" compiles
@@ -32,6 +35,7 @@ import qualified Test.GLFW.Control as Control
 import qualified Test.GLFW.Dynamic as Dynamic
 import qualified Test.GLFW.Host as Host
 import qualified Test.GLFW.Input as Input
+import qualified Test.GLFW.Interop as Interop
 import qualified Test.GLFW.Linking as Linking
 import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
@@ -41,6 +45,7 @@ import qualified Test.GLFW.Protected as Protected
 import qualified Test.GLFW.Render as Render
 import qualified Test.GLFW.Scheduled as Scheduled
 import qualified Test.GLFW.Session as Session
+import qualified Test.GLFW.Surface as Surface
 import qualified Test.GLFW.Notify as Notify
 import qualified Test.GLFW.Trace as Trace
 import qualified Test.GLFW.Wake as Wake
@@ -50,6 +55,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "GLFW" $ do
   Session.spec
+  Interop.spec
   Wake.spec
   Notify.spec
   Window.spec
@@ -66,6 +72,7 @@ spec = describe "GLFW" $ do
   Mode.spec
   Attachment.spec
   Attachments.spec
+  Surface.spec
   Owner.spec
   Linking.spec
   Opacity.spec
