@@ -40,6 +40,7 @@ import Hetoimasia.Runtime.GLFW
   , TargetStanding (..)
   , allRetirementFacts
   , awaitOwnerRound
+  , readOwnerStatusNow
   , closeHostWindow
   , completionNotice
   , custodyOf
@@ -91,6 +92,7 @@ spec = describe "Vulkan controller" $ do
     it "lets a deferred attachment be announced again and admitted" (bounded testDeferredAnnounced)
     it "reports a deferred surface whose destruction failed at a checkpoint, never retries it, and retains its parents" (bounded testDeferredUncertain)
     it "watches an attachment whose answer a cancellation lost after publication, when its recovered announcement finds the port full" (bounded testRecoveredDeferred)
+    it "watches a refused attachment even when the owner drains its port and goes idle before the handover answers" (bounded testRefusalThenIdle)
 
   describe "close and exit" $ do
     it "closing the first-created window retires its target alone, leaving the shared roots and the second target live" (bounded testCloseFirst)
@@ -455,6 +457,47 @@ testDeferredAnnounced = do
     pure (standing, SurfaceDestroyed 102 `elem` events)
   standing `shouldBe` TargetUsable
   earlyDestruction `shouldBe` False
+
+testRefusalThenIdle ∷ IO ()
+testRefusalThenIdle = do
+  base ← newRigOf 3
+  let rig = base {rigPortCapacity = Just 1}
+  (deadline, destroyedWhileRunning) ← runRig rig $ \host control → do
+    gate ← newTVarIO False
+    scriptNative rig AtQueryDevices (HoldsUntil gate)
+    chosen ← newTVarIO Nothing
+    flip finally (atomically (writeTVar gate True)) $ do
+      let owner = vulkanGraphicsOwner host
+      [first, second, third] ← windowsOf host
+      one ← handedOver host first RequiredTarget
+      atomically (custodyOf owner (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+      two ← handedOver host second RequiredTarget
+      -- In the instant after the refusal, and before the handover answers, the
+      -- owner is let go: it finishes the first construction, takes the second
+      -- announcement, constructs it, and completes that round — choosing its
+      -- next deadline — while nothing else is left to wake it.
+      afterRefusal rig $ \_ → do
+        held ← atomically (statusRounds <$> readOwnerStatusNow owner)
+        atomically (writeTVar gate True)
+        TargetUsable ← awaitStanding host two
+        status ← atomically (awaitOwnerRound owner (held + 1))
+        atomically (writeTVar chosen (Just (statusNextDeadline status)))
+      deferred ←
+        handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) owner third RequiredTarget >>= \case
+          VulkanAnnouncementDeferred service → pure service
+          other → failWith ("the third window was not deferred: " <> show other)
+      _ ← releaseGraphicsTarget (vulkanWindowHost host) owner deferred
+      pumpUntil host control "the deferred surface's destruction" (elem (SurfaceDestroyed 102) <$> journal rig)
+      deadline ← atomically (readTVar chosen)
+      roots ← atomically (readVulkanRoots (vulkanController host))
+      pure (deadline, viewInstance roots)
+  -- The round the owner finished before the handover answered already named a
+  -- deadline, because the watch was registered before the announcement.
+  deadline `shouldSatisfy` maybe False isJust
+  destroyedWhileRunning `shouldBe` RootLive
+  owner ← threadsOf rig (== InstanceCreated)
+  destroyer ← threadsOf rig (== SurfaceDestroyed 102)
+  destroyer `shouldBe` owner
 
 testRecoveredDeferred ∷ IO ()
 testRecoveredDeferred = do

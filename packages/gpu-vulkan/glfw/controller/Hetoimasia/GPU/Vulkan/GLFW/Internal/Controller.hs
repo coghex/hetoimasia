@@ -90,6 +90,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , vulkanHostConfig
   , VulkanHost (..)
   , withVulkanOwnerHostOver
+  , withVulkanOwnerHostHooked
+  , ControllerHooks (..)
+  , noControllerHooks
   , NativeObserver (..)
   , noObserver
 
@@ -258,7 +261,19 @@ data State inst msgr phys dev lease obligation = State
   , stateClock ∷ !MonotonicSource
   , statePoll ∷ !Duration
     -- ^ How soon the owner looks at them again, while any exist.
+  , stateHooks ∷ !ControllerHooks
   }
+
+-- | Instants the package's own examples must reach and nothing else can: a
+-- private seam, never set in production.
+newtype ControllerHooks = ControllerHooks
+  { hookAfterRefusal ∷ AttachmentId → IO ()
+    -- ^ Runs on the main thread immediately after the owner's full port
+    -- refused an announcement, before the handover answers.
+  }
+
+noControllerHooks ∷ ControllerHooks
+noControllerHooks = ControllerHooks (\_ → pure ())
 
 -- | An attachment the owner was never told about, and how to tell whether it
 -- still has not been: its custody stage, as the owner's ledger holds it.
@@ -291,7 +306,20 @@ newVulkanController
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanController ops pointer bridge layers budgets clock poll = do
+newVulkanController = newVulkanControllerWith noControllerHooks
+
+-- | 'newVulkanController' with the examples' hooks.
+newVulkanControllerWith
+  ∷ ControllerHooks
+  → RootOps Quiesced inst msgr phys dev
+  → (inst → Ptr ())
+  → SurfaceBridge lease obligation
+  → [ByteString]
+  → Budgets
+  → MonotonicSource
+  → Duration
+  → IO VulkanController
+newVulkanControllerWith hooks ops pointer bridge layers budgets clock poll = do
   roots ← newRoots ops budgets clock
   fmap VulkanController $
     State roots pointer bridge layers
@@ -303,6 +331,7 @@ newVulkanController ops pointer bridge layers budgets clock poll = do
       <*> newTVarIO Map.empty
       <*> pure clock
       <*> pure poll
+      <*> pure hooks
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -733,13 +762,27 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
     -- so a release or a close of it still has its surface destroyed. One the
     -- closed port refused needs nothing more: the owner's own retirement
     -- destroys every surface its lease still owes.
+    --
+    -- The watch is registered /before/ the announcement is attempted, and
+    -- withdrawn if it was admitted or the port has closed. Registering it
+    -- after a refusal instead would leave a gap: the owner could drain the
+    -- full port, find no watch when it chose its next deadline, and go idle
+    -- for good, so a later release would never reach it. With the entry in
+    -- place first, whatever the owner decides after taking a refused port's
+    -- events is decided with it in view. The owner's step cannot act on the
+    -- entry meanwhile: it touches only an attachment whose slot has begun
+    -- retiring, and only the main thread — this one — can begin that.
     announceOrWatch service = do
+      atomically $
+        modifyTVar' (stateUnannounced state) $
+          Map.insert attachment (Unannounced service (custodyOf owner attachment))
       admitted ← announceGraphicsTarget owner service
-      when (admitted == EventRefusedFull) $
-        atomically $
-          modifyTVar' (stateUnannounced state) $
-            Map.insert (graphicsAttachment service) (Unannounced service (custodyOf owner (graphicsAttachment service)))
+      if admitted == EventRefusedFull
+        then hookAfterRefusal (stateHooks state) attachment
+        else atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
       pure admitted
+      where
+        attachment = graphicsAttachment service
     recover = do
       found ← atomically (windowGraphicsService host window)
       for_ found $ \service → do
@@ -916,11 +959,27 @@ withVulkanOwnerHostOver
   → VulkanHostConfig scene
   → (VulkanHost scene → IO r)
   → IO (r, DiagnosticVerdict)
-withVulkanOwnerHostOver logger layer pointer bridge enter extensions config use =
+withVulkanOwnerHostOver = withVulkanOwnerHostHooked noControllerHooks
+
+-- | 'withVulkanOwnerHostOver' with the examples' hooks. Only this package's
+-- private sublibrary exports it, and nothing in production calls it.
+withVulkanOwnerHostHooked
+  ∷ ControllerHooks
+  → Logger
+  → (DiagnosticCapture → RootOps Quiesced inst msgr phys dev)
+  → (inst → Ptr ())
+  → SurfaceBridge lease obligation
+  → (SessionConfig → Scoped Session)
+  → (Session → IO [ByteString])
+  → VulkanHostConfig scene
+  → (VulkanHost scene → IO r)
+  → IO (r, DiagnosticVerdict)
+withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions config use =
   withDiagnosticCapture (vulkanCapture config) logger $ \capture → do
     let observer = vulkanObserver config capture
     controller@(VulkanController state) ←
-      newVulkanController
+      newVulkanControllerWith
+        hooks
         (observeRoots observer (layer capture))
         pointer
         (observeBridge observer bridge)

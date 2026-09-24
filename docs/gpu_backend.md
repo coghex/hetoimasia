@@ -161,7 +161,12 @@ announces the attachment to the owner through its bounded port:
 when the port was full, and `VulkanOwnerClosed` once the owner's admission has
 ended. `VulkanRootsNotReady` attaches nothing.
 
-A deferred attachment stays attached, with its surface deposited. The same
+The handover registers the owner's watch over an attachment before it
+attempts the announcement, and withdraws it once the announcement is admitted
+or the port has closed. So an owner that takes a refused port's events and
+then chooses its next deadline always sees the watch; registering it only
+after the refusal would let the owner go idle in between and never learn of
+it. A deferred attachment stays attached, with its surface deposited. The same
 holds for an attachment whose answer a cancellation lost after it was
 published: the handover's recovery re-announces it, and if the port is full it
 is deferred and watched exactly the same way. The caller
@@ -286,7 +291,8 @@ examples:
   attachment released and its surface destroyed by the owner while the host
   runs, one announced again and admitted, one whose destruction failed
   reported at a checkpoint without a retry, and one whose answer a cancellation
-  lost after publication, recovered into the same watch — rollback at every startup and
+  lost after publication, recovered into the same watch, and one refused while
+  the owner drains its port and goes idle before the handover answers — rollback at every startup and
   bootstrap step, a cancellation during the handoff's surface creation,
   repeated cancellation during the exit, a first window's close, an individual
   release, the exit order with the owner joined before any window goes, a

@@ -31,6 +31,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , SurfaceScript (..)
   , scriptSurface
   , raiseAfterAttach
+  , afterRefusal
   , bridgeLeaseAnswer
 
     -- * The rig
@@ -100,10 +101,11 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanHost (..)
   , VulkanHostConfig (..)
   , Readiness (..)
+  , ControllerHooks (..)
   , handOverVulkanTarget
   , readReadiness
   , vulkanHostConfig
-  , withVulkanOwnerHostOver
+  , withVulkanOwnerHostHooked
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DeviceOffer (..)
@@ -329,6 +331,11 @@ data Bridge = Bridge
   , bridgeLeases ∷ !(TVar [Lease])
   }
 
+-- | Run this on the main thread right after the owner's full port refuses a
+-- handover's announcement, before the handover answers.
+afterRefusal ∷ Rig → (AttachmentId → IO ()) → IO ()
+afterRefusal rig action = atomically (writeTVar (rigAfterRefusal rig) action)
+
 -- | Have the next attach raise this, once, after the host has published it.
 raiseAfterAttach ∷ Rig → SomeException → IO ()
 raiseAfterAttach rig failure = atomically (writeTVar (bridgeRaiseAfterAttach (rigBridge rig)) (Just failure))
@@ -459,6 +466,9 @@ data Rig = Rig
   , rigVerdict ∷ !(TVar (Maybe DiagnosticVerdict))
   , rigPortCapacity ∷ !(Maybe Int)
     -- ^ The owner's lifetime port capacity, when an example narrows it.
+  , rigAfterRefusal ∷ !(TVar (AttachmentId → IO ()))
+    -- ^ What runs on the main thread right after the owner's full port
+    -- refuses a handover's announcement.
   }
 
 -- | A rig over one hidden window.
@@ -508,6 +518,7 @@ newRigWith windows = do
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
+  refusalHook ← newTVarIO (\_ → pure ())
   pure
     Rig
       { rigSeam = seam
@@ -518,6 +529,7 @@ newRigWith windows = do
       , rigOwner = owner
       , rigVerdict = verdict
       , rigPortCapacity = Nothing
+      , rigAfterRefusal = refusalHook
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -540,7 +552,8 @@ runRigHere rig body = do
     "vulkan-controller-example"
     ( \_ use → do
         (result, verdict) ←
-          withVulkanOwnerHostOver
+          withVulkanOwnerHostHooked
+            (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
             quietLogger
             (nativeLayer (rigJournal rig) (rigNative rig))
             instanceAddress
