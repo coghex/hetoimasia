@@ -1,27 +1,31 @@
--- | Entry point for the native backend package's headless suite.
---
--- The examples live in the component specs this module composes under one
--- top-level group, @Native roots@; it declares none of its own. They make no
--- native call. 'configFailOnEmpty' makes a selection that matches no example a
--- failure rather than a silent pass.
---
--- @tools/vulkan-proof/run-proof.sh --headless@ is what builds and runs this
--- suite, and it hands every suite it runs its own @--headless@ mode flag, which
--- means nothing more here than it already is: this suite is headless whatever
--- it is given. It is dropped before Hspec reads the arguments.
 module Main (main) where
 
-import System.Environment (getArgs, withArgs)
-import qualified Test.GPU.Vulkan.Native.Profile as Profile
-import qualified Test.GPU.Vulkan.Native.Roots as Roots
-import Test.Hspec (describe)
-import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
+import Crypto.Hash.SHA256 qualified as SHA256
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as ByteString
+import Data.ByteString.Builder (byteStringHex, toLazyByteString)
+import Data.ByteString.Lazy.Char8 qualified as LazyChar8
+import Test.Hspec (hspec)
 
+import Test.Shader.Fragment (verificationFragment)
+import Test.Shader.Spec qualified as Shader
+import Test.Shader.Vertex (verificationVertex)
+
+-- | The suite first says exactly what it embedded, so two builds — from two
+-- extractions of the package, or on two machines with one compiler — can be
+-- compared byte for byte from their logs alone.
 main ∷ IO ()
 main = do
-  arguments ← filter (/= "--headless") <$> getArgs
-  withArgs arguments $
-    hspecWith defaultConfig {configFailOnEmpty = True} $
-      describe "Native roots" $ do
-        Profile.spec
-        Roots.spec
+  mapM_ identify [("vertex", verificationVertex), ("fragment", verificationFragment)]
+  hspec Shader.spec
+  where
+    identify ∷ (String, ByteString) → IO ()
+    identify (stage, spirv) =
+      putStrLn
+        ( "embedded "
+            <> stage
+            <> " SPIR-V: "
+            <> show (ByteString.length spirv)
+            <> " bytes, sha256 "
+            <> LazyChar8.unpack (toLazyByteString (byteStringHex (SHA256.hash spirv)))
+        )

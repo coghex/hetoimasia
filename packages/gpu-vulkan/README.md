@@ -27,12 +27,15 @@ permanent rather than a staging step:
 - [`native/`](native/README.md) — `hetoimasia-gpu-vulkan-native`, the native
   backend. It owns the binding, the handles and the calls, and depends on the
   diagnostics and model packages and on no window system. It holds VK-6's
-  messengers and C callback, and VK-7's roots: the runtime profile's
+  messengers and C callback, VK-9's shader adapter — GLSL compiled during the
+  build by the provisioned compiler, embedded as SPIR-V, with the compiler's
+  identity a rebuild input — and VK-7's roots: the runtime profile's
   decisions, and the instance, the explicit messenger, the one shared device
   and a record per target surface, over an open native layer. It is listed
   only in `cabal.project.vulkan`, with its local dependency closure, so
   CPU-only and ordinary project selection both exclude it, and only
-  `tools/vulkan-proof/run-proof.sh` builds it. Neither the model nor the
+  `tools/vulkan-proof/run-shaders.sh` and `tools/vulkan-proof/run-proof.sh`,
+  which runs the former first, build it. Neither the model nor the
   diagnostics package will ever depend on it: completion reaches the model only
   as abstract facts through an injected interface, so the model proves no
   native completion and cannot be made to.

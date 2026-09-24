@@ -1759,9 +1759,13 @@ it, pointing it elsewhere, or replacing it with a file is refused. On
 macOS the loader is copied instead, because its own install name is
 `@rpath/libvulkan.1.dylib`: a consumer pointed at the vendor SDK would need an
 rpath and would record a machine path in every product, and the copy's absolute
-install name is what lets `cabal.project.vulkan` link with no generated project
-file and no rpath at all. Editing a Mach-O invalidates its signature, so the
-copy is re-signed ad hoc.
+install name is what lets this project's own packages link with no generated
+project file and no rpath at all. The store-built binding is the one exception —
+command-line directories never reach it — and `cabal.project.vulkan` names its
+loader directory under `if os(darwin)`, as
+[the toolchain record](toolchain.md#why-the-loader-is-copied-on-macos-and-where-an-rpath-is-still-needed)
+explains. Editing a Mach-O invalidates its signature, so the copy is re-signed
+ad hoc.
 
 The manifest's `vulkan` section records, for every input, both halves of its
 identity — the manifest *and* the binary it names, the wrapper *and* the

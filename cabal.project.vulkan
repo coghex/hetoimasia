@@ -11,11 +11,13 @@
 -- builds this. The other packages here are the local dependency closure of the
 -- native package and of the interop component — the diagnostics package whose C
 -- capture the native package installs, the GPU model, the runtime the GLFW
--- package's runtime integration uses, and the foundation — which the ordinary
--- projects list too; `cabal.project` lists the GLFW package itself, with the
--- flag off. Selecting this project is an explicit act:
+-- package's runtime integration uses, the foundation, and the test-only support
+-- library the native package's shader suite uses — which the ordinary projects
+-- list too; `cabal.project` lists the GLFW package itself, with the flag off.
+-- Selecting this project is an explicit act:
 --
 --   bash tools/vulkan-proof/run-proof.sh
+--   bash tools/vulkan-proof/run-shaders.sh
 --
 -- which is also what points the build at the loader: the native prefix
 -- `tools/native/vulkan.py` provisions carries it, and the runner passes that
@@ -33,6 +35,7 @@ packages:
   packages/gpu-vulkan/model
   packages/runtime
   packages/foundation
+  tools/test-support
 
 -- The GLFW package's Vulkan interop component: the shared loader capability and
 -- the surface bridge the proof's VK-5 cases exercise. Off everywhere else.
@@ -51,3 +54,20 @@ package hetoimasia-glfw
 constraints:
     vulkan +safe-foreign-calls,
     vulkan -darwin-lib-dirs
+
+-- Where macOS finds the loader while it compiles. `vulkan-utils`, and every
+-- shader splice through it, runs Template Haskell against the compiled binding,
+-- so GHC loads the binding's dylib during the build, and that dylib records the
+-- loader as `@rpath/libvulkan.1.dylib`. Command-line `--extra-lib-dirs` reach
+-- this project's own packages only, never the binding the store builds, so the
+-- binding's directory and rpath are named here: the directory `MACOS_LOADER` and
+-- `MACOS_INCLUDE` in tools/native/vulkan.pin pin, which `native.py prepare`
+-- verifies by digest before any build. This is the configuration
+-- `tools/toolchain/qualify-binding.sh` qualified. Executables still link the
+-- provisioned prefix's copy, which `run-proof.sh` names ahead of it. Linux needs
+-- none of this: the binding finds the loader through the prefix's `vulkan.pc`.
+if os(darwin)
+  package vulkan
+    extra-lib-dirs: /usr/local/lib
+    extra-include-dirs: /usr/local/include
+    ghc-options: -optl-Wl,-rpath,/usr/local/lib

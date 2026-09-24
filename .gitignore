@@ -36,3 +36,6 @@ config/*.local.yaml
 /receipts/
 /cabal.project.vulkan.local
 /dist-vulkan-proof/
+# The shader toolchain fingerprint `hetoimasia-shader-fingerprint` generates
+# before every shader build; it names this machine's native prefix.
+/packages/gpu-vulkan/native/shaders/toolchain.fingerprint

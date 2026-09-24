@@ -15,6 +15,19 @@
 -- thread and is never given to a worker action; a worker receives its
 -- 'Hetoimasia.Foundation.Worker.StopToken' and the component handles it needs.
 --
+-- __Drain status.__ 'workerGroupStatus' is the one exception to that thread
+-- ownership. It reads the group's 'Hetoimasia.Foundation.Worker.groupStatus'
+-- and nothing else — no checkpoint, classification, observation, latch
+-- delivery, or report — so application assembly may pass the control to a
+-- thread outside the group, such as a quit watchdog, which may read it at any
+-- time, including while the boundary is blocked in its drain. It reports
+-- observed state only: it names no cause for a stall and says nothing about
+-- whether resources are safe to release. Its closed phase means the foundation
+-- published its 'Hetoimasia.Foundation.Worker.GroupReport', not that
+-- supervision has settled outcomes, that dependencies have been released, or
+-- that the application's terminal report was made. Elapsed time, sampling
+-- cadence, output, and any deadline belong to the observing application.
+--
 -- __Policy.__ 'startSupervised' registers a 'WorkerPolicy' for the worker
 -- before any of the worker's own code runs: its 'Role' (a 'Service' runs until
 -- asked to stop, a 'Job' may finish), its 'Disposition' ('Required' or
@@ -189,6 +202,9 @@ module Hetoimasia.Runtime.Supervision
   , checkRuntime
   , awaitSupervised
 
+    -- * Drain status
+  , workerGroupStatus
+
     -- * Failures
   , UnexpectedServiceExit (..)
   , UnexpectedWorkerTermination (..)
@@ -251,6 +267,7 @@ import Hetoimasia.Foundation.Recovery
 import Hetoimasia.Foundation.Worker
   ( Completion (..)
   , GroupReport (..)
+  , GroupStatus
   , Requested (..)
   , Result (..)
   , RunEnd (..)
@@ -264,6 +281,7 @@ import Hetoimasia.Foundation.Worker
   , WorkerSummary
   , awaitStartup
   , closeWorkerGroup
+  , groupStatus
   , observeCompletion
   , pollCompletion
   , requestCancel
@@ -632,6 +650,14 @@ awaitSupervised (RuntimeControl _ state) work = loop
       case step of
         Right result → pure result
         Left batch → settle state batch >> deliver state >> loop
+
+-- | The group's drain status, read in one transaction.
+--
+-- Unlike every other operation on the control, any thread may call it, at any
+-- time, including while the boundary drains. It reads the foundation status
+-- and nothing else: see the module header's "Drain status".
+workerGroupStatus ∷ RuntimeControl → STM GroupStatus
+workerGroupStatus (RuntimeControl group _) = groupStatus group
 
 -- | Every registered worker with a published outcome not yet handled, in
 -- registration order, with whether its owner asked it to stop.

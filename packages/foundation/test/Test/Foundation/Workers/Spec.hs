@@ -12,6 +12,12 @@
 -- stops an example that has already hung. The stuck-worker and blocked-delivery
 -- examples release their worker explicitly before checking disposal, and no
 -- example expects arbitrary blocking IO to be interrupted.
+--
+-- The drain-status examples read 'groupStatus' and wait on it only through
+-- STM. Where a state lasts only between a helper's delivery and its
+-- deregistration, they hold the helper with the package-private coordination
+-- probe, which runs on the production helper path of a production group; the
+-- probe's own opacity is proven by "Test.Foundation.Workers.Opacity".
 module Test.Foundation.Workers.Spec (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
@@ -44,7 +50,7 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (forM, forM_, replicateM_, unless, void)
+import Control.Monad (forM, forM_, replicateM_, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (elemIndex)
@@ -72,7 +78,11 @@ import Hetoimasia.Foundation.Resource
   )
 import Hetoimasia.Foundation.Worker
   ( Completion (..)
+  , GroupPhase (..)
   , GroupReport (..)
+  , GroupStatus (..)
+  , Outstanding (..)
+  , OutstandingWorker (..)
   , Requested (..)
   , Result (..)
   , RunEnd (..)
@@ -83,12 +93,14 @@ import Hetoimasia.Foundation.Worker
   , Worker
   , WorkerCancelled (..)
   , WorkerEvidence (..)
+  , WorkerGroup
   , activeWorkerCount
   , allocWorkerGroup
   , awaitCompletion
   , awaitStartup
   , awaitStopRequest
   , closeWorkerGroup
+  , groupStatus
   , observeCompletion
   , pollCompletion
   , requestCancel
@@ -99,8 +111,11 @@ import Hetoimasia.Foundation.Worker
   , workerDefinition
   , workerEvidenceInContext
   , workerId
+  , workerLabel
   )
+import Hetoimasia.Foundation.Worker.Internal (GroupProbe (..), withWorkerGroupProbed)
 import System.Timeout (timeout)
+import qualified Test.Foundation.Workers.Opacity as Opacity
 import Test.Hspec
   ( Expectation
   , Spec
@@ -108,6 +123,7 @@ import Test.Hspec
   , expectationFailure
   , it
   , shouldBe
+  , shouldReturn
   , shouldSatisfy
   )
 
@@ -166,6 +182,20 @@ spec = describe "Workers" $ do
       (boundedExample testRetirement)
     it "keeps an observed failure through retirement and an exceptional group exit"
       (boundedExample testObservedFailureAtExit)
+
+  describe "Drain status" $ do
+    it "follows a held worker through closing, owner failure, and a held helper, and changes nothing it reads"
+      (boundedExample testStatusThroughDrain)
+    it "keeps a worker already terminal with a helper pending when closing begins until the helper settles"
+      (boundedExample testStatusHelperPendingAtClosing)
+    it "reports unacknowledged startup and omits settled workers kept only for observation"
+      (boundedExample testStatusStartupAndSettled)
+    it "leaves a cancellation unconfirmed while the worker cannot receive it"
+      (boundedExample testStatusBlockedDelivery)
+    it "keeps confirmed delivery for a worker that caught its cancellation and kept running"
+      (boundedExample testStatusDeliveryPersists)
+
+  Opacity.spec
 
 -- Fixtures -------------------------------------------------------------------
 
@@ -798,3 +828,230 @@ testObservedFailureAtExit = do
       map (isException (Broken "observed")) failures `shouldBe` [True, False]
       map (isException (Broken "unobserved")) failures `shouldBe` [False, True]
     _ → expectationFailure "expected the group exit as evidence"
+
+-- Drain status ---------------------------------------------------------------
+
+-- | One status read.
+statusOf ∷ WorkerGroup → IO GroupStatus
+statusOf = atomically . groupStatus
+
+-- | Wait, through STM, until the status satisfies a condition. The wait is the
+-- example's own: the query itself never retries.
+awaitStatus ∷ WorkerGroup → (GroupStatus → Bool) → IO GroupStatus
+awaitStatus group ready = atomically $ do
+  status ← groupStatus group
+  check (ready status)
+  pure status
+
+-- | The expected entry for a worker, from its handle.
+outstandingOf ∷ Worker r → Bool → Requested → Bool → Outstanding → Int → OutstandingWorker
+outstandingOf worker = OutstandingWorker (workerId worker) (workerLabel worker)
+
+-- | A probe holding every cancellation helper at the point between its
+-- delivery attempt and its deregistration, announcing each arrival.
+data HeldHelpers = HeldHelpers
+  { heldArrived ∷ MVar ()
+  , heldRelease ∷ MVar ()
+  }
+
+newHeldHelpers ∷ IO HeldHelpers
+newHeldHelpers = HeldHelpers <$> newEmptyMVar <*> newEmptyMVar
+
+heldProbe ∷ HeldHelpers → GroupProbe
+heldProbe held = GroupProbe (\_ → putMVar (heldArrived held) () >> takeMVar (heldRelease held))
+
+-- | A report reduced to what a caller can compare: each list's labels, result
+-- kinds, run-exit records, and cleanup labels.
+type ReportShape = [[(Text, Kind, RunExit, [Text])]]
+
+reportShape ∷ GroupReport → ReportShape
+reportShape report =
+  map (map summary) [reportExitedBeforeClosing report, reportDrained report, reportObservedFailures report]
+  where
+    summary completion =
+      ( completionLabel completion
+      , kindOf completion
+      , completionExit completion
+      , map cleanupFailureLabel (completionCleanup completion)
+      )
+
+-- | What one run of the drain scenario left for a caller: whether the owner's
+-- failure stayed primary, the report's shape, the retained cleanup labels, and
+-- the trace.
+data DrainRun = DrainRun
+  { runOwnerPrimary ∷ Bool
+  , runReport ∷ Maybe ReportShape
+  , runCleanup ∷ [Text]
+  , runTrace ∷ [Text]
+  }
+  deriving (Eq, Show)
+
+-- | A worker that exited before closing, and one that ignores its stop request
+-- and holds a failing release, drain after closing begins, the owner fails
+-- during the drain, and the cancellation helper is held after delivery. With
+-- @observe@, every stage is also read through 'groupStatus'; the coordination
+-- is the same either way.
+drainScenario ∷ Bool → IO DrainRun
+drainScenario observe = do
+  trace ← newTrace
+  held ← newHeldHelpers
+  published ← newEmptyMVar
+  never ← newEmptyMVar
+  (owner, done) ← forkOwner $
+    withScoped (resource trace "parent") $ \() →
+      withWorkerGroupProbed (heldProbe held) $ \group → do
+        early ← expectStarted =<< startWorker group (workerDefinition "exited-early" (\_ → pure ()) (\_ () → pure ()))
+        _ ← atomically (awaitCompletion early)
+        worker ←
+          expectStarted
+            =<< startWorker group (workerDefinition "held" (\_ → failingResource trace "child socket") (\_ () → takeMVar never))
+        putMVar published (group, worker)
+        closeWorkerGroup group
+  (group, worker) ← takeMVar published
+  -- Blocked on STM only inside closeWorkerGroup's wait: closing has begun.
+  awaitBlockedOnSTM owner
+  when observe $
+    statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True StopWasRequested False AwaitingTerminal 0]
+  throwTo owner (Broken "owner")
+  takeMVar (heldArrived held)
+  _ ← atomically (awaitCompletion worker)
+  when observe $
+    statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
+  awaitBlockedOnSTM owner
+  tryReadMVar done >>= expectNothing
+  putMVar (heldRelease held) ()
+  caught ← takeMVar done >>= expectFailure
+  when observe $ statusOf group `shouldReturn` GroupStatus GroupClosed []
+  entries ← readIORef trace
+  pure
+    DrainRun
+      { runOwnerPrimary = isException (Broken "owner") caught
+      , runReport = case contextOf caught of
+          [GroupExit report] → Just (reportShape report)
+          _ → Nothing
+      , runCleanup = cleanupLabels caught
+      , runTrace = entries
+      }
+
+testStatusThroughDrain ∷ Expectation
+testStatusThroughDrain = do
+  observed ← drainScenario True
+  unobserved ← drainScenario False
+  observed `shouldBe` unobserved
+  observed
+    `shouldBe` DrainRun
+      { runOwnerPrimary = True
+      , runReport =
+          Just
+            [ [("exited-early", SucceededKind, RunExited RunReturned NothingRequested, [])]
+            , [("held", CancelledKind, RunExited RunCancelled CancelWasRequested, ["child socket"])]
+            , []
+            ]
+      , runCleanup = ["child socket"]
+      , runTrace = ["acquire parent", "acquire child socket", "release child socket", "release parent"]
+      }
+
+testStatusHelperPendingAtClosing ∷ Expectation
+testStatusHelperPendingAtClosing = do
+  held ← newHeldHelpers
+  published ← newEmptyMVar
+  proceed ← newEmptyMVar
+  never ← newEmptyMVar
+  (owner, done) ← forkOwner $
+    withWorkerGroupProbed (heldProbe held) $ \group → do
+      worker ← expectStarted =<< startWorker group (workerDefinition "cancelled-early" (\_ → pure ()) (\_ () → takeMVar never))
+      requestCancel worker
+      putMVar published (group, worker)
+      takeMVar proceed
+      closeWorkerGroup group
+  (group, worker) ← takeMVar published
+  takeMVar (heldArrived held)
+  _ ← atomically (awaitCompletion worker)
+  let pending = [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
+  statusOf group `shouldReturn` GroupStatus GroupOpen pending
+  putMVar proceed ()
+  awaitStatus group ((== GroupClosing) . statusPhase) `shouldReturn` GroupStatus GroupClosing pending
+  awaitBlockedOnSTM owner
+  tryReadMVar done >>= expectNothing
+  putMVar (heldRelease held) ()
+  report ← takeMVar done >>= either (\_ → fail "the owner failed") pure
+  statusOf group `shouldReturn` GroupStatus GroupClosed []
+  reportShape report
+    `shouldBe` [[("cancelled-early", CancelledKind, RunExited RunCancelled CancelWasRequested, [])], [], []]
+
+testStatusStartupAndSettled ∷ Expectation
+testStatusStartupAndSettled = do
+  startupGate ← newEmptyMVar
+  report ← withWorkerGroup $ \group → do
+    finished ← expectStarted =<< startWorker group (workerDefinition "finished" (\_ → pure ()) (\_ () → pure ()))
+    _ ← atomically (awaitCompletion finished)
+    started ←
+      startWorkerWith group
+        (workerDefinition "starting" (\_ → liftIO (takeMVar startupGate)) (\token () → atomically (awaitStopRequest token)))
+        (\_ → pure ())
+        (\_ → pure ())
+    starting ← either (\rejection → fail ("rejected: " <> show rejection)) (pure . fst) started
+    -- The finished worker is still in active bookkeeping, unobserved, but the
+    -- drain owes it nothing.
+    atomically (activeWorkerCount group) `shouldReturn` 2
+    statusOf group
+      `shouldReturn` GroupStatus GroupOpen [outstandingOf starting False NothingRequested False AwaitingTerminal 0]
+    putMVar startupGate ()
+    _ ← atomically (awaitStartup starting)
+    statusOf group
+      `shouldReturn` GroupStatus GroupOpen [outstandingOf starting True NothingRequested False AwaitingTerminal 0]
+    closeWorkerGroup group
+  map (map (\(label, _, _, _) → label)) (reportShape report) `shouldBe` [["finished"], ["starting"], []]
+
+testStatusBlockedDelivery ∷ Expectation
+testStatusBlockedDelivery = do
+  running ← newEmptyMVar
+  release ← newEmptyMVar
+  withWorkerGroup $ \group → do
+    worker ←
+      expectStarted
+        =<< startWorker group
+          ( workerDefinition "uninterruptible" (\_ → pure ()) $ \_ () →
+              uninterruptibleMask_ (putMVar running () >> takeMVar release)
+          )
+    takeMVar running
+    requestCancel worker
+    -- The worker cannot receive the cancellation, so no helper has confirmed
+    -- it, whether or not the helper has reached its throwTo yet.
+    statusOf group
+      `shouldReturn` GroupStatus GroupOpen [outstandingOf worker True CancelWasRequested False AwaitingTerminal 1]
+    putMVar release ()
+    _ ← atomically (awaitCompletion worker)
+    awaitStatus group (null . statusOutstanding) `shouldReturn` GroupStatus GroupOpen []
+
+testStatusDeliveryPersists ∷ Expectation
+testStatusDeliveryPersists = do
+  running ← newEmptyMVar
+  caught ← newEmptyMVar
+  release ← newEmptyMVar
+  never ← newEmptyMVar
+  report ← withWorkerGroup $ \group → do
+    worker ←
+      expectStarted
+        =<< startWorker group
+          ( workerDefinition "survivor" (\_ → pure ()) $ \_ () → do
+              interrupted ← try (putMVar running () >> takeMVar never)
+              case interrupted of
+                Left WorkerCancelled → putMVar caught ()
+                Right () → pure ()
+              takeMVar release
+          )
+    takeMVar running
+    requestCancel worker
+    takeMVar caught
+    -- Once the helper has settled, the delivery it recorded stays visible
+    -- while the worker keeps running.
+    awaitStatus group ((== [0]) . map outstandingHelpers . statusOutstanding)
+      `shouldReturn` GroupStatus GroupOpen [outstandingOf worker True CancelWasRequested True AwaitingTerminal 0]
+    putMVar release ()
+    _ ← atomically (awaitCompletion worker)
+    report ← closeWorkerGroup group
+    statusOf group `shouldReturn` GroupStatus GroupClosed []
+    pure report
+  reportShape report
+    `shouldBe` [[("survivor", SucceededKind, RunExited RunReturned CancelWasRequested, [])], [], []]

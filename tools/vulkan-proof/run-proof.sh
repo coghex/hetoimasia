@@ -2,13 +2,14 @@
 # Run the native Vulkan compatibility proof against the loader, driver, and
 # validation layers the private native prefix was provisioned with.
 #
-# This is the only thing that builds `tools/vulkan-proof`, and with it the
-# native backend package `packages/gpu-vulkan/native`, the window integration
-# package `packages/gpu-vulkan/glfw`, and the GLFW package's Vulkan interop
-# component. It selects the repository's third project file,
-# `cabal.project.vulkan`, which is the only one that names the first three or
-# turns the fourth on — so an ordinary `cabal build all`, with either of the
-# other two project files, neither resolves nor links the Vulkan binding.
+# This is the only thing that builds `tools/vulkan-proof`, the window
+# integration package `packages/gpu-vulkan/glfw`, and the GLFW package's Vulkan
+# interop component, and — with `run-shaders.sh`, which it runs first — the
+# native backend package `packages/gpu-vulkan/native`. It selects the
+# repository's third project file, `cabal.project.vulkan`, which is the only one
+# that names the proof, the native package or the integration package or turns
+# the interop component on — so an ordinary `cabal build all`, with either of
+# the other two project files, neither resolves nor links the Vulkan binding.
 #
 # Every input comes from one place: `tools/native/native.py prepare`, which
 # refuses the prefix unless it is exactly what this configuration provisions and
@@ -165,13 +166,16 @@ root = sys.argv[1]
 roots = ["tools/vulkan-proof", "tools/native", "tools/display",
          "packages/gpu-vulkan/native", "packages/gpu-vulkan/glfw", "packages/glfw",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
-         "packages/runtime", "packages/foundation"]
+         "packages/runtime", "packages/foundation", "tools/test-support"]
 files = ["cabal.project.vulkan", "cabal.project.common",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 
 def carried(path):
     parts = path.split(os.sep)
-    return "__pycache__" not in parts and not path.endswith(".pyc") and ".DS_Store" not in parts
+    # The shader fingerprint is generated from the prefix, which the record
+    # already identifies; it is not a source.
+    return ("__pycache__" not in parts and not path.endswith(".pyc") and ".DS_Store" not in parts
+            and not path.endswith(os.path.join("shaders", "toolchain.fingerprint")))
 
 paths = set(files)
 for directory in roots:
@@ -208,7 +212,8 @@ if [ -z "${HETOIMASIA_PROOF_REVISION:-}" ]; then
       "$root/cabal.project.common" "$root/tools/toolchain/binding.pin" \
       "$root/packages/gpu-vulkan/native" "$root/packages/gpu-vulkan/glfw" "$root/packages/glfw" \
       "$root/packages/gpu-vulkan/diagnostics" "$root/packages/gpu-vulkan/model" \
-      "$root/packages/runtime" "$root/packages/foundation" 2>/dev/null; then
+      "$root/packages/runtime" "$root/packages/foundation" \
+      "$root/tools/test-support" 2>/dev/null; then
       source_revision="$source_revision (dirty)"
     fi
   else
@@ -232,6 +237,12 @@ echo "run-proof: Vulkan prefix $HETOIMASIA_VULKAN_PREFIX"
 python3 "$root/tools/native/native.py" check --prefix "$native_prefix" | sed 's/^native:/run-proof:/'
 "$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/run-proof: glslang wrapper reports /'
 
+# VK-9's shader contract runs first, against this same prefix and build
+# directory. It needs no display and no consent, so it is the same run whatever
+# the harness below is asked to do, and a failure stops the proof. Until VK-8's
+# `test.vulkan-headless` exists, this route is where that suite is required to
+# run; run-shaders.sh is also its standalone entry.
+bash "$root/tools/vulkan-proof/run-shaders.sh"
 
 # What the caller asked the harness itself to do. The harness owns `--headless`
 # and takes it out of the arguments before Hspec's runner sees them, so an
