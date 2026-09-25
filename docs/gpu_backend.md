@@ -14,13 +14,22 @@ and destruction, keyed by the GPU model's identities — D-7, D-16, D-18, D-22
 and D-30, P-2, P-8 and P-15, and Q-12. See
 [Swapchain generations](#swapchain-generations).
 
-Nothing is recorded, submitted or presented yet: there is no command buffer, no
-acquisition and no queue submission, and the owner's progress step reports no
-render demand. Its deadlines are the brief self-scheduled watch over an
+VK-11 ([#223](https://github.com/coghex/hetoimasia/issues/223)) adds the
+**renderer-facing boundary**: managed rendering resources, a scoped recorder
+that retains the exact generations each command references, sealed single-use
+batches that can be discarded, readback memory, and the audited `unsafe`
+recording subset — D-15, D-26 and D-28, P-1's renderer-facing boundary and
+P-8. See [Recording through managed resources](#recording-through-managed-resources).
+
+Nothing is submitted or presented yet: there is no acquisition and no queue
+submission, a recorded batch can only be discarded, and the owner's progress
+step reports no render demand. The controller wires no recording in either:
+the recorder exists in the native package, and its native case drives it on
+private roots. Its deadlines are the brief self-scheduled watch over an
 attachment whose announcement a full port deferred, described below, and the
 generations' own: a settling resize, a deferred recovery attempt, and the
-model's schedule for a retired generation still held. Recording, acquisition,
-submission and presentation are VK-11 through VK-13's. Acting on a target
+model's schedule for a retired generation still held. Acquisition, submission
+and presentation are VK-12 and VK-13's. Acting on a target
 policy's exhaustion is VK-14's, and completing device-loss teardown across
 submitted work is VK-15's.
 
@@ -47,7 +56,12 @@ exposes `Hetoimasia.GPU.Vulkan.Native.Profile`,
 beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`, and VK-10's
 `Hetoimasia.GPU.Vulkan.Native.Presentation` — the presentation profile and the
 extent policy, as pure decisions — and `Hetoimasia.GPU.Vulkan.Native.Generations`,
-the generations above the roots.
+the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recording`
+— managed resources and the recorder over an open native layer —
+`Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`, its production layer, and
+`Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
+embedded shaders. The audited `unsafe` subset is the private module
+`Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, which no client can import.
 
 ## The ownership graph
 
@@ -373,7 +387,9 @@ is still held: `useVulkanGeneration` holds one on the active generation, from
 any thread, and `endVulkanGenerationUse` ends it. While one is held the
 generation is retired but not destroyed; the model's schedule keeps the owner
 polling it, and the owner destroys it at the first step after the use ends.
-Recording, submission and presentation add their own holds in VK-11 to VK-13.
+A recorded batch holds the generation it records into as a recorded reference
+([Retention](#retention)); submission and presentation add their own holds in
+VK-12 and VK-13.
 
 ### Failure and close
 
@@ -403,6 +419,234 @@ Recording, submission and presentation add their own holds in VK-11 to VK-13.
   generation whose holds have ended, and raises `GenerationsRetained` —
   manufacturing no evidence — if any remains, which retains the surface, the
   window and every parent.
+
+## Recording through managed resources
+
+`Hetoimasia.GPU.Vulkan.Native.Recording` is D-26's small Vulkan-specific
+recording interface as VK-11 delivers it. A renderer never holds a native
+handle: it holds opaque managed handles, each naming one generation of one
+managed resource by the model's `ResourceId`, and it records through a
+`Recorder` lent to one consumer action. Every native call goes through an open
+native layer, `RecordingOps`, whose production form is
+`Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`; the headless examples supply a
+stand-in. A `Recording` is created over the session's roots and generations by
+the graphics owner, and every operation is refused with `RefusedNotOwner` on any
+other thread.
+
+### The boundary as delivered
+
+| Capability | Operation | What the backend keeps |
+| --- | --- | --- |
+| Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
+| Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
+| Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
+| Recorded batch | `discardBatch`; `resetFrameRecorder` | Sealed commands and references, whether or not the caller keeps the `BatchId` |
+| Readback | `readReadback`, `fillReadback` | The mapped memory and what last wrote it |
+| Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
+
+The supported vocabulary is exactly the triangle and its verification: dynamic
+rendering into the frame's one color view, a graphics pipeline compatible with
+the frame's format, dynamic viewport and scissor, whole-triangle draws, the four
+image transitions below, and one bounded copy of the whole image into a readback
+buffer. There is no raw command buffer, no callback escape hatch, no descriptor,
+no vertex buffer and no render graph. A command outside that vocabulary — an
+unsupported transition, a draw that is not whole triangles, a copy from an image
+that is not a transfer source — is `RefusedUnsupported`; one the recorder's state
+does not admit — a draw outside rendering or before a pipeline, viewport and
+scissor, a transition inside rendering or from a layout the image is not in,
+rendering into an image that is not a color attachment — is `RefusedIllegal`.
+Either way nothing native happens.
+
+Construction is ordinary `IO` on the owner. A creation reserves its accounting
+first, so an exhausted budget is `RefusedBackpressure` before any native call;
+a creation that raised created nothing and gives the reservation back; one that
+returned is recorded as a managed generation in the same masked step. A frame
+slot has at most one storage — a command pool with one primary command buffer —
+and one outstanding batch.
+
+### Retention
+
+Every recording operation, in order:
+
+1. checks the calling thread, that the recorder's consumer is still running
+   (`RefusedRecorderClosed` otherwise), each handle it names — this session's
+   (`ForeignIdentity`), still managed (`StaleIdentity`), not replaced
+   (`StaleIdentity`), not released (`WrongPhase`) — and the recorder's state;
+2. registers, in the model, the exact resource generations it references — its
+   own, and the transitive dependencies of the binding: a pipeline's layout
+   generation, fixed when the pipeline was built — as recorded references of the
+   batch (`extendBatch`), before the native call that could capture them;
+3. makes the native call.
+
+Steps 2 and 3 are one masked step, so a cancellation lands only before the
+reference is taken or after the command is recorded; a refusal at step 1 or 2
+makes no native call. The union is taken per operation and the model keeps one
+reference per subject per batch, so binding the same pipeline twice, or two
+pipelines over one layout, retains each subject once and is not a duplicate. The
+batch itself is admitted by `recordBatch` against the acquired frame, which
+reserves its record — the only accounting a batch needs — and retains the frame's
+swapchain generation and the slot's storage; a budget that cannot reserve it
+refuses `recordFrame` before any command buffer is begun.
+
+A batch never resolves a resource again. `replacePipeline` publishes a new
+generation and releases the old one, whose handle then records nothing more;
+every batch that recorded the old generation keeps naming it, and it and its
+layout are destroyed only when those batches' references end. Releasing a handle
+denies new recordings through it and ends its CPU use, and leaves every batch
+that already recorded it untouched. In-place mutation of data a batch depends on
+is refused: `fillReadback` answers `RefusedInUse` while any batch or submission
+holds the buffer, and nothing else can write a managed resource.
+
+### Batches
+
+`recordFrame` runs its consumer exactly once. It seals the batch only if the
+consumer returned with rendering ended. A consumer that raised, a cancellation,
+or rendering left open leaves the batch **partial**: its commands and every
+reference it took stay owned, the slot's storage stays occupied, it can never be
+submitted, and the exception is re-raised (or `RefusedIllegal` answered for
+unbalanced rendering). A recorder kept past its scope refuses every command; no
+claim is made that Haskell's lexical scope prevents keeping one.
+
+`discardBatch` and `resetFrameRecorder` end a batch. Each first resets the
+storage's pool — the native invalidation that makes future submission of its
+commands impossible — and only after that returns discharges, in the model,
+exactly that batch's references (`resetFrameRecorder`: every unsubmitted batch of
+the frame). Neither settles the frame's acquisition or presentation obligation.
+A batch still being recorded is refused, and so is one the model no longer
+holds, or a frame no longer acquired: a submitted batch's commands may be
+executing, and resetting its pool then would be invalid. An invalidation that
+raised is uncertain: the batch keeps every reference, is never invalidated
+again, the session fails with `CleanupFailed`, and `BatchInvalidationFailed` is
+raised. Discarding one batch never releases another batch's reference to a
+shared resource.
+
+`skipUnsubmittedFrame` in the model also discharges a frame's batches. VK-12's
+skip must therefore reset the frame's recorder through this module first, so the
+native invalidation always precedes the discharge.
+
+### The checked frame
+
+`recordFrame` requires the frame to be acquired in the model, with its image's
+generation still recordable. Public acquisition is VK-12's; the backend offers
+no way to fake one. The native case supplies its frame privately — it reserves a
+frame and records the acquisition of image 0 in the model alone, through the
+roots' model, making no native acquisition — and after the discard skips the
+frame and supplies its unpresented-frame settlement, which is everything that
+frame owes. That construction lives in the suite
+(`Test.GPU.Vulkan.Native.Recording`), not in the backend's interface.
+
+### Image transitions
+
+The recorder tracks the frame image's layout and records each transition as one
+`vkCmdPipelineBarrier2`, with these scopes:
+
+| From | To | Source stage, access | Destination stage, access |
+| --- | --- | --- | --- |
+| Undefined | Color attachment | Color-attachment output, none | Color-attachment output, color-attachment write |
+| Color attachment | Transfer source | Color-attachment output, color-attachment write | Copy, transfer read |
+| Color attachment | Present source | Color-attachment output, color-attachment write | None, none |
+| Transfer source | Present source | Copy, none | None, none |
+
+Entering rendering waits on the color-attachment stage, which is where an
+acquisition's semaphore wait is made. Retention proves lifetime only: these
+layout and synchronization rules are the supported operations' own explicit
+contract, not an automatic hazard resolver.
+
+### Readback memory
+
+A readback buffer is a transfer-destination buffer in host-visible memory —
+cached where the device offers it — bound, and mapped whole for its lifetime.
+
+- **The copy.** `copyToReadback` needs the frame's image in the transfer-source
+  layout, and an image its generation made a transfer source: only generations
+  built for a verification capture are
+  (`newGenerationsCapturing`, [below](#capture-usage)). The buffer must hold the
+  whole image, four bytes a pixel (`readbackBytesFor`), or the copy is
+  `RefusedOutOfBounds`. After the copy the recorder records a buffer barrier from
+  the copy's transfer write to host reads; the transitions around it are the
+  renderer's explicit commands.
+- **Completion before exposure.** `readReadback` answers bytes only with
+  completion evidence: the batch that recorded the copy left the model by
+  submission rather than by a discard — every discard goes through this module,
+  which marks the bytes undefined first — and the buffer owes no recorded
+  reference and no submitted use, which the model discharges only on the
+  submission's completion fact. A fence is not a host-visibility barrier; the
+  recorded barrier is what makes the write visible, and the completion is what
+  makes reading it legal. With nothing submitted, a read is `RefusedNotWritten`,
+  so a recorded-and-discarded batch never claims a captured pixel.
+- **Non-coherent memory.** Before a read of non-coherent memory the mapped range
+  is invalidated, and after `fillReadback` writes it the range is flushed. The
+  range (`mappedRange`) is the bytes asked for with the start rounded down and
+  the end rounded up to the device's non-coherent atom, the end clamped to the
+  memory's size, which is what Vulkan requires of both calls. Coherent memory is
+  read without either.
+- **Release.** Releasing a readback ends its CPU use: it is read no more.
+
+### Capture usage
+
+P-15's profile never requires transfer usage of a surface. A verification
+capture needs its images to be transfer sources, so
+`planGenerationWith CaptureWhenOffered` adds that usage wherever the surface
+offers it, and otherwise plans exactly what `planGeneration` does — capture is
+never a gap. `newGenerationsCapturing` builds generations that way; no normal
+target does, and the controller does not. VK-2 verified the transfer-source
+capture profile on both drivers.
+
+### Destruction
+
+`disposeResources` destroys, on the owner, every released generation the model
+reports every hold of ended, and records each disposal with a progress turn
+that answers for managed resources only. A pipeline layout waits until every
+pipeline built over it is destroyed; a pass destroys pipelines first. A
+destruction that raised is uncertain, never retried, fails the session with
+`CleanupFailed` and raises `ResourceDestructionFailed`, and retains everything
+that depends on it. `retireRecording` releases every live handle, destroys what
+it can and raises `ResourcesRetained`, naming the rest, without manufacturing
+evidence; every managed resource must be gone before the device.
+
+### The FFI audit
+
+D-28's production split, as built. The binding is compiled with
+`+safe-foreign-calls`, so every import of its own is `safe`; the package's only
+genuine `unsafe` Vulkan imports are the ten `dynamic` imports in the private
+`Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
+pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
+command buffer's device, with structures marshalled by the binding's
+`withCStruct`. A Haskell wrapper around a `safe` import would not have changed
+its calling convention.
+
+| Entry point | Why it may be `unsafe` |
+| --- | --- |
+| `vkBeginCommandBuffer` | Puts a command buffer the owner alone holds into the recording state. No wait, no other thread's lock; its result is checked and raised as the binding raises it. |
+| `vkEndCommandBuffer` | Ends that recording state. The same. |
+| `vkCmdPipelineBarrier2` | Records a barrier; it does not execute one. |
+| `vkCmdBeginRendering` | Records the start of dynamic rendering. |
+| `vkCmdEndRendering` | Records its end. |
+| `vkCmdBindPipeline` | Records a binding of an already-created pipeline. |
+| `vkCmdSetViewport` | Records dynamic state. |
+| `vkCmdSetScissor` | Records dynamic state. |
+| `vkCmdDraw` | Records a draw. |
+| `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
+
+Each records into a command buffer the calling thread owns; none waits on the
+device, blocks on another thread, or can run long enough to matter. None can
+call back into Haskell: the package installs no Haskell callback, no allocation
+callback and no trampoline, so the only code a validation layer can reach from
+inside one is #217's C-only capture messenger
+(`hetoimasia_vulkan_capture_messenger`), which copies capped data into bounded
+storage and returns. Everything else stays `safe`, through the binding: waits,
+queue submission and presentation (VK-12 and VK-13), pipeline creation, every
+construction and destruction, the pool reset and mapped-memory maintenance.
+Masking, native-effect accounting and retention hold across the mix, because
+every unsafe call sits inside the same masked step as the retention before it
+and the count after it, and an unsafe call cannot be interrupted.
+
+`nativeFfiConfiguration` records the list (`ffiUnsafeImports`), the binding's
+flags and the C-only callback; the native case's record prints it, so it is
+part of the evidence identity beside the build's source digest. The headless
+suite reads the package's own import declarations and requires exactly those
+ten `dynamic` imports and, besides them, only the capture callback's address
+import.
 
 ## Destruction order
 
@@ -457,6 +701,10 @@ retains its parents.
 | Generation records | The generations | The owner's step builds, replaces and destroys; any thread holds and ends a CPU use, or reports a swapchain result, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
 | Swapchain results | The generations | The owner reports; its step consumes | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
+| Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
+| Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
+| Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
+| A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
 
 ## Evidence
 
@@ -524,6 +772,26 @@ retains its parents.
   hidden target, and a closing window's views and swapchain destroyed before its
   surface.
 
+VK-11's examples are in `native-tests` too, over a stand-in recording layer
+that journals every call and fails at a chosen step: a sealed batch retaining
+the frame's generation, its storage, the pipeline and — transitively — its
+layout, observed from inside the native bind; repeated and overlapping use
+retained once; a replacement not redirecting an earlier batch; foreign, stale,
+released, duplicate and consumed capabilities and a stranger's thread refused
+with no native call; a recorder kept past its scope and a consumer run exactly
+once; unsupported and illegal commands refused at the interface; a batch the
+object budget cannot reserve refused before any command buffer begins; a
+consumer that raised, one that was cancelled and one that left rendering open,
+each leaving a partial batch owned; invalidation observed to precede discharge,
+and a failed invalidation retaining everything; a discard and a reset each
+discharging only its own references; a submitted batch neither discarded nor
+reset; release preserving a sealed batch, a layout outliving its pipelines, and
+a failed destruction retained without a retry; the readback's aligned ranges,
+bounds, transfer-source requirement, non-coherent invalidation and flush, and
+completion before exposure; and the FFI audit held to the package's import
+declarations. The model's own suite adds `extendBatch`'s examples. The
+presentation examples add the capture usage, taken only where offered.
+
 **Native.** The group `test.vulkan-native` runs the native suite below. The
 retained per-slice records from the retired proof harness —
 [`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
@@ -531,7 +799,8 @@ and VK-6 records beside it — stay as the historical evidence of the inputs
 they name. VK-10's native cases are retained as
 [`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run,
 and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
-worker.
+worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
+and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md).
 
 ## The native suite
 
@@ -546,7 +815,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, and `synchronization-hazard`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, and `synchronization-hazard`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -576,6 +845,25 @@ assertions unchanged — VK-2's profile, completion, abandonment and capture,
 with the synchronization-validation finding added; VK-6's C-only capture;
 VK-5's bridge; VK-7's roots through the destruction order at the host's exit —
 and the synchronization control.
+
+VK-11's case, `vk11-recording`, runs on private roots because it records
+against a generation of its own and destroys everything it made: the production
+native layer's roots, planned from the same request as every other case, admit
+one window's surface; a generation built for a verification capture gives it a
+real swapchain image; and the production recording layer constructs a pipeline
+layout, a pipeline over VK-9's embedded verification shaders in the generation's
+format, the frame slot's storage and a readback buffer for the generation's
+extent. Against the [fixture-private frame](#the-checked-frame) it records one
+batch of eleven commands — into rendering, the pipeline, viewport and scissor, a
+triangle, out of rendering, into the copy, the copy with its host-read barrier,
+and out to presentation — through the audited `unsafe` subset; requires the
+model to hold all four resources for that batch, and the readback to refuse its
+bytes since nothing was submitted; discards the batch, after which none is held;
+settles the frame in the model; and releases and destroys every resource, then
+the generation, the surface, the device, the messenger and the instance. It
+passes only if no step received a validation error and the capture's verdict
+after the last teardown callback is clean. Its record prints the package's FFI
+configuration. No safe-versus-unsafe timing is measured, and none is asserted.
 
 Run it as the group does:
 

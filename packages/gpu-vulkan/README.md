@@ -31,7 +31,9 @@ permanent rather than a staging step:
   build by the provisioned compiler, embedded as SPIR-V, with the compiler's
   identity a rebuild input — and VK-7's roots: the runtime profile's
   decisions, and the instance, the explicit messenger, the one shared device
-  and a record per target surface, over an open native layer. It is listed
+  and a record per target surface, over an open native layer — VK-10's
+  swapchain generations above them, and VK-11's managed resources, scoped
+  recorder and audited `unsafe` recording subset above those. It is listed
   only in `cabal.project.vulkan`, with its local dependency closure, so
   CPU-only and ordinary project selection both exclude it, and only
   [`tools/vulkan/run.sh`](../../tools/vulkan/run.sh) builds it. Neither the model nor the

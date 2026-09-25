@@ -3,8 +3,8 @@
 Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/native`.
 
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
-diagnostic messengers, VK-9's shader adapter, VK-7's roots, and VK-10's
-swapchain generations. It depends on no
+diagnostic messengers, VK-9's shader adapter, VK-7's roots, VK-10's
+swapchain generations, and VK-11's managed resources and recorder. It depends on no
 window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
@@ -32,7 +32,25 @@ destroys it.
   coalesced replacement through the irreversible `oldSwapchain` transition,
   bounded live generations, recovery attempts through the model's episode, and
   destruction child before parent once every hold has ended. Its calls are the
-  roots' `GenerationOps`.
+  roots' `GenerationOps`. `newGenerationsCapturing` also makes a generation's
+  images transfer sources where the surface offers it, for a verification
+  capture; no normal target is built that way.
+- `Hetoimasia.GPU.Vulkan.Native.Recording` is VK-11's renderer-facing boundary
+  over an open native layer (`RecordingOps`): opaque managed handles — a
+  pipeline layout, a pipeline, a frame slot's command storage, a readback
+  buffer — keyed by the model's `ResourceId`; a scoped recorder that retains,
+  in the model and before each native call, the exact generations each command
+  references, a pipeline's layout included; sealed single-use batches that a
+  discard or a reset invalidates natively before their references are
+  discharged; readback reads gated on completion evidence, with non-coherent
+  memory invalidated and flushed over atom-aligned ranges; and destruction on
+  the owner once every hold has ended.
+- `Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan` is its production layer:
+  construction, destruction and memory maintenance through the binding's safe
+  calls, and every recorded command through the private
+  `Hetoimasia.GPU.Vulkan.Native.Internal.Commands` — the audited `unsafe`
+  recording subset. `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders` embeds the
+  verification pipeline's triangle shaders.
 
 - `Hetoimasia.GPU.Vulkan.Native.Diagnostics` builds the two debug-utils
   messengers an instance can have — the one chained into `VkInstanceCreateInfo`
@@ -53,8 +71,9 @@ destroys it.
   layout.
 - `nativeFfiConfiguration` records this package's own use of the binding: the
   binding-wide flags `cabal.project.vulkan` constrains, the C-only capture
-  callback, no Haskell callbacks, and no `unsafe` imports yet — the audited
-  recording subset is VK-11's. The roots add no recording or submission.
+  callback, no Haskell callbacks, and the audited recording subset — the only
+  genuine `unsafe` imports, which the headless suite holds to the package's
+  import declarations. Nothing here submits or presents yet.
 
 It is listed only in `cabal.project.vulkan`, beside its local dependency closure
 — the diagnostics package, `hetoimasia-gpu-vulkan-model`, the foundation, and
@@ -63,8 +82,8 @@ project resolves the binding, the Vulkan headers or a loader. The only thing
 that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
 points Cabal at the provisioned loader and headers. Its headless suite,
 `native-tests` (`test/RootsMain.hs`), runs the profile's, the roots', the
-presentation planner's and the generations' examples over a stand-in native
-layer, and the shader suite runs beside it,
+presentation planner's, the generations' and the recording's examples over
+stand-in native layers, and the shader suite runs beside it,
 both in the validation group `test.vulkan-headless`; its native cases run in
 the window integration's native suite, `test.vulkan-native` — see
 [the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
@@ -202,4 +221,4 @@ named, is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.
 
 [`docs/vulkan_diagnostics.md`](../../../docs/vulkan_diagnostics.md) is the
 messengers' contract in prose, and [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)
-the roots'.
+the roots', the generations' and the recording's, with the FFI audit.
