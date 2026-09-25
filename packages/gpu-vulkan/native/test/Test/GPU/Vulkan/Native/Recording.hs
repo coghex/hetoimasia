@@ -42,12 +42,14 @@ import Hetoimasia.GPU.Model
   , modelBudgets
   , recordCompletion
   , reserveFrame
+  , resetRecorder
+  , skipUnsubmittedFrame
   , sessionState
   , submitFrames
   , usage
   , usageObjects
   )
-import Hetoimasia.GPU.Model.Budget (BudgetKind (ObjectBudget), BudgetRequest, defaultBudgetRequest, objectLimit, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (ObjectBudget), BudgetRequest (..), defaultBudgetRequest, objectLimit, validateBudgets)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
   , FrameSlotId
@@ -302,6 +304,25 @@ spec = describe "Recording" $ do
       viewBatchStanding view `shouldBe` BatchPartial "the consumer left rendering open"
       nativeOf rig `shouldReturn'` \calls → [() | Ended _ ← calls] `shouldBe` []
 
+    it "never seals a batch whose command raised, even when the consumer catches it and returns" $ do
+      rig ← newRig
+      kit ← newKit rig
+      frame ← acquired rig
+      failAt (rigRecording' rig) AtRecord
+      answer ← recordFrame (rigRecording rig) frame $ \recorder → do
+        caught ← try @RecordingFailure (transitionImage recorder LayoutUndefined LayoutColorAttachment)
+        later ← bindPipeline recorder (kitPipelineHandle kit)
+        pure (either (const True) (const False) caught, later)
+      fmap snd answer `shouldBe` Left (RefusedIllegal "a command failed during recording, so the batch was not sealed")
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldBe` BatchPartial "vkCmdPipelineBarrier2 raised: RecordingFailure AtRecord"
+      nativeOf rig `shouldReturn'` \calls → do
+        [() | Ended _ ← calls] `shouldBe` []
+        [() | Recorded _ (CommandBindPipeline _) ← calls] `shouldBe` []
+      -- It stays owned, partial, until a discard invalidates it.
+      succeedAt (rigRecording' rig) AtRecord
+      ok (discardBatch (rigRecording rig) (viewBatch view))
+
     it "retains a batch whose invalidation raised, with every reference, and fails the session" $ do
       rig ← newRig
       kit ← newKit rig
@@ -375,6 +396,25 @@ spec = describe "Recording" $ do
       ok (releaseManaged (rigRecording rig) (kitPipelineHandle kit))
       sort <$> dispose rig `shouldReturn` sort [kitPipeline kit, kitLayout kit]
 
+    it "records every destruction that returned, even beyond one progress turn's action limit" $ do
+      rig ← newRig
+      layouts ← mapM (const (created (createPipelineLayout (rigRecording rig)))) [1 .. 70 ∷ Int]
+      mapM_ (ok . releaseManaged (rigRecording rig)) layouts
+      destroyed ← dispose rig
+      length destroyed `shouldBe` 70
+      atomically (readManaged (rigRecording rig)) `shouldReturn` []
+      retireRecording (rigRecording rig) (at 2)
+
+    it "refuses frame storage for a foreign target or a slot the frame budget cannot issue, before any native call" $ do
+      rig ← newRig
+      foreignRig ← newRig
+      before ← nativeCount rig
+      fmap (const ()) <$> createFrameStorage (rigRecording rig) (rigTarget foreignRig) 0
+        `shouldReturn` Left (RefusedMisuse (ForeignIdentity TargetIdentity))
+      fmap (const ()) <$> createFrameStorage (rigRecording rig) (rigTarget rig) 2
+        `shouldReturn` Left (RefusedOutOfBounds 2 2)
+      nativeCount rig `shouldReturn` before
+
     it "retains a resource whose destruction raised, never retries it, and fails the session" $ do
       rig ← newRig
       kit ← newKit rig
@@ -444,7 +484,7 @@ spec = describe "Recording" $ do
       ok (fillReadback (rigRecording rig) readback 0xAB)
       nativeOf rig `shouldReturn'` \calls → last calls `shouldBe` Flushed (0, standInMemorySize bytes)
       frame ← acquired rig
-      (_, ()) ← recorded rig frame $ \recorder → do
+      (batch, ()) ← recorded rig frame $ \recorder → do
         drawTriangle recorder kit
         ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
         ok (copyToReadback recorder readback)
@@ -456,9 +496,13 @@ spec = describe "Recording" $ do
       -- Recorded, not submitted: no bytes, and no host write either.
       readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
       fillReadback (rigRecording rig) readback 0 `shouldReturn` Left RefusedInUse
-      submission ← submitInModel rig frame
+      submission@(SubmissionIdOf submitted) ← submitInModel rig frame
       readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
       completeInModel rig submission
+      -- Completed in the model, but nothing yet says this batch was the one
+      -- submitted: no bytes.
+      readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+      ok (noteBatchSubmitted (rigRecording rig) batch submitted)
       before ← nativeCount rig
       readReadback (rigRecording rig) readback 100 16 `shouldReturn` Right (ByteString.replicate 16 0xAB)
       calls ← drop before <$> nativeCalls' rig
@@ -483,6 +527,31 @@ spec = describe "Recording" $ do
       -- Released, it is read no more.
       ok (releaseManaged (rigRecording rig) readback)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedMisuse (WrongPhase ResourceIdentity))
+
+    it "exposes nothing a copy would have written once the model skipped or reset its unsubmitted batch, and records no submission for it" $ do
+      -- Three slots: the skipped frame keeps its own until it is settled.
+      rig ← newRigWith CaptureWhenOffered defaultBudgetRequest {requestedFrameSlots = 3}
+      kit ← newKit rig
+      readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
+      skipped ← acquired rig
+      second ← acquiredOn rig 1
+      _ ← created (createFrameStorage (rigRecording rig) (rigTarget rig) 1)
+      let copying recorder = do
+            drawTriangle recorder kit
+            ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+            ok (copyToReadback recorder readback)
+      (first, ()) ← recorded rig skipped copying
+      inModel rig (skipUnsubmittedFrame skipped)
+      readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+      (reset, ()) ← recorded rig second copying
+      inModel rig (resetRecorder second)
+      readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+      -- Neither batch was submitted, so neither can be recorded as submitted.
+      third ← acquiredOn rig 2
+      submission ← submitInModel rig third
+      let SubmissionIdOf submitted = submission
+      noteBatchSubmitted (rigRecording rig) first submitted `shouldReturn` Left (RefusedMisuse (WrongParent SubmissionIdentity))
+      noteBatchSubmitted (rigRecording rig) reset submitted `shouldReturn` Left (RefusedMisuse (WrongParent SubmissionIdentity))
 
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset the configuration records, and for nothing else" $ do
@@ -608,6 +677,13 @@ submitInModel ∷ Rig → FrameSlotId → IO SubmissionIdOf
 submitInModel rig frame = atomically $ stateRootsModel (rigRoots rig) $ \model → case submitFrames [frame] SubmissionAccepted model of
   Admitted (next, SubmissionRecorded submission) → (SubmissionIdOf submission, next)
   _ → error "the submission was refused"
+
+-- | Apply one model operation through the roots, as VK-12's skip or reset
+-- would, bypassing this module.
+inModel ∷ Rig → (GpuModel → Outcome GpuModel) → IO ()
+inModel rig operation = atomically $ stateRootsModel (rigRoots rig) $ \model → case operation model of
+  Admitted next → ((), next)
+  _ → error "the model refused the operation"
 
 completeInModel ∷ Rig → SubmissionIdOf → IO ()
 completeInModel rig (SubmissionIdOf submission) = atomically $ stateRootsModel (rigRoots rig) $ \model →

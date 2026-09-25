@@ -76,8 +76,11 @@ vulkanRecordingOps physical = do
       , opsDestroyPipeline = \device handle → destroyPipeline device (Pipeline handle) Nothing
       , opsCreateStorage = \device family → do
           CommandPool pool ← createCommandPool device CommandPoolCreateInfo {next = (), flags = zero, queueFamilyIndex = family} Nothing
+          -- The pool exists from here on, and the caller learns its handle only
+          -- if this returns: a failure below destroys it before raising.
           buffers ←
             allocateCommandBuffers device CommandBufferAllocateInfo {commandPool = CommandPool pool, level = COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount = 1}
+              `onException` destroyCommandPool device (CommandPool pool) Nothing
           case Vector.toList buffers of
             [commands] → pure (pool, commands)
             _ → do
@@ -207,8 +210,10 @@ createReadback' memory atom device bytes = do
       device
       BufferCreateInfo {next = (), flags = zero, size = fromIntegral bytes, usage = BUFFER_USAGE_TRANSFER_DST_BIT, sharingMode = SHARING_MODE_EXCLUSIVE, queueFamilyIndices = Vector.empty}
       Nothing
+  -- Every step after the buffer exists destroys what it made before raising,
+  -- since the caller learns no handle unless this returns.
   let destroyedBuffer = destroyBuffer device (Buffer buffer) Nothing
-  requirements ← getBufferMemoryRequirements device (Buffer buffer)
+  requirements ← getBufferMemoryRequirements device (Buffer buffer) `onException` destroyedBuffer
   let types = zip [0 ∷ Word32 ..] (Vector.toList memory.memoryTypes)
       allowed index = requirements.memoryTypeBits .&. (2 ^ index) /= 0
       offers flags (index, kind) = allowed index && kind.propertyFlags .&. flags == flags && index < memory.memoryTypeCount

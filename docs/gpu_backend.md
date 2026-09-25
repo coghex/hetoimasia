@@ -440,7 +440,7 @@ other thread.
 | Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
 | Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
-| Recorded batch | `discardBatch`; `resetFrameRecorder` | Sealed commands and references, whether or not the caller keeps the `BatchId` |
+| Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, for VK-12's submission path | Sealed commands and references, whether or not the caller keeps the `BatchId` |
 | Readback | `readReadback`, `fillReadback` | The mapped memory and what last wrote it |
 | Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
 
@@ -462,7 +462,12 @@ first, so an exhausted budget is `RefusedBackpressure` before any native call;
 a creation that raised created nothing and gives the reservation back; one that
 returned is recorded as a managed generation in the same masked step. A frame
 slot has at most one storage — a command pool with one primary command buffer —
-and one outstanding batch.
+and one outstanding batch; `createFrameStorage` refuses, before any native
+call, a target that is not this session's, not admitted or suspended, or a slot
+the frame budget cannot issue. A construction whose native layer raised after
+making part of its objects — a pool whose command buffer could not be
+allocated, a buffer whose memory could not be bound — destroys that part before
+raising, so a creation that raised created nothing.
 
 ### Retention
 
@@ -500,7 +505,11 @@ holds the buffer, and nothing else can write a managed resource.
 ### Batches
 
 `recordFrame` runs its consumer exactly once. It seals the batch only if the
-consumer returned with rendering ended. A consumer that raised, a cancellation,
+consumer returned with rendering ended and no command's native call raised. A
+command whose call raised may or may not have reached the buffer: the batch is
+marked partial at that boundary, the recorder records nothing more, and a
+consumer that catches the exception and returns still gets `RefusedIllegal`
+rather than a sealed batch. A consumer that raised, a cancellation,
 or rendering left open leaves the batch **partial**: its commands and every
 reference it took stay owned, the slot's storage stays occupied, it can never be
 submitted, and the exception is re-raised (or `RefusedIllegal` answered for
@@ -566,11 +575,14 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   the copy's transfer write to host reads; the transitions around it are the
   renderer's explicit commands.
 - **Completion before exposure.** `readReadback` answers bytes only with
-  completion evidence: the batch that recorded the copy left the model by
-  submission rather than by a discard — every discard goes through this module,
-  which marks the bytes undefined first — and the buffer owes no recorded
-  reference and no submitted use, which the model discharges only on the
-  submission's completion fact. A fence is not a host-visibility barrier; the
+  positive completion evidence: the batch that recorded the copy was recorded
+  as submitted — `noteBatchSubmitted`, which VK-12's submission path calls once
+  the model has accepted the submission, and which checks that the model no
+  longer holds the batch and that its frame is submitted under exactly that
+  record — and the buffer owes no recorded reference and no submitted use,
+  which the model discharges only on that submission's completion fact. A batch
+  the model merely no longer holds proves nothing, since a skip or a reset in
+  the model removes one without submitting it. A fence is not a host-visibility barrier; the
   recorded barrier is what makes the write visible, and the completion is what
   makes reading it legal. With nothing submitted, a read is `RefusedNotWritten`,
   so a recorded-and-discarded batch never claims a captured pixel.
@@ -595,8 +607,10 @@ capture profile on both drivers.
 ### Destruction
 
 `disposeResources` destroys, on the owner, every released generation the model
-reports every hold of ended, and records each disposal with a progress turn
-that answers for managed resources only. A pipeline layout waits until every
+reports every hold of ended, and records each disposal with progress turns
+that answer for managed resources only. A turn does bounded work, so turns
+continue until every destruction that returned is recorded, and passes continue
+until one destroys nothing. A pipeline layout waits until every
 pipeline built over it is destroyed; a pass destroys pipelines first. A
 destruction that raised is uncertain, never retried, fails the session with
 `CleanupFailed` and raises `ResourceDestructionFailed`, and retains everything
@@ -781,14 +795,17 @@ released, duplicate and consumed capabilities and a stranger's thread refused
 with no native call; a recorder kept past its scope and a consumer run exactly
 once; unsupported and illegal commands refused at the interface; a batch the
 object budget cannot reserve refused before any command buffer begins; a
-consumer that raised, one that was cancelled and one that left rendering open,
-each leaving a partial batch owned; invalidation observed to precede discharge,
+consumer that raised, one that was cancelled, one that left rendering open, and
+one that caught a failed command and returned, each leaving a partial batch
+owned and unsealed; invalidation observed to precede discharge,
 and a failed invalidation retaining everything; a discard and a reset each
 discharging only its own references; a submitted batch neither discarded nor
 reset; release preserving a sealed batch, a layout outliving its pipelines, and
-a failed destruction retained without a retry; the readback's aligned ranges,
-bounds, transfer-source requirement, non-coherent invalidation and flush, and
-completion before exposure; and the FFI audit held to the package's import
+a failed destruction retained without a retry, every destruction recorded
+beyond one progress turn's action limit, and frame storage refused for a
+foreign target or an unissuable slot; the readback's aligned ranges, bounds,
+transfer-source requirement, non-coherent invalidation and flush, completion
+before exposure, and no exposure after a skip or a reset in the model; and the FFI audit held to the package's import
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 

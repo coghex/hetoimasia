@@ -57,9 +57,10 @@
 -- a transfer source, as only generations built for a verification capture do
 -- ("Hetoimasia.GPU.Vulkan.Native.Generations.newGenerationsCapturing"), and
 -- which must already be in the transfer-source layout — and after it a buffer
--- barrier from the transfer write to the host read. Bytes are exposed only with completion evidence: the batch that wrote
--- them has left the model by submission, not by a discard, and the buffer owes
--- no recorded reference and no submitted use. Non-coherent memory is
+-- barrier from the transfer write to the host read. Bytes are exposed only
+-- with completion evidence: the batch that wrote them was recorded as
+-- submitted ('noteBatchSubmitted'), and the buffer owes no recorded reference
+-- and no submitted use. Non-coherent memory is
 -- invalidated over the atom-aligned range before it is read and flushed over
 -- that range after 'fillReadback' writes it; 'mappedRange' is that range. A
 -- write while any batch or submission holds the buffer is refused.
@@ -132,6 +133,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
     -- * Batches
   , discardBatch
   , resetFrameRecorder
+  , noteBatchSubmitted
 
     -- * Readback
   , readReadback
@@ -198,8 +200,11 @@ import Hetoimasia.GPU.Model
   , HoldView (..)
   , Outcome (..)
   , SessionFailureCause (CleanupFailed)
+  , TargetPhase (..)
+  , TargetView (..)
   , TurnReport (..)
   , beginAllocation
+  , modelBudgets
   , createResource
   , disposalEligible
   , endResourceCpuUse
@@ -216,7 +221,7 @@ import Hetoimasia.GPU.Model
   , silentEvidence
   )
 import qualified Hetoimasia.GPU.Model as Model
-import Hetoimasia.GPU.Model.Budget (BudgetKind)
+import Hetoimasia.GPU.Model.Budget (BudgetKind, frameSlotLimit)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
   , FrameSlotId
@@ -224,6 +229,7 @@ import Hetoimasia.GPU.Model.Identity
   , IdentityKind (..)
   , Misuse (..)
   , ResourceId
+  , SubmissionId
   , TargetId
   , frameSlotNumber
   , frameTarget
@@ -231,6 +237,7 @@ import Hetoimasia.GPU.Model.Identity
   , imageGeneration
   , imageIndex
   , resourceSession
+  , targetSession
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), Generations, TargetGenerationsView (..), readTargetGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
@@ -426,6 +433,9 @@ data BatchStanding
     -- references stay owned; it can only be discarded.
   | BatchUncertain !Text
     -- ^ Resetting its storage raised. Everything is retained.
+  | BatchSubmitted !SubmissionId
+    -- ^ The model submitted it as this record ('noteBatchSubmitted'). It is
+    -- never reset or discarded here again.
   deriving (Eq, Show)
 
 data BatchRecord = BatchRecord
@@ -595,12 +605,26 @@ buildPipeline recording (PipelineLayout layout) shaders format replacing =
 -- | A frame slot's command storage: a pool on the session's queue family and
 -- its one primary command buffer. A slot has at most one; 'recordFrame'
 -- records every frame of that slot into it.
+--
+-- The target must be one of this session's, still admitted or suspended, and
+-- the slot one its frame budget can issue; anything else is refused before
+-- any native call.
 createFrameStorage ∷ Recording q inst msgr phys dev cmd → TargetId → Natural → IO (Either Refusal FrameStorage)
 createFrameStorage recording target slot = do
   existing ← Map.lookup (target, slot) <$> readTVarIO (recordingStorages recording)
-  case existing of
-    Just _ → pure (Left (RefusedMisuse (DuplicateSubject FrameIdentity)))
-    Nothing → do
+  model ← atomically (stateRootsModel (recordingRoots recording) (\current → (current, current)))
+  let limit = frameSlotLimit (modelBudgets model)
+      unusable = case Model.targetView target model of
+        _ | targetSession target /= rootsSessionIdentity (recordingRoots recording) → Just (RefusedMisuse (ForeignIdentity TargetIdentity))
+        Nothing → Just (RefusedMisuse (StaleIdentity TargetIdentity))
+        Just view
+          | viewTargetPhase view `notElem` [TargetAdmitted, TargetSuspended] → Just (RefusedMisuse (WrongPhase TargetIdentity))
+          | slot >= limit → Just (RefusedOutOfBounds slot limit)
+          | otherwise → Nothing
+  case (existing, unusable) of
+    (_, Just refused) → pure (Left refused)
+    (Just _, _) → pure (Left (RefusedMisuse (DuplicateSubject FrameIdentity)))
+    (Nothing, Nothing) → do
       family ← fmap (planQueueFamily . fst) <$> atomically (readRootsDevice (recordingRoots recording))
       case family of
         Nothing → pure (Left RefusedDeviceAbsent)
@@ -789,14 +813,21 @@ recordFrame recording frame consumer =
                 writeIORef opened False
                 case ran of
                   Left failure@(ExceptionWithContext _ exception) → do
-                    partial
-                      ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
-                          <> Text.pack (displayException exception)
-                      )
+                    -- A command that failed has already said why the batch
+                    -- is partial; that reason stands.
+                    standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
+                    when (standing == Just BatchRecording) $
+                      partial
+                        ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
+                            <> Text.pack (displayException exception)
+                        )
                     rethrowIO failure
                   Right value → do
                     rendering ← stateRendering <$> readIORef state
-                    if rendering
+                    standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
+                    if standing /= Just BatchRecording
+                      then pure (Left (RefusedIllegal "a command failed during recording, so the batch was not sealed"))
+                      else if rendering
                       then do
                         partial "the consumer left rendering open"
                         pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
@@ -882,11 +913,22 @@ command recorder decide =
                 else atomically (modelAnswer roots (fmap (\model → (model, ())) . extendBatch batch (unique references)))
             case retained of
               Left refusal → pure (Left refusal)
-              Right () → do
-                rootsCall roots (nativeName native) (opsRecord (recordingOps recording) (recorderCommands recorder) native)
-                atomically (editBatch recording batch (\entry → entry {batchCommands = batchCommands entry + 1}))
-                writeIORef (recorderState recorder) next
-                pure (Right ())
+              Right () →
+                tryWithContext @SomeException (rootsCall roots (nativeName native) (opsRecord (recordingOps recording) (recorderCommands recorder) native)) >>= \case
+                  -- The command may or may not have reached the buffer, so the
+                  -- batch can never be sealed: it is partial, the recorder
+                  -- records nothing more, and a consumer that catches this
+                  -- cannot change either.
+                  Left failure@(ExceptionWithContext _ exception) → do
+                    writeIORef (recorderOpen recorder) False
+                    atomically $
+                      editBatch recording batch $ \entry →
+                        entry {batchStanding = BatchPartial (nativeName native <> " raised: " <> Text.pack (displayException exception))}
+                    rethrowIO failure
+                  Right () → do
+                    atomically (editBatch recording batch (\entry → entry {batchCommands = batchCommands entry + 1}))
+                    writeIORef (recorderState recorder) next
+                    pure (Right ())
   where
     recording = recorderRecording recorder
     roots = recordingRoots recording
@@ -1104,6 +1146,29 @@ invalidate recording storage batches discharge =
       Just (NativeStorage _ _ handle _) → Just handle
       _ → Nothing
 
+-- | Record that the model submitted this sealed batch as this submission
+-- record: the model no longer holds the batch, and the frame it was recorded
+-- for is submitted under exactly that record. It is the positive submission
+-- evidence 'readReadback' needs, and VK-12's submission path supplies it once
+-- the model has accepted a submission. Nothing native happens, and the batch
+-- is never reset or discarded here again.
+noteBatchSubmitted ∷ Recording q inst msgr phys dev cmd → BatchId → SubmissionId → IO (Either Refusal ())
+noteBatchSubmitted recording batch submission =
+  owned recording $ atomically $ do
+    record ← Map.lookup batch <$> readTVar (recordingBatches recording)
+    held ← batchHeld roots batch
+    model ← stateRootsModel roots (\current → (current, current))
+    case record of
+      Nothing → pure (Left (RefusedMisuse (AlreadyConsumed BatchIdentity)))
+      Just entry
+        | batchStanding entry /= BatchSealed → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
+        | held → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
+        | (frameView (batchFrame entry) model >>= viewFrameSubmission) /= Just submission →
+            pure (Left (RefusedMisuse (WrongParent SubmissionIdentity)))
+        | otherwise → Right () <$ editBatch recording batch (\held' → held' {batchStanding = BatchSubmitted submission})
+  where
+    roots = recordingRoots recording
+
 -- ---------------------------------------------------------------------------
 -- Readback
 
@@ -1119,9 +1184,10 @@ mappedRange atom memorySize offset size = (start, end - start)
     end = min memorySize (((offset + size + step - 1) `div` step) * step)
 
 -- | Read bytes a completed submission wrote. Refused unless the batch that
--- recorded the copy left the model by submission rather than by a discard,
--- and the buffer owes no recorded reference and no submitted use — which is
--- the completion evidence the model supplies; or unless the host wrote them.
+-- recorded the copy was recorded as submitted ('noteBatchSubmitted') and the
+-- buffer owes no recorded reference and no submitted use — which the model
+-- discharges only on that submission's completion fact; or unless the host
+-- wrote them.
 -- Non-coherent memory is invalidated over the aligned range first.
 readReadback ∷ Recording q inst msgr phys dev cmd → Readback → Natural → Natural → IO (Either Refusal ByteString)
 readReadback recording (Readback readback) offset size =
@@ -1141,25 +1207,22 @@ readReadback recording (Readback readback) offset size =
                 ContentsHostWritten
                   | null pending → Right ()
                   | otherwise → Left RefusedInUse
-                -- A copy's batch leaves the model by submission or by discard,
-                -- and every discard goes through this module, which marks the
-                -- bytes undefined first. A sealed batch the model no longer
-                -- holds was therefore submitted, and a buffer that then owes
-                -- no submitted use saw that submission complete.
-                ContentsCopyRecorded writer
-                  | not (null pending) → Left (RefusedNotWritten "a batch or a submission still holds the buffer")
-                  | batchHeld' writer model → Left (RefusedNotWritten "the batch that copies into it has not been submitted")
-                  | (batchStanding <$> Map.lookup writer batches) /= Just BatchSealed → Left (RefusedNotWritten "the batch that copies into it was not sealed")
-                  | otherwise → Right ()
+                -- Positive evidence only: the batch that copies into it was
+                -- recorded as submitted ('noteBatchSubmitted'), and the buffer
+                -- owes no submitted use, which the model discharges only on
+                -- that submission's completion fact. A batch the model merely
+                -- no longer holds proves nothing: a skip or a reset in the
+                -- model removes one without submitting it.
+                ContentsCopyRecorded writer → case batchStanding <$> Map.lookup writer batches of
+                  _ | not (null pending) → Left (RefusedNotWritten "a batch or a submission still holds the buffer")
+                  Just (BatchSubmitted _) → Right ()
+                  _ → Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
             case evidence of
               Left refusal → pure (Left refusal)
               Right () → Right <$> readMapped allocation
       Right _ → pure (Left RefusedWrongKind)
   where
     roots = recordingRoots recording
-    batchHeld' writer model = case Model.discardBatch writer model of
-      Admitted _ → True
-      _ → False
     readMapped allocation = do
       device ← fmap snd <$> atomically (readRootsDevice roots)
       unless (allocationCoherent allocation) $
@@ -1206,14 +1269,25 @@ fillReadback recording (Readback readback) byte =
 -- pipeline built over it to be destroyed first. A destruction that raised is
 -- reported, after the whole pass, as 'ResourceDestructionFailed'.
 disposeResources ∷ Recording q inst msgr phys dev cmd → Instant → IO [ResourceId]
-disposeResources recording now = owner recording $ do
-  destroyedFirst ← pass
-  destroyedLater ← if null destroyedFirst then pure [] else pass
-  pure (destroyedFirst <> destroyedLater)
+disposeResources recording now = owner recording (go [])
   where
     roots = recordingRoots recording
-    -- Pipelines go before their layouts, so a second pass takes a layout
-    -- whose last pipeline the first one destroyed.
+    -- Pass after pass, since a pass can make a layout eligible by destroying
+    -- its last pipeline, until one destroys nothing. Each pass's destructions
+    -- are recorded before the next begins, and a failure is raised only once
+    -- everything that did return has been recorded.
+    go recorded = do
+      (destroyed, failures) ← pass
+      unless (null failures) (atomically (failRootsSession roots CleanupFailed))
+      settled ← settle []
+      for_ failures $ \(resource, reason) → throwIO (ResourceDestructionFailed resource reason)
+      if null destroyed then pure (recorded <> settled) else go (recorded <> settled)
+    -- A progress turn does bounded work, so turns continue until the model
+    -- has recorded every destruction that returned, or a turn does nothing.
+    settle recorded = do
+      (disposed, acted) ← atomically (progress recording now)
+      pending ← any ((== ManagedDestroyedPending) . managedStanding) . Map.elems <$> readTVarIO (recordingManaged recording)
+      if not acted || not pending then pure (recorded <> disposed) else settle (recorded <> disposed)
     pass = do
       (candidates, device) ← atomically $ do
         managed ← readTVar (recordingManaged recording)
@@ -1232,11 +1306,7 @@ disposeResources recording now = owner recording $ do
       results ← case device of
         Nothing → pure []
         Just handle → forM candidates $ \(resource, record) → (,) resource <$> destroyOne handle resource record
-      let failures = [(resource, reason) | (resource, Just reason) ← results]
-      unless (null failures) (atomically (failRootsSession roots CleanupFailed))
-      disposed ← atomically (progress recording now)
-      for_ failures $ \(resource, reason) → throwIO (ResourceDestructionFailed resource reason)
-      pure disposed
+      pure ([resource | (resource, Nothing) ← results], [(resource, reason) | (resource, Just reason) ← results])
     destroyOne device resource record = mask_ $
       tryWithContext @SomeException (destroyNative recording device (managedNative record)) >>= \case
         Right () → Nothing <$ atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedDestroyedPending}))
@@ -1255,8 +1325,9 @@ disposeResources recording now = owner recording $ do
       _ → False
 
 -- | One model progress turn answering for this module's resources only,
--- forgetting every one the model recorded as disposed.
-progress ∷ Recording q inst msgr phys dev cmd → Instant → STM [ResourceId]
+-- forgetting every one the model recorded as disposed. Answers those, and
+-- whether the turn took any action at all.
+progress ∷ Recording q inst msgr phys dev cmd → Instant → STM ([ResourceId], Bool)
 progress recording now = do
   managed ← readTVar (recordingManaged recording)
   let answer = \case
@@ -1271,7 +1342,7 @@ progress recording now = do
   let disposed = [resource | ResourceSubject resource ← turnDisposed report]
   modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
   modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
-  pure disposed
+  pure (disposed, turnActions report > 0)
 
 -- | Release every live handle, destroy every generation whose holds have
 -- ended, and raise 'ResourcesRetained' — manufacturing no evidence — if any
