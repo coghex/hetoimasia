@@ -22,6 +22,13 @@ module Test.GPU.Vulkan.Native.StandIn
   , StandInFailure (..)
   , StandInLoss (..)
 
+    -- * Naming
+  , offerNaming
+  , failNaming
+  , restoreNaming
+  , NamingFailure (..)
+  , namesGiven
+
     -- * Surfaces' presentation
   , standInOffer
   , offerSurface
@@ -47,6 +54,7 @@ import Control.Exception (Exception, fromException, throwIO, tryWithContext, uni
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Time (scriptedInstant, scriptedSource, zeroDuration)
@@ -67,6 +75,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , validationFeaturesExtension
   , swapchainMaintenance1Extension
   )
+import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), NativeObjectKind)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
@@ -100,6 +109,11 @@ data Call
     -- ^ The view made, and the image it views.
   | DestroyedView !Word64
   | DestroyedSwapchain !Word64
+  | QueriedQueue !Word32
+    -- ^ The device's queue of that family, asked for to name it.
+  | Named !NativeObjectKind !Word64 !ByteString
+    -- ^ A naming call: the kind, the handle and the name. One that raised is
+    -- recorded too, before it raised.
   deriving (Eq, Show)
 
 -- | A step the stand-in can be scripted at.
@@ -157,6 +171,10 @@ data StandIn = StandIn
   , standDuring ∷ !(TVar (IO ()))
     -- ^ Run inside the next swapchain creation, once.
   , standHandles ∷ !(TVar Word64)
+  , standNaming ∷ !(TVar Bool)
+    -- ^ Whether the device offers naming; off unless an example turns it on.
+  , standNameFails ∷ !(TVar [NativeObjectKind])
+    -- ^ Kinds whose naming raises 'NamingFailure'.
   }
 
 newStandIn ∷ IO StandIn
@@ -168,6 +186,8 @@ newStandIn = do
     <*> newTVarIO 3
     <*> newTVarIO (pure ())
     <*> newTVarIO 100
+    <*> newTVarIO False
+    <*> newTVarIO []
 
 -- | A surface that supplies a concrete 640 by 480 extent and offers the
 -- profile's BGRA sRGB format, FIFO, color attachment and opaque composition,
@@ -228,6 +248,29 @@ standInDevice =
 -- | A surface no queue family of the stand-in device presents to.
 unsupportedSurface ∷ Word64
 unsupportedSurface = 666
+
+-- | Have the device offer naming from now on.
+offerNaming ∷ StandIn → IO ()
+offerNaming standIn = atomically (writeTVar (standNaming standIn) True)
+
+-- | Have every later naming of an object of this kind raise 'NamingFailure'
+-- once it is recorded.
+failNaming ∷ StandIn → NativeObjectKind → IO ()
+failNaming standIn kind = atomically (modifyTVar' (standNameFails standIn) (kind :))
+
+-- | Have naming of this kind succeed again.
+restoreNaming ∷ StandIn → NativeObjectKind → IO ()
+restoreNaming standIn kind = atomically (modifyTVar' (standNameFails standIn) (filter (/= kind)))
+
+-- | A naming call the stand-in was told to fail.
+newtype NamingFailure = NamingFailure NativeObjectKind
+  deriving (Eq, Show)
+
+instance Exception NamingFailure
+
+-- | Every naming call so far, oldest first.
+namesGiven ∷ StandIn → IO [(NativeObjectKind, Word64, ByteString)]
+namesGiven standIn = (\recorded → [(kind, handle, name) | Named kind handle name ← recorded]) <$> calls standIn
 
 -- | Script one step.
 script ∷ StandIn → Step → Scripted → IO ()
@@ -304,6 +347,18 @@ standInOps standIn =
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , opsMessengerHandle = fromIntegral
+    , opsDeviceHandle = fromIntegral
+    , opsDeviceQueue = \_ family → 4 <$ record standIn (QueriedQueue family)
+    , opsInstrumentation = \_ → do
+        offered ← readTVarIO (standNaming standIn)
+        pure $
+          if not offered
+            then Nothing
+            else Just $ Instrumentation $ \kind handle name → do
+              record standIn (Named kind handle name)
+              failing ← elem kind <$> readTVarIO (standNameFails standIn)
+              if failing then throwIO (NamingFailure kind) else pure ()
     , opsGenerations =
         GenerationOps
           { opsSurfaceOffer = \_ surface → do

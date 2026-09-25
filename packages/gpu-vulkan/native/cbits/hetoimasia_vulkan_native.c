@@ -39,7 +39,15 @@ SAME_FIELD(hetoimasia_capture_object_name, object_name, VkDebugUtilsObjectNameIn
 _Static_assert(sizeof(hetoimasia_capture_object_name) == sizeof(VkDebugUtilsObjectNameInfoEXT),
                "the object name mirror is not the size of VkDebugUtilsObjectNameInfoEXT");
 
-_Static_assert(HETOIMASIA_CAPTURE_SEVERITY_VERBOSE == VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT, "verbose bit");
+SAME_FIELD(hetoimasia_capture_label, s_type, VkDebugUtilsLabelEXT, sType);
+SAME_FIELD(hetoimasia_capture_label, next, VkDebugUtilsLabelEXT, pNext);
+SAME_FIELD(hetoimasia_capture_label, label_name, VkDebugUtilsLabelEXT, pLabelName);
+SAME_FIELD(hetoimasia_capture_label, color, VkDebugUtilsLabelEXT, color);
+/* Both label arrays are read by element, so their stride has to agree too. */
+_Static_assert(sizeof(hetoimasia_capture_label) == sizeof(VkDebugUtilsLabelEXT),
+               "the label mirror is not the size of VkDebugUtilsLabelEXT");
+
+_Static_assert(HETOIMASIA_CAPTURE_SEVERITY_VERBOSE ==VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT, "verbose bit");
 _Static_assert(HETOIMASIA_CAPTURE_SEVERITY_INFO == VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT, "info bit");
 _Static_assert(HETOIMASIA_CAPTURE_SEVERITY_WARNING == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT, "warning bit");
 _Static_assert(HETOIMASIA_CAPTURE_SEVERITY_ERROR == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT, "error bit");

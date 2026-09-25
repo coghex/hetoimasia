@@ -37,6 +37,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , classifySeverity
   , severityBits
   , CapturedObject (..)
+  , CapturedLabels (..)
   , CapturedRecord (..)
   , takeRecord
 
@@ -79,15 +80,18 @@ import Foreign.Storable (peek, poke, pokeByteOff)
 
 -- Limits ---------------------------------------------------------------------
 
--- | The three bounds a storage is built with.
+-- | The four bounds a storage is built with.
 data Limits = Limits
   { limitQueueCapacity ∷ !Int
     -- ^ Records queued at once. A record offered while this many wait is dropped.
   , limitTextBudget ∷ !Int
     -- ^ Bytes of text copied per record, shared by the message id name, the
-    -- message and every object name.
+    -- message, every object name and every label name.
   , limitObjectLimit ∷ !Int
     -- ^ Object identifiers copied per record.
+  , limitLabelLimit ∷ !Int
+    -- ^ Labels copied per record from each of the callback's two label arrays:
+    -- at most this many queue labels, and as many command-buffer labels.
   }
   deriving (Eq, Show)
 
@@ -96,6 +100,7 @@ data LimitError
   = QueueCapacityRejected !Int
   | TextBudgetRejected !Int
   | ObjectLimitRejected !Int
+  | LabelLimitRejected !Int
   | AllocationUnrepresentable !Integer
     -- ^ Each bound fits, but the bytes they need together do not fit in the
     -- sizes the allocation is computed in.
@@ -114,6 +119,7 @@ checkLimits limits
   | outOfRange (limitQueueCapacity limits) = Left (QueueCapacityRejected (limitQueueCapacity limits))
   | outOfRange (limitTextBudget limits) = Left (TextBudgetRejected (limitTextBudget limits))
   | outOfRange (limitObjectLimit limits) = Left (ObjectLimitRejected (limitObjectLimit limits))
+  | outOfRange (limitLabelLimit limits) = Left (LabelLimitRejected (limitLabelLimit limits))
   | total > largest = Left (AllocationUnrepresentable total)
   | otherwise = Right limits
   where
@@ -121,13 +127,15 @@ checkLimits limits
     total = toInteger (limitQueueCapacity limits) * recordFootprint limits
     largest = min (toInteger (maxBound ∷ CSize)) (toInteger (maxBound ∷ Int))
 
--- | The bytes one queued record needs: its fixed part, its text budget, and its
--- object records.
+-- | The bytes one queued record needs: its fixed part, its text budget, its
+-- object records, and its label records — the label limit's worth for each of
+-- its two label arrays.
 recordFootprint ∷ Limits → Integer
 recordFootprint limits =
   toInteger hetoimasia_capture_record_size
     + toInteger (limitTextBudget limits)
     + toInteger (limitObjectLimit limits) * toInteger hetoimasia_capture_object_size
+    + 2 * toInteger (limitLabelLimit limits) * toInteger hetoimasia_capture_label_size
 
 -- Storage --------------------------------------------------------------------
 
@@ -160,6 +168,7 @@ createStorage limits = do
     pokeByteOff cLimits 0 (fromIntegral (limitQueueCapacity checked) ∷ Word32)
     pokeByteOff cLimits 4 (fromIntegral (limitTextBudget checked) ∷ Word32)
     pokeByteOff cLimits 8 (fromIntegral (limitObjectLimit checked) ∷ Word32)
+    pokeByteOff cLimits 12 (fromIntegral (limitLabelLimit checked) ∷ Word32)
     alloca $ \out → do
       status ← hetoimasia_capture_create cLimits out
       case status of
@@ -171,8 +180,8 @@ createStorage limits = do
         4 → throwIO StorageSlotsExhausted
         _ → throwIO StorageOutOfMemory
   where
-    -- Three uint32_t fields, and no padding between or after them.
-    limitsSize = 12
+    -- Four uint32_t fields, and no padding between or after them.
+    limitsSize = 16
 
 -- | Close the storage if it is not closed, and free it; its consumer must not
 -- take a record again. Its slot's latches and counters stay readable through
@@ -245,6 +254,16 @@ data CapturedObject = CapturedObject
   }
   deriving (Eq, Show)
 
+-- | One of a record's two label arrays: how many labels the callback said it
+-- carried, and the names of the ones copied, in the callback's order. A name is
+-- as much of it as the record's text budget held, and 'Nothing' when the
+-- callback passed a label with no name.
+data CapturedLabels = CapturedLabels
+  { labelsReported ∷ !Word32
+  , labelNames ∷ ![Maybe ByteString]
+  }
+  deriving (Eq, Show)
+
 -- | One record, copied out of the storage. It owns all of its data: nothing
 -- in it points into the storage or at anything the callback was passed.
 data CapturedRecord = CapturedRecord
@@ -259,6 +278,10 @@ data CapturedRecord = CapturedRecord
     -- ^ How many objects the callback said it carried.
   , recordObjects ∷ ![CapturedObject]
     -- ^ The ones that were copied, at most the object limit.
+  , recordQueueLabels ∷ !CapturedLabels
+    -- ^ The queue labels, at most the label limit of them.
+  , recordCommandBufferLabels ∷ !CapturedLabels
+    -- ^ The command-buffer labels, at most the label limit of them.
   }
   deriving (Eq, Show)
 
@@ -296,6 +319,8 @@ copyRecord record = do
   reported ← hetoimasia_capture_record_objects_reported record
   count ← hetoimasia_capture_record_object_count record
   objects ← traverse (copyObject record) (takeWhile (< count) [0 ..])
+  queueLabels ← copyLabels record 1
+  commandBufferLabels ← copyLabels record 0
   pure
     CapturedRecord
       { recordSeverity = classifySeverity severity
@@ -306,6 +331,8 @@ copyRecord record = do
       , recordTruncated = truncated /= 0
       , recordObjectsReported = reported
       , recordObjects = objects
+      , recordQueueLabels = queueLabels
+      , recordCommandBufferLabels = commandBufferLabels
       }
 
 copyObject ∷ Ptr RecordT → Word32 → IO CapturedObject
@@ -322,6 +349,25 @@ copyObject record index = do
             (hetoimasia_capture_record_object_name_length record index)
       else pure Nothing
   pure CapturedObject {objectType = kind, objectHandle = handle, objectName = name}
+
+-- | One label array: the queue labels when @which@ is 1, the command-buffer
+-- labels when it is 0.
+copyLabels ∷ Ptr RecordT → CInt → IO CapturedLabels
+copyLabels record which = do
+  reported ← hetoimasia_capture_record_labels_reported record which
+  count ← hetoimasia_capture_record_label_count record which
+  names ← traverse name (takeWhile (< count) [0 ..])
+  pure CapturedLabels {labelsReported = reported, labelNames = names}
+  where
+    name index = do
+      present ← hetoimasia_capture_record_label_has_name record which index
+      if present /= 0
+        then
+          Just
+            <$> copyText
+              (hetoimasia_capture_record_label_name record which index)
+              (hetoimasia_capture_record_label_name_length record which index)
+        else pure Nothing
 
 copyText ∷ IO CString → IO Word32 → IO ByteString
 copyText pointer size = do
@@ -408,6 +454,14 @@ data Offer = Offer
     -- ^ 'Nothing' passes a NULL object array.
   , offerObjectCount ∷ !(Maybe Word32)
     -- ^ The count the callback data claims; the array's length when 'Nothing'.
+  , offerQueueLabels ∷ !(Maybe [Maybe ByteString])
+    -- ^ The queue labels' names; 'Nothing' passes a NULL label array, and a
+    -- 'Nothing' name a label whose name is NULL.
+  , offerQueueLabelCount ∷ !(Maybe Word32)
+    -- ^ The count the callback data claims; the array's length when 'Nothing'.
+  , offerCommandBufferLabels ∷ !(Maybe [Maybe ByteString])
+    -- ^ The command-buffer labels' names, as the queue labels'.
+  , offerCommandBufferLabelCount ∷ !(Maybe Word32)
   }
 
 -- | A validation-typed record with this severity and message and nothing else.
@@ -421,6 +475,10 @@ plainOffer severity message =
     , offerMessage = Just message
     , offerObjects = Just []
     , offerObjectCount = Nothing
+    , offerQueueLabels = Just []
+    , offerQueueLabelCount = Nothing
+    , offerCommandBufferLabels = Just []
+    , offerCommandBufferLabelCount = Nothing
     }
 
 -- | Offer one record exactly as a messenger would: the callback data is built
@@ -437,36 +495,45 @@ submit ∷ Ptr () → Offer → Bool → IO ()
 submit userData request missing =
   withOptional (offerIdName request) $ \idName →
     withOptional (offerMessage request) $ \message →
-      case offerObjects request of
-        Nothing →
-          call idName message (fromMaybe 0 (offerObjectCount request)) nullPtr nullPtr nullPtr
-        Just objects →
-          withArray [kind | (kind, _, _) ← objects] $ \kinds →
-            withArray [handle | (_, handle, _) ← objects] $ \handles →
-              withNames [name | (_, _, name) ← objects] $ \names →
-                call
-                  idName
-                  message
-                  (fromMaybe (fromIntegral (length objects)) (offerObjectCount request))
-                  kinds
-                  handles
-                  names
-  where
-    call idName message count kinds handles names = do
-      _ ←
-        hetoimasia_capture_offer
-          userData
-          (offerSeverity request)
-          (offerTypes request)
-          idName
-          (offerIdNumber request)
-          message
-          count
-          kinds
-          handles
-          names
-          (if missing then 1 else 0)
-      pure ()
+      withLabels (offerQueueLabels request) (offerQueueLabelCount request) $ \queueCount queueNames →
+        withLabels (offerCommandBufferLabels request) (offerCommandBufferLabelCount request) $ \commandCount commandNames →
+          let call count kinds handles names = do
+                _ ←
+                  hetoimasia_capture_offer
+                    userData
+                    (offerSeverity request)
+                    (offerTypes request)
+                    idName
+                    (offerIdNumber request)
+                    message
+                    count
+                    kinds
+                    handles
+                    names
+                    queueCount
+                    queueNames
+                    commandCount
+                    commandNames
+                    (if missing then 1 else 0)
+                pure ()
+           in case offerObjects request of
+                Nothing →
+                  call (fromMaybe 0 (offerObjectCount request)) nullPtr nullPtr nullPtr
+                Just objects →
+                  withArray [kind | (kind, _, _) ← objects] $ \kinds →
+                    withArray [handle | (_, handle, _) ← objects] $ \handles →
+                      withNames [name | (_, _, name) ← objects] $ \names →
+                        call
+                          (fromMaybe (fromIntegral (length objects)) (offerObjectCount request))
+                          kinds
+                          handles
+                          names
+
+-- | A label array's claimed count and its names, or NULL.
+withLabels ∷ Maybe [Maybe ByteString] → Maybe Word32 → (Word32 → Ptr CString → IO a) → IO a
+withLabels Nothing count continue = continue (fromMaybe 0 count) nullPtr
+withLabels (Just names) count continue =
+  withNames names (continue (fromMaybe (fromIntegral (length names)) count))
 
 -- | A NUL-terminated copy of the text, or NULL.
 withOptional ∷ Maybe ByteString → (CString → IO a) → IO a
@@ -529,6 +596,9 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_reco
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_object_size"
   hetoimasia_capture_object_size ∷ CSize
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_label_size"
+  hetoimasia_capture_label_size ∷ CSize
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_create"
   hetoimasia_capture_create ∷ Ptr () → Ptr (Ptr StorageT) → IO CInt
@@ -617,6 +687,21 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_reco
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_object_name_length"
   hetoimasia_capture_record_object_name_length ∷ Ptr RecordT → Word32 → IO Word32
 
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_labels_reported"
+  hetoimasia_capture_record_labels_reported ∷ Ptr RecordT → CInt → IO Word32
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_label_count"
+  hetoimasia_capture_record_label_count ∷ Ptr RecordT → CInt → IO Word32
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_label_has_name"
+  hetoimasia_capture_record_label_has_name ∷ Ptr RecordT → CInt → Word32 → IO CInt
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_label_name"
+  hetoimasia_capture_record_label_name ∷ Ptr RecordT → CInt → Word32 → IO CString
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_record_label_name_length"
+  hetoimasia_capture_record_label_name_length ∷ Ptr RecordT → CInt → Word32 → IO Word32
+
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_preset_counter"
   hetoimasia_capture_preset_counter ∷ Ptr StorageT → CInt → Word64 → IO ()
 
@@ -631,6 +716,10 @@ foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer"
     → Word32
     → Ptr Int32
     → Ptr Word64
+    → Ptr CString
+    → Word32
+    → Ptr CString
+    → Word32
     → Ptr CString
     → CInt
     → IO Word32

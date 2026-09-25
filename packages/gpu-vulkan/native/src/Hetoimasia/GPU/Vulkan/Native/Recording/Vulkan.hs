@@ -42,6 +42,7 @@ import Vulkan.Core13
 import Vulkan.Core13.Enums.AccessFlags2
 import Vulkan.Core13.Enums.PipelineStageFlags2
 import Vulkan.Core12 (ResolveModeFlagBits (RESOLVE_MODE_NONE))
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsLabelEXT (..))
 import Vulkan.Zero (zero)
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Commands
@@ -104,6 +105,7 @@ vulkanRecordingOps physical = do
           beginCommandBufferUnsafe commands CommandBufferBeginInfo {next = (), flags = COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, inheritanceInfo = Nothing}
       , opsEndCommands = endCommandBufferUnsafe
       , opsRecord = recordCommand
+      , opsCommandBufferHandle = fromIntegral . ptrToWordPtr . commandBufferHandle
       }
 
 mapped ∷ ReadbackAllocation → Ptr ()
@@ -381,3 +383,5 @@ recordCommand commands = \case
               )
         , imageMemoryBarriers = Vector.empty
         }
+  CommandBeginLabel name → beginLabelUnsafe commands DebugUtilsLabelEXT {labelName = name, color = (0, 0, 0, 0)}
+  CommandEndLabel → endLabelUnsafe commands

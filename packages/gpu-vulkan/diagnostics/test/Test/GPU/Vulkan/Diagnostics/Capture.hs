@@ -14,22 +14,26 @@ import Control.Monad (forM, forM_, replicateM_, when)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Foreign.Ptr (nullPtr)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
-  ( CapturedObject (..)
+  ( CapturedLabels (..)
+  , CapturedObject (..)
   , CapturedRecord (..)
   , Counter (..)
   , Latch (..)
+  , LimitError (..)
   , Limits (..)
   , Offer (..)
   , Severity (..)
   , Storage
   , closeStorage
   , counterValue
+  , checkLimits
   , createStorage
+  , recordFootprint
   , storageClosed
   , freeStorage
   , latchSet
@@ -53,8 +57,14 @@ withStorage ∷ Limits → (Storage → IO a) → IO a
 withStorage bounds = bracket (createStorage bounds) freeStorage
 
 limits ∷ Int → Int → Int → Limits
-limits capacity budget objects =
-  Limits {limitQueueCapacity = capacity, limitTextBudget = budget, limitObjectLimit = objects}
+limits capacity budget objects = labelled capacity budget objects 2
+
+labelled ∷ Int → Int → Int → Int → Limits
+labelled capacity budget objects labels =
+  Limits {limitQueueCapacity = capacity, limitTextBudget = budget, limitObjectLimit = objects, limitLabelLimit = labels}
+
+noLabels ∷ CapturedLabels
+noLabels = CapturedLabels {labelsReported = 0, labelNames = []}
 
 offerInto ∷ Storage → Offer → IO ()
 offerInto storage = offer (storageUserData storage)
@@ -70,6 +80,120 @@ counters storage = forM [minBound .. maxBound] $ \counter → (,) counter <$> co
 
 spec ∷ Spec
 spec = describe "Capture" $ do
+  describe "labels" $ do
+    it "copies both label arrays apart, in the callback's order, with what each reported" $
+      withStorage (labelled 4 64 2 3) $ \storage → do
+        offerInto
+          storage
+          (plainOffer SeverityError "inside a batch")
+            { offerQueueLabels = Just [Just "submit 1"]
+            , offerCommandBufferLabels = Just [Just "batch 3", Just "pass 3", Nothing]
+            }
+        [record] ← drainAll storage
+        recordQueueLabels record `shouldBe` CapturedLabels {labelsReported = 1, labelNames = [Just "submit 1"]}
+        recordCommandBufferLabels record
+          `shouldBe` CapturedLabels {labelsReported = 3, labelNames = [Just "batch 3", Just "pass 3", Nothing]}
+        recordTruncated record `shouldBe` False
+        counterValue storage Truncated `shouldReturn` 0
+
+    it "copies at most the label limit from each array, and counts the record truncated once" $
+      withStorage (labelled 4 64 2 2) $ \storage → do
+        offerInto
+          storage
+          (plainOffer SeverityInfo "labels")
+            { offerQueueLabels = Just [Just "q1", Just "q2", Just "q3"]
+            , offerCommandBufferLabels = Just [Just "c1", Just "c2", Just "c3", Just "c4"]
+            }
+        [record] ← drainAll storage
+        recordQueueLabels record `shouldBe` CapturedLabels {labelsReported = 3, labelNames = [Just "q1", Just "q2"]}
+        recordCommandBufferLabels record `shouldBe` CapturedLabels {labelsReported = 4, labelNames = [Just "c1", Just "c2"]}
+        recordTruncated record `shouldBe` True
+        counterValue storage Truncated `shouldReturn` 1
+
+    it "copies exactly the label limit without truncating" $
+      withStorage (labelled 4 64 2 2) $ \storage → do
+        offerInto storage (plainOffer SeverityInfo "labels") {offerCommandBufferLabels = Just [Just "c1", Just "c2"]}
+        [record] ← drainAll storage
+        labelNames (recordCommandBufferLabels record) `shouldBe` [Just "c1", Just "c2"]
+        recordTruncated record `shouldBe` False
+
+    it "treats a positive label count with no array as truncation, copying none" $
+      withStorage (labelled 4 64 2 2) $ \storage → do
+        offerInto
+          storage
+          (plainOffer SeverityInfo "missing")
+            { offerQueueLabels = Nothing
+            , offerQueueLabelCount = Just 2
+            , offerCommandBufferLabels = Nothing
+            , offerCommandBufferLabelCount = Just 1
+            }
+        [record] ← drainAll storage
+        recordQueueLabels record `shouldBe` CapturedLabels {labelsReported = 2, labelNames = []}
+        recordCommandBufferLabels record `shouldBe` CapturedLabels {labelsReported = 1, labelNames = []}
+        recordTruncated record `shouldBe` True
+        counterValue storage Truncated `shouldReturn` 1
+
+    it "takes a zero label count with no array as no labels, and nothing cut" $
+      withStorage (labelled 4 64 2 2) $ \storage → do
+        offerInto storage (plainOffer SeverityInfo "none") {offerQueueLabels = Nothing, offerCommandBufferLabels = Nothing}
+        [record] ← drainAll storage
+        recordQueueLabels record `shouldBe` noLabels
+        recordCommandBufferLabels record `shouldBe` noLabels
+        recordTruncated record `shouldBe` False
+
+    it "shares the text budget in order: id name, message, objects, queue labels, command-buffer labels" $
+      withStorage (labelled 4 16 2 2) $ \storage → do
+        -- 2 + 3 + 3 bytes leave 8: the queue label takes 4, the first
+        -- command-buffer label the last 4 of its 5, and the second none.
+        offerInto
+          storage
+          (plainOffer SeverityInfo "msg")
+            { offerIdName = Just "id"
+            , offerObjects = Just [(1, 1, Just "obj")]
+            , offerQueueLabels = Just [Just "qqqq"]
+            , offerCommandBufferLabels = Just [Just "ccccc", Just "dd"]
+            }
+        [record] ← drainAll storage
+        recordIdName record `shouldBe` Just "id"
+        recordMessage record `shouldBe` "msg"
+        map objectName (recordObjects record) `shouldBe` [Just "obj"]
+        labelNames (recordQueueLabels record) `shouldBe` [Just "qqqq"]
+        labelNames (recordCommandBufferLabels record) `shouldBe` [Just "cccc", Just ""]
+        recordTruncated record `shouldBe` True
+        counterValue storage Truncated `shouldReturn` 1
+
+    it "counts a record whose objects and labels were both cut as one truncation" $
+      withStorage (labelled 4 64 1 1) $ \storage → do
+        offerInto
+          storage
+          (plainOffer SeverityInfo "both")
+            { offerObjects = Just [(1, 1, Nothing), (2, 2, Nothing)]
+            , offerCommandBufferLabels = Just [Just "a", Just "b"]
+            }
+        [_] ← drainAll storage
+        counterValue storage Truncated `shouldReturn` 1
+
+    it "leaves one record's labels out of the next record that reuses its space" $
+      withStorage (labelled 1 64 2 2) $ \storage → do
+        offerInto storage (plainOffer SeverityInfo "first") {offerCommandBufferLabels = Just [Just "batch 1", Just "pass 1"]}
+        [first] ← drainAll storage
+        labelNames (recordCommandBufferLabels first) `shouldBe` [Just "batch 1", Just "pass 1"]
+        offerInto storage (plainOffer SeverityInfo "second")
+        [second] ← drainAll storage
+        recordCommandBufferLabels second `shouldBe` noLabels
+
+    it "rejects a label limit that is not positive or that the storage cannot count" $ do
+      checkLimits (labelled 1 1 1 0) `shouldBe` Left (LabelLimitRejected 0)
+      let beyond = fromIntegral (maxBound ∷ Word32) + 1
+      checkLimits (labelled 1 1 1 beyond) `shouldBe` Left (LabelLimitRejected beyond)
+
+    it "includes both label arrays' records in the allocation it checks" $ do
+      let footprint = recordFootprint . labelled 1 1 1
+      (footprint 3 - footprint 1) `shouldSatisfy` (> 0)
+      -- Two arrays of labels per record: two more labels cost exactly twice
+      -- what one more does.
+      (footprint 3 - footprint 1) `shouldBe` 2 * (footprint 2 - footprint 1)
+
   describe "bounded copying" $ do
     it "copies every field of a record that fits, and marks nothing truncated" $
       withStorage (limits 4 64 2) $ \storage → do
@@ -95,6 +219,8 @@ spec = describe "Capture" $ do
                 [ CapturedObject {objectType = 10, objectHandle = 0xdeadbeef, objectName = Just "buffer"}
                 , CapturedObject {objectType = 11, objectHandle = 7, objectName = Nothing}
                 ]
+            , recordQueueLabels = noLabels
+            , recordCommandBufferLabels = noLabels
             }
         counterValue storage Truncated `shouldReturn` 0
 

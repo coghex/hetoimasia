@@ -13,6 +13,11 @@
 -- may block or re-enter; none installs a Haskell callback, and both messengers
 -- register the C capture callback of "Hetoimasia.GPU.Vulkan.Native.Diagnostics".
 --
+-- The device's naming call is @vkSetDebugUtilsObjectNameEXT@ from the device's
+-- own dispatch table, offered only when that table resolved it and both
+-- command-buffer label calls: a device whose instance did not enable
+-- @VK_EXT_debug_utils@ resolves none of them, and is left unnamed.
+--
 -- A plan that asks for validation features chains a @VkValidationFeaturesEXT@
 -- into the instance's own create info, beside the capture's messenger. That is
 -- the only way this layer turns synchronization validation on: not an
@@ -24,6 +29,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
   , validationFeaturesInfo
   , instancePointer
   , isDeviceLoss
+  , vulkanInstrumentation
   ) where
 
 import Control.Exception (SomeException, fromException)
@@ -33,13 +39,14 @@ import qualified Data.ByteString as ByteString
 import qualified Data.Text.Encoding as Encoding
 import qualified Data.Vector as Vector
 import Data.Word (Word64)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullFunPtr, ptrToWordPtr)
 import Vulkan.CStruct.Extends (Chain, SomeStruct (..))
 import Vulkan.Core10
 import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), enumerateInstanceVersion, getPhysicalDeviceFeatures2)
 import Vulkan.Core13 (PhysicalDeviceVulkan13Features (..))
 import Vulkan.Exception (VulkanException (..))
-import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerEXT)
+import Vulkan.Dynamic (DeviceCmds (..))
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerEXT (..), DebugUtilsObjectNameInfoEXT (..), setDebugUtilsObjectNameEXT)
 import Vulkan.Extensions.VK_EXT_validation_features
   ( ValidationFeaturesEXT (..)
   , data VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
@@ -74,6 +81,7 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
   , destroyCaptureMessenger
   , destroyInstanceQuiesced
   )
+import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), objectTypeCode)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DeviceOffer (..)
   , DevicePlan (..)
@@ -135,8 +143,37 @@ vulkanRootOps capture =
     , opsSurfaceSupport = \_ physical family surface →
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss
+    , opsMessengerHandle = \(DebugUtilsMessengerEXT handle) → handle
+    , opsDeviceHandle = dispatchable . deviceHandle
+    , opsDeviceQueue = \device family → dispatchable . queueHandle <$> getDeviceQueue device family 0
+    , opsInstrumentation = pure . vulkanInstrumentation
     , opsGenerations = vulkanGenerationOps
     }
+
+-- | A dispatchable handle's pointer, as the 64-bit value the naming call
+-- takes for it.
+dispatchable ∷ Ptr a → Word64
+dispatchable = fromIntegral . ptrToWordPtr
+
+-- | The device's naming call, when its dispatch table resolved it and both
+-- command-buffer label calls.
+vulkanInstrumentation ∷ Device → Maybe Instrumentation
+vulkanInstrumentation device
+  | any (== nullFunPtr) resolved = Nothing
+  | otherwise =
+      Just $
+        Instrumentation $ \kind handle name →
+          setDebugUtilsObjectNameEXT
+            device
+            DebugUtilsObjectNameInfoEXT {objectType = ObjectType (objectTypeCode kind), objectHandle = handle, objectName = Just name}
+  where
+    Device {deviceCmds = commands} = device
+    resolved ∷ [FunPtr ()]
+    resolved =
+      [ castFunPtr (pVkSetDebugUtilsObjectNameEXT commands)
+      , castFunPtr (pVkCmdBeginDebugUtilsLabelEXT commands)
+      , castFunPtr (pVkCmdEndDebugUtilsLabelEXT commands)
+      ]
 
 -- | The generation calls over the binding. Every decision about what to create
 -- is "Hetoimasia.GPU.Vulkan.Native.Presentation"'s plan, and every decision

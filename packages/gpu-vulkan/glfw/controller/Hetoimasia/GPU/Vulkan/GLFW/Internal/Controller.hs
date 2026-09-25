@@ -199,6 +199,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , trackTarget
   , useGeneration
   )
+import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationFeature)
@@ -1029,6 +1030,11 @@ observeRoots (NativeObserver observe) ops =
     , opsDestroyDevice = observe "vkDestroyDevice" . opsDestroyDevice ops
     , opsSurfaceSupport = \created physical family surface →
         observe "vkGetPhysicalDeviceSurfaceSupportKHR" (opsSurfaceSupport ops created physical family surface)
+    , opsDeviceQueue = \device family → observe "vkGetDeviceQueue" (opsDeviceQueue ops device family)
+    , opsInstrumentation = \device →
+        fmap
+          (\instrumentation → Instrumentation (\kind handle name → observe "vkSetDebugUtilsObjectNameEXT" (instrumentName instrumentation kind handle name)))
+          <$> opsInstrumentation ops device
     , opsGenerations =
         generations
           { opsSurfaceOffer = \physical surface → observe "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" (opsSurfaceOffer generations physical surface)

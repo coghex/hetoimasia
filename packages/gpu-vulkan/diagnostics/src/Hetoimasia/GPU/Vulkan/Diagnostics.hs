@@ -7,8 +7,9 @@
 -- the callback is C: 'captureCallback', with 'captureUserData' as its user
 -- data. It copies a capped record into storage this lifetime owns, latches an
 -- error before it attempts admission, counts what it drops or cuts, and
--- returns. It never allocates from the Haskell heap, waits for space, writes to
--- a sink, calls Vulkan, or raises.
+-- returns. It allocates nothing — on the Haskell heap or the C heap: every
+-- record, object and label it can copy into was allocated with the storage —
+-- and it never waits for space, writes to a sink, calls Vulkan, or raises.
 --
 -- A drain worker, in a foundation worker group this lifetime owns rather than
 -- the application's, takes those records and hands them to the caller's logger
@@ -74,7 +75,8 @@
 -- | State              | Owner               | Writers                    | Readers                   | Lifetime and reset              |
 -- +====================+=====================+============================+===========================+=================================+
 -- | C storage: queue,  | this lifetime       | producers (any thread),    | the worker; the lifetime  | allocated at entry; freed in    |
--- | objects, text      |                     | the worker (consumption)   | after it                  | step 4 unless retained          |
+-- | objects, labels,   |                     | the worker (consumption)   | after it                  | step 4 unless retained          |
+-- | text               |                     |                            |                           |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 -- | C slot: latches,   | this lifetime, then | producers (any thread),    | the lifetime;             | static; claimed at entry, reset |
 -- | counters, handshake| the next claimant   | the lifetime (close)       | 'captureStatus'           | only when claimed again         |
@@ -186,6 +188,7 @@ import Hetoimasia.Foundation.Log
   , logEvent
   , unsafeComponent
   , withBreadcrumb
+  , withFields
   )
 import Hetoimasia.Foundation.Worker
   ( Completion (..)
@@ -204,6 +207,7 @@ import Hetoimasia.Foundation.Worker
   )
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   ( CaptureCallback
+  , CapturedLabels (..)
   , CapturedObject (..)
   , CapturedRecord (..)
   , Counter (..)
@@ -233,9 +237,13 @@ data CaptureConfig = CaptureConfig
     -- queue is full is dropped and counted.
   , captureTextBudget ∷ !Int
     -- ^ Bytes of text copied per record, shared by the message id name, the
-    -- message and every object name; 4,096 by default.
+    -- message, every object name, every queue label name and every
+    -- command-buffer label name, in that order; 4,096 by default.
   , captureObjectLimit ∷ !Int
     -- ^ Object identifiers copied per record; 16 by default.
+  , captureLabelLimit ∷ !Int
+    -- ^ Labels copied per record from each of the callback's two label
+    -- arrays, the queue labels and the command-buffer labels; 4 by default.
   , capturePollInterval ∷ !Int
     -- ^ Microseconds the worker waits for a wake-up before looking at the
     -- queue again; 2,000 by default. The producer cannot wake it — waking
@@ -251,6 +259,7 @@ defaultCaptureConfig =
     { captureQueueCapacity = 1024
     , captureTextBudget = 4096
     , captureObjectLimit = 16
+    , captureLabelLimit = 4
     , capturePollInterval = 2000
     }
 
@@ -284,6 +293,7 @@ limitsOf config =
     { limitQueueCapacity = captureQueueCapacity config
     , limitTextBudget = captureTextBudget config
     , limitObjectLimit = captureObjectLimit config
+    , limitLabelLimit = captureLabelLimit config
     }
 
 -- The lifetime -----------------------------------------------------------------
@@ -822,10 +832,25 @@ drainWorker config logger storage capture =
 trySome ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
 trySome = tryWithContext
 
--- | Hand one record to the logger.
+-- | Hand one record to the logger. Its labels are the record's scoped
+-- context: a logger derived for this record alone carries them, and the
+-- record's own fields carry everything else.
 deliver ∷ Logger → CapturedRecord → IO ()
 deliver logger record =
-  logEvent logger (severityLevel (recordSeverity record)) diagnosticsComponent "Vulkan diagnostic" (recordFields record)
+  logEvent (withFields (labelFields record) logger) (severityLevel (recordSeverity record)) diagnosticsComponent "Vulkan diagnostic" (recordFields record)
+
+-- | The record's labels: for the queue labels and then the command-buffer
+-- labels, how many the callback carried, when any, and each copied label's
+-- name, numbered from 1 in the callback's order. A label whose name was NULL
+-- has no field.
+labelFields ∷ CapturedRecord → [(Text, Text)]
+labelFields record = fields "queue" (recordQueueLabels record) <> fields "cmdbuf" (recordCommandBufferLabels record)
+  where
+    fields prefix labels =
+      [(prefix <> ".labels", Text.pack (show (labelsReported labels))) | labelsReported labels > 0]
+        <> [ (prefix <> ".label." <> Text.pack (show index), Encoding.decodeUtf8With Encoding.lenientDecode name)
+           | (index, Just name) ← zip [1 ∷ Int ..] (labelNames labels)
+           ]
 
 recordFields ∷ CapturedRecord → [(Text, Text)]
 recordFields record =

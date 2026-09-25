@@ -20,10 +20,11 @@ import Test.GPU.Vulkan.Diagnostics.Support (everythingFilter, quiescent, recordi
 
 spec ∷ Spec
 spec = describe "Configuration" $ do
-  it "defaults to 1,024 records, 4 KiB of text per record and 16 objects" $ do
+  it "defaults to 1,024 records, 4 KiB of text per record, 16 objects and 4 labels of each kind" $ do
     captureQueueCapacity defaultCaptureConfig `shouldBe` 1024
     captureTextBudget defaultCaptureConfig `shouldBe` 4096
     captureObjectLimit defaultCaptureConfig `shouldBe` 16
+    captureLabelLimit defaultCaptureConfig `shouldBe` 4
     validateCaptureConfig defaultCaptureConfig `shouldSatisfy` either (const False) (const True)
 
   it "rejects a limit that is not positive" $ do
@@ -34,6 +35,8 @@ spec = describe "Configuration" $ do
       `shouldBe` Just (CaptureLimitRejected (TextBudgetRejected (-1)))
     rejected defaultCaptureConfig {captureObjectLimit = 0}
       `shouldBe` Just (CaptureLimitRejected (ObjectLimitRejected 0))
+    rejected defaultCaptureConfig {captureLabelLimit = 0}
+      `shouldBe` Just (CaptureLimitRejected (LabelLimitRejected 0))
     rejected defaultCaptureConfig {capturePollInterval = 0}
       `shouldBe` Just (PollIntervalRejected 0)
 
@@ -41,10 +44,17 @@ spec = describe "Configuration" $ do
     let beyond = fromIntegral (maxBound ∷ Word32) + 1
     validateCaptureConfig defaultCaptureConfig {captureObjectLimit = beyond}
       `shouldBe` Left (CaptureLimitRejected (ObjectLimitRejected beyond))
+    validateCaptureConfig defaultCaptureConfig {captureLabelLimit = beyond}
+      `shouldBe` Left (CaptureLimitRejected (LabelLimitRejected beyond))
 
   it "rejects limits whose allocation cannot be represented, though each fits" $ do
     let huge = fromIntegral (maxBound ∷ Word32)
     case validateCaptureConfig defaultCaptureConfig {captureQueueCapacity = huge, captureTextBudget = huge} of
+      Left (CaptureLimitRejected (AllocationUnrepresentable bytes)) →
+        bytes `shouldSatisfy` (> toInteger (maxBound ∷ Int))
+      other → expectationFailure ("expected an unrepresentable allocation, got " <> show other)
+    -- The label records alone, two arrays of them per record, overflow it.
+    case validateCaptureConfig defaultCaptureConfig {captureQueueCapacity = huge, captureLabelLimit = huge} of
       Left (CaptureLimitRejected (AllocationUnrepresentable bytes)) →
         bytes `shouldSatisfy` (> toInteger (maxBound ∷ Int))
       other → expectationFailure ("expected an unrepresentable allocation, got " <> show other)

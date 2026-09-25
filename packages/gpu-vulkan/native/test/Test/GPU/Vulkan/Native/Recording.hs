@@ -67,11 +67,34 @@ import Hetoimasia.GPU.Model.Identity
   )
 import Hetoimasia.GPU.Vulkan.Native.Diagnostics (NativeFfiConfiguration (..), nativeFfiConfiguration)
 import Hetoimasia.GPU.Vulkan.Native.Generations
+import Hetoimasia.GPU.Vulkan.Native.Naming
+  ( NativeObjectKind (..)
+  , batchLabel
+  , commandBufferName
+  , commandPoolName
+  , passLabel
+  , pipelineLayoutName
+  , pipelineName
+  , readbackBufferName
+  , readbackMemoryName
+  )
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.RecordingStandIn
-import Test.GPU.Vulkan.Native.StandIn (StandInRoots, newStandIn, newStandInRoots, offerSurface, standardRequest, surfaceNumbered)
+import Test.GPU.Vulkan.Native.StandIn
+  ( NamingFailure (..)
+  , StandIn
+  , StandInRoots
+  , failNaming
+  , namesGiven
+  , newStandIn
+  , newStandInRoots
+  , offerNaming
+  , offerSurface
+  , standardRequest
+  , surfaceNumbered
+  )
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -710,6 +733,161 @@ spec = describe "Recording" $ do
       fmap (const ()) raised `shouldBe` Left (RecordingFailure AtFlush)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "nothing has written the buffer")
 
+  describe "names" $ do
+    it "names every managed resource's objects from its ResourceId before its handle is returned" $ do
+      rig ← newNamingRig
+      layout ← created (createPipelineLayout (rigRecording rig))
+      pipeline ← created (createPipeline (rigRecording rig) layout shaders formatB8G8R8A8Srgb)
+      storage ← created (createFrameStorage (rigRecording rig) (rigTarget rig) 0)
+      readback ← created (createReadback (rigRecording rig) 1024)
+      calls ← nativeCalls' rig
+      let layoutNative = last [handle | CreatedLayout handle ← calls]
+          pipelineNative = last [handle | CreatedPipeline handle _ _ ← calls]
+          (pool, buffer) = last [(created', commands) | CreatedStorage created' commands ← calls]
+      [readbackHandles] ← map viewNativeHandles . filter ((== managedResource readback) . viewResource) <$> atomically (readManaged (rigRecording rig))
+      namesGiven (rigStandIn rig)
+        `shouldReturn` [ (ObjectPipelineLayout, layoutNative, pipelineLayoutName (managedResource layout))
+                       , (ObjectPipeline, pipelineNative, pipelineName (managedResource pipeline))
+                       , (ObjectCommandPool, pool, commandPoolName (managedResource storage) (rigTarget rig) 0)
+                       , (ObjectCommandBuffer, buffer, commandBufferName (managedResource storage) (rigTarget rig) 0)
+                       , (ObjectBuffer, firstOr 0 readbackHandles, readbackBufferName (managedResource readback))
+                       , (ObjectDeviceMemory, lastOr 0 readbackHandles, readbackMemoryName (managedResource readback))
+                       ]
+
+    it "releases a resource whose naming raised, returns no handle, and lets disposal destroy it" $ do
+      rig ← newNamingRig
+      layout ← created (createPipelineLayout (rigRecording rig))
+      failNaming (rigStandIn rig) ObjectPipeline
+      raised ← try @NamingFailure (createPipeline (rigRecording rig) layout shaders formatB8G8R8A8Srgb)
+      fmap (const ()) raised `shouldBe` Left (NamingFailure ObjectPipeline)
+      [(unnamed, standing)] ←
+        (\views → [(viewResource view, viewManagedStanding view) | view ← views, viewKind view == "pipeline"]) <$> atomically (readManaged (rigRecording rig))
+      standing `shouldBe` ManagedReleased
+      pipelineNative ← (\calls → last [handle | CreatedPipeline handle _ _ ← calls]) <$> nativeCalls' rig
+      disposed ← dispose rig
+      disposed `shouldContain` [unnamed]
+      nativeOf rig `shouldReturn'` \calls → [() | DestroyedPipeline handle ← calls, handle == pipelineNative] `shouldBe` [()]
+      standingOf' rig unnamed `shouldReturn` Nothing
+      -- The layout it was built over is untouched.
+      standingOf' rig (managedResource layout) `shouldReturn` Just ManagedLive
+
+  describe "labels" $ do
+    it "brackets a batch and its rendering pass in balanced labels naming the batch, the target and the generation" $ do
+      rig ← newNamingRig
+      kit ← newKit rig
+      frame ← acquired rig
+      generation ← activeGeneration rig
+      (batch, ()) ← recordTriangle rig kit frame
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just BatchSealed
+      fmap viewBatchCommands <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just 12
+      nativeOf rig `shouldReturn'` \calls →
+        map labelOrKind [command | Recorded _ command ← calls]
+          `shouldBe` [ Just (Left (batchLabel batch generation))
+                     , Just (Right "barrier")
+                     , Just (Left (passLabel batch generation))
+                     , Just (Right "begin rendering")
+                     , Nothing
+                     , Nothing
+                     , Nothing
+                     , Nothing
+                     , Just (Right "end rendering")
+                     , Just (Right "end label")
+                     , Just (Right "barrier")
+                     , Just (Right "end label")
+                     ]
+
+    it "records no label, and seals exactly as before, when the device offers no naming" $ do
+      rig ← newRig
+      kit ← newKit rig
+      frame ← acquired rig
+      (batch, ()) ← recordTriangle rig kit frame
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just BatchSealed
+      nativeOf rig `shouldReturn'` \calls → [() | Recorded _ command ← calls, isLabel command] `shouldBe` []
+
+    it "closes every open label, innermost first, when the consumer raises inside rendering, and keeps its failure" $ do
+      rig ← newNamingRig
+      kit ← newKit rig
+      frame ← acquired rig
+      raised ← try @ErrorCall $ recorded rig frame $ \recorder → do
+        enterRendering recorder
+        ok (bindPipeline recorder (kitPipelineHandle kit))
+        void (throwIO (ErrorCall "the consumer failed"))
+      fmap (const ()) raised `shouldBe` Left (ErrorCall "the consumer failed")
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldBe` BatchPartial "the consumer raised: the consumer failed"
+      nativeOf rig `shouldReturn'` \calls → do
+        labelBalance calls `shouldBe` 0
+        [command | Recorded _ command ← drop (length calls - 2) calls] `shouldBe` [CommandEndLabel, CommandEndLabel]
+        [() | Ended _ ← calls] `shouldBe` []
+
+    it "closes every open label after a cancellation, and re-delivers the cancellation" $ do
+      rig ← newNamingRig
+      kit ← newKit rig
+      frame ← acquired rig
+      started ← newEmptyMVar
+      never ← newEmptyMVar
+      owner ← myThreadId
+      _ ← forkIO (takeMVar started >> killThread owner >> putMVar never ())
+      outcome ← try @SomeException $ recorded rig frame $ \recorder → do
+        enterRendering recorder
+        ok (bindPipeline recorder (kitPipelineHandle kit))
+        putMVar started ()
+        takeMVar never
+      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldSatisfy` \case
+        BatchPartial reason → "a cancellation ended the consumer" `Text.isPrefixOf` reason
+        _ → False
+      nativeOf rig `shouldReturn'` \calls → labelBalance calls `shouldBe` 0
+
+    it "closes every open label when a command failed and the consumer returned, and still refuses to seal" $ do
+      rig ← newNamingRig
+      kit ← newKit rig
+      frame ← acquired rig
+      answer ← recordFrame (rigRecording rig) frame $ \recorder → do
+        enterRendering recorder
+        failAt (rigRecording' rig) AtRecord
+        try @RecordingFailure (bindPipeline recorder (kitPipelineHandle kit))
+      fmap (const ()) answer `shouldBe` Left (RefusedIllegal "a command failed during recording, so the batch was not sealed")
+      nativeOf rig `shouldReturn'` \calls → labelBalance calls `shouldBe` 0
+
+    it "leaves a batch whose labels could not be balanced partial and unsubmittable, raising the closing failure" $ do
+      rig ← newNamingRig
+      frame ← acquired rig
+      _ ← created (createFrameStorage (rigRecording rig) (rigTarget rig) 0)
+      failAt (rigRecording' rig) AtEndLabel
+      raised ← try @RecordingFailure $ recorded rig frame $ \recorder →
+        ok (transitionImage recorder LayoutUndefined LayoutColorAttachment)
+      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtEndLabel)
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldBe` BatchPartial "the batch's labels could not be balanced: RecordingFailure AtEndLabel"
+      nativeOf rig `shouldReturn'` \calls → [() | Ended _ ← calls] `shouldBe` []
+      -- Never sealed, so never submittable; it keeps its storage and holds
+      -- until a discard invalidates it.
+      model ← modelOf rig
+      [storage] ← (\views → [viewResource each | each ← views, viewKind each == "frame storage"]) <$> atomically (readManaged (rigRecording rig))
+      recordedOf model storage `shouldBe` [viewBatch view]
+      ok (discardBatch (rigRecording rig) (viewBatch view))
+      after ← modelOf rig
+      recordedOf after storage `shouldBe` []
+
+    it "keeps the consumer's own failure when its labels could not be balanced either" $ do
+      rig ← newNamingRig
+      kit ← newKit rig
+      frame ← acquired rig
+      raised ← try @ErrorCall $ recorded rig frame $ \recorder → do
+        enterRendering recorder
+        ok (bindPipeline recorder (kitPipelineHandle kit))
+        failAt (rigRecording' rig) AtEndLabel
+        void (throwIO (ErrorCall "the consumer failed"))
+      fmap (const ()) raised `shouldBe` Left (ErrorCall "the consumer failed")
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldBe` BatchPartial "the batch's labels could not be balanced: RecordingFailure AtEndLabel"
+      model ← modelOf rig
+      recordedOf model (kitPipeline kit) `shouldBe` [viewBatch view]
+      succeedAt (rigRecording' rig) AtEndLabel
+      ok (discardBatch (rigRecording rig) (viewBatch view))
+
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset the configuration records, and for nothing else" $ do
       sources ← haskellSources "src"
@@ -726,6 +904,7 @@ spec = describe "Recording" $ do
 
 data Rig = Rig
   { rigRecording' ∷ !RecordingStandIn
+  , rigStandIn ∷ !StandIn
   , rigRoots ∷ !StandInRoots
   , rigGenerations ∷ !(Generations () Int Int Text Int)
   , rigRecording ∷ !(Recording () Int Int Text Int Word64)
@@ -736,6 +915,14 @@ data Rig = Rig
 -- 480 generation of three images, and a recording over them.
 newRig ∷ IO Rig
 newRig = newRigWith WithoutCapture defaultBudgetRequest
+
+-- | 'newRig' on a device that offers naming, so resources are named and
+-- batches labelled.
+newNamingRig ∷ IO Rig
+newNamingRig = do
+  rig ← newRig
+  offerNaming (rigStandIn rig)
+  pure rig
 
 -- | 'newRig' whose surface offers transfer-source usage and whose
 -- generations ask for it, as a verification capture's do.
@@ -757,7 +944,7 @@ newRigWith capture request = do
   _ ← stepGenerations generations (at 0) (Map.singleton target (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
   recordingStandIn ← newRecordingStandIn
   recording ← newRecording (recordingStandInOps recordingStandIn) roots generations
-  pure (Rig recordingStandIn roots generations recording target)
+  pure (Rig recordingStandIn standIn roots generations recording target)
 
 -- | A layout, a pipeline over it for the generation's format, and slot 0's
 -- storage.
@@ -927,6 +1114,35 @@ isCopyOrHostBarrier = \case
 
 bufferOf ∷ [RecordingCall] → Word64
 bufferOf calls = last [buffer | CreatedReadback buffer _ _ ← calls]
+
+-- | A label command's name as 'Left', a few other commands' kinds as 'Right',
+-- and anything else as 'Nothing'.
+labelOrKind ∷ NativeCommand → Maybe (Either ByteString.ByteString Text)
+labelOrKind = \case
+  CommandBeginLabel name → Just (Left name)
+  CommandEndLabel → Just (Right "end label")
+  CommandImageBarrier {} → Just (Right "barrier")
+  CommandBeginRendering {} → Just (Right "begin rendering")
+  CommandEndRendering → Just (Right "end rendering")
+  _ → Nothing
+
+isLabel ∷ NativeCommand → Bool
+isLabel = \case
+  CommandBeginLabel _ → True
+  CommandEndLabel → True
+  _ → False
+
+-- | Opened less closed label regions, over every label call that returned.
+labelBalance ∷ [RecordingCall] → Int
+labelBalance calls = length [() | Recorded _ (CommandBeginLabel _) ← calls] - length [() | Recorded _ CommandEndLabel ← calls]
+
+firstOr, lastOr ∷ a → [a] → a
+firstOr fallback = \case
+  first : _ → first
+  [] → fallback
+lastOr fallback = \case
+  [] → fallback
+  values → last values
 
 -- | The instant this many milliseconds after the scripted clock's origin.
 at ∷ Integer → Instant

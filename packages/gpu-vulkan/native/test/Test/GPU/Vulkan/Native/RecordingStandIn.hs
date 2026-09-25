@@ -72,6 +72,9 @@ data RecordingStep
   | AtBegin
   | AtEnd
   | AtRecord
+    -- ^ Every recorded command but a label's.
+  | AtBeginLabel
+  | AtEndLabel
   | AtFlush
   deriving (Eq, Ord, Show)
 
@@ -207,5 +210,10 @@ recordingStandInOps standIn =
     , opsRecord = \commands native → do
         action ← readTVarIO (recordingDuringRecord standIn)
         action native
-        step standIn AtRecord (Recorded commands native)
+        let at = case native of
+              CommandBeginLabel _ → AtBeginLabel
+              CommandEndLabel → AtEndLabel
+              _ → AtRecord
+        step standIn at (Recorded commands native)
+    , opsCommandBufferHandle = id
     }
