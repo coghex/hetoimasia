@@ -54,6 +54,7 @@ import Test.Hspec (Spec, describe, expectationFailure, it)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, runSpecForest, specResultSuccess)
 
 import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
+import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.Vulkan.Proof.Bridge as Bridge
@@ -145,6 +146,14 @@ runScenario refusedOrGranted name = case refusedOrGranted of
       hPutStrLn stderr ("vulkan-native-tests: unknown private roots scenario " <> show name)
       exitWith unknownScenarioExit
     scenario : _ → do
+      -- The validation features every instance enables are compiled in; the
+      -- run is refused if they are not the set the provisioned layer is pinned
+      -- to, which is the set the receipt names.
+      checkValidationFeatures >>= \case
+        Right () → pure ()
+        Left reason → do
+          hPutStrLn stderr ("vulkan-native-tests " <> name <> ": " <> Text.unpack reason)
+          exitWith (ExitFailure 1)
       journal ← newJournal
       (examples, record) ← scenarioRun scenario consent journal
       passed ← runCompleteSpec examples
