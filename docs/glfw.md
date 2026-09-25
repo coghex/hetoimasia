@@ -4639,9 +4639,9 @@ package's manual `vulkan-interop` flag, off by default: `cabal build all` and
 Vulkan binding, and link no loader, and every existing public module,
 `allocSession`, and every window-only constructor keep their signatures and
 behaviour. `cabal.project.vulkan` lists the package and sets the flag, and
-[`tools/vulkan-proof/run-proof.sh`](../tools/vulkan-proof/README.md) passes the
+[`tools/vulkan/run.sh`](../tools/vulkan/run.sh) passes the
 provisioned prefix's Vulkan include and library directories on its command
-line; the workflow suite's Vulkan proof boundary examples check that only that
+line; the workflow suite's Vulkan project boundary examples check that only that
 project turns the flag on and that, with it off, no ordinary package resolves
 the binding.
 
@@ -4800,8 +4800,8 @@ queue is full, a double discharge, an uncertain destruction, and a second
 obligation or an in-flight construction keeping the attachment and the lease.
 
 The native evidence runs through the production capability and bridge in the
-VK-2 harness until VK-8 migrates it; see
-[the proof harness](../tools/vulkan-proof/README.md#vk-5-the-loader-aware-surface-bridge).
+Vulkan native suite's `vk5-bridge` case, with private roots in a child process;
+see [the Vulkan native suite](gpu_backend.md#the-native-suite).
 
 ## State
 
@@ -5103,6 +5103,10 @@ own on Linux, or a human's explicit approval on a real desktop.
   [The native suite](#the-native-suite).
 
 ## The native suite
+
+The Vulkan window integration has a native suite of its own, built on these
+rules and adding the graphics owner's: see
+[the Vulkan native suite](gpu_backend.md#the-native-suite).
 
 GLFW requires the process main thread, and Hspec runs examples on threads of its
 own, so `glfw-native-tests` makes its process main thread the owner of one

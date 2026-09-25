@@ -34,7 +34,6 @@ import Test.Vulkan.Proof.Matrix
   , standing
   )
 import Test.Vulkan.Proof.Record (achievedFrom, matrixTable, renderRecord)
-import qualified Test.Vulkan.Proof.InvocationSpec as Invocation
 import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import Test.Vulkan.Proof.Retention (teardownEntries)
 import qualified Test.Vulkan.Proof.RetentionSpec as Retention
@@ -43,10 +42,9 @@ spec ∷ Outcome → Spec
 spec outcome = do
   -- The release decision teardown obeyed, asserted over its own inputs rather
   -- than over what this run happened to reach. These are the same examples
-  -- `run-proof.sh --headless` selects on their own, and they make no native
-  -- call here either.
+  -- the native suite runs on their own without a session, and they make no
+  -- native call here either.
   Retention.spec
-  Invocation.spec
   Loader.spec
 
   describe "The native run" $
@@ -91,6 +89,10 @@ spec outcome = do
         -- clearing the ambient overrides only restores the loader's default
         -- search for them. The policy switches that search off.
         facts.platformImplicitLayerPolicy `shouldSatisfy` Text.isInfixOf "~implicit~"
+
+    it "enabled synchronization validation through the instance's own create info" $
+      onFindings outcome $ \findings →
+        findings.findingsPlatform.platformValidationFeatures `shouldBe` ["SynchronizationValidation"]
 
     it "recorded the layers the pinned path offers" $
       onFindings outcome $ \findings →

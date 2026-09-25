@@ -86,6 +86,7 @@ Each group declares:
 | `category` | string | `build`, `test`, `smoke`, or `probe`. |
 | `optional` | boolean | Required. An optional group runs only when explicitly requested. |
 | `platforms` | array of strings, optional | The `runner_os` values whose workers build this group's components. Omitting the key declares the group applicable everywhere, which is the ordinary case; a declaration narrows and can never widen. A plan taken on a platform the list does not name omits the group as [`platform-inapplicable`](#reasons-and-inputs_changed). Entries must be non-empty, distinct, and match the plan's `runner_os` exactly (`Linux`, `Darwin`), the way the [image](#the-linux-ci-image) compares it. A `floor` group may not declare it: the mandatory floor is selected on every platform. |
+| `preparation` | object, optional | A stage executed to completion **before** `command`, under a budget of its own: `{"command": [...], "timeout_seconds": N}`, both required and nothing else allowed, with the same rules as the group's own `command` and `timeout_seconds`. It exists for a group whose `timeout_seconds` is a measurement rather than a ceiling — a native check whose budget counts its display, fixture, examples and teardown but not the compilation that produced its executable. The plan copies it into the group's entry (`null` when absent), the [plan identity](#receipts) binds it, and a receipt records how it ended apart from the execution it prepared. A group whose preparation did not pass never runs its command and never passes; see [Preparation and the watchdog](#preparation-and-the-watchdog). |
 
 Observed durations and pass/fail history are deliberately absent: the catalog
 declares what a group is, not how it has behaved.
@@ -226,20 +227,98 @@ teardown ordering on every exit. It is mandatory but outside the floor, like
 binding or loader, and running its suite through the CPU project is what shows
 it. Its Cabal closure reaches the package's private `capture` sublibrary and its
 C sources, so a change to the capture itself selects it. The native cases that
-install the same capture on real messengers are not this group; they run through
-the VK-2 proof route until VK-8, as
-[the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture)
-describes.
+install the same capture on real messengers are not this group; they are
+`test.vulkan-native`'s VK-6 case, below.
+
+`test.vulkan-headless` runs the Vulkan-linked headless suites through
+`cabal.project.vulkan`, against the provisioned native prefix, and executes them
+rather than only building them: the native backend's profile and roots decisions
+over a stand-in native layer (`native-tests`), its shader contract against the
+provisioned compiler (`shader-tests`, which regenerates the toolchain
+fingerprint first), and the window integration's controller over the GLFW
+package's scripted seam (`integration-tests`). Headless means that none of them
+acquires a display, a GLFW session, or a device, and none reads desktop
+consent; the Vulkan headers and loader are build and link prerequisites and
+nothing more, which is why the group needs a provisioned worker and not a
+display. It is mandatory outside the floor, runs on the `cpu` class, and its
+command is [`tools/vulkan/run.sh`](../tools/vulkan/run.sh)'s test mode:
+
+```bash
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests \
+  hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests
+```
+
+Its component is the integration suite, whose closure reaches the native
+package's and the GLFW package's libraries; it also declares the whole
+`packages/gpu-vulkan/native/` directory, because that package's two suites share
+a `test/` source directory no single component's closure reaches, beside
+`cabal.project.vulkan`, `cabal.project.common`, `tools/native/`,
+`tools/ci-image/`, `tools/vulkan/`, `tools/toolchain/binding.pin`, and
+`tools/test-support/`, the test-only library the shader suite compiles its
+external clients through, which the declared component's closure does not
+reach. Later
+backend slices extend its coverage and inputs as their suites grow. It stays
+apart from `test.vulkan-native`'s measured native execution on purpose: these
+examples are deterministic, need no permission, and are never optional probes.
+
+`test.vulkan-native` is the Vulkan native suite
+([docs/gpu_backend.md](gpu_backend.md#the-native-suite)): the package-native
+fixture's shared roots under the graphics owner, and the migrated VK-2, VK-5,
+VK-6 and VK-7 cases and the synchronization-validation control in child
+processes of their own. It requires the `display` class, is mandatory outside
+the floor, and is the one group with a [preparation](#preparation-and-the-watchdog):
+
+```json
+"command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"],
+"preparation": {
+  "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"],
+  "timeout_seconds": 3600
+},
+"timeout_seconds": 30
+```
+
+The preparation compiles the suite; the command builds nothing — it asks Cabal
+for the built executable and refuses one that was not prepared. `--complete`
+makes the receipt speak for the whole profile: the suite runs every example
+through Hspec's own primitives with the configuration-reading step left out, so
+no `HSPEC_*`, `.hspec` file or selector can narrow it, and fails unless its
+shared session was acquired and every private scenario ran and passed. Its thirty
+seconds are D-21's budget for the whole native execution: on Linux the isolated
+X11 display the command starts for itself, the shared session and its roots,
+every example and child, retirement, the diagnostic verdict computed after the
+last teardown callback, and the display's own teardown. On macOS the same
+command needs the human's per-session `desktop` consent, as
+[A local run and its receipt](#a-local-run-and-its-receipt) describes. A missing
+loader, device, layer or display fails the group; an empty selection fails the
+suite, and the suite's own report names its non-empty selection. Its inputs are
+the suite's Cabal closure, `cabal.project.vulkan`, `cabal.project.common`,
+`tools/display/`, `tools/native/`, `tools/ci-image/`, `tools/vulkan/`, and
+`tools/toolchain/binding.pin`. It declares no `platforms`: the shared profile
+applies everywhere, and the one case with no Cocoa equivalent — VK-5's failed
+initialization — reports itself pending on macOS rather than passing.
+
+Every validation-enabled instance either group creates enables the Khronos
+layer's **synchronization validation** through its own create info
+(`VkValidationFeaturesEXT`), and nothing else decides it: the native suite
+clears the layer's own settings variables and points its settings file at an
+empty one before any Vulkan call. The pinned layer is qualified for that
+mechanism by the native recipe, which records the feature beside the layer, so
+`vulkan-layers` in the toolchain map — and therefore every Linux plan, image
+descriptor and receipt — reads
+`VK_LAYER_KHRONOS_validation <version> <digest> +synchronization`, and changing
+the feature invalidates evidence exactly as changing the layer does.
 
 `test.workflow` runs only when affected or requested. It contains workflow,
 planner, receipt, packaging, and runner contracts, including short one-second
 fixtures proving that the runner enforces its deadline and reaps children. It
 contains no display-helper examples. It declares `packages/gpu-vulkan/native/`
-and `packages/gpu-vulkan/glfw/` among its inputs, as it declares
-`tools/vulkan-proof/`: no CPU group can build the native backend package or the
-window integration package, whose only build is the proof route, and this
-group's Vulkan boundary examples are what hold those packages out of the
-ordinary projects and read their dependencies.
+and `packages/gpu-vulkan/glfw/` among its inputs, with `tools/vulkan/`, what
+remains of `tools/vulkan-proof/`, and exactly the retained records in
+`docs/vulkan/` its examples read — not the directory, so retaining a later
+record, such as a platform's evidence for the very candidate it describes, does
+not move that candidate's identity: its Vulkan boundary examples are what hold
+those packages out of the ordinary projects, read their dependencies, and hold
+the two Vulkan groups to their commands and routing.
 
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
@@ -349,7 +428,15 @@ A group's inputs are the union of:
   directory prefixes), its `main-is`, its `c-sources`, `cxx-sources`, and
   `include-dirs`, the owning package's `.cabal` file, and `cabal.project`,
   followed transitively across local `build-depends` and `build-tool-depends`.
-  `"all"` starts from every component of every local package.
+  `"all"` starts from every component of every package the root project lists.
+
+The package graph is the root `cabal.project`'s packages together with those
+`cabal.project.vulkan` lists: the native backend and the window integration,
+which the root project deliberately leaves out. A group running through the
+Vulkan project names its component exactly as any other group does, and its
+closure is derived the same way; `"all"` still means `cabal build all` through
+the root project, so it consumes none of the Vulkan-only packages. A package
+both files list is one package, and must be the same directory in each.
 
 Native sources are declared relative to the package rather than to a Haskell
 source directory, so nothing in the `hs-source-dirs` walk reaches them. They are
@@ -397,7 +484,10 @@ not build still has its sources counted, so a
 [platform-only probe](#the-macos-confinement-probe) reports changed inputs
 wherever the plan is taken. Any other conditional, anything else inside one,
 and brace-delimited syntax can change dependencies, so the planner rejects them
-with a diagnostic rather than silently omitting a dependency. `cabal.project` is
+with a diagnostic rather than silently omitting a dependency. A line indented
+beyond the field it follows continues that field's value, as Cabal reads it, so
+a wrapped description whose next line begins with `if` or `else` is prose, not
+a conditional. `cabal.project` is
 read for its `packages:` field; a glob entry is rejected for the same reason.
 The files it imports, such as `cabal.project.common`, and the CPU-only
 `cabal.project.cpu` are not component inputs, so a change to one is an unknown
@@ -597,7 +687,7 @@ is the only place the routing between them is written down:
 | Class | What a worker declaring it provides |
 | --- | --- |
 | `cpu` | An ordinary headless worker: builds, Hspec suites, and the console smoke. |
-| `display` | A windowing session — on Linux, an isolated X11 display established for each group it runs. |
+| `display` | A windowing session — on Linux, an isolated X11 display established for each group it runs, by the worker around the group or by the group's own command inside its execution. |
 
 Each worker is declared once, to the planner:
 
@@ -605,7 +695,8 @@ Each worker is declared once, to the planner:
 python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
-  --worker glfw-native=display:test.glfw-native,test.glfw-wayland
+  --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
+  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native
 ```
 
 Before producing a plan, the planner refuses — naming every problem — a worker
@@ -709,7 +800,7 @@ publishes an applicability document that reuses nothing.
 
 ### Workers
 
-Three workers run in parallel, each with a 45-minute timeout, each inside the
+Four workers run in parallel, each with a 45-minute timeout (90 for `vulkan`), each inside the
 [Linux CI image](#the-linux-ci-image) the plan names by exact digest, and each
 **skipped entirely** when the plan selected none of the groups it owns. Each
 runs exactly the groups the plan assigns it, and passes its own name and runner
@@ -720,6 +811,7 @@ class to every execution:
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
+| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest
@@ -763,8 +855,10 @@ A cache miss costs time and can never change a result.
 
 ### The display worker
 
-`glfw-native` is the only worker declaring the `display` runner class, and the
-only job that ever starts a display. Its steps are the CPU workers' — verify
+Two workers declare the `display` runner class. `glfw-native` starts a display
+around each group it runs; `vulkan` starts none, because its native group's
+command starts its own inside the execution the runner times (see
+[The Vulkan worker](#the-vulkan-worker)). `glfw-native`'s steps are the CPU workers' — verify
 the image, link a native consumer, restore caches keyed separately as
 `dist-newstyle-native-…` — except that it runs each group through a display
 helper, chosen by the group:
@@ -875,6 +969,33 @@ still selects the group against the merge base, as described under
 [Reasons and `inputs_changed`](#reasons-and-inputs_changed), and the job is
 skipped through valid receipt reuse instead.
 
+### The Vulkan worker
+
+`vulkan` runs the two groups that build through `cabal.project.vulkan`, so the
+Vulkan closure — the binding, the native backend, the window integration — is
+built once, in `dist-vulkan`, by one job. It declares both runner classes and
+executes each group with both:
+
+```bash
+python3 -I tools/validation/run.py test.vulkan-native --plan plan.json --receipts receipts \
+  --worker vulkan --runner-class cpu --runner-class display --toolchain ...
+```
+
+No display helper wraps `run.py`. `test.vulkan-native`'s command,
+`tools/vulkan/run.sh native`, starts `tools/display/x11.sh` itself when it runs
+on Linux with no consent of its own, so the display's startup and teardown are
+part of the execution the runner measures and watches, and a display that
+cannot be established is that execution failing — with a receipt — rather than
+a job failing before any group began. A command already running inside an
+isolated display, or carrying a human's desktop approval, uses that session and
+starts no second one. The helper keeps its server and window-manager logs in
+the group's evidence directory (`--retain`), and the suite writes each private
+scenario's output and record there too; the worker uploads them with its
+receipts. Its caches are keyed on `cabal.project.vulkan` rather than
+`cabal.project`: `cabal-store-vulkan-…`, falling back to the ordinary store, and
+`dist-vulkan-…`. A job summary shows the native group's preparation and
+execution times against their budgets.
+
 #### The isolated headless Wayland session
 
 `tools/display/wayland.sh` is the second display helper, shaped like the first
@@ -958,7 +1079,10 @@ Fixture catalogs reach the runner through the plan: resolve one with
 explained away is refused rather than executed, and leaves no receipt.
 
 The receipt records the group, the exact command, the outcome, the exit status,
-start and end timestamps, the duration, the declared timeout, the plan identity,
+start and end timestamps, the measured duration, the declared timeout, how a
+deadline expired and what cleanup followed it (`expiry`), whether the command
+ran at all (`executed`), its preparation's own record (`preparation`), the files
+it left in its evidence directory (`evidence`), the plan identity,
 the candidate's input identity and policy identity, the pull request's head
 commit, the commit and tree that actually executed, the runner's OS and
 architecture, the worker that executed it and the runner class it required, the
@@ -1178,6 +1302,43 @@ anything still there once the grace period expires is killed outright. The runne
 or timed out — the receipt is still written — and `2` for a diagnostic that
 prevented any execution.
 
+#### Preparation and the watchdog
+
+Receipts are schema 4 and plans schema 4: a group may declare a `preparation`,
+and a stage's measurement is kept apart from the cleanup after its deadline.
+
+A stage — the preparation, then the command — is measured from its start until
+the command **and every descendant it started** have gone, or until its
+deadline, whichever comes first. A command whose leader exits while something it
+started is still running has not finished its teardown, so the runner keeps
+measuring, and a teardown that never finishes expires the deadline like a
+stalled setup does. At expiry the runner signals the whole group with `SIGTERM`
+first, so a command that keeps its diagnostics in its own cleanup — the display
+helper's server log, say — can retain them, then kills whatever survives the
+grace period. That cleanup is recorded as `expiry` —
+`{"expired_at", "cleanup_seconds", "killed"}` — and never counted in
+`duration_seconds`, and an expired stage's outcome is `timeout` whatever its
+process reports once it has been stopped: a command that answers the watchdog's
+signal by exiting `0` has certified nothing.
+
+A group with a preparation runs it first, under the preparation's own budget,
+and records it as `preparation` — the same fields a stage has. A preparation
+that fails or expires ends the group there: the command never starts,
+`executed` is `false`, the group's outcome is the preparation's, and
+`duration_seconds` is `0` because nothing was measured. A receipt that claims an
+execution after a preparation that did not pass, or no execution without one, is
+malformed. The aggregate reports such a group as never having run and says why.
+The group's own `timeout_seconds` bounds the command alone, which is what lets
+it be a measurement: `test.vulkan-native`'s thirty seconds count nothing that
+compiled.
+
+Both stages run with `HETOIMASIA_VALIDATION_EVIDENCE` naming
+`<receipts>/evidence/<group-id>/`, which the runner empties — removing whatever
+an earlier execution of the group left there — and creates afresh. Whatever a stage
+leaves there is listed in the receipt's `evidence`, relative to the receipts
+directory, and uploaded with the receipts, so a group that failed or expired
+keeps what its cleanup would otherwise have deleted.
+
 A plan is rejected outright, before any verdict, when it could not honestly
 have produced one: an unreadable or non-object document, a schema version this
 tool does not read, a missing or mistyped field, a group registered twice, a
@@ -1193,7 +1354,7 @@ accounted for, and a candidate that ran nothing reports success.
 **Plan identity** is a SHA-256 over everything that decides what must run and
 how: the plan and policy revisions, the digest of the catalog that classified
 the candidate, both endpoints' commits and trees, the normalized request, and
-every group's selection, reason, command, and timeout. It deliberately omits the
+every group's selection, reason, command, timeout, and preparation. It deliberately omits the
 catalog and request *paths*, which are run-local filenames rather than contract,
 and the changed-path listing, which explains a selection without being able to
 alter it.
@@ -1255,7 +1416,8 @@ That artifact is accepted only when all of this holds:
   a run's generic page always shows its newest attempt, so an upload that
   survived a re-run is not that re-run's evidence and must not stand in for an
   execution nobody has looked at;
-- the receipt records the command the plan selected, and matches the
+- the receipt records the command and the preparation the plan selected, and
+  records an execution (a group its preparation stopped is never reused), and matches the
   candidate's `input_identity`, `policy_version`, `toolchain`, and `runner_os`;
 - the receipt records the runner class the group requires and the worker the
   plan assigns it;
@@ -1501,30 +1663,20 @@ cannot publish.
 | `descriptor` | Writes the descriptor for the hit or the published image, as the `ci-image-descriptor` artifact and in the job summary. |
 | `anonymous-pull` | Pulls the reference by digest with no credentials and no token grant, and records how long the pull took. |
 
-`ci-image.yml` also carries two dispatch-only routes that have nothing to do
-with publishing an image. Each skips every job above, holds no package grant,
+`ci-image.yml` also carries one dispatch-only route that has nothing to do
+with publishing an image. It skips every job above, holds no package grant,
 publishes nothing, and writes no descriptor, and no push and no pull request
-starts either. Both are lodged here rather than in workflows of their own
-because GitHub offers `workflow_dispatch` only for a workflow already on the
-default branch, so a new workflow cannot supply pre-merge evidence for the pull
-request introducing it; dispatch a candidate branch with `--ref`.
+starts it. It is lodged here rather than in a workflow of its own because
+GitHub offers `workflow_dispatch` only for a workflow already on the default
+branch, so a new workflow cannot supply pre-merge evidence for the pull request
+introducing it; dispatch a candidate branch with `--ref`.
 
-`route: vulkan-proof` runs the native Vulkan compatibility proof inside the
-image the checked-out `tools/ci-image/descriptor.json` names — refusing to run
-at all unless that descriptor describes the candidate — and on the isolated X11
-display `tools/display/x11.sh` starts. It uploads the record as the
-`vulkan-compatibility-linux` artifact and repeats it in the job summary, beside
-the Vulkan identities the descriptor names and the ones the image itself
-reports. VK-4 provisioned that runtime into the image, so the throwaway
-container this route used to build is gone and the proof now runs against
-exactly the inputs ordinary Linux validation runs against. The same run carries
-VK-6's native capture cases, on an instance of their own after the VK-2 session,
-VK-5's surface bridge cases, and VK-7's roots under the graphics owner, and
-builds the native backend and window integration packages they exercise; its
-record's source digest covers those packages and their local closure. Nothing
-about it is required. See
-[the compatibility record](vulkan_compatibility_record.md) and
-[the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture).
+The `vulkan-proof` route that once ran VK-2's native proof here is gone. VK-8
+moved those cases, and VK-5's, VK-6's and VK-7's, into the Vulkan native suite,
+which the validation workflow runs as `test.vulkan-native` on every change that
+affects it, on the published image, with a receipt. Their retained per-slice
+records stay in `docs/vulkan/` as the historical evidence of the inputs they
+name; see [the compatibility record](vulkan_compatibility_record.md).
 
 `route: wayland-probe` runs `tools/display/wayland.sh` inside the image the
 checked-out descriptor names, with the candidate tree mounted:
@@ -1547,12 +1699,12 @@ It is WL-1's provisioning proof, dispatched deliberately when the recipe's
 compositor inputs change. Registering a validation group that runs the native
 suite under the Wayland helper is WL-2's and WL-3's work, not this route's.
 
-Every proof route is excluded from `resolve` by name, and everything that
+The probe route is excluded from `resolve` by name, and everything that
 publishes reaches the registry through `resolve`, so no part of the
 publication chain runs for one. `workflow-tests` reads the workflow and holds
 it to that: each route the dispatch input offers other than `image` must be
 excluded from `resolve` and selected by exactly one job that also requires the
-dispatch event — which is what keeps a proof route out of a pull request,
+dispatch event — which is what keeps a probe route out of a pull request,
 since a pull request carries no route input at all — and only `publish` may
 hold the package grant.
 
@@ -1805,8 +1957,8 @@ bytes, so an ordinary run records one identity and rebuilds no native library.
 #### Verifying a pulled image
 
 A validation worker runs in a `container:` bound to the descriptor's digest and
-is then checked against the plan. A route that pulls the image itself — the
-`vulkan-proof` route does — has no plan, and matching the descriptor's recipe
+is then checked against the plan. A route that pulls the image itself — as the
+retired `vulkan-proof` route did — has no plan, and matching the descriptor's recipe
 fingerprint against the candidate establishes nothing about *which* image its
 digest points at, because the descriptor is excluded from that fingerprint. So
 the descriptor could name the expected fingerprint while pointing at another
@@ -1826,9 +1978,9 @@ when it was stamped and against the one it actually runs (`ghc` and `cabal`
 `architecture` are checked against the running container's `uname -s` and
 `dpkg --print-architecture`. The reference and digest need no answer from the
 image, because the route runs `reference@digest` and the container runtime
-has already bound them. The proof route runs it inside the
-pulled image before proving anything, so a record is only ever attributable to
-the image the committed descriptor describes.
+has already bound them. A route that pulls the image runs it inside that image
+before proving anything, so what it shows is only ever attributable to the image
+the committed descriptor describes.
 
 `check` never falls back to another GLFW. It refuses an absent prefix — naming a
 system GLFW `pkg-config` can see, and not using it — a prefix whose pin, recipe
@@ -1868,19 +2020,18 @@ manifest; remove it rather than reuse those products.
 ### A local run and its receipt
 
 A local run records its own identity and never claims the Linux digest. Plan and
-run with the same map:
+run with the same map — the compiler, and every entry the native prefix
+contributes, one `--toolchain` each:
 
 ```bash
-native="$(python3 tools/native/native.py toolchain)"
-python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console,test.workflow,test.glfw-native \
+toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
+while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
+python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 That declaration names every group a Darwin plan can select, and deliberately
@@ -1911,8 +2062,7 @@ asks the human user for explicit approval, and waits for acceptance, exactly as
 HETOIMASIA_NATIVE_SESSION=desktop \
   python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 Without the consent the group fails before initializing GLFW and writes no
@@ -1920,6 +2070,68 @@ passing receipt. The approval covers this one run; it is never a profile
 setting or part of a script an agent runs on its own. That receipt records
 `Darwin` as its runner OS, and remote CI never runs macOS, so it is local
 evidence only: it can never satisfy a Linux plan.
+
+#### The Vulkan groups' local evidence
+
+On macOS the solver runs the two Vulkan groups before opening a pull request
+that affects them; remote CI is Linux-only, so this is the only macOS evidence
+there will be, and review checks it. Plan with the local worker above, whose
+declaration names both, and run the headless group, which needs no consent:
+
+```bash
+python3 -I tools/validation/run.py test.vulkan-headless --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
+  "${toolchain[@]}"
+```
+
+`test.vulkan-native` opens windows and presents to one of them on the person's
+desktop, under MoltenVK and Cocoa, for a few seconds. An agent first describes
+that disruption, asks the human user for explicit approval for that session,
+and waits for acceptance, exactly as for the GLFW native suite; only then does
+the one approved command carry the consent:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop \
+  python3 -I tools/validation/run.py test.vulkan-native --plan plan.json --receipts receipts \
+  --worker local --runner-class cpu --runner-class display \
+  "${toolchain[@]}"
+```
+
+The runner builds the suite in the preparation stage, then times the native
+execution alone under the thirty-second watchdog. The receipt this leaves
+separates the two:
+
+```json
+{
+  "group": "test.vulkan-native",
+  "outcome": "passed",
+  "executed": true,
+  "preparation": {"command": ["bash", "tools/vulkan/run.sh", "build", "…"], "outcome": "passed",
+                  "duration_seconds": 41.2, "timeout_seconds": 3600, "expiry": null, "…": "…"},
+  "command": ["bash", "tools/vulkan/run.sh", "native", "…"],
+  "duration_seconds": 2.6,
+  "timeout_seconds": 30,
+  "expiry": null,
+  "runner_os": "Darwin",
+  "toolchain": {"vulkan-layers": "VK_LAYER_KHRONOS_validation 1.3.296 dc6b9c2fd7b6 +synchronization", "…": "…"},
+  "evidence": ["evidence/test.vulkan-native/vk2-compatibility.log", "…"],
+  "…": "…"
+}
+```
+
+That is what the retained macOS evidence identifies: the selected groups and
+their outcomes, the elapsed native time apart from the build, the tested inputs
+(`input_identity`, `executed_commit`), and the actual toolchain and native
+environment — the compiler, and the loader, driver, layer with its validation
+features, and glslang the local prefix provisioned. It never names the Linux
+image: a Darwin plan carries no `ci-image` entry and records `Darwin` as its
+runner OS, so it can never satisfy a Linux plan or receipt, and a Linux receipt
+can never stand in for it. Retain the receipts, and the evidence directory's
+per-scenario records, with the pull request. Without the human's approval the
+native group is not run, and the pull request says local macOS verification is
+pending, never passed. A change to anything either group consumes invalidates
+the evidence under the ordinary rules and needs a new run before merge; a
+documentation-only change may reuse it.
 
 #### The macOS confinement probe's receipt
 
@@ -1937,7 +2149,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -2438,7 +2650,17 @@ declaration that is empty, not a list of strings, or names one platform twice.
 The same suite drives the real runner, aggregate, timing report, and review
 gate against fixture catalogs, plans, and receipt directories. It covers a
 failing command's non-zero receipt, the enforced catalog timeout and the reaping
-of the command's descendants, a plan whose candidate is not its head executing
+of the command's descendants, a preparation recorded apart from the command it
+prepared and bound into the plan's identity and the receipt's comparison, a
+failed or expired preparation that never runs its command, a leader that exits
+while its descendants run on being measured to the deadline, an expired
+deadline staying a timeout when the stopped command exits `0`, the cleanup
+after expiry recorded apart from the measurement, and the evidence a stopped
+command writes in its own cleanup being kept, a command's start spent from the
+same absolute deadline, a group watched after its leader could no longer name
+it, the checked-in headless command — the Vulkan runner's test mode, against
+stand-ins for the compiler, Cabal and the native prefix — reporting its suites'
+failure and success through the runner and the aggregate, a plan whose candidate is not its head executing
 from a checkout of that candidate and recording both separately, a selected
 group with no receipt, receipts belonging to another plan or another head,
 malformed receipts and malformed plans, omitted `unaffected`

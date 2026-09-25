@@ -200,8 +200,9 @@ def reuse_finding(record: dict, entry: dict, plan: dict) -> Finding:
     )
     if receipt.get("group") != identifier:
         problems.append(f"the reused receipt records group {receipt.get('group')!r}")
-    if receipt.get("command") != list(entry["command"]):
-        problems.append("the reused receipt records a different command from the one the plan selected")
+    problems += receipts.stage_problems(entry, receipt, "the reused receipt")
+    if not receipt.get("executed"):
+        problems.append("the reused receipt records a group its preparation stopped before it ran")
     problems += receipts.routing_problems(plan, entry, receipt, "the reused receipt")
     if receipt.get("outcome") != "passed" or receipt.get("exit_status") != 0:
         problems.append(f"the reused receipt records outcome {receipt.get('outcome')!r}")
@@ -293,14 +294,9 @@ def inspect_group(
             f"the receipt names head {receipt['head_commit'][:12]}, not {plan['head']['commit'][:12]}",
             False,
         )
-    if receipt["command"] != list(entry["command"]):
-        return Finding(
-            identifier,
-            reason,
-            "mismatched",
-            "the receipt records a different command from the one the plan selected",
-            False,
-        )
+    stages = receipts.stage_problems(entry, receipt, "the receipt")
+    if stages:
+        return Finding(identifier, reason, "mismatched", "; ".join(stages), False)
     # A fresh execution is of the candidate itself, so its provenance and its
     # compatibility fields are both the plan's. A reused execution is judged
     # differently, in `reuse_finding`, because it belongs to an earlier run.
@@ -324,6 +320,15 @@ def inspect_group(
     problems += receipts.routing_problems(plan, entry, receipt, "the receipt")
     if problems:
         return Finding(identifier, reason, "mismatched", "; ".join(problems), False)
+    preparation = receipt["preparation"]
+    if not receipt["executed"] and preparation is not None:
+        # The preparation's own result, named as the preparation's: the command
+        # it prepared never ran, so nothing about it is reported.
+        if preparation["outcome"] == "timeout":
+            detail = f"its preparation exhausted its {preparation['timeout_seconds']}s budget"
+        else:
+            detail = f"its preparation exited {preparation['exit_status']}"
+        return Finding(identifier, reason, preparation["outcome"], detail + ", so it never ran", False)
     if receipt["outcome"] == "timeout":
         return Finding(
             identifier,

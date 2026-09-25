@@ -146,6 +146,33 @@ def pinned_packages(target: str, pin: dict[str, str]) -> list[dict[str, str]]:
     ]
 
 
+# The validation features a pin may name, and the layer extension each one is
+# enabled through. A feature is turned on by the instance's own create info
+# (VkValidationFeaturesEXT), never by an environment variable or a settings
+# file; the recipe's part is to refuse a layer that does not offer the
+# extension that create info needs, and to carry the features into the identity
+# every plan and receipt names, so evidence gathered under one configuration
+# never answers for another.
+VALIDATION_FEATURES = {"synchronization": "VK_EXT_validation_features"}
+
+
+def validation_features(value: str | None, name: str) -> list[str]:
+    """The comma-separated validation features a pin names, each one known."""
+    if not value:
+        return []
+    features = [entry.strip() for entry in value.split(",") if entry.strip()]
+    unknown = [feature for feature in features if feature not in VALIDATION_FEATURES]
+    if unknown:
+        raise VulkanError(
+            f"{name} names validation features {', '.join(unknown)}; the recipe knows "
+            + ", ".join(sorted(VALIDATION_FEATURES)),
+            status=2,
+        )
+    if len(set(features)) != len(features):
+        raise VulkanError(f"{name} names a validation feature more than once", status=2)
+    return features
+
+
 def pinned_inputs(target: str, pin: dict[str, str]) -> dict:
     """What this platform names, where it looks, and which identity qualifies it.
 
@@ -185,6 +212,7 @@ def pinned_inputs(target: str, pin: dict[str, str]) -> dict:
             "sha256": optional("LAYER_MANIFEST_SHA256"),
             "library": optional("LAYER_LIBRARY"),
             "library_sha256": optional("LAYER_LIBRARY_SHA256"),
+            "features": validation_features(optional("LAYER_FEATURES"), f"{platform}_LAYER_FEATURES"),
         },
         "glslang": {
             "path": pinned("GLSLANG"),
@@ -578,9 +606,29 @@ def resolve(target: str, pin: dict[str, str] | None = None) -> dict:
             f"{pinned['layer']['version']!r}; a validation layer of another version is a different layer",
             status=1,
         )
+    # A pinned validation feature is only a configuration if the layer can be
+    # asked for it. The layer names the instance extensions it provides in its
+    # own manifest, and the one each feature's create info needs has to be
+    # among them: a layer that would reject the request fails here, before
+    # anything is provisioned, rather than at the first instance a run creates.
+    offered = [
+        extension.get("name")
+        for extension in declared.get("instance_extensions", [])
+        if isinstance(extension, dict)
+    ]
+    for feature in pinned["layer"]["features"]:
+        needed = VALIDATION_FEATURES[feature]
+        if needed not in offered:
+            raise VulkanError(
+                f"the layer manifest {layer['resolved']} offers the instance extensions "
+                f"{', '.join(str(name) for name in offered) or 'none'}, not {needed}, so the pinned "
+                f"{feature} validation cannot be enabled through the instance's create info",
+                status=1,
+            )
     layer.update(
         {
             "name": pinned["layer"]["name"],
+            "features": list(pinned["layer"]["features"]),
             "api_version": api_version,
             "implementation_version": declared.get("implementation_version"),
             "library_resolved": layer_library["resolved"],
@@ -939,6 +987,7 @@ def provision(prefix: str, target: str, pin: dict[str, str] | None = None) -> di
                 "name": resolved["layer"]["name"],
                 "api_version": resolved["layer"]["api_version"],
                 "implementation_version": resolved["layer"]["implementation_version"],
+                "features": resolved["layer"]["features"],
                 "source": resolved["layer"]["resolved"],
                 "source_sha256": resolved["layer"]["sha256"],
                 "manifest": layer["path"],
@@ -1172,6 +1221,7 @@ def verify(prefix: str, target: str, recorded, pin: dict[str, str] | None = None
             ("api version", layer.get("api_version"), current["layer"]["api_version"]),
             ("manifest digest", layer.get("source_sha256"), current["layer"]["sha256"]),
             ("library digest", layer.get("library_sha256"), current["layer"]["library_sha256"]),
+            ("validation features", layer.get("features"), current["layer"]["features"]),
         ):
             if recorded_value != actual_value:
                 problems.append(
@@ -1244,6 +1294,11 @@ def environment(prefix: str, recorded: dict) -> dict[str, str]:
         # consumer holds whatever it actually loaded to this one.
         "HETOIMASIA_VULKAN_QUALIFIED_LOADER": recorded["loader"]["path"],
         "HETOIMASIA_GLSLANG": recorded["glslang"]["wrapper"],
+        # The validation features the qualified layer is pinned to run with.
+        # This enables nothing — only an instance's own create info does — but
+        # a consumer that enables some other set is running a configuration
+        # its receipt would not name, and refuses rather than doing so.
+        "HETOIMASIA_VULKAN_VALIDATION_FEATURES": ",".join(recorded["layers"][0].get("features", [])),
     }
 
 
@@ -1265,8 +1320,12 @@ def summary(recorded: dict) -> list[str]:
     ]
     for layer in recorded["layers"]:
         lines.append(
-            "layer {} {} ({}) via {}".format(
-                layer["name"], layer["api_version"], layer["library_sha256"][:12], layer["manifest"]
+            "layer {} {} ({}){} via {}".format(
+                layer["name"],
+                layer["api_version"],
+                layer["library_sha256"][:12],
+                layer_features(layer),
+                layer["manifest"],
             )
         )
     lines.append("headers {} at {}".format(recorded["loader"]["headers_sha256"][:12], recorded["loader"]["include"]))
@@ -1304,6 +1363,11 @@ def identity_digest(recorded: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def layer_features(layer: dict) -> str:
+    """A layer's pinned validation features, as its identity spells them."""
+    return "".join(" +" + feature for feature in layer.get("features", []))
+
+
 def toolchain_entries(recorded: dict) -> dict[str, str]:
     """What a plan declares and a worker must independently arrive at."""
     driver = recorded["driver"]
@@ -1313,7 +1377,7 @@ def toolchain_entries(recorded: dict) -> dict[str, str]:
         "vulkan-loader": "{} {}".format(recorded["loader"]["version"], recorded["loader"]["sha256"][:12]),
         "vulkan-driver": "{} {} {}".format(driver["name"], driver["api_version"], driver["library_sha256"][:12]),
         "vulkan-layers": "; ".join(
-            "{} {} {}".format(layer["name"], layer["api_version"], layer["library_sha256"][:12])
+            "{} {} {}{}".format(layer["name"], layer["api_version"], layer["library_sha256"][:12], layer_features(layer))
             for layer in recorded["layers"]
         ),
         "glslang": "{} {}".format(glslang["version"], glslang["compiler_sha256"][:12]),

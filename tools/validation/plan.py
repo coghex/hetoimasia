@@ -45,6 +45,16 @@ IDENTITY_SCHEMA_VERSION = 1
 DEFAULT_CATALOG = "tools/validation/catalog.json"
 PROJECT_FILE = "cabal.project"
 
+# Project files that select packages the root project deliberately leaves out.
+# `cabal.project.vulkan` is the only one: it names the Vulkan native backend
+# and its window integration, which neither `cabal.project` nor
+# `cabal.project.cpu` may resolve. A group whose command runs through it names
+# its component exactly as any other group does, so the component's transitive
+# closure is derived from the same package graph; the packages it adds join
+# that graph, and `component: "all"` — `cabal build all` through the root
+# project — still means the root project's packages alone.
+SECONDARY_PROJECT_FILES = ("cabal.project.vulkan",)
+
 # Packaging inputs decide what is compiled, so they are never prose however a
 # catalog classifies them. Every other exclusion is derived from the declared
 # inputs and the declared non-affecting classes rather than hard-coded here.
@@ -278,6 +288,9 @@ class Package:
         self.directory = directory
         self.cabal_path = cabal_path
         self.components: dict[tuple[str, str], dict[str, list[str]]] = {}
+        # The project files that list this package. The root project's
+        # packages are what `component: "all"` means.
+        self.projects: set[str] = set()
 
 
 def field_values(raw: str) -> list[str]:
@@ -332,6 +345,13 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
 
         if stanza is not top_level:
             flag_if_indents = {opened for opened in flag_if_indents if opened <= indent}
+        # A line indented beyond the field it follows continues that field's
+        # value, as Cabal reads it, whatever word it begins with: a description
+        # whose prose wraps onto a line starting with "else" or "if" is still
+        # prose, not a conditional.
+        if field is not None and indent > field_indent:
+            stanza.setdefault(field, []).extend(field_values(content))
+            continue
         if CONDITIONAL_PATTERN.match(content) or content in ("{", "}") or content.endswith("{"):
             flag_match = FLAG_CONDITIONAL_PATTERN.fullmatch(content)
             if indent > 0 and stanza is not top_level and flag_match is not None:
@@ -368,10 +388,6 @@ def parse_cabal(text: str, path: str) -> tuple[str, dict[tuple[str, str], dict[s
                 "by the validation planner; it can change dependencies silently (only an "
                 "`if os(...)` or `else` block inside a stanza declaring link fields is accepted)"
             )
-
-        if field is not None and indent > field_indent:
-            stanza.setdefault(field, []).extend(field_values(content))
-            continue
 
         stanza_match = STANZA_PATTERN.match(content)
         if indent == 0 and stanza_match and stanza_match.group(1).lower() in STANZA_KEYWORDS:
@@ -457,14 +473,25 @@ def load_packages(tree, required: bool) -> dict[str, Package]:
     """Read the local package graph from one tree.
 
     ``required`` distinguishes the head revision, where the project metadata must
-    exist, from a base revision that may predate it.
+    exist, from a base revision that may predate it. The root project is
+    required; a secondary project file is read wherever it exists, and a
+    package both list must be the same directory in each.
     """
     if not tree.exists(PROJECT_FILE):
         if required:
             raise PlannerError(f"{PROJECT_FILE} does not exist at {tree.label}")
         return {}
-    directories = parse_project(tree.read(PROJECT_FILE), f"{PROJECT_FILE}@{tree.label}")
     packages: dict[str, Package] = {}
+    for project in (PROJECT_FILE,) + SECONDARY_PROJECT_FILES:
+        if project != PROJECT_FILE and not tree.exists(project):
+            continue
+        load_project_packages(tree, project, required, packages)
+    return packages
+
+
+def load_project_packages(tree, project: str, required: bool, packages: dict[str, Package]) -> None:
+    """Add the packages one project file lists to the graph."""
+    directories = parse_project(tree.read(project), f"{project}@{tree.label}")
     for entry in directories:
         directory = join_path(entry)
         candidates = sorted(
@@ -476,19 +503,25 @@ def load_packages(tree, required: bool) -> dict[str, Package]:
             if required:
                 raise PlannerError(
                     f"no package description under {entry!r} at {tree.label}; "
-                    f"{PROJECT_FILE} lists it as a local package"
+                    f"{project} lists it as a local package"
                 )
             continue
         if len(candidates) > 1:
             raise PlannerError(f"{entry!r} contains more than one package description at {tree.label}")
         cabal_path = candidates[0]
         name, components = parse_cabal(tree.read(cabal_path), f"{cabal_path}@{tree.label}")
+        known = packages.get(name)
+        if known is not None:
+            if known.directory != directory:
+                raise PlannerError(f"two local packages are named {name!r} at {tree.label}")
+            if project in known.projects:
+                raise PlannerError(f"{project} lists {name!r} twice at {tree.label}")
+            known.projects.add(project)
+            continue
         package = Package(name, directory, cabal_path)
         package.components = components
-        if name in packages:
-            raise PlannerError(f"two local packages are named {name!r} at {tree.label}")
+        package.projects.add(project)
         packages[name] = package
-    return packages
 
 
 def component_closure(
@@ -549,6 +582,7 @@ def component_inputs(packages: dict[str, Package], component: str | None) -> set
         start = [
             (package.name, kind, name)
             for package in packages.values()
+            if PROJECT_FILE in package.projects
             for (kind, name) in package.components
         ]
     else:
@@ -589,7 +623,7 @@ def component_inputs(packages: dict[str, Package], component: str | None) -> set
 
 def resolve_component(packages: dict[str, Package], component: str) -> bool:
     if component == "all":
-        return bool(packages)
+        return any(PROJECT_FILE in package.projects for package in packages.values())
     parts = component.split(":")
     if len(parts) != 3 or parts[1] not in COMPONENT_KINDS:
         return False
@@ -653,7 +687,46 @@ GROUP_KEYS = {
 # wherever it is planned.
 OPTIONAL_GROUP_KEYS = {
     "platforms": list,
+    "preparation": dict,
 }
+
+# A preparation stage: a command the runner executes to completion before the
+# group's own command, under a budget of its own, and records separately. It
+# exists for a group whose ``timeout_seconds`` is a measurement rather than a
+# ceiling — a native check whose budget counts its display, fixture, examples
+# and teardown but not the compilation that produced its executable. Its command
+# is part of the plan's identity exactly as the group's own is, so evidence
+# gathered under one preparation never answers for another; and it can never
+# stand in for the command it prepares, because a group whose preparation did
+# not pass is a group that did not run.
+PREPARATION_KEYS = {
+    "command": list,
+    "timeout_seconds": int,
+}
+
+
+def preparation_problems(preparation: dict, where: str) -> list[str]:
+    """Every problem with one group's preparation declaration."""
+    problems: list[str] = []
+    for key in PREPARATION_KEYS:
+        if key not in preparation:
+            problems.append(f"{where} preparation is missing required key {key!r}")
+    for key in preparation:
+        if key not in PREPARATION_KEYS:
+            problems.append(f"{where} preparation has unknown key {key!r}")
+    command = preparation.get("command")
+    if "command" in preparation and (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(token, str) and token for token in command)
+    ):
+        problems.append(f"{where} preparation 'command' must be a non-empty list of non-empty strings")
+    timeout = preparation.get("timeout_seconds")
+    if "timeout_seconds" in preparation and (
+        not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0
+    ):
+        problems.append(f"{where} preparation 'timeout_seconds' must be a positive integer")
+    return problems
 
 
 def validate_catalog(document: dict, path: str, packages: dict[str, Package] | None) -> list[str]:
@@ -744,6 +817,9 @@ def validate_catalog(document: dict, path: str, packages: dict[str, Package] | N
             # counting it would raise where a diagnostic is owed.
             elif len(set(named)) != len(named):
                 problems.append(f"{where} names a platform more than once")
+        preparation = group.get("preparation")
+        if isinstance(preparation, dict):
+            problems.extend(preparation_problems(preparation, where))
 
         if not isinstance(identifier, str) or not ID_PATTERN.match(identifier or ""):
             problems.append(f"{where} has an invalid id; expected dotted lowercase, e.g. 'test.engine'")
@@ -1168,6 +1244,15 @@ def build_plan(
                 "runner": group["runner"],
                 "timeout_seconds": group["timeout_seconds"],
                 "command": list(group["command"]),
+                # `null` for a group whose command is its whole execution.
+                "preparation": (
+                    {
+                        "command": list(group["preparation"]["command"]),
+                        "timeout_seconds": group["preparation"]["timeout_seconds"],
+                    }
+                    if "preparation" in group
+                    else None
+                ),
             }
         )
 
@@ -1302,6 +1387,14 @@ def render_prose(plan: dict) -> str:
             f"runner: {entry['runner']:<7}  worker: {owners.get(entry['id'], '-'):<{owner_width}}  "
             f"{' '.join(entry['command'])}"
         )
+        if entry["preparation"] is not None:
+            # The line below the group says what is built before it, and that
+            # its own budget measures the command alone.
+            lines.append(
+                f"         prepared first, under {entry['preparation']['timeout_seconds']}s: "
+                f"{' '.join(entry['preparation']['command'])}; "
+                f"the command alone is watched for {entry['timeout_seconds']}s"
+            )
 
     lines.append("")
     if plan["workers"] is None:

@@ -172,11 +172,11 @@ loader into the private native prefix and writes
 `pkgconfig-depends: vulkan` resolves the project-managed prefix rather than
 whatever a distribution installed; and `native.py prepare` prints
 `HETOIMASIA_VULKAN_LIBDIR` and `HETOIMASIA_VULKAN_INCLUDEDIR`, which
-`tools/vulkan-proof/run-proof.sh` passes to Cabal as `--extra-lib-dirs` and
+`tools/vulkan/run.sh` passes to Cabal as `--extra-lib-dirs` and
 `--extra-include-dirs` on the one command line. Nothing is generated on disk.
 
 Those flags reach this project's own packages, and that is all they reach: the
-proof and the native package link against the prefix's loader through them.
+native package, the window integration and their suites link against the prefix's loader through them.
 They do not reach the binding, which the store builds — like `--ghc-options`,
 Cabal applies a command-line package option to local packages only. VK-9
 established this rather than assuming it: the binding's unit id is the same
@@ -187,12 +187,12 @@ binding's loader directory itself; see below.
 
 Linking selects the loader's directory; it does not select the file loaded at
 run time. On Linux `-lvulkan` leaves a `libvulkan.so.1` dependency the dynamic
-linker resolves when the proof starts, so `LD_LIBRARY_PATH` could put an
-ABI-compatible substitute ahead of the one `prepare` verified. `run-proof.sh`
+linker resolves when an executable starts, so `LD_LIBRARY_PATH` could put an
+ABI-compatible substitute ahead of the one `prepare` verified. `tools/vulkan/run.sh`
 therefore refuses `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, and the `DYLD_*`
 search and insertion variables before its first check, and `prepare` also
 exports `HETOIMASIA_VULKAN_QUALIFIED_LOADER`, the recorded loader's path: the
-harness canonicalizes it and the image the binding's `vkGetInstanceProcAddr`
+native suite canonicalizes it and the image the binding's `vkGetInstanceProcAddr`
 was resolved from, and stops unless they are the same file.
 
 #### Why the loader is copied on macOS, and where an rpath is still needed
@@ -208,8 +208,8 @@ contributes no rpath, so the compile-time load fails with
 For what this project links, the recipe removes the `@rpath` rather than
 working around it. The qualified loader is copied into `<prefix>/vulkan/lib`
 and given an **absolute install name**, and the copy is re-signed ad hoc
-because editing a Mach-O invalidates its signature. The proof and every other
-executable linked through `run-proof.sh`'s `--extra-lib-dirs` record that
+because editing a Mach-O invalidates its signature. Every executable linked
+through `tools/vulkan/run.sh`'s `--extra-lib-dirs` records that
 absolute path, with no rpath and no machine path involved.
 
 The binding itself is the exception, because the command line never reaches it
@@ -233,7 +233,7 @@ the directory `MACOS_LOADER` and `MACOS_INCLUDE` in `tools/native/vulkan.pin`
 pin; `tools/test/VulkanProof.hs` holds the stanza to the pin, and
 `native.py prepare` verifies the loader there by digest before every build. It
 changes only the binding's own build: executables still link the prefix's copy,
-which `run-proof.sh` names on the command line, and the proof still refuses any
+which `tools/vulkan/run.sh` names on the command line, and the native suite still refuses any
 loader image but the recorded one. Linux is untouched.
 
 `tools/toolchain/qualify-binding.sh` still emits its own `package vulkan` stanza
@@ -275,8 +275,9 @@ builds (D-11, P-9), and the toolchain rules that make that reproducible are:
   shaders, and an unchanged one recompiles nothing, without relying on GHC to
   notice a changed executable.
 
-`tools/vulkan-proof/run-shaders.sh` performs those steps and runs the shader
-suite; `run-proof.sh` runs it first. The adapter's contract, and what it
+`tools/vulkan/run.sh` performs those steps before anything that builds the
+native package, and its test mode runs the shader suite as part of the
+`test.vulkan-headless` group. The adapter's contract, and what it
 refuses, is in
 [the native package's README](../packages/gpu-vulkan/native/README.md#shaders).
 

@@ -10,7 +10,7 @@
 -- asked to be cancelled at a chosen instant. They open no window, initialize
 -- no GLFW, make no native call, and need no @HETOIMASIA_NATIVE_SESSION@:
 --
--- > bash tools/vulkan-proof/run-proof.sh --headless --match cancellation
+-- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --match cancellation
 --
 -- The cancellation is real rather than simulated: a second thread's 'throwTo',
 -- delivered at the first point the code under test permits one. Determinism

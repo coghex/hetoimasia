@@ -38,9 +38,11 @@ part of the contract was weakened to reach it.
 
 ## What produced it
 
-`tools/vulkan-proof` is the harness; [its README](../tools/vulkan-proof/README.md)
-says how it is arranged and run. The raw records it wrote are retained beside
-this file:
+`tools/vulkan-proof` was the harness. It is retired: VK-8 moved its cases,
+unchanged, into the Vulkan native suite (see "Reproducing it" below), and
+[its README](../tools/vulkan-proof/README.md) now only points here. The raw
+records it wrote, with the commands that produced them at the time, are retained
+beside this file:
 
 | Platform | Record | Produced by |
 | --- | --- | --- |
@@ -99,8 +101,9 @@ this record that selection lived in `tools/vulkan-proof/environment.pin`, which
 pinned the Homebrew manifest by absolute path; VK-4 (#208) retired that file and
 moved the same selection into `tools/native/vulkan.pin`, which the native recipe
 qualifies by digest and provisions into `<native prefix>/vulkan`. Either way
-`run-proof.sh` passes the selected manifest as `VK_DRIVER_FILES`, which is the
-loader's own documented override. The harness additionally clears `VK_ICD_FILENAMES`,
+the runner — `run-proof.sh` then, `tools/vulkan/run.sh` now — passes the
+selected manifest as `VK_DRIVER_FILES`, which is the loader's own documented
+override. The harness additionally cleared, as the native suite still clears, `VK_ICD_FILENAMES`,
 `VK_ADD_DRIVER_FILES`, `VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`, and the loader's
 select/disable variables out of its own environment before initializing, and
 records which it removed — a run whose driver selection could have been
@@ -291,25 +294,28 @@ both platforms.
 
 ## Reproducing it
 
-The toolchain must be the one [`docs/toolchain.md`](toolchain.md) pins; the
-runner refuses outright otherwise.
+The proof's cases are now the Vulkan native suite's `vk2-compatibility` case,
+run in a child process with roots of its own, and the validation group
+`test.vulkan-native` runs it — on Linux on every change that affects it, on the
+published image and an isolated X11 display, and on macOS as the solver's local
+pre-PR evidence. The toolchain must be the one
+[`docs/toolchain.md`](toolchain.md) pins; the runner refuses outright otherwise.
+Every instance it creates now also enables synchronization validation, which the
+retained records above predate.
 
-macOS, only after a human has approved that session, because the proof opens a
-window on the desktop it runs on:
-
-```bash
-HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan-proof/run-proof.sh
-```
-
-Linux, through the manually dispatched route, which needs no approval because
-`tools/display/x11.sh` starts an isolated display and supplies the consent for
-that display alone:
+macOS, only after a human has approved that session, because the suite opens a
+window on the desktop it runs on and presents to it:
 
 ```bash
-gh workflow run ci-image.yml -R coghex/hetoimasia \
-  --ref <branch> -f route=vulkan-proof
+bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests
+HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
 ```
 
-Neither is a required check, and neither runs on an ordinary validation worker.
+Linux, where the same native command starts an isolated display and supplies
+the consent for that display alone, so it needs no approval. With the validation
+runner's evidence directory set, each case writes its record there, in the shape
+of the records above; see
+[the native suite](gpu_backend.md#the-native-suite).
+
 `cabal build all` and `cabal build all --project-file cabal.project.cpu` continue
 to resolve and link no Vulkan binding at all.

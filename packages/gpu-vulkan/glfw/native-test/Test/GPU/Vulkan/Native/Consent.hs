@@ -1,7 +1,7 @@
--- | The per-run authorization this proof requires before it initializes GLFW,
--- creates a window, or touches a driver.
+-- | The per-run authorization the Vulkan native suite requires before it
+-- initializes GLFW, creates a window, touches a driver, or starts a child.
 --
--- The proof opens a visible window and presents to it, so it disrupts whatever
+-- The suite opens windows and presents to them, so it disrupts whatever
 -- desktop it runs on exactly as @glfw-native-tests@ does. AGENTS.md requires an
 -- agent to describe that disruption, ask the human user for explicit approval,
 -- and wait for acceptance before starting such a session, and that conversation
@@ -15,12 +15,11 @@
 --   display is up, and authorizes only that display.
 --
 -- A bare @DISPLAY@ or a @CI@ variable is not consent. The rules match
--- @Test.GLFW.Native.Consent@ deliberately: this is the second component that
--- enters a native session, and a run authorized for one is authorized for the
--- other. It is a separate module rather than a shared one because AGENTS.md
--- forbids importing a helper from another component's spec, and this harness is
--- a qualification artefact that VK-8 will retire.
-module Test.Vulkan.Proof.Consent
+-- @Test.GLFW.Native.Consent@ deliberately, except that this suite has no
+-- Wayland session: a run authorized for the GLFW suite's X11 or desktop session
+-- is authorized for this one. It is a separate module rather than a shared one
+-- because AGENTS.md forbids importing a helper from another component's spec.
+module Test.GPU.Vulkan.Native.Consent
   ( Consent (..)
   , Refusal (..)
   , consentFrom
@@ -90,7 +89,7 @@ refusalReason ∷ Refusal → Text
 refusalReason = \case
   NoConsent → Text.pack consentVariable <> " is not set"
   UnknownConsent value →
-    Text.pack consentVariable <> "=" <> Text.pack (show value) <> " is not a consent this proof recognizes"
+    Text.pack consentVariable <> "=" <> Text.pack (show value) <> " is not a consent this suite recognizes"
   IsolationElsewhere display current →
     Text.pack consentVariable
       <> " authorizes the isolated X11 display "
@@ -104,14 +103,14 @@ refusalReason = \case
       <> ", which is not a session on "
       <> Text.pack platform
 
--- | One message naming what is missing, what the proof would do to the desktop,
+-- | One message naming what is missing, what the suite would do to the desktop,
 -- how a human approves a run, and the isolated alternative.
 refusalMessage ∷ Refusal → Text
 refusalMessage refusal =
   "this run is not authorized to enter a native session: "
     <> refusalReason refusal
-    <> ". The proof opens a visible window on the desktop it runs on and presents to it, so an agent describes that disruption, asks the human user for explicit approval, and waits for acceptance; the approved command then carries "
+    <> ". The Vulkan native suite opens windows on the desktop it runs on and presents to them, so an agent describes that disruption, asks the human user for explicit approval, and waits for acceptance; the approved command then carries "
     <> Text.pack consentVariable
     <> "="
     <> Text.pack desktopValue
-    <> " for that one run. On Linux, `bash tools/display/x11.sh -- <command>` runs the command on an isolated X11 display instead and needs no approval. DISPLAY and CI are not consent."
+    <> " for that one run. On Linux, `bash tools/vulkan/run.sh native <component>` runs the suite on an isolated X11 display it starts instead, and needs no approval. DISPLAY and CI are not consent."

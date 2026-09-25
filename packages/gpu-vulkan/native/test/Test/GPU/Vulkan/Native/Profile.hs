@@ -7,6 +7,7 @@ import Test.GPU.Vulkan.Native.StandIn (standInDevice)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Vulkan.Extensions.VK_EXT_debug_utils (data EXT_DEBUG_UTILS_EXTENSION_NAME)
 import Vulkan.Extensions.VK_EXT_surface_maintenance1 (data EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+import Vulkan.Extensions.VK_EXT_validation_features (data EXT_VALIDATION_FEATURES_EXTENSION_NAME)
 import Vulkan.Extensions.VK_EXT_swapchain_maintenance1 (data EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)
 import Vulkan.Extensions.VK_KHR_get_surface_capabilities2 (data KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)
 import Vulkan.Extensions.VK_KHR_portability_enumeration (data KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)
@@ -39,6 +40,25 @@ spec = describe "Profile" $ do
     it "refuses a layer the loader does not offer" $
       planInstance request {requestLayers = ["VK_LAYER_KHRONOS_validation"]} (offer everything)
         `shouldBe` Left (InstanceLayersUnavailable ["VK_LAYER_KHRONOS_validation"])
+
+    it "enables synchronization validation through an enabled layer that offers it" $ do
+      plan ← rightOf (planInstance validating (offer everything) {offerLayers = [validation], offerLayerExtensions = [(validation, ["VK_EXT_debug_utils", validationFeaturesExtension])]})
+      planValidationFeatures plan `shouldBe` [SynchronizationValidation]
+      planLayers plan `shouldBe` [validation]
+      planInstanceExtensions plan `shouldSatisfy` elem validationFeaturesExtension
+
+    it "refuses validation features no enabled layer offers, rather than validating without them" $ do
+      -- The loader's own listing never carries a layer's extension, and a
+      -- layer that is offered but not enabled contributes nothing.
+      planInstance validating (offer (validationFeaturesExtension : everything)) {offerLayers = [validation, "VK_LAYER_other"], offerLayerExtensions = [(validation, ["VK_EXT_debug_utils"]), ("VK_LAYER_other", [validationFeaturesExtension])]}
+        `shouldBe` Left (ValidationFeaturesUnavailable [validation])
+      planInstance validating {requestLayers = []} (offer everything) {offerLayerExtensions = [(validation, [validationFeaturesExtension])]}
+        `shouldBe` Left (ValidationFeaturesUnavailable [])
+
+    it "asks for the validation features extension only when a feature is requested" $ do
+      plan ← rightOf (planInstance request {requestLayers = [validation]} (offer everything) {offerLayers = [validation], offerLayerExtensions = [(validation, [validationFeaturesExtension])]})
+      planValidationFeatures plan `shouldBe` []
+      planInstanceExtensions plan `shouldSatisfy` notElem validationFeaturesExtension
 
   describe "the device" $ do
     it "takes the first device satisfying the whole profile, with one family for graphics and presentation" $ do
@@ -103,6 +123,7 @@ spec = describe "Profile" $ do
     , swapchainExtension
     , swapchainMaintenance1Extension
     , portabilitySubsetExtension
+    , validationFeaturesExtension
     ]
       `shouldBe` [ EXT_DEBUG_UTILS_EXTENSION_NAME
                  , KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
@@ -111,11 +132,14 @@ spec = describe "Profile" $ do
                  , KHR_SWAPCHAIN_EXTENSION_NAME
                  , EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
                  , KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+                 , EXT_VALIDATION_FEATURES_EXTENSION_NAME
                  ]
   where
-    request = InstanceRequest ["VK_KHR_surface", "VK_KHR_xcb_surface"] []
+    request = InstanceRequest ["VK_KHR_surface", "VK_KHR_xcb_surface"] [] []
+    validation = "VK_LAYER_KHRONOS_validation"
+    validating = request {requestLayers = [validation], requestValidationFeatures = [SynchronizationValidation]}
     everything = ["VK_KHR_surface", "VK_KHR_xcb_surface", debugUtilsExtension, getSurfaceCapabilities2Extension, surfaceMaintenance1Extension]
-    offer extensions = InstanceOffer (packApiVersion 1 3 275) extensions []
+    offer extensions = InstanceOffer (packApiVersion 1 3 275) extensions [] []
 
 -- | The value of a decision expected to succeed.
 rightOf ∷ Show e ⇒ Either e a → IO a

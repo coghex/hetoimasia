@@ -1,33 +1,35 @@
--- The Vulkan project: the VK-2 proof harness, the native backend package, and
--- the GLFW package with its Vulkan interop component enabled — the only project
--- file that names the first two or turns that component on.
+-- The Vulkan project: the native backend package, the window integration
+-- package with its native suite, and the GLFW package with its Vulkan interop
+-- component enabled — the only project file that names the first two or turns
+-- that component on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
--- `tools/vulkan-proof` or `packages/gpu-vulkan/native`, and neither sets the
--- GLFW package's manual `vulkan-interop` flag, so neither resolves nor links the
--- Vulkan binding and neither `cabal build all` nor `cabal build all
+-- `packages/gpu-vulkan/native` or `packages/gpu-vulkan/glfw`, and neither sets
+-- the GLFW package's manual `vulkan-interop` flag, so neither resolves nor links
+-- the Vulkan binding and neither `cabal build all` nor `cabal build all
 -- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
--- mandatory validation group runs through one of those two, so the floor never
--- builds this. The other packages here are the local dependency closure of the
--- native package and of the interop component — the diagnostics package whose C
--- capture the native package installs, the GPU model, the runtime the GLFW
--- package's runtime integration uses, the foundation, and the test-only support
--- library the native package's shader suite uses — which the ordinary projects
--- list too; `cabal.project` lists the GLFW package itself, with the flag off.
--- Selecting this project is an explicit act:
+-- group of the mandatory floor runs through one of those two, so the floor
+-- never builds this. The other packages here are the local dependency closure
+-- of the native package and of the interop component — the diagnostics package
+-- whose C capture the native package installs, the GPU model, the runtime the
+-- GLFW package's runtime integration uses, the foundation, and the test-only
+-- support library the native package's shader suite uses — which the ordinary
+-- projects list too; `cabal.project` lists the GLFW package itself, with the
+-- flag off. Selecting this project is an explicit act, and one command makes
+-- it:
 --
---   bash tools/vulkan-proof/run-proof.sh
---   bash tools/vulkan-proof/run-shaders.sh
+--   bash tools/vulkan/run.sh build|test|native <component>...
 --
 -- which is also what points the build at the loader: the native prefix
 -- `tools/native/vulkan.py` provisions carries it, and the runner passes that
 -- prefix's link and include directories on the command line. No project file is
--- generated, here or beside this one. See docs/validation.md and
--- docs/vulkan_compatibility_record.md.
+-- generated, here or beside this one. The validation groups `test.vulkan-headless`
+-- and `test.vulkan-native` run through that command, and the planner reads this
+-- file's packages beside the root project's so their components resolve. See
+-- docs/validation.md and docs/gpu_backend.md.
 import: cabal.project.common
 
 packages:
-  tools/vulkan-proof
   packages/gpu-vulkan/native
   packages/gpu-vulkan/glfw
   packages/glfw
@@ -38,19 +40,20 @@ packages:
   tools/test-support
 
 -- The GLFW package's Vulkan interop component: the shared loader capability and
--- the surface bridge the proof's VK-5 cases exercise. Off everywhere else.
+-- the surface bridge the window integration and its native suite use. Off
+-- everywhere else.
 package hetoimasia-glfw
   flags: +vulkan-interop
 
 -- The flags docs/toolchain.md qualified, restated here because a constraint is
 -- what actually reaches the dependency: `safe-foreign-calls` so a Vulkan call
--- may re-enter the proof's Haskell debug-utils callback, and `darwin-lib-dirs`
+-- may re-enter the VK-2 case's Haskell debug-utils callback, and `darwin-lib-dirs`
 -- off so the loader is the one this repository names rather than whatever sits
--- in /usr/local/lib. `run-proof.sh` checks these against
+-- in /usr/local/lib. `tools/vulkan/run.sh` checks these against
 -- tools/toolchain/binding.pin. They are the native package's build too: a
 -- project builds one configuration of the binding, and that package records the
 -- flags it is built under, and the C-only capture callback that needs neither,
--- in `nativeFfiConfiguration`, which the proof record prints.
+-- in `nativeFfiConfiguration`, which the native suite's VK-6 record prints.
 constraints:
     vulkan +safe-foreign-calls,
     vulkan -darwin-lib-dirs
@@ -64,7 +67,7 @@ constraints:
 -- `MACOS_INCLUDE` in tools/native/vulkan.pin pin, which `native.py prepare`
 -- verifies by digest before any build. This is the configuration
 -- `tools/toolchain/qualify-binding.sh` qualified. Executables still link the
--- provisioned prefix's copy, which `run-proof.sh` names ahead of it. Linux needs
+-- provisioned prefix's copy, which `tools/vulkan/run.sh` names ahead of it. Linux needs
 -- none of this: the binding finds the loader through the prefix's `vulkan.pc`.
 if os(darwin)
   package vulkan

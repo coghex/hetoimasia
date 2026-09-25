@@ -77,6 +77,7 @@ import argparse
 import hashlib
 import json
 import platform
+import shutil
 import signal
 import stat
 import subprocess
@@ -694,8 +695,8 @@ def reaped(process: subprocess.Popen, seconds: int) -> bool:
     return True
 
 
-def terminate_group(process: subprocess.Popen) -> None:
-    """End the command and every descendant it started.
+def terminate_group(process: subprocess.Popen, group: int | None) -> bool:
+    """End the command and every descendant it started; say whether any was killed.
 
     The launched process exiting is not the same as the group ending. A
     descendant that ignores SIGTERM keeps running under the same group
@@ -704,34 +705,118 @@ def terminate_group(process: subprocess.Popen) -> None:
     happens to hold a handle to. Anything still there after the grace period is
     killed outright: the budget has already expired, and a survivor would keep
     holding the runner's CPU and scratch space.
+
+    SIGTERM comes first and gets its grace period because a command that owns
+    a display or a fixture keeps its diagnostics in its own cleanup: a signal it
+    can handle lets it retain them before it goes. That cleanup is not part of
+    the measurement, and nothing it reports can turn the expiry into a pass.
     """
-    try:
-        group = os.getpgid(process.pid)
-    except OSError:
-        group = None
     signal_group(process, group, signal.SIGTERM)
+    grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     leader_exited = reaped(process, TERMINATION_GRACE_SECONDS)
-    if not leader_exited or group_alive(group):
-        signal_group(process, group, signal.SIGKILL)
+    # The leader going is not the group going: its descendants get whatever is
+    # left of the same grace before anything is killed.
+    while leader_exited and group_alive(group) and time.monotonic() < grace:
+        time.sleep(TEARDOWN_POLL_SECONDS)
+    if leader_exited and not group_alive(group):
+        return False
+    signal_group(process, group, signal.SIGKILL)
     if not reaped(process, TERMINATION_GRACE_SECONDS):
         process.kill()
         process.wait()
+    return True
 
 
-def execute(command: list[str], root: str, timeout_seconds: int) -> tuple[int, bool, float, str, str]:
+# How often a finished command's process group is asked whether its descendants
+# have gone. The group is the only thing that can answer, and it signals
+# nothing when it empties, so it is asked.
+TEARDOWN_POLL_SECONDS = 0.05
+
+
+def execute(command: list[str], root: str, timeout_seconds: int, environment: dict[str, str]) -> dict:
+    """Run one stage under its deadline, and describe how it ended.
+
+    The measurement is the stage's own: it ends when the command *and every
+    descendant it started* have gone, or at the deadline, whichever comes first.
+    A command whose leader exits while something it started is still running
+    has not finished its teardown, so the runner keeps measuring until that
+    group is empty — bounded by the same deadline. Whatever happens after the
+    deadline is cleanup, recorded apart as ``expiry`` and never counted in
+    ``duration_seconds``, and an expired stage is a ``timeout`` whatever its
+    process reports once it has been stopped.
+    """
     started_at = timestamp()
     started = time.monotonic()
+    deadline = started + timeout_seconds
     # A new session gives the command its own process group, so a timeout can
     # reap the descendants it spawned rather than only the process it launched.
-    process = subprocess.Popen(command, cwd=root, start_new_session=True)
-    timed_out = False
+    process = subprocess.Popen(command, cwd=root, start_new_session=True, env=environment)
+    # A new session makes the command its own process group, whose identifier
+    # is the command's own process id. It is taken from there rather than asked
+    # of the process, because a command that has already exited — leaving a
+    # child running in that group — can no longer answer, and a group nobody
+    # could name would be one nobody watched.
+    group: int | None = process.pid
+    expired = False
     try:
-        process.wait(timeout=timeout_seconds)
+        # The deadline is absolute, fixed before the command was started, so
+        # whatever starting it cost is spent from the same budget.
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        while group_alive(group):
+            if time.monotonic() >= deadline:
+                expired = True
+                break
+            time.sleep(TEARDOWN_POLL_SECONDS)
     except subprocess.TimeoutExpired:
-        timed_out = True
-        terminate_group(process)
-    duration = time.monotonic() - started
-    return process.returncode, timed_out, duration, started_at, timestamp()
+        expired = True
+    # A command that finished only after its deadline did not finish inside
+    # it, however its exit was observed.
+    if not expired and time.monotonic() > deadline:
+        expired = True
+    measured = min(time.monotonic(), deadline) - started
+    expiry = None
+    if expired:
+        expired_at = timestamp()
+        killed = terminate_group(process, group)
+        expiry = {
+            "expired_at": expired_at,
+            "cleanup_seconds": round(max(0.0, time.monotonic() - started - measured), 3),
+            "killed": killed,
+        }
+    status = process.returncode
+    if expiry is not None:
+        outcome = "timeout"
+    elif status == 0:
+        outcome = "passed"
+    else:
+        outcome = "failed"
+    return {
+        "command": list(command),
+        "outcome": outcome,
+        "exit_status": status,
+        "started_at": started_at,
+        "ended_at": timestamp(),
+        "duration_seconds": round(measured, 3),
+        "timeout_seconds": timeout_seconds,
+        "expiry": expiry,
+    }
+
+
+# The variable a group's command is told its evidence directory by. Whatever a
+# stage leaves there — a display server's log, a fixture's record — is listed
+# in the receipt and travels with it, which is how a failed or expired run keeps
+# the diagnostics its cleanup would otherwise have deleted.
+EVIDENCE_VARIABLE = "HETOIMASIA_VALIDATION_EVIDENCE"
+
+
+def evidence_files(receipts_directory: str, directory: str) -> list[str]:
+    """Every file under one group's evidence directory, relative to the receipts."""
+    found: list[str] = []
+    for base, _, names in os.walk(directory):
+        for name in names:
+            relative = os.path.relpath(os.path.join(base, name), receipts_directory)
+            found.append(relative.replace(os.sep, "/"))
+    return sorted(found)
 
 
 def main(argv: list[str]) -> int:
@@ -824,33 +909,88 @@ def main(argv: list[str]) -> int:
 
     command = list(group["command"])
     timeout_seconds = group["timeout_seconds"]
-    print(
-        f"validation: running {arguments.group} ({group['reason']}) "
-        f"under a {timeout_seconds}s budget: " + " ".join(command),
-        flush=True,
-    )
+    receipts_directory = os.path.abspath(arguments.receipts)
+    evidence_directory = os.path.join(receipts_directory, "evidence", arguments.group)
+    # Every file the receipt lists must be one this execution left, so whatever
+    # an earlier execution of the same group left here goes first. A link
+    # standing where the directory belongs is removed, never followed.
     try:
-        status, timed_out, duration, started_at, ended_at = execute(command, root, timeout_seconds)
+        if os.path.islink(evidence_directory) or os.path.isfile(evidence_directory):
+            os.unlink(evidence_directory)
+        elif os.path.isdir(evidence_directory):
+            shutil.rmtree(evidence_directory)
+        os.makedirs(evidence_directory)
     except OSError as error:
-        raise ProvenanceError(f"cannot execute {arguments.group}: {error}") from error
+        raise ProvenanceError(f"cannot prepare the evidence directory {evidence_directory}: {error}") from error
+    environment = dict(os.environ)
+    environment[EVIDENCE_VARIABLE] = evidence_directory
 
-    if timed_out:
-        outcome = "timeout"
-    elif status == 0:
-        outcome = "passed"
+    # The preparation, when the group declares one, runs to completion first
+    # and is recorded apart. The group's own budget then measures its command
+    # alone: what was built is not what was timed.
+    preparation = None
+    if group["preparation"] is not None:
+        stage = group["preparation"]
+        print(
+            f"validation: preparing {arguments.group} under a {stage['timeout_seconds']}s budget: "
+            + " ".join(stage["command"]),
+            flush=True,
+        )
+        try:
+            preparation = execute(list(stage["command"]), root, stage["timeout_seconds"], environment)
+        except OSError as error:
+            raise ProvenanceError(f"cannot prepare {arguments.group}: {error}") from error
+        print(
+            f"validation: {arguments.group} preparation {preparation['outcome']} after "
+            f"{preparation['duration_seconds']:.1f}s (exit {preparation['exit_status']})",
+            flush=True,
+        )
+
+    if preparation is not None and preparation["outcome"] != "passed":
+        # A group whose preparation did not pass did not run, and says so: its
+        # outcome is the preparation's, and its command was never started, so
+        # nothing about the command's own behaviour is claimed.
+        execution = {
+            "command": command,
+            "outcome": preparation["outcome"],
+            "exit_status": preparation["exit_status"],
+            "started_at": preparation["ended_at"],
+            "ended_at": preparation["ended_at"],
+            "duration_seconds": 0,
+            "timeout_seconds": timeout_seconds,
+            "expiry": None,
+        }
+        executed = False
+        print(f"validation: {arguments.group} did not run, because its preparation did not pass", flush=True)
     else:
-        outcome = "failed"
+        print(
+            f"validation: running {arguments.group} ({group['reason']}) "
+            f"under a {timeout_seconds}s budget: " + " ".join(command),
+            flush=True,
+        )
+        try:
+            execution = execute(command, root, timeout_seconds, environment)
+        except OSError as error:
+            raise ProvenanceError(f"cannot execute {arguments.group}: {error}") from error
+        executed = True
 
+    outcome = execution["outcome"]
+    status = execution["exit_status"]
+    duration = execution["duration_seconds"]
     receipt = {
         "schema_version": receipts.RECEIPT_SCHEMA_VERSION,
         "group": arguments.group,
         "command": command,
         "outcome": outcome,
         "exit_status": status,
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "duration_seconds": round(duration, 3),
+        "started_at": execution["started_at"],
+        "ended_at": execution["ended_at"],
+        "duration_seconds": duration,
         "timeout_seconds": timeout_seconds,
+        "expiry": execution["expiry"],
+        "executed": executed,
+        "preparation": preparation,
+        "evidence": evidence_files(receipts_directory, evidence_directory),
         "plan_identity": identity,
         "head_commit": plan["head"]["commit"],
         "executed_commit": executed_commit,
@@ -872,9 +1012,16 @@ def main(argv: list[str]) -> int:
         written = receipts.write_receipt(arguments.receipts, receipt)
     except EvidenceError as failure:
         raise ProvenanceError(str(failure)) from failure
+    expiry = execution["expiry"]
+    cleanup = (
+        f"; its deadline expired and cleanup took a further {expiry['cleanup_seconds']:.1f}s"
+        + (", killing what survived" if expiry["killed"] else "")
+        if expiry is not None
+        else ""
+    )
     print(
         f"validation: {arguments.group} {outcome} after {duration:.1f}s "
-        f"(exit {status}); receipt {written}",
+        f"(exit {status}){cleanup}; receipt {written}",
         flush=True,
     )
     return 0 if outcome == "passed" else 1

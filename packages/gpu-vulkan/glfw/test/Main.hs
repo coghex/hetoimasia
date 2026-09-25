@@ -4,17 +4,12 @@
 -- declares none of its own. 'configFailOnEmpty' makes a selection that
 -- matches no example a failure rather than a silent pass.
 --
--- @tools/vulkan-proof/run-proof.sh --headless@ is what builds and runs this
--- suite, and it hands every suite it runs its own @--headless@ mode flag, which
--- means nothing more here than it already is. It is dropped before Hspec reads
--- the arguments.
+-- @tools/vulkan/run.sh test@ is what builds and runs this suite, as part of
+-- the validation group @test.vulkan-headless@.
 module Main (main) where
 
-import System.Environment (getArgs, withArgs)
 import qualified Test.GPU.Vulkan.GLFW.Controller as Controller
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = do
-  arguments ← filter (/= "--headless") <$> getArgs
-  withArgs arguments (hspecWith defaultConfig {configFailOnEmpty = True} Controller.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} Controller.spec

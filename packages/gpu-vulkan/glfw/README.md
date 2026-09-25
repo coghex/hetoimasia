@@ -29,8 +29,18 @@ order.
 
 Its headless examples (`integration-tests`) run whole graphics hosts over the
 GLFW package's scripted seam with a stand-in native layer and surface bridge;
-they create no Vulkan object. Like the native package, it is listed only in
-`cabal.project.vulkan`, and only `tools/vulkan-proof/run-proof.sh` builds it:
-`--headless` runs its examples, and the native run exercises it through the
-proof harness's VK-7 session until VK-8 moves those cases into a
-package-native fixture.
+they create no Vulkan object, and the validation group `test.vulkan-headless`
+runs them. Like the native package, it is listed only in `cabal.project.vulkan`,
+and only [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh) builds it.
+
+Its native suite (`vulkan-native-tests`, in `native-test/`) is the
+package-native Vulkan fixture: the process main thread owns one shared
+production graphics session — this package's `withVulkanOwnerHost`, the roots
+it owns, and GLFW — and serves Hspec, which runs on a thread of its own; the
+native cases VK-2 and VK-5 through VK-7 once ran in the proof harness run in
+child processes with roots of their own, beside a synchronization-validation
+control. It is the validation group `test.vulkan-native`, built in a
+preparation stage and timed without its compilation under a thirty-second
+watchdog; on macOS it needs the human's per-session desktop approval.
+[`docs/gpu_backend.md`](../../../docs/gpu_backend.md#the-native-suite) is its
+contract.

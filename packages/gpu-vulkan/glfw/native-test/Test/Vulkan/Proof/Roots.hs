@@ -38,6 +38,7 @@ module Test.Vulkan.Proof.Roots
   , runRoots
   , rootsCaptureConfig
   , teardownReports
+  , nativeCallObserver
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -45,7 +46,7 @@ import Control.Concurrent.STM (atomically, check)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -104,6 +105,7 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.Vulkan.Proof.Interop (osThread)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
@@ -190,7 +192,8 @@ session journal recorded = do
       config =
         (vulkanHostConfig host rootsCaptureConfig budgets scene)
           { vulkanLayers = [encode validationLayer]
-          , vulkanObserver = observer recorded
+          , vulkanValidationFeatures = validationFeatures
+          , vulkanObserver = nativeCallObserver recorded
           }
   observed ←
     withLoaderIntegration $ \integration →
@@ -298,15 +301,17 @@ pumpUntil vulkan control ready =
 
 -- | Record, around every native call, the OS thread it ran on and the reports
 -- the capture received meanwhile.
-observer ∷ IORef [NativeCall] → DiagnosticCapture → NativeObserver
-observer recorded capture = NativeObserver $ \name call → do
+nativeCallObserver ∷ IORef [NativeCall] → DiagnosticCapture → NativeObserver
+nativeCallObserver recorded capture = NativeObserver $ \name call → do
   onOs ← osThread
   onHaskell ← myThreadId
   before ← offered
   outcome ← try @SomeException call
   after ← offered
   let raised = either (Just . Text.pack . displayException) (const Nothing) outcome
-  modifyIORef' recorded (NativeCall name onOs onHaskell (after - before) raised :)
+  -- Atomically: the owner's calls and the main thread's surface creations
+  -- are observed from two threads.
+  atomicModifyIORef' recorded (\calls → (NativeCall name onOs onHaskell (after - before) raised : calls, ()))
   either throwIO pure outcome
   where
     offered = countOffered . statusCounters <$> captureStatus capture

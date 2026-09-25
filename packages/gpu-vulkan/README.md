@@ -34,8 +34,7 @@ permanent rather than a staging step:
   and a record per target surface, over an open native layer. It is listed
   only in `cabal.project.vulkan`, with its local dependency closure, so
   CPU-only and ordinary project selection both exclude it, and only
-  `tools/vulkan-proof/run-shaders.sh` and `tools/vulkan-proof/run-proof.sh`,
-  which runs the former first, build it. Neither the model nor the
+  [`tools/vulkan/run.sh`](../../tools/vulkan/run.sh) builds it. Neither the model nor the
   diagnostics package will ever depend on it: completion reaches the model only
   as abstract facts through an injected interface, so the model proves no
   native completion and cannot be made to.
@@ -45,8 +44,8 @@ permanent rather than a staging step:
   owner with the roots as its operations, hands each window's surface over from
   the main thread, and composes the diagnostic lifetime, the loader-aware
   session and the protected host. Like the native package it is listed only in
-  `cabal.project.vulkan`. Nothing depends on it but an application and the
-  proof harness.
+  `cabal.project.vulkan`. Nothing depends on it but an application; its own
+  native suite is the package-native Vulkan fixture.
 
 The dependency direction is one way: the model and the diagnostics package
 depend on neither of the other two, the native package does not depend on the

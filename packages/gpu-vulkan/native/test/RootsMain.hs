@@ -5,23 +5,18 @@
 -- native call. 'configFailOnEmpty' makes a selection that matches no example a
 -- failure rather than a silent pass.
 --
--- @tools/vulkan-proof/run-proof.sh --headless@ is what builds and runs this
--- suite, and it hands every suite it runs its own @--headless@ mode flag, which
--- means nothing more here than it already is: this suite is headless whatever
--- it is given. It is dropped before Hspec reads the arguments.
+-- @tools/vulkan/run.sh test@ is what builds and runs this suite, as part of
+-- the validation group @test.vulkan-headless@.
 module Main (main) where
 
-import System.Environment (getArgs, withArgs)
 import qualified Test.GPU.Vulkan.Native.Profile as Profile
 import qualified Test.GPU.Vulkan.Native.Roots as Roots
 import Test.Hspec (describe)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = do
-  arguments ← filter (/= "--headless") <$> getArgs
-  withArgs arguments $
-    hspecWith defaultConfig {configFailOnEmpty = True} $
-      describe "Native roots" $ do
-        Profile.spec
-        Roots.spec
+main =
+  hspecWith defaultConfig {configFailOnEmpty = True} $
+    describe "Native roots" $ do
+      Profile.spec
+      Roots.spec

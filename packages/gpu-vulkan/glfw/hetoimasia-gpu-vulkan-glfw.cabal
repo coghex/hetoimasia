@@ -22,6 +22,8 @@ category: Game
 build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
+extra-source-files:
+    native-test/cbits/hetoimasia_vulkan_proof.h
 
 source-repository head
     type: git
@@ -78,7 +80,7 @@ library
 -- and a stand-in native layer and surface bridge. They initialize no GLFW,
 -- open no window and create no Vulkan object; the executable links the loader
 -- only because the native package does, so it is built and run through
--- `tools/vulkan-proof/run-proof.sh --headless`.
+-- `tools/vulkan/run.sh test` — the group `test.vulkan-headless`.
 test-suite integration-tests
     import: language
     type: exitcode-stdio-1.0
@@ -104,3 +106,91 @@ test-suite integration-tests
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw:controller
+
+-- The native suite: the package-native Vulkan fixture and the native cases of
+-- VK-2 and VK-5 through VK-7 it took over from the retired proof harness. The
+-- process main thread owns one shared production graphics session — a GLFW
+-- session, the supervised graphics owner and the native roots it owns — and
+-- serves Hspec, which runs on a thread of its own; cases that must create,
+-- poison or destroy roots of their own run in a child process of this
+-- executable. It opens windows and creates devices, so it enters no session
+-- without the run's consent: on Linux `tools/vulkan/run.sh native` runs it
+-- inside the isolated X11 display `tools/display/x11.sh` starts, and on macOS
+-- the human's `HETOIMASIA_NATIVE_SESSION=desktop` must be on the one approved
+-- command. It is the catalog group `test.vulkan-native`, built in that group's
+-- preparation stage and timed without its compilation. See
+-- docs/gpu_backend.md.
+test-suite vulkan-native-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: native-test
+    -- PatternSynonyms is the binding's own idiom: its extension names, flag
+    -- bits, and version constants are all bidirectional pattern synonyms.
+    default-extensions: PatternSynonyms
+    ghc-options: -threaded -rtsopts
+    other-modules:
+        Test.GPU.Vulkan.Native.Consent
+        Test.GPU.Vulkan.Native.Environment
+        Test.GPU.Vulkan.Native.Fixture
+        Test.GPU.Vulkan.Native.Gate
+        Test.GPU.Vulkan.Native.Hazard
+        Test.GPU.Vulkan.Native.Private
+        Test.GPU.Vulkan.Native.Shared
+        Test.GPU.Vulkan.Native.Spec
+        Test.Vulkan.Proof.Bridge
+        Test.Vulkan.Proof.BridgeSpec
+        Test.Vulkan.Proof.Construction
+        Test.Vulkan.Proof.ConstructionSpec
+        Test.Vulkan.Proof.Diagnostics
+        Test.Vulkan.Proof.DiagnosticsSpec
+        Test.Vulkan.Proof.Findings
+        Test.Vulkan.Proof.Interop
+        Test.Vulkan.Proof.Journal
+        Test.Vulkan.Proof.Loader
+        Test.Vulkan.Proof.LoaderSpec
+        Test.Vulkan.Proof.Matrix
+        Test.Vulkan.Proof.Ownership
+        Test.Vulkan.Proof.Publication
+        Test.Vulkan.Proof.PublicationSpec
+        Test.Vulkan.Proof.Record
+        Test.Vulkan.Proof.Retention
+        Test.Vulkan.Proof.RetentionSpec
+        Test.Vulkan.Proof.Roots
+        Test.Vulkan.Proof.RootsSpec
+        Test.Vulkan.Proof.Run
+        Test.Vulkan.Proof.Spec
+    -- The VK-2 cases' own GLFW/Vulkan interop shim, the `dladdr` image
+    -- provenance, and the `pthread_self` reading the thread identities are
+    -- recorded through. Test-only; nothing production uses it.
+    c-sources: native-test/cbits/hetoimasia_vulkan_proof.c
+    include-dirs: native-test/cbits
+    -- The private GLFW prefix `tools/native/native.py` builds, exactly as the
+    -- GLFW package finds it. The suite adds no second GLFW.
+    pkgconfig-depends: glfw3 >=3.4 && <3.5
+    if os(darwin)
+        frameworks: Cocoa IOKit CoreFoundation
+    if os(linux)
+        extra-libraries: rt m dl
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3.8 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        time >=1.15 && <1.16,
+        vector >=0.13 && <0.14,
+        vulkan >=3.27 && <3.28,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw

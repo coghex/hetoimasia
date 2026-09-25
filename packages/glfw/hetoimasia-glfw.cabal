@@ -179,7 +179,7 @@ library runtime-glfw-core
 -- headers, before GLFW's; the ordinary native library above keeps
 -- GLFW_INCLUDE_NONE. It depends on no GPU package and no renderer. Built only
 -- with the `vulkan-interop` flag, which only `cabal.project.vulkan` sets, where
--- `tools/vulkan-proof/run-proof.sh` passes the provisioned prefix's Vulkan
+-- `tools/vulkan/run.sh` passes the provisioned prefix's Vulkan
 -- include and library directories on the command line.
 library vulkan-interop
     import: language

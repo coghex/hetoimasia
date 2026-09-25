@@ -5,7 +5,7 @@
 -- compiler is a child process, and nothing here creates a Vulkan object. It
 -- does need the provisioned toolchain, because the embedded shaders were
 -- compiled by it and the runtime entry runs it; the suite is built and run by
--- @tools\/vulkan-proof\/run-shaders.sh@, which generates the fingerprint first.
+-- @tools\/vulkan\/run.sh test@, which generates the fingerprint first.
 module Test.Shader.Spec (spec) where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))

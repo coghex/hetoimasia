@@ -243,8 +243,11 @@ def check_receipt(
 ) -> None:
     if receipt["group"] != group:
         raise Rejection(f"its receipt records group {receipt['group']!r}", url)
-    if receipt["command"] != list(entry["command"]):
-        raise Rejection("its receipt records a different command from the plan's", url)
+    stages = receipts.stage_problems(entry, receipt, "its receipt")
+    if stages:
+        raise Rejection("; ".join(stages), url)
+    if not receipt["executed"]:
+        raise Rejection("its receipt records a group its preparation stopped before it ran", url)
     identifier = run.get("id")
     attempt = run.get("run_attempt")
     attributed = attributed_attempt(receipt["source_run_url"], identifier) if isinstance(identifier, int) else None

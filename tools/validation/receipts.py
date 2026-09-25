@@ -19,8 +19,14 @@ import json
 import os
 import re
 
-PLAN_SCHEMA_VERSION = 3
-RECEIPT_SCHEMA_VERSION = 3
+# Version 4 of both carries a group's optional preparation stage: the plan
+# declares it, the plan identity binds it, and a receipt records how it ended
+# beside the execution it prepared, with a deadline's expiry kept apart from the
+# cleanup that followed it. A version 3 reader would run a prepared group's
+# command without its preparation, so the versions move rather than the field
+# being added silently.
+PLAN_SCHEMA_VERSION = 4
+RECEIPT_SCHEMA_VERSION = 4
 APPLICABILITY_SCHEMA_VERSION = 1
 
 # The execution environments a group can require and a worker can provide.
@@ -443,6 +449,13 @@ def load_plan(path: str) -> dict:
         timeout = require_int(entry, "timeout_seconds", description)
         if timeout <= 0:
             raise EvidenceError(f"{description} declares a non-positive timeout")
+        preparation = _value(entry, "preparation", description)
+        if preparation is not None:
+            if not isinstance(preparation, dict):
+                raise EvidenceError(f"{description} field 'preparation' is neither an object nor null")
+            require_str_list(preparation, "command", f"{description} preparation")
+            if require_int(preparation, "timeout_seconds", f"{description} preparation") <= 0:
+                raise EvidenceError(f"{description} declares a non-positive preparation timeout")
 
     selected = require_str_list(document, "selected", "plan")
     unregistered = [identifier for identifier in selected if identifier not in registered]
@@ -506,6 +519,10 @@ def plan_identity(plan: dict) -> str:
                 "runner": entry["runner"],
                 "command": list(entry["command"]),
                 "timeout_seconds": entry["timeout_seconds"],
+                # What is built before the command is part of what the command
+                # is: the same command after a different preparation runs a
+                # different executable.
+                "preparation": entry["preparation"],
             }
             for entry in plan["groups"]
         ],
@@ -515,6 +532,26 @@ def plan_identity(plan: dict) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def preparation_command(document: dict) -> list[str] | None:
+    """The preparation command a plan entry declares or a receipt records."""
+    preparation = document.get("preparation")
+    return None if preparation is None else list(preparation["command"])
+
+
+def stage_problems(entry: dict, receipt: dict, description: str) -> list[str]:
+    """How a receipt's execution definition differs from a plan entry's.
+
+    The command and the preparation are compared together, because either one
+    changing means the receipt describes a different execution.
+    """
+    problems: list[str] = []
+    if receipt["command"] != list(entry["command"]):
+        problems.append(f"{description} records a different command from the plan's")
+    if preparation_command(receipt) != preparation_command(entry):
+        problems.append(f"{description} records a different preparation from the plan's")
+    return problems
 
 
 def plan_group(plan: dict, identifier: str) -> dict:
@@ -570,7 +607,77 @@ def validate_receipt(document: dict, description: str) -> dict:
     require_str(document, "policy_version", description)
     require_str(document, "source_run_url", description)
     require_toolchain(document, "toolchain", description)
+    executed = require_bool(document, "executed", description)
+    if executed:
+        validate_expiry(document, description)
+    elif _value(document, "expiry", description) is not None:
+        raise EvidenceError(f"{description} records a deadline's expiry for a command that never ran")
+    preparation = _value(document, "preparation", description)
+    if preparation is not None:
+        if not isinstance(preparation, dict):
+            raise EvidenceError(f"{description} field 'preparation' is neither an object nor null")
+        validate_stage(preparation, f"{description} preparation")
+    # The two stages have to tell one story. A group that did not execute was
+    # stopped by a preparation that did not pass, and reports that
+    # preparation's outcome as its own; a preparation that did not pass can
+    # never be followed by an execution, let alone a passing one.
+    if not executed:
+        if preparation is None or preparation["outcome"] == "passed":
+            raise EvidenceError(
+                f"{description} records no execution, but no preparation stopped it"
+            )
+        if document["outcome"] != preparation["outcome"]:
+            raise EvidenceError(
+                f"{description} records outcome {document['outcome']!r} for a group its "
+                f"preparation stopped with {preparation['outcome']!r}"
+            )
+    elif preparation is not None and preparation["outcome"] != "passed":
+        raise EvidenceError(f"{description} records an execution after a preparation that did not pass")
+    evidence = require_str_list(document, "evidence", description)
+    for path in evidence:
+        if os.path.isabs(path) or ".." in path.split("/"):
+            raise EvidenceError(f"{description} names evidence outside its receipt directory: {path!r}")
     return document
+
+
+def validate_stage(document: dict, description: str) -> None:
+    """One stage of an execution: what ran, how it ended, and how long it took."""
+    require_str_list(document, "command", description)
+    outcome = require_str(document, "outcome", description)
+    if outcome not in OUTCOMES:
+        raise EvidenceError(
+            f"{description} records outcome {outcome!r}, which is not one of " + ", ".join(OUTCOMES)
+        )
+    require_int(document, "exit_status", description)
+    require_str(document, "started_at", description)
+    require_str(document, "ended_at", description)
+    require_number(document, "duration_seconds", description)
+    require_int(document, "timeout_seconds", description)
+    validate_expiry(document, description)
+
+
+def validate_expiry(document: dict, description: str) -> None:
+    """A deadline's expiry, kept apart from the cleanup that followed it.
+
+    ``expiry`` is null for a stage that ended inside its budget. Otherwise it
+    says when the deadline passed, how long the cleanup after it took, and
+    whether anything had to be killed — and the stage's outcome is ``timeout``
+    whatever the process reported once it was stopped, because an expired
+    deadline certifies nothing about how the command would have ended.
+    """
+    expiry = _value(document, "expiry", description)
+    outcome = document.get("outcome")
+    if expiry is None:
+        if outcome == "timeout":
+            raise EvidenceError(f"{description} records a timeout without the deadline's expiry")
+        return
+    if not isinstance(expiry, dict):
+        raise EvidenceError(f"{description} field 'expiry' is neither an object nor null")
+    require_str(expiry, "expired_at", f"{description} expiry")
+    require_number(expiry, "cleanup_seconds", f"{description} expiry")
+    require_bool(expiry, "killed", f"{description} expiry")
+    if outcome != "timeout":
+        raise EvidenceError(f"{description} records an expired deadline with outcome {outcome!r}")
 
 
 def load_receipt(path: str) -> dict:

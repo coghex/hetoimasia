@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 21,
+  "policy_version": 22,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -15,6 +15,8 @@
   "generated_paths": [
     "dist-newstyle/",
     "dist-dev/",
+    "dist-vulkan/",
+    "dist-vulkan-proof/",
     ".worktrees/",
     "captures/",
     "plan.json",
@@ -239,8 +241,72 @@
       "optional": false
     },
     {
+      "id": "test.vulkan-headless",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), and the window integration's controller over the GLFW package's scripted seam (integration-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "command": [
+        "bash",
+        "tools/vulkan/run.sh",
+        "test",
+        "hetoimasia-gpu-vulkan-native:test:native-tests",
+        "hetoimasia-gpu-vulkan-native:test:shader-tests",
+        "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
+      ],
+      "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "packages/gpu-vulkan/native/",
+        "tools/ci-image/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/test-support/",
+        "tools/vulkan/"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 3600,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.vulkan-native",
+      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable is built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the human's per-session desktop consent.",
+      "command": [
+        "bash",
+        "tools/vulkan/run.sh",
+        "native",
+        "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+        "--",
+        "--complete"
+      ],
+      "preparation": {
+        "command": [
+          "bash",
+          "tools/vulkan/run.sh",
+          "build",
+          "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
+        ],
+        "timeout_seconds": 3600
+      },
+      "component": "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "tools/ci-image/",
+        "tools/display/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/vulkan/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
+      "timeout_seconds": 30,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner, the CI image builder, and the native recipe helper against temporary Git repositories; the local test/flake lab's selection, durable history, recovery, process guardians, exports, and skill installation; and the boundary that keeps the VK-2 Vulkan proof out of the mandatory floor and holds its compatibility summary to the records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the local test/flake lab's selection, durable history, recovery, process guardians, exports, and skill installation; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its two groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
       "command": [
         "cabal",
         "test",
@@ -249,11 +315,21 @@
       ],
       "component": "hetoimasia:test:workflow-tests",
       "inputs": [
+        ".github/workflows/validation.yml",
+        ".github/workflows/ci-image.yml",
         "cabal.project",
         "cabal.project.common",
         "cabal.project.cpu",
         "cabal.project.vulkan",
-        "docs/vulkan/",
+        "docs/vulkan/linux-provisioned.md",
+        "docs/vulkan/linux-vk5.md",
+        "docs/vulkan/linux-vk6.md",
+        "docs/vulkan/linux-vk7.md",
+        "docs/vulkan/linux.md",
+        "docs/vulkan/macos-provisioned.md",
+        "docs/vulkan/macos-vk5.md",
+        "docs/vulkan/macos-vk6.md",
+        "docs/vulkan/macos.md",
         "docs/vulkan_compatibility_record.md",
         "tools/ci-image/",
         "tools/display/",
@@ -262,6 +338,7 @@
         "tools/native/",
         "tools/toolchain/",
         "tools/validation/",
+        "tools/vulkan/",
         "tools/vulkan-proof/",
         "tools/flake/",
         "packages/gpu-vulkan/native/",

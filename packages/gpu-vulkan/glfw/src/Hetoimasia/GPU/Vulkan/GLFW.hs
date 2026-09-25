@@ -18,6 +18,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
     withVulkanOwnerHost
   , VulkanHostConfig (..)
   , vulkanHostConfig
+  , ValidationFeature (..)
   , VulkanHost (..)
   , NativeObserver (..)
   , noObserver
@@ -77,6 +78,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , withVulkanOwnerHostOver
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
+import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 
 -- | Run a Vulkan graphics host over this loader capability, and answer the

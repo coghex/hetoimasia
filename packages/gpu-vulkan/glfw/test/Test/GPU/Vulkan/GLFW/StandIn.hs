@@ -260,6 +260,7 @@ nativeLayer events native capture =
             , offerInstanceExtensions =
                 ["VK_KHR_surface", "VK_KHR_wayland_surface", debugUtilsExtension, getSurfaceCapabilities2Extension, surfaceMaintenance1Extension]
             , offerLayers = []
+            , offerLayerExtensions = []
             }
     , opsCreateInstance = \_ → 1 <$ step events native AtCreateInstance InstanceCreated
     , opsCreateMessenger = \_ → 2 <$ step events native AtCreateMessenger MessengerCreated
