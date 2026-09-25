@@ -392,6 +392,43 @@ spec = describe "Generations" $ do
       created rig `shouldReturn` [(640, 480), (800, 600)]
       recoveryAttempts rig `shouldReturn` 1
 
+    it "cancels a settling move when a failed construction's geometry returns, so a later move waits its own full period" $ do
+      rig ← newRig
+      script (rigStandIn rig) AtCreateSwapchain Fails
+      stepAt rig 0 (seen 640 480)
+      stepAt rig 1 (seen 640 480)
+      stepAt rig 2 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 101)
+      resizeSurface rig 800 600
+      stepAt rig 80 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 96)
+      resizeSurface rig 640 480
+      stepAt rig 90 (seen 640 480)
+      resizeSurface rig 800 600
+      stepAt rig 95 (seen 800 600)
+      stepAt rig 101 (seen 800 600)
+      length <$> created rig `shouldReturn` 2
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 111)
+      stepAt rig 111 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (640, 480), (800, 600)]
+
+    it "cancels a settling move when an out-of-date result's geometry returns to the active generation's, so a later move waits its own full period" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      noteActive rig SwapchainOutOfDate
+      stepAt rig 10 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      stepAt rig 15 (seen 640 480)
+      length <$> created rig `shouldReturn` 2
+      noteActive rig SwapchainOutOfDate
+      resizeSurface rig 800 600
+      stepAt rig 20 (seen 800 600)
+      stepAt rig 26 (seen 800 600)
+      length <$> created rig `shouldReturn` 2
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 36)
+      stepAt rig 36 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (640, 480), (800, 600)]
+
     it "retries a failing construction only through the recovery episode's attempts and delays, then reports it spent" $ do
       rig ← newRigOf RequiredTarget defaultBudgetRequest
       script (rigStandIn rig) AtCreateSwapchain Fails

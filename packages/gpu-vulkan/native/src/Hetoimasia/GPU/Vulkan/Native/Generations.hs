@@ -561,7 +561,7 @@ reconcile generations now target geometry = do
       -- the move to settle first, as any resize does.
       | recordFailed record =
           if maybe False (\(extent, observed) → extent == planExtent planned && sameGeometry observed geometry) (recordLastPlanned record)
-            then recover planned
+            then unmoved planned
             else settle planned (recover planned)
       | Just (_, native) ← active
       , reported
@@ -569,7 +569,7 @@ reconcile generations now target geometry = do
           -- Out of date or suboptimal with the extent it already has: not a
           -- resize, so rebuilding it is a recovery attempt — after the
           -- observed geometry, if it has moved, has settled.
-          if sameGeometry (genGeometry native) geometry then recover planned else settle planned (recover planned)
+          if sameGeometry (genGeometry native) geometry then unmoved planned else settle planned (recover planned)
       -- The first generation is built at once. A later one with nothing
       -- active — the active one retired on its own to make room — is a
       -- replacement like any other, and waits for its geometry to settle.
@@ -605,6 +605,12 @@ reconcile generations now target geometry = do
           Right due
             | due <= now → continue
             | otherwise → Nothing <$ setCondition (Settling due)
+    -- A recovery rebuild at the geometry it was already planned from: a move
+    -- that had begun to settle is cancelled, so a later move waits its own
+    -- full period rather than inheriting that one's start.
+    unmoved planned = do
+      atomically (modifyRecord (\entry → entry {recordSettling = Nothing}))
+      recover planned
     recover planned =
       lookupRecordIO >>= \case
         Just record | recordRecovering record → construct planned

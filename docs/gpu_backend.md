@@ -333,7 +333,9 @@ nothing, and the package's public module does not offer one.
   a required one failing the session — and reported as `RecoverySpent` for VK-14
   to act on. Nothing retries hot. A recovery rebuild whose observed geometry
   has moved — since the active generation, or since the failed construction
-  was planned — first waits for that move to settle, as any resize does.
+  was planned — first waits for that move to settle, as any resize does; one
+  whose geometry has come back cancels the move it had begun to settle, so a
+  later move waits its own full period.
 - **The irreversible `oldSwapchain` transition.** Replacement hands the active
   generation over. The model retires it when the replacement is admitted, and
   it is recorded as handed over to Vulkan immediately before the creation call
@@ -491,7 +493,8 @@ retains its parents.
   repeated out-of-date and suboptimal results bounded by the recovery episode
   without a hot loop, a reported result asking for a step at once until it is
   reconciled, a moved observation and a resize after a failed construction
-  each settling before the recovery rebuild, failures after the swapchain destroying exactly what they
+  each settling before the recovery rebuild, and a move cancelled while
+  recovery waits leaving a later move its full quiet period, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
   retaining the surface, a replacement cancelled before its creation never
   handing the old swapchain over, a cancellation right after a candidate's
