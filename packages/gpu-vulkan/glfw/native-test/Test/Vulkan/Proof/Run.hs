@@ -74,7 +74,7 @@ import Data.Word (Word32, Word64, Word8)
 import Foreign.Ptr (castFunPtrToPtr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peekByteOff)
 import System.Directory (canonicalizePath)
-import System.Environment (lookupEnv, setEnv, unsetEnv)
+import System.Environment (lookupEnv)
 import System.Info (arch, os)
 
 import Vulkan.CStruct.Extends (SomeStruct (..), peekSomeCStruct, withSomeStruct)
@@ -93,6 +93,7 @@ import Vulkan.Exception (VulkanException (..))
 import Vulkan.Extensions.VK_EXT_debug_utils
 import Vulkan.Extensions.VK_EXT_surface_maintenance1
 import Vulkan.Extensions.VK_EXT_swapchain_maintenance1
+import Vulkan.Extensions.VK_EXT_validation_features (ValidationFeaturesEXT, data EXT_VALIDATION_FEATURES_EXTENSION_NAME)
 import Vulkan.Extensions.VK_KHR_get_surface_capabilities2
 import Vulkan.Extensions.VK_KHR_portability_enumeration
 import Vulkan.Extensions.VK_KHR_portability_subset
@@ -100,7 +101,9 @@ import Vulkan.Extensions.VK_KHR_surface
 import Vulkan.Extensions.VK_KHR_swapchain
 import Vulkan.Zero (zero)
 
-import Test.Vulkan.Proof.Consent (Consent, describeConsent)
+import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (validationFeaturesInfo)
+import Test.GPU.Vulkan.Native.Consent (Consent, describeConsent)
+import Test.GPU.Vulkan.Native.Environment (applyImplicitLayerPolicy, clearConflictingOverrides, validationFeatures)
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop
   ( Provenance (..)
@@ -298,71 +301,16 @@ validationLayerName = "VK_LAYER_KHRONOS_validation"
 validationLayerImage ∷ Text
 validationLayerImage = "VkLayer_khronos_validation"
 
--- | Where the revision under proof comes from. `run-proof.sh` derives it from
--- the checkout, and the Linux container bakes it in because there is no
--- checkout inside to ask.
+-- | Where the revision under test comes from. `tools/vulkan/run.sh`
+-- derives it from the checkout, marking a dirty one.
 revisionVariable ∷ String
-revisionVariable = "HETOIMASIA_PROOF_REVISION"
+revisionVariable = "HETOIMASIA_VULKAN_REVISION"
 
--- | The exact identity of the sources under proof, which the runner computes
+-- | The exact identity of the sources under test, which the runner computes
 -- from their content. A revision can be dirty or absent; this cannot.
 digestVariable ∷ String
-digestVariable = "HETOIMASIA_PROOF_SOURCE_DIGEST"
+digestVariable = "HETOIMASIA_VULKAN_SOURCE_DIGEST"
 
-conflictingOverrides ∷ [String]
-conflictingOverrides =
-  [ -- Driver discovery and selection.
-    "VK_ICD_FILENAMES"
-  , "VK_ADD_DRIVER_FILES"
-  , "VK_LOADER_DRIVERS_SELECT"
-  , "VK_LOADER_DRIVERS_DISABLE"
-  , -- Explicit layer discovery, and the legacy list that force-enables layers.
-    "VK_ADD_LAYER_PATH"
-  , "VK_INSTANCE_LAYERS"
-  , -- Implicit layers, which need no request from the application at all and
-    -- would otherwise join the chain unrecorded.
-    "VK_IMPLICIT_LAYER_PATH"
-  , "VK_ADD_IMPLICIT_LAYER_PATH"
-  , -- The loader's own layer filters. `DISABLE` is the dangerous one: it can
-    -- switch off the validation layer this proof requested, leaving a run that
-    -- reported zero validation errors because nothing was validating.
-    "VK_LOADER_LAYERS_ENABLE"
-  , "VK_LOADER_LAYERS_DISABLE"
-  , "VK_LOADER_LAYERS_ALLOW"
-  ]
-
--- | The loader filter that disables every implicit layer, and the policy the
--- record states. Scrubbing the ambient overrides only returns the loader to its
--- default implicit-layer search; this switches that search off, so the chain is
--- exactly the explicit layers this proof asked for and nothing a machine
--- happened to have installed.
-implicitLayerFilter ∷ String
-implicitLayerFilter = "VK_LOADER_LAYERS_DISABLE"
-
-implicitLayerPolicy ∷ Text
-implicitLayerPolicy = "~implicit~"
-
--- | Disable implicit layers, after the ambient overrides have been cleared.
--- Returns the policy actually in force, for the record.
-applyImplicitLayerPolicy ∷ IO Text
-applyImplicitLayerPolicy = do
-  setEnv implicitLayerFilter (Text.unpack implicitLayerPolicy)
-  pure
-    ( Text.pack implicitLayerFilter
-        <> "="
-        <> implicitLayerPolicy
-        <> ", so no implicit layer joins the chain and the explicit layers below are all of it"
-    )
-
-clearConflictingOverrides ∷ IO [Text]
-clearConflictingOverrides =
-  fmap concat . forM conflictingOverrides $ \name → do
-    present ← lookupEnv name
-    case present of
-      Nothing → pure []
-      Just value → do
-        unsetEnv name
-        pure [Text.pack name <> "=" <> Text.pack value]
 
 -- --------------------------------------------------------------------------
 -- The run
@@ -518,6 +466,7 @@ procedure journal consent cleanups sink ledger = do
           <> [KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME]
           <> [EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME]
           <> [KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME | portabilityEnumeration]
+          <> [EXT_VALIDATION_FEATURES_EXTENSION_NAME]
       validationLayer = validationLayerName
       enabledLayers = [validationLayer | validationLayer `elem` layerNames]
   forM_ (KHR_SURFACE_EXTENSION_NAME : required) $ \name →
@@ -537,6 +486,16 @@ procedure journal consent cleanups sink ledger = do
     "validation"
     "the pinned layer path supplies no VK_LAYER_KHRONOS_validation, so a clean run would prove nothing"
     (not (null enabledLayers))
+  -- Synchronization validation is enabled by this instance's own create info,
+  -- through the layer's validation-features extension, exactly as the
+  -- production roots enable it. A layer that does not offer the extension is
+  -- a stop, never a run validated without it.
+  (_, layerExtensions) ← enumerateInstanceExtensionProperties (Just validationLayer)
+  require
+    "synchronization validation"
+    "the validation layer does not offer VK_EXT_validation_features, so synchronization validation cannot be enabled"
+    (EXT_VALIDATION_FEATURES_EXTENSION_NAME `elem` [e.extensionName | e ← Vector.toList layerExtensions])
+  note journal ("the instance enables the validation features " <> Text.pack (show validationFeatures) <> " through its create info")
 
   -- Registered before the instance, so it is released after it: the trampoline
   -- has to still be callable while vkDestroyInstance runs.
@@ -549,7 +508,7 @@ procedure journal consent cleanups sink ledger = do
     owning cleanups TheVulkanInstance
     ( createInstance
       ( InstanceCreateInfo
-          { next = (createInfo, ())
+          { next = (createInfo, (validationFeaturesInfo validationFeatures, ()))
           , flags = if portabilityEnumeration then INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR else zero
           , applicationInfo =
               Just
@@ -563,7 +522,7 @@ procedure journal consent cleanups sink ledger = do
           , enabledLayerNames = Vector.fromList enabledLayers
           , enabledExtensionNames = Vector.fromList wantedInstance
           }
-          ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT]
+          ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT, ValidationFeaturesEXT]
       )
       Nothing
     )
@@ -779,6 +738,7 @@ procedure journal consent cleanups sink ledger = do
             , platformRequestedLayers = map decodeName enabledLayers
             , platformImplicitLayerPolicy = implicitPolicy
             , platformValidationLayerLoaded = validationLoaded
+            , platformValidationFeatures = map (Text.pack . show) validationFeatures
             , platformGlfwRequired = map decodeName required
             }
       , findingsLoader =

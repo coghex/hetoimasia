@@ -9,9 +9,9 @@
 -- "Test.Vulkan.Proof.Retention". Only the native layer is a stand-in, and it
 -- is a stand-in precisely so that the step a run fails at can be chosen:
 --
--- > bash tools/vulkan-proof/run-proof.sh --headless
+-- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --match "without a native session"
 --
--- selects these alongside the retention examples, before consent is read and
+-- selects these alongside the retention examples, with no consent and
 -- before any native procedure would run. They open no window, initialize no
 -- GLFW, and make no native call.
 --

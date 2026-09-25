@@ -332,7 +332,7 @@ renderToolchainFailure failure =
          | Just manifest ← [refusalManifest failure]
          ]
       <> [ "  No other glslangValidator is used. Regenerate the fingerprint from the provisioned prefix with"
-         , "  `bash tools/vulkan-proof/run-shaders.sh`, or see packages/gpu-vulkan/native/README.md."
+         , "  `bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-native`, or see packages/gpu-vulkan/native/README.md."
          ]
 
 -- | Read a fingerprint and hold it to the wrapper, compiler and manifest it

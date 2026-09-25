@@ -7,10 +7,10 @@
 -- "Test.Vulkan.Proof.Run" obeys. They open no window, initialize no GLFW, make
 -- no native call, and need no @HETOIMASIA_NATIVE_SESSION@:
 --
--- > bash tools/vulkan-proof/run-proof.sh --headless
+-- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --match "without a native session"
 --
--- selects exactly this module, before consent is read and before any native
--- procedure would run.
+-- selects them with the suite's other session-free examples, and needs no
+-- consent.
 --
 -- The cases are the ones a native run cannot be asked to produce on demand. A
 -- present fence that times out, a device-idle boundary that fails, and a lost

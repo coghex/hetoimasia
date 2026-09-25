@@ -47,14 +47,21 @@ destroys it.
 It is listed only in `cabal.project.vulkan`, beside its local dependency closure
 — the diagnostics package, `hetoimasia-gpu-vulkan-model`, the foundation, and
 the test-only support library its shader suite uses — so neither ordinary
-project resolves the binding, the Vulkan headers or a loader. The only things
-that build it are `tools/vulkan-proof/run-shaders.sh` and
-`tools/vulkan-proof/run-proof.sh`, which runs the former first; both point Cabal
-at the provisioned loader and headers. Its headless suite, `native-tests`
-(`test/RootsMain.hs`), runs the profile's and the roots' examples over a
-stand-in native layer through `run-proof.sh --headless`, beside the shader
-suite; its native cases run in the proof harness until VK-8 moves them into a
-package-native fixture — see [the proof harness](../../../tools/vulkan-proof/README.md).
+project resolves the binding, the Vulkan headers or a loader. The only thing
+that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
+points Cabal at the provisioned loader and headers. Its headless suite,
+`native-tests` (`test/RootsMain.hs`), runs the profile's and the roots'
+examples over a stand-in native layer, and the shader suite runs beside it,
+both in the validation group `test.vulkan-headless`; its native cases run in
+the window integration's native suite, `test.vulkan-native` — see
+[the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
+
+The roots' production layer enables synchronization validation through the
+instance's own create info (`validationFeaturesInfo`, chained as a
+`VkValidationFeaturesEXT`) whenever the caller's request names a
+`ValidationFeature`, and the profile plans it only through an enabled layer that
+offers `VK_EXT_validation_features`; anything else is refused rather than
+validated without it.
 
 ## Shaders
 
@@ -153,15 +160,13 @@ every splice checks it.
 ### Building and testing
 
 ```bash
-bash tools/vulkan-proof/run-shaders.sh
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:shader-tests
 ```
 
-runs `native.py prepare`, the fingerprint generator and
-`cabal test hetoimasia-gpu-vulkan-native:shader-tests`, with the proof's build
-directory and Cabal flags. Arguments are forwarded to the suite. It needs no
-display, device or consent, and `run-proof.sh` runs it before the proof, which
-is the route that executes the suite until VK-8's `test.vulkan-headless`
-exists. The suite first prints the embedded pair's sizes and SHA-256 digests,
+runs `native.py prepare`, the fingerprint generator and the suite, with the
+Vulkan build directory and Cabal flags; arguments after `--` are forwarded to
+the suite. It needs no display, device or consent, and the group
+`test.vulkan-headless` runs it on every change that affects it. The suite first prints the embedded pair's sizes and SHA-256 digests,
 then checks that the embedded SPIR-V is version 1.6, that the interpolated
 constant and location reached the compiled vertex module, that the fragment
 file's transitive include was resolved, that the runtime entry compiles that
@@ -170,7 +175,7 @@ refused, and — by compiling a client module outside the package with the
 package's fingerprint — that a broken splice fails the build with its module,
 position, stage and compiler message.
 
-`tools/vulkan-proof/shader-evidence.sh` is the local verification of what one
+`tools/vulkan/shader-evidence.sh` is the local verification of what one
 build cannot show: which modules recompile, and which shader compilations run,
 when a source, an include, an interpolated constant, the flags, the target or
 the compiler's identity changes; that an edited fingerprint is refused and a
@@ -179,8 +184,8 @@ refused while a competing `glslangValidator` first on `PATH` never runs; and
 that the source distribution builds, from two extraction directories, to the
 same embedded bytes. Its retained transcript is
 [docs/vulkan/shader-rebuilds-macos.md](../../../docs/vulkan/shader-rebuilds-macos.md).
-The Linux proof route's run of the suite, with the compiler identity it named,
-is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.md).
+The retired Linux proof route's run of the suite, with the compiler identity it
+named, is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.md).
 
 [`docs/vulkan_diagnostics.md`](../../../docs/vulkan_diagnostics.md) is the
 messengers' contract in prose, and [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)

@@ -129,7 +129,7 @@ data PlatformFacts = PlatformFacts
     -- ^ The identity that is exact. A SHA-256 over the content of every source
     -- the proof is built from, so a retained record names the tree it was
     -- produced by whether or not a revision was resolvable, and a reader can
-    -- recompute it. `tools/vulkan-proof/run-proof.sh` prints how.
+    -- recompute it. `tools/vulkan/run.sh` computes it, and says how.
   , platformConsent ∷ Text
   , platformDriverFiles ∷ Maybe Text
   , platformLayerPath ∷ Maybe Text
@@ -146,6 +146,10 @@ data PlatformFacts = PlatformFacts
     -- ambient overrides is not enough: that restores the loader's *default*
     -- implicit search rather than disabling it, and @VK_LAYER_PATH@ governs
     -- explicit layers only.
+  , platformValidationFeatures ∷ [Text]
+    -- ^ The validation features the instance's own create info enabled
+    -- through the validation layer: synchronization validation, which the
+    -- layer leaves off otherwise.
   , platformValidationLayerLoaded ∷ Bool
     -- ^ Whether the validation layer is in the chain the loader actually built,
     -- observed by attributing a resolved device entry point to its image.

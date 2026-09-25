@@ -6,7 +6,7 @@
 # `qualify-binding.sh` can prove the pair still resolves and builds on demand.
 # VK-4 has since provisioned a Vulkan runtime into that image and into the local
 # native prefix; the pair pinned here is unchanged by it, and
-# `tools/vulkan-proof/run-proof.sh` is what builds against the provisioned one.
+# `tools/vulkan/run.sh` is what builds against the provisioned one.
 # See docs/toolchain.md.
 VULKAN_VERSION=3.27
 VULKAN_UTILS_VERSION=0.5.11.0

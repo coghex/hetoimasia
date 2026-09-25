@@ -68,6 +68,7 @@ import Vulkan.Core13 (data API_VERSION_1_3)
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import Vulkan.Dynamic (DeviceCmds (..), InstanceCmds (..))
 import Vulkan.Extensions.VK_EXT_debug_utils
+import Vulkan.Extensions.VK_EXT_validation_features (ValidationFeaturesEXT, data EXT_VALIDATION_FEATURES_EXTENSION_NAME)
 import Vulkan.Extensions.VK_KHR_portability_enumeration
 import Vulkan.Extensions.VK_KHR_portability_subset
 import Vulkan.Zero (zero)
@@ -102,6 +103,8 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
   , destroyInstanceQuiesced
   , nativeFfiConfiguration
   )
+import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (validationFeaturesInfo)
+import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.Vulkan.Proof.Interop (Provenance (..), provenanceOf)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
@@ -193,9 +196,10 @@ validationLayer = "VK_LAYER_KHRONOS_validation"
 stopWith ∷ Text → IO a
 stopWith reason = throwIO (userError (Text.unpack reason))
 
--- | Run the session. It inherits the process environment the VK-2 run
--- established — the pinned driver manifest, the one-layer path, and the
--- implicit-layer policy — because it runs after it in the same process.
+-- | Run the session. It runs in the environment the native suite established
+-- at startup — the pinned driver manifest, the one-layer path, the
+-- implicit-layer policy, and no ambient layer settings — which its child
+-- process inherits and establishes again.
 runDiagnostics ∷ Journal → IO DiagnosticsOutcome
 runDiagnostics journal = do
   heading journal "VK-6: C-only validation capture"
@@ -305,10 +309,15 @@ session journal phases cursor capture = do
     stopWith "the pinned layer path offers no VK_LAYER_KHRONOS_validation"
   unless (advertised EXT_DEBUG_UTILS_EXTENSION_NAME) $
     stopWith "the loader does not advertise VK_EXT_debug_utils"
+  -- Synchronization validation, through this instance's own create info, as
+  -- every validation-enabled instance of the suite enables it.
+  (_, layerExtensions) ← enumerateInstanceExtensionProperties (Just validationLayer)
+  unless (EXT_VALIDATION_FEATURES_EXTENSION_NAME `elem` [e.extensionName | e ← Vector.toList layerExtensions]) $
+    stopWith "the validation layer does not offer VK_EXT_validation_features, so synchronization validation cannot be enabled"
 
   let createInfo =
         InstanceCreateInfo
-          { next = (captureMessengerCreateInfo capture, ())
+          { next = (captureMessengerCreateInfo capture, (validationFeaturesInfo validationFeatures, ()))
           , flags = if portability then INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR else zero
           , applicationInfo =
               Just
@@ -322,9 +331,11 @@ session journal phases cursor capture = do
           , enabledLayerNames = Vector.singleton validationLayer
           , enabledExtensionNames =
               Vector.fromList
-                ([EXT_DEBUG_UTILS_EXTENSION_NAME] <> [KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME | portability])
+                ( [EXT_DEBUG_UTILS_EXTENSION_NAME, EXT_VALIDATION_FEATURES_EXTENSION_NAME]
+                    <> [KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME | portability]
+                )
           }
-          ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT]
+          ∷ InstanceCreateInfo '[DebugUtilsMessengerCreateInfoEXT, ValidationFeaturesEXT]
   -- The instance is the outermost native scope, so vkDestroyInstance is the
   -- last thing this body does: after the explicit messenger, and before the
   -- lifetime closes admission. It is destroyed through the native package's

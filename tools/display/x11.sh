@@ -29,7 +29,14 @@
 # the human's HETOIMASIA_NATIVE_SESSION=desktop on a real desktop, which no
 # script supplies.
 #
-#   tools/display/x11.sh [--summary FILE] -- COMMAND [ARGUMENT...]
+#   tools/display/x11.sh [--summary FILE] [--retain DIRECTORY] -- COMMAND [ARGUMENT...]
+#
+# The server's and the window manager's logs live in a scratch directory that
+# is removed when the helper exits, however it exits. `--retain DIRECTORY`
+# copies them into that directory first — on a normal exit, a refusal, and a
+# signal alike — so a run that was stopped, or whose display failed, keeps the
+# diagnostics its cleanup would otherwise delete. The validation runner's
+# evidence directory is what `tools/vulkan/run.sh` names.
 #
 # Exit status: the command's own once it ran; 1 when the display could not be
 # established, with the command never started; 2 for a usage error. See
@@ -37,16 +44,22 @@
 set -uo pipefail
 
 usage() {
-  echo "x11.sh: usage: x11.sh [--summary FILE] -- COMMAND [ARGUMENT...]" >&2
+  echo "x11.sh: usage: x11.sh [--summary FILE] [--retain DIRECTORY] -- COMMAND [ARGUMENT...]" >&2
   exit 2
 }
 
 summary=""
+retain=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --summary)
       [ "$#" -ge 2 ] || usage
       summary="$2"
+      shift 2
+      ;;
+    --retain)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      retain="$2"
       shift 2
       ;;
     --)
@@ -99,6 +112,12 @@ stop() {
   done
   wait
   if [ -n "$scratch" ]; then
+    if [ -n "$retain" ]; then
+      mkdir -p "$retain"
+      for log in "$scratch"/*.log "$scratch"/*.txt; do
+        [ -f "$log" ] && cp "$log" "$retain/x11-$(basename "$log")"
+      done
+    fi
     rm -rf "$scratch"
   fi
 } 2>/dev/null

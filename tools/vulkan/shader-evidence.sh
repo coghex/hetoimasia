@@ -6,7 +6,9 @@
 # what it shows is what a build does across builds — which modules Cabal and
 # GHC recompile, and which shader compilations actually run, when one input
 # changes — and no single Hspec example can observe that from inside one build.
-# `run-shaders.sh` is the routine route; this is what its claims rest on.
+# `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:shader-tests`
+# — the group `test.vulkan-headless` — is the routine route; this is what its
+# claims rest on.
 #
 # Nothing in the checkout is touched. The tracked and untracked-but-not-ignored
 # files are copied to a scratch directory and edited there, and the compiler is
@@ -17,7 +19,7 @@
 # than inferred. The provisioned prefix is still what `native.py prepare`
 # verifies and what the build links against.
 #
-#   bash tools/vulkan-proof/shader-evidence.sh > transcript.txt
+#   bash tools/vulkan/shader-evidence.sh > transcript.txt
 #
 # It prints a transcript; docs/vulkan/shader-rebuilds-macos.md retains one.
 # It opens no window, starts no session and reads no consent.

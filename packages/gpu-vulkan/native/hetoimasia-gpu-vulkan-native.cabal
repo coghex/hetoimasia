@@ -64,8 +64,8 @@ library
         Hetoimasia.GPU.Vulkan.Native.Shader
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
-    -- from the provisioned Vulkan prefix `tools/vulkan-proof/run-proof.sh`
-    -- passes to Cabal; the capture header from the diagnostics package.
+    -- from the provisioned Vulkan prefix `tools/vulkan/run.sh` passes to
+    -- Cabal; the capture header from the diagnostics package.
     c-sources: cbits/hetoimasia_vulkan_native.c
     include-dirs: cbits
     cc-options: -std=c11 -Wall -Wextra -Werror
@@ -111,7 +111,7 @@ library shader-toolchain
 
 -- Run before every build that splices shaders: it validates the wrapper and
 -- the native manifest and rewrites the fingerprint only when it changed.
--- `tools/vulkan-proof/run-shaders.sh` runs it; see README.md.
+-- `tools/vulkan/run.sh` runs it before every build and test; see README.md.
 executable hetoimasia-shader-fingerprint
     default-language: GHC2024
     default-extensions: UnicodeSyntax
@@ -155,8 +155,8 @@ test-suite shader-tests
 -- decision of the roots over a stand-in native layer that fails at a chosen
 -- step. They make no native call and create no device; the executable links
 -- the loader only because the library does, so it is built and run through
--- `tools/vulkan-proof/run-proof.sh --headless`, which points Cabal at the
--- provisioned prefix. It shares `test/` with the shader suite and has its own
+-- `tools/vulkan/run.sh test` — the group `test.vulkan-headless` — which points
+-- Cabal at the provisioned prefix. It shares `test/` with the shader suite and has its own
 -- main.
 test-suite native-tests
     import: language

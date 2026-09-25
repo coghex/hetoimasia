@@ -4,7 +4,7 @@
 # loader and headers because it predates VK-4, which has since provisioned a
 # qualified Vulkan runtime into the CI image itself; this container's inputs are
 # its own and say nothing about that one. What proves the runtime *profile* is
-# now the `vulkan-proof` route running inside the published image, and what this
+# now the `test.vulkan-native` group running on the published image, and what this
 # still answers is the narrower question it was built for: does the pinned
 # binding compile against the pinned compiler at all.
 #

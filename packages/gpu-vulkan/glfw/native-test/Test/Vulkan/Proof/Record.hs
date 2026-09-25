@@ -70,8 +70,8 @@ renderRecordWith title invocation transcript outcome extra passed =
     , "Verdict: **" <> (if passed then "pass" else "fail") <> "**."
     , ""
     , "The proof process's own command and the environment that decided which"
-    , "loader, driver, and layers it used. `tools/vulkan-proof/run-proof.sh` is"
-    , "what establishes this; see the README beside it for how to reproduce."
+    , "loader, driver, and layers it used. `tools/vulkan/run.sh` is what"
+    , "establishes this; see docs/gpu_backend.md for how to reproduce."
     , ""
     , "```"
     , invocation
@@ -141,6 +141,7 @@ platformSection facts =
       , ("implicit-layer policy", facts.platformImplicitLayerPolicy)
       , ("layers requested", listOrNone facts.platformRequestedLayers)
       , ("the validation layer is in the loaded chain", yesNo facts.platformValidationLayerLoaded)
+      , ("validation features enabled by the create info", listOrNone facts.platformValidationFeatures)
       , ("surface extensions GLFW requires", listOrNone facts.platformGlfwRequired)
       ]
 

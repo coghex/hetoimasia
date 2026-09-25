@@ -169,11 +169,12 @@ absentWaylandDisplay = "hetoimasia-vulkan-proof-no-such-display"
 runBridge ∷ Journal → IO BridgeOutcome
 runBridge journal = do
   heading journal "VK-5: the loader-aware GLFW surface bridge"
-  -- The VK-2 run handed GLFW this same entry point through its throwaway shim
-  -- and never took it back. Restore the default first, so every setting this
-  -- session observes is one the production shim made.
+  -- The VK-2 case hands GLFW this same entry point through its throwaway shim
+  -- and never takes it back. This session has a process of its own, but it
+  -- restores the default first all the same, so every setting it observes is
+  -- one the production shim made whatever ran before it.
   initVulkanLoader nullFunPtr
-  note journal "restored GLFW's default loader through the VK-2 shim, which had left the binding's entry point installed"
+  note journal "restored GLFW's default loader through the VK-2 shim before the production shim's first setting"
   outcome ← try @SomeException (session journal)
   case outcome of
     Left failure → do
