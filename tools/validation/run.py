@@ -77,6 +77,7 @@ import argparse
 import hashlib
 import json
 import platform
+import shutil
 import signal
 import stat
 import subprocess
@@ -910,10 +911,17 @@ def main(argv: list[str]) -> int:
     timeout_seconds = group["timeout_seconds"]
     receipts_directory = os.path.abspath(arguments.receipts)
     evidence_directory = os.path.join(receipts_directory, "evidence", arguments.group)
+    # Every file the receipt lists must be one this execution left, so whatever
+    # an earlier execution of the same group left here goes first. A link
+    # standing where the directory belongs is removed, never followed.
     try:
-        os.makedirs(evidence_directory, exist_ok=True)
+        if os.path.islink(evidence_directory) or os.path.isfile(evidence_directory):
+            os.unlink(evidence_directory)
+        elif os.path.isdir(evidence_directory):
+            shutil.rmtree(evidence_directory)
+        os.makedirs(evidence_directory)
     except OSError as error:
-        raise ProvenanceError(f"cannot create the evidence directory {evidence_directory}: {error}") from error
+        raise ProvenanceError(f"cannot prepare the evidence directory {evidence_directory}: {error}") from error
     environment = dict(os.environ)
     environment[EVIDENCE_VARIABLE] = evidence_directory
 

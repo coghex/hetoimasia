@@ -1327,7 +1327,8 @@ it be a measurement: `test.vulkan-native`'s thirty seconds count nothing that
 compiled.
 
 Both stages run with `HETOIMASIA_VALIDATION_EVIDENCE` naming
-`<receipts>/evidence/<group-id>/`, which the runner creates. Whatever a stage
+`<receipts>/evidence/<group-id>/`, which the runner empties — removing whatever
+an earlier execution of the group left there — and creates afresh. Whatever a stage
 leaves there is listed in the receipt's `evidence`, relative to the receipts
 directory, and uploaded with the receipts, so a group that failed or expired
 keeps what its cleanup would otherwise have deleted.

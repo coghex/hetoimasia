@@ -162,6 +162,19 @@ spec = describe "Validation execution" $ do
         stringsField receipt "evidence"
           `shouldBe` Just ["evidence/probe.prepared/built", "evidence/probe.prepared/ran"]
 
+    it "lists only what this execution left in its evidence, whatever an earlier one left" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.prepared"]
+        -- An earlier execution of the same group into the same receipts
+        -- directory, which left a file this one will not.
+        writeFixtureFile (receiptsDirectory fixture) "evidence/probe.prepared/earlier.log" "an earlier run's output\n"
+        (result, _, _) ← runGroup fixture "probe.prepared" plan []
+        result `shouldBe` ExitSuccess
+        receipt ← readReceipt fixture "probe.prepared"
+        stringsField receipt "evidence"
+          `shouldBe` Just ["evidence/probe.prepared/built", "evidence/probe.prepared/ran"]
+        doesFileExist (receiptsDirectory fixture </> "evidence/probe.prepared/earlier.log") `shouldReturn` False
+
     it "records a group without a preparation as one stage" $
       withFixture $ \fixture → do
         change fixture "src/note.txt" "revised source\n"
