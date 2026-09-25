@@ -34,6 +34,7 @@ import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
 
 -- | One native call the recording made, in the order it made it.
@@ -158,7 +159,13 @@ recordingStandInOps standIn =
         handle ← fresh standIn
         handle <$ step standIn AtCreateLayout (CreatedLayout handle)
     , opsDestroyPipelineLayout = \_ handle → step standIn AtDestroyLayout (DestroyedLayout handle)
-    , opsCreatePipeline = \_ request → do
+    , opsCreatePipeline = \_ request name → do
+        -- Its shader modules are numbers too, named as the production layer
+        -- names them and gone once it returns.
+        vertex ← fresh standIn
+        name VertexStage vertex
+        fragment ← fresh standIn
+        name FragmentStage fragment
         handle ← fresh standIn
         handle <$ step standIn AtCreatePipeline (CreatedPipeline handle (requestLayout request) (requestColorFormat request))
     , opsDestroyPipeline = \_ handle → step standIn AtDestroyPipeline (DestroyedPipeline handle)

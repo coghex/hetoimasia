@@ -47,7 +47,12 @@
 -- ("Hetoimasia.GPU.Vulkan.Native.Naming") — a frame storage's pool and command
 -- buffer with the target and slot they serve too — once the model has issued
 -- that identity and before the handle is returned, so no batch can reference
--- an unnamed object. A naming call that raised releases the generation it was
+-- an unnamed object. A pipeline's two shader modules exist only while it is
+-- built, before that identity is issued, so they are named, as each is created,
+-- under the identity the model is about to issue — every model operation that
+-- issues one is this owner's, so it is the one issued — and a module whose
+-- name could not be set fails the pipeline's construction: the native layer
+-- destroys what it made, and the reservation is given back. A naming call that raised releases the generation it was
 -- naming, which the owner's disposal then destroys like any other released
 -- generation, and re-raises: the handle is never returned, and a replacement
 -- whose new generation could not be named leaves neither generation
@@ -271,6 +276,7 @@ import Hetoimasia.GPU.Model.Identity
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), Generations, TargetGenerationsView (..), readTargetGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
+  , ShaderStage
   , batchLabel
   , commandBufferName
   , commandPoolName
@@ -278,6 +284,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , pipelineLayoutName
   , pipelineName
   , readbackBufferName
+  , shaderModuleName
   , readbackMemoryName
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
@@ -401,9 +408,11 @@ data ReadbackAllocation = ReadbackAllocation
 data RecordingOps dev cmd = RecordingOps
   { opsCreatePipelineLayout ∷ dev → IO Word64
   , opsDestroyPipelineLayout ∷ dev → Word64 → IO ()
-  , opsCreatePipeline ∷ dev → PipelineRequest → IO Word64
+  , opsCreatePipeline ∷ dev → PipelineRequest → (ShaderStage → Word64 → IO ()) → IO Word64
     -- ^ Builds and destroys its own shader modules; the pipeline is the only
-    -- thing it leaves.
+    -- thing it leaves. Each module is handed to the naming call right after it
+    -- is created, before anything uses it; a naming call that raised destroys
+    -- every module made so far before the failure is re-raised.
   , opsDestroyPipeline ∷ dev → Word64 → IO ()
   , opsCreateStorage ∷ dev → Word32 → IO (Word64, cmd)
     -- ^ A command pool on the queue family, and the one primary command buffer
@@ -616,7 +625,7 @@ instance Exception ResourcesRetained where
 createPipelineLayout ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
 createPipelineLayout recording =
   fmap PipelineLayout
-    <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device → NativeLayout <$> opsCreatePipelineLayout ops device) Nothing
+    <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ → NativeLayout <$> opsCreatePipelineLayout ops device) Nothing
 
 -- | A graphics pipeline over the layout, rendering to the color format. The
 -- layout must be live; the pipeline depends on that exact generation, which
@@ -649,7 +658,10 @@ buildPipeline recording (PipelineLayout layout) shaders format replacing =
           0
           1
           "vkCreateGraphicsPipelines"
-          (\ops device → (\created → NativePipeline created layout format) <$> opsCreatePipeline ops device (PipelineRequest handle shaders format))
+          ( \ops device issued → do
+              naming ← shaderNaming recording issued
+              (\created → NativePipeline created layout format) <$> opsCreatePipeline ops device (PipelineRequest handle shaders format) naming
+          )
           replacing
     Right _ → pure (Left RefusedWrongKind)
 
@@ -686,7 +698,7 @@ createFrameStorage recording target slot = do
               0
               2
               "vkCreateCommandPool"
-              (\ops device → (\(pool, commands) → NativeStorage target slot pool commands) <$> opsCreateStorage ops device queueFamily)
+              (\ops device _ → (\(pool, commands) → NativeStorage target slot pool commands) <$> opsCreateStorage ops device queueFamily)
               Nothing
           for_ made (\resource → atomically (modifyTVar' (recordingStorages recording) (Map.insert (target, slot) resource)))
           pure (FrameStorage <$> made)
@@ -703,19 +715,34 @@ createReadback recording bytes
           bytes
           2
           "vkCreateBuffer"
-          (\ops device → (\allocation → NativeReadback allocation ContentsUndefined) <$> opsCreateReadback ops device bytes)
+          (\ops device _ → (\allocation → NativeReadback allocation ContentsUndefined) <$> opsCreateReadback ops device bytes)
           Nothing
+
+-- | The naming call a pipeline's shader modules are given: under the
+-- identity the model is about to issue the pipeline, when the roots offer
+-- naming, and nothing otherwise.
+shaderNaming ∷ Recording q inst msgr phys dev cmd → Maybe ResourceId → IO (ShaderStage → Word64 → IO ())
+shaderNaming recording issued =
+  readRootsInstrumentation roots >>= \case
+    Just (_, instrumentation)
+      | Just resource ← issued →
+          pure (\stage handle → nameRootsObject roots instrumentation ObjectShaderModule handle (shaderModuleName resource stage))
+    _ → pure (\_ _ → pure ())
+  where
+    roots = recordingRoots recording
 
 -- | Reserve the accounting, make the native object, and turn the reservation
 -- into a managed generation — or into a new generation of the one being
 -- replaced — in one masked step. A creation that raised created nothing: its
--- reservation is given back, and the failure is re-raised.
+-- reservation is given back, and the failure is re-raised. The creation is
+-- told the identity the model is about to issue the generation, for what it
+-- names before that identity exists.
 construct
   ∷ Recording q inst msgr phys dev cmd
   → Natural
   → Natural
   → Text
-  → (RecordingOps dev cmd → dev → IO (NativeResource cmd))
+  → (RecordingOps dev cmd → dev → Maybe ResourceId → IO (NativeResource cmd))
   → Maybe ResourceId
   → IO (Either Refusal ResourceId)
 construct recording bytes objects name create replacing =
@@ -734,8 +761,17 @@ construct recording bytes objects name create replacing =
             reserved ← atomically (modelAnswer roots (beginAllocation bytes objects))
             case reserved of
               Left refusal → pure (Left refusal)
-              Right allocation →
-                tryWithContext @SomeException (rootsCall roots name (create (recordingOps recording) device)) >>= \case
+              Right allocation → do
+                issued ← atomically $ stateRootsModel roots $ \model →
+                  let answer = case replacing of
+                        Nothing → createResource allocation model
+                        Just old → rebuildResource old allocation model
+                   in ( case answer of
+                          Admitted (_, resource) → Just resource
+                          _ → Nothing
+                      , model
+                      )
+                tryWithContext @SomeException (rootsCall roots name (create (recordingOps recording) device issued)) >>= \case
                   Left failure → do
                     atomically $ do
                       modelEdit roots (recordAllocationFailure allocation)

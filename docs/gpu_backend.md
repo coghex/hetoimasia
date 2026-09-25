@@ -580,6 +580,7 @@ No caller-supplied text reaches a name.
 | Each swapchain image | `… generation <g> image <index>` | Right after the images are enumerated |
 | Each image view | `… generation <g> view <index>` | Right after each is created |
 | A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
+| A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
 | A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
 | A readback's buffer and memory | `resource <n>.<g> readback buffer`, `… readback memory` | The same |
 
@@ -590,6 +591,8 @@ admitted, so its creator still owns it. A device or queue whose name could not
 be set stays recorded and owned, and is named again at the next admission. A
 generation whose swapchain, image or view could not be named fails its
 construction: it is retired unpublished and destroyed once its holds end. A
+pipeline whose shader module could not be named is not created: the native
+layer destroys the modules it made, and the reservation is given back. A
 managed resource whose objects could not be named is released — nothing can
 record it, and the owner's disposal destroys it — and its handle is never
 returned; a replacement whose new generation could not be named leaves neither

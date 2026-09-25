@@ -69,6 +69,7 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics (NativeFfiConfiguration (..), na
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
+  , ShaderStage (..)
   , batchLabel
   , commandBufferName
   , commandPoolName
@@ -77,6 +78,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , pipelineName
   , readbackBufferName
   , readbackMemoryName
+  , shaderModuleName
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
@@ -747,12 +749,26 @@ spec = describe "Recording" $ do
       [readbackHandles] ← map viewNativeHandles . filter ((== managedResource readback) . viewResource) <$> atomically (readManaged (rigRecording rig))
       namesGiven (rigStandIn rig)
         `shouldReturn` [ (ObjectPipelineLayout, layoutNative, pipelineLayoutName (managedResource layout))
+                       , -- The stand-in numbers the modules just before the pipeline.
+                         (ObjectShaderModule, pipelineNative - 2, shaderModuleName (managedResource pipeline) VertexStage)
+                       , (ObjectShaderModule, pipelineNative - 1, shaderModuleName (managedResource pipeline) FragmentStage)
                        , (ObjectPipeline, pipelineNative, pipelineName (managedResource pipeline))
                        , (ObjectCommandPool, pool, commandPoolName (managedResource storage) (rigTarget rig) 0)
                        , (ObjectCommandBuffer, buffer, commandBufferName (managedResource storage) (rigTarget rig) 0)
                        , (ObjectBuffer, firstOr 0 readbackHandles, readbackBufferName (managedResource readback))
                        , (ObjectDeviceMemory, lastOr 0 readbackHandles, readbackMemoryName (managedResource readback))
                        ]
+
+    it "fails a pipeline whose shader module could not be named: nothing is created or managed, and the reservation is given back" $ do
+      rig ← newNamingRig
+      layout ← created (createPipelineLayout (rigRecording rig))
+      before ← usage <$> modelOf rig
+      failNaming (rigStandIn rig) ObjectShaderModule
+      raised ← try @NamingFailure (createPipeline (rigRecording rig) layout shaders formatB8G8R8A8Srgb)
+      fmap (const ()) raised `shouldBe` Left (NamingFailure ObjectShaderModule)
+      nativeOf rig `shouldReturn'` \calls → [() | CreatedPipeline {} ← calls] `shouldBe` []
+      map viewKind <$> atomically (readManaged (rigRecording rig)) `shouldReturn` ["pipeline layout"]
+      usage <$> modelOf rig `shouldReturn` before
 
     it "releases a resource whose naming raised, returns no handle, and lets disposal destroy it" $ do
       rig ← newNamingRig

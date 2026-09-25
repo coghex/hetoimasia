@@ -23,6 +23,7 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
     Instrumentation (..)
   , NativeObjectKind (..)
   , objectTypeCode
+  , ShaderStage (..)
 
     -- * Bounds
   , maximumNameBytes
@@ -37,6 +38,7 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , imageViewName
   , pipelineLayoutName
   , pipelineName
+  , shaderModuleName
   , commandPoolName
   , commandBufferName
   , readbackBufferName
@@ -92,6 +94,7 @@ data NativeObjectKind
   | ObjectCommandBuffer
   | ObjectPipelineLayout
   | ObjectPipeline
+  | ObjectShaderModule
   | ObjectBuffer
   | ObjectDeviceMemory
   deriving (Eq, Ord, Show, Enum, Bounded)
@@ -106,6 +109,7 @@ objectTypeCode = \case
   ObjectBuffer → 9
   ObjectImage → 10
   ObjectImageView → 14
+  ObjectShaderModule → 15
   ObjectPipelineLayout → 17
   ObjectPipeline → 19
   ObjectCommandPool → 25
@@ -153,6 +157,20 @@ pipelineLayoutName resource = boundedName (resourceText resource <> " pipeline l
 
 pipelineName ∷ ResourceId → ByteString
 pipelineName resource = boundedName (resourceText resource <> " pipeline")
+
+-- | The stage a pipeline's shader module serves.
+data ShaderStage = VertexStage | FragmentStage
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | One of the shader modules a pipeline is built from, which exist only
+-- while it is built: the pipeline's resource, and the stage.
+shaderModuleName ∷ ResourceId → ShaderStage → ByteString
+shaderModuleName resource stage =
+  boundedName
+    ( resourceText resource <> " pipeline " <> case stage of
+        VertexStage → "vertex shader"
+        FragmentStage → "fragment shader"
+    )
 
 -- | A frame slot's command pool: its resource, and the target and slot it
 -- serves.

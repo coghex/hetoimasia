@@ -42,6 +42,7 @@ spec = describe "Profile" $ do
                        , (ObjectCommandBuffer, OBJECT_TYPE_COMMAND_BUFFER)
                        , (ObjectPipelineLayout, OBJECT_TYPE_PIPELINE_LAYOUT)
                        , (ObjectPipeline, OBJECT_TYPE_PIPELINE)
+                       , (ObjectShaderModule, OBJECT_TYPE_SHADER_MODULE)
                        , (ObjectBuffer, OBJECT_TYPE_BUFFER)
                        , (ObjectDeviceMemory, OBJECT_TYPE_DEVICE_MEMORY)
                        ]

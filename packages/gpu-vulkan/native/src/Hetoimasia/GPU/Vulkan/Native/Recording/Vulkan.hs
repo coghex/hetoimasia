@@ -46,6 +46,7 @@ import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsLabelEXT (..))
 import Vulkan.Zero (zero)
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Commands
+import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
@@ -116,14 +117,18 @@ mappedRangeOf allocation (offset, size) =
   MappedMemoryRange {memory = DeviceMemory allocation.allocationMemory, offset = fromIntegral offset, size = fromIntegral size}
 
 -- | A pipeline for dynamic rendering into one color format: its two shader
--- modules are made, used and destroyed here.
-createPipeline' ∷ Device → PipelineRequest → IO Word64
-createPipeline' device request = do
+-- modules are made, named, used and destroyed here.
+createPipeline' ∷ Device → PipelineRequest → (ShaderStage → Word64 → IO ()) → IO Word64
+createPipeline' device request name = do
   let shaders = request.requestShaders
       moduleOf code = createShaderModule device ShaderModuleCreateInfo {next = (), flags = zero, code = code} Nothing
+      handleOf (ShaderModule handle) = handle
+      destroyModule shader = destroyShaderModule device shader Nothing
   vertex ← moduleOf shaders.shaderVertex
+  name VertexStage (handleOf vertex) `onException` destroyModule vertex
   fragment ←
-    moduleOf shaders.shaderFragment `onException` destroyShaderModule device vertex Nothing
+    moduleOf shaders.shaderFragment `onException` destroyModule vertex
+  name FragmentStage (handleOf fragment) `onException` (destroyModule fragment >> destroyModule vertex)
   let stage kind shader =
         SomeStruct
           PipelineShaderStageCreateInfo {next = (), flags = zero, stage = kind, module' = shader, name = "main", specializationInfo = Nothing}
