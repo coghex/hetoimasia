@@ -64,6 +64,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , reserveFrame
   , acquireImage
   , recordBatch
+  , extendBatch
   , discardBatch
   , resetRecorder
   , resetSubmissionFence
@@ -1594,6 +1595,37 @@ recordBatch identity references model =
                                 }
                           , BatchId (frameTarget identity) batch
                           )
+
+-- | Extend a recorded batch's references before the next command that names
+-- them is recorded into it. The batch keeps its one identity; each subject is
+-- retained once however many commands use it, so naming a subject the batch
+-- already holds is ordinary repeated use and changes nothing. A request that
+-- names one subject twice is misuse, and so is any subject whose logical
+-- release or ended CPU use has been certified, whether or not the batch
+-- already holds it: nothing may record through it again. Nothing is charged:
+-- the batch's one record was reserved when it was recorded, and a reference is
+-- an entry in a subject's hold, not a record of its own.
+extendBatch ∷ BatchId → [ResourceId] → GpuModel → Outcome GpuModel
+extendBatch identity references model =
+  scheduling_ model $
+  resolved (running model) $ \() →
+    resolved (resolveBatch model identity) $ \(number, batch) →
+      resolved (traverse (resolveResource model) references) $ \resolvedResources →
+        let keys = map (uncurry ResourceKey . fst) resolvedResources
+            unique = Set.fromList keys
+         in if Set.size unique /= length keys
+              then Rejected (DuplicateSubject ResourceIdentity)
+              else
+                if any (sealed model) keys
+                  then Rejected (WrongPhase ResourceIdentity)
+                  else
+                    let added = Set.difference unique (batchSubjects batch)
+                        retained = foldl' (\current key → editHolds key (retainRecorded number) current) model (Set.toList added)
+                     in Admitted
+                          retained
+                            { gpuBatches =
+                                Map.insert number batch {batchSubjects = Set.union (batchSubjects batch) added} (gpuBatches retained)
+                            }
 
 -- | Whether a subject has been certified as recordable no longer: either the
 -- owner released it, or it certified that no retained capability can reach it.

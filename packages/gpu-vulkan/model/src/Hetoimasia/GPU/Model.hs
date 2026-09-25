@@ -99,6 +99,7 @@ module Hetoimasia.GPU.Model
   , reserveFrame
   , acquireImage
   , recordBatch
+  , extendBatch
   , discardBatch
   , resetRecorder
   , resetSubmissionFence

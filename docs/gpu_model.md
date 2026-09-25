@@ -182,6 +182,19 @@ exact generations it referenced: rebuilding a managed resource beneath a recorde
 batch leaves the batch naming the generation it recorded, which therefore stays
 undisposable.
 
+A batch is retained incrementally. `recordBatch` admits it against an acquired
+frame with the subjects known then — possibly none besides the frame's own
+generation — and reserves its one record, which is all the accounting a batch
+needs. `extendBatch` then adds references to that same batch before each command
+that names them is recorded, and charges nothing, so an exhausted object budget
+refuses a new batch but never a reference the recorder owes an existing one. The
+batch keeps its identity, and each subject is retained once however many
+commands use it: naming a subject the batch already holds is repeated use, not a
+duplicate. A request naming one subject twice is `DuplicateSubject`, and a subject
+whose logical release or ended CPU use has been certified is `WrongPhase` even if
+the batch already holds it, because a new command would record through it.
+Either refusal changes nothing, and a consumed batch extends no further.
+
 ## Frame ownership
 
 | Phase                       | Retains                                                        | Legal exits                                                                 |
@@ -611,7 +624,10 @@ retained identity for it is still called stale.
 It covers the same class of edge for the transitions themselves: a still-
 constructing candidate refused as an `oldSwapchain` predecessor without mutating
 anything; recording refused against a released or CPU-use-ended subject while an
-already-recorded batch survives; a retry refused in a terminal session for every
+already-recorded batch survives; one batch extended incrementally, retaining each
+subject once through repeated and overlapping use, charging nothing, refusing a
+duplicated request or a sealed subject without effect, and discharging every
+reference it gained when discarded; a retry refused in a terminal session for every
 cause that ends one; a reclamation pass reading exactly its window of raw records
 and reaching an eligible one beyond that window on a later pass; and the backoff
 restarting for retirement work whoever created it.
