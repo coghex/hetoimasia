@@ -530,16 +530,23 @@ reconcile generations now target geometry = do
           -- Out of date or suboptimal with the extent it already has: not a
           -- resize, so rebuilding it is a recovery attempt.
           recover planned
-      | Just (_, native) ← active
-      , not reported
-      , planExtent (genPlan native) == planExtent planned = do
-          -- The geometry moved without changing the extent a generation would
-          -- be built at: adopt it, and rebuild nothing.
-          atomically (editActive (\entry → entry {genGeometry = geometry}))
-          Nothing <$ setCondition Presenting
       | Nothing ← active = construct planned
-      | otherwise = settle planned
-    settle planned = do
+      | Just (_, native) ← active = settle planned $
+          if planExtent (genPlan native) == planExtent planned
+            then do
+              -- The geometry moved and has settled without changing the extent
+              -- a generation would be built at: adopt it, and rebuild nothing.
+              atomically $ do
+                editActive (\entry → entry {genGeometry = geometry})
+                modifyRecord (\entry → entry {recordSettling = Nothing})
+                modelEdit_ (resumeTarget target)
+              Nothing <$ setCondition Presenting
+            else construct planned
+    -- Wait until the extent a replacement would be built at has been the same
+    -- for the settling period, then continue. A surface that reports a new
+    -- extent a moment after the observation that moved is therefore still
+    -- seen, rather than the move being adopted at the old extent.
+    settle planned continue = do
         waiting ← atomically $ do
           record ← lookupRecord
           case record >>= recordSettling of
@@ -549,9 +556,9 @@ reconcile generations now target geometry = do
               pure (Left now)
         let since = either id id waiting
         case addDuration since settlingPeriod of
-          Left _ → construct planned
+          Left _ → continue
           Right due
-            | due <= now → construct planned
+            | due <= now → continue
             | otherwise → Nothing <$ setCondition (Settling due)
     recover planned =
       lookupRecordIO >>= \case

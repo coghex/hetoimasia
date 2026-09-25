@@ -117,6 +117,26 @@ spec = describe "Generations" $ do
       created rig `shouldReturn` [(640, 480), (1024, 768)]
       viewCondition <$> generationsOf rig `shouldReturn` Presenting
 
+    it "waits out a move whose surface has not caught up yet, and rebuilds once it has" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      stepAt rig 10 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      resizeSurface rig 800 600
+      stepAt rig 20 (seen 800 600)
+      stepAt rig 36 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+
+    it "adopts a settled move that leaves the extent unchanged, without a rebuild" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      stepAt rig 10 (seen 320 240)
+      stepAt rig 26 (seen 320 240)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      stepAt rig 30 (seen 320 240)
+      created rig `shouldReturn` [(640, 480)]
+      length . filter isQuery <$> swapchainCalls rig `shouldReturn` 3
+
     it "hands the active generation over as oldSwapchain, and keeps it owned until its holds end" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
