@@ -116,6 +116,8 @@ readByTheseExamples =
     <> map snd captureRecords
     <> map snd bridgeRecords
     <> map snd rootsRecords
+    <> headlessMains
+    <> [nativeSuiteMain]
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -129,6 +131,25 @@ retiredProof = "tools/vulkan-proof"
 -- | The one command that builds, tests and runs the Vulkan project.
 runner ∷ FilePath
 runner = "tools/vulkan/run.sh"
+
+-- | The native suite's main, which holds the complete profile's rules.
+nativeSuiteMain ∷ FilePath
+nativeSuiteMain = integrationPackage </> "native-test/Main.hs"
+
+-- | Why an example reading a sibling package's source is pending: those files
+-- are checkout-only, absent from an unpacked source distribution.
+siblingSourcesAbsent ∷ String
+siblingSourcesAbsent =
+  "the Vulkan packages' sources are checkout-only and absent here, as in an unpacked source \
+  \distribution; this check runs from a checkout, which is where the workflow group runs it"
+
+-- | The mains of the three suites the headless group runs.
+headlessMains ∷ [FilePath]
+headlessMains =
+  [ nativePackage </> "test/RootsMain.hs"
+  , nativePackage </> "test/Main.hs"
+  , integrationPackage </> "test/Main.hs"
+  ]
 
 -- | The two validation groups that run through the Vulkan project.
 headlessGroup, nativeGroup ∷ String
@@ -318,6 +339,19 @@ spec = describe "The Vulkan project boundary" $ do
         testMode = takeWhile (/= "native)") (dropWhile (/= "test)") active)
     filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
 
+  it "fails each headless suite on a selection that matches none of its examples" $ do
+    -- The group runs three suites under one command, so one of them passing
+    -- empty — every example filtered away by a selector or an ambient Hspec
+    -- setting — would leave a passing receipt that asserted nothing for it.
+    -- Each suite's main has to refuse an empty selection itself.
+    present ← mapM doesFileExist headlessMains
+    if not (and present)
+      then pendingWith siblingSourcesAbsent
+      else forM_ headlessMains $ \main' → do
+        source ← readFile main'
+        (main', "configFailOnEmpty = True" `isInfixOf` source) `shouldBe` (main', True)
+        (main', any (("hspec " `isPrefixOf`) . trim) (lines source)) `shouldBe` (main', False)
+
   it "prepares the native suite apart from its execution, and watches that execution for thirty seconds" $ do
     group ← catalogGroup nativeGroup
     (group >>= field "runner" >>= asString) `shouldBe` Just "display"
@@ -328,10 +362,14 @@ spec = describe "The Vulkan project boundary" $ do
     -- ran.
     (group >>= stringsAt "command")
       `shouldBe` Just ["bash", runner, "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"]
-    suite ← readFile "packages/gpu-vulkan/glfw/native-test/Main.hs"
-    suite `shouldContain` "completeFlag = \"--complete\""
-    suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
-    suite `shouldContain` "completenessProblems report children"
+    present ← doesFileExist nativeSuiteMain
+    if not present
+      then pendingWith siblingSourcesAbsent
+      else do
+        suite ← readFile nativeSuiteMain
+        suite `shouldContain` "completeFlag = \"--complete\""
+        suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
+        suite `shouldContain` "completenessProblems report children"
     (group >>= field "preparation" >>= stringsAt "command")
       `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
     -- The execution builds nothing: the runner's native mode names an

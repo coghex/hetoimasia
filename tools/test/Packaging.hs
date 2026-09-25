@@ -97,6 +97,10 @@ checkoutOnly =
   , ( "packages/gpu-vulkan/glfw/hetoimasia-gpu-vulkan-glfw.cabal"
     , "VulkanProof.hs reads the window integration package's dependencies beside the ordinary projects, as a sibling package"
     )
+  , ("packages/gpu-vulkan/native/test/RootsMain.hs", "VulkanProof.hs checks the headless native suite fails an empty selection, as a sibling package's source")
+  , ("packages/gpu-vulkan/native/test/Main.hs", "VulkanProof.hs checks the shader suite fails an empty selection, as a sibling package's source")
+  , ("packages/gpu-vulkan/glfw/test/Main.hs", "VulkanProof.hs checks the integration suite fails an empty selection, as a sibling package's source")
+  , ("packages/gpu-vulkan/glfw/native-test/Main.hs", "VulkanProof.hs checks the native suite's complete profile, as a sibling package's source")
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"
     )
