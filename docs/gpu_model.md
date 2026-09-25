@@ -195,6 +195,12 @@ whose logical release or ended CPU use has been certified is `WrongPhase` even i
 the batch already holds it, because a new command would record through it.
 Either refusal changes nothing, and a consumed batch extends no further.
 
+A batch leaves the model by discard, reset, skip or submission, and only the
+last means its work was submitted. `submissionCarries` answers, while a
+submission is outstanding, whether it consumed a given batch — the positive
+evidence a boundary needs before treating a batch's work as submitted, since a
+frame whose batch was reset can still be submitted without it.
+
 ## Frame ownership
 
 | Phase                       | Retains                                                        | Legal exits                                                                 |
@@ -627,7 +633,8 @@ anything; recording refused against a released or CPU-use-ended subject while an
 already-recorded batch survives; one batch extended incrementally, retaining each
 subject once through repeated and overlapping use, charging nothing, refusing a
 duplicated request or a sealed subject without effect, and discharging every
-reference it gained when discarded; a retry refused in a terminal session for every
+reference it gained when discarded; a submission naming the batch it consumed and
+not one reset before it; a retry refused in a terminal session for every
 cause that ends one; a reclamation pass reading exactly its window of raw records
 and reaching an eligible one beyond that window on a later pass; and the backoff
 restarting for retirement work whoever created it.

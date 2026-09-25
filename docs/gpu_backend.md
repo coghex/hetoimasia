@@ -571,15 +571,20 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   built for a verification capture are
   (`newGenerationsCapturing`, [below](#capture-usage)). The buffer must hold the
   whole image, four bytes a pixel (`readbackBytesFor`), or the copy is
-  `RefusedOutOfBounds`. After the copy the recorder records a buffer barrier from
+  `RefusedOutOfBounds`. A buffer has one writer at a time: a copy into one that
+  any batch — an earlier copy in the same batch included — or any submission
+  still holds is `RefusedInUse`, since the two writes would be unordered and the
+  contents misattributed. After the copy the recorder records a buffer barrier from
   the copy's transfer write to host reads; the transitions around it are the
   renderer's explicit commands.
 - **Completion before exposure.** `readReadback` answers bytes only with
   positive completion evidence: the batch that recorded the copy was recorded
   as submitted — `noteBatchSubmitted`, which VK-12's submission path calls once
-  the model has accepted the submission, and which checks that the model no
-  longer holds the batch and that its frame is submitted under exactly that
-  record — and the buffer owes no recorded reference and no submitted use,
+  the model has accepted the submission and before it completes, and which
+  requires the model's word that the outstanding submission consumed exactly
+  that batch (`submissionCarries`), so a batch reset in the model whose frame
+  was then submitted without it is refused — and the buffer owes no recorded
+  reference and no submitted use,
   which the model discharges only on that submission's completion fact. A batch
   the model merely no longer holds proves nothing, since a skip or a reset in
   the model removes one without submitting it. A fence is not a host-visibility barrier; the
@@ -591,7 +596,8 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   range (`mappedRange`) is the bytes asked for with the start rounded down and
   the end rounded up to the device's non-coherent atom, the end clamped to the
   memory's size, which is what Vulkan requires of both calls. Coherent memory is
-  read without either.
+  read without either, and an empty read reads nothing and invalidates
+  nothing.
 - **Release.** Releasing a readback ends its CPU use: it is read no more.
 
 ### Capture usage

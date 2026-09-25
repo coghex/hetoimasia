@@ -498,16 +498,18 @@ spec = describe "Recording" $ do
       fillReadback (rigRecording rig) readback 0 `shouldReturn` Left RefusedInUse
       submission@(SubmissionIdOf submitted) ← submitInModel rig frame
       readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
-      completeInModel rig submission
-      -- Completed in the model, but nothing yet says this batch was the one
-      -- submitted: no bytes.
-      readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
       ok (noteBatchSubmitted (rigRecording rig) batch submitted)
+      readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
+      completeInModel rig submission
       before ← nativeCount rig
       readReadback (rigRecording rig) readback 100 16 `shouldReturn` Right (ByteString.replicate 16 0xAB)
       calls ← drop before <$> nativeCalls' rig
       calls `shouldBe` [Invalidated (64, 64), ReadMapped 100 16]
       readReadback (rigRecording rig) readback (bytes - 8) 16 `shouldReturn` Left (RefusedOutOfBounds (bytes + 8) bytes)
+      -- An empty read reads nothing and invalidates nothing.
+      empty ← nativeCount rig
+      readReadback (rigRecording rig) readback 0 0 `shouldReturn` Right ByteString.empty
+      nativeCount rig `shouldReturn` empty
 
     it "forgets what a discarded copy would have written, and reads coherent memory without invalidating it" $ do
       rig ← newCapturingRig
@@ -552,6 +554,39 @@ spec = describe "Recording" $ do
       let SubmissionIdOf submitted = submission
       noteBatchSubmitted (rigRecording rig) first submitted `shouldReturn` Left (RefusedMisuse (WrongParent SubmissionIdentity))
       noteBatchSubmitted (rigRecording rig) reset submitted `shouldReturn` Left (RefusedMisuse (WrongParent SubmissionIdentity))
+
+    it "records no submission for a batch the model reset before submitting its still-acquired frame" $ do
+      rig ← newCapturingRig
+      kit ← newKit rig
+      readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
+      frame ← acquired rig
+      (batch, ()) ← recorded rig frame $ \recorder → do
+        drawTriangle recorder kit
+        ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+        ok (copyToReadback recorder readback)
+      inModel rig (resetRecorder frame)
+      submission@(SubmissionIdOf submitted) ← submitInModel rig frame
+      noteBatchSubmitted (rigRecording rig) batch submitted `shouldReturn` Left (RefusedMisuse (WrongParent SubmissionIdentity))
+      completeInModel rig submission
+      readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+
+    it "refuses a second copy into a buffer another batch, or an earlier copy in the same batch, still holds" $ do
+      rig ← newCapturingRig
+      kit ← newKit rig
+      readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
+      first ← acquired rig
+      second ← acquiredOn rig 1
+      _ ← created (createFrameStorage (rigRecording rig) (rigTarget rig) 1)
+      answers ← newIORef []
+      let copyingTwice recorder = do
+            drawTriangle recorder kit
+            ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+            copyToReadback recorder readback >>= \answer → modifyIORef' answers (answer :)
+            copyToReadback recorder readback >>= \answer → modifyIORef' answers (answer :)
+      _ ← recorded rig first copyingTwice
+      _ ← recorded rig second copyingTwice
+      reverse <$> readIORef answers `shouldReturn` [Right (), Left RefusedInUse, Left RefusedInUse, Left RefusedInUse]
+      nativeOf rig `shouldReturn'` \calls → length [() | Recorded _ (CommandCopyImageToBuffer {}) ← calls] `shouldBe` 1
 
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset the configuration records, and for nothing else" $ do

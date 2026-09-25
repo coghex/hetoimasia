@@ -69,6 +69,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , resetRecorder
   , resetSubmissionFence
   , submitFrames
+  , submissionCarries
   , enqueuePresentation
   , skipUnsubmittedFrame
   , closeSubmittedFrame
@@ -406,6 +407,8 @@ data Batch = Batch
 
 data Submission = Submission
   { submissionFrames ∷ ![(Natural, Natural)]
+  , submissionBatches ∷ !(Set Natural)
+    -- ^ The batches it consumed, by their session-wide numbers.
   , submissionSubjects ∷ !(Set SubjectKey)
   , submissionUncertain ∷ !Bool
   }
@@ -1778,6 +1781,7 @@ submitFrames identities outcome model
                       submission
                       Submission
                         { submissionFrames = [(number, slot) | (number, slot, _) ← frames]
+                        , submissionBatches = Set.fromList batches
                         , submissionSubjects = subjects
                         , submissionUncertain = uncertain
                         }
@@ -1787,6 +1791,15 @@ submitFrames identities outcome model
          in if uncertain
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
               else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
+
+-- | Whether an outstanding submission consumed this batch: the positive
+-- evidence that a batch's recorded work was submitted, rather than discarded,
+-- reset or skipped. 'Nothing' when the submission is not outstanding — never
+-- issued, another session's, or already completed.
+submissionCarries ∷ SubmissionId → BatchId → GpuModel → Maybe Bool
+submissionCarries submission batch model = case resolveSubmission model submission of
+  Right (_, record) → Just (batchNumber batch `Set.member` submissionBatches record)
+  Left _ → Nothing
 
 -- | Raise a replacement request on a target. Requests are counted rather than
 -- flagged, so a publication can satisfy exactly the request it was begun for.

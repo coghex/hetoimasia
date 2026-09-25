@@ -173,6 +173,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
+import Control.Applicative ((<|>))
 import Control.Monad (forM, unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
@@ -219,6 +220,7 @@ import Hetoimasia.GPU.Model
   , resetRecorder
   , runProgressTurn
   , silentEvidence
+  , submissionCarries
   )
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Budget (BudgetKind, frameSlotLimit)
@@ -1037,7 +1039,14 @@ copyToReadback recorder (Readback readback) =
             | not (frameImageCapturable frame) = Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")
             | needed > allocationSize allocation = Just (RefusedOutOfBounds needed (allocationSize allocation))
             | otherwise = Nothing
-      case unfit of
+      -- One writer at a time: a buffer another batch — or an earlier copy in
+      -- this one — or a submission still holds would be written again with no
+      -- ordering between the two writes, and its contents misattributed.
+      holds ← atomically $ do
+        model ← stateRootsModel (recordingRoots recording) (\current → (current, current))
+        pure (maybe [] viewOutstanding (holdView (ResourceSubject readback) model))
+      let busy = any (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) holds
+      case unfit <|> (if busy then Just RefusedInUse else Nothing) of
         Just refused → pure (Left refused)
         Nothing → do
           copied ←
@@ -1147,11 +1156,13 @@ invalidate recording storage batches discharge =
       _ → Nothing
 
 -- | Record that the model submitted this sealed batch as this submission
--- record: the model no longer holds the batch, and the frame it was recorded
--- for is submitted under exactly that record. It is the positive submission
--- evidence 'readReadback' needs, and VK-12's submission path supplies it once
--- the model has accepted a submission. Nothing native happens, and the batch
--- is never reset or discarded here again.
+-- record: the model no longer holds the batch, and the outstanding submission
+-- consumed exactly this batch ('submissionCarries') — so a batch reset or
+-- skipped in the model, whose frame was then submitted without it, is refused.
+-- It is the positive submission evidence 'readReadback' needs, and VK-12's
+-- submission path supplies it once the model has accepted a submission and
+-- before that submission completes. Nothing native happens, and the batch is
+-- never reset or discarded here again.
 noteBatchSubmitted ∷ Recording q inst msgr phys dev cmd → BatchId → SubmissionId → IO (Either Refusal ())
 noteBatchSubmitted recording batch submission =
   owned recording $ atomically $ do
@@ -1163,7 +1174,7 @@ noteBatchSubmitted recording batch submission =
       Just entry
         | batchStanding entry /= BatchSealed → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
         | held → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
-        | (frameView (batchFrame entry) model >>= viewFrameSubmission) /= Just submission →
+        | submissionCarries submission batch model /= Just True →
             pure (Left (RefusedMisuse (WrongParent SubmissionIdentity)))
         | otherwise → Right () <$ editBatch recording batch (\held' → held' {batchStanding = BatchSubmitted submission})
   where
@@ -1219,6 +1230,9 @@ readReadback recording (Readback readback) offset size =
                   _ → Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
             case evidence of
               Left refusal → pure (Left refusal)
+              -- An empty read reads nothing, and its range would be an invalid
+              -- one to invalidate.
+              Right () | size == 0 → pure (Right ByteString.empty)
               Right () → Right <$> readMapped allocation
       Right _ → pure (Left RefusedWrongKind)
   where

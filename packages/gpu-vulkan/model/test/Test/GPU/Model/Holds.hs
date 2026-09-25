@@ -226,6 +226,23 @@ spec = describe "holds" $ do
     extended ← admitted_ "extending the batch already recorded" (extendBatch batch [resource] full)
     recorded extended (ResourceSubject resource) `shouldBe` [batch]
 
+  it "says which batches a submission consumed, so a reset batch is never mistaken for a submitted one" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    (resourced, resource) ← aResource 1024 active
+    (framed, frame) ← acquiredFrame target resourced
+    (first, resetBatch) ← admitted "recording a batch" (recordBatch frame [resource] framed)
+    reset ← admitted_ "resetting the recorder" (resetRecorder frame first)
+    (second, carriedBatch) ← admitted "recording another batch" (recordBatch frame [resource] reset)
+    (submitted, answer) ← admitted "submitting the frame" (submitFrames [frame] SubmissionAccepted second)
+    submission ← case answer of
+      SubmissionRecorded identity → pure identity
+      other → fail ("expected a submission record, got " ++ show other)
+    submissionCarries submission carriedBatch submitted `shouldBe` Just True
+    submissionCarries submission resetBatch submitted `shouldBe` Just False
+    completed ← admitted_ "completing it" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) submitted)
+    submissionCarries submission carriedBatch completed `shouldBe` Nothing
+
   it "refuses to record against a subject whose release or ended CPU use has been certified" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model

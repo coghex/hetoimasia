@@ -104,6 +104,7 @@ module Hetoimasia.GPU.Model
   , resetRecorder
   , resetSubmissionFence
   , submitFrames
+  , submissionCarries
   , enqueuePresentation
   , skipUnsubmittedFrame
   , closeSubmittedFrame
