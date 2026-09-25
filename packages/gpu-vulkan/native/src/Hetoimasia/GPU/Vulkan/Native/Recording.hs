@@ -1006,6 +1006,12 @@ transitionImage recorder from to = command recorder $ \state →
   if not (supportedTransition from to)
     then Left (RefusedUnsupported ("the image transition " <> tshow from <> " to " <> tshow to))
     else
+      -- The transfer-source layout is valid only for an image created as a
+      -- transfer source, which only a generation built for a verification
+      -- capture makes.
+      if LayoutTransferSource `elem` [from, to] && not (frameImageCapturable (recorderFrame recorder))
+        then Left (RefusedUnsupported "a transfer-source transition of an image its generation did not make a transfer source")
+        else
       if stateRendering state
         then Left (RefusedIllegal "an image transition inside rendering")
         else

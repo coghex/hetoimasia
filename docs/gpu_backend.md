@@ -450,8 +450,9 @@ the frame's format, dynamic viewport and scissor, whole-triangle draws, the four
 image transitions below, and one bounded copy of the whole image into a readback
 buffer. There is no raw command buffer, no callback escape hatch, no descriptor,
 no vertex buffer and no render graph. A command outside that vocabulary — an
-unsupported transition, a draw that is not whole triangles, a copy from an image
-that is not a transfer source — is `RefusedUnsupported`; one the recorder's state
+unsupported transition, a draw that is not whole triangles, a transition into or
+out of the transfer-source layout or a copy of an image that is not a transfer
+source — is `RefusedUnsupported`; one the recorder's state
 does not admit — a draw outside rendering or before a pipeline, viewport and
 scissor, a transition inside rendering or from a layout the image is not in,
 rendering into an image that is not a color attachment, a viewport that is not

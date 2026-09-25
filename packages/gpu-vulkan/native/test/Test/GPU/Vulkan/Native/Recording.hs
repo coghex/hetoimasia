@@ -211,7 +211,7 @@ spec = describe "Recording" $ do
       nativeCount rig `shouldReturn` before
 
     it "refuses a command outside the supported vocabulary, or illegal in the recorder's state, at the interface" $ do
-      rig ← newRig
+      rig ← newCapturingRig
       kit ← newKit rig
       frame ← acquired rig
       answers ← newIORef []
@@ -487,7 +487,7 @@ spec = describe "Recording" $ do
       mappedRange 64 250 200 50 `shouldBe` (192, 58)
       mappedRange 1 100 3 4 `shouldBe` (3, 4)
 
-    it "refuses a copy from an image its generation did not make a transfer source, before recording it" $ do
+    it "refuses a transfer-source transition or a copy of an image its generation did not make a transfer source, before recording either" $ do
       rig ← newRig
       _ ← newKit rig
       readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
@@ -495,10 +495,15 @@ spec = describe "Recording" $ do
       answers ← newIORef []
       _ ← recorded rig frame $ \recorder → do
         ok (transitionImage recorder LayoutUndefined LayoutColorAttachment)
-        ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+        transitionImage recorder LayoutColorAttachment LayoutTransferSource >>= \answer → modifyIORef' answers (answer :)
         copyToReadback recorder readback >>= \answer → modifyIORef' answers (answer :)
-      readIORef answers `shouldReturn` [Left (RefusedUnsupported "a copy from an image its generation did not make a transfer source")]
-      nativeOf rig `shouldReturn'` \calls → [() | Recorded _ (CommandCopyImageToBuffer {}) ← calls] `shouldBe` []
+      reverse <$> readIORef answers
+        `shouldReturn` [ Left (RefusedUnsupported "a transfer-source transition of an image its generation did not make a transfer source")
+                       , Left (RefusedUnsupported "a copy from an image its generation did not make a transfer source")
+                       ]
+      nativeOf rig `shouldReturn'` \calls → do
+        [() | Recorded _ (CommandCopyImageToBuffer {}) ← calls] `shouldBe` []
+        [() | Recorded _ (CommandImageBarrier _ _ LayoutTransferSource) ← calls] `shouldBe` []
 
     it "refuses a copy the buffer cannot hold, before recording it" $ do
       rig ← newCapturingRig
