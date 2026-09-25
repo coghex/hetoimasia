@@ -636,6 +636,15 @@ spec = describe "Validation evidence reuse" $ do
         affected ← planRouted fixture workers "vulkan-headless-plan.json"
         entryText affected "test.vulkan-headless" "reason" `shouldReturn` Just "affected"
 
+    it "selects the headless group when the test-only support library its shader suite uses changes" $
+      withCheckedInRouting $ \fixture workers → do
+        -- `shader-tests` compiles external clients through
+        -- `Test.Support.ExternalClient`, which the group's one declared
+        -- component does not reach; the group declares the library itself.
+        change fixture "tools/test-support/src/Test/Support/ExternalClient.hs" "module Test.Support.ExternalClient where\n"
+        plan ← planRouted fixture workers "vulkan-support-plan.json"
+        entryText plan "test.vulkan-headless" "reason" `shouldReturn` Just "affected"
+
     it "executes the native group's preparation before its command, on the Vulkan worker" $
       withCheckedInRouting $ \fixture workers → do
         change fixture "tools/vulkan/run.sh" "a changed runner\n"

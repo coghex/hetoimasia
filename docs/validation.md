@@ -253,7 +253,10 @@ package's and the GLFW package's libraries; it also declares the whole
 `packages/gpu-vulkan/native/` directory, because that package's two suites share
 a `test/` source directory no single component's closure reaches, beside
 `cabal.project.vulkan`, `cabal.project.common`, `tools/native/`,
-`tools/ci-image/`, `tools/vulkan/`, and `tools/toolchain/binding.pin`. Later
+`tools/ci-image/`, `tools/vulkan/`, `tools/toolchain/binding.pin`, and
+`tools/test-support/`, the test-only library the shader suite compiles its
+external clients through, which the declared component's closure does not
+reach. Later
 backend slices extend its coverage and inputs as their suites grow. It stays
 apart from `test.vulkan-native`'s measured native execution on purpose: these
 examples are deterministic, need no permission, and are never optional probes.
@@ -309,8 +312,11 @@ the feature invalidates evidence exactly as changing the layer does.
 planner, receipt, packaging, and runner contracts, including short one-second
 fixtures proving that the runner enforces its deadline and reaps children. It
 contains no display-helper examples. It declares `packages/gpu-vulkan/native/`
-and `packages/gpu-vulkan/glfw/` among its inputs, with `tools/vulkan/` and what
-remains of `tools/vulkan-proof/`: its Vulkan boundary examples are what hold
+and `packages/gpu-vulkan/glfw/` among its inputs, with `tools/vulkan/`, what
+remains of `tools/vulkan-proof/`, and exactly the retained records in
+`docs/vulkan/` its examples read — not the directory, so retaining a later
+record, such as a platform's evidence for the very candidate it describes, does
+not move that candidate's identity: its Vulkan boundary examples are what hold
 those packages out of the ordinary projects, read their dependencies, and hold
 the two Vulkan groups to their commands and routing.
 
