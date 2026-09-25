@@ -10,6 +10,12 @@
 -- none ('Nothing' where an instrumentation is asked for) names nothing and
 -- labels nothing, and nothing fails for it.
 --
+-- The explicit debug messenger has no name here, and never will: the pinned
+-- loader hands the application its own wrapper for a messenger and forwards a
+-- naming call without translating it, which MoltenVK reads as one of its own
+-- objects and crashes on (#250). Vulkan permits naming it; this backend makes
+-- no naming call for one.
+--
 -- Nothing here makes a native call or names a binding type; the native
 -- package's examples hold 'objectTypeCode' to the binding's own constants.
 module Hetoimasia.GPU.Vulkan.Native.Naming
@@ -23,7 +29,6 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , boundedName
 
     -- * Object names
-  , messengerName
   , deviceName
   , queueName
   , surfaceName
@@ -74,10 +79,10 @@ newtype Instrumentation = Instrumentation
     -- dispatchable handle as its pointer's value — and the name.
   }
 
--- | The kinds of native object the backend names.
+-- | The kinds of native object the backend names. The debug messenger is
+-- deliberately not one of them.
 data NativeObjectKind
-  = ObjectMessenger
-  | ObjectDevice
+  = ObjectDevice
   | ObjectQueue
   | ObjectSurface
   | ObjectSwapchain
@@ -106,7 +111,6 @@ objectTypeCode = \case
   ObjectCommandPool → 25
   ObjectSurface → 1000000000
   ObjectSwapchain → 1000001000
-  ObjectMessenger → 1000128000
 
 -- ---------------------------------------------------------------------------
 -- Bounds
@@ -123,9 +127,6 @@ boundedName = ByteString.take maximumNameBytes . ByteString.filter (/= 0) . Enco
 
 -- ---------------------------------------------------------------------------
 -- Object names
-
-messengerName ∷ ByteString
-messengerName = boundedName "hetoimasia messenger"
 
 deviceName ∷ ByteString
 deviceName = boundedName "hetoimasia device"

@@ -347,7 +347,6 @@ standInOps standIn =
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
-    , opsMessengerHandle = fromIntegral
     , opsDeviceHandle = fromIntegral
     , opsDeviceQueue = \_ family → 4 <$ record standIn (QueriedQueue family)
     , opsInstrumentation = \_ → do

@@ -44,17 +44,21 @@
 -- When the instance enabled @VK_EXT_debug_utils@ and the device offers its
 -- naming call ('opsInstrumentation'), the roots name what they own once a
 -- device exists to name it through ("Hetoimasia.GPU.Vulkan.Native.Naming"):
--- the explicit messenger, the device and its one queue at the first
--- admission, and each target's surface before the target is admitted, under
--- the 'TargetId' the model is about to issue it. A naming call runs on the
+-- the device and its one queue at the first admission, and each target's
+-- surface before the target is admitted, under the 'TargetId' the model is
+-- about to issue it. A naming call runs on the
 -- owner's thread like every other call here, and one that raised fails the
 -- admission exactly as any other native failure there does: a surface whose
 -- name could not be set is not admitted, so it is still its creator's, and the
--- roots' own names are attempted again at the next admission. The instance
--- itself is not named: naming requires external synchronization of the object
--- named, and the surface bridge's lease lets the main thread use the instance
--- while the owner runs. Without the extension nothing is named and nothing
--- fails.
+-- roots' own names are attempted again at the next admission. Two roots are
+-- never named. The instance: naming requires external synchronization of the
+-- object named, and the surface bridge's lease lets the main thread use the
+-- instance while the owner runs. The explicit messenger: the pinned loader
+-- answers its own wrapper for it and forwards a naming call without
+-- translating that wrapper, which MoltenVK then reads as one of its own objects
+-- and crashes on (#250), so no naming call is ever made for it; its
+-- diagnostics are the capture's, which names it nowhere. Without the extension
+-- nothing is named and nothing fails.
 --
 -- A destruction that raised is uncertain: it is recorded, never attempted
 -- again, and every parent that must outlive it is retained — a later step
@@ -193,7 +197,6 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   ( Instrumentation (..)
   , NativeObjectKind (..)
   , deviceName
-  , messengerName
   , queueName
   , surfaceName
   )
@@ -242,8 +245,6 @@ data RootOps q inst msgr phys dev = RootOps
     -- ^ Whether that queue family of that device presents to that surface.
   , opsDeviceLoss ∷ SomeException → Bool
     -- ^ Whether a failure one of these calls raised is the loss of the device.
-  , opsMessengerHandle ∷ msgr → Word64
-    -- ^ The explicit messenger's 64-bit handle, to name it by.
   , opsDeviceHandle ∷ dev → Word64
     -- ^ The device's dispatchable handle, as its pointer's value.
   , opsDeviceQueue ∷ dev → Word32 → IO Word64
@@ -356,7 +357,7 @@ data Roots q inst msgr phys dev = Roots
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
-    -- ^ Whether the messenger, the device and its queue have been named.
+    -- ^ Whether the device and its queue have been named.
   , rootsSession ∷ !SessionIdentity
   , rootsDeviceIdentity ∷ !DeviceId
   }
@@ -586,9 +587,9 @@ admitRootTarget roots classification surface = do
         Backpressure kind → pure (Left (TargetBudgetExhausted kind))
         Rejected _ → pure (Left TargetAdmissionClosed)
 
--- | Name the explicit messenger, the device and its queue, once, when the
--- device offers naming. A call that raised leaves them unnamed, to be named
--- again at the next admission.
+-- | Name the device and its queue, once, when the device offers naming. A
+-- call that raised leaves them unnamed, to be named again at the next
+-- admission. The explicit messenger is never named (see "Names" above).
 nameRoots ∷ Roots q inst msgr phys dev → IO ()
 nameRoots roots = do
   named ← readTVarIO (rootsNamed roots)
@@ -598,9 +599,6 @@ nameRoots roots = do
       Just (device, instrumentation) → do
         let ops = rootsOps roots
             name = nameRootsObject roots instrumentation
-        readTVarIO (rootsMessenger roots) >>= \case
-          Live messenger → name ObjectMessenger (opsMessengerHandle ops messenger) messengerName
-          _ → pure ()
         name ObjectDevice (opsDeviceHandle ops device) deviceName
         family ← fmap (planQueueFamily . fst) <$> atomically (readRootsDevice roots)
         for_ family $ \index → do

@@ -9,7 +9,6 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , boundedName
   , deviceName
   , maximumNameBytes
-  , messengerName
   , objectTypeCode
   , queueName
   )
@@ -33,8 +32,7 @@ spec = describe "Profile" $ do
       [(kind, objectTypeCode kind) | kind ← [minBound .. maxBound]]
         `shouldBe` [ (kind, code)
                    | (kind, ObjectType code) ←
-                       [ (ObjectMessenger, OBJECT_TYPE_DEBUG_UTILS_MESSENGER_EXT)
-                       , (ObjectDevice, OBJECT_TYPE_DEVICE)
+                       [ (ObjectDevice, OBJECT_TYPE_DEVICE)
                        , (ObjectQueue, OBJECT_TYPE_QUEUE)
                        , (ObjectSurface, OBJECT_TYPE_SURFACE_KHR)
                        , (ObjectSwapchain, OBJECT_TYPE_SWAPCHAIN_KHR)
@@ -55,7 +53,7 @@ spec = describe "Profile" $ do
       boundedName "a\NULb" `shouldBe` "ab"
       -- The largest queue identity the device can report still fits.
       ByteString.length (queueName maxBound maxBound) `shouldSatisfy` (<= maximumNameBytes)
-      [messengerName, deviceName, queueName 0 0] `shouldBe` ["hetoimasia messenger", "hetoimasia device", "hetoimasia queue family 0 index 0"]
+      [deviceName, queueName 0 0] `shouldBe` ["hetoimasia device", "hetoimasia queue family 0 index 0"]
 
   describe "the instance" $ do
     it "asks for the surface extensions, the capture's and the maintenance chain's, and nothing the loader lacks" $ do

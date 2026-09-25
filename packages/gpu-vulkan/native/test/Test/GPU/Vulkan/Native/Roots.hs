@@ -287,15 +287,14 @@ spec = describe "Roots" $ do
       checkRoots roots `shouldReturn` ()
 
   describe "names" $ do
-    it "names the messenger, the device, its queue and every surface from existing identities once the device exists" $ do
+    it "names the device, its queue and every surface from existing identities once the device exists, and never the messenger" $ do
       (standIn, roots) ← fresh
       offerNaming standIn
       _ ← startRoots roots standardRequest
       first ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
       second ← admitted roots OptionalTarget (surfaceNumbered standIn 11)
       namesGiven standIn
-        `shouldReturn` [ (ObjectMessenger, 2, "hetoimasia messenger")
-                       , (ObjectDevice, 3, "hetoimasia device")
+        `shouldReturn` [ (ObjectDevice, 3, "hetoimasia device")
                        , (ObjectQueue, 4, "hetoimasia queue family 0 index 0")
                        , (ObjectSurface, 10, surfaceName first)
                        , (ObjectSurface, 11, surfaceName second)
@@ -307,6 +306,10 @@ spec = describe "Roots" $ do
       takeWhile (not . isNamed) recorded `shouldSatisfy` elem (CreatedDevice "stand-in device" 0)
       times standIn (QueriedQueue 0) `shouldReturn` 1
       surfaceName first `shouldBe` "target 0.1 surface"
+      -- No naming call is dispatched for the explicit messenger, handle 2,
+      -- however many admissions follow.
+      _ ← admitted roots OptionalTarget (surfaceNumbered standIn 12)
+      (\given → [handle | (_, handle, _) ← given, handle == 2]) <$> namesGiven standIn `shouldReturn` []
 
     it "names nothing, asks for no queue and fails nothing when the device offers no naming" $ do
       (standIn, roots) ← started
@@ -343,7 +346,7 @@ spec = describe "Roots" $ do
       restoreNaming standIn ObjectDevice
       _ ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
       map (\(kind, _, _) → kind) <$> namesGiven standIn
-        `shouldReturn` [ObjectMessenger, ObjectDevice, ObjectMessenger, ObjectDevice, ObjectQueue, ObjectSurface]
+        `shouldReturn` [ObjectDevice, ObjectDevice, ObjectQueue, ObjectSurface]
       devicesCreated standIn `shouldReturn` 1
 
 -- | Fresh roots over a fresh stand-in, with the default budgets.

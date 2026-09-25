@@ -101,10 +101,10 @@ spec fixture = describe "the shared roots" $ do
     let devices = [call | call ← calls, call.callName == "vkCreateDevice"]
     length devices `shouldBe` 1
     ownerThreads calls devices
-    -- The device offers debug-utils naming, so the roots and each surface
+    -- The device offers debug-utils naming, so the device, its queue and each surface
     -- were named, on the owner's thread and with every call returning.
     let naming = [call | call ← calls, call.callName `elem` ["vkGetDeviceQueue", "vkSetDebugUtilsObjectNameEXT"]]
-    length [() | call ← naming, call.callName == "vkSetDebugUtilsObjectNameEXT"] `shouldSatisfy` (>= 5)
+    length [() | call ← naming, call.callName == "vkSetDebugUtilsObjectNameEXT"] `shouldSatisfy` (>= 4)
     ownerThreads calls naming
     [call.callRaised | call ← naming] `shouldSatisfy` all (== Nothing)
 

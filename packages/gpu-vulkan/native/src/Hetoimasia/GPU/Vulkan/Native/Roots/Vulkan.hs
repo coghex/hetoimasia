@@ -46,7 +46,7 @@ import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), enumerateInstanceVersion, ge
 import Vulkan.Core13 (PhysicalDeviceVulkan13Features (..))
 import Vulkan.Exception (VulkanException (..))
 import Vulkan.Dynamic (DeviceCmds (..))
-import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerEXT (..), DebugUtilsObjectNameInfoEXT (..), setDebugUtilsObjectNameEXT)
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerEXT, DebugUtilsObjectNameInfoEXT (..), setDebugUtilsObjectNameEXT)
 import Vulkan.Extensions.VK_EXT_validation_features
   ( ValidationFeaturesEXT (..)
   , data VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
@@ -143,7 +143,6 @@ vulkanRootOps capture =
     , opsSurfaceSupport = \_ physical family surface →
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss
-    , opsMessengerHandle = \(DebugUtilsMessengerEXT handle) → handle
     , opsDeviceHandle = dispatchable . deviceHandle
     , opsDeviceQueue = \device family → dispatchable . queueHandle <$> getDeviceQueue device family 0
     , opsInstrumentation = pure . vulkanInstrumentation

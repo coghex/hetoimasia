@@ -332,8 +332,7 @@ nativeLayer events native capture =
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
     , -- The stand-in device offers no naming, so nothing is named and its
       -- queue is never asked for.
-      opsMessengerHandle = fromIntegral
-    , opsDeviceHandle = fromIntegral
+      opsDeviceHandle = fromIntegral
     , opsDeviceQueue = \_ _ → pure 4
     , opsInstrumentation = \_ → pure Nothing
     , opsGenerations =

@@ -21,6 +21,13 @@ batches that can be discarded, readback memory, and the audited `unsafe`
 recording subset — D-15, D-26 and D-28, P-1's renderer-facing boundary and
 P-8. See [Recording through managed resources](#recording-through-managed-resources).
 
+[#250](https://github.com/coghex/hetoimasia/issues/250) (VKR-2) adds **debug
+names and recording labels**: every native object the backend creates is named
+from identities it already holds — the debug messenger excepted — and every
+batch and every dynamic-rendering pass is bracketed in balanced command-buffer
+labels, which [the diagnostic capture](vulkan_diagnostics.md) now copies. See
+[Names and labels](#names-and-labels).
+
 Nothing is submitted or presented yet: there is no acquisition and no queue
 submission, a recorded batch can only be discarded, and the owner's progress
 step reports no render demand. The controller wires no recording in either:
@@ -550,6 +557,76 @@ it.
 skip must therefore reset the frame's recorder through this module first, so the
 native invalidation always precedes the discharge.
 
+### Names and labels
+
+`Hetoimasia.GPU.Vulkan.Native.Naming` is the naming scheme as pure decisions.
+When the instance enabled `VK_EXT_debug_utils` — the profile always asks for it —
+and the device's own dispatch table resolved `vkSetDebugUtilsObjectNameEXT`,
+`vkCmdBeginDebugUtilsLabelEXT` and `vkCmdEndDebugUtilsLabelEXT`, the roots offer
+an `Instrumentation` (`readRootsInstrumentation`), and the backend names what it
+creates and labels what it records. Without it nothing is named or labelled,
+nothing fails, and recording and sealing are otherwise unchanged.
+
+Every name is built from identities the backend already holds, by one function,
+`boundedName`, which caps it at 64 bytes (`maximumNameBytes`) and drops any NUL.
+No caller-supplied text reaches a name.
+
+| Object | Named | When |
+| --- | --- | --- |
+| The device | `hetoimasia device` | At the first admission, once the device exists |
+| Its one queue | `hetoimasia queue family <f> index 0` | The same; `vkGetDeviceQueue` is asked for it only to name it |
+| A target's surface | `target <n>.<incarnation> surface` | Before the target is admitted, under the `TargetId` the model is about to issue |
+| A generation's swapchain | `target <n>.<i> generation <g> swapchain` | Right after it is created, before the generation is published |
+| Each swapchain image | `… generation <g> image <index>` | Right after the images are enumerated |
+| Each image view | `… generation <g> view <index>` | Right after each is created |
+| A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
+| A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
+| A readback's buffer and memory | `resource <n>.<g> readback buffer`, `… readback memory` | The same |
+
+Every naming call runs on the graphics owner's thread through the roots' device
+loss classification, and one that raised is handled as a failure of what it was
+naming, by that thing's own rules. A surface whose name could not be set is not
+admitted, so its creator still owns it. A device or queue whose name could not
+be set stays recorded and owned, and is named again at the next admission. A
+generation whose swapchain, image or view could not be named fails its
+construction: it is retired unpublished and destroyed once its holds end. A
+managed resource whose objects could not be named is released — nothing can
+record it, and the owner's disposal destroys it — and its handle is never
+returned; a replacement whose new generation could not be named leaves neither
+generation recordable. Nothing is published as named that was not.
+
+Two objects are never named. **The instance**: naming requires external
+synchronization of the object named, and the surface bridge's lease lets the
+main thread use the instance while the owner runs. **The debug messenger**,
+on both profiles: the pinned loader answers its own wrapper for a messenger and
+forwards a naming call without translating it, and MoltenVK reads that wrapper
+as one of its own objects and crashes. Vulkan permits naming a messenger; the
+defect is the loader's and the driver's together, and the backend makes no
+naming call for one. The messenger's diagnostics stay the capture's own. The
+crash and its diagnosis are retained in
+[`docs/vulkan/macos-debug-utils-naming.md`](vulkan/macos-debug-utils-naming.md),
+which also shows that a surface is named safely on a device that enabled
+`VK_KHR_swapchain`, as the profile's device always does.
+
+A labelled batch's command buffer carries two kinds of region, each named from
+the batch's `BatchId` and its frame's target and generation:
+
+| Region | Label | Opens | Closes |
+| --- | --- | --- | --- |
+| The batch | `batch <b> target <t> generation <g>` | Right after `vkBeginCommandBuffer` | Right before `vkEndCommandBuffer` |
+| A dynamic-rendering pass | `pass batch <b> target <t> generation <g>` | Right before `vkCmdBeginRendering`, in the same masked step | Right after `vkCmdEndRendering`, in the same masked step |
+
+The recorder counts the regions open, each from the moment its opening call
+returned. Whatever else happens — a consumer that raised, a cancellation,
+rendering left open, a command whose call raised — every region still open is
+closed, innermost first, before `recordFrame` returns or raises. A closing call
+that raised leaves the batch partial with the reason that its labels could not
+be balanced: it is never sealed, never submittable, and keeps its commands,
+storage and references until a discard or reset invalidates it; a label failure
+supplies no retirement evidence. The consumer's own failure, when there was one,
+is still the one raised. Label commands go through the native layer's
+`opsRecord`, like every other recorded command, and count as commands.
+
 ### The checked frame
 
 `recordFrame` requires the frame to be acquired in the model, with its image's
@@ -648,7 +725,7 @@ evidence; every managed resource must be gone before the device.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the ten `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the twelve `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -667,6 +744,8 @@ its calling convention.
 | `vkCmdSetScissor` | Records dynamic state. |
 | `vkCmdDraw` | Records a draw. |
 | `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
+| `vkCmdBeginDebugUtilsLabelEXT` | Records the opening of a label region; the label's name is marshalled for the call and not kept. |
+| `vkCmdEndDebugUtilsLabelEXT` | Records its closing. |
 
 Each records into a command buffer the calling thread owns; none waits on the
 device, blocks on another thread, or can run long enough to matter. None can
@@ -685,7 +764,7 @@ and the count after it, and an unsafe call cannot be interrupted.
 flags and the C-only callback; the native case's record prints it, so it is
 part of the evidence identity beside the build's source digest. The headless
 suite reads the package's own import declarations and requires exactly those
-ten `dynamic` imports and, besides them, only the capture callback's address
+twelve `dynamic` imports and, besides them, only the capture callback's address
 import.
 
 ## Destruction order
@@ -840,6 +919,23 @@ batch's record with it; invalid viewports and scissors refused; and the FFI audi
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 
+#250's examples are there too, over the same stand-ins with naming turned on or
+left off: the naming scheme's object types held to the binding's and its bound;
+the device, its queue and every surface named from their identities once the
+device exists, and no naming call ever dispatched for the messenger; nothing
+named, and no queue asked for, when the device offers no naming; a surface
+whose naming raised left unadmitted and its creator's, and a device whose naming
+raised kept and named at the next admission; a generation's swapchain, images
+and views named as each is made, and a construction whose naming raised retired
+unpublished and destroyed child before parent; every managed resource's objects
+named before its handle is returned, and one whose naming raised released and
+destroyed by disposal; a batch and its pass bracketed in balanced labels naming
+the batch, target and generation, and no label without naming; every open label
+closed after a consumer that raised inside rendering, a cancellation, and a
+failed command; and a batch whose labels could not be balanced left partial and
+unsealed, keeping its storage and holds until a discard and keeping the
+consumer's own failure.
+
 **Native.** The group `test.vulkan-native` runs the native suite below. The
 retained per-slice records from the retired proof harness —
 [`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
@@ -848,7 +944,9 @@ they name. VK-10's native cases are retained as
 [`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run,
 and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
 worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
-and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md).
+and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). #250's are retained as
+[`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
+[`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md).
 
 ## The native suite
 
@@ -863,7 +961,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, and `synchronization-hazard`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -904,7 +1002,8 @@ format, the frame slot's storage and a readback buffer for the generation's
 extent. Against the [fixture-private frame](#the-checked-frame) it records one
 batch of eleven commands — into rendering, the pipeline, viewport and scissor, a
 triangle, out of rendering, into the copy, the copy with its host-read barrier,
-and out to presentation — through the audited `unsafe` subset; requires the
+and out to presentation — through the audited `unsafe` subset, inside the
+batch's label and, around the rendering, the pass's, which make fifteen; requires the
 model to hold all four resources for that batch, and the readback to refuse its
 bytes since nothing was submitted; discards the batch, after which none is held;
 settles the frame in the model; and releases and destroys every resource, then
@@ -912,6 +1011,24 @@ the generation, the surface, the device, the messenger and the instance. It
 passes only if no step received a validation error and the capture's verdict
 after the last teardown callback is clean. Its record prints the package's FFI
 configuration. No safe-versus-unsafe timing is measured, and none is asserted.
+
+#250's case, `debug-names`, is VK-11's on private roots of its own, with one
+destructive seam only the fixture holds: it wraps the production recording
+layer so the batch's copy into the readback buffer is recorded, through the
+binding's own call, four bytes into the buffer, where the whole image no longer
+fits. Core validation reports that while the command is recorded, as
+`VUID-vkCmdCopyImageToBuffer-pRegions-00183`; nothing is submitted, and no
+handle leaves the backend's interface, since the wrapper sees only what the
+backend hands its own native layer. The case passes only when that report, and
+no other error, reached the capture from the recording step; when the report's
+objects carry the readback buffer's handle with the name the backend gave it;
+when the batch's label is the report's innermost command-buffer label, if the
+pinned layer reports command-buffer labels at all — which label arrays each
+layer populates is recorded in the case's record, not assumed; and when the
+verdict after the last teardown callback fails for the latched error and
+nothing else, with nothing dropped, cut, refused or undelivered. The shared
+session also requires every naming call it made to have run on the owner's
+thread and returned.
 
 Run it as the group does:
 
