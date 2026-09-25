@@ -2009,19 +2009,18 @@ manifest; remove it rather than reuse those products.
 ### A local run and its receipt
 
 A local run records its own identity and never claims the Linux digest. Plan and
-run with the same map:
+run with the same map — the compiler, and every entry the native prefix
+contributes, one `--toolchain` each:
 
 ```bash
-native="$(python3 tools/native/native.py toolchain)"
-python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native" \
+toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
+while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
+python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
   --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 That declaration names every group a Darwin plan can select, and deliberately
@@ -2052,8 +2051,7 @@ asks the human user for explicit approval, and waits for acceptance, exactly as
 HETOIMASIA_NATIVE_SESSION=desktop \
   python3 -I tools/validation/run.py test.glfw-native --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 Without the consent the group fails before initializing GLFW and writes no
@@ -2072,8 +2070,7 @@ declaration names both, and run the headless group, which needs no consent:
 ```bash
 python3 -I tools/validation/run.py test.vulkan-headless --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 `test.vulkan-native` opens windows and presents to one of them on the person's
@@ -2086,8 +2083,7 @@ the one approved command carry the consent:
 HETOIMASIA_NATIVE_SESSION=desktop \
   python3 -I tools/validation/run.py test.vulkan-native --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
-  --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
-  --toolchain "$native"
+  "${toolchain[@]}"
 ```
 
 The runner builds the suite in the preparation stage, then times the native
