@@ -65,9 +65,12 @@
 -- presentation pool is not a generation's and is untouched. A destruction that
 -- raised is uncertain: the generation is marked so, never offered again, and
 -- everything above it is retained, because the model's session fails with
--- 'CleanupFailed' and the roots close admission, and the step raises
+-- 'CleanupFailed', and the roots close admission, and the step raises
 -- 'GenerationDestructionFailed'. An effect whose bookkeeping could not be
--- committed enters the same path ('GenerationEffectUncertain').
+-- committed enters the same path ('GenerationEffectUncertain'), and so does a
+-- creation a cancellation interrupted inside its call: whether it created
+-- anything is unknown, so its candidate is retained, never destroyed, and the
+-- cancellation is delivered after the session has failed.
 --
 -- = Close
 --
@@ -147,6 +150,7 @@ import Control.Exception
   )
 import Control.Monad (forM, forM_, unless, when)
 import Data.Foldable (for_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
@@ -506,8 +510,11 @@ reconcile generations now target geometry = do
         Right ()
           | isJust active && not moved && not reported && not (recordFailed record) → do
               -- Nothing to build: a target back to the geometry its generation
-              -- has resumes without a rebuild.
-              when suspendedNow (atomically (modelEdit_ (resumeTarget target)))
+              -- has resumes without a rebuild, and a move it had begun to settle
+              -- is cancelled, so a later move waits its own full period.
+              atomically $ do
+                modifyRecord (\entry → entry {recordSettling = Nothing})
+                when suspendedNow (modelEdit_ (resumeTarget target))
               Nothing <$ setCondition Presenting
           | otherwise → plan record active reported
     plan record active reported =
@@ -657,12 +664,20 @@ reconcile generations now target geometry = do
           let request = SwapchainRequest surface planned (planQueueFamily devicePlan) handed
           -- The construction runs masked. Each native effect and the record of
           -- it are consecutive, and a cancellation can land only at the marked
-          -- points between effects, so whatever exists is recorded before it can
-          -- be delivered — and the settlement below, which records how the
-          -- construction ended, runs before it is re-raised.
+          -- points between effects — whatever exists is then recorded — or
+          -- inside a call that blocks interruptibly. The settlement below, which
+          -- records how the construction ended, runs before it is re-raised.
+          inCreation ← newIORef Nothing
+          let creating name call record = do
+                writeIORef inCreation (Just name)
+                created ← rootsCall roots name call
+                atomically (record created)
+                writeIORef inCreation Nothing
+                pure created
           outcome ← tryWithContext $ do
-            swapchain ← rootsCall roots "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request)
-            atomically (editGeneration generations candidate (\entry → entry {genSwapchain = Just swapchain}))
+            swapchain ←
+              creating "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request) $ \created →
+                editGeneration generations candidate (\entry → entry {genSwapchain = Just created})
             allowInterrupt
             images ← rootsCall roots "vkGetSwapchainImagesKHR" (opsSwapchainImages ops device swapchain)
             atomically (editGeneration generations candidate (\entry → entry {genImages = images}))
@@ -672,15 +687,27 @@ reconcile generations now target geometry = do
               then pure count
               else do
                 forM_ images $ \image → do
-                  view ← rootsCall roots "vkCreateImageView" (opsCreateImageView ops device image (surfaceFormat (planFormat planned)))
-                  atomically (editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [view]}))
+                  _ ←
+                    creating "vkCreateImageView" (opsCreateImageView ops device image (surfaceFormat (planFormat planned))) $ \created →
+                      editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [created]})
                   allowInterrupt
                 pure count
           case outcome of
             Right count → publish candidate count
-            Left failure@(ExceptionWithContext _ exception) → do
-              failed candidate (Text.pack (displayException exception))
-              if isAsynchronous exception then rethrowIO failure else rethrowUnlessOrdinary failure
+            Left failure@(ExceptionWithContext _ exception) →
+              readIORef inCreation >>= \case
+                -- A cancellation inside a creation call leaves unknown whether
+                -- that call created something whose handle never came back. It
+                -- is not a failed construction: the candidate is retained,
+                -- uncertain, with everything above it, and the session fails.
+                Just call | isAsynchronous exception → do
+                  let reason = "a cancellation interrupted " <> call <> ", so whether it created anything is unknown"
+                  uncertain candidate reason
+                  noteFailure reason
+                  rethrowIO failure
+                _ → do
+                  failed candidate (Text.pack (displayException exception))
+                  if isAsynchronous exception then rethrowIO failure else rethrowUnlessOrdinary failure
     -- Device loss was latched by the call that raised it and is the owner's
     -- failure; any other failure is this construction's, and is settled.
     rethrowUnlessOrdinary failure@(ExceptionWithContext _ exception)

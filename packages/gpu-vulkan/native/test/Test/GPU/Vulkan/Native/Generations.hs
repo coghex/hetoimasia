@@ -127,6 +127,21 @@ spec = describe "Generations" $ do
       stepAt rig 36 (seen 800 600)
       created rig `shouldReturn` [(640, 480), (800, 600)]
 
+    it "cancels a settling move when the geometry returns, so a later move waits its own full period" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      resizeSurface rig 800 600
+      stepAt rig 10 (seen 800 600)
+      resizeSurface rig 640 480
+      stepAt rig 15 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      resizeSurface rig 800 600
+      stepAt rig 30 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 46)
+      created rig `shouldReturn` [(640, 480)]
+      stepAt rig 46 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+
     it "adopts a settled move that leaves the extent unchanged, without a rebuild" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
@@ -383,6 +398,37 @@ spec = describe "Generations" $ do
       later ← swapchainCalls rig
       [call | call ← later, isDestroyedSwapchain call || isCreated call]
         `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 101 10 (640, 480) Nothing]
+
+    describe "retains a candidate whose creation a cancellation interrupted inside the call, fails the session, and destroys none of it" $ do
+      let interruptedAt at' = do
+            rig ← newRig
+            gate ← newTVarIO False
+            script (rigStandIn rig) at' (WaitsInterruptibly gate)
+            finished ← newEmptyMVar
+            stepper ← forkIO (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished)
+            awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
+            case at' of
+              AtCreateView → awaitCall (rigStandIn rig) (CreatedView 101 100000)
+              _ → pure ()
+            killThread stepper
+            outcome ← takeMVar finished
+            either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+            atomically (writeTVar gate True)
+            [generation] ← viewGenerations <$> generationsOf rig
+            viewStanding generation `shouldSatisfy` \case
+              GenerationUncertain _ → True
+              _ → False
+            model ← atomically (readRootsModel (rigRoots rig))
+            sessionState model `shouldBe` SessionFailed CleanupFailed
+            viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
+            stepAt rig 1 (seen 640 480)
+            stepAt rig 200 (seen 640 480)
+            destroyed rig `shouldReturn` []
+            length <$> created rig `shouldReturn` 1
+            retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
+            retireRootTarget (rigRoots rig) (rigTarget rig) `raises` \(TargetGenerationsRemain _ _) → True
+      it "in the swapchain's creation" (interruptedAt AtCreateSwapchain)
+      it "in an image view's creation" (interruptedAt AtCreateView)
 
     it "keeps a destruction a cancellation ended part-way uncertain, and never attempts it again" $ do
       rig ← newRig

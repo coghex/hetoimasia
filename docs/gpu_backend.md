@@ -369,8 +369,13 @@ Recording, submission and presentation add their own holds in VK-11 to VK-13.
 - Each native effect and its record are consecutive inside a masked
   construction, and a cancellation can land only between effects: whatever
   exists is recorded, the construction is settled as failed, and the
-  cancellation is then delivered. A creation a cancellation reached leaves its
-  swapchain owned, and destroyed before the next construction.
+  cancellation is then delivered. A creation a cancellation reached after it
+  returned leaves its swapchain owned, and destroyed before the next
+  construction. One a cancellation interrupted *inside* the call — which blocks
+  interruptibly — may have created something whose handle never came back: its
+  candidate is kept uncertain and never destroyed, the session fails with
+  `CleanupFailed`, admission closes, and the surface and everything above are
+  retained.
 - Device loss raised by any generation call is latched as the roots' is.
 - Close wins: a closed target begins no construction and admits no recovery
   attempt, and a construction completed after the close is retired rather than
@@ -457,7 +462,8 @@ retains its parents.
   swapchain generations over the stand-in: construction from the surface's
   extent and format, a stale observation, zero area suspending without an
   attempt, coalesced resize waiting 16 ms for the newest geometry, a move the
-  surface has not caught up with yet, capacity retiring and destroying first
+  surface has not caught up with yet, a cancelled move not shortening a later
+  one's quiet period, capacity retiring and destroying first
   and pausing otherwise, the one-generation configuration, per-target
   reservation isolation, an oversized and a zero returned image count refused
   before any view, a failed replacement unable to reacquire from or hand over
@@ -465,8 +471,9 @@ retains its parents.
   repeated out-of-date and suboptimal results bounded by the recovery episode
   without a hot loop, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
-  retaining the surface, a cancellation at a creation's handoff and one ending a
-  destruction part-way, device loss, and close winning over retry and
+  retaining the surface, a cancellation at a creation's handoff, one
+  interrupting a swapchain's or a view's creation inside the call, and one
+  ending a destruction part-way, device loss, and close winning over retry and
   publication;
 - `hetoimasia-gpu-vulkan-glfw:integration-tests` — whole graphics hosts over the
   GLFW package's scripted seam, driven through the real owner machinery and
