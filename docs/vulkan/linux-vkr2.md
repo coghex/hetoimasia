@@ -6,17 +6,17 @@
 > runner wrote on the Linux worker, verbatim.
 
 This is the Linux evidence for issue #250 (VKR-2): pull request #264's
-validation run [36193069046](https://github.com/coghex/hetoimasia/actions/runs/36193069046), on the `vulkan` worker, inside the
+validation run [36197357322](https://github.com/coghex/hetoimasia/actions/runs/36197357322), on the `vulkan` worker, inside the
 published CI image the committed `tools/ci-image/descriptor.json` names, with
 Mesa's Lavapipe and the pinned validation layer with `+synchronization`. The
-runner executed the integration candidate `808997477a831e0dc8b24c5d6a6bd38261e3ad2e`, the merge of the pull
-request's head `60f7866cacb4aaa5557edaeb330ccf63efc00289` into its base, with the catalog's `--complete` command.
+runner executed the integration candidate `a28bc42a9cf1142ae5a9ad03dbcd00c1558eaca3`, the merge of the pull
+request's head `d915bec6d84e5ea06d5c143de4d2474cd36c49c9` into its base, with the catalog's `--complete` command.
 
-`test.vulkan-native`'s preparation built the suite in 8.188 s. Its watched
+`test.vulkan-native`'s preparation built the suite in 26.356 s. Its watched
 native execution — the isolated X11 display the command started for itself, the
 shared session and its roots, every example and child, retirement, the
 diagnostic verdict after the last teardown callback, and the display's own
-teardown — took 2.169 s against the 30-second watchdog. The display helper's
+teardown — took 2.069 s against the 30-second watchdog. The display helper's
 logs and every scenario's output and record are in the worker's
 `validation-receipts-vulkan` artifact. The macOS evidence is
 [`macos-vkr2.md`](macos-vkr2.md).
@@ -79,7 +79,7 @@ Verdict: **pass**.
 | the device | 0 | 0 |
 | the messenger and the instance | 1 | 0 |
 
-- error VUID-vkCmdCopyImageToBuffer-pRegions-00183, objects [("6:0x94ce990",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0x110000000011",Just "resource 3.1 readback buffer")]
+- error VUID-vkCmdCopyImageToBuffer-pRegions-00183, objects [("6:0x43ac9640",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0x110000000011",Just "resource 3.1 readback buffer")]
   - queue labels reported: 0, copied []
   - command-buffer labels reported: 3, copied ["pass batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0"]
 - records delivered: 90
@@ -93,7 +93,7 @@ Verdict: **pass**.
 the device llvmpipe (LLVM 20.1.2, 256 bits) offers debug-utils naming
 the readback buffer 0x110000000011 is named resource 3.1 readback buffer
 recorded BatchId (TargetId 0 1) 0, labelled batch 0 target 0.1 generation 0: Just (BatchView {viewBatch = BatchId (TargetId 0 1) 0, viewBatchFrame = FrameSlotId (TargetId 0 1) 0 1, viewBatchStanding = BatchSealed, viewBatchCommands = 15})
-error VUID-vkCmdCopyImageToBuffer-pRegions-00183: objects [("6:0x94ce990",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0x110000000011",Just "resource 3.1 readback buffer")]
+error VUID-vkCmdCopyImageToBuffer-pRegions-00183: objects [("6:0x43ac9640",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0x110000000011",Just "resource 3.1 readback buffer")]
   queue labels reported: none, []
   command-buffer labels reported: 3, ["pass batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0"]
 the lifetime delivered 90 records
@@ -111,8 +111,8 @@ the lifetime delivered 90 records
     "--",
     "--complete"
   ],
-  "duration_seconds": 2.169,
-  "ended_at": "2026-09-25T21:45:14.156Z",
+  "duration_seconds": 2.069,
+  "ended_at": "2026-09-25T22:36:40.395Z",
   "evidence": [
     "evidence/test.vulkan-native/debug-names.log",
     "evidence/test.vulkan-native/debug-names.md",
@@ -133,15 +133,15 @@ the lifetime delivered 90 records
     "evidence/test.vulkan-native/x11-server.txt"
   ],
   "executed": true,
-  "executed_commit": "808997477a831e0dc8b24c5d6a6bd38261e3ad2e",
-  "executed_tree": "5eafd827bbb400db2a2e78cfb63121e19788d0c1",
+  "executed_commit": "a28bc42a9cf1142ae5a9ad03dbcd00c1558eaca3",
+  "executed_tree": "c4446c956ff0143f1a697423b82bbc7750828b1b",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "60f7866cacb4aaa5557edaeb330ccf63efc00289",
-  "input_identity": "c290ad49d08e886b88bab85e1c14d860240a1c388b67f1e432bea24108678c60",
+  "head_commit": "d915bec6d84e5ea06d5c143de4d2474cd36c49c9",
+  "input_identity": "abd8a7df74ee2048f6dbceeef31737db7c6d4bb1e719cbd395965bb1d6ef6345",
   "outcome": "passed",
-  "plan_identity": "5324f439ac7b33ac3f844c7e4b095908a366a3d75a12548c59c7f1b98da19f7b",
+  "plan_identity": "ac300ffe7de5c134b756d24a84108b81d74311cc4e748560ae889f2ccc5f218f",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": {
     "command": [
@@ -150,12 +150,12 @@ the lifetime delivered 90 records
       "build",
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
-    "duration_seconds": 8.188,
-    "ended_at": "2026-09-25T21:45:11.987Z",
+    "duration_seconds": 26.356,
+    "ended_at": "2026-09-25T22:36:38.325Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-25T21:45:03.799Z",
+    "started_at": "2026-09-25T22:36:11.970Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "X64",
@@ -163,8 +163,8 @@ the lifetime delivered 90 records
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36193069046/attempts/1",
-  "started_at": "2026-09-25T21:45:11.987Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36197357322/attempts/1",
+  "started_at": "2026-09-25T22:36:38.326Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -194,19 +194,19 @@ the lifetime delivered 90 records
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 3.886,
-  "ended_at": "2026-09-25T21:45:03.635Z",
+  "duration_seconds": 32.192,
+  "ended_at": "2026-09-25T22:36:11.784Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "808997477a831e0dc8b24c5d6a6bd38261e3ad2e",
-  "executed_tree": "5eafd827bbb400db2a2e78cfb63121e19788d0c1",
+  "executed_commit": "a28bc42a9cf1142ae5a9ad03dbcd00c1558eaca3",
+  "executed_tree": "c4446c956ff0143f1a697423b82bbc7750828b1b",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "60f7866cacb4aaa5557edaeb330ccf63efc00289",
-  "input_identity": "c290ad49d08e886b88bab85e1c14d860240a1c388b67f1e432bea24108678c60",
+  "head_commit": "d915bec6d84e5ea06d5c143de4d2474cd36c49c9",
+  "input_identity": "abd8a7df74ee2048f6dbceeef31737db7c6d4bb1e719cbd395965bb1d6ef6345",
   "outcome": "passed",
-  "plan_identity": "5324f439ac7b33ac3f844c7e4b095908a366a3d75a12548c59c7f1b98da19f7b",
+  "plan_identity": "ac300ffe7de5c134b756d24a84108b81d74311cc4e748560ae889f2ccc5f218f",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": null,
   "runner_arch": "X64",
@@ -214,8 +214,8 @@ the lifetime delivered 90 records
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36193069046/attempts/1",
-  "started_at": "2026-09-25T21:44:59.749Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36197357322/attempts/1",
+  "started_at": "2026-09-25T22:35:39.592Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",
