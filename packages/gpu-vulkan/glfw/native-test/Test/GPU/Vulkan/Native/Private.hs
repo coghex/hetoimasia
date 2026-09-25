@@ -18,7 +18,9 @@
 -- * @vk11-recording@ — VK-11's managed resources and a recorded, discarded
 --   triangle batch against a swapchain generation's image (#223);
 -- * @synchronization-hazard@ — the negative control that proves
---   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard").
+--   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
+-- * @debug-names@ — #250's provoked validation report on a named managed
+--   resource inside a labelled batch ("Test.GPU.Vulkan.Native.Naming").
 --
 -- The child asserts its migrated examples exactly as the proof did: the whole
 -- spec and only the whole spec, through Hspec's own primitives with the
@@ -59,6 +61,7 @@ import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
+import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
@@ -122,6 +125,12 @@ scenarios =
       $ \_ journal → do
         outcome ← Hazard.runHazard journal
         pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
+  , Scenario
+      "debug-names"
+      "carries a provoked validation report's named managed resource, and its batch's label, into the capture"
+      $ \_ journal → do
+        outcome ← Naming.runNaming journal
+        pure (Naming.spec outcome, section "The #250 debug names and labels record" (Naming.namingSection outcome))
   ]
   where
     invocation = "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete"
