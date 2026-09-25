@@ -28,12 +28,12 @@ The diagnostics package includes no Vulkan header and depends on no binding or
 loader, so `cabal build all` with either ordinary project builds it with no
 Vulkan SDK present, and its suite is the CPU validation group
 `test.vulkan-diagnostics`. The native package is built only by
-`tools/vulkan-proof/run-proof.sh`, which is what points Cabal at the provisioned
-loader and headers; see [the proof harness](../tools/vulkan-proof/README.md).
+`tools/vulkan/run.sh`, which is what points Cabal at the provisioned loader and
+headers; its groups are `test.vulkan-headless` and `test.vulkan-native`.
 `tools/test/VulkanProof.hs` holds that boundary: neither ordinary project names
 the native package, no package they name depends on the binding, and the Vulkan
-project names exactly the proof, the native package, and the native package's
-local closure.
+project names exactly the native package, the window integration package, and
+their local closure.
 
 ## The producer
 
@@ -432,7 +432,10 @@ where no public coordination point exists: a failed body kept primary over a
 group-closing failure whose own context stays reachable, and every combination
 of body outcome, finalization cancellation and group-closing failure.
 
-The native cases run through the VK-2 proof route until VK-8 moves them into
-the package-native fixture; see
-[the proof harness](../tools/vulkan-proof/README.md#vk-6-validation-capture) for
-what they show and where their records are retained.
+The native cases are the Vulkan native suite's `vk6-capture` case, on an
+instance of its own in a child process; see
+[the Vulkan native suite](gpu_backend.md#the-native-suite). Their earlier records
+are retained as `docs/vulkan/linux-vk6.md` and `docs/vulkan/macos-vk6.md`. Every
+validation-enabled instance there, and the shared roots', also enables
+synchronization validation through its create info, and the suite's
+`synchronization-hazard` case proves the capture receives its reports.

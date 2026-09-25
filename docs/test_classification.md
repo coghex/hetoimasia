@@ -98,9 +98,11 @@ Other existing apparatus is already outside routine automation:
   see [GLFW's native suite](glfw.md#the-native-suite).
 - `lua-hazard callback-cancellation`: unsupported-path manual diagnostic with
   potentially variable/crashing outcomes; not a pass/fail regression.
-- The separate [Vulkan compatibility proof](../tools/vulkan-proof/README.md)
-  project and [toolchain qualification](toolchain.md): deliberate qualification
-  work, outside the routine catalog; follow their own platform and consent rules.
+- The [toolchain qualification](toolchain.md): deliberate qualification work,
+  outside the routine catalog; follow its own platform and consent rules. The
+  retired Vulkan compatibility proof's cases are now the required group
+  `test.vulkan-native`, and its records stay in
+  [the compatibility record](vulkan_compatibility_record.md).
 
 ## Coordinated local selection
 

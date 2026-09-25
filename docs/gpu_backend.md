@@ -27,8 +27,9 @@ The GLFW package depends on neither, and the native package does not depend on
 the integration package. Both are listed only in `cabal.project.vulkan`, and
 `cabal.project.common` holds their `-Werror` entries; `cabal.project` and
 `cabal.project.cpu` resolve no Vulkan header, binding or loader. Only
-[`tools/vulkan-proof/run-proof.sh`](../tools/vulkan-proof/README.md) builds
-them. [`packages/gpu-vulkan/README.md`](../packages/gpu-vulkan/README.md) maps
+[`tools/vulkan/run.sh`](../tools/vulkan/run.sh) builds them, and the validation
+groups `test.vulkan-headless` and `test.vulkan-native` run through it; see
+[validation.md](validation.md#the-registered-groups). [`packages/gpu-vulkan/README.md`](../packages/gpu-vulkan/README.md) maps
 all four GPU packages.
 
 The integration package's public module is `Hetoimasia.GPU.Vulkan.GLFW`; its
@@ -271,8 +272,9 @@ retains its parents.
 
 ## Evidence
 
-**Headless.** `run-proof.sh --headless` runs, beside the harness's own pure
-examples:
+**Headless.** The group `test.vulkan-headless` builds and runs, through
+`bash tools/vulkan/run.sh test`, the native backend's shader contract
+(`shader-tests`) and:
 
 - `hetoimasia-gpu-vulkan-native:native-tests` — the profile's decisions, and the
   roots over a stand-in native layer: rollback of exactly what exists at every
@@ -281,8 +283,10 @@ examples:
   the incompatible-target rejection with no second device, the bootstrap
   target owning nothing, the full destruction order, every refused step behind
   an uncertain destruction without a retry — including a destruction that
-  raised outright and one a cancellation ended part-way — and device loss closing admission
-  with the model failed while an unknown outcome is neither loss nor success;
+  raised outright and one a cancellation ended part-way — device loss closing
+  admission with the model failed while an unknown outcome is neither loss nor
+  success, and synchronization validation planned only through an enabled
+  layer that offers it;
 - `hetoimasia-gpu-vulkan-glfw:integration-tests` — whole graphics hosts over the
   GLFW package's scripted seam, driven through the real owner machinery and
   controller with a stand-in native layer and surface bridge, journalling every
@@ -300,11 +304,61 @@ examples:
   checkpoint while retirement is pending, staying primary over a failed
   cleanup that is retained without a retry.
 
-**Native.** The proof harness's VK-7 session runs `withVulkanOwnerHost` itself
-over two hidden windows, closes the first-created one while the second stays
-attached, and exits, recording every native call's OS thread and the reports
-the capture received during it. Its record — under "VK-7: the Vulkan roots
-under the graphics owner" — is retained for Linux as
-[`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md). See
-[the proof README](../tools/vulkan-proof/README.md#vk-7-the-vulkan-roots-under-the-graphics-owner).
-VK-8 moves these cases into a package-native fixture.
+**Native.** The group `test.vulkan-native` runs the native suite below. The
+retained per-slice records from the retired proof harness —
+[`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
+and VK-6 records beside it — stay as the historical evidence of the inputs
+they name.
+
+## The native suite
+
+`hetoimasia-gpu-vulkan-glfw:vulkan-native-tests`, in `packages/gpu-vulkan/glfw/native-test/`,
+is the package-native Vulkan fixture and the native cases of VK-2 and VK-5
+through VK-7 that it took over from the retired proof harness. It follows
+[the GLFW native suite's](glfw.md#the-native-suite) ownership rules — which it
+companions — and adds the Vulkan owner's:
+
+| Rule | How it holds |
+| --- | --- |
+| Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
+| Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
+| Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, and `synchronization-hazard`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
+| Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
+| Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
+| Validation | Every validation-enabled instance, shared or private, enables the Khronos layer and its **synchronization validation** through the instance's own create info. The fixture refuses to run with a set other than the one the provisioned layer is pinned to (`HETOIMASIA_VULKAN_VALIDATION_FEATURES`), which is the one the receipt names. `synchronization-hazard` records two `vkCmdFillBuffer` writes to one buffer with no barrier between them, on an instance the production native layer planned from the same request, and passes only when the capture carries `SYNC-HAZARD-WRITE-AFTER-WRITE` from inside the second write, completely, and its post-teardown verdict fails for that latched error and nothing else — reported apart from the clean profile's verdict and never filtered out of it. |
+| After teardown | The shared session is released only once Hspec has finished: the loop finishes, the host retires every remaining target, and the owner destroys every surface, then the device, then the messenger, then the instance, which is the last native call. Only then does the run check that order, the owner's thread for each of them, and the capture's final verdict, which must be clean: any validation error or incomplete capture fails the run, and the run prints the error records. |
+| Report | The run prints the environment it established, the shared session's acquisitions, native calls, destruction order and verdict, each child's exit and seconds, and how long the process ran. Each child's output and record are written to the validation runner's evidence directory. |
+
+The initial required profile, over the shared roots: dispatched operations run
+on the bound main thread; the instance and its explicit messenger are created on
+the owner's thread; two windows are handed over as required targets on one
+shared device, each surface created on the main thread, and when the
+first-created closes, its surface is destroyed on the owner's thread while the
+device, the instance and the second target stay live; and a later example's
+target lands on the same device. The private cases carry the migrated
+assertions unchanged — VK-2's profile, completion, abandonment and capture,
+with the synchronization-validation finding added; VK-6's C-only capture;
+VK-5's bridge; VK-7's roots through the destruction order at the host's exit —
+and the synchronization control.
+
+Run it as the group does:
+
+```bash
+bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests
+bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --dry-run
+```
+
+On Linux the native mode starts an isolated X11 display for the run and needs
+no approval. On macOS the suite opens windows on the person's desktop, so an
+agent first describes that disruption, asks the human user for explicit
+approval for that session, and waits for acceptance; then, and only on that
+one command:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests
+```
+
+See [validation.md](validation.md#the-vulkan-groups-local-evidence) for the
+receipt that run leaves and what it is evidence of.

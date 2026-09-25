@@ -2264,6 +2264,12 @@ version and source/build identity, shader compiler, native recipe/manifest and
 Linux image digest through the existing toolchain map. VK-4 pins the validation
 layers as native recipe inputs on both platforms, including their manifest and
 binary identity; an ambient SDK layer with the same name is not interchangeable.
+VK-8 pins the layer's validation features beside it: every validation-enabled
+instance enables the Khronos layer's synchronization validation through its own
+create info (`VkValidationFeaturesEXT`), never through an environment variable or
+settings file, the native recipe refuses a layer whose manifest cannot enable it,
+and the `vulkan-layers` identity names it (`+synchronization`), so evidence
+gathered without it cannot stand in for evidence gathered with it.
 Both planner and worker use coherent declared identities, and the worker
 verifies its actual environment. Local macOS evidence identifies its own native
 manifest; package changes invalidate affected evidence under existing rules.
