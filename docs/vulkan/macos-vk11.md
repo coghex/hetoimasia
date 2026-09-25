@@ -12,12 +12,12 @@ and — under the human user's explicit approval for this task's runs, given on
 2026-09-25 and carried on that one command as
 `HETOIMASIA_NATIVE_SESSION=desktop` — `test.vulkan-native`, under MoltenVK and
 Cocoa, with the catalog's `--complete` command. Both passed at commit
-`c5d5bc64c21a5c065a355cf9797d0f7c299c09d7`.
+`d8c1ec164b600d2a1a3240e8b91c47303cc45224`.
 
-The native group's preparation built the suite in 4.763 s, and its watched
+The native group's preparation built the suite in 4.87 s, and its watched
 native execution — the shared session and its roots, every example and child,
 retirement, the diagnostic verdict after the last teardown callback — took
-5.488 s against the 30-second watchdog. The receipts record `Darwin` and the
+5.653 s against the 30-second watchdog. The receipts record `Darwin` and the
 local prefix's own toolchain map — the MoltenVK driver, the 1.3.296 layer with
 `+synchronization` — and no `ci-image` entry, so neither can satisfy a Linux
 plan. The Linux evidence is [`linux-vk11.md`](linux-vk11.md).
@@ -59,13 +59,13 @@ vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 53
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 67 records delivered
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.5202e-2s
-vulkan-native-tests: private vk11-recording: ExitSuccess in 0.200141s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.502861s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.160094s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 4.9769e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 0.20735s
-vulkan-native-tests: the process ran for 2.813679s, fixtures, examples and teardown included
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.8028e-2s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 0.198432s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.459165s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.160097s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 4.8884e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.189361s
+vulkan-native-tests: the process ran for 2.784859s, fixtures, examples and teardown included
 ```
 
 Each private scenario's own examples:
@@ -142,8 +142,8 @@ the lifetime delivered 65 records
     "--",
     "--complete"
   ],
-  "duration_seconds": 5.488,
-  "ended_at": "2026-09-25T19:29:26.211Z",
+  "duration_seconds": 5.653,
+  "ended_at": "2026-09-25T19:44:15.244Z",
   "evidence": [
     "evidence/test.vulkan-native/synchronization-hazard.log",
     "evidence/test.vulkan-native/synchronization-hazard.md",
@@ -159,15 +159,15 @@ the lifetime delivered 65 records
     "evidence/test.vulkan-native/vk7-roots.md"
   ],
   "executed": true,
-  "executed_commit": "c5d5bc64c21a5c065a355cf9797d0f7c299c09d7",
-  "executed_tree": "8c70416a6be92440284a7db36624020c1058c5ba",
+  "executed_commit": "d8c1ec164b600d2a1a3240e8b91c47303cc45224",
+  "executed_tree": "2b63e709ca20383d15556685d68f2f2b65430944",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "c5d5bc64c21a5c065a355cf9797d0f7c299c09d7",
-  "input_identity": "c80ced6d10645ee22bdcc31f1918e888a35b979019d43467a64b8808ecfa67a4",
+  "head_commit": "d8c1ec164b600d2a1a3240e8b91c47303cc45224",
+  "input_identity": "e6e38e94ff4042a360f504e571906fcc8c5dfcd305ebb19238b1515ded22da2f",
   "outcome": "passed",
-  "plan_identity": "4472bfe218d402e213624133daff07ccd4cc259816195846700906311d8b0537",
+  "plan_identity": "4356c7b69821c527f96697f7edca4647f6c15396a6cb6baea5244401a29d10f8",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": {
     "command": [
@@ -176,12 +176,12 @@ the lifetime delivered 65 records
       "build",
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
-    "duration_seconds": 4.763,
-    "ended_at": "2026-09-25T19:29:20.722Z",
+    "duration_seconds": 4.87,
+    "ended_at": "2026-09-25T19:44:09.590Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-25T19:29:15.958Z",
+    "started_at": "2026-09-25T19:44:04.719Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "arm64",
@@ -190,7 +190,7 @@ the lifetime delivered 65 records
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-25T19:29:20.722Z",
+  "started_at": "2026-09-25T19:44:09.591Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -218,19 +218,19 @@ the lifetime delivered 65 records
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 19.897,
-  "ended_at": "2026-09-25T19:29:14.761Z",
+  "duration_seconds": 20.551,
+  "ended_at": "2026-09-25T19:44:03.454Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "c5d5bc64c21a5c065a355cf9797d0f7c299c09d7",
-  "executed_tree": "8c70416a6be92440284a7db36624020c1058c5ba",
+  "executed_commit": "d8c1ec164b600d2a1a3240e8b91c47303cc45224",
+  "executed_tree": "2b63e709ca20383d15556685d68f2f2b65430944",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "c5d5bc64c21a5c065a355cf9797d0f7c299c09d7",
-  "input_identity": "c80ced6d10645ee22bdcc31f1918e888a35b979019d43467a64b8808ecfa67a4",
+  "head_commit": "d8c1ec164b600d2a1a3240e8b91c47303cc45224",
+  "input_identity": "e6e38e94ff4042a360f504e571906fcc8c5dfcd305ebb19238b1515ded22da2f",
   "outcome": "passed",
-  "plan_identity": "4472bfe218d402e213624133daff07ccd4cc259816195846700906311d8b0537",
+  "plan_identity": "4356c7b69821c527f96697f7edca4647f6c15396a6cb6baea5244401a29d10f8",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": null,
   "runner_arch": "arm64",
@@ -239,7 +239,7 @@ the lifetime delivered 65 records
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-25T19:28:54.864Z",
+  "started_at": "2026-09-25T19:43:42.902Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",
