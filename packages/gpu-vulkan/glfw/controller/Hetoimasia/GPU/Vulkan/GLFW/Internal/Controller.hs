@@ -50,11 +50,22 @@
 -- before one of the two has been settled: a construction that raised leaves
 -- the obligation on the lease, where the target's retirement finds it.
 --
+-- = Swapchain generations
+--
+-- Every target the roots admit is tracked by the generations above them
+-- ("Hetoimasia.GPU.Vulkan.Native.Generations"). Each progress step hands them
+-- the geometry the owner folded for each constructed target — its eligibility,
+-- its last coherent framebuffer observation and the bounds the platform
+-- published — and they build, replace and destroy its generations on the
+-- owner's thread. The observation reaches the owner through
+-- 'Hetoimasia.Runtime.GLFW.publishGraphicsObservation' on the main thread.
+--
 -- = Destruction
 --
--- A target's retirement destroys its surface, through the roots when they
--- admitted it and directly when they did not, and raises — manufacturing no
--- evidence — when that destruction was uncertain. Whole-owner retirement
+-- A target's retirement destroys its swapchain generations and then its
+-- surface, through the roots when they admitted it and directly when they did
+-- not, and raises — manufacturing no evidence — when a destruction was
+-- uncertain or a generation is still held. Whole-owner retirement
 -- closes the lease, destroys every surface no target holds (those whose
 -- announcement never reached the owner), and destroys the device; whole-owner
 -- destruction waits for any surface creation still in its native call, settles
