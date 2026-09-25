@@ -6,19 +6,19 @@
 > the runs printed.
 
 This is the Linux evidence for issue #220: pull request #260's validation run
-[36082596496](https://github.com/coghex/hetoimasia/actions/runs/36082596496/attempts/1), on the `vulkan` worker, inside the
+[36083601959](https://github.com/coghex/hetoimasia/actions/runs/36083601959/attempts/1), on the `vulkan` worker, inside the
 published CI image the committed `tools/ci-image/descriptor.json` names, with
 Mesa's Lavapipe and the pinned 1.3.275 validation layer with
 `+synchronization`. The runner executed the integration candidate
-`6301eafa6888b2d75e09ee034125f83e9fc37007`, the merge of the pull request's head
-`eaa32d77773e4bbad42ef4c26c4b7b63edf882a7` into its base, with the catalog's `--complete`
+`ecf7d2a2044b0babfd316b61e95a7fbe192de6e6`, the merge of the pull request's head
+`a558b9ee80169f9c9d1fc4f1591755a83f054f47` into its base, with the catalog's `--complete`
 command.
 
 `test.vulkan-native`'s preparation built the suite in 1.016 s. Its watched native
 execution — the isolated X11 display the command started for itself, the shared
 session and its roots, every example and child, retirement, the diagnostic
 verdict after the last teardown callback, and the display's own teardown — took
-1.718 s against the 30-second watchdog. The display helper's logs are
+1.667 s against the 30-second watchdog. The display helper's logs are
 in the worker's `validation-receipts-vulkan` artifact beside each scenario's
 output and record. The macOS evidence is [`macos-vk8.md`](macos-vk8.md).
 
@@ -35,12 +35,12 @@ vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 16
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 90 records delivered
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 9.225452e-2s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.138964879s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 4.8153511e-2s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 9.2892075e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 0.129295967s
-vulkan-native-tests: the process ran for 0.810867142s, fixtures, examples and teardown included
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 9.762016e-2s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.136294147s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 4.7747575e-2s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 9.7046434e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.133211614s
+vulkan-native-tests: the process ran for 0.80498793s, fixtures, examples and teardown included
 ```
 
 Each private scenario's own examples:
@@ -98,8 +98,8 @@ Each private scenario's own examples:
     "--",
     "--complete"
   ],
-  "duration_seconds": 1.718,
-  "ended_at": "2026-09-25T01:35:31.760Z",
+  "duration_seconds": 1.667,
+  "ended_at": "2026-09-25T01:49:50.635Z",
   "evidence": [
     "evidence/test.vulkan-native/synchronization-hazard.log",
     "evidence/test.vulkan-native/synchronization-hazard.md",
@@ -116,15 +116,15 @@ Each private scenario's own examples:
     "evidence/test.vulkan-native/x11-server.txt"
   ],
   "executed": true,
-  "executed_commit": "6301eafa6888b2d75e09ee034125f83e9fc37007",
-  "executed_tree": "433d7109cc445e7d57de70dc08c6caa1a3da17b4",
+  "executed_commit": "ecf7d2a2044b0babfd316b61e95a7fbe192de6e6",
+  "executed_tree": "0362c2f4f49c54b5eeadc377cf620ffa80e808d7",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "input_identity": "2ed94b704134869e66b38218c81b491de3e883a269aa2e9f300f5cf5c0de7069",
+  "head_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "input_identity": "16900c6f036943fd6f78a118c77dc3b14b0a7cab1e6f16ef612dc651f9c11875",
   "outcome": "passed",
-  "plan_identity": "4008f308eb9ca35eb5cc0b39dbe25d48b484a820b22d4942d4a653a7e908508a",
+  "plan_identity": "f49516511d7e1ee3eb208e4c1926fbf95e6869e7ec6b825aeab089f0d03049b0",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": {
     "command": [
@@ -134,11 +134,11 @@ Each private scenario's own examples:
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
     "duration_seconds": 1.016,
-    "ended_at": "2026-09-25T01:35:30.043Z",
+    "ended_at": "2026-09-25T01:49:48.967Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-25T01:35:29.026Z",
+    "started_at": "2026-09-25T01:49:47.951Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "X64",
@@ -146,8 +146,8 @@ Each private scenario's own examples:
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36082596496/attempts/1",
-  "started_at": "2026-09-25T01:35:30.043Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36083601959/attempts/1",
+  "started_at": "2026-09-25T01:49:48.967Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -177,19 +177,19 @@ Each private scenario's own examples:
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 3.934,
-  "ended_at": "2026-09-25T01:35:28.840Z",
+  "duration_seconds": 4.73,
+  "ended_at": "2026-09-25T01:49:47.762Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "6301eafa6888b2d75e09ee034125f83e9fc37007",
-  "executed_tree": "433d7109cc445e7d57de70dc08c6caa1a3da17b4",
+  "executed_commit": "ecf7d2a2044b0babfd316b61e95a7fbe192de6e6",
+  "executed_tree": "0362c2f4f49c54b5eeadc377cf620ffa80e808d7",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "input_identity": "2ed94b704134869e66b38218c81b491de3e883a269aa2e9f300f5cf5c0de7069",
+  "head_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "input_identity": "16900c6f036943fd6f78a118c77dc3b14b0a7cab1e6f16ef612dc651f9c11875",
   "outcome": "passed",
-  "plan_identity": "4008f308eb9ca35eb5cc0b39dbe25d48b484a820b22d4942d4a653a7e908508a",
+  "plan_identity": "f49516511d7e1ee3eb208e4c1926fbf95e6869e7ec6b825aeab089f0d03049b0",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": null,
   "runner_arch": "X64",
@@ -197,8 +197,8 @@ Each private scenario's own examples:
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36082596496/attempts/1",
-  "started_at": "2026-09-25T01:35:24.906Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36083601959/attempts/1",
+  "started_at": "2026-09-25T01:49:43.032Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",

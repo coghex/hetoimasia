@@ -11,12 +11,12 @@ and — under the human user's explicit approval for this session, given on
 2026-09-24 and carried on that one command as
 `HETOIMASIA_NATIVE_SESSION=desktop` — `test.vulkan-native`, under MoltenVK and
 Cocoa, with the catalog's `--complete` command. Both passed at commit
-`eaa32d77773e4bbad42ef4c26c4b7b63edf882a7`.
+`a558b9ee80169f9c9d1fc4f1591755a83f054f47`.
 
-The native group's preparation built the suite in 1.224 s on a warm build, and its
+The native group's preparation built the suite in 1.208 s on a warm build, and its
 watched native execution — the shared session and its roots, every example and
 child, retirement, the diagnostic verdict after the last teardown callback —
-took 1.655 s against the 30-second watchdog. The receipts record `Darwin`
+took 1.687 s against the 30-second watchdog. The receipts record `Darwin`
 and the local prefix's own toolchain map — the MoltenVK driver, the 1.3.296
 layer with `+synchronization` — and no `ci-image` entry, so neither can satisfy
 a Linux plan. The Linux evidence is [`linux-vk8.md`](linux-vk8.md).
@@ -35,12 +35,12 @@ vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 16
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 64 records delivered
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 3.5767e-2s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.255049s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.141695s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 4.9639e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 0.171004s
-vulkan-native-tests: the process ran for 0.942182s, fixtures, examples and teardown included
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.0954e-2s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.249992s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.149909s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 5.3286e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.174686s
+vulkan-native-tests: the process ran for 0.973906s, fixtures, examples and teardown included
 ```
 
 Each private scenario's own examples:
@@ -98,8 +98,8 @@ Each private scenario's own examples:
     "--",
     "--complete"
   ],
-  "duration_seconds": 1.655,
-  "ended_at": "2026-09-25T01:34:21.128Z",
+  "duration_seconds": 1.687,
+  "ended_at": "2026-09-25T01:48:31.570Z",
   "evidence": [
     "evidence/test.vulkan-native/synchronization-hazard.log",
     "evidence/test.vulkan-native/synchronization-hazard.md",
@@ -113,15 +113,15 @@ Each private scenario's own examples:
     "evidence/test.vulkan-native/vk7-roots.md"
   ],
   "executed": true,
-  "executed_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "executed_tree": "433d7109cc445e7d57de70dc08c6caa1a3da17b4",
+  "executed_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "executed_tree": "0362c2f4f49c54b5eeadc377cf620ffa80e808d7",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "input_identity": "d2441b29d6f78ff884b32865cb9c61906b3e7267a224441f5b38091738bd7de3",
+  "head_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "input_identity": "11ce9400e900b47848c1a60cc06b5139ede928fbb4f6ef7852b6b570c7fd4b6c",
   "outcome": "passed",
-  "plan_identity": "468b72519abbbcf426c05a66a8a3860f26fcaf4681cf7de15f3325a145128a2f",
+  "plan_identity": "028a26614947cd006685a62b59a5511e5d9ca83df4e413fda4a534806d87a19a",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": {
     "command": [
@@ -130,12 +130,12 @@ Each private scenario's own examples:
       "build",
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
-    "duration_seconds": 1.224,
-    "ended_at": "2026-09-25T01:34:19.472Z",
+    "duration_seconds": 1.208,
+    "ended_at": "2026-09-25T01:48:29.883Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-25T01:34:18.248Z",
+    "started_at": "2026-09-25T01:48:28.675Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "arm64",
@@ -144,7 +144,7 @@ Each private scenario's own examples:
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-25T01:34:19.472Z",
+  "started_at": "2026-09-25T01:48:29.883Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -172,19 +172,19 @@ Each private scenario's own examples:
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 3.953,
-  "ended_at": "2026-09-25T01:34:17.934Z",
+  "duration_seconds": 4.222,
+  "ended_at": "2026-09-25T01:48:28.358Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "executed_tree": "433d7109cc445e7d57de70dc08c6caa1a3da17b4",
+  "executed_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "executed_tree": "0362c2f4f49c54b5eeadc377cf620ffa80e808d7",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "eaa32d77773e4bbad42ef4c26c4b7b63edf882a7",
-  "input_identity": "d2441b29d6f78ff884b32865cb9c61906b3e7267a224441f5b38091738bd7de3",
+  "head_commit": "a558b9ee80169f9c9d1fc4f1591755a83f054f47",
+  "input_identity": "11ce9400e900b47848c1a60cc06b5139ede928fbb4f6ef7852b6b570c7fd4b6c",
   "outcome": "passed",
-  "plan_identity": "468b72519abbbcf426c05a66a8a3860f26fcaf4681cf7de15f3325a145128a2f",
+  "plan_identity": "028a26614947cd006685a62b59a5511e5d9ca83df4e413fda4a534806d87a19a",
   "policy_version": "c30ee2b9af078c3312475a5290cfba008a5ccf7c9fa8c8b40dee4873892e8783",
   "preparation": null,
   "runner_arch": "arm64",
@@ -193,7 +193,7 @@ Each private scenario's own examples:
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-25T01:34:13.980Z",
+  "started_at": "2026-09-25T01:48:24.136Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",
