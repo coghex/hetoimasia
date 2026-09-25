@@ -463,6 +463,41 @@ spec = describe "Generations" $ do
       retireRootTarget (rigRoots rig) (rigTarget rig)
       filter isSurfaceDestroyed <$> calls (rigStandIn rig) `shouldReturn` [DestroyedSurface 10]
 
+    it "counts a replacement cancelled before its creation as never handing the old swapchain over, and destroys that first" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      gate ← newTVarIO False
+      reached ← newEmptyMVar
+      atomically $ writeTVar (rigAfterAdmission rig) $ \_ → do
+        putMVar reached ()
+        atomically (readTVar gate >>= check)
+      resizeSurface rig 800 600
+      stepAt rig 10 (seen 800 600)
+      finished ← newEmptyMVar
+      stepper ← forkIO (try @SomeException (stepAt rig 26 (seen 800 600)) >>= putMVar finished)
+      takeMVar reached
+      killThread stepper
+      _ ← takeMVar finished
+      atomically $ do
+        writeTVar gate True
+        writeTVar (rigAfterAdmission rig) (\_ → pure ())
+      standings ← viewGenerations <$> generationsOf rig
+      lookup first [(viewGeneration each, (viewStanding each, viewHandedOver each)) | each ← standings]
+        `shouldBe` Just (GenerationRetiredHeld, False)
+      -- The old swapchain is still one Vulkan counts as unretired, and it is
+      -- held: nothing is created for the surface, and no attempt is spent.
+      stepAt rig 30 (seen 800 600)
+      stepAt rig 60 (seen 800 600)
+      created rig `shouldReturn` [(640, 480)]
+      recoveryAttempts rig `shouldReturn` 0
+      atomically (endGenerationUse (rigGenerations rig) use)
+      stepAt rig 80 (seen 800 600)
+      later ← swapchainCalls rig
+      [call | call ← later, isDestroyedSwapchain call || isCreated call]
+        `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 104 10 (800, 600) Nothing]
+
     it "records a swapchain whose creation a cancellation reached, and destroys it before building afresh" $ do
       rig ← newRig
       gate ← newTVarIO False

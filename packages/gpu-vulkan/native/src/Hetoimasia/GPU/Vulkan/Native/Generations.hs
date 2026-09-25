@@ -608,31 +608,37 @@ reconcile generations now target geometry = do
     recover planned =
       lookupRecordIO >>= \case
         Just record | recordRecovering record → construct planned
+        -- An attempt that could not begin is not admitted, so waiting for an
+        -- unretired swapchain to go spends none of the episode.
         _ →
-          atomically (modelEdit (beginTargetRecovery now target)) >>= \case
-            Just (RecoveryAttempt _) → do
-              atomically (modifyRecord (\entry → entry {recordRecovering = True}))
-              construct planned
-            Just (RecoveryDeferred at) → Nothing <$ setCondition (RecoveryWaiting at)
-            Just (RecoveryExhausted _) → Nothing <$ setCondition RecoverySpent
-            -- An attempt is outstanding only between its admission and its
-            -- settlement in this same step, so there is nothing to begin.
-            _ → pure Nothing
+          atomically unretiredRemains >>= \case
+            True → pure Nothing
+            False →
+              atomically (modelEdit (beginTargetRecovery now target)) >>= \case
+                Just (RecoveryAttempt _) → do
+                  atomically (modifyRecord (\entry → entry {recordRecovering = True}))
+                  construct planned
+                Just (RecoveryDeferred at) → Nothing <$ setCondition (RecoveryWaiting at)
+                Just (RecoveryExhausted _) → Nothing <$ setCondition RecoverySpent
+                -- An attempt is outstanding only between its admission and its
+                -- settlement in this same step, so there is nothing to begin.
+                _ → pure Nothing
+    -- Every swapchain Vulkan still counts as unretired, other than the active
+    -- one a construction hands over, must be gone before a fresh one is made
+    -- for the same surface.
+    unretiredRemains = do
+      record ← lookupRecord
+      pure $ case record of
+        Nothing → True
+        Just entry →
+          or
+            [ isJust (genSwapchain native) && not (genHandedOver native)
+            | (generation, native) ← Map.toList (recordGenerations entry)
+            , Just generation /= recordActive entry
+            , genStanding native /= GenerationDestroyedPending
+            ]
     construct planned = do
-      -- Every swapchain Vulkan still counts as unretired, other than the one
-      -- this construction hands over, must be gone before a fresh one is made
-      -- for the same surface.
-      blocked ← atomically $ do
-        record ← lookupRecord
-        pure $ case record of
-          Nothing → True
-          Just entry →
-            or
-              [ isJust (genSwapchain native) && not (genHandedOver native)
-              | (generation, native) ← Map.toList (recordGenerations entry)
-              , Just generation /= recordActive entry
-              , genStanding native /= GenerationDestroyedPending
-              ]
+      blocked ← atomically unretiredRemains
       if blocked
         then pure Nothing
         else begin planned
@@ -650,7 +656,9 @@ reconcile generations now target geometry = do
         case answer of
           Right (candidate, handed) → do
             for_ handed $ \previous →
-              editGeneration generations previous (\entry → entry {genStanding = GenerationRetiredHeld, genHandedOver = True})
+              -- Retired in the model here; handed over to Vulkan only when the
+              -- creation that passes it is actually called.
+              editGeneration generations previous (\entry → entry {genStanding = GenerationRetiredHeld})
             for_ handed (\previous → retireCpu previous)
             modifyRecord $ \entry →
               entry
@@ -664,7 +672,7 @@ reconcile generations now target geometry = do
             handedHandle ← case handed of
               Nothing → pure Nothing
               Just previous → (>>= genSwapchain) <$> lookupGeneration generations previous
-            pure (Right (candidate, handedHandle, maybe 0 recordSurface record))
+            pure (Right (candidate, (,) <$> handed <*> handedHandle, maybe 0 recordSurface record))
           Left refusal → pure (Left refusal)
       case attempt of
         Left (Just kind) → capacity planned kind
@@ -698,7 +706,7 @@ reconcile generations now target geometry = do
           stillFull ← atomically (maybe True (not . Map.null . recordGenerations) <$> lookupRecord)
           if stillFull then pure Nothing else construct planned
         else pure Nothing
-    build planned candidate handed surface = do
+    build planned candidate handing surface = do
           -- The construction runs masked. Each native effect and the record of
           -- it are consecutive, and a cancellation can land only at the marked
           -- points between effects — whatever exists is then recorded — or
@@ -715,7 +723,14 @@ reconcile generations now target geometry = do
             generationsAfterAdmission generations candidate
             (devicePlan, device) ← readDevice >>= maybe (throwIO DeviceAbsent) pure
             limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
-            let request = SwapchainRequest surface planned (planQueueFamily devicePlan) handed
+            let request = SwapchainRequest surface planned (planQueueFamily devicePlan) (snd <$> handing)
+            -- Passing @oldSwapchain@ retires it whatever the creation answers,
+            -- so it is recorded as handed over immediately before the call, with
+            -- no point between the two a cancellation could land at. A
+            -- construction cancelled before this never handed it over, and the
+            -- old swapchain stays one Vulkan counts as unretired.
+            for_ handing $ \(previous, _) →
+              atomically (editGeneration generations previous (\entry → entry {genHandedOver = True}))
             swapchain ←
               creating "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request) $ \created →
                 editGeneration generations candidate (\entry → entry {genSwapchain = Just created})

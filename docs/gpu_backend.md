@@ -335,13 +335,18 @@ nothing, and the package's public module does not offer one.
   has moved — since the active generation, or since the failed construction
   was planned — first waits for that move to settle, as any resize does.
 - **The irreversible `oldSwapchain` transition.** Replacement hands the active
-  generation over. It is marked retired before the native call, and a creation
+  generation over. The model retires it when the replacement is admitted, and
+  it is recorded as handed over to Vulkan immediately before the creation call
+  that passes it — a replacement cancelled before that call never handed it
+  over, and it stays a swapchain Vulkan counts as unretired. It is marked
+  retired before the native call, and a creation
   that then fails leaves the target without an active generation, in
   `ConstructionFailed`. The next construction is a fresh one — never passed the
   retired handle, never replaying the failed call — and a recovery attempt. It
   begins only once every swapchain of the target that Vulkan still counts as
   unretired has been destroyed, so a failed candidate that was created goes
-  first.
+  first, and so does an old generation a cancelled replacement never handed
+  over; a retry that must wait for one spends no recovery attempt.
 - **A newer resize during a replacement** is not lost: the replacement publishes
   what it was begun for, and the newer geometry is built next, while the
   generation it replaced keeps its obligations until they end.
@@ -488,7 +493,9 @@ retains its parents.
   reconciled, a moved observation and a resize after a failed construction
   each settling before the recovery rebuild, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
-  retaining the surface, a cancellation right after a candidate's admission
+  retaining the surface, a replacement cancelled before its creation never
+  handing the old swapchain over, a cancellation right after a candidate's
+  admission
   and one at a creation's handoff, one
   interrupting a swapchain's or a view's creation inside the call, and one
   ending a destruction part-way, device loss, and close winning over retry and
