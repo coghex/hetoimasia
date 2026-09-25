@@ -58,6 +58,8 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
+        Hetoimasia.GPU.Vulkan.Native.Generations
+        Hetoimasia.GPU.Vulkan.Native.Presentation
         Hetoimasia.GPU.Vulkan.Native.Profile
         Hetoimasia.GPU.Vulkan.Native.Roots
         Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
@@ -164,6 +166,8 @@ test-suite native-tests
     main-is: RootsMain.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.Native.Generations
+        Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn
