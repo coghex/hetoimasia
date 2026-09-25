@@ -1140,6 +1140,8 @@ resetFrameRecorder recording frame =
       Just current
         | current /= FrameAcquired → pure (Left (RefusedMisuse (WrongPhase FrameIdentity)))
         | any ((== BatchRecording) . batchStanding . snd) ours → pure (Left (RefusedIllegal "the frame's batch is still being recorded"))
+        -- An invalidation that raised is never retried, by either path.
+        | any (uncertain . batchStanding . snd) ours → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
         | otherwise → do
             storage ← Map.lookup (frameTarget frame, frameSlotNumber frame) <$> readTVarIO (recordingStorages recording)
             case storage of
@@ -1147,6 +1149,9 @@ resetFrameRecorder recording frame =
               Just resource → invalidate recording resource (map fst ours) (resetRecorder frame)
   where
     roots = recordingRoots recording
+    uncertain = \case
+      BatchUncertain _ → True
+      _ → False
 
 -- | Reset a storage's pool, then discharge in the model. The two are one
 -- masked step. A reset that raised retains every batch named, fails the
@@ -1173,20 +1178,27 @@ invalidate recording storage batches discharge =
                 failRootsSession roots CleanupFailed
               if isAsynchronous exception then rethrowIO failure else throwIO (BatchInvalidationFailed batches reason)
             Right () → atomically $ do
-              modelEdit roots discharge
-              records ← readTVar (recordingBatches recording)
-              for_ batches $ \batch → for_ (Map.lookup batch records) $ \record →
-                for_ (batchReadbacks record) $ \readback →
-                  editManaged recording readback $ \entry → case managedNative entry of
-                    NativeReadback held (ContentsCopyRecorded writer) | writer == batch → entry {managedNative = NativeReadback held ContentsUndefined}
-                    _ → entry
-              modifyTVar' (recordingBatches recording) (\held → foldr Map.delete held batches)
-              pure (Right ())
+              -- The records go only with the model's discharge: a refused
+              -- discharge keeps them, so no local record is dropped while the
+              -- model still holds its references.
+              discharged ← modelAnswer roots (fmap (\model → (model, ())) . discharge)
+              case discharged of
+                Left refusal → pure (Left refusal)
+                Right () → dropRecords
   where
     roots = recordingRoots recording
     storagePool managed = case managedNative <$> Map.lookup storage managed of
       Just (NativeStorage _ _ handle _) → Just handle
       _ → Nothing
+    dropRecords = do
+      records ← readTVar (recordingBatches recording)
+      for_ batches $ \batch → for_ (Map.lookup batch records) $ \record →
+        for_ (batchReadbacks record) $ \readback →
+          editManaged recording readback $ \entry → case managedNative entry of
+            NativeReadback held (ContentsCopyRecorded writer) | writer == batch → entry {managedNative = NativeReadback held ContentsUndefined}
+            _ → entry
+      modifyTVar' (recordingBatches recording) (\held → foldr Map.delete held batches)
+      pure (Right ())
 
 -- | Record that the model submitted this sealed batch as this submission
 -- record: the model no longer holds the batch, and the outstanding submission

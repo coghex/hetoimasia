@@ -21,6 +21,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Data.Bits ((.|.))
+import Data.Maybe (isJust)
 import Data.Word (Word32, Word64)
 import System.Directory (listDirectory, doesDirectoryExist)
 import System.FilePath ((</>), takeExtension)
@@ -338,9 +339,14 @@ spec = describe "Recording" $ do
       model ← modelOf rig
       recordedOf model (kitPipeline kit) `shouldBe` [batch]
       sessionState model `shouldBe` SessionFailed CleanupFailed
-      -- It is never retried.
+      -- It is never retried, by a discard or by a reset of its frame.
       succeedAt (rigRecording' rig) AtResetStorage
+      resets ← length . filter isReset <$> nativeCalls' rig
       discardBatch (rigRecording rig) batch `shouldReturn` Left (RefusedMisuse (WrongPhase BatchIdentity))
+      resetFrameRecorder (rigRecording rig) frame `shouldReturn` Left (RefusedMisuse (WrongPhase BatchIdentity))
+      length . filter isReset <$> nativeCalls' rig `shouldReturn` resets
+      atomically (readBatch (rigRecording rig) batch) >>= (`shouldSatisfy` isJust)
+      recordedOf <$> modelOf rig <*> pure (kitPipeline kit) >>= (`shouldBe` [batch])
 
   describe "discard, reset and release" $ do
     it "discards one batch's references and a reset discards another's, never touching a shared hold of the other" $ do

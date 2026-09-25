@@ -525,8 +525,10 @@ A batch still being recorded is refused, and so is one the model no longer
 holds, or a frame no longer acquired: a submitted batch's commands may be
 executing, and resetting its pool then would be invalid. An invalidation that
 raised is uncertain: the batch keeps every reference, is never invalidated
-again, the session fails with `CleanupFailed`, and `BatchInvalidationFailed` is
-raised. Discarding one batch never releases another batch's reference to a
+again — neither `discardBatch` nor `resetFrameRecorder` of its frame retries
+it — the session fails with `CleanupFailed`, and `BatchInvalidationFailed` is
+raised. A batch record goes only with the model's discharge, so one the model
+refuses to discharge stays. Discarding one batch never releases another batch's reference to a
 shared resource.
 
 A submitted batch keeps its record, and its slot's storage, until the
