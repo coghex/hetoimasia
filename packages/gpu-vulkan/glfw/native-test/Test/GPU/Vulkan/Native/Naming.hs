@@ -27,10 +27,11 @@
 --
 -- The case passes when that report, and no other error, reached the capture;
 -- when its objects carry the readback buffer's handle with the name the
--- backend gave it; when the label the backend opened around the batch is the
--- innermost command-buffer label of the report, if the pinned layer reports
--- command-buffer labels at all — which labels each layer populates is recorded
--- in the record, not assumed; and when the error latch, and nothing else,
+-- backend gave it; when the report's command-buffer labels include the label
+-- the backend opened around the batch, if the pinned layer reports
+-- command-buffer labels at all — which labels each layer populates, and in
+-- what order, is recorded in the record, not assumed; and when the error
+-- latch, and nothing else,
 -- fails the verdict after the last teardown callback, with nothing lost.
 module Test.GPU.Vulkan.Native.Naming
   ( NamingOutcome (..)
@@ -479,11 +480,13 @@ spec outcome = describe "#250 names and labels" $ do
       for_ (errorEntries (factsEntries facts)) $ \entry →
         objectsOf entry `shouldSatisfy` elem (buffer, Just (decode (observedBufferName observed)))
 
-  it "carried the batch's label as the report's innermost command-buffer label, wherever the layer reports one" $
+  it "carried the enclosing batch's label among the report's command-buffer labels, wherever the layer reports any" $
     onFacts outcome $ \facts →
+      -- The order, and whether a region already closed is still listed, are
+      -- the layer's; the record keeps the whole array as reported.
       for_ (errorEntries (factsEntries facts)) $ \entry → case labelsOf "cmdbuf" entry of
         [] → pure ()
-        labels → last labels `shouldBe` decode (observedBatchLabel (factsObserved facts))
+        labels → labels `shouldSatisfy` elem (decode (observedBatchLabel (factsObserved facts)))
 
   it "lost nothing, and failed its verdict after the last teardown callback for the latched error alone" $
     onFacts outcome $ \facts → do

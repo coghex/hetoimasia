@@ -1022,9 +1022,10 @@ handle leaves the backend's interface, since the wrapper sees only what the
 backend hands its own native layer. The case passes only when that report, and
 no other error, reached the capture from the recording step; when the report's
 objects carry the readback buffer's handle with the name the backend gave it;
-when the batch's label is the report's innermost command-buffer label, if the
-pinned layer reports command-buffer labels at all — which label arrays each
-layer populates is recorded in the case's record, not assumed; and when the
+when the report's command-buffer labels include the batch's, if the pinned
+layer reports command-buffer labels at all — which label arrays each layer
+populates, in what order, is recorded in the case's record, not assumed; and
+when the
 verdict after the last teardown callback fails for the latched error and
 nothing else, with nothing dropped, cut, refused or undelivered. The shared
 session also requires every naming call it made to have run on the owner's
