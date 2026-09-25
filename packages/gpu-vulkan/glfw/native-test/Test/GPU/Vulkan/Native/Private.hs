@@ -15,6 +15,8 @@
 -- * @vk5-bridge@ — VK-5's loader-aware surface bridge (#216);
 -- * @vk7-roots@ — VK-7's roots under the graphics owner, over two windows,
 --   including the destruction order at the host's exit (#219);
+-- * @vk11-recording@ — VK-11's managed resources and a recorded, discarded
+--   triangle batch against a swapchain generation's image (#223);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard").
 --
@@ -57,6 +59,7 @@ import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
+import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
 import qualified Test.Vulkan.Proof.Diagnostics as Diagnostics
@@ -107,6 +110,12 @@ scenarios =
   , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" $ \_ journal → do
       outcome ← Roots.runRoots journal
       pure (RootsSpec.spec outcome, section "The VK-7 Vulkan roots record" (rootsSection outcome))
+  , Scenario
+      "vk11-recording"
+      "records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing"
+      $ \_ journal → do
+        outcome ← Recording.runRecording journal
+        pure (Recording.spec outcome, section "The VK-11 managed recording record" (Recording.recordingSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"
