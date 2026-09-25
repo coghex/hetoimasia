@@ -865,7 +865,16 @@ retireCompleted recording frame = do
   (storage, completed) ← atomically $ do
     model ← stateRootsModel roots (\current → (current, current))
     batches ← Map.toList <$> readTVar (recordingBatches recording)
-    storage ← Map.lookup (frameTarget frame, frameSlotNumber frame) <$> readTVar (recordingStorages recording)
+    managed ← readTVar (recordingManaged recording)
+    -- Only a live storage is reset: a released one is refused by 'checkFrame'
+    -- before anything native happens, and its completed batches go when it is
+    -- destroyed.
+    storage ←
+      (\slot → slot >>= \resource → case managedStanding <$> Map.lookup resource managed of
+          Just ManagedLive → Just resource
+          _ → Nothing)
+        . Map.lookup (frameTarget frame, frameSlotNumber frame)
+        <$> readTVar (recordingStorages recording)
     pure
       ( storage
       , [ batch
@@ -1036,17 +1045,39 @@ bindPipeline recorder (Pipeline pipeline) =
           Right (state {statePipeline = Just pipeline}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
+-- | Set the viewport. It must be finite, have area, and lie within the
+-- frame's image — which Vulkan guarantees is within every device's viewport
+-- dimension and bounds limits, so no device limit needs reading here.
 setViewport ∷ Recorder q inst msgr phys dev cmd → Viewport → IO (Either Refusal ())
 setViewport recorder viewport = command recorder $ \state →
-  if viewportWidth viewport <= 0 || viewportHeight viewport <= 0
-    then Left (RefusedIllegal "a viewport with no area")
-    else Right (state {stateViewport = True}, [], CommandSetViewport viewport)
+  let extent = frameImageExtent (recorderFrame recorder)
+      values = [viewportX viewport, viewportY viewport, viewportWidth viewport, viewportHeight viewport]
+   in if any (\value → isNaN value || isInfinite value) values
+        then Left (RefusedIllegal "a viewport that is not finite")
+        else
+          if viewportWidth viewport <= 0 || viewportHeight viewport <= 0
+            then Left (RefusedIllegal "a viewport with no area")
+            else
+              if viewportX viewport < 0
+                || viewportY viewport < 0
+                || viewportX viewport + viewportWidth viewport > fromIntegral (extentWidth extent)
+                || viewportY viewport + viewportHeight viewport > fromIntegral (extentHeight extent)
+                then Left (RefusedIllegal "a viewport outside the frame's image")
+                else Right (state {stateViewport = True}, [], CommandSetViewport viewport)
 
+-- | Set the scissor, which must lie within the frame's image, so its offset
+-- and extent never overflow.
 setScissor ∷ Recorder q inst msgr phys dev cmd → Rect → IO (Either Refusal ())
 setScissor recorder rect = command recorder $ \state →
-  if rectX rect < 0 || rectY rect < 0
-    then Left (RefusedIllegal "a scissor with a negative offset")
-    else Right (state {stateScissor = True}, [], CommandSetScissor rect)
+  let extent = frameImageExtent (recorderFrame recorder)
+      reach offset size = toInteger offset + toInteger size
+   in if rectX rect < 0 || rectY rect < 0
+        then Left (RefusedIllegal "a scissor with a negative offset")
+        else
+          if reach (rectX rect) (rectWidth rect) > toInteger (extentWidth extent)
+            || reach (rectY rect) (rectHeight rect) > toInteger (extentHeight extent)
+            then Left (RefusedIllegal "a scissor outside the frame's image")
+            else Right (state {stateScissor = True}, [], CommandSetScissor rect)
 
 -- | Draw triangles with the bound pipeline, inside rendering, once the
 -- viewport and scissor have been set. The batch retains the bound pipeline
@@ -1433,6 +1464,11 @@ progress recording now = do
   let disposed = [resource | ResourceSubject resource ← turnDisposed report]
   modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
   modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
+  -- A storage is disposable only once no batch or submission holds it, so a
+  -- batch record still naming a destroyed storage is a submitted one whose
+  -- submission completed: it goes with its storage. A readback it copied into
+  -- keeps its own evidence.
+  modifyTVar' (recordingBatches recording) (Map.filter ((`notElem` disposed) . batchStorage))
   pure (disposed, turnActions report > 0)
 
 -- | Release every live handle, destroy every generation whose holds have

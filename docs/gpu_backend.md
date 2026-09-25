@@ -454,7 +454,11 @@ unsupported transition, a draw that is not whole triangles, a copy from an image
 that is not a transfer source — is `RefusedUnsupported`; one the recorder's state
 does not admit — a draw outside rendering or before a pipeline, viewport and
 scissor, a transition inside rendering or from a layout the image is not in,
-rendering into an image that is not a color attachment — is `RefusedIllegal`.
+rendering into an image that is not a color attachment, a viewport that is not
+finite or has no area, a viewport or scissor that leaves the frame's image — is
+`RefusedIllegal`. Keeping both within the image keeps them within every
+device's viewport limits, which Vulkan requires to cover any image a
+framebuffer can hold, so no device limit is read.
 Either way nothing native happens.
 
 Construction is ordinary `IO` on the owner. A creation reserves its accounting
@@ -536,7 +540,10 @@ submission that carried it completes, since its commands may be executing
 until then. The next `recordFrame` for that slot then resets the storage —
 invalidating the executed commands so the buffer can be begun again — and drops
 the record, so a slot records frame after frame. The frame is checked first:
-a stale or foreign frame is refused before anything is done for the slot.
+a stale or foreign frame is refused before anything is done for the slot, and
+only a live storage is ever reset. A completed batch's record also goes when
+its storage is destroyed, since a storage is disposable only once nothing holds
+it.
 
 `skipUnsubmittedFrame` in the model also discharges a frame's batches. VK-12's
 skip must therefore reset the frame's recorder through this module first, so the
@@ -826,8 +833,9 @@ transfer-source requirement, non-coherent invalidation and flush, completion
 before exposure, and no exposure after a skip or a reset in the model, after a
 reset followed by the frame's submission, or after a fill whose flush raised; a
 second writer refused; a slot reused for a second submitted frame once the
-first's submission completed, and the first's stale frame refused without a
-reset; and the FFI audit held to the package's import
+first's submission completed, the first's stale frame and a released
+storage refused without a reset, and a destroyed storage taking its completed
+batch's record with it; invalid viewports and scissors refused; and the FFI audit held to the package's import
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 

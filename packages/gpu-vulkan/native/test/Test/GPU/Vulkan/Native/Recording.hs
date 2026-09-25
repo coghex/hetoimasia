@@ -235,6 +235,37 @@ spec = describe "Recording" $ do
                    ]
       nativeOf rig `shouldReturn'` \calls → [() | Recorded _ (CommandDraw {}) ← calls] `shouldBe` []
 
+    it "refuses a viewport that is not finite or leaves the image, and a scissor that leaves it, at the interface" $ do
+      rig ← newRig
+      _ ← newKit rig
+      frame ← acquired rig
+      answers ← newIORef []
+      let note action = action >>= \answer → modifyIORef' answers (answer :)
+          nan = 0 / 0 ∷ Float
+          infinite = 1 / 0 ∷ Float
+      _ ← recorded rig frame $ \recorder → do
+        note (setViewport recorder (Viewport 0 0 nan 480))
+        note (setViewport recorder (Viewport 0 0 infinite 480))
+        note (setViewport recorder (Viewport 100 0 640 480))
+        note (setViewport recorder (Viewport (-1) 0 10 10))
+        note (setScissor recorder (Rect 0 0 641 480))
+        note (setScissor recorder (Rect 600 400 maxBound 1))
+        note (setViewport recorder (Viewport 0 0 640 480))
+        note (setScissor recorder (Rect 0 0 640 480))
+      reverse <$> readIORef answers
+        `shouldReturn` [ Left (RefusedIllegal "a viewport that is not finite")
+                       , Left (RefusedIllegal "a viewport that is not finite")
+                       , Left (RefusedIllegal "a viewport outside the frame's image")
+                       , Left (RefusedIllegal "a viewport outside the frame's image")
+                       , Left (RefusedIllegal "a scissor outside the frame's image")
+                       , Left (RefusedIllegal "a scissor outside the frame's image")
+                       , Right ()
+                       , Right ()
+                       ]
+      nativeOf rig `shouldReturn'` \calls → do
+        length [() | Recorded _ (CommandSetViewport _) ← calls] `shouldBe` 1
+        length [() | Recorded _ (CommandSetScissor _) ← calls] `shouldBe` 1
+
     it "refuses a batch whose record the object budget cannot reserve, before beginning any command buffer" $ do
       rig ← newRig
       _ ← newKit rig
@@ -618,6 +649,31 @@ spec = describe "Recording" $ do
       fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) again) `shouldReturn` Just BatchSealed
       atomically (readBatch (rigRecording rig) batch) `shouldReturn` Nothing
       readReadback (rigRecording rig) readback 0 4 `shouldSatisfy'` either (const False) (const True)
+
+    it "refuses a frame whose slot's storage was released, before resetting it, and drops the completed batch with the storage" $ do
+      rig ← newRig
+      kit ← newKit rig
+      first ← acquired rig
+      (batch, ()) ← recordTriangle rig kit first
+      submission@(SubmissionIdOf submitted) ← submitInModel rig first
+      ok (noteBatchSubmitted (rigRecording rig) batch submitted)
+      completeInModel rig submission
+      inModel rig (closeSubmittedFrame first)
+      inModel rig (recordCompletion (at 1) (UnpresentedFrameSettled first))
+      ok (releaseManaged (rigRecording rig) (kitStorageHandle kit))
+      second ← acquiredOn rig 1
+      before ← nativeCount rig
+      fmap (const ()) <$> recordFrame (rigRecording rig) second (\_ → pure ())
+        `shouldReturn` Left RefusedNoStorage
+      nativeCount rig `shouldReturn` before
+      -- Destroying the storage takes the completed batch's record with it,
+      -- and a new storage for the slot records again.
+      destroyed ← dispose rig
+      destroyed `shouldContain` [kitStorage kit]
+      atomically (readBatch (rigRecording rig) batch) `shouldReturn` Nothing
+      _ ← created (createFrameStorage (rigRecording rig) (rigTarget rig) (frameSlotNumber second))
+      (again, ()) ← recordTriangle rig kit second
+      map viewBatch <$> atomically (readBatches (rigRecording rig)) `shouldReturn` [again]
 
     it "refuses a stale frame for a slot whose submitted batch completed, before resetting that slot's storage" $ do
       rig ← newRig
