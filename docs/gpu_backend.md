@@ -535,7 +535,8 @@ A submitted batch keeps its record, and its slot's storage, until the
 submission that carried it completes, since its commands may be executing
 until then. The next `recordFrame` for that slot then resets the storage —
 invalidating the executed commands so the buffer can be begun again — and drops
-the record, so a slot records frame after frame.
+the record, so a slot records frame after frame. The frame is checked first:
+a stale or foreign frame is refused before anything is done for the slot.
 
 `skipUnsubmittedFrame` in the model also discharges a frame's batches. VK-12's
 skip must therefore reset the frame's recorder through this module first, so the
@@ -825,7 +826,8 @@ transfer-source requirement, non-coherent invalidation and flush, completion
 before exposure, and no exposure after a skip or a reset in the model, after a
 reset followed by the frame's submission, or after a fill whose flush raised; a
 second writer refused; a slot reused for a second submitted frame once the
-first's submission completed; and the FFI audit held to the package's import
+first's submission completed, and the first's stale frame refused without a
+reset; and the FFI audit held to the package's import
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 

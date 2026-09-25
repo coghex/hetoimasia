@@ -791,7 +791,11 @@ recordFrame
   → IO (Either Refusal (BatchId, a))
 recordFrame recording frame consumer =
   owned recording $
-    retireCompleted recording frame >>= \case
+    -- The frame is checked before anything is done for its slot: a stale or
+    -- foreign frame must fail before the slot's storage is touched.
+    (atomically (frameAcquired recording frame) >>= \case
+      Left refusal → pure (Left refusal)
+      Right () → retireCompleted recording frame) >>= \case
       Left refusal → pure (Left refusal)
       Right () →
         checkFrame recording frame >>= \case
@@ -876,6 +880,20 @@ retireCompleted recording frame = do
     _ → pure (Right ())
   where
     roots = recordingRoots recording
+
+-- | Whether the model holds this frame acquired: its identity resolves —
+-- this session's, this slot's current use — and it has an image. Any other
+-- answer is the model's own classification of the misuse.
+frameAcquired ∷ Recording q inst msgr phys dev cmd → FrameSlotId → STM (Either Refusal ())
+frameAcquired recording frame = do
+  model ← stateRootsModel (recordingRoots recording) (\model → (model, model))
+  pure $ case frameView frame model of
+    Nothing → Left (RefusedMisuse (case recordBatch frame [] model of
+      Rejected misuse → misuse
+      _ → UnknownIdentity FrameIdentity))
+    Just view
+      | viewFramePhase view /= FrameAcquired → Left (RefusedMisuse (WrongPhase FrameIdentity))
+      | otherwise → Right ()
 
 -- | Everything 'recordFrame' checks before it asks the model for a batch.
 checkFrame

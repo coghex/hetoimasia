@@ -619,6 +619,25 @@ spec = describe "Recording" $ do
       atomically (readBatch (rigRecording rig) batch) `shouldReturn` Nothing
       readReadback (rigRecording rig) readback 0 4 `shouldSatisfy'` either (const False) (const True)
 
+    it "refuses a stale frame for a slot whose submitted batch completed, before resetting that slot's storage" $ do
+      rig ← newRig
+      kit ← newKit rig
+      first ← acquired rig
+      (batch, ()) ← recordTriangle rig kit first
+      submission@(SubmissionIdOf submitted) ← submitInModel rig first
+      ok (noteBatchSubmitted (rigRecording rig) batch submitted)
+      completeInModel rig submission
+      inModel rig (closeSubmittedFrame first)
+      inModel rig (recordCompletion (at 1) (UnpresentedFrameSettled first))
+      -- The slot is issued again, so the old frame's identity is stale.
+      second ← acquiredOn rig 1
+      frameSlotNumber second `shouldBe` frameSlotNumber first
+      before ← nativeCount rig
+      fmap (const ()) <$> recordFrame (rigRecording rig) first (\_ → pure ())
+        `shouldReturn` Left (RefusedMisuse (StaleIdentity FrameIdentity))
+      nativeCount rig `shouldReturn` before
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just (BatchSubmitted submitted)
+
     it "exposes nothing a fill changed if its flush raised, whatever the buffer held before" $ do
       rig ← newCapturingRig
       atomically (writeTVar (recordingCoherent (rigRecording' rig)) False)
