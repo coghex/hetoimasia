@@ -335,8 +335,10 @@ or filed. Next audit starts after `425e97b`, plus changed specs/docs.
   `runtime-glfw-core` beneath that contract. Still open: no surface, GPU
   submission, or device wait exists anywhere here — evidence that GPU work has
   completed is the backend's. Vulkan compatibility proof #158 has qualified
-  present-fence retirement and image release on both selected profiles; its
-  proof harness is separate from the still-planned production backend.
+  present-fence retirement and image release on both selected profiles; VK-8
+  (#220) retired its harness and runs its cases, with VK-5–VK-7's, in the
+  window integration's native suite, the required group `test.vulkan-native`,
+  with synchronization validation enabled on every validation-enabled instance.
 - [Lua](docs/lua_runtime_design.md) has returned to `exploring` under D-11.
   Independent UI/gameplay execution domains; stop unsafe authoritative gameplay
   while keeping UI available. Untrusted mods require separate processes per mod/domain,
