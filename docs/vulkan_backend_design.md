@@ -2211,9 +2211,18 @@ assuming Linux's green check enforces a local requirement:
   evidence. Use existing receipts where applicable; local evidence must never
   claim the Linux image identity or satisfy a Linux receipt requirement.
 - Explicit platform applicability and a visible non-empty example selection.
-  The current catalog has runner classes and the plan has an OS identity, but
-  the catalog has no platform selector. Use platform-aware suite composition
-  with reported coverage. Do not add an unrecognized field or count zero matched examples,
+  The [validation contract](validation.md) already delivers the selector: a
+  catalog group may declare optional `platforms`, which narrows and never
+  widens applicability; a plan whose `runner_os` it does not name omits the
+  group as [`platform-inapplicable`](validation.md#reasons-and-inputs_changed);
+  the runner refuses to execute that unselected group or create its receipt;
+  and the [aggregate](validation.md#the-aggregate-and-build-test) rejects a
+  receipt collected for it, or an offered reuse of an earlier execution of it,
+  the one omission reason that refuses evidence. Declare `platforms` only for
+  a genuinely platform-specific group; inside shared groups keep
+  platform-aware suite composition and report a visible non-empty selection.
+  The mandatory floor may not declare `platforms` and stays
+  platform-independent. Do not count zero matched examples,
   a missing loader/device/layer/display, or an unavailable required feature as
   a passing selected native check. Wrong-platform cases are identified as
   inapplicable, not credited as having passed on this platform.
