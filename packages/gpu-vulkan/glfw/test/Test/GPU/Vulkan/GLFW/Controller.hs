@@ -27,6 +27,12 @@ import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.GLFW.Command (clientObservations)
+import Hetoimasia.GLFW.Window (Attribute (Observed), Extent (..), WindowId, observedFramebufferExtent)
+import Hetoimasia.GPU.Vulkan.Native.Generations (TargetCondition (..), TargetGenerationsView (..))
+import Hetoimasia.GPU.Vulkan.Native.Presentation (Suspension (..))
 import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..))
 import Hetoimasia.Runtime.GLFW
@@ -46,6 +52,7 @@ import Hetoimasia.Runtime.GLFW
   , custodyOf
   , graphicsAttachment
   , hostGraphicsPublisher
+  , hostWindowClient
   , hostPendingAttachments
   , observedSlot
   , ownerDestroyed
@@ -107,6 +114,12 @@ spec = describe "Vulkan controller" $ do
 
   describe "progress" $
     it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
+
+  describe "swapchain generations" $ do
+    it "builds a visible target's generation on the owner's thread, from the framebuffer the owner last observed, and the exit destroys it" (bounded testGenerationBuilt)
+    it "replaces it after a resize the owner observed, handing the old one over, and destroys the old one only once its hold ends" (bounded testGenerationReplaced)
+    it "builds nothing for a hidden target, and asks its surface nothing" (bounded testHiddenSuspended)
+    it "destroys a closing window's views and swapchain on the owner's thread before its surface" (bounded testGenerationClosed)
 
 -- ---------------------------------------------------------------------------
 -- Handing targets over
@@ -814,6 +827,136 @@ testNoDemand = do
   statusNextDeadline status `shouldBe` Nothing
   statusAdvanced status `shouldBe` 0
   statusImmediate status `shouldBe` False
+
+-- ---------------------------------------------------------------------------
+-- Swapchain generations
+
+testGenerationBuilt ∷ IO ()
+testGenerationBuilt = do
+  rig ← visibleRig
+  mainThread ← newTVarIO Nothing
+  view ← runRig rig $ \host control → do
+    myThreadId >>= atomically . writeTVar mainThread . Just
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+  fmap viewCondition view `shouldBe` Just Presenting
+  events ← journal rig
+  -- Built on the target's admission, and destroyed, child before parent, by
+  -- the host's exit.
+  filter generational events
+    `shouldBe` [ SwapchainCreated 500 (640, 480) Nothing
+               , ViewCreated 501
+               , ViewCreated 502
+               , ViewCreated 503
+               , ViewDestroyed 503
+               , ViewDestroyed 502
+               , ViewDestroyed 501
+               , SwapchainDestroyed 500
+               ]
+  Just main ← atomically (readTVar mainThread)
+  owners ← threadsOf rig (== InstanceCreated)
+  built ← threadsOf rig generational
+  built `shouldSatisfy` all (`elem` owners)
+  built `shouldSatisfy` all (/= main)
+
+testGenerationReplaced ∷ IO ()
+testGenerationReplaced = do
+  rig ← visibleRig
+  (retainedWhileHeld, events) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    Just first ← (>>= viewActive) <$> atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+    held ← atomically (useVulkanGeneration (vulkanController host) first) >>= either (throwIO . userError . show) pure
+    resizeFramebuffer rig host window (800, 600)
+    pumpUntil host control "the resize's observation" (observedFramebuffer host window (800, 600))
+    publishObservation host service window
+    pumpUntil host control "the replacement" (elem (SwapchainCreated 504 (800, 600) (Just 500)) <$> journal rig)
+    -- The owner keeps taking rounds while the old generation is held; none
+    -- destroys it.
+    pumpUntil host control "a later owner round" $ do
+      status ← atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
+      pure (statusAdvanced status > 0)
+    retained ← notElem (SwapchainDestroyed 500) <$> journal rig
+    atomically (endVulkanGenerationUse (vulkanController host) held)
+    pumpUntil host control "the old generation's destruction" (elem (SwapchainDestroyed 500) <$> journal rig)
+    (,) retained <$> journal rig
+  retainedWhileHeld `shouldBe` True
+  filter generational events
+    `shouldBe` [ SwapchainCreated 500 (640, 480) Nothing
+               , ViewCreated 501
+               , ViewCreated 502
+               , ViewCreated 503
+               , SwapchainCreated 504 (800, 600) (Just 500)
+               , ViewCreated 505
+               , ViewCreated 506
+               , ViewCreated 507
+               , ViewDestroyed 503
+               , ViewDestroyed 502
+               , ViewDestroyed 501
+               , SwapchainDestroyed 500
+               ]
+
+testHiddenSuspended ∷ IO ()
+testHiddenSuspended = do
+  rig ← newRig
+  view ← runRig rig $ \host _ → do
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    _ ← atomically (awaitOwnerRound (vulkanGraphicsOwner host) 0)
+    atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+  fmap viewCondition view `shouldSatisfy` \case
+    Just (Suspended (SuspendedIneligible _)) → True
+    _ → False
+  filter generational <$> journal rig >>= (`shouldBe` [])
+
+testGenerationClosed ∷ IO ()
+testGenerationClosed = do
+  rig ← visibleRig
+  _ ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    CloseStarted ← closeHostWindow (vulkanWindowHost host) window
+    pumpUntil host control "the window's release" (elem (WindowGone False) <$> journal rig)
+  events ← journal rig
+  takeWhile (/= WindowGone False) (dropWhile (not . closing) events)
+    `shouldBe` [ViewDestroyed 503, ViewDestroyed 502, ViewDestroyed 501, SwapchainDestroyed 500, SurfaceDestroyed 100]
+  where
+    closing = \case
+      ViewDestroyed _ → True
+      _ → False
+
+-- | Whether the window's latest observation reports this framebuffer.
+observedFramebuffer ∷ VulkanHost Scene → WindowId → (Int, Int) → IO Bool
+observedFramebuffer host window (width, height) =
+  atomically (hostWindowClient (vulkanWindowHost host) window) >>= \case
+    Nothing → pure False
+    Just client → do
+      observation ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+      pure (observedFramebufferExtent observation == Observed (Extent width height))
+
+presenting ∷ VulkanHost Scene → GraphicsService → IO Bool
+presenting host service =
+  atomically $
+    maybe False ((== Presenting) . viewCondition) <$> readVulkanGenerations (vulkanController host) (graphicsAttachment service)
+
+generational ∷ Event → Bool
+generational = \case
+  SwapchainCreated {} → True
+  ViewCreated _ → True
+  ViewDestroyed _ → True
+  SwapchainDestroyed _ → True
+  _ → False
 
 -- ---------------------------------------------------------------------------
 -- Helpers

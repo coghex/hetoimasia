@@ -39,6 +39,12 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanRoots
   , readVulkanModel
 
+    -- * Swapchain generations
+  , readVulkanGenerations
+  , useVulkanGeneration
+  , endVulkanGenerationUse
+  , noteVulkanSwapchainResult
+
     -- * Failures
   , InstanceExtensionsMissing (..)
   , OrphanSurfacesUncertain (..)
@@ -69,10 +75,14 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRejection (..)
   , readReadiness
   , readTargetRejection
+  , endVulkanGenerationUse
+  , noteVulkanSwapchainResult
+  , readVulkanGenerations
   , readVulkanModel
   , readVulkanRoots
   , readVulkanTargets
   , noObserver
+  , useVulkanGeneration
   , rejectionsRetained
   , vulkanHostConfig
   , withVulkanOwnerHostOver

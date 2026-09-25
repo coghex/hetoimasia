@@ -85,6 +85,13 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanRoots
   , readVulkanModel
 
+    -- * Swapchain generations
+  , readVulkanGenerations
+  , useVulkanGeneration
+  , endVulkanGenerationUse
+  , noteVulkanSwapchainResult
+  , targetGeometry
+
     -- * The composition
   , VulkanHostConfig (..)
   , vulkanHostConfig
@@ -130,6 +137,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.Word (Word32)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
 import Hetoimasia.Foundation.Log (Logger)
@@ -148,9 +156,11 @@ import Hetoimasia.Foundation.Time
   )
 import Hetoimasia.GLFW.Session (Session, SessionConfig)
 import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.GLFW.Window (Extent)
+import qualified Hetoimasia.GLFW.Window as Window
 import Hetoimasia.GPU.Model (GpuModel)
 import Hetoimasia.GPU.Model.Budget (Budgets)
-import Hetoimasia.GPU.Model.Identity (TargetClass (..), TargetId)
+import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig
   , DiagnosticCapture
@@ -161,9 +171,29 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , withDiagnosticCapture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+import Hetoimasia.GPU.Vulkan.Native.Generations
+  ( GenerationUse
+  , Generations
+  , StepSummary (..)
+  , SwapchainResult
+  , TargetGenerationsView
+  , UseRefusal
+  , endGenerationUse
+  , generationsDeadline
+  , newGenerations
+  , noteSwapchainResult
+  , readTargetGenerations
+  , retireTargetGenerations
+  , stepGenerations
+  , trackTarget
+  , useGeneration
+  )
+import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
+import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationFeature)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( RootOps (..)
+  ( GenerationOps (..)
+  , RootOps (..)
   , RootStanding (..)
   , RootTargetView (..)
   , Roots
@@ -188,6 +218,7 @@ import Hetoimasia.Runtime.GLFW
   ( AttachmentId
   , AttachmentProtocol (..)
   , EventAdmission (..)
+  , ExtentBounds (..)
   , GraphicsAttachment (..)
   , GraphicsOperations (..)
   , GraphicsOwner
@@ -200,6 +231,8 @@ import Hetoimasia.Runtime.GLFW
   , OwnerReady
   , OwnerRetire (..)
   , OwnerRetired
+  , OwnerStep (..)
+  , RenderEligibility (..)
   , RolledBack
   , SlotState (SlotAttached)
   , StepReport (..)
@@ -207,7 +240,9 @@ import Hetoimasia.Runtime.GLFW
   , TargetHandoff (..)
   , TargetRetire (..)
   , TargetRetired
+  , TargetGeometry (..)
   , TargetStart (..)
+  , TargetStepView (..)
   , WindowHost
   , announceGraphicsTarget
   , custodyOf
@@ -241,6 +276,8 @@ data VulkanController = ∀ inst msgr phys dev lease obligation. VulkanControlle
 
 data State inst msgr phys dev lease obligation = State
   { stateRoots ∷ !(Roots Quiesced inst msgr phys dev)
+  , stateGenerations ∷ !(Generations Quiesced inst msgr phys dev)
+    -- ^ Every admitted target's swapchain generations, above the roots.
   , statePointer ∷ !(inst → Ptr ())
   , stateBridge ∷ !(SurfaceBridge lease obligation)
   , stateLayers ∷ ![ByteString]
@@ -325,8 +362,9 @@ newVulkanControllerWith
   → IO VulkanController
 newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
+  generations ← newGenerations roots
   fmap VulkanController $
-    State roots pointer bridge layers validation
+    State roots generations pointer bridge layers validation
       <$> newTVarIO Nothing
       <*> newTVarIO LeasePending
       <*> newTVarIO Map.empty
@@ -406,21 +444,35 @@ readReadiness (VulkanController state) =
 
 -- | The operations the graphics owner runs, on its own thread.
 --
--- The progress step raises a latched device loss, and otherwise does one
--- piece of housekeeping and no rendering work: it destroys the surface of any
+-- The progress step raises a latched device loss; destroys the surface of any
 -- attachment whose announcement the port refused and whose slot has since
--- begun retiring. It asks for a round only while such attachments exist, and
--- otherwise names no deadline: this slice records and submits nothing.
+-- begun retiring; and reconciles every admitted target's swapchain generations
+-- with the geometry the owner folded for it this round — its eligibility, its
+-- last coherent framebuffer observation and the bounds the platform published
+-- ('targetGeometry') — building, replacing and destroying generations as
+-- "Hetoimasia.GPU.Vulkan.Native.Generations" decides. Nothing is recorded,
+-- submitted or presented. It asks for a round while an unannounced attachment
+-- is watched, and when the generations name a deadline: a settling resize, a
+-- deferred recovery attempt, or the model's own schedule.
 controllerOperations ∷ VulkanController → GraphicsOperations scene
 controllerOperations (VulkanController state) =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
-    , graphicsStep = \_ → do
+    , graphicsStep = \step → do
         checkRoots (stateRoots state)
         settled ← settleUnannounced state
-        pure (if settled then noStepWork {stepAdvanced = True} else noStepWork)
-    , graphicsNextDeadline = unannouncedDeadline state
+        mapped ← readTVarIO (stateTargets state)
+        let geometries =
+              Map.fromList
+                [ (target, targetGeometry view)
+                | view ← stepTargets step
+                , viewConstructed view
+                , Just target ← [Map.lookup (viewTarget view) mapped]
+                ]
+        summary ← stepGenerations (stateGenerations state) (stepNow step) geometries
+        pure (if settled || summaryAdvanced summary then noStepWork {stepAdvanced = True} else noStepWork)
+    , graphicsNextDeadline = ownerDeadline state
     , graphicsRetireTarget = retireTarget state
     , graphicsRetireOwner = retireOwner state
     , graphicsDestroyOwner = \_ → destroyOwner state
@@ -467,6 +519,41 @@ settleUnannounced state = do
   pure (or settled)
   where
     bridge = stateBridge state
+
+-- | The earliest of the unannounced watch and the generations' own deadline.
+ownerDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+ownerDeadline state = do
+  watch ← unannouncedDeadline state
+  owed ← atomically (generationsDeadline (stateGenerations state))
+  generation ← case owed of
+    Nothing → pure NoOwnerDemand
+    Just (Right due) → pure (OwnerDeadline due)
+    Just (Left ()) → OwnerDeadline <$> readInstant (stateClock state)
+  pure $ case (watch, generation) of
+    (NoOwnerDemand, other) → other
+    (other, NoOwnerDemand) → other
+    (OwnerDeadline first, OwnerDeadline second) → OwnerDeadline (min first second)
+
+-- | The geometry one target's view carries, in the native backend's terms: its
+-- eligibility, the last coherent framebuffer observation and the bounds the
+-- platform published. This is D-30's seam as the owner folded it; the extent
+-- policy behind it is the native backend's.
+targetGeometry ∷ TargetStepView → Presentation.TargetGeometry
+targetGeometry view =
+  Presentation.TargetGeometry
+    { Presentation.geometryEligibility = case viewEligibility view of
+        RenderEligible → Right ()
+        RenderSuspended → Left "suspended: hidden, minimized or without area"
+        RenderDeferred → Left "deferred: no framebuffer extent observed"
+        RenderExcluded → Left "closing"
+    , Presentation.geometryFramebuffer = physical <$> geometryFramebuffer (viewGeometry view)
+    , Presentation.geometryBounds = (\bounds → (physical (boundsMinimum bounds), physical (boundsMaximum bounds))) <$> geometryBounds (viewGeometry view)
+    , Presentation.geometryRevision = viewRevision view
+    }
+  where
+    physical ∷ Extent → SurfaceExtent
+    physical extent = SurfaceExtent (dimension (Window.extentWidth extent)) (dimension (Window.extentHeight extent))
+    dimension = fromIntegral . max 0 . min (fromIntegral (maxBound ∷ Word32))
 
 -- | A round soon, while an unannounced attachment is being watched; otherwise
 -- none.
@@ -517,7 +604,9 @@ constructTarget state start = do
           -- uninterruptible in any case.
           admitted ← mask_ $ do
             answer ← admitRootTarget (stateRoots state) classification (TargetSurface (handleOf obligation) (destruction bridge obligation))
-            for_ answer $ \target → atomically (modifyTVar' (stateTargets state) (Map.insert attachment target))
+            for_ answer $ \target → atomically $ do
+              modifyTVar' (stateTargets state) (Map.insert attachment target)
+              trackTarget (stateGenerations state) target classification (handleOf obligation)
             pure answer
           case admitted of
             Right target → do
@@ -571,6 +660,11 @@ retireTarget state retiring = do
   mapped ← atomically (Map.lookup attachment <$> readTVar (stateTargets state))
   retiredRoot ← case mapped of
     Just target → mask_ $ do
+      -- Its swapchain generations go first: they are the surface's children.
+      -- Raises, and keeps them, the surface and this mapping, if any could not
+      -- be destroyed.
+      now ← readInstant (stateClock state)
+      retireTargetGenerations (stateGenerations state) now target
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
       retireRootTarget (stateRoots state) target
@@ -872,6 +966,26 @@ readVulkanRoots (VulkanController state) = readRootsView (stateRoots state)
 readVulkanModel ∷ VulkanController → STM GpuModel
 readVulkanModel (VulkanController state) = readRootsModel (stateRoots state)
 
+-- | The swapchain generations of the target this attachment is, while the
+-- owner holds it.
+readVulkanGenerations ∷ VulkanController → AttachmentId → STM (Maybe TargetGenerationsView)
+readVulkanGenerations (VulkanController state) attachment =
+  Map.lookup attachment <$> readTVar (stateTargets state) >>= \case
+    Nothing → pure Nothing
+    Just target → readTargetGenerations (stateGenerations state) target
+
+-- | Hold a CPU use of a target's active generation from any thread; while it
+-- is held, that generation is not destroyed.
+useVulkanGeneration ∷ VulkanController → GenerationId → STM (Either UseRefusal GenerationUse)
+useVulkanGeneration (VulkanController state) = useGeneration (stateGenerations state)
+
+endVulkanGenerationUse ∷ VulkanController → GenerationUse → STM ()
+endVulkanGenerationUse (VulkanController state) = endGenerationUse (stateGenerations state)
+
+-- | Report what a swapchain call on a target's active generation answered.
+noteVulkanSwapchainResult ∷ VulkanController → GenerationId → SwapchainResult → STM Bool
+noteVulkanSwapchainResult (VulkanController state) = noteSwapchainResult (stateGenerations state)
+
 -- ---------------------------------------------------------------------------
 -- The composition
 
@@ -899,7 +1013,18 @@ observeRoots (NativeObserver observe) ops =
     , opsDestroyDevice = observe "vkDestroyDevice" . opsDestroyDevice ops
     , opsSurfaceSupport = \created physical family surface →
         observe "vkGetPhysicalDeviceSurfaceSupportKHR" (opsSurfaceSupport ops created physical family surface)
+    , opsGenerations =
+        generations
+          { opsSurfaceOffer = \physical surface → observe "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" (opsSurfaceOffer generations physical surface)
+          , opsCreateSwapchain = \device request → observe "vkCreateSwapchainKHR" (opsCreateSwapchain generations device request)
+          , opsSwapchainImages = \device swapchain → observe "vkGetSwapchainImagesKHR" (opsSwapchainImages generations device swapchain)
+          , opsCreateImageView = \device image format → observe "vkCreateImageView" (opsCreateImageView generations device image format)
+          , opsDestroyImageView = \device view → observe "vkDestroyImageView" (opsDestroyImageView generations device view)
+          , opsDestroySwapchain = \device swapchain → observe "vkDestroySwapchainKHR" (opsDestroySwapchain generations device swapchain)
+          }
     }
+  where
+    generations = opsGenerations ops
 
 -- | The surface bridge, with its two native calls observed.
 observeBridge ∷ NativeObserver → SurfaceBridge lease obligation → SurfaceBridge lease obligation
