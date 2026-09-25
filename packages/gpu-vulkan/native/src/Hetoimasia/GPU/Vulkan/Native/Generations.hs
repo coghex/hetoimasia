@@ -101,6 +101,7 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   ( -- * The generations
     Generations
   , newGenerations
+  , newGenerationsHooked
   , settlingPeriod
   , trackTarget
 
@@ -289,7 +290,9 @@ data TargetRecord = TargetRecord
   , recordGenerations ∷ !(Map GenerationId NativeGeneration)
   , recordActive ∷ !(Maybe GenerationId)
   , recordCondition ∷ !TargetCondition
-  , recordSettling ∷ !(Maybe (SurfaceExtent, Instant))
+  , recordSettling ∷ !(Maybe (SurfaceExtent, TargetGeometry, Instant))
+    -- ^ The extent a replacement would be built at, the observed geometry it
+    -- was planned from, and since when both have been what they are.
   , recordResult ∷ !(Maybe SwapchainResult)
   , recordFailed ∷ !Bool
     -- ^ The last construction failed, so the next is a recovery attempt.
@@ -302,10 +305,18 @@ data TargetRecord = TargetRecord
 data Generations q inst msgr phys dev = Generations
   { generationsRoots ∷ !(Roots q inst msgr phys dev)
   , generationsTargets ∷ !(TVar (Map TargetId TargetRecord))
+  , generationsAfterAdmission ∷ GenerationId → IO ()
+    -- ^ The examples' seam: runs right after the model admitted a candidate,
+    -- inside the construction's masked settlement. Production runs nothing.
   }
 
 newGenerations ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerations roots = Generations roots <$> newTVarIO Map.empty
+newGenerations = newGenerationsHooked (\_ → pure ())
+
+-- | 'newGenerations' with the examples' seam, which runs right after the model
+-- admits each candidate. Nothing in production sets it.
+newGenerationsHooked ∷ (GenerationId → IO ()) → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+newGenerationsHooked hook roots = (\targets → Generations roots targets hook) <$> newTVarIO Map.empty
 
 -- | How long the geometry a replacement would be built from must stay the
 -- same before it is built: 16 ms.
@@ -537,7 +548,10 @@ reconcile generations now target geometry = do
           -- Out of date or suboptimal with the extent it already has: not a
           -- resize, so rebuilding it is a recovery attempt.
           recover planned
-      | Nothing ← active = construct planned
+      -- The first generation is built at once. A later one with nothing
+      -- active — the active one retired on its own to make room — is a
+      -- replacement like any other, and waits for its geometry to settle.
+      | Nothing ← active = if recordConstructions record == 0 then construct planned else settle planned (construct planned)
       | Just (_, native) ← active = settle planned $
           if planExtent (genPlan native) == planExtent planned
             then do
@@ -549,17 +563,19 @@ reconcile generations now target geometry = do
                 modelEdit_ (resumeTarget target)
               Nothing <$ setCondition Presenting
             else construct planned
-    -- Wait until the extent a replacement would be built at has been the same
-    -- for the settling period, then continue. A surface that reports a new
-    -- extent a moment after the observation that moved is therefore still
-    -- seen, rather than the move being adopted at the old extent.
+    -- Wait until the extent a replacement would be built at, and the observed
+    -- geometry it was planned from, have both been the same for the settling
+    -- period, then continue. A surface that reports a new extent a moment
+    -- after the observation that moved is therefore still seen, rather than
+    -- the move being adopted at the old extent, and a newer observation
+    -- restarts the wait even while the surface still reports the old extent.
     settle planned continue = do
         waiting ← atomically $ do
           record ← lookupRecord
           case record >>= recordSettling of
-            Just (extent, since) | extent == planExtent planned → pure (Right since)
+            Just (extent, observed, since) | extent == planExtent planned, sameGeometry observed geometry → pure (Right since)
             _ → do
-              modifyRecord (\entry → entry {recordSettling = Just (planExtent planned, now)})
+              modifyRecord (\entry → entry {recordSettling = Just (planExtent planned, geometry, now)})
               pure (Left now)
         let since = either id id waiting
         case addDuration since settlingPeriod of
@@ -598,7 +614,10 @@ reconcile generations now target geometry = do
       if blocked
         then pure Nothing
         else begin planned
-    begin planned = do
+    -- Admission through the construction's settlement is one masked region:
+    -- a candidate the model admitted is always settled, published, failed or
+    -- retained uncertain, however a cancellation arrives.
+    begin planned = mask_ $ do
       attempt ← atomically $ do
         record ← lookupRecord
         let old = record >>= recordActive
@@ -656,12 +675,7 @@ reconcile generations now target geometry = do
           stillFull ← atomically (maybe True (not . Map.null . recordGenerations) <$> lookupRecord)
           if stillFull then pure Nothing else construct planned
         else pure Nothing
-    build planned candidate handed surface =
-      readDevice >>= \case
-        Nothing → pure Nothing
-        Just (devicePlan, device) → mask_ $ do
-          limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
-          let request = SwapchainRequest surface planned (planQueueFamily devicePlan) handed
+    build planned candidate handed surface = do
           -- The construction runs masked. Each native effect and the record of
           -- it are consecutive, and a cancellation can land only at the marked
           -- points between effects — whatever exists is then recorded — or
@@ -675,6 +689,10 @@ reconcile generations now target geometry = do
                 writeIORef inCreation Nothing
                 pure created
           outcome ← tryWithContext $ do
+            generationsAfterAdmission generations candidate
+            (devicePlan, device) ← readDevice >>= maybe (throwIO DeviceAbsent) pure
+            limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
+            let request = SwapchainRequest surface planned (planQueueFamily devicePlan) handed
             swapchain ←
               creating "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request) $ \created →
                 editGeneration generations candidate (\entry → entry {genSwapchain = Just created})
@@ -797,6 +815,13 @@ reconcile generations now target geometry = do
         Just entry | genUses entry == 0 → endCpuUse generations generation
         _ → pure ()
     ops = rootsGenerationOps roots
+
+-- | The roots held no live device when a construction began.
+data DeviceAbsent = DeviceAbsent
+  deriving (Show)
+
+instance Exception DeviceAbsent where
+  displayException DeviceAbsent = "the roots hold no live device"
 
 sameGeometry ∷ TargetGeometry → TargetGeometry → Bool
 sameGeometry left right =

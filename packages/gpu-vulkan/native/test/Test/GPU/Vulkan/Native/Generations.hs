@@ -8,7 +8,7 @@ module Test.GPU.Vulkan.Native.Generations (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
 import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
@@ -142,6 +142,18 @@ spec = describe "Generations" $ do
       stepAt rig 46 (seen 800 600)
       created rig `shouldReturn` [(640, 480), (800, 600)]
 
+    it "restarts the quiet period for a newer observation while the surface still reports the extent it planned" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      resizeSurface rig 800 600
+      stepAt rig 10 (seen 800 600)
+      stepAt rig 15 (seen 900 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 31)
+      stepAt rig 26 (seen 900 600)
+      created rig `shouldReturn` [(640, 480)]
+      stepAt rig 31 (seen 900 600)
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+
     it "adopts a settled move that leaves the extent unchanged, without a rebuild" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
@@ -264,6 +276,22 @@ spec = describe "Generations" $ do
       let order = [call | call ← later, isDestroyedSwapchain call || isCreated call]
       order `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 104 10 (800, 600) Nothing]
 
+    it "with one live generation, waits the quiet period for a newer resize that arrived while its only generation was held" $ do
+      rig ← newRigWith defaultBudgetRequest {requestedGenerations = 1}
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      resize rig 20 800 600
+      viewCondition <$> generationsOf rig `shouldReturn` Backpressured GenerationBudget
+      resizeSurface rig 1024 768
+      stepAt rig 50 (seen 1024 768)
+      atomically (endGenerationUse (rigGenerations rig) use)
+      stepAt rig 55 (seen 1024 768)
+      created rig `shouldReturn` [(640, 480)]
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 66)
+      stepAt rig 66 (seen 1024 768)
+      created rig `shouldReturn` [(640, 480), (1024, 768)]
+
     it "never lets one target's backpressure stop another, or take its reservations" $ do
       rig ← newRig
       other ← admitAnother rig 11
@@ -375,6 +403,29 @@ spec = describe "Generations" $ do
       retireTargetGenerations (rigGenerations rig) (at 80) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → first `elem` remaining
       retireRootTarget (rigRoots rig) (rigTarget rig) `raises` \(TargetGenerationsRemain _ _) → True
       filter isSurfaceDestroyed <$> calls (rigStandIn rig) `shouldReturn` []
+
+    it "settles a candidate a cancellation reached right after its admission, and leaves the surface destroyable" $ do
+      rig ← newRig
+      gate ← newTVarIO False
+      reached ← newEmptyMVar
+      atomically $ writeTVar (rigAfterAdmission rig) $ \_ → do
+        putMVar reached ()
+        atomically (readTVar gate >>= check)
+      finished ← newEmptyMVar
+      stepper ← forkIO (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished)
+      takeMVar reached
+      killThread stepper
+      outcome ← takeMVar finished
+      either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+      [generation] ← viewGenerations <$> generationsOf rig
+      (viewStanding generation, viewSwapchain generation) `shouldBe` (GenerationRetiredHeld, Nothing)
+      created rig `shouldReturn` []
+      atomically $ do
+        writeTVar gate True
+        writeTVar (rigAfterAdmission rig) (\_ → pure ())
+      retireTargetGenerations (rigGenerations rig) (at 1) (rigTarget rig)
+      retireRootTarget (rigRoots rig) (rigTarget rig)
+      filter isSurfaceDestroyed <$> calls (rigStandIn rig) `shouldReturn` [DestroyedSurface 10]
 
     it "records a swapchain whose creation a cancellation reached, and destroys it before building afresh" $ do
       rig ← newRig
@@ -516,6 +567,8 @@ data Rig = Rig
   , rigRoots ∷ !StandInRoots
   , rigGenerations ∷ !(Generations () Int Int Text Int)
   , rigTarget ∷ !TargetId
+  , rigAfterAdmission ∷ !(TVar (GenerationId → IO ()))
+    -- ^ What runs right after the model admits each candidate.
   }
 
 newRig ∷ IO Rig
@@ -532,9 +585,10 @@ newRigOf classification request = do
   roots ← newStandInRoots standIn (budgetsOf request)
   _ ← startRoots roots standardRequest
   target ← admitRootTarget roots classification (surfaceNumbered standIn 10) >>= either (fail . show) pure
-  generations ← newGenerations roots
+  hook ← newTVarIO (\_ → pure ())
+  generations ← newGenerationsHooked (\candidate → readTVarIO hook >>= ($ candidate)) roots
   atomically (trackTarget generations target classification 10)
-  pure (Rig standIn roots generations target)
+  pure (Rig standIn roots generations target hook)
 
 admitAnother ∷ Rig → Word64 → IO TargetId
 admitAnother rig surface = do

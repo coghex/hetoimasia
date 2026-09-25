@@ -309,11 +309,13 @@ active generation answered out of date or suboptimal (`noteSwapchainResult`, or
 a replacement the model counted from an acquisition).
 
 - **Ordinary resize** is not a failed construction. The extent a replacement
-  would be built at is watched, and the generation is rebuilt only once that
-  extent has been the same for 16 ms on the owner's monotonic clock
-  (`Settling`); a newer observation restarts the wait, so only the newest
-  geometry is built. A move that settles at the extent the active generation
-  already has is adopted without a rebuild.
+  would be built at is watched, with the observed geometry it was planned
+  from, and the generation is rebuilt only once both have been the same for
+  16 ms on the owner's monotonic clock (`Settling`); a newer observation
+  restarts the wait even while the surface still reports the old extent, so
+  only the newest geometry is built. A move that settles at the extent the
+  active generation already has is adopted without a rebuild, and a move that
+  returns to the active generation's geometry is cancelled.
 - **Reconciliation without a fresh observation.** With a concrete surface
   extent, an out-of-date or suboptimal result is enough to rebuild at the
   surface's new extent: a main thread stalled in a platform modal loop does not
@@ -345,7 +347,9 @@ whose holds have ended is destroyed first; if the replacement still cannot fit,
 the target is `Backpressured` — suspended in the model — until a hold ends, and
 every other target and the owner carry on. With a limit of one, the active
 generation is the only thing in the way: it is retired on its own, awaited, and
-destroyed, and a fresh generation is built without it. No target reserves or
+destroyed, and a fresh generation is built without it once its geometry has
+settled — every construction after a target's first is a replacement, and
+waits the same quiet period. No target reserves or
 releases anything of another's.
 
 ### Holds
@@ -366,8 +370,10 @@ Recording, submission and presentation add their own holds in VK-11 to VK-13.
   with it the device and the instance.
 - An effect whose bookkeeping could not be committed enters the same path
   (`GenerationEffectUncertain`). A creation that raised created nothing.
-- Each native effect and its record are consecutive inside a masked
-  construction, and a cancellation can land only between effects: whatever
+- Admission through a construction's settlement is one masked region, so a
+  candidate the model admitted is always settled. Each native effect and its
+  record are consecutive inside it, and a cancellation can land only between
+  effects: whatever
   exists is recorded, the construction is settled as failed, and the
   cancellation is then delivered. A creation a cancellation reached after it
   returned leaves its swapchain owned, and destroyed before the next
@@ -463,7 +469,9 @@ retains its parents.
   extent and format, a stale observation, zero area suspending without an
   attempt, coalesced resize waiting 16 ms for the newest geometry, a move the
   surface has not caught up with yet, a cancelled move not shortening a later
-  one's quiet period, capacity retiring and destroying first
+  one's quiet period, a newer observation restarting it at an unchanged
+  surface extent, a newer resize waiting it out under the one-generation
+  limit, capacity retiring and destroying first
   and pausing otherwise, the one-generation configuration, per-target
   reservation isolation, an oversized and a zero returned image count refused
   before any view, a failed replacement unable to reacquire from or hand over
@@ -471,7 +479,8 @@ retains its parents.
   repeated out-of-date and suboptimal results bounded by the recovery episode
   without a hot loop, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
-  retaining the surface, a cancellation at a creation's handoff, one
+  retaining the surface, a cancellation right after a candidate's admission
+  and one at a creation's handoff, one
   interrupting a swapchain's or a view's creation inside the call, and one
   ending a destruction part-way, device loss, and close winning over retry and
   publication;
