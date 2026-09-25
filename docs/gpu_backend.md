@@ -493,7 +493,8 @@ retains its parents.
 retained per-slice records from the retired proof harness —
 [`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
 and VK-6 records beside it — stay as the historical evidence of the inputs
-they name.
+they name. VK-10's native cases are retained as
+[`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run.
 
 ## The native suite
 
