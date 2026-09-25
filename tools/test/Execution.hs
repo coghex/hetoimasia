@@ -1650,6 +1650,8 @@ watchdogStage fixture mode = do
       , "-c"
       , unlines
           [ "import importlib.util, os, sys, time"
+          , "# Loading the runner by path must not leave its bytecode in the checkout."
+          , "sys.dont_write_bytecode = True"
           , "path, root, mode = sys.argv[1:4]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
