@@ -16,6 +16,7 @@
     "dist-newstyle/",
     "dist-dev/",
     "dist-vulkan/",
+    "dist-vulkan-proof/",
     ".worktrees/",
     "captures/",
     "plan.json",
