@@ -197,7 +197,8 @@ Either refusal changes nothing, and a consumed batch extends no further.
 
 A batch leaves the model by discard, reset, skip or submission, and only the
 last means its work was submitted. `submissionCarries` answers, while a
-submission is outstanding, whether it consumed a given batch — the positive
+submission is outstanding, whether it consumed a given batch — by its full
+identity, so another session's batch of the same number never matches — the positive
 evidence a boundary needs before treating a batch's work as submitted, since a
 frame whose batch was reset can still be submitted without it.
 
@@ -634,7 +635,7 @@ already-recorded batch survives; one batch extended incrementally, retaining eac
 subject once through repeated and overlapping use, charging nothing, refusing a
 duplicated request or a sealed subject without effect, and discharging every
 reference it gained when discarded; a submission naming the batch it consumed and
-not one reset before it; a retry refused in a terminal session for every
+not one reset before it, nor another session's batch of the same number; a retry refused in a terminal session for every
 cause that ends one; a reclamation pass reading exactly its window of raw records
 and reaching an eligible one beyond that window on a later pass; and the backoff
 restarting for retirement work whoever created it.

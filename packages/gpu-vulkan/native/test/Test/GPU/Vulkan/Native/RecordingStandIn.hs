@@ -72,6 +72,7 @@ data RecordingStep
   | AtBegin
   | AtEnd
   | AtRecord
+  | AtFlush
   deriving (Eq, Ord, Show)
 
 -- | What a failing step raises, after recording the call.
@@ -186,7 +187,7 @@ recordingStandInOps standIn =
             }
     , opsDestroyReadback = \_ allocation → journal standIn (DestroyedReadback (allocationBuffer allocation))
     , opsInvalidate = \_ _ range → journal standIn (Invalidated range)
-    , opsFlush = \_ _ range → journal standIn (Flushed range)
+    , opsFlush = \_ _ range → step standIn AtFlush (Flushed range)
     , opsReadMapped = \allocation offset size → do
         journal standIn (ReadMapped offset size)
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO (recordingMemory standIn)

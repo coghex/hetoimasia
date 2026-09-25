@@ -407,8 +407,9 @@ data Batch = Batch
 
 data Submission = Submission
   { submissionFrames ∷ ![(Natural, Natural)]
-  , submissionBatches ∷ !(Set Natural)
-    -- ^ The batches it consumed, by their session-wide numbers.
+  , submissionBatches ∷ !(Set BatchId)
+    -- ^ The batches it consumed, as their full identities: session, target
+    -- incarnation and number.
   , submissionSubjects ∷ !(Set SubjectKey)
   , submissionUncertain ∷ !Bool
   }
@@ -1781,7 +1782,13 @@ submitFrames identities outcome model
                       submission
                       Submission
                         { submissionFrames = [(number, slot) | (number, slot, _) ← frames]
-                        , submissionBatches = Set.fromList batches
+                        , submissionBatches =
+                            Set.fromList
+                              [ BatchId (targetIdOf charged (batchTargetNumber record) target) number
+                              | number ← batches
+                              , Just record ← [Map.lookup number (gpuBatches charged)]
+                              , Just target ← [Map.lookup (batchTargetNumber record) (gpuTargets charged)]
+                              ]
                         , submissionSubjects = subjects
                         , submissionUncertain = uncertain
                         }
@@ -1792,13 +1799,14 @@ submitFrames identities outcome model
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
               else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
 
--- | Whether an outstanding submission consumed this batch: the positive
--- evidence that a batch's recorded work was submitted, rather than discarded,
--- reset or skipped. 'Nothing' when the submission is not outstanding — never
+-- | Whether an outstanding submission consumed this exact batch — this
+-- session's, this target incarnation's, this number: the positive evidence
+-- that a batch's recorded work was submitted, rather than discarded, reset or
+-- skipped. Another session's batch of the same number is not it. 'Nothing' when the submission is not outstanding — never
 -- issued, another session's, or already completed.
 submissionCarries ∷ SubmissionId → BatchId → GpuModel → Maybe Bool
 submissionCarries submission batch model = case resolveSubmission model submission of
-  Right (_, record) → Just (batchNumber batch `Set.member` submissionBatches record)
+  Right (_, record) → Just (batch `Set.member` submissionBatches record)
   Left _ → Nothing
 
 -- | Raise a replacement request on a target. Requests are counted rather than

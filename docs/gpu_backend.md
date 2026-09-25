@@ -529,6 +529,12 @@ again, the session fails with `CleanupFailed`, and `BatchInvalidationFailed` is
 raised. Discarding one batch never releases another batch's reference to a
 shared resource.
 
+A submitted batch keeps its record, and its slot's storage, until the
+submission that carried it completes, since its commands may be executing
+until then. The next `recordFrame` for that slot then resets the storage —
+invalidating the executed commands so the buffer can be begun again — and drops
+the record, so a slot records frame after frame.
+
 `skipUnsubmittedFrame` in the model also discharges a frame's batches. VK-12's
 skip must therefore reset the frame's recorder through this module first, so the
 native invalidation always precedes the discharge.
@@ -585,7 +591,8 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   that batch (`submissionCarries`), so a batch reset in the model whose frame
   was then submitted without it is refused — and the buffer owes no recorded
   reference and no submitted use,
-  which the model discharges only on that submission's completion fact. A batch
+  which the model discharges only on that submission's completion fact. The
+  evidence is kept on the buffer, so it outlives the batch's record. A batch
   the model merely no longer holds proves nothing, since a skip or a reset in
   the model removes one without submitting it. A fence is not a host-visibility barrier; the
   recorded barrier is what makes the write visible, and the completion is what
@@ -597,7 +604,9 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   the end rounded up to the device's non-coherent atom, the end clamped to the
   memory's size, which is what Vulkan requires of both calls. Coherent memory is
   read without either, and an empty read reads nothing and invalidates
-  nothing.
+  nothing. `fillReadback` marks the bytes unreadable before its write changes
+  the first of them, and readable again only once the write and any flush have
+  returned, so a write or flush that raised part-way exposes nothing.
 - **Release.** Releasing a readback ends its CPU use: it is read no more.
 
 ### Capture usage
@@ -811,7 +820,10 @@ a failed destruction retained without a retry, every destruction recorded
 beyond one progress turn's action limit, and frame storage refused for a
 foreign target or an unissuable slot; the readback's aligned ranges, bounds,
 transfer-source requirement, non-coherent invalidation and flush, completion
-before exposure, and no exposure after a skip or a reset in the model; and the FFI audit held to the package's import
+before exposure, and no exposure after a skip or a reset in the model, after a
+reset followed by the frame's submission, or after a fill whose flush raised; a
+second writer refused; a slot reused for a second submitted frame once the
+first's submission completed; and the FFI audit held to the package's import
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 

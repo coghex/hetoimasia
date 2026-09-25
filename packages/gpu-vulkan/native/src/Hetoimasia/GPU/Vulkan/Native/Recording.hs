@@ -415,8 +415,10 @@ data ReadbackContents
   = ContentsUndefined
   | ContentsHostWritten
   | ContentsCopyRecorded !BatchId
-    -- ^ A batch records a copy into it; the bytes exist once that batch's
-    -- submission has completed.
+    -- ^ A batch records a copy into it that no submission is known to carry.
+  | ContentsCopySubmitted !SubmissionId
+    -- ^ A submission carried the copying batch ('noteBatchSubmitted'); the
+    -- bytes exist once it has completed. This outlives the batch's record.
   deriving (Eq, Show)
 
 data ManagedRecord cmd = ManagedRecord
@@ -789,58 +791,89 @@ recordFrame
   → IO (Either Refusal (BatchId, a))
 recordFrame recording frame consumer =
   owned recording $
-    checkFrame recording frame >>= \case
+    retireCompleted recording frame >>= \case
       Left refusal → pure (Left refusal)
-      Right (storage, commands, image) → mask $ \restore → do
-        admitted ← atomically $ do
-          answer ← modelAnswer roots (recordBatch frame [storage])
-          for_ answer $ \batch →
-            modifyTVar' (recordingBatches recording) (Map.insert batch (BatchRecord frame storage BatchRecording 0 []))
-          pure answer
-        case admitted of
+      Right () →
+        checkFrame recording frame >>= \case
           Left refusal → pure (Left refusal)
-          Right batch → do
-            opened ← newIORef True
-            state ← newIORef (RecorderState LayoutUndefined False Nothing False False)
-            let recorder = Recorder recording batch commands image opened state
-                partial reason = atomically (editBatch recording batch (\entry → entry {batchStanding = BatchPartial reason}))
-            began ← tryWithContext @SomeException (rootsCall roots "vkBeginCommandBuffer" (opsBeginCommands (recordingOps recording) commands))
-            case began of
-              Left failure@(ExceptionWithContext _ exception) → do
-                writeIORef opened False
-                partial ("beginning the command buffer raised: " <> Text.pack (displayException exception))
-                rethrowIO failure
-              Right () → do
-                ran ← tryWithContext @SomeException (restore (consumer recorder))
-                writeIORef opened False
-                case ran of
+          Right (storage, commands, image) → mask $ \restore → do
+            admitted ← atomically $ do
+              answer ← modelAnswer roots (recordBatch frame [storage])
+              for_ answer $ \batch →
+                modifyTVar' (recordingBatches recording) (Map.insert batch (BatchRecord frame storage BatchRecording 0 []))
+              pure answer
+            case admitted of
+              Left refusal → pure (Left refusal)
+              Right batch → do
+                opened ← newIORef True
+                state ← newIORef (RecorderState LayoutUndefined False Nothing False False)
+                let recorder = Recorder recording batch commands image opened state
+                    partial reason = atomically (editBatch recording batch (\entry → entry {batchStanding = BatchPartial reason}))
+                began ← tryWithContext @SomeException (rootsCall roots "vkBeginCommandBuffer" (opsBeginCommands (recordingOps recording) commands))
+                case began of
                   Left failure@(ExceptionWithContext _ exception) → do
-                    -- A command that failed has already said why the batch
-                    -- is partial; that reason stands.
-                    standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
-                    when (standing == Just BatchRecording) $
-                      partial
-                        ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
-                            <> Text.pack (displayException exception)
-                        )
+                    writeIORef opened False
+                    partial ("beginning the command buffer raised: " <> Text.pack (displayException exception))
                     rethrowIO failure
-                  Right value → do
-                    rendering ← stateRendering <$> readIORef state
-                    standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
-                    if standing /= Just BatchRecording
-                      then pure (Left (RefusedIllegal "a command failed during recording, so the batch was not sealed"))
-                      else if rendering
-                      then do
-                        partial "the consumer left rendering open"
-                        pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
-                      else
-                        tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
-                          Left failure@(ExceptionWithContext _ exception) → do
-                            partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
-                            rethrowIO failure
-                          Right () → do
-                            atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
-                            pure (Right (batch, value))
+                  Right () → do
+                    ran ← tryWithContext @SomeException (restore (consumer recorder))
+                    writeIORef opened False
+                    case ran of
+                      Left failure@(ExceptionWithContext _ exception) → do
+                        -- A command that failed has already said why the batch
+                        -- is partial; that reason stands.
+                        standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
+                        when (standing == Just BatchRecording) $
+                          partial
+                            ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
+                                <> Text.pack (displayException exception)
+                            )
+                        rethrowIO failure
+                      Right value → do
+                        rendering ← stateRendering <$> readIORef state
+                        standing ← atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
+                        if standing /= Just BatchRecording
+                          then pure (Left (RefusedIllegal "a command failed during recording, so the batch was not sealed"))
+                          else if rendering
+                          then do
+                            partial "the consumer left rendering open"
+                            pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
+                          else
+                            tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
+                              Left failure@(ExceptionWithContext _ exception) → do
+                                partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
+                                rethrowIO failure
+                              Right () → do
+                                atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
+                                pure (Right (batch, value))
+  where
+    roots = recordingRoots recording
+
+-- | Free the frame's slot of batches whose submission has completed. A
+-- submitted batch keeps its record, and its storage, until the submission
+-- that carried it completes — its commands may be executing until then — and
+-- the model answers that the submission is no longer outstanding only once it
+-- has. Then the storage is reset, which invalidates the executed commands so
+-- the buffer can be begun again, and the record goes. A readback the batch
+-- copied into keeps its own evidence ('ContentsCopySubmitted').
+retireCompleted ∷ Recording q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal ())
+retireCompleted recording frame = do
+  (storage, completed) ← atomically $ do
+    model ← stateRootsModel roots (\current → (current, current))
+    batches ← Map.toList <$> readTVar (recordingBatches recording)
+    storage ← Map.lookup (frameTarget frame, frameSlotNumber frame) <$> readTVar (recordingStorages recording)
+    pure
+      ( storage
+      , [ batch
+        | (batch, record) ← batches
+        , Just (batchStorage record) == storage
+        , BatchSubmitted submission ← [batchStanding record]
+        , submissionCarries submission batch model == Nothing
+        ]
+      )
+  case (storage, completed) of
+    (Just resource, _ : _) → invalidate recording resource completed Admitted
+    _ → pure (Right ())
   where
     roots = recordingRoots recording
 
@@ -1176,7 +1209,14 @@ noteBatchSubmitted recording batch submission =
         | held → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
         | submissionCarries submission batch model /= Just True →
             pure (Left (RefusedMisuse (WrongParent SubmissionIdentity)))
-        | otherwise → Right () <$ editBatch recording batch (\held' → held' {batchStanding = BatchSubmitted submission})
+        | otherwise → do
+            editBatch recording batch (\held' → held' {batchStanding = BatchSubmitted submission})
+            for_ (batchReadbacks entry) $ \readback →
+              editManaged recording readback $ \managed → case managedNative managed of
+                NativeReadback allocation (ContentsCopyRecorded writer)
+                  | writer == batch → managed {managedNative = NativeReadback allocation (ContentsCopySubmitted submission)}
+                _ → managed
+            pure (Right ())
   where
     roots = recordingRoots recording
 
@@ -1210,7 +1250,6 @@ readReadback recording (Readback readback) offset size =
         | otherwise → do
             evidence ← atomically $ do
               model ← stateRootsModel roots (\model → (model, model))
-              batches ← readTVar (recordingBatches recording)
               let holds = maybe [] viewOutstanding (holdView (ResourceSubject readback) model)
                   pending = filter (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) holds
               pure $ case contents of
@@ -1224,10 +1263,12 @@ readReadback recording (Readback readback) offset size =
                 -- that submission's completion fact. A batch the model merely
                 -- no longer holds proves nothing: a skip or a reset in the
                 -- model removes one without submitting it.
-                ContentsCopyRecorded writer → case batchStanding <$> Map.lookup writer batches of
-                  _ | not (null pending) → Left (RefusedNotWritten "a batch or a submission still holds the buffer")
-                  Just (BatchSubmitted _) → Right ()
-                  _ → Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+                ContentsCopyRecorded _
+                  | not (null pending) → Left (RefusedNotWritten "a batch or a submission still holds the buffer")
+                  | otherwise → Left (RefusedNotWritten "no submission of the batch that copies into it is recorded")
+                ContentsCopySubmitted _
+                  | not (null pending) → Left (RefusedNotWritten "a batch or a submission still holds the buffer")
+                  | otherwise → Right ()
             case evidence of
               Left refusal → pure (Left refusal)
               -- An empty read reads nothing, and its range would be an invalid
@@ -1260,20 +1301,26 @@ fillReadback recording (Readback readback) byte =
           pure (maybe [] viewOutstanding (holdView (ResourceSubject readback) model))
         if any (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) held
           then pure (Left RefusedInUse)
-          else do
+          else mask_ $ do
+            -- The bytes are unreadable from before the write changes the first
+            -- of them until the write and any flush have both returned, so a
+            -- write or flush that raised part-way exposes nothing under the
+            -- old contents' evidence.
+            atomically (setContents ContentsUndefined)
             opsWriteMapped (recordingOps recording) allocation 0 (ByteString.replicate (fromIntegral (allocationSize allocation)) byte)
             device ← fmap snd <$> atomically (readRootsDevice roots)
             unless (allocationCoherent allocation) $
               for_ device $ \handle →
                 rootsCall roots "vkFlushMappedMemoryRanges" $
                   opsFlush (recordingOps recording) handle allocation (mappedRange (allocationAtom allocation) (allocationMemorySize allocation) 0 (allocationSize allocation))
-            atomically $ editManaged recording readback $ \entry → case managedNative entry of
-              NativeReadback kept _ → entry {managedNative = NativeReadback kept ContentsHostWritten}
-              _ → entry
+            atomically (setContents ContentsHostWritten)
             pure (Right ())
       Right _ → pure (Left RefusedWrongKind)
   where
     roots = recordingRoots recording
+    setContents contents = editManaged recording readback $ \entry → case managedNative entry of
+      NativeReadback kept _ → entry {managedNative = NativeReadback kept contents}
+      _ → entry
 
 -- ---------------------------------------------------------------------------
 -- Disposal

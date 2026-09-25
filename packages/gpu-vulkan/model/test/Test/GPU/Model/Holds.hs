@@ -243,6 +243,23 @@ spec = describe "holds" $ do
     completed ← admitted_ "completing it" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) submitted)
     submissionCarries submission carriedBatch completed `shouldBe` Nothing
 
+  it "never says a submission consumed another session's batch of the same number" $ do
+    ours ← freshModel
+    theirs ← freshModel
+    (oursActive, oursTarget, _) ← activeTarget 2 ours
+    (theirsActive, theirsTarget, _) ← activeTarget 2 theirs
+    (oursFramed, oursFrame) ← acquiredFrame oursTarget oursActive
+    (theirsFramed, theirsFrame) ← acquiredFrame theirsTarget theirsActive
+    (oursRecorded, ourBatch) ← admitted "recording ours" (recordBatch oursFrame [] oursFramed)
+    (_, theirBatch) ← admitted "recording theirs" (recordBatch theirsFrame [] theirsFramed)
+    batchNumber theirBatch `shouldBe` batchNumber ourBatch
+    (submitted, answer) ← admitted "submitting ours" (submitFrames [oursFrame] SubmissionAccepted oursRecorded)
+    submission ← case answer of
+      SubmissionRecorded identity → pure identity
+      other → fail ("expected a submission record, got " ++ show other)
+    submissionCarries submission ourBatch submitted `shouldBe` Just True
+    submissionCarries submission theirBatch submitted `shouldBe` Just False
+
   it "refuses to record against a subject whose release or ended CPU use has been certified" $ do
     model ← freshModel
     (active, target, generation) ← activeTarget 2 model

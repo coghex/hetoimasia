@@ -42,6 +42,7 @@ import Hetoimasia.GPU.Model
   , modelBudgets
   , recordCompletion
   , reserveFrame
+  , closeSubmittedFrame
   , resetRecorder
   , skipUnsubmittedFrame
   , sessionState
@@ -61,6 +62,7 @@ import Hetoimasia.GPU.Model.Identity
   , SubmissionId
   , TargetClass (..)
   , TargetId
+  , frameSlotNumber
   )
 import Hetoimasia.GPU.Vulkan.Native.Diagnostics (NativeFfiConfiguration (..), nativeFfiConfiguration)
 import Hetoimasia.GPU.Vulkan.Native.Generations
@@ -588,6 +590,40 @@ spec = describe "Recording" $ do
       reverse <$> readIORef answers `shouldReturn` [Right (), Left RefusedInUse, Left RefusedInUse, Left RefusedInUse]
       nativeOf rig `shouldReturn'` \calls → length [() | Recorded _ (CommandCopyImageToBuffer {}) ← calls] `shouldBe` 1
 
+    it "reuses a slot for a second submitted frame once the first's submission completed, keeping the readback's evidence" $ do
+      rig ← newCapturingRig
+      kit ← newKit rig
+      readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
+      first ← acquired rig
+      (batch, ()) ← recorded rig first $ \recorder → do
+        drawTriangle recorder kit
+        ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+        ok (copyToReadback recorder readback)
+      submission@(SubmissionIdOf submitted) ← submitInModel rig first
+      ok (noteBatchSubmitted (rigRecording rig) batch submitted)
+      completeInModel rig submission
+      inModel rig (closeSubmittedFrame first)
+      inModel rig (recordCompletion (at 1) (UnpresentedFrameSettled first))
+      second ← acquiredOn rig 1
+      frameSlotNumber second `shouldBe` frameSlotNumber first
+      resets ← length . filter isReset <$> nativeCalls' rig
+      (again, ()) ← recordTriangle rig kit second
+      length . filter isReset <$> nativeCalls' rig `shouldReturn` resets + 1
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) again) `shouldReturn` Just BatchSealed
+      atomically (readBatch (rigRecording rig) batch) `shouldReturn` Nothing
+      readReadback (rigRecording rig) readback 0 4 `shouldSatisfy'` either (const False) (const True)
+
+    it "exposes nothing a fill changed if its flush raised, whatever the buffer held before" $ do
+      rig ← newCapturingRig
+      atomically (writeTVar (recordingCoherent (rigRecording' rig)) False)
+      readback ← created (createReadback (rigRecording rig) 1024)
+      ok (fillReadback (rigRecording rig) readback 1)
+      readReadback (rigRecording rig) readback 0 4 `shouldReturn` Right (ByteString.replicate 4 1)
+      failAt (rigRecording' rig) AtFlush
+      raised ← try @RecordingFailure (fillReadback (rigRecording rig) readback 2)
+      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtFlush)
+      readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "nothing has written the buffer")
+
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset the configuration records, and for nothing else" $ do
       sources ← haskellSources "src"
@@ -774,6 +810,14 @@ nativeCount rig = length <$> nativeCalls' rig
 
 shouldReturn' ∷ IO a → (a → IO ()) → IO ()
 shouldReturn' action assertion = action >>= assertion
+
+shouldSatisfy' ∷ IO a → (a → Bool) → IO ()
+shouldSatisfy' action predicate = action >>= \value → predicate value `shouldBe` True
+
+isReset ∷ RecordingCall → Bool
+isReset = \case
+  ResetStorage _ → True
+  _ → False
 
 isEnded, isBind, isDestruction ∷ RecordingCall → Bool
 isEnded = \case
