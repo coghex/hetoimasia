@@ -139,7 +139,8 @@ decides nothing, and the default observes nothing.
 | Instance and messenger creation and destruction, device selection and creation, the later-target check, every surface's destruction, device destruction | The graphics owner |
 | Every surface query, swapchain and image view creation and destruction | The graphics owner |
 | Publishing a target's observation (`publishGraphicsObservation`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
-| Holding and ending a generation's CPU use, reporting a swapchain result | Any thread, in `STM` |
+| Holding and ending a generation's CPU use | Any thread, in `STM` |
+| Reporting a swapchain call's out-of-date or suboptimal result | The graphics owner, whose acquisitions and presentations produce it |
 
 The controller makes no GLFW call. A surface is destroyed through the loader
 capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
@@ -306,7 +307,11 @@ at once; it is a structured target failure, not an assumption.
 
 A target is rebuilt when its geometry moves or when a swapchain call on its
 active generation answered out of date or suboptimal (`noteSwapchainResult`, or
-a replacement the model counted from an acquisition).
+a replacement the model counted from an acquisition). Those calls run on the
+owner's thread, and so does the report: it makes the owner's next deadline
+immediate, so the owner that reported a result takes the round that
+reconciles it rather than going idle. A report from another thread wakes
+nothing, and the package's public module does not offer one.
 
 - **Ordinary resize** is not a failed construction. The extent a replacement
   would be built at is watched, with the observed geometry it was planned
@@ -326,7 +331,9 @@ a replacement the model counted from an acquisition).
   then 500 ms apart after failures (`RecoveryWaiting`), and exhausting it is
   escalated through the target's designation — an optional target unavailable,
   a required one failing the session — and reported as `RecoverySpent` for VK-14
-  to act on. Nothing retries hot.
+  to act on. Nothing retries hot. A recovery rebuild whose observed geometry
+  has moved — since the active generation, or since the failed construction
+  was planned — first waits for that move to settle, as any resize does.
 - **The irreversible `oldSwapchain` transition.** Replacement hands the active
   generation over. It is marked retired before the native call, and a creation
   that then fails leaves the target without an active generation, in
@@ -441,7 +448,7 @@ retains its parents.
 | Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
 | Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
 | Generation records | The generations | The owner's step builds, replaces and destroys; any thread holds and ends a CPU use, or reports a swapchain result, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
-| Swapchain results | The generations | Any thread reports; the owner's step consumes | Any | Until the active generation is replaced | Cleared by the publication that replaces it |
+| Swapchain results | The generations | The owner reports; its step consumes | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 
 ## Evidence
@@ -477,7 +484,9 @@ retains its parents.
   before any view, a failed replacement unable to reacquire from or hand over
   the retired handle, a newer resize surviving an in-flight replacement,
   repeated out-of-date and suboptimal results bounded by the recovery episode
-  without a hot loop, failures after the swapchain destroying exactly what they
+  without a hot loop, a reported result asking for a step at once until it is
+  reconciled, a moved observation and a resize after a failed construction
+  each settling before the recovery rebuild, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
   retaining the surface, a cancellation right after a candidate's admission
   and one at a creation's handoff, one

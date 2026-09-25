@@ -227,6 +227,29 @@ spec = describe "Generations" $ do
       stepAt rig 100 (seen 640 480)
       length <$> created rig `shouldReturn` 4
 
+    it "asks for a step at once when a result is reported, until a step has reconciled it, so the owner that reported it is not left idle" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      noteActive rig SwapchainSuboptimal
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` immediate)
+      stepAt rig 1 (seen 640 480)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      length <$> created rig `shouldReturn` 2
+
+    it "settles a moved observation before an out-of-date result's recovery rebuild, and builds the newest extent as a resize" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      noteActive rig SwapchainOutOfDate
+      stepAt rig 10 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      created rig `shouldReturn` [(640, 480)]
+      resizeSurface rig 800 600
+      stepAt rig 20 (seen 800 600)
+      stepAt rig 36 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+      recoveryAttempts rig `shouldReturn` 0
+
     it "keeps a suspended target suspended whatever results are reported, and spends nothing" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
@@ -355,6 +378,19 @@ spec = describe "Generations" $ do
                    , CreatedSwapchain 105 10 (800, 600) Nothing
                    ]
       viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
+    it "settles a resize that arrives after a failed construction before retrying at its geometry" $ do
+      rig ← newRig
+      script (rigStandIn rig) AtCreateSwapchain (SucceedsThenFails 0)
+      stepAt rig 0 (seen 640 480)
+      clearScript rig AtCreateSwapchain
+      resizeSurface rig 800 600
+      stepAt rig 5 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 21)
+      recoveryAttempts rig `shouldReturn` 0
+      stepAt rig 21 (seen 800 600)
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+      recoveryAttempts rig `shouldReturn` 1
 
     it "retries a failing construction only through the recovery episode's attempts and delays, then reports it spent" $ do
       rig ← newRigOf RequiredTarget defaultBudgetRequest
@@ -703,6 +739,12 @@ raises action expected =
   try action >>= \case
     Left failure → expected failure `shouldBe` True
     Right _ → expectationFailure "expected a failure, but the action returned"
+
+-- | Whether a deadline asks for a step now.
+immediate ∷ Maybe (Either () Instant) → Bool
+immediate = \case
+  Just (Left ()) → True
+  _ → False
 
 -- | Wait until a thread is blocked delivering an exception to another, which
 -- is the one observable sign that a cancellation is pending on its target.

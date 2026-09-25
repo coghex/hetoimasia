@@ -294,6 +294,11 @@ data TargetRecord = TargetRecord
     -- ^ The extent a replacement would be built at, the observed geometry it
     -- was planned from, and since when both have been what they are.
   , recordResult ∷ !(Maybe SwapchainResult)
+  , recordResultUnseen ∷ !Bool
+    -- ^ A result was reported since the target's last reconciliation, so a
+    -- step is owed at once.
+  , recordLastPlanned ∷ !(Maybe (SurfaceExtent, TargetGeometry))
+    -- ^ The extent and observed geometry of the last construction begun.
   , recordFailed ∷ !Bool
     -- ^ The last construction failed, so the next is a recovery attempt.
   , recordRecovering ∷ !Bool
@@ -339,6 +344,8 @@ trackTarget generations target classification surface =
         , recordCondition = AwaitingGeneration
         , recordSettling = Nothing
         , recordResult = Nothing
+        , recordResultUnseen = False
+        , recordLastPlanned = Nothing
         , recordFailed = False
         , recordRecovering = False
         , recordConstructions = 0
@@ -381,6 +388,12 @@ instance Exception GenerationsRetained where
 -- | Report what a swapchain call on a generation answered. Only the target's
 -- active generation is replaced for it; a report about any other answers
 -- 'False' and changes nothing.
+--
+-- It is the owner's: the acquisitions and presentations that produce these
+-- results run on the graphics owner's thread. A report asks for a step at
+-- once through 'generationsDeadline', so the owner that made it takes the
+-- round that reconciles it rather than going idle. A report from another
+-- thread wakes nothing.
 noteSwapchainResult ∷ Generations q inst msgr phys dev → GenerationId → SwapchainResult → STM Bool
 noteSwapchainResult generations generation result = do
   records ← readTVar (generationsTargets generations)
@@ -389,7 +402,7 @@ noteSwapchainResult generations generation result = do
       | recordActive record == Just generation → do
           writeTVar
             (generationsTargets generations)
-            (Map.insert (generationTarget generation) record {recordResult = Just (strongest (recordResult record) result)} records)
+            (Map.insert (generationTarget generation) record {recordResult = Just (strongest (recordResult record) result), recordResultUnseen = True} records)
           pure True
     _ → pure False
   where
@@ -461,14 +474,15 @@ stepGenerations generations now geometries = do
   let constructed = [generation | Just generation ← built]
   pure (StepSummary constructed destroyed (not (null constructed && null destroyed)))
 
--- | The earliest instant a step is owed: a settling replacement, a deferred
--- recovery attempt, or the model's own schedule. 'Left' means a step is owed
--- now.
+-- | The earliest instant a step is owed: a swapchain result not yet
+-- reconciled, a settling replacement, a deferred recovery attempt, or the
+-- model's own schedule. 'Left' means a step is owed now.
 generationsDeadline ∷ Generations q inst msgr phys dev → STM (Maybe (Either () Instant))
 generationsDeadline generations = do
   records ← Map.elems <$> readTVar (generationsTargets generations)
   model ← stateRootsModel (generationsRoots generations) (\model → (model, model))
-  let own =
+  let unseen = any recordResultUnseen records
+      own =
         mapMaybe
           ( \record → case recordCondition record of
               Settling at → Just at
@@ -480,7 +494,7 @@ generationsDeadline generations = do
         TurnNow → Just (Left ())
         TurnAt at → Just (Right at)
         _ → Nothing
-      candidates = map Right own <> maybe [] pure modelled
+      candidates = [Left () | unseen] <> map Right own <> maybe [] pure modelled
   pure $ case candidates of
     [] → Nothing
     _ | any isNow candidates → Just (Left ())
@@ -493,6 +507,7 @@ generationsDeadline generations = do
 reconcile ∷ Generations q inst msgr phys dev → Instant → TargetId → TargetGeometry → IO (Maybe GenerationId)
 reconcile generations now target geometry = do
   snapshot ← atomically $ do
+    modifyTVar' (generationsTargets generations) (Map.adjust (\entry → entry {recordResultUnseen = False}) target)
     records ← readTVar (generationsTargets generations)
     model ← stateRootsModel roots (\model → (model, model))
     pure ((,) <$> Map.lookup target records <*> targetView target model)
@@ -541,13 +556,20 @@ reconcile generations now target geometry = do
               Nothing <$ setCondition (PresentationUnsupported gaps)
             Planned planned → classify record active reported planned
     classify record active reported planned
-      | recordFailed record = recover planned
+      -- A retry after a failed construction is a recovery attempt. If the
+      -- geometry has moved since that construction was planned, it waits for
+      -- the move to settle first, as any resize does.
+      | recordFailed record =
+          if maybe False (\(extent, observed) → extent == planExtent planned && sameGeometry observed geometry) (recordLastPlanned record)
+            then recover planned
+            else settle planned (recover planned)
       | Just (_, native) ← active
       , reported
       , planExtent (genPlan native) == planExtent planned =
           -- Out of date or suboptimal with the extent it already has: not a
-          -- resize, so rebuilding it is a recovery attempt.
-          recover planned
+          -- resize, so rebuilding it is a recovery attempt — after the
+          -- observed geometry, if it has moved, has settled.
+          if sameGeometry (genGeometry native) geometry then recover planned else settle planned (recover planned)
       -- The first generation is built at once. A later one with nothing
       -- active — the active one retired on its own to make room — is a
       -- replacement like any other, and waits for its geometry to settle.
@@ -634,6 +656,7 @@ reconcile generations now target geometry = do
               entry
                 { recordActive = Nothing
                 , recordSettling = Nothing
+                , recordLastPlanned = Just (planExtent planned, geometry)
                 , recordConstructions = recordConstructions entry + 1
                 , recordGenerations =
                     Map.insert candidate (NativeGeneration planned GenerationBuilding Nothing [] [] False 0 False geometry) (recordGenerations entry)

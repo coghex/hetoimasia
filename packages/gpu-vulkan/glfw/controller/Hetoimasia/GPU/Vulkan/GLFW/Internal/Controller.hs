@@ -993,7 +993,12 @@ useVulkanGeneration (VulkanController state) = useGeneration (stateGenerations s
 endVulkanGenerationUse ∷ VulkanController → GenerationUse → STM ()
 endVulkanGenerationUse (VulkanController state) = endGenerationUse (stateGenerations state)
 
--- | Report what a swapchain call on a target's active generation answered.
+-- | Report what a swapchain call on a target's active generation answered. It
+-- is the owner's, as the acquisitions and presentations that produce these
+-- results run on its thread (VK-12, VK-13): the report makes the owner's next
+-- deadline immediate, so the owner takes the round that reconciles it. A
+-- report from another thread wakes nothing, so this stays in the controller's
+-- private sublibrary rather than the package's public module.
 noteVulkanSwapchainResult ∷ VulkanController → GenerationId → SwapchainResult → STM Bool
 noteVulkanSwapchainResult (VulkanController state) = noteSwapchainResult (stateGenerations state)
 

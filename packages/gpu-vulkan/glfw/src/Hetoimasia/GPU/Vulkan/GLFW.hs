@@ -43,7 +43,6 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanGenerations
   , useVulkanGeneration
   , endVulkanGenerationUse
-  , noteVulkanSwapchainResult
 
     -- * Failures
   , InstanceExtensionsMissing (..)
@@ -76,7 +75,6 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readReadiness
   , readTargetRejection
   , endVulkanGenerationUse
-  , noteVulkanSwapchainResult
   , readVulkanGenerations
   , readVulkanModel
   , readVulkanRoots
