@@ -29,6 +29,7 @@ module Test.GPU.Vulkan.Native.Hazard
   , HazardStep (..)
   , runHazard
   , hazardMessageId
+  , hazardSection
   , spec
   ) where
 
@@ -250,6 +251,35 @@ hazard journal step vulkan = do
     compatible ∷ PhysicalDeviceMemoryProperties → Word32 → Maybe Word32
     compatible memory bits =
       find (\index → bits .&. (2 ^ index) /= 0) [0 .. memory.memoryTypeCount - 1]
+
+-- | The record's section: every step with what the capture received during
+-- it, the error reports by message id, and the verdict's issues.
+hazardSection ∷ HazardOutcome → [Text]
+hazardSection = \case
+  HazardStopped reason verdict steps →
+    ["", "## The session stopped", "", reason, ""]
+      <> stepTable steps
+      <> ["", "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) verdict]
+  HazardRecorded facts →
+    [ ""
+    , "## Two writes to one buffer with no barrier between them"
+    , ""
+    , "- device: " <> facts.hazardDevice
+    ]
+      <> [""]
+      <> stepTable facts.hazardSteps
+      <> [ ""
+         , "- error reports, by message id: " <> joined (idsOfSeverity "error" facts)
+         , "- records delivered: " <> tshow facts.hazardVerdict.verdictDelivered
+         , "- undelivered: " <> tshow facts.hazardVerdict.verdictUndelivered
+         , "- verdict issues: " <> tshow (verdictIssues facts.hazardVerdict)
+         ]
+  where
+    joined [] = "none"
+    joined ids = Text.intercalate ", " ids
+    stepTable steps =
+      ["| step | reports | errors |", "| --- | --- | --- |"]
+        <> ["| " <> step.stepName <> " | " <> tshow step.stepReports <> " | " <> tshow step.stepErrors <> " |" | step ← steps]
 
 -- ---------------------------------------------------------------------------
 -- The verdict

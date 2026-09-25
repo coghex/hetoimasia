@@ -112,7 +112,7 @@ scenarios =
       "observes a deliberate synchronization hazard, proving synchronization validation active"
       $ \_ journal → do
         outcome ← Hazard.runHazard journal
-        pure (Hazard.spec outcome, section "The synchronization validation control record" [])
+        pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
   ]
   where
     invocation = "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
