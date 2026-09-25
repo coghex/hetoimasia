@@ -266,7 +266,7 @@ processes of their own. It requires the `display` class, is mandatory outside
 the floor, and is the one group with a [preparation](#preparation-and-the-watchdog):
 
 ```json
-"command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"],
+"command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"],
 "preparation": {
   "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"],
   "timeout_seconds": 3600
@@ -275,7 +275,11 @@ the floor, and is the one group with a [preparation](#preparation-and-the-watchd
 ```
 
 The preparation compiles the suite; the command builds nothing — it asks Cabal
-for the built executable and refuses one that was not prepared — and its thirty
+for the built executable and refuses one that was not prepared. `--complete`
+makes the receipt speak for the whole profile: the suite runs every example
+through Hspec's own primitives with the configuration-reading step left out, so
+no `HSPEC_*`, `.hspec` file or selector can narrow it, and fails unless its
+shared session was acquired and every private scenario ran and passed. Its thirty
 seconds are D-21's budget for the whole native execution: on Linux the isolated
 X11 display the command starts for itself, the shared session and its roots,
 every example and child, retirement, the diagnostic verdict computed after the
@@ -2645,7 +2649,11 @@ failed or expired preparation that never runs its command, a leader that exits
 while its descendants run on being measured to the deadline, an expired
 deadline staying a timeout when the stopped command exits `0`, the cleanup
 after expiry recorded apart from the measurement, and the evidence a stopped
-command writes in its own cleanup being kept, a plan whose candidate is not its head executing
+command writes in its own cleanup being kept, a command's start spent from the
+same absolute deadline, a group watched after its leader could no longer name
+it, the checked-in headless command — the Vulkan runner's test mode, against
+stand-ins for the compiler, Cabal and the native prefix — reporting its suites'
+failure and success through the runner and the aggregate, a plan whose candidate is not its head executing
 from a checkout of that candidate and recording both separately, a selected
 group with no receipt, receipts belonging to another plan or another head,
 malformed receipts and malformed plans, omitted `unaffected`

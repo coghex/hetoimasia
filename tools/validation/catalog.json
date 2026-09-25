@@ -274,7 +274,9 @@
         "bash",
         "tools/vulkan/run.sh",
         "native",
-        "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
+        "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+        "--",
+        "--complete"
       ],
       "preparation": {
         "command": [

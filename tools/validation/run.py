@@ -750,19 +750,27 @@ def execute(command: list[str], root: str, timeout_seconds: int, environment: di
     # A new session gives the command its own process group, so a timeout can
     # reap the descendants it spawned rather than only the process it launched.
     process = subprocess.Popen(command, cwd=root, start_new_session=True, env=environment)
-    try:
-        group: int | None = os.getpgid(process.pid)
-    except OSError:
-        group = None
+    # A new session makes the command its own process group, whose identifier
+    # is the command's own process id. It is taken from there rather than asked
+    # of the process, because a command that has already exited — leaving a
+    # child running in that group — can no longer answer, and a group nobody
+    # could name would be one nobody watched.
+    group: int | None = process.pid
     expired = False
     try:
-        process.wait(timeout=timeout_seconds)
+        # The deadline is absolute, fixed before the command was started, so
+        # whatever starting it cost is spent from the same budget.
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
         while group_alive(group):
             if time.monotonic() >= deadline:
                 expired = True
                 break
             time.sleep(TEARDOWN_POLL_SECONDS)
     except subprocess.TimeoutExpired:
+        expired = True
+    # A command that finished only after its deadline did not finish inside
+    # it, however its exit was observed.
+    if not expired and time.monotonic() > deadline:
         expired = True
     measured = min(time.monotonic(), deadline) - started
     expiry = None

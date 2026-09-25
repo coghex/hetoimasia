@@ -183,11 +183,14 @@ fingerprint="packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
 generate_fingerprint() {
   if [ ! -e "$fingerprint" ]; then
     # The directory too, when this created it: Git records no empty
-    # directory, so one left behind is an addition the candidate lacks.
+    # directory, so one left behind is an addition the candidate lacks. The
+    # cleanup must never decide the exit status — under `set -e` a failing
+    # command in the trap would replace the suites' own — so each step
+    # tolerates what it finds.
     if [ -d "$(dirname "$fingerprint")" ]; then
-      trap 'rm -f "$root/$fingerprint"' EXIT
+      trap 'rm -f "$root/$fingerprint" || true' EXIT
     else
-      trap 'rm -f "$root/$fingerprint"; rmdir "$root/$(dirname "$fingerprint")" 2>/dev/null' EXIT
+      trap 'rm -f "$root/$fingerprint" || true; rmdir "$root/$(dirname "$fingerprint")" 2>/dev/null || true' EXIT
     fi
   fi
   "$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/vulkan: glslang wrapper reports /'

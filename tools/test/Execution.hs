@@ -244,6 +244,21 @@ spec = describe "Validation execution" $ do
         (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just True
         (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (>= 5)
 
+    it "spends the time a command took to start from the same absolute deadline" $
+      withFixture $ \fixture → do
+        -- Starting the command is slowed by 0.6s, and it then runs for 0.7s:
+        -- 1.3s in all against a one-second budget. A wait that began its full
+        -- budget only once the command had started would call that a pass.
+        watchdogStage fixture "slow-start" `shouldReturn` "timeout"
+
+    it "watches the command's group even when its leader has already gone" $
+      withFixture $ \fixture → do
+        -- The shell exits at once, leaving a child in its group, and the
+        -- process can no longer be asked which group it led. The group is the
+        -- one its own session made, so the child is still watched and the
+        -- deadline still expires on it.
+        watchdogStage fixture "gone-leader" `shouldReturn` "timeout"
+
     it "retains the evidence a stopped command writes in its own cleanup" $
       withFixture $ \fixture → do
         plan ← planRequesting fixture ["probe.evidence"]
@@ -1618,6 +1633,47 @@ asNumber ∷ Json → Maybe Double
 asNumber = \case
   JNumber value → Just value
   _ → Nothing
+
+-- | Drive the real runner's stage execution with process startup made slow,
+-- or with the launched process made unable to report its group, and return
+-- the outcome it recorded. These are instants a command cannot be asked to
+-- produce, so the runner is loaded by path in an isolated interpreter and only
+-- the one standard-library call is replaced.
+watchdogStage ∷ Fixture → String → IO String
+watchdogStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, sys, time"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "if mode == 'slow-start':"
+          , "    original = runner.subprocess.Popen"
+          , "    def slow(*arguments, **options):"
+          , "        time.sleep(0.6)"
+          , "        return original(*arguments, **options)"
+          , "    runner.subprocess.Popen = slow"
+          , "    stage = runner.execute(['sh', '-c', 'sleep 0.7'], root, 1, dict(os.environ))"
+          , "else:"
+          , "    def gone(pid):"
+          , "        raise OSError('the leader has already exited')"
+          , "    runner.os.getpgid = gone"
+          , "    stage = runner.execute(['sh', '-c', 'sleep 300 >/dev/null 2>&1 & exit 0'], root, 1, dict(os.environ))"
+          , "print(stage['outcome'])"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (takeWhile (/= '\n') output)
 
 -- | Replace a receipt's recorded preparation command.
 patchPreparation ∷ Fixture → FilePath → String → IO ()

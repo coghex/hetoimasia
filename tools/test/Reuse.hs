@@ -9,7 +9,7 @@
 module Reuse (spec) where
 
 import Control.Monad (forM_, void)
-import Data.List (isInfixOf)
+import Data.List (find, intercalate, isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Json (Json, asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox
@@ -645,6 +645,70 @@ spec = describe "Validation evidence reuse" $ do
         receipt ← readFile (receiptPath fixture "test.vulkan-native")
         receipt `shouldContain` "\"preparation\": {"
         receipt `shouldContain` "\"runner_class\": \"display\""
+
+    forM_ [(1 ∷ Int, "failed"), (0, "passed")] $ \(status, outcome) →
+      it ("reports the headless group " ++ outcome ++ " when its suites exit " ++ show status ++ ", through the runner and the aggregate") $ do
+        -- The group's real command — the checked-in runner's test mode —
+        -- against stand-ins for the compiler, Cabal and the native prefix, so
+        -- the suites' exit status is chosen. A route that dropped a suite's
+        -- failure would pass here with status 1.
+        checkout ← getCurrentDirectory
+        runner ← readFile (checkout </> "tools/vulkan/run.sh")
+        toolchainPin ← readFile (checkout </> "tools/ci-image/toolchain.pin")
+        bindingPin ← readFile (checkout </> "tools/toolchain/binding.pin")
+        let seeded' =
+              [ ("tools/vulkan/run.sh", runner)
+              , ("tools/ci-image/toolchain.pin", toolchainPin)
+              , ("tools/toolchain/binding.pin", bindingPin)
+              , ("tools/native/native.py", standInNative)
+              , ("cabal.project.vulkan", "packages:\n  hetoimasia-gpu-vulkan-glfw\n\nconstraints:\n    vulkan +safe-foreign-calls,\n    vulkan -darwin-lib-dirs\n")
+              ]
+        withCheckedInRoutingKeeping ["test.vulkan-headless"] seeded' $ \fixture workers →
+          withSystemTempDirectory "hetoimasia-stand-in-native" $ \native → do
+            let bin = native </> "bin"
+                version name = maybe "" (drop (length name + 1)) (find ((name ++ "=") `isPrefixOf`) (lines toolchainPin))
+            createDirectoryIfMissing True bin
+            createDirectoryIfMissing True (native </> "layers")
+            writeFile (native </> "icd.json") "{}\n"
+            executable (bin </> "ghc") ("#!/bin/sh\necho " ++ version "GHC_VERSION" ++ "\n")
+            executable (bin </> "glslang") "#!/bin/sh\necho 'glslang stand-in'\n"
+            executable (bin </> "cabal") $
+              unlines
+                [ "#!/bin/sh"
+                , "case \"$1\" in"
+                , "  --numeric-version) echo " ++ version "CABAL_VERSION" ++ " ;;"
+                , "  run) echo 'shader fingerprint: stand-in' ;;"
+                , "  test) echo \"stand-in suites: $*\"; exit \"$FIXTURE_SUITE_STATUS\" ;;"
+                , "  *) exit 64 ;;"
+                , "esac"
+                ]
+            let inherited = environment fixture
+                path = maybe "" id (lookup "PATH" inherited)
+                standing =
+                  fixture
+                    { environment =
+                        [("PATH", bin ++ ":" ++ path), ("FIXTURE_NATIVE", native), ("FIXTURE_SUITE_STATUS", show status)]
+                          ++ filter ((`notElem` ["PATH", "FIXTURE_NATIVE", "FIXTURE_SUITE_STATUS"]) . fst) inherited
+                    }
+            change standing "hetoimasia-gpu-vulkan-glfw/integration-tests/Main.hs" "module Main (main) where\n"
+            plan ← planRouted standing workers "headless-route-plan.json"
+            entryText plan "test.vulkan-headless" "reason" `shouldReturn` Just "affected"
+            -- Nothing earlier to reuse: every selected group executes here.
+            writeFixtureFile (stubDirectory standing) "artifacts.json" "{\"total_count\": 0, \"artifacts\": []}\n"
+            exitOf <$> reuseWith standing plan (restated workers) `shouldReturn` ExitSuccess
+            selected ← selectedGroups plan
+            forM_ (filter (/= "test.vulkan-headless") selected) $ \group → do
+              (other, _, otherErrors) ← runGroup standing plan group engineRoute
+              (group, other, otherErrors) `shouldBe` (group, ExitSuccess, "")
+            (ran, output, errors) ←
+              runGroup standing plan "test.vulkan-headless" ["--worker", "vulkan", "--runner-class", "cpu", "--runner-class", "display"]
+            (ran, errors) `shouldBe` (if status == 0 then ExitSuccess else ExitFailure 1, "")
+            output `shouldContain` "stand-in suites: test"
+            receipt ← readFile (receiptPath standing "test.vulkan-headless")
+            receipt `shouldContain` ("\"outcome\": \"" ++ outcome ++ "\"")
+            (verdict, report, _) ← aggregate standing plan (reportedSuccess workers)
+            verdict `shouldBe` (if status == 0 then ExitSuccess else ExitFailure 1)
+            [line | line ← lines report, "test.vulkan-headless" `isInfixOf` line] `shouldSatisfy` any (outcome `isInfixOf`)
 
   describe "the checked-in routing of the GPU model group" $ do
     -- `test.vulkan` is the first mandatory group that is neither in the floor
@@ -1300,7 +1364,13 @@ fixtureCatalogWith policy inputs =
 -- minimal package per component the catalog names, and the worker declarations
 -- the validation workflow's plan step passes.
 withCheckedInRouting ∷ (Fixture → [String] → IO a) → IO a
-withCheckedInRouting action = do
+withCheckedInRouting = withCheckedInRoutingKeeping [] []
+
+-- | The same, keeping the named groups' real commands and preparations, and
+-- seeding these extra files, so an example can run a checked-in command
+-- against stand-ins for what it needs.
+withCheckedInRoutingKeeping ∷ [String] → [(FilePath, String)] → (Fixture → [String] → IO a) → IO a
+withCheckedInRoutingKeeping kept extra action = do
   checkout ← getCurrentDirectory
   workflow ← readFile (checkout </> ".github/workflows/validation.yml")
   let workers = concat [["--worker", declaration] | declaration ← mapMaybe planDeclaration (lines workflow)]
@@ -1320,10 +1390,14 @@ withCheckedInRouting action = do
         , "import json, os, sys\n\
           \catalog = json.load(open(sys.argv[1], encoding='utf-8'))\n\
           \packages = {}\n\
+          \kept = json.loads(sys.argv[3])\n\
           \for group in catalog['groups']:\n\
-          \    group['command'] = ['true']\n\
-          \    if group.get('preparation'):\n\
-          \        group['preparation']['command'] = ['true']\n\
+          \    if group['id'] in kept:\n\
+          \        pass\n\
+          \    else:\n\
+          \        group['command'] = ['true']\n\
+          \        if group.get('preparation'):\n\
+          \            group['preparation']['command'] = ['true']\n\
           \    if group['component'] not in (None, 'all'):\n\
           \        package, kind, name = group['component'].split(':')\n\
           \        packages.setdefault(package, []).append((kind, name))\n\
@@ -1340,8 +1414,10 @@ withCheckedInRouting action = do
           \open('cabal.project', 'w').write('packages:\\n' + ''.join('  ' + package + '\\n' for package in packages))\n"
         , checkout </> "tools/validation/catalog.json"
         , fixtureGenerated
+        , "[" ++ intercalate ", " (map show kept) ++ "]"
         ]
     (seeded', errors) `shouldBe` (ExitSuccess, "")
+    mapM_ (uncurry (writeFixtureFile directory)) extra
     void $ git pinned directory ["init", "-b", "master"]
     void $ git pinned directory ["add", "."]
     void $ git pinned directory ["commit", "-q", "-m", "Seed the checked-in routing"]
@@ -1352,6 +1428,31 @@ withCheckedInRouting action = do
     permissions ← getPermissions stub
     setPermissions stub (setOwnerExecutable True permissions)
     action fixture {seeded = seed} workers
+
+-- | A stand-in for the native recipe's @prepare@, exporting the discovery the
+-- runner reads from files an example creates.
+standInNative ∷ String
+standInNative =
+  unlines
+    [ "import os"
+    , "directory = os.environ['FIXTURE_NATIVE']"
+    , "for name, value in ["
+    , "    ('VK_DRIVER_FILES', os.path.join(directory, 'icd.json')),"
+    , "    ('VK_LAYER_PATH', os.path.join(directory, 'layers')),"
+    , "    ('HETOIMASIA_GLSLANG', os.path.join(directory, 'bin', 'glslang')),"
+    , "    ('HETOIMASIA_VULKAN_LIBDIR', directory),"
+    , "    ('HETOIMASIA_VULKAN_INCLUDEDIR', directory),"
+    , "    ('HETOIMASIA_VULKAN_VALIDATION_FEATURES', 'synchronization'),"
+    , "]:"
+    , "    print('export %s=%s' % (name, value))"
+    ]
+
+-- | Write an executable script.
+executable ∷ FilePath → String → IO ()
+executable path contents = do
+  writeFile path contents
+  permissions ← getPermissions path
+  setPermissions path (setOwnerExecutable True permissions)
 
 -- | One worker declaration of the plan step, such as
 -- @haskell-engine=cpu:build.all,test.engine@. The aggregate step's result

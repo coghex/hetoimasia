@@ -322,7 +322,16 @@ spec = describe "The Vulkan project boundary" $ do
     group ← catalogGroup nativeGroup
     (group >>= field "runner" >>= asString) `shouldBe` Just "display"
     (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 30)
-    (group >>= stringsAt "command") `shouldBe` Just ["bash", runner, "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
+    -- `--complete` is what makes the receipt speak for the whole profile: the
+    -- suite runs every example with no configuration an environment could
+    -- narrow, and fails unless its shared session and every private scenario
+    -- ran.
+    (group >>= stringsAt "command")
+      `shouldBe` Just ["bash", runner, "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"]
+    suite ← readFile "packages/gpu-vulkan/glfw/native-test/Main.hs"
+    suite `shouldContain` "completeFlag = \"--complete\""
+    suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
+    suite `shouldContain` "completenessProblems report children"
     (group >>= field "preparation" >>= stringsAt "command")
       `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
     -- The execution builds nothing: the runner's native mode names an

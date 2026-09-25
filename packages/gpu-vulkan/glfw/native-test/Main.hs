@@ -18,7 +18,11 @@
 -- group runs:
 --
 -- > bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests
--- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests
+-- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
+--
+-- where @--complete@ runs the whole profile with nothing an environment could
+-- narrow, and fails unless the shared session and every private scenario ran;
+-- without it the suite is an ordinary Hspec run that selects as asked.
 --
 -- which on Linux starts an isolated X11 display for it, and on macOS needs
 -- the human's @HETOIMASIA_NATIVE_SESSION=desktop@ on that one command. See
@@ -35,9 +39,17 @@ import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import System.Environment (getArgs)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
-import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWithResult, isSuccess)
+import Test.Hspec.Runner
+  ( Config (configFailOnEmpty)
+  , defaultConfig
+  , evalSpec
+  , hspecWithResult
+  , isSuccess
+  , runSpecForest
+  , specResultSuccess
+  )
 
 import Hetoimasia.Foundation.Log (LogEntry (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..), verdictIssues)
@@ -45,7 +57,7 @@ import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, readConsent, refusalMes
 import Test.GPU.Vulkan.Native.Environment (establishEnvironment)
 import Test.GPU.Vulkan.Native.Fixture (SharedReport (..), ThreadCheck (..), runShared)
 import Test.GPU.Vulkan.Native.Gate (newGate, refusals)
-import Test.GPU.Vulkan.Native.Private (ChildRun (..), privateRootsFlag, runScenario)
+import Test.GPU.Vulkan.Native.Private (ChildRun (..), privateRootsFlag, runScenario, scenarioNames)
 import qualified Test.GPU.Vulkan.Native.Spec as Native
 import Test.Vulkan.Proof.Roots (NativeCall (..))
 
@@ -57,17 +69,39 @@ main = do
   consent ← readConsent
   getArgs >>= \case
     [flag, scenario] | flag == privateRootsFlag → runScenario consent scenario
-    _ → do
-      forM_ environment (Text.putStrLn . ("vulkan-native-tests: " <>))
-      runSuite consent started
+    arguments
+      | completeFlag `elem` arguments && arguments /= [completeFlag] → do
+          hPutStrLn stderr ("vulkan-native-tests: " <> completeFlag <> " runs the whole profile and takes no other argument")
+          exitWith (ExitFailure 2)
+      | otherwise → do
+          forM_ environment (Text.putStrLn . ("vulkan-native-tests: " <>))
+          runSuite consent started (arguments == [completeFlag])
 
-runSuite ∷ Either Refusal Consent → UTCTime → IO ()
-runSuite consent started = do
+-- | The whole required profile, and nothing an environment could narrow.
+--
+-- The catalog group runs the suite with this, so its receipt speaks for every
+-- example: the tree is evaluated and run through Hspec's own primitives with
+-- the configuration-reading step left out — no command-line selection,
+-- @~/.hspec@, @./.hspec@ or @HSPEC_*@ can select a subset — and the run then
+-- requires that the shared session was acquired, exactly once, and that every
+-- private scenario ran and passed. Without it the suite is an ordinary Hspec
+-- run: dry runs, listings and local selections work as anywhere else, and a
+-- selection that reaches no native case passes without claiming one.
+completeFlag ∷ String
+completeFlag = "--complete"
+
+runSuite ∷ Either Refusal Consent → UTCTime → Bool → IO ()
+runSuite consent started complete = do
   gate ← newGate consent
   timings ← newIORef []
-  (result, report) ←
-    runShared gate $ \fixture →
-      hspecWithResult defaultConfig {configFailOnEmpty = True} (Native.spec gate fixture timings)
+  (passed, report) ←
+    runShared gate $ \fixture → do
+      let examples = Native.spec gate fixture timings
+      if complete
+        then do
+          (config, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} examples
+          specResultSuccess <$> runSpecForest forest config
+        else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} examples
   children ← readIORef timings
   refused ← refusals gate
   finished ← getCurrentTime
@@ -77,9 +111,24 @@ runSuite consent started = do
         <> show (realToFrac (diffUTCTime finished started) ∷ Double)
         <> "s, fixtures, examples and teardown included"
     )
-  let problems = sharedProblems report <> refusalProblems consent refused
+  let problems =
+        sharedProblems report
+          <> refusalProblems consent refused
+          <> (if complete then completenessProblems report children else [])
   forM_ problems (hPutStrLn stderr . ("vulkan-native-tests: " <>) . Text.unpack)
-  unless (isSuccess result && null problems) exitFailure
+  unless (passed && null problems) exitFailure
+
+-- | What a complete run must have done, whatever Hspec reported: the shared
+-- session acquired once, and every private scenario run to a pass.
+completenessProblems ∷ SharedReport → [ChildRun] → [Text]
+completenessProblems report children =
+  [ "the complete profile never acquired the shared session"
+  | report.reportAcquisitions /= 1
+  ]
+    <> [ "the complete profile did not run the private scenario " <> Text.pack name <> " to a pass"
+       | name ← scenarioNames
+       , name `notElem` [child.childScenario | child ← children, child.childStatus == ExitSuccess]
+       ]
 
 -- | What the run's shared session did, and what each child cost.
 summary ∷ SharedReport → [ChildRun] → [Text]

@@ -115,7 +115,7 @@ scenarios =
         pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
   ]
   where
-    invocation = "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
+    invocation = "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete"
     section title body passed transcript =
       Text.unlines $
         ["# " <> title, "", "Verdict: **" <> (if passed then "pass" else "fail") <> "**."]
