@@ -9,6 +9,8 @@
 -- the validation group @test.vulkan-headless@.
 module Main (main) where
 
+import qualified Test.GPU.Vulkan.Native.Generations as Generations
+import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Profile as Profile
 import qualified Test.GPU.Vulkan.Native.Roots as Roots
 import Test.Hspec (describe)
@@ -20,3 +22,5 @@ main =
     describe "Native roots" $ do
       Profile.spec
       Roots.spec
+      Presentation.spec
+      Generations.spec

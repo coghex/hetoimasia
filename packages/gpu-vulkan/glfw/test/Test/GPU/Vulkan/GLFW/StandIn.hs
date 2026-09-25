@@ -39,6 +39,10 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Scene
   , newRig
   , newRigOf
+  , visibleRig
+  , resizeFramebuffer
+  , publishObservation
+  , offerExtent
   , twoWindows
   , creationsBegun
   , runRig
@@ -67,6 +71,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (Exception, SomeException, fromException, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -75,7 +80,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -83,6 +88,7 @@ import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Seam
   ( Seam
   , SeamScript (..)
+  , WindowAttribute (VisibleAttribute)
   , asProcessMainThread
   , defaultIntegrationScript
   , defaultScript
@@ -91,7 +97,10 @@ import Hetoimasia.GLFW.Seam
   , seamIntegration
   )
 import Hetoimasia.GLFW.Vulkan (requiredInstanceExtensions)
-import Hetoimasia.GLFW.Window (WindowConfig, WindowId, hiddenTestWindowConfig)
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, setWindowSizeCommand)
+import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, defaultCaptureConfig)
@@ -119,7 +128,19 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , swapchainExtension
   , swapchainMaintenance1Extension
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (RootOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Presentation
+  ( GenerationPlan (..)
+  , SurfaceCapabilities (..)
+  , SurfaceExtent (..)
+  , SurfaceFormat (..)
+  , SurfaceOffer (..)
+  , colorSpaceSrgbNonlinear
+  , compositeAlphaOpaque
+  , formatB8G8R8A8Srgb
+  , imageUsageColorAttachment
+  , presentModeFifo
+  )
+import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), RootOps (..), SwapchainRequest (..))
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
   , AttachmentProtocol (..)
@@ -136,6 +157,10 @@ import Hetoimasia.Runtime.GLFW
   , defaultHostConfig
   , graphicsAttachment
   , graphicsOwnerWorker
+  , hostCommandPort
+  , hostWindowClient
+  , publishGraphicsObservation
+  , windowRenderEligibility
   , hostWindowIdentities
   , noApplicationEvents
   , readTargetStanding
@@ -163,6 +188,12 @@ data Event
   | DeviceDestroyed
   | MessengerDestroyed
   | InstanceDestroyed
+  | SwapchainCreated !Word64 !(Word32, Word32) !(Maybe Word64)
+    -- ^ The swapchain made, its extent, and the one handed over as
+    -- @oldSwapchain@.
+  | ViewCreated !Word64
+  | ViewDestroyed !Word64
+  | SwapchainDestroyed !Word64
   | WindowGone !Bool
     -- ^ The seam destroyed a window; whether the graphics owner's worker had
     -- already completed by then.
@@ -226,7 +257,17 @@ instance Exception StandInLoss
 data Native = Native
   { nativeScript ∷ !(TVar (Map Step Scripted))
   , nativeUnsupported ∷ !(TVar (Set Word64))
+  , nativeHandles ∷ !(TVar Word64)
+    -- ^ The next swapchain or view handle, from 500.
+  , nativeCurrentExtent ∷ !(TVar (Maybe SurfaceExtent))
+    -- ^ The concrete current extent every surface reports, or 'Nothing' for
+    -- the application to choose.
   }
+
+-- | Have every surface report this concrete current extent from now on, or
+-- leave the extent to the application.
+offerExtent ∷ Rig → Maybe SurfaceExtent → IO ()
+offerExtent rig extent = atomically (writeTVar (nativeCurrentExtent (rigNative rig)) extent)
 
 scriptNative ∷ Rig → Step → Scripted → IO ()
 scriptNative rig at scripted = atomically (modifyTVar' (nativeScript (rigNative rig)) (Map.insert at scripted))
@@ -289,7 +330,40 @@ nativeLayer events native capture =
         step events native AtSupport (SupportQueried surface)
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , opsGenerations =
+        GenerationOps
+          { opsSurfaceOffer = \_ _ → do
+              current ← readTVarIO (nativeCurrentExtent native)
+              pure
+                SurfaceOffer
+                  { offerCapabilities =
+                      SurfaceCapabilities
+                        { capabilityMinImages = 2
+                        , capabilityMaxImages = 3
+                        , capabilityCurrentExtent = current
+                        , capabilityMinExtent = SurfaceExtent 1 1
+                        , capabilityMaxExtent = SurfaceExtent 16384 16384
+                        , capabilityUsage = imageUsageColorAttachment
+                        , capabilityCurrentTransform = 1
+                        , capabilityCompositeAlpha = compositeAlphaOpaque
+                        }
+                  , offerFormats = [SurfaceFormat formatB8G8R8A8Srgb colorSpaceSrgbNonlinear]
+                  , offerPresentModes = [presentModeFifo]
+                  }
+          , opsCreateSwapchain = \_ request → do
+              handle ← fresh
+              let extent = planExtent (requestPlan request)
+              handle <$ record events (SwapchainCreated handle (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
+          , opsSwapchainImages = \_ swapchain → pure [swapchain * 10 + index | index ← [0 .. 2]]
+          , opsCreateImageView = \_ _ _ → do
+              handle ← fresh
+              handle <$ record events (ViewCreated handle)
+          , opsDestroyImageView = \_ view → record events (ViewDestroyed view)
+          , opsDestroySwapchain = \_ swapchain → record events (SwapchainDestroyed swapchain)
+          }
     }
+  where
+    fresh = atomically (stateTVar (nativeHandles native) (\next → (next, next + 1)))
 
 -- ---------------------------------------------------------------------------
 -- The surface bridge
@@ -470,6 +544,8 @@ data Rig = Rig
   , rigAfterRefusal ∷ !(TVar (AttachmentId → IO ()))
     -- ^ What runs on the main thread right after the owner's full port
     -- refuses a handover's announcement.
+  , rigFramebuffer ∷ !(TVar (Int, Int))
+    -- ^ What every window's framebuffer size query answers.
   }
 
 -- | A rig over one hidden window.
@@ -488,8 +564,39 @@ newRigOf count = newRigWith [hiddenTestWindowConfig (Text.pack ("window " <> sho
 creationsBegun ∷ Rig → STM Word64
 creationsBegun rig = subtract 100 <$> readTVar (bridgeNext (rigBridge rig))
 
+-- | A rig over one window the seam reports visible, with a 640 by 480
+-- framebuffer, so its target is eligible to render and its generations are
+-- built.
+visibleRig ∷ IO Rig
+visibleRig = newRigVisible True [hiddenTestWindowConfig "visible" 64 48]
+
+-- | Change what the window's framebuffer size query answers, and resize it
+-- through the host's command port, from the calling thread, so the owner loop
+-- samples and publishes the new framebuffer. The loop must be turning.
+resizeFramebuffer ∷ Rig → VulkanHost Scene → WindowId → (Int, Int) → IO ()
+resizeFramebuffer rig host window (width, height) = do
+  atomically (writeTVar (rigFramebuffer rig) (width, height))
+  awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent width height)) >>= \case
+    WaitAccepted _ → pure ()
+    WaitClosed → throwIO (StandInFailure "the host's command port closed")
+
+-- | Publish the window's latest observation for its target to the owner, as
+-- the main thread's loop does for an application — which, until VK-16's loop
+-- adapter publishes one every turn, is the application itself.
+publishObservation ∷ VulkanHost Scene → GraphicsService → WindowId → IO ()
+publishObservation host service window = do
+  client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
+  observation ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+  -- The attachment's revisions start after the slot's initial zero, and rise
+  -- with the window's own.
+  void (publishGraphicsObservation (vulkanGraphicsOwner host) service (observedRevision observation + 1) observation (windowRenderEligibility observation) Nothing)
+
 newRigWith ∷ [WindowConfig] → IO Rig
-newRigWith windows = do
+newRigWith = newRigVisible False
+
+newRigVisible ∷ Bool → [WindowConfig] → IO Rig
+newRigVisible visible windows = do
+  framebuffer ← newTVarIO (640, 480)
   events ← newTVarIO []
   owner ← newTVarIO Nothing
   posts ← newTVarIO (0 ∷ Int)
@@ -515,8 +622,10 @@ newRigWith windows = do
                 Just graphics → isJust <$> atomically (Worker.pollCompletion (graphicsOwnerWorker graphics))
             record events (WindowGone joined)
         , scriptTerminate = \_ → record events SessionEnded
+        , scriptFramebufferSize = \_ → readTVarIO framebuffer
+        , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
@@ -531,6 +640,7 @@ newRigWith windows = do
       , rigVerdict = verdict
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
+      , rigFramebuffer = framebuffer
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound

@@ -17,7 +17,29 @@ module Test.GPU.Vulkan.Native.Shared (spec) where
 
 import Control.Concurrent (isCurrentThreadBound, myThreadId)
 import Control.Concurrent.STM (atomically)
+import Control.Monad (when)
+import Data.Maybe (isJust)
+import qualified System.Info as Info
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
+
+import Hetoimasia.GLFW.Command (setWindowSizeCommand, showWindowCommand)
+import Hetoimasia.GLFW.Window (Attribute (Observed), ContentScale (..), observedContentScale, observedFramebufferExtent, observedLogicalExtent)
+import qualified Hetoimasia.GLFW.Window as Window
+import Hetoimasia.GPU.Vulkan.Native.Generations
+  ( GenerationStanding (..)
+  , GenerationView (..)
+  , TargetCondition (..)
+  , TargetGenerationsView (..)
+  )
+import Hetoimasia.GPU.Vulkan.Native.Presentation
+  ( GenerationPlan (..)
+  , SurfaceExtent (..)
+  , SurfaceFormat (..)
+  , colorSpaceSrgbNonlinear
+  , formatB8G8R8A8Srgb
+  , formatR8G8B8A8Srgb
+  , presentModeFifo
+  )
 
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
@@ -25,10 +47,13 @@ import Hetoimasia.GPU.Vulkan.GLFW
   ( Readiness (..)
   , VulkanHandover (..)
   , VulkanHost (..)
+  , endVulkanGenerationUse
   , handOverVulkanTarget
   , readReadiness
+  , readVulkanGenerations
   , readVulkanRoots
   , readVulkanTargets
+  , useVulkanGeneration
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW (GraphicsService, TargetStanding (..), graphicsAttachment, readTargetStanding)
@@ -90,6 +115,94 @@ spec fixture = describe "the shared roots" $ do
     ownerThreads retired destroyed
     closeWindow fixture second
 
+  it "builds a generation on the owner's thread from the surface's extent and the profile's format, the framebuffer's pixels rather than the window's size" $ do
+    vulkan ← sharedHost fixture
+    window ← createWindow fixture "hetoimasia VK-10 generation"
+    commandWindow fixture "showing the window" (showWindowCommand window)
+    service ← handOver fixture vulkan window
+    _ ← publishObservation fixture service window
+    view ← awaitGeneration vulkan service (const True)
+    observation ← readObservation fixture window
+    Just generation ← pure (activeOf view)
+    let plan = viewPlan generation
+        extent = planExtent plan
+    planFormat plan `shouldSatisfy` (`elem` [SurfaceFormat formatB8G8R8A8Srgb colorSpaceSrgbNonlinear, SurfaceFormat formatR8G8B8A8Srgb colorSpaceSrgbNonlinear])
+    planPresentMode plan `shouldBe` presentModeFifo
+    length (viewImageViews generation) `shouldBe` length (viewImages generation)
+    -- The swapchain is the framebuffer's size in physical pixels, which on a
+    -- Retina display is twice the window's.
+    Observed framebuffer ← pure (observedFramebufferExtent observation)
+    Observed logical ← pure (observedLogicalExtent observation)
+    Observed scale ← pure (observedContentScale observation)
+    (extentWidth extent, extentHeight extent) `shouldBe` (fromIntegral (Window.extentWidth framebuffer), fromIntegral (Window.extentHeight framebuffer))
+    putStrLn
+      ( "    VK-10 generation: "
+          <> show (extentWidth extent)
+          <> "x"
+          <> show (extentHeight extent)
+          <> " from "
+          <> show (planExtentSource plan)
+          <> ", window "
+          <> show (Window.extentWidth logical)
+          <> "x"
+          <> show (Window.extentHeight logical)
+          <> " at content scale "
+          <> show (scaleX scale)
+          <> ", "
+          <> show (length (viewImages generation))
+          <> " images of format "
+          <> show (surfaceFormat (planFormat plan))
+      )
+    when (Info.os == "darwin") $ do
+      scaleX scale `shouldSatisfy` (> 1)
+      Window.extentWidth framebuffer `shouldBe` round (fromIntegral (Window.extentWidth logical) * scaleX scale)
+      Window.extentWidth framebuffer `shouldNotBe` Window.extentWidth logical
+    calls ← nativeCalls fixture
+    ownerThreads calls [call | call ← calls, call.callName `elem` ["vkCreateSwapchainKHR", "vkGetSwapchainImagesKHR", "vkCreateImageView"]]
+    closeWindow fixture window
+    -- Its views and swapchain went before its surface, on the owner's thread.
+    after ← nativeCalls fixture
+    let named = map (.callName) after
+        lastIndex name = last [index | (index, called) ← zip [0 ∷ Int ..] named, called == name]
+    lastIndex "vkDestroyImageView" `shouldSatisfy` (< lastIndex "vkDestroySwapchainKHR")
+    lastIndex "vkDestroySwapchainKHR" `shouldSatisfy` (< lastIndex "vkDestroySurfaceKHR")
+    ownerThreads after [call | call ← after, call.callName `elem` ["vkDestroyImageView", "vkDestroySwapchainKHR"]]
+
+  it "replaces a generation after a resize through the main-thread dispatch, retiring the old one only after its hold ends" $ do
+    vulkan ← sharedHost fixture
+    let controller = vulkanController vulkan
+    window ← createWindow fixture "hetoimasia VK-10 resize"
+    commandWindow fixture "showing the window" (showWindowCommand window)
+    service ← handOver fixture vulkan window
+    _ ← publishObservation fixture service window
+    first ← awaitGeneration vulkan service (const True)
+    Just old ← pure (activeOf first)
+    held ← atomically (useVulkanGeneration controller (viewGeneration old)) >>= either (fail . show) pure
+    before ← destroyedSwapchains
+    commandWindow fixture "resizing the window" (setWindowSizeCommand window (Window.Extent 240 180))
+    resized ← readObservation fixture window
+    _ ← publishObservation fixture service window
+    Observed framebuffer ← pure (observedFramebufferExtent resized)
+    second ← awaitGeneration vulkan service (\view → viewActive view /= Just (viewGeneration old))
+    Just new ← pure (activeOf second)
+    let extent = planExtent (viewPlan new)
+    (extentWidth extent, extentHeight extent) `shouldBe` (fromIntegral (Window.extentWidth framebuffer), fromIntegral (Window.extentHeight framebuffer))
+    -- The old generation was handed over and retired, and it is still owned:
+    -- its hold has not ended, so its swapchain has not been destroyed.
+    lookup (viewGeneration old) [(viewGeneration each, (viewStanding each, viewHandedOver each, isJust (viewSwapchain each))) | each ← viewGenerations second]
+      `shouldBe` Just (GenerationRetiredHeld, True, True)
+    destroyedSwapchains `shouldReturn'` before
+    atomically (endVulkanGenerationUse controller held)
+    _ ← awaitWithin 10 "the old generation's destruction" $
+      readVulkanGenerations controller (graphicsAttachment service) >>= \case
+        Just view | viewGeneration old `notElem` map viewGeneration (viewGenerations view) → pure (Just ())
+        _ → pure Nothing
+    after ← destroyedSwapchains
+    after `shouldBe` before + 1
+    calls ← nativeCalls fixture
+    ownerThreads calls [call | call ← calls, call.callName `elem` ["vkCreateSwapchainKHR", "vkDestroySwapchainKHR", "vkDestroyImageView"]]
+    closeWindow fixture window
+
   it "serves a later example's target from the same device" $ do
     vulkan ← sharedHost fixture
     window ← createWindow fixture "hetoimasia VK-8 later"
@@ -106,12 +219,26 @@ spec fixture = describe "the shared roots" $ do
     -- Every call ran on one Haskell thread that is not the main one, and off
     -- the main OS thread. The owner is one serialized Haskell thread, not a
     -- promise of OS-thread affinity, so only the main thread is excluded.
+    destroyedSwapchains = length . filter ((== "vkDestroySwapchainKHR") . (.callName)) <$> nativeCalls fixture
+    shouldReturn' action expected = action >>= (`shouldBe` expected)
     ownerThreads all' calls = do
       let owner = [call.callHaskellThread | call ← all', call.callName == "vkCreateInstance"]
       calls `shouldSatisfy` (not . null)
       [call.callHaskellThread | call ← calls] `shouldSatisfy` all (`elem` owner)
       [call.callHaskellThread | call ← calls] `shouldSatisfy` all (/= fixtureMainThread fixture)
       [call.callOsThread | call ← calls] `shouldSatisfy` all (/= mainOsThread fixture)
+
+-- | Wait until the target's generations are presenting on an active
+-- generation the predicate accepts.
+awaitGeneration ∷ VulkanHost () → GraphicsService → (TargetGenerationsView → Bool) → IO TargetGenerationsView
+awaitGeneration vulkan service accepted =
+  awaitWithin 10 "the target's generation" $
+    readVulkanGenerations (vulkanController vulkan) (graphicsAttachment service) >>= \case
+      Just view | viewCondition view == Presenting, accepted view → pure (Just view)
+      _ → pure Nothing
+
+activeOf ∷ TargetGenerationsView → Maybe GenerationView
+activeOf view = viewActive view >>= \active → lookup active [(viewGeneration each, each) | each ← viewGenerations view]
 
 -- | Hand a window over as a required target on the main thread, and wait for
 -- the owner to admit it.

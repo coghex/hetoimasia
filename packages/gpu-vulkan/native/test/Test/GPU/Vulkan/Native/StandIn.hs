@@ -22,6 +22,12 @@ module Test.GPU.Vulkan.Native.StandIn
   , StandInFailure (..)
   , StandInLoss (..)
 
+    -- * Surfaces' presentation
+  , standInOffer
+  , offerSurface
+  , returnImages
+  , duringCreation
+
     -- * Surfaces
   , surfaceNumbered
   , surfaceFailing
@@ -36,7 +42,7 @@ module Test.GPU.Vulkan.Native.StandIn
   , testBudgets
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception, fromException, throwIO, tryWithContext, uninterruptibleMask_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -61,9 +67,12 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , validationFeaturesExtension
   , swapchainMaintenance1Extension
   )
+import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( RootOps (..)
+  ( GenerationOps (..)
+  , RootOps (..)
   , Roots
+  , SwapchainRequest (..)
   , SurfaceDestruction (..)
   , TargetSurface (..)
   , newRoots
@@ -82,6 +91,15 @@ data Call
   | DestroyedDevice
   | DestroyedMessenger
   | DestroyedInstance
+  | QueriedSurface !Word64
+  | CreatedSwapchain !Word64 !Word64 !(Word32, Word32) !(Maybe Word64)
+    -- ^ The swapchain made, the surface, the extent, and the swapchain handed
+    -- over as @oldSwapchain@.
+  | EnumeratedImages !Word64
+  | CreatedView !Word64 !Word64
+    -- ^ The view made, and the image it views.
+  | DestroyedView !Word64
+  | DestroyedSwapchain !Word64
   deriving (Eq, Show)
 
 -- | A step the stand-in can be scripted at.
@@ -94,6 +112,12 @@ data Step
   | AtDestroyDevice
   | AtDestroyMessenger
   | AtDestroyInstance
+  | AtSurfaceOffer
+  | AtCreateSwapchain
+  | AtSwapchainImages
+  | AtCreateView
+  | AtDestroyView
+  | AtDestroySwapchain
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a scripted step does instead of succeeding.
@@ -105,6 +129,11 @@ data Scripted
     -- ^ Raises 'StandInLoss', which the stand-in classifies as device loss.
   | HoldsUntil !(TVar Bool)
     -- ^ Blocks until the variable is true, then succeeds.
+  | SucceedsThenFails !Int
+    -- ^ Succeeds this many more times, then behaves as 'Fails'.
+  | WaitsInterruptibly !(TVar Bool)
+    -- ^ Blocks, interruptibly, until the variable is true, then succeeds — so
+    -- a cancellation can end the call part-way, leaving its outcome unknown.
 
 newtype StandInFailure = StandInFailure Step
   deriving (Eq, Show)
@@ -122,13 +151,64 @@ data StandIn = StandIn
   , standScript ∷ !(TVar (Map Step Scripted))
   , standOffers ∷ ![DeviceOffer Text]
   , standLoaderVersion ∷ !Word32
+  , standSurfaceOffer ∷ !(TVar SurfaceOffer)
+  , standImages ∷ !(TVar Int)
+    -- ^ How many images a swapchain creation returns.
+  , standDuring ∷ !(TVar (IO ()))
+    -- ^ Run inside the next swapchain creation, once.
+  , standHandles ∷ !(TVar Word64)
   }
 
 newStandIn ∷ IO StandIn
 newStandIn = do
   recorded ← newTVarIO []
   scripted ← newTVarIO Map.empty
-  pure (StandIn recorded scripted [standInDevice] (packApiVersion 1 3 296))
+  StandIn recorded scripted [standInDevice] (packApiVersion 1 3 296)
+    <$> newTVarIO standInOffer
+    <*> newTVarIO 3
+    <*> newTVarIO (pure ())
+    <*> newTVarIO 100
+
+-- | A surface that supplies a concrete 640 by 480 extent and offers the
+-- profile's BGRA sRGB format, FIFO, color attachment and opaque composition,
+-- with at least two images and at most eight.
+standInOffer ∷ SurfaceOffer
+standInOffer =
+  SurfaceOffer
+    { offerCapabilities =
+        SurfaceCapabilities
+          { capabilityMinImages = 2
+          , capabilityMaxImages = 8
+          , capabilityCurrentExtent = Just (SurfaceExtent 640 480)
+          , capabilityMinExtent = SurfaceExtent 1 1
+          , capabilityMaxExtent = SurfaceExtent 4096 4096
+          , capabilityUsage = imageUsageColorAttachment
+          , capabilityCurrentTransform = 1
+          , capabilityCompositeAlpha = compositeAlphaOpaque
+          }
+    , offerFormats = [SurfaceFormat 44 colorSpaceSrgbNonlinear, SurfaceFormat formatB8G8R8A8Srgb colorSpaceSrgbNonlinear]
+    , offerPresentModes = [0, presentModeFifo]
+    }
+
+-- | Change what every surface reports from now on.
+offerSurface ∷ StandIn → (SurfaceOffer → SurfaceOffer) → IO ()
+offerSurface standIn edit = atomically (modifyTVar' (standSurfaceOffer standIn) edit)
+
+-- | Have every later swapchain creation return this many images.
+returnImages ∷ StandIn → Int → IO ()
+returnImages standIn count = atomically (writeTVar (standImages standIn) count)
+
+-- | Run an action inside the next swapchain creation, after it is recorded
+-- and before it returns — as something the owner observes only later, such as
+-- a newer resize or a close, would arrive while a native call is in flight.
+duringCreation ∷ StandIn → IO () → IO ()
+duringCreation standIn action = atomically (writeTVar (standDuring standIn) action)
+
+fresh ∷ StandIn → IO Word64
+fresh standIn = atomically $ do
+  next ← readTVar (standHandles standIn)
+  writeTVar (standHandles standIn) (next + 1)
+  pure next
 
 -- | One device satisfying the whole profile, whose single queue family answers
 -- graphics and presentation to every surface but 'unsupportedSurface'.
@@ -168,14 +248,22 @@ record standIn call = atomically (modifyTVar' (standCalls standIn) (call :))
 step ∷ StandIn → Step → Call → IO ()
 step standIn at call = do
   record standIn call
-  scripted ← Map.lookup at <$> readTVarIO (standScript standIn)
+  scripted ← atomically $ do
+    held ← Map.lookup at <$> readTVar (standScript standIn)
+    case held of
+      Just (SucceedsThenFails remaining)
+        | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (SucceedsThenFails (remaining - 1)))
+        | otherwise → pure (Just Fails)
+      other → pure other
   case scripted of
     Nothing → pure ()
     Just Fails → throwIO (StandInFailure at)
     Just Loses → throwIO (StandInLoss at)
+    Just (SucceedsThenFails _) → pure ()
     -- Held as a native call is: nothing interrupts it part-way, and a
     -- cancellation aimed at its thread meanwhile is delivered once it returns.
     Just (HoldsUntil gate) → uninterruptibleMask_ (atomically (readTVar gate >>= check))
+    Just (WaitsInterruptibly gate) → atomically (readTVar gate >>= check)
 
 -- | The stand-in's native layer. Handles are numbers: the instance is 1, the
 -- messenger 2 and the device 3; a surface is whatever number it was made with.
@@ -216,6 +304,31 @@ standInOps standIn =
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , opsGenerations =
+        GenerationOps
+          { opsSurfaceOffer = \_ surface → do
+              step standIn AtSurfaceOffer (QueriedSurface surface)
+              readTVarIO (standSurfaceOffer standIn)
+          , opsCreateSwapchain = \_ request → do
+              handle ← fresh standIn
+              let extent = planExtent (requestPlan request)
+              step standIn AtCreateSwapchain (CreatedSwapchain handle (requestSurface request) (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
+              during ← atomically $ do
+                action ← readTVar (standDuring standIn)
+                writeTVar (standDuring standIn) (pure ())
+                pure action
+              during
+              pure handle
+          , opsSwapchainImages = \_ swapchain → do
+              step standIn AtSwapchainImages (EnumeratedImages swapchain)
+              count ← readTVarIO (standImages standIn)
+              pure [swapchain * 1000 + fromIntegral index | index ← [0 .. count - 1]]
+          , opsCreateImageView = \_ image _ → do
+              handle ← fresh standIn
+              handle <$ step standIn AtCreateView (CreatedView handle image)
+          , opsDestroyImageView = \_ view → step standIn AtDestroyView (DestroyedView view)
+          , opsDestroySwapchain = \_ swapchain → step standIn AtDestroySwapchain (DestroyedSwapchain swapchain)
+          }
     }
   where
     decode = Encoding.decodeUtf8Lenient

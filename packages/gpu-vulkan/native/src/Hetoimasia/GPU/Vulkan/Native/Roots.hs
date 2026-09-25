@@ -79,6 +79,8 @@
 module Hetoimasia.GPU.Vulkan.Native.Roots
   ( -- * The native layer
     RootOps (..)
+  , GenerationOps (..)
+  , SwapchainRequest (..)
 
     -- * The roots
   , Roots
@@ -98,6 +100,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , RootsNotStarted (..)
   , UnknownRootTarget (..)
   , SurfaceDestructionFailed (..)
+  , TargetGenerationsRemain (..)
 
     -- * Device loss
   , GraphicsDeviceLost (..)
@@ -119,9 +122,16 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsModel
   , readRootsQuiesced
   , readRootsInstance
+
+    -- * For the generations above the roots
+  , readRootsDevice
+  , rootsGenerationOps
+  , rootsCall
+  , stateRootsModel
+  , failRootsSession
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -141,20 +151,24 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (newUnique)
 import Data.Word (Word32, Word64)
+import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
   ( GpuModel
   , Outcome (..)
-  , SessionFailureCause (DeviceLost)
+  , SessionFailureCause (..)
+  , TargetView (viewTargetGenerations)
   , admitTarget
   , closeTarget
   , escalateSession
   , newGpuModel
   , runProgressTurn
   , silentEvidence
+  , targetView
   )
 import Hetoimasia.GPU.Model.Budget (Budgets)
 import Hetoimasia.GPU.Model.Identity (DeviceId, SessionIdentity, TargetClass, TargetId, sessionIdentity)
+import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan, SurfaceOffer)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DevicePlan (..)
   , InstancePlan
@@ -198,7 +212,39 @@ data RootOps q inst msgr phys dev = RootOps
     -- ^ Whether that queue family of that device presents to that surface.
   , opsDeviceLoss ∷ SomeException → Bool
     -- ^ Whether a failure one of these calls raised is the loss of the device.
+  , opsGenerations ∷ GenerationOps phys dev
+    -- ^ The calls a target's swapchain generations are built and destroyed
+    -- with ("Hetoimasia.GPU.Vulkan.Native.Generations").
   }
+
+-- | Every native call a target's swapchain generations need. A swapchain, a
+-- swapchain image and an image view are each their 64-bit handle, as a surface
+-- is.
+data GenerationOps phys dev = GenerationOps
+  { opsSurfaceOffer ∷ phys → Word64 → IO SurfaceOffer
+    -- ^ The surface's capabilities, formats and presentation modes for the
+    -- session's physical device.
+  , opsCreateSwapchain ∷ dev → SwapchainRequest → IO Word64
+    -- ^ @vkCreateSwapchainKHR@. Passing an @oldSwapchain@ retires it whether
+    -- or not the creation succeeds.
+  , opsSwapchainImages ∷ dev → Word64 → IO [Word64]
+    -- ^ @vkGetSwapchainImagesKHR@. The images are the swapchain's: they go
+    -- with its destruction and are never destroyed on their own.
+  , opsCreateImageView ∷ dev → Word64 → Word32 → IO Word64
+    -- ^ A color view of one swapchain image in the given format.
+  , opsDestroyImageView ∷ dev → Word64 → IO ()
+  , opsDestroySwapchain ∷ dev → Word64 → IO ()
+  }
+
+-- | One swapchain creation: the surface, the plan, the session's queue family,
+-- and the active generation's swapchain being handed over, if any.
+data SwapchainRequest = SwapchainRequest
+  { requestSurface ∷ !Word64
+  , requestPlan ∷ !GenerationPlan
+  , requestQueueFamily ∷ !Word32
+  , requestOldSwapchain ∷ !(Maybe Word64)
+  }
+  deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- The roots
@@ -346,6 +392,16 @@ instance Exception SurfaceDestructionFailed where
   displayException (SurfaceDestructionFailed target reason) =
     "destroying the surface of " <> show target <> " did not complete: " <> Text.unpack reason
 
+-- | A target's surface was not destroyed because the model still holds
+-- swapchain generations of that target: they are the surface's children, and
+-- go first.
+data TargetGenerationsRemain = TargetGenerationsRemain !TargetId !Natural
+  deriving (Eq, Show)
+
+instance Exception TargetGenerationsRemain where
+  displayException (TargetGenerationsRemain target count) =
+    "the surface of " <> show target <> " is retained: " <> show count <> " of its swapchain generations remain"
+
 -- | A root's destruction raised. It is recorded uncertain, never attempted
 -- again, and its parents are retained.
 data RootDestructionFailed = RootDestructionFailed !Text !Text
@@ -484,6 +540,10 @@ retireRootTarget roots target =
     Just record → case recordUncertain record of
       Just reason → throwIO (SurfaceDestructionFailed target reason)
       Nothing → do
+        -- A swapchain generation is the surface's child: while the model holds
+        -- one, the surface is refused rather than destroyed under it.
+        remaining ← atomically (maybe 0 viewTargetGenerations . targetView target <$> readTVar (rootsModel roots))
+        when (remaining > 0) (throwIO (TargetGenerationsRemain target remaining))
         -- Read before the destruction, so nothing that can fail stands
         -- between a destruction that returned and its record.
         now ← readInstant (rootsClock roots)
@@ -686,6 +746,35 @@ readRootsModel = readTVar . rootsModel
 -- | What the instance's destruction proved, once it has returned.
 readRootsQuiesced ∷ Roots q inst msgr phys dev → STM (Maybe q)
 readRootsQuiesced = readTVar . rootsQuiesced
+
+-- | The session's device, with the plan it was selected by, once it is live.
+readRootsDevice ∷ Roots q inst msgr phys dev → STM (Maybe (DevicePlan phys, dev))
+readRootsDevice roots =
+  readTVar (rootsDevice roots) >>= \case
+    Live selected → pure (Just (selectedPlan selected, selectedDevice selected))
+    _ → pure Nothing
+
+-- | The generation calls of the roots' native layer.
+rootsGenerationOps ∷ Roots q inst msgr phys dev → GenerationOps phys dev
+rootsGenerationOps = opsGenerations . rootsOps
+
+-- | Run one native call against the roots' device, latching device loss if
+-- that is what it raised, exactly as the roots' own calls are run.
+rootsCall ∷ Roots q inst msgr phys dev → Text → IO a → IO a
+rootsCall = guarded
+
+-- | Read and replace the roots' model in one transaction.
+stateRootsModel ∷ Roots q inst msgr phys dev → (GpuModel → (a, GpuModel)) → STM a
+stateRootsModel roots = stateTVar (rootsModel roots)
+
+-- | Enter the session-level safety failure: an effect whose outcome is
+-- unknown, or a cleanup that failed. Admission closes and the model's session
+-- fails with the cause, in one transaction; nothing is rolled back, and every
+-- parent of what is unverified stays retained.
+failRootsSession ∷ Roots q inst msgr phys dev → SessionFailureCause → STM ()
+failRootsSession roots cause = do
+  writeTVar (rootsAdmitting roots) False
+  modifyTVar' (rootsModel roots) (escalateSession cause)
 
 -- | The live instance, for the caller that leases it to a surface bridge.
 readRootsInstance ∷ Roots q inst msgr phys dev → STM (Maybe inst)

@@ -3878,7 +3878,8 @@ reports that the application chooses falls back to the last coherent
 observation clamped to the reported bounds; with no observation at all the
 answer is `ExtentWithheld ExtentUnobserved`. The policy behind the seam — what
 a backend reports, and what a suspended target does next — is VK-10's, not
-this layer's.
+this layer's; the Vulkan backend's is in
+[Swapchain generations](gpu_backend.md#swapchain-generations).
 
 #### The exit, which is D-33's
 

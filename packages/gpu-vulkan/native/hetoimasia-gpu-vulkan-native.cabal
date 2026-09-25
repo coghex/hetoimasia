@@ -11,9 +11,11 @@ description:
     compiler's identity a rebuild input — and VK-7's roots: the instance, the
     explicit messenger, the one shared device and the per-target surface
     records, with their profile, admission, device-loss latch and
-    child-before-parent destruction over an open native layer. It depends on no
-    window system: a surface arrives as its handle and the action that
-    destroys it.
+    child-before-parent destruction over an open native layer — and VK-10's
+    swapchain generations above them: the presentation profile and extent
+    policy as pure decisions, and each target's generations built, replaced and
+    destroyed by the model's identities and holds. It depends on no window
+    system: a surface arrives as its handle and the action that destroys it.
     .
     It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
     nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a loader.
@@ -58,6 +60,8 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
+        Hetoimasia.GPU.Vulkan.Native.Generations
+        Hetoimasia.GPU.Vulkan.Native.Presentation
         Hetoimasia.GPU.Vulkan.Native.Profile
         Hetoimasia.GPU.Vulkan.Native.Roots
         Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
@@ -164,6 +168,8 @@ test-suite native-tests
     main-is: RootsMain.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.Native.Generations
+        Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn

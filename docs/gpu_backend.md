@@ -8,11 +8,19 @@ graphics owner and retired through its protected exit. It covers the design's
 D-7, D-9, D-12, D-14, D-15, D-17, D-22, D-29, D-32 and D-33, and P-1, P-5, P-7,
 P-8 and P-14 as far as this slice reaches.
 
-Nothing is recorded, submitted or presented yet: there is no swapchain, no
-command buffer and no queue submission, and the owner's progress step reports
-no rendering work and no render demand — its only deadline is the brief
-self-scheduled watch over an attachment whose announcement a full port
-deferred, described below. Those are VK-10 through VK-13's. Acting on a target
+VK-10 ([#222](https://github.com/coghex/hetoimasia/issues/222)) adds each
+target's **swapchain generations**: their planning, construction, replacement
+and destruction, keyed by the GPU model's identities — D-7, D-16, D-18, D-22
+and D-30, P-2, P-8 and P-15, and Q-12. See
+[Swapchain generations](#swapchain-generations).
+
+Nothing is recorded, submitted or presented yet: there is no command buffer, no
+acquisition and no queue submission, and the owner's progress step reports no
+render demand. Its deadlines are the brief self-scheduled watch over an
+attachment whose announcement a full port deferred, described below, and the
+generations' own: a settling resize, a deferred recovery attempt, and the
+model's schedule for a retired generation still held. Recording, acquisition,
+submission and presentation are VK-11 through VK-13's. Acting on a target
 policy's exhaustion is VK-14's, and completing device-loss teardown across
 submitted work is VK-15's.
 
@@ -36,7 +44,10 @@ The integration package's public module is `Hetoimasia.GPU.Vulkan.GLFW`; its
 controller lives in a private `controller` sublibrary. The native package
 exposes `Hetoimasia.GPU.Vulkan.Native.Profile`,
 `Hetoimasia.GPU.Vulkan.Native.Roots` and `Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan`
-beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`.
+beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`, and VK-10's
+`Hetoimasia.GPU.Vulkan.Native.Presentation` — the presentation profile and the
+extent policy, as pure decisions — and `Hetoimasia.GPU.Vulkan.Native.Generations`,
+the generations above the roots.
 
 ## The ownership graph
 
@@ -57,6 +68,9 @@ beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`.
                                │    │          first target's surface)
                                │    └─ target surfaces, one record per target,
                                │         keyed by the model's TargetId
+                               │           └─ swapchain generations, keyed by
+                               │              GenerationId: each swapchain, its
+                               │              images and their views
                                └─ GPU model (identities, the session's state)
 ```
 
@@ -69,6 +83,13 @@ beside VK-6's `Hetoimasia.GPU.Vulkan.Native.Diagnostics`.
   its retirement destroys it. Each target record carries the model's
   `TargetId`, the application's required or optional designation (D-22), the
   surface's handle and the one action that destroys it.
+- **Each target's swapchain generations belong to the generations above the
+  roots**, from the construction that begins one until its destruction. A
+  generation is the surface's child and the device's: the roots refuse to
+  destroy a target's surface while the model holds any generation of it
+  (`TargetGenerationsRemain`), and every generation of every target goes before
+  the device. Swapchain images are the swapchain's and go with it; the image
+  views are the generation's own.
 - **The attachment and the window belong to the main thread.** A surface's
   obligation holds its attachment and the instance's lease from the instant
   the native call returns, so neither the window's release nor the instance's
@@ -116,6 +137,10 @@ decides nothing, and the default observes nothing.
 | --- | --- |
 | Loader-aware session, extension copy, window creation, each surface's creation through GLFW | The process main thread |
 | Instance and messenger creation and destruction, device selection and creation, the later-target check, every surface's destruction, device destruction | The graphics owner |
+| Every surface query, swapchain and image view creation and destruction | The graphics owner |
+| Publishing a target's observation (`publishGraphicsObservation`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
+| Holding and ending a generation's CPU use | Any thread, in `STM` |
+| Reporting a swapchain call's out-of-date or suboptimal result | The graphics owner, whose acquisitions and presentations produce it |
 
 The controller makes no GLFW call. A surface is destroyed through the loader
 capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
@@ -218,11 +243,172 @@ instead, and the owner retires it — which is where the uncertainty is kept.
 An admitted target is `TargetUsable`; `readVulkanTargets` lists each by its
 attachment, with its model identity, designation and surface.
 
+## Swapchain generations
+
+`Hetoimasia.GPU.Vulkan.Native.Generations` owns every admitted target's
+swapchain generations, above the roots and over their native layer's
+`GenerationOps`. The controller tracks a target as soon as the roots admit it,
+hands every progress step the geometry the owner folded for each constructed
+target, and retires a target's generations before its surface. Each generation
+is the model's `GenerationId`, and each of its images that identity and an
+index; the model decides what a generation owes and when it may go, and this
+module makes the calls and records each result in the same masked step that
+made it.
+
+### Lifecycle
+
+| Stage | What happens |
+| --- | --- |
+| Planned | The surface's capabilities, formats and modes are read on the owner's thread, and `planGeneration` decides: the profile's format and FIFO, D-30's extent, and an image count within the surface's limits and the tracking limit. |
+| Constructing | `beginGeneration` reserves the candidate's image accounting at the tracking limit and, for a replacement, retires the active generation there and then. The swapchain is created; its images are enumerated, and their count is checked against the tracking limit **before** any view is built; a view is created for each image. |
+| Active | `publishGeneration` records the count the driver actually returned. The target is `Presenting`. |
+| Retired | Handed over as `oldSwapchain`, retired on its own, refused, failed or superseded. Nothing is acquired from it again, and no CPU use of it can begin. |
+| Destroyed | Once the model reports every hold on it ended: its views, newest first, then its swapchain, whose images go with it. Then the model records the disposal. |
+
+The per-target presentation pool is not a generation's and is untouched.
+
+### The extent
+
+`chooseExtent` is D-30, in the order of `Hetoimasia.Runtime.GLFW`'s
+`chooseTargetExtent` seam, over the controller's `targetGeometry` view of it:
+
+1. the target's render eligibility — hidden, minimized, deferred with no
+   framebuffer observed, or closing — withholds it before the surface is asked
+   anything;
+2. a concrete current extent the surface supplies is taken as it is, unless it
+   has no area;
+3. otherwise the application chooses: the last published framebuffer
+   observation, checked for area **before** it is clamped, then clamped to the
+   bounds the platform published, if any, and to the surface's reported bounds;
+   a clamp that still leaves no area is withheld too.
+
+Nothing is invented: with no observation to choose from the extent is withheld
+(`SuspendedUnobserved`). A withheld extent leaves the target `Suspended`, which
+is not a failure and spends no recovery attempt. The swapchain is always the
+framebuffer's size in physical pixels, never the window's: on a Retina display
+it is twice the window size.
+
+The observation reaches the owner through `publishGraphicsObservation` on the
+main thread. VK-16's loop adapter will publish one every turn; until then an
+application publishes it itself, after a handover and after anything that
+changes its window.
+
+### The profile
+
+P-15's first profile: single-sample SDR, color-attachment usage only, FIFO,
+opaque composition where offered, and an advertised `B8G8R8A8_SRGB` or
+`R8G8B8A8_SRGB` format in the sRGB nonlinear color space. The transfer usages
+the retired proof harness asked for are neither required nor requested, and
+nothing falls back to a UNORM or an arbitrary format. A surface that cannot
+serve the profile leaves its target `PresentationUnsupported`, naming every gap
+at once; it is a structured target failure, not an assumption.
+
+### Replacement
+
+A target is rebuilt when its geometry moves or when a swapchain call on its
+active generation answered out of date or suboptimal (`noteSwapchainResult`, or
+a replacement the model counted from an acquisition). Those calls run on the
+owner's thread, and so does the report: it makes the owner's next deadline
+immediate, so the owner that reported a result takes the round that
+reconciles it rather than going idle. A report from another thread wakes
+nothing, and the package's public module does not offer one.
+
+- **Ordinary resize** is not a failed construction. The extent a replacement
+  would be built at is watched, with the observed geometry it was planned
+  from, and the generation is rebuilt only once both have been the same for
+  16 ms on the owner's monotonic clock (`Settling`); a newer observation
+  restarts the wait even while the surface still reports the old extent, so
+  only the newest geometry is built. A move that settles at the extent the
+  active generation already has is adopted without a rebuild, and a move that
+  returns to the active generation's geometry is cancelled.
+- **Reconciliation without a fresh observation.** With a concrete surface
+  extent, an out-of-date or suboptimal result is enough to rebuild at the
+  surface's new extent: a main thread stalled in a platform modal loop does not
+  hold the target at stale geometry.
+- **Unchanged geometry** is not a resize. An out-of-date or suboptimal result
+  whose plan is the extent the active generation already has makes the rebuild
+  a recovery attempt, admitted by the model's episode: at most three, 100 ms and
+  then 500 ms apart after failures (`RecoveryWaiting`), and exhausting it is
+  escalated through the target's designation — an optional target unavailable,
+  a required one failing the session — and reported as `RecoverySpent` for VK-14
+  to act on. Nothing retries hot. A recovery rebuild whose observed geometry
+  has moved — since the active generation, or since the failed construction
+  was planned — first waits for that move to settle, as any resize does; one
+  whose geometry has come back cancels the move it had begun to settle, so a
+  later move waits its own full period.
+- **The irreversible `oldSwapchain` transition.** Replacement hands the active
+  generation over. The model retires it when the replacement is admitted, and
+  it is recorded as handed over to Vulkan immediately before the creation call
+  that passes it — a replacement cancelled before that call never handed it
+  over, and it stays a swapchain Vulkan counts as unretired. It is marked
+  retired before the native call, and a creation
+  that then fails leaves the target without an active generation, in
+  `ConstructionFailed`. The next construction is a fresh one — never passed the
+  retired handle, never replaying the failed call — and a recovery attempt. It
+  begins only once every swapchain of the target that Vulkan still counts as
+  unretired has been destroyed, so a failed candidate that was created goes
+  first, and so does an old generation a cancelled replacement never handed
+  over; a retry that must wait for one spends no recovery attempt.
+- **A newer resize during a replacement** is not lost: the replacement publishes
+  what it was begun for, and the newer geometry is built next, while the
+  generation it replaced keeps its obligations until they end.
+
+### Bounds
+
+A target holds at most the model's generation limit, two by default, counting
+active, constructing and retired together. At capacity, every retired generation
+whose holds have ended is destroyed first; if the replacement still cannot fit,
+the target is `Backpressured` — suspended in the model — until a hold ends, and
+every other target and the owner carry on. With a limit of one, the active
+generation is the only thing in the way: it is retired on its own, awaited, and
+destroyed, and a fresh generation is built without it once its geometry has
+settled — every construction after a target's first is a replacement, and
+waits the same quiet period. No target reserves or
+releases anything of another's.
+
+### Holds
+
+A generation's ended-CPU-use hold is certified when it retires, unless a CPU use
+is still held: `useVulkanGeneration` holds one on the active generation, from
+any thread, and `endVulkanGenerationUse` ends it. While one is held the
+generation is retired but not destroyed; the model's schedule keeps the owner
+polling it, and the owner destroys it at the first step after the use ends.
+Recording, submission and presentation add their own holds in VK-11 to VK-13.
+
+### Failure and close
+
+- A destruction that raised is uncertain. The generation is kept, marked so,
+  and never offered again; the session fails with `CleanupFailed` and the roots
+  close admission; the step raises `GenerationDestructionFailed`, which ends the
+  owner's run. The surface above it is retained (`TargetGenerationsRemain`), and
+  with it the device and the instance.
+- An effect whose bookkeeping could not be committed enters the same path
+  (`GenerationEffectUncertain`). A creation that raised created nothing.
+- Admission through a construction's settlement is one masked region, so a
+  candidate the model admitted is always settled. Each native effect and its
+  record are consecutive inside it, and a cancellation can land only between
+  effects: whatever
+  exists is recorded, the construction is settled as failed, and the
+  cancellation is then delivered. A creation a cancellation reached after it
+  returned leaves its swapchain owned, and destroyed before the next
+  construction. One a cancellation interrupted *inside* the call — which blocks
+  interruptibly — may have created something whose handle never came back: its
+  candidate is kept uncertain and never destroyed, the session fails with
+  `CleanupFailed`, admission closes, and the surface and everything above are
+  retained.
+- Device loss raised by any generation call is latched as the roots' is.
+- Close wins: a closed target begins no construction and admits no recovery
+  attempt, and a construction completed after the close is retired rather than
+  published. A target's retirement retires its active generation, destroys every
+  generation whose holds have ended, and raises `GenerationsRetained` —
+  manufacturing no evidence — if any remains, which retains the surface, the
+  window and every parent.
+
 ## Destruction order
 
 | Exit | What is destroyed, in order, on the owner's thread |
 | --- | --- |
-| A window closed or a target released | That target's surface. The owner writes its terminal record only after the destruction returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. |
+| A window closed or a target released | That target's swapchain generations — each one's image views, newest first, then its swapchain — and then its surface. The owner writes its terminal record only after the destructions returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. A generation still held retains the surface, and with it everything above. |
 | Whole-host exit (D-33) | Every remaining target's surface; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
 
 Each step is refused rather than reordered when something that must go first
@@ -268,6 +454,8 @@ retains its parents.
 | Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
 | Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
 | Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
+| Generation records | The generations | The owner's step builds, replaces and destroys; any thread holds and ends a CPU use, or reports a swapchain result, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
+| Swapchain results | The generations | The owner reports; its step consumes | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 
 ## Evidence
@@ -286,7 +474,35 @@ retains its parents.
   raised outright and one a cancellation ended part-way — device loss closing
   admission with the model failed while an unknown outcome is neither loss nor
   success, and synchronization validation planned only through an enabled
-  layer that offers it;
+  layer that offers it; the presentation profile and D-30's extent as pure
+  decisions — concrete against application-chosen extents, zero area checked
+  before clamping, eligibility first, no invented geometry, every gap of an
+  unsupported surface named, no transfer usage required and no UNORM fallback,
+  image counts within the surface's limits and the tracking limit; and the
+  swapchain generations over the stand-in: construction from the surface's
+  extent and format, a stale observation, zero area suspending without an
+  attempt, coalesced resize waiting 16 ms for the newest geometry, a move the
+  surface has not caught up with yet, a cancelled move not shortening a later
+  one's quiet period, a newer observation restarting it at an unchanged
+  surface extent, a newer resize waiting it out under the one-generation
+  limit, capacity retiring and destroying first
+  and pausing otherwise, the one-generation configuration, per-target
+  reservation isolation, an oversized and a zero returned image count refused
+  before any view, a failed replacement unable to reacquire from or hand over
+  the retired handle, a newer resize surviving an in-flight replacement,
+  repeated out-of-date and suboptimal results bounded by the recovery episode
+  without a hot loop, a reported result asking for a step at once until it is
+  reconciled, a moved observation and a resize after a failed construction
+  each settling before the recovery rebuild, and a move cancelled while
+  recovery waits leaving a later move its full quiet period, failures after the swapchain destroying exactly what they
+  left child before parent, a failed cleanup retained without a retry and
+  retaining the surface, a replacement cancelled before its creation never
+  handing the old swapchain over, a cancellation right after a candidate's
+  admission
+  and one at a creation's handoff, one
+  interrupting a swapchain's or a view's creation inside the call, and one
+  ending a destruction part-way, device loss, and close winning over retry and
+  publication;
 - `hetoimasia-gpu-vulkan-glfw:integration-tests` — whole graphics hosts over the
   GLFW package's scripted seam, driven through the real owner machinery and
   controller with a stand-in native layer and surface bridge, journalling every
@@ -302,13 +518,20 @@ retains its parents.
   release, the exit order with the owner joined before any window goes, a
   destruction still pending certifying nothing, and device loss reaching a
   checkpoint while retirement is pending, staying primary over a failed
-  cleanup that is retained without a retry.
+  cleanup that is retained without a retry; and swapchain generations built on
+  the owner's thread from the geometry the owner folded, replaced after a resize
+  with the old one handed over and destroyed only once its hold ended, none for a
+  hidden target, and a closing window's views and swapchain destroyed before its
+  surface.
 
 **Native.** The group `test.vulkan-native` runs the native suite below. The
 retained per-slice records from the retired proof harness —
 [`docs/vulkan/linux-vk7.md`](vulkan/linux-vk7.md) for VK-7, and the VK-2, VK-5
 and VK-6 records beside it — stay as the historical evidence of the inputs
-they name.
+they name. VK-10's native cases are retained as
+[`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run,
+and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
+worker.
 
 ## The native suite
 
@@ -337,7 +560,18 @@ the owner's thread; two windows are handed over as required targets on one
 shared device, each surface created on the main thread, and when the
 first-created closes, its surface is destroyed on the owner's thread while the
 device, the instance and the second target stay live; and a later example's
-target lands on the same device. The private cases carry the migrated
+target lands on the same device. VK-10's cases, over the same roots: a shown
+window's target builds a generation on the owner's thread from the surface's
+extent and the profile's format — the framebuffer's pixels, which the case
+prints beside the window's size and content scale, and which on macOS it
+requires to be the window's size times a scale above one — with a view of every
+image, and its close destroys the views and then the swapchain before the
+surface; and a window resized through the host's command port, which the main
+thread executes, is replaced at its new framebuffer extent with the old
+generation handed over, retired and still owned while a CPU use of it is held,
+and destroyed on the owner's thread once that use ends. After teardown the run
+also requires every image view and swapchain to have gone before the device,
+and every swapchain created to have been destroyed. The private cases carry the migrated
 assertions unchanged — VK-2's profile, completion, abandonment and capture,
 with the synchronization-validation finding added; VK-6's C-only capture;
 VK-5's bridge; VK-7's roots through the destruction order at the host's exit —

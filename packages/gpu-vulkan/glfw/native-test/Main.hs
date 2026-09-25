@@ -182,9 +182,10 @@ sharedProblems report
            , call.callName == "glfwCreateWindowSurface"
            , call.callOsThread /= report.reportMainOs
            ]
-    -- Child before parent: every surface before the device, the device before
-    -- the explicit messenger, and the messenger before the instance, which is
-    -- the last native call of all.
+    -- Child before parent: every image view and swapchain before the device,
+    -- every surface before the device, the device before the explicit
+    -- messenger, and the messenger before the instance, which is the last
+    -- native call of all. Every swapchain created was destroyed.
     orderProblems =
       let named = map (.callName) calls
           positions name = [index | (index, called) ← zip [0 ∷ Int ..] named, called == name]
@@ -195,13 +196,20 @@ sharedProblems report
             _ → True
        in [ "the shared roots were not destroyed surface, device, messenger, instance: " <> Text.intercalate ", " (destructions report)
           | not
-              ( lastOf "vkDestroySurfaceKHR" `before` firstOf "vkDestroyDevice"
+              ( lastOf "vkDestroyImageView" `before` firstOf "vkDestroyDevice"
+                  && lastOf "vkDestroySwapchainKHR" `before` firstOf "vkDestroyDevice"
+                  && lastOf "vkDestroySurfaceKHR" `before` firstOf "vkDestroyDevice"
                   && lastOf "vkDestroyDevice" `before` firstOf "vkDestroyDebugUtilsMessengerEXT"
                   && isJust (lastOf "vkDestroyInstance")
                   && lastOf "vkDestroyInstance" == Just (length named - 1)
                   && lastOf "vkDestroyDebugUtilsMessengerEXT" `before` lastOf "vkDestroyInstance"
               )
           ]
+            <> [ "created " <> tshow made <> " swapchains and destroyed " <> tshow gone
+               | let made = length [() | call ← calls, call.callName == "vkCreateSwapchainKHR", call.callRaised == Nothing]
+                     gone = length [() | call ← calls, call.callName == "vkDestroySwapchainKHR", call.callRaised == Nothing]
+               , made /= gone
+               ]
     verdictProblems = case report.reportVerdict of
       Nothing → ["the shared session gave no diagnostic verdict"]
       Just verdict

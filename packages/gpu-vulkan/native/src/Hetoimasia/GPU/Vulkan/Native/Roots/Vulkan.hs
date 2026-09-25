@@ -45,7 +45,26 @@ import Vulkan.Extensions.VK_EXT_validation_features
   , data VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
   )
 import Vulkan.Extensions.VK_EXT_swapchain_maintenance1 (PhysicalDeviceSwapchainMaintenance1FeaturesKHR (..))
-import Vulkan.Extensions.VK_KHR_surface (SurfaceKHR (..), getPhysicalDeviceSurfaceSupportKHR)
+import Vulkan.Extensions.VK_KHR_surface
+  ( ColorSpaceKHR (..)
+  , CompositeAlphaFlagBitsKHR (..)
+  , PresentModeKHR (..)
+  , SurfaceCapabilitiesKHR (..)
+  , SurfaceFormatKHR (..)
+  , SurfaceKHR (..)
+  , SurfaceTransformFlagBitsKHR (..)
+  , getPhysicalDeviceSurfaceCapabilitiesKHR
+  , getPhysicalDeviceSurfaceFormatsKHR
+  , getPhysicalDeviceSurfacePresentModesKHR
+  , getPhysicalDeviceSurfaceSupportKHR
+  )
+import Vulkan.Extensions.VK_KHR_swapchain
+  ( SwapchainCreateInfoKHR (..)
+  , SwapchainKHR (..)
+  , createSwapchainKHR
+  , destroySwapchainKHR
+  , getSwapchainImagesKHR
+  )
 import Vulkan.Zero (zero)
 
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, Quiesced)
@@ -63,7 +82,15 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , QueueFamilyOffer (..)
   , ValidationFeature (..)
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (RootOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Presentation
+  ( GenerationPlan (..)
+  , SurfaceCapabilities (..)
+  , SurfaceExtent (..)
+  , SurfaceFormat (..)
+  , SurfaceOffer (..)
+  , undefinedExtentDimension
+  )
+import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), RootOps (..), SwapchainRequest (..))
 
 -- | The production layer's handle types.
 type VulkanRootOps = RootOps Quiesced Instance DebugUtilsMessengerEXT PhysicalDevice Device
@@ -108,7 +135,100 @@ vulkanRootOps capture =
     , opsSurfaceSupport = \_ physical family surface →
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss
+    , opsGenerations = vulkanGenerationOps
     }
+
+-- | The generation calls over the binding. Every decision about what to create
+-- is "Hetoimasia.GPU.Vulkan.Native.Presentation"'s plan, and every decision
+-- about what to destroy and when is "Hetoimasia.GPU.Vulkan.Native.Generations"'.
+vulkanGenerationOps ∷ GenerationOps PhysicalDevice Device
+vulkanGenerationOps =
+  GenerationOps
+    { opsSurfaceOffer = surfaceOffer
+    , opsCreateSwapchain = \device request →
+        let plan = request.requestPlan
+            SwapchainKHR old = maybe NULL_HANDLE SwapchainKHR request.requestOldSwapchain
+         in (\(SwapchainKHR created) → created)
+              <$> createSwapchainKHR
+                device
+                ( SwapchainCreateInfoKHR
+                    { next = ()
+                    , flags = zero
+                    , surface = SurfaceKHR request.requestSurface
+                    , minImageCount = plan.planMinImages
+                    , imageFormat = Format (fromIntegral plan.planFormat.surfaceFormat)
+                    , imageColorSpace = ColorSpaceKHR (fromIntegral plan.planFormat.surfaceColorSpace)
+                    , imageExtent = Extent2D plan.planExtent.extentWidth plan.planExtent.extentHeight
+                    , imageArrayLayers = 1
+                    , imageUsage = ImageUsageFlagBits plan.planUsage
+                    , imageSharingMode = SHARING_MODE_EXCLUSIVE
+                    , queueFamilyIndices = Vector.singleton request.requestQueueFamily
+                    , preTransform = SurfaceTransformFlagBitsKHR plan.planTransform
+                    , compositeAlpha = CompositeAlphaFlagBitsKHR plan.planCompositeAlpha
+                    , presentMode = PresentModeKHR (fromIntegral plan.planPresentMode)
+                    , clipped = True
+                    , oldSwapchain = SwapchainKHR old
+                    }
+                    ∷ SwapchainCreateInfoKHR '[]
+                )
+                Nothing
+    , opsSwapchainImages = \device swapchain → do
+        (_, images) ← getSwapchainImagesKHR device (SwapchainKHR swapchain)
+        pure [handle | Image handle ← Vector.toList images]
+    , opsCreateImageView = \device image format →
+        (\(ImageView created) → created)
+          <$> createImageView
+            device
+            ( ImageViewCreateInfo
+                { next = ()
+                , flags = zero
+                , image = Image image
+                , viewType = IMAGE_VIEW_TYPE_2D
+                , format = Format (fromIntegral format)
+                , components = ComponentMapping COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY
+                , subresourceRange = ImageSubresourceRange IMAGE_ASPECT_COLOR_BIT 0 1 0 1
+                }
+                ∷ ImageViewCreateInfo '[]
+            )
+            Nothing
+    , opsDestroyImageView = \device view → destroyImageView device (ImageView view) Nothing
+    , opsDestroySwapchain = \device swapchain → destroySwapchainKHR device (SwapchainKHR swapchain) Nothing
+    }
+
+-- | What the surface reports for the session's physical device.
+surfaceOffer ∷ PhysicalDevice → Word64 → IO SurfaceOffer
+surfaceOffer physical handle = do
+  let surface = SurfaceKHR handle
+  capabilities ← getPhysicalDeviceSurfaceCapabilitiesKHR physical surface
+  (_, formats) ← getPhysicalDeviceSurfaceFormatsKHR physical surface
+  (_, modes) ← getPhysicalDeviceSurfacePresentModesKHR physical surface
+  let extent (Extent2D width height) = SurfaceExtent width height
+      current = capabilities.currentExtent
+      ImageUsageFlagBits usage = capabilities.supportedUsageFlags
+      SurfaceTransformFlagBitsKHR transform = capabilities.currentTransform
+      CompositeAlphaFlagBitsKHR alpha = capabilities.supportedCompositeAlpha
+  pure
+    SurfaceOffer
+      { offerCapabilities =
+          SurfaceCapabilities
+            { capabilityMinImages = capabilities.minImageCount
+            , capabilityMaxImages = capabilities.maxImageCount
+            , capabilityCurrentExtent =
+                if current.width == undefinedExtentDimension && current.height == undefinedExtentDimension
+                  then Nothing
+                  else Just (extent current)
+            , capabilityMinExtent = extent capabilities.minImageExtent
+            , capabilityMaxExtent = extent capabilities.maxImageExtent
+            , capabilityUsage = usage
+            , capabilityCurrentTransform = transform
+            , capabilityCompositeAlpha = alpha
+            }
+      , offerFormats =
+          [ SurfaceFormat (fromIntegral code) (fromIntegral space)
+          | SurfaceFormatKHR {format = Format code, colorSpace = ColorSpaceKHR space} ← Vector.toList formats
+          ]
+      , offerPresentModes = [fromIntegral mode | PresentModeKHR mode ← Vector.toList modes]
+      }
 
 -- | The instance's create info over whichever chain the plan needs.
 instanceCreateInfo ∷ InstancePlan → Chain es → InstanceCreateInfo es

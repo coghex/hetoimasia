@@ -50,6 +50,9 @@ module Test.GPU.Vulkan.Native.Fixture
   , mainOsThread
   , fixtureMainThread
   , createWindow
+  , commandWindow
+  , publishObservation
+  , readObservation
   , closeWindow
   , awaitWithin
   ) where
@@ -107,17 +110,20 @@ import Hetoimasia.Foundation.Log
   , callbackSink
   , mkLogger
   )
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command
   ( WaitedSubmission (..)
+  , WindowCommand
   , awaitSubmitWindowCommand
+  , clientObservations
   , clientWindow
   , createWindowCommand
   , pollCompletion
   , pollWindowClient
   )
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
-import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig)
+import Hetoimasia.GLFW.Window (WindowId, WindowObservation, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW
@@ -128,16 +134,21 @@ import Hetoimasia.GPU.Vulkan.GLFW
   )
 import Hetoimasia.Runtime.GLFW
   ( CloseStart (..)
+  , GraphicsService
   , HostConfig (..)
   , LoopHooks (..)
+  , ObservationPublication
   , TurnStep (..)
   , closeHostWindow
   , defaultHostConfig
   , hostCommandPort
+  , hostWindowClient
   , hostWindowIdentities
   , noApplicationEvents
+  , publishGraphicsObservation
   , runGraphicsOwnerApplication
   , runOwnerLoop
+  , windowRenderEligibility
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
@@ -386,6 +397,41 @@ createWindow fixture name = do
       atomically (pollWindowClient ticket) >>= \case
         Just client → pure (clientWindow client)
         Nothing → throwIO (userError ("the creation of " <> Text.unpack name <> " settled without a window: " <> show settled))
+
+-- | Submit a control command for a window through the host's command port,
+-- from the calling thread, and wait until the main thread's loop has executed
+-- it.
+commandWindow ∷ Fixture → Text → WindowCommand → IO ()
+commandWindow fixture what command = do
+  vulkan ← sharedHost fixture
+  awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost vulkan)) [("client", "vulkan-native-tests")] command >>= \case
+    WaitClosed → throwIO (userError ("the host's command port closed before " <> Text.unpack what <> " was admitted"))
+    WaitAccepted ticket → void (awaitWithin 10 what (pollCompletion ticket))
+
+-- | The window's latest observation, as its client reads it.
+readObservation ∷ Fixture → WindowId → IO WindowObservation
+readObservation fixture window = do
+  vulkan ← sharedHost fixture
+  atomically (hostWindowClient (vulkanWindowHost vulkan) window) >>= \case
+    Nothing → throwIO (userError "the window has no client")
+    Just client → preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+
+-- | Publish the window's latest observation for its target to the graphics
+-- owner, on the main thread, with the eligibility the main thread classifies
+-- it as. An application's loop does this; until VK-16's loop adapter does it
+-- every turn, the application does it itself. The attachment's revisions
+-- start after the slot's initial zero and rise with the window's own.
+publishObservation ∷ Fixture → GraphicsService → WindowId → IO ObservationPublication
+publishObservation fixture service window = do
+  observation ← readObservation fixture window
+  onMain fixture $ \vulkan →
+    publishGraphicsObservation
+      (vulkanGraphicsOwner vulkan)
+      service
+      (observedRevision observation + 1)
+      observation
+      (windowRenderEligibility observation)
+      Nothing
 
 -- | Close a window on the main thread and wait until the host no longer holds
 -- it — its attachment retired, its surface destroyed on the owner's thread and

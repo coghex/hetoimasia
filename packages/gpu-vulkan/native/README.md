@@ -3,7 +3,8 @@
 Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/native`.
 
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
-diagnostic messengers, VK-9's shader adapter, and VK-7's roots. It depends on no
+diagnostic messengers, VK-9's shader adapter, VK-7's roots, and VK-10's
+swapchain generations. It depends on no
 window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
@@ -21,6 +22,17 @@ destroys it.
   native call of its own.
 - `Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan` is the production native layer:
   the binding's own calls, reporting into a diagnostic capture.
+- `Hetoimasia.GPU.Vulkan.Native.Presentation` is VK-10's first presentation
+  profile and D-30's extent policy as pure decisions over what a surface
+  reports (`planGeneration`, `chooseExtent`). It names no binding type, and its
+  examples hold its format, mode, usage and composite values to the binding's.
+- `Hetoimasia.GPU.Vulkan.Native.Generations` owns every admitted target's
+  swapchain generations above the roots, keyed by the model's `GenerationId`:
+  planning, construction with the returned image count checked before any view,
+  coalesced replacement through the irreversible `oldSwapchain` transition,
+  bounded live generations, recovery attempts through the model's episode, and
+  destruction child before parent once every hold has ended. Its calls are the
+  roots' `GenerationOps`.
 
 - `Hetoimasia.GPU.Vulkan.Native.Diagnostics` builds the two debug-utils
   messengers an instance can have — the one chained into `VkInstanceCreateInfo`
@@ -50,8 +62,9 @@ the test-only support library its shader suite uses — so neither ordinary
 project resolves the binding, the Vulkan headers or a loader. The only thing
 that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
 points Cabal at the provisioned loader and headers. Its headless suite,
-`native-tests` (`test/RootsMain.hs`), runs the profile's and the roots'
-examples over a stand-in native layer, and the shader suite runs beside it,
+`native-tests` (`test/RootsMain.hs`), runs the profile's, the roots', the
+presentation planner's and the generations' examples over a stand-in native
+layer, and the shader suite runs beside it,
 both in the validation group `test.vulkan-headless`; its native cases run in
 the window integration's native suite, `test.vulkan-native` — see
 [the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
