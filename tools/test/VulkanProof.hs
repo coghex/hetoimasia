@@ -1,13 +1,15 @@
--- | Hspec coverage for the boundary around the Vulkan proof harness.
+-- | Hspec coverage for the boundary around the Vulkan project.
 --
--- Issue #158's first requirement is that the harness exists and that the
--- mandatory validation floor never builds it. That used to be established for
--- free: the floor ran on a CI image with no Vulkan loader at all, so a package
--- added to either ordinary project file failed outright. VK-4 provisioned a
--- loader, a driver, the validation layers, and a compiler into that image, and
--- a successful build there now proves nothing about independence. So the claim
--- is checked here directly instead, by reading the two ordinary project files
--- and requiring that neither names the proof package or resolves the binding.
+-- `cabal.project.vulkan` is the one project file that names the native
+-- backend package and the window integration package, or turns the GLFW
+-- package's Vulkan interop component on, and the mandatory validation floor
+-- must never build it. That used to be established for free: the floor ran on
+-- a CI image with no Vulkan loader at all, so a package added to either
+-- ordinary project file failed outright. VK-4 provisioned a loader, a driver,
+-- the validation layers, and a compiler into that image, and a successful
+-- build there now proves nothing about independence. So the claim is checked
+-- here directly instead, by reading the two ordinary project files and
+-- requiring that neither names a Vulkan package or resolves the binding.
 --
 -- Those two files, and the sibling packages they name, are read out of the
 -- checkout and are deliberately not in the root package's source distribution:
@@ -18,22 +20,28 @@
 -- is present it runs, and a checkout holding only one of them fails.
 --
 -- What the rest of these examples check is everything the floor cannot see:
--- that the one project file which does select the proof agrees with the
--- toolchain record's binding flags, that the validation catalog declares no
--- group reaching it, that every Vulkan input is pinned by absolute path, that
--- the runner takes its discovery from the provisioned prefix rather than from
--- a retired environment pin or a generated project file, and that it never
--- supplies the native-session consent AGENTS.md reserves for a human.
+-- that the Vulkan project agrees with the toolchain record's binding flags;
+-- that exactly two validation groups reach it, off the floor, each on the
+-- runner class it needs — the headless suites on a CPU worker and the native
+-- suite on a display worker, with its build a preparation stage and its
+-- execution watched for thirty seconds; that its one runner takes its
+-- discovery from the provisioned prefix rather than from a generated project
+-- file, refuses a runtime library search override, and never supplies the
+-- native-session consent AGENTS.md reserves for a human; that the retired
+-- proof route is gone; and that the retained per-slice records still say what
+-- the compatibility summary quotes them as saying.
 --
--- They read the repository's own project files, pins, and catalog out of the
--- checkout they run in. They start no session and build nothing; the one that
--- runs the runner does so only as far as a refusal made before its first check.
+-- They read the repository's own project files, pins, workflows and catalog
+-- out of the checkout they run in. They start no session and build nothing; the
+-- ones that run the runner do so only as far as a refusal made before its
+-- first check.
 module VulkanProof (spec, readByTheseExamples) where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
-import Json (asArray, asString, field, parseJson)
+import Data.Maybe (mapMaybe)
+import Json (Json (..), asArray, asBool, asString, field, parseJson)
 import Sandbox (run)
 import System.Directory (doesFileExist, getCurrentDirectory, listDirectory)
 import System.Environment (getEnvironment)
@@ -91,11 +99,13 @@ readByTheseExamples =
   [ "cabal.project"
   , "cabal.project.cpu"
   , "cabal.project.vulkan"
+  , ".github/workflows/ci-image.yml"
+  , ".github/workflows/validation.yml"
   , "tools/native/vulkan.pin"
   , "tools/toolchain/binding.pin"
   , "tools/validation/catalog.json"
-  , "tools/vulkan-proof/run-proof.sh"
-  , "tools/vulkan-proof/run-shaders.sh"
+  , runner
+  , retiredProof </> "README.md"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
   , integrationPackage </> "hetoimasia-gpu-vulkan-glfw.cabal"
   , glfwPackage </> "hetoimasia-glfw.cabal"
@@ -111,9 +121,19 @@ readByTheseExamples =
 ordinaryProjects ∷ [FilePath]
 ordinaryProjects = ["cabal.project", "cabal.project.cpu"]
 
--- | The package directory the proof lives in, as a project file would name it.
-proofPackage ∷ String
-proofPackage = "tools/vulkan-proof"
+-- | Where the retired VK-2 proof harness lived. Only its README remains, as a
+-- pointer to the records it produced; no project file may name the directory.
+retiredProof ∷ String
+retiredProof = "tools/vulkan-proof"
+
+-- | The one command that builds, tests and runs the Vulkan project.
+runner ∷ FilePath
+runner = "tools/vulkan/run.sh"
+
+-- | The two validation groups that run through the Vulkan project.
+headlessGroup, nativeGroup ∷ String
+headlessGroup = "test.vulkan-headless"
+nativeGroup = "test.vulkan-native"
 
 -- | The native backend package. Like the proof it resolves the binding and the
 -- Vulkan headers, so the Vulkan project is the only one that may name it.
@@ -137,16 +157,15 @@ glfwPackage = "packages/glfw"
 interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
--- | Everything the Vulkan project names: the proof, the native package, the
--- window integration package, the GLFW package whose interop component it
--- enables, the local dependency closure of the native package and that
--- component, and the test-only support library the native package's shader
--- suite uses. All but the first three are ordinary packages the other projects
--- list too, and with the interop flag off none of them depends on the binding.
+-- | Everything the Vulkan project names: the native package, the window
+-- integration package, the GLFW package whose interop component it enables,
+-- the local dependency closure of the native package and that component, and
+-- the test-only support library the native package's shader suite uses. All but
+-- the first two are ordinary packages the other projects list too, and with the
+-- interop flag off none of them depends on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
-  [ proofPackage
-  , nativePackage
+  [ nativePackage
   , integrationPackage
   , glfwPackage
   , "packages/gpu-vulkan/diagnostics"
@@ -162,8 +181,8 @@ bindingPackage ∷ String
 bindingPackage = "vulkan"
 
 spec ∷ Spec
-spec = describe "The Vulkan proof boundary" $ do
-  it "names the proof, the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
+spec = describe "The Vulkan project boundary" $ do
+  it "names the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
     declared `shouldBe` vulkanProject
 
@@ -187,13 +206,13 @@ spec = describe "The Vulkan proof boundary" $ do
         cabal ← readFile (glfwPackage </> "hetoimasia-glfw.cabal")
         flagDefaults cabal `shouldBe` [(interopFlag, (False, True))]
 
-  it "hashes every package the Vulkan project builds into the proof's source digest" $ do
+  it "hashes every package the Vulkan project builds into the native records' source digest" $ do
     -- A record's digest has to move when production capture code moves, not
-    -- only when the harness does, or two different builds could be recorded
-    -- as one. The runner names its roots by directory, so each is looked for
-    -- as a quoted root.
-    runner ← readFile "tools/vulkan-proof/run-proof.sh"
-    [package | package ← vulkanProject, not (("\"" <> package <> "\"") `isInfixOf` runner)] `shouldBe` []
+    -- only when the suite does, or two different builds could be recorded as
+    -- one. The runner names its roots by directory, so each is looked for as a
+    -- quoted root.
+    script ← readFile runner
+    [package | package ← vulkanProject, not (("\"" <> package <> "\"") `isInfixOf` script)] `shouldBe` []
 
   it "names the binding's macOS loader directory exactly where the pin puts the loader, and on macOS alone" $ do
     -- `vulkan-utils` and every shader splice run Template Haskell against the
@@ -219,29 +238,27 @@ spec = describe "The Vulkan proof boundary" $ do
     -- Linux binding, which finds its loader through the prefix's `vulkan.pc`.
     length (filter (== "package vulkan") project) `shouldBe` 1
 
-  it "runs the shader contract suite on the proof route, from the provisioned prefix" $ do
-    -- VK-9's suite is required to run on the proof route until VK-8's headless
-    -- group exists, and building its executable is not running it. It also has
-    -- to regenerate the toolchain fingerprint before Cabal decides anything is
-    -- up to date, or a replaced compiler would go unnoticed on a warm build.
-    proof ← map trim . lines <$> readFile "tools/vulkan-proof/run-proof.sh"
-    shaders ← map trim . lines <$> readFile "tools/vulkan-proof/run-shaders.sh"
-    let active = filter (not . ("#" `isPrefixOf`))
-        runsShaders = position' ("run-shaders.sh\"" `isInfixOf`) (active proof)
-        harness = position' ("exec cabal test" `isPrefixOf`) (active proof)
-    -- Both present, and the suite before the harness `exec`s away the shell.
-    (<) <$> runsShaders <*> harness `shouldBe` Just True
-    active shaders `shouldSatisfy` any ("native.py\" prepare --prefix" `isInfixOf`)
-    let fingerprint = position' ("hetoimasia-shader-fingerprint" `isInfixOf`) (active shaders)
-        suite = position' ("hetoimasia-gpu-vulkan-native:shader-tests" `isInfixOf`) (active shaders)
+  it "runs the shader contract suite in the headless group, regenerating the fingerprint first" $ do
+    -- VK-9's suite moved from the proof route to the headless group, and
+    -- building its executable is not running it. The fingerprint also has to
+    -- be regenerated before Cabal decides anything is up to date, or a
+    -- replaced compiler would go unnoticed on a warm build.
+    group ← catalogGroup headlessGroup
+    fmap (any ("shader-tests" `isInfixOf`)) (group >>= stringsAt "command") `shouldBe` Just True
+    fmap (take 3) (group >>= stringsAt "command") `shouldBe` Just ["bash", runner, "test"]
+    script ← map trim . lines <$> readFile runner
+    let active = filter (not . ("#" `isPrefixOf`)) script
+        testMode = dropWhile (/= "test)") active
+        fingerprint = position' ("generate_fingerprint" ==) testMode
+        suite = position' ("cabal test " `isPrefixOf`) testMode
     (<) <$> fingerprint <*> suite `shouldBe` Just True
-    [line | line ← active shaders, "HETOIMASIA_NATIVE_SESSION=" `isInfixOf` line] `shouldBe` []
+    active `shouldSatisfy` any ("hetoimasia-shader-fingerprint" `isInfixOf`)
 
   it "shares the qualified index with every other project" $ do
     text ← readFile "cabal.project.vulkan"
     lines text `shouldContain` ["import: cabal.project.common"]
 
-  it "constrains the binding to the flags the toolchain record qualified" $ do
+  it "constrains the binding to the flags the toolchain record qualified, and the runner checks both" $ do
     project ← readFile "cabal.project.vulkan"
     pin ← readFile "tools/toolchain/binding.pin"
     -- The pin is the record; the constraint is what actually reaches the
@@ -251,29 +268,95 @@ spec = describe "The Vulkan proof boundary" $ do
     settingOf pin "VULKAN_FLAG_DARWIN_LIB_DIRS=" `shouldBe` Just "off"
     map trim (lines project) `shouldContain` ["vulkan +safe-foreign-calls,"]
     map trim (lines project) `shouldContain` ["vulkan -darwin-lib-dirs"]
+    script ← readFile runner
+    script `shouldContain` "VULKAN_FLAG_SAFE_FOREIGN_CALLS"
+    script `shouldContain` "VULKAN_FLAG_DARWIN_LIB_DIRS"
 
-  it "declares no validation group whose command would build the proof" $ do
+  it "declares exactly the headless and native groups through the Vulkan project, both required and off the floor" $ do
     catalog ← readFile "tools/validation/catalog.json"
-    -- A group may declare the proof's files as *inputs* — `test.workflow` does,
-    -- because this module reads them — but no group's command may select the
-    -- project file or the package. One that did would put a Vulkan loader on
-    -- the mandatory floor of an image that has none.
-    case parseJson catalog >>= field "groups" >>= asArray of
-      Nothing → expectationFailure "tools/validation/catalog.json is not a JSON object with a groups array"
-      Just groups → do
-        let commands =
-              [ (identifier, word)
+    -- A group may declare the Vulkan project's files as *inputs* — the
+    -- workflow group does, because this module reads them — but only these two
+    -- may run a command that selects the project. One more would put a Vulkan
+    -- build where nothing accounts for it; one on the floor would build the
+    -- binding for every change.
+    case parseJson catalog of
+      Nothing → expectationFailure "tools/validation/catalog.json is not a JSON object"
+      Just document → do
+        let groups = maybe [] id (field "groups" document >>= asArray)
+            floor' = maybe [] (mapMaybe asString) (field "floor" document >>= asArray)
+            reaching =
+              [ identifier
               | group ← groups
               , Just identifier ← [field "id" group >>= asString]
-              , Just arguments ← [field "command" group >>= asArray]
-              , Just word ← map asString arguments
+              , let words' = concat [maybe [] id (stringsAt key group) | key ← ["command"]]
+                      <> maybe [] id (field "preparation" group >>= stringsAt "command")
+              , any (\word → any (`isInfixOf` word) [runner, "cabal.project.vulkan", "vulkan-proof"]) words'
               ]
-            offending =
-              [ identifier <> " runs " <> word
-              | (identifier, word) ← commands
-              , any (`isInfixOf` word) ["vulkan-proof", "cabal.project.vulkan"]
-              ]
-        offending `shouldBe` []
+        reaching `shouldBe` [headlessGroup, nativeGroup]
+        filter (`elem` reaching) floor' `shouldBe` []
+        forM_ reaching $ \identifier → do
+          group ← catalogGroup identifier
+          (group >>= field "optional" >>= asBool) `shouldBe` Just False
+          (group >>= field "platforms") `shouldSatisfy` isNothing'
+
+  it "runs the headless suites on a CPU worker, with no preparation, display or consent" $ do
+    group ← catalogGroup headlessGroup
+    (group >>= field "runner" >>= asString) `shouldBe` Just "cpu"
+    (group >>= field "preparation") `shouldSatisfy` isNothing'
+    command ← maybe (fail "the headless group has no command") pure (group >>= stringsAt "command")
+    command `shouldSatisfy` all (not . ("display" `isInfixOf`))
+    -- Every suite it names executes; building one is not running it.
+    drop 3 command
+      `shouldBe` [ "hetoimasia-gpu-vulkan-native:test:native-tests"
+                 , "hetoimasia-gpu-vulkan-native:test:shader-tests"
+                 , "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
+                 ]
+    -- And the runner's test mode starts no display: the only display it
+    -- ever starts is the native mode's.
+    script ← map trim . lines <$> readFile runner
+    let active = filter (not . ("#" `isPrefixOf`)) script
+        testMode = takeWhile (/= "native)") (dropWhile (/= "test)") active)
+    filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
+
+  it "prepares the native suite apart from its execution, and watches that execution for thirty seconds" $ do
+    group ← catalogGroup nativeGroup
+    (group >>= field "runner" >>= asString) `shouldBe` Just "display"
+    (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 30)
+    (group >>= stringsAt "command") `shouldBe` Just ["bash", runner, "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
+    (group >>= field "preparation" >>= stringsAt "command")
+      `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
+    -- The execution builds nothing: the runner's native mode names an
+    -- executable Cabal already built and refuses one that was not.
+    script ← map trim . lines <$> readFile runner
+    let active = filter (not . ("#" `isPrefixOf`)) script
+        nativeMode = dropWhile (/= "native)") active
+    filter (\line → "cabal build" `isInfixOf` line || "cabal test" `isInfixOf` line) nativeMode `shouldBe` []
+    nativeMode `shouldSatisfy` any ("cabal list-bin" `isInfixOf`)
+    nativeMode `shouldSatisfy` any ("has not been built" `isInfixOf`)
+
+  it "routes both groups to a worker whose loop starts no display around them" $ do
+    workflow ← lines <$> readFile ".github/workflows/validation.yml"
+    -- The plan step's declaration: both classes, both groups, one worker.
+    workflow `shouldSatisfy` any ("--worker \"vulkan=cpu+display:test.vulkan-headless,test.vulkan-native\"" `isInfixOf`)
+    -- The native group's command starts its own display inside the timed
+    -- execution, so the job must not start a second one around run.py.
+    let job = takeWhile (not . ("  seed-dependencies:" `isPrefixOf`)) (dropWhile (/= "  vulkan:") workflow)
+        active = [line | line ← job, not ("#" `isPrefixOf` trim line)]
+    active `shouldSatisfy` (not . null)
+    filter ("tools/display/" `isInfixOf`) active `shouldBe` []
+    active `shouldSatisfy` any ("--runner-class display" `isInfixOf`)
+
+  it "no longer offers the proof route, and builds nothing under the retired proof harness" $ do
+    workflow ← lines <$> readFile ".github/workflows/ci-image.yml"
+    let active = [trim line | line ← workflow, not ("#" `isPrefixOf` trim line)]
+    filter ("vulkan-proof" `isInfixOf`) active `shouldBe` []
+    forM_ ("cabal.project.vulkan" : ordinaryProjects) $ \path → do
+      present ← doesFileExist path
+      when present $ do
+        declared ← projectPackages path
+        (path, filter (retiredProof `isPrefixOf`) declared) `shouldBe` (path, [])
+    remaining ← listDirectory retiredProof
+    remaining `shouldBe` ["README.md"]
 
   it "pins every Vulkan input on both platforms, each by absolute path" $ do
     -- One pin now names the loader, the driver manifest, the layer manifest and
@@ -307,7 +390,7 @@ spec = describe "The Vulkan proof boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (\entry → any (`isPrefixOf` entry) [proofPackage, nativePackage, integrationPackage]) declared)
+        (path, filter (\entry → any (`isPrefixOf` entry) [retiredProof, nativePackage, integrationPackage]) declared)
           `shouldBe` (path, [])
         -- The diagnostics package is the header-free half: it is in both, and
         -- the dependency check below is what holds it free of the binding.
@@ -320,8 +403,6 @@ spec = describe "The Vulkan proof boundary" $ do
         resolved ← mapM (packageDependenciesWith []) declared
         (path, [name | name ← concat resolved, name == bindingPackage]) `shouldBe` (path, [])
         -- And the packages that do resolve it, to show the check would notice.
-        proofDependencies ← packageDependencies proofPackage
-        proofDependencies `shouldContain` [bindingPackage]
         nativeDependencies ← packageDependencies nativePackage
         nativeDependencies `shouldContain` [bindingPackage]
         interopDependencies ← packageDependenciesWith [interopFlag] glfwPackage
@@ -364,18 +445,21 @@ spec = describe "The Vulkan proof boundary" $ do
     -- manifest is the single place a driver manifest, a layer directory, and
     -- the loader's directories are named. A runner that read a pin again, or
     -- named a machine path itself, would be selecting inputs nothing qualified.
-    runner ← readFile "tools/vulkan-proof/run-proof.sh"
-    let active = [line | line ← map trim (lines runner), not ("#" `isPrefixOf` line)]
+    script ← readFile runner
+    let active = [line | line ← map trim (lines script), not ("#" `isPrefixOf` line)]
     filter ("environment.pin" `isInfixOf`) active `shouldBe` []
     active `shouldSatisfy` any ("native.py\" prepare --prefix" `isInfixOf`)
     active `shouldSatisfy` any ("--extra-lib-dirs=\"$HETOIMASIA_VULKAN_LIBDIR\"" `isInfixOf`)
+    -- The Vulkan build directory is stamped by `prepare`, so a build linked
+    -- against another native configuration is never reused.
+    active `shouldSatisfy` any ("--build-dir \"$build_directory\"" `isInfixOf`)
 
   it "diagnoses an obsolete generated project file rather than building under it" $ do
     -- Cabal reads `<project-file>.local` silently, so one left over from before
     -- VK-4 would put the former SDK paths back into every build here without
     -- saying so. The runner must refuse and name it, and must not write one.
-    runner ← readFile "tools/vulkan-proof/run-proof.sh"
-    let active = [line | line ← map trim (lines runner), not ("#" `isPrefixOf` line)]
+    script ← readFile runner
+    let active = [line | line ← map trim (lines script), not ("#" `isPrefixOf` line)]
     active `shouldSatisfy` any (\line → "refuse " `isPrefixOf` line && "$local_project exists" `isInfixOf` line)
     filter (\line → "cat > \"$local_project\"" `isInfixOf` line) active `shouldBe` []
 
@@ -623,14 +707,14 @@ spec = describe "The Vulkan proof boundary" $ do
         declared `shouldSatisfy` (not . null)
         filter (not . covered) readByTheseExamples `shouldBe` []
 
-  it "forwards its own arguments to the harness rather than dropping them" $ do
-    -- `--headless` selects the release decision's pure examples, and the
-    -- harness is what owns that flag. A runner that forwarded nothing would
-    -- read consent and start the native proof instead — the opposite of what
-    -- the caller asked for, and a session this mode has no approval for.
-    runner ← lines <$> readFile "tools/vulkan-proof/run-proof.sh"
-    runner `shouldSatisfy` any ("--test-option=$argument" `isInfixOf`)
-    runner `shouldSatisfy` any ("${options[@]+\"${options[@]}\"}" `isInfixOf`)
+  it "forwards its own arguments to the suites and the executable rather than dropping them" $ do
+    -- A selector such as `--match` or `--dry-run` has to reach what it
+    -- selects: every suite in the test mode, the executable in the native
+    -- mode. A runner that forwarded nothing would run everything instead.
+    script ← lines <$> readFile runner
+    script `shouldSatisfy` any ("--test-option=$argument" `isInfixOf`)
+    script `shouldSatisfy` any ("${options[@]+\"${options[@]}\"}" `isInfixOf`)
+    script `shouldSatisfy` any ("exec \"$executable\" ${arguments[@]+\"${arguments[@]}\"}" `isInfixOf`)
 
   forM_ [("LD_LIBRARY_PATH", False), ("LD_PRELOAD", True)] $ \(variable, namesFile) →
     it ("refuses " ++ variable ++ " naming an alternate loader before it checks or builds anything") $
@@ -649,23 +733,43 @@ spec = describe "The Vulkan proof boundary" $ do
             ((variable, if namesFile then alternate else directory) : inherited)
             checkout
             "bash"
-            ["tools/vulkan-proof/run-proof.sh"]
+            [runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
         status `shouldBe` ExitFailure 2
-        errors `shouldContain` ("run-proof: " ++ variable ++ " is set")
-        output `shouldNotContain` "run-proof: ghc"
+        errors `shouldContain` ("vulkan: " ++ variable ++ " is set")
+        output `shouldNotContain` "vulkan: ghc"
 
   it "never supplies the native-session consent itself" $ do
     -- AGENTS.md: the human's approval is given on one approved command, never
     -- by a script an agent runs on its own, and `tools/display/x11.sh` is the
-    -- only thing that may supply the isolated-display value.
-    runner ← readFile "tools/vulkan-proof/run-proof.sh"
+    -- only thing that may supply the isolated-display value. The runner only
+    -- ever reads it, to decide whether to start that isolated display.
+    script ← readFile runner
     let assignments =
           [ line
-          | line ← lines runner
+          | line ← lines script
           , "HETOIMASIA_NATIVE_SESSION=" `isInfixOf` line
           , not ("#" `isPrefixOf` trim line)
           ]
     assignments `shouldBe` []
+
+-- | One group's declaration in the checked-in catalog.
+catalogGroup ∷ String → IO (Maybe Json)
+catalogGroup identifier = do
+  catalog ← readFile "tools/validation/catalog.json"
+  pure $ do
+    groups ← parseJson catalog >>= field "groups" >>= asArray
+    lookup (Just identifier) [(field "id" group >>= asString, group) | group ← groups]
+
+-- | A field that is an array of strings.
+stringsAt ∷ String → Json → Maybe [String]
+stringsAt name document = field name document >>= asArray >>= traverse asString
+
+-- | Absent or null.
+isNothing' ∷ Maybe Json → Bool
+isNothing' = \case
+  Nothing → True
+  Just JNull → True
+  Just _ → False
 
 -- | The runtime library search overrides the runner refuses, stripped from an
 -- example's inherited environment so only the one under test is present.

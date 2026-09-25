@@ -593,7 +593,7 @@ spec = describe "Validation evidence reuse" $ do
           change fixture path "changed input\n"
           plan ← planRouted fixture workers "probes-unrequested-plan.json"
           selected ← selectedGroups plan
-          owned ← concat <$> mapM (workerGroups plan) ["haskell-engine", "haskell-workflow", "glfw-native"]
+          owned ← concat <$> mapM (workerGroups plan) ["haskell-engine", "haskell-workflow", "glfw-native", "vulkan"]
           forM_ ["test.x11-helper", "test.wayland-helper", "test.lua-hazard", "test.lua-confinement-linux", "test.macos-confinement"] $ \group → do
             entryText plan group "reason" `shouldReturn` Just "optional-unrequested"
             selected `shouldNotContain` [group]
@@ -609,6 +609,42 @@ spec = describe "Validation evidence reuse" $ do
           entryText plan group "reason" `shouldReturn` Just "requested"
           selectedGroups plan >>= (`shouldContain` [group])
           workerGroups plan "local-probes" `shouldReturn` [group]
+
+  describe "the checked-in routing of the Vulkan groups" $ do
+    it "routes both Vulkan groups to the one worker providing both classes, and publishes each receipt" $
+      withCheckedInRouting $ \fixture workers → do
+        workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
+        change fixture "tools/vulkan/run.sh" "a changed runner\n"
+        plan ← planRouted fixture workers "vulkan-routing-plan.json"
+        workerGroups plan "vulkan" `shouldReturn` ["test.vulkan-headless", "test.vulkan-native"]
+        entryText plan "test.vulkan-headless" "runner" `shouldReturn` Just "cpu"
+        entryText plan "test.vulkan-native" "runner" `shouldReturn` Just "display"
+        forM_ ["test.vulkan-headless", "test.vulkan-native"] $ \group → do
+          entryText plan group "reason" `shouldReturn` Just "affected"
+          workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
+          workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
+
+    it "selects the headless group when a headless suite's source changes, and leaves it off a prose change" $
+      withCheckedInRouting $ \fixture workers → do
+        -- Planned against the seed each time, so the prose plan comes first:
+        -- the source change's range includes it.
+        change fixture "README.md" "a prose-only update\n"
+        prose ← planRouted fixture workers "vulkan-prose-plan.json"
+        entryText prose "test.vulkan-headless" "reason" `shouldReturn` Just "unaffected"
+        entryText prose "test.vulkan-native" "reason" `shouldReturn` Just "unaffected"
+        change fixture "hetoimasia-gpu-vulkan-glfw/integration-tests/Main.hs" "module Main (main) where\n"
+        affected ← planRouted fixture workers "vulkan-headless-plan.json"
+        entryText affected "test.vulkan-headless" "reason" `shouldReturn` Just "affected"
+
+    it "executes the native group's preparation before its command, on the Vulkan worker" $
+      withCheckedInRouting $ \fixture workers → do
+        change fixture "tools/vulkan/run.sh" "a changed runner\n"
+        plan ← planRouted fixture workers "vulkan-execution-plan.json"
+        let route = ["--worker", "vulkan", "--runner-class", "cpu", "--runner-class", "display"]
+        exitOf <$> runGroup fixture plan "test.vulkan-native" route `shouldReturn` ExitSuccess
+        receipt ← readFile (receiptPath fixture "test.vulkan-native")
+        receipt `shouldContain` "\"preparation\": {"
+        receipt `shouldContain` "\"runner_class\": \"display\""
 
   describe "the checked-in routing of the GPU model group" $ do
     -- `test.vulkan` is the first mandatory group that is neither in the floor
@@ -1286,6 +1322,8 @@ withCheckedInRouting action = do
           \packages = {}\n\
           \for group in catalog['groups']:\n\
           \    group['command'] = ['true']\n\
+          \    if group.get('preparation'):\n\
+          \        group['preparation']['command'] = ['true']\n\
           \    if group['component'] not in (None, 'all'):\n\
           \        package, kind, name = group['component'].split(':')\n\
           \        packages.setdefault(package, []).append((kind, name))\n\

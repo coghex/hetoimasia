@@ -39,6 +39,32 @@ spec = describe "Validation planner" $ do
         selectionOf plan "test.demo" `shouldBe` Just (Selection "affected" True True)
         selectionOf plan "test.harness" `shouldBe` Just (Selection "unaffected" False False)
 
+    it "resolves a component only the Vulkan project lists, while `all` stays the root project's" $
+      withFixture $ \fixture → do
+        -- `cabal.project.vulkan` names packages the root project leaves out.
+        -- A group through it names its component like any other and has its
+        -- closure derived the same way; `cabal build all` through the root
+        -- project builds none of it, so `all` must not consume it either.
+        writeFixtureFile (root fixture) "cabal.project.vulkan" "packages:\n  packages/beta\n  packages/alpha\n"
+        writeFixtureFile (root fixture) "packages/beta/beta.cabal" betaPackage
+        writeFixtureFile (root fixture) "packages/beta/test/Main.hs" "module Main (main) where\nmain :: IO ()\nmain = pure ()\n"
+        change fixture "tools/validation/catalog.json" vulkanProjectCatalog
+        base ← revision fixture "HEAD"
+        change fixture "packages/beta/test/Main.hs" "module Main (main) where\nmain :: IO ()\nmain = pure (pure ())\n"
+        plan ← planJsonAt fixture base []
+        selectionOf plan "test.beta" `shouldBe` Just (Selection "affected" True True)
+        selectionOf plan "build.all" `shouldBe` Just (Selection "floor" True False)
+        -- And its closure reaches the root project's package it depends on.
+        change fixture "packages/alpha/src/Alpha.hs" "module Alpha (alpha) where\nalpha :: Int\nalpha = 3\n"
+        through ← planJsonAt fixture base []
+        selectionOf through "test.beta" `shouldBe` Just (Selection "affected" True True)
+
+    it "reads a description line that begins with a conditional's keyword as the prose it continues" $
+      withFixture $ \fixture → do
+        change fixture "packages/alpha/alpha.cabal" (continuedDescription alphaPackage)
+        (result, _, errors) ← planRaw fixture (seeded fixture) []
+        (result, errors) `shouldBe` (ExitSuccess, "")
+
     it "follows a sublibrary dependency to that library's own sources" $
       withFixture $ \fixture → do
         writeFixtureFile (root fixture) "packages/alpha/extra/Extra.hs" (extraModule 1)
@@ -825,6 +851,48 @@ fixtureCatalog =
     , groupDocument "probe.slow" "null" ["tools/shared.sh", "probe/"] "hspec" "probe" True
     , linuxOnlyGroup
     ]
+
+-- | A package only the fixture's Vulkan project lists, depending on the root
+-- project's library.
+betaPackage ∷ String
+betaPackage =
+  unlines
+    [ "cabal-version: 3.16"
+    , "name: beta"
+    , "version: 0.1.0.0"
+    , "build-type: Simple"
+    , ""
+    , "test-suite beta-tests"
+    , "    type: exitcode-stdio-1.0"
+    , "    main-is: Main.hs"
+    , "    hs-source-dirs: test"
+    , "    default-language: GHC2024"
+    , "    build-depends: base, alpha"
+    ]
+
+-- | The fixture catalog with a group whose component only the Vulkan project
+-- lists.
+vulkanProjectCatalog ∷ String
+vulkanProjectCatalog =
+  catalogDocument
+    ["    \"build.all\""]
+    [ groupDocument "build.all" "\"all\"" ["cabal.project.common"] "none" "build" False
+    , groupDocument "test.demo" "\"demo:test:demo-tests\"" ["cabal.project.common"] "hspec" "test" False
+    , groupDocument "test.harness" "\"demo:test:harness-tests\"" ["cabal.project.common", "tools/shared.sh", "docs/consumed.md"] "hspec" "test" False
+    , groupDocument "test.beta" "\"beta:test:beta-tests\"" ["cabal.project.vulkan"] "hspec" "test" False
+    ]
+
+-- | A package description whose wrapped description has a line beginning
+-- with @else@ and one beginning with @if@.
+continuedDescription ∷ String → String
+continuedDescription package =
+  unlines
+    ( concatMap
+        (\line → if "synopsis:" `isPrefix` line then [line, "description:", "    A description that wraps onto the next line, or", "    else. It keeps going, and", "    if it wraps again, it is still prose."] else [line])
+        (lines package)
+    )
+  where
+    isPrefix prefix line = take (length prefix) line == prefix
 
 -- | The fixture catalog with the optional group's command redefined.
 revisedOptionalCatalog ∷ String

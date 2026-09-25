@@ -67,8 +67,9 @@ consumed =
   , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, and Reuse.hs reads its worker declarations")
   , ("cabal.project.vulkan", "VulkanProof.hs reads the packages and constraints it declares")
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
-  , ("tools/vulkan-proof/run-proof.sh", "VulkanProof.hs reads it to check it supplies no native-session consent")
-  , ("tools/vulkan-proof/run-shaders.sh", "VulkanProof.hs reads it to check the proof route runs the shader suite")
+  , ("tools/vulkan/run.sh", "VulkanProof.hs reads it to check its discovery, its modes, and that it supplies no native-session consent")
+  , ("tools/vulkan-proof/README.md", "VulkanProof.hs checks it is all that remains of the retired proof harness")
+  , (".github/workflows/ci-image.yml", "VulkanProof.hs checks it no longer offers the retired proof route")
   , ("docs/vulkan/macos.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan/linux.md", "VulkanProof.hs reads the retained record it must agree with")
   , ("docs/vulkan_compatibility_record.md", "VulkanProof.hs checks it still quotes the records' own totals")
@@ -129,7 +130,7 @@ spec = describe "Source distribution" $ do
     inventory ← packagedFiles checkout
     [path | (path, _) ← checkoutOnly, path `elem` inventory] `shouldBe` []
 
-  it "accounts for every file the Vulkan proof boundary reads" $ do
+  it "accounts for every file the Vulkan project boundary reads" $ do
     -- That module states what it reads once, for the planner's sake; this holds
     -- the same list to the packaging inventory's two halves, so a file it
     -- starts reading is either carried or declared checkout-only.
