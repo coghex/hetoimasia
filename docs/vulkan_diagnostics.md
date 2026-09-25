@@ -373,8 +373,10 @@ installs no Haskell callback, no allocation callback and no trampoline.
 back: the binding at `vulkan-3.27` with `safe-foreign-calls` on and
 `darwin-lib-dirs` off, as `cabal.project.vulkan` constrains it and
 `tools/toolchain/binding.pin` records; the C-only capture callback; no Haskell
-callbacks; and no `unsafe` imports of its own yet — the audited recording subset
-is VK-11's. The proof record prints it beside the build's source digest, and the
+callbacks; and, since VK-11, the audited recording subset — the package's only
+genuine `unsafe` imports, which [the FFI audit](gpu_backend.md#the-ffi-audit)
+lists entry point by entry point, and from which only this C-only callback is
+reachable. The proof record prints it beside the build's source digest, and the
 proof checks the binding flags against the pin.
 
 ## State

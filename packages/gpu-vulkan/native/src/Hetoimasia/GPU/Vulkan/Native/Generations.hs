@@ -101,6 +101,7 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   ( -- * The generations
     Generations
   , newGenerations
+  , newGenerationsCapturing
   , newGenerationsHooked
   , settlingPeriod
   , trackTarget
@@ -313,15 +314,22 @@ data Generations q inst msgr phys dev = Generations
   , generationsAfterAdmission ∷ GenerationId → IO ()
     -- ^ The examples' seam: runs right after the model admitted a candidate,
     -- inside the construction's masked settlement. Production runs nothing.
+  , generationsCapture ∷ !CaptureUsage
   }
 
 newGenerations ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
 newGenerations = newGenerationsHooked (\_ → pure ())
 
+-- | 'newGenerations' whose every plan also asks for transfer-source usage
+-- where the surface offers it ('CaptureWhenOffered'), so a verification can
+-- read its images back. No normal target is built this way.
+newGenerationsCapturing ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+newGenerationsCapturing roots = (\targets → Generations roots targets (\_ → pure ()) CaptureWhenOffered) <$> newTVarIO Map.empty
+
 -- | 'newGenerations' with the examples' seam, which runs right after the model
 -- admits each candidate. Nothing in production sets it.
 newGenerationsHooked ∷ (GenerationId → IO ()) → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerationsHooked hook roots = (\targets → Generations roots targets hook) <$> newTVarIO Map.empty
+newGenerationsHooked hook roots = (\targets → Generations roots targets hook WithoutCapture) <$> newTVarIO Map.empty
 
 -- | How long the geometry a replacement would be built from must stay the
 -- same before it is built: 16 ms.
@@ -549,7 +557,7 @@ reconcile generations now target geometry = do
         Just (devicePlan, _) → do
           offer ← rootsCall roots "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" (opsSurfaceOffer ops (planDevice devicePlan) (recordSurface record))
           limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
-          case planGeneration limit geometry offer of
+          case planGenerationWith (generationsCapture generations) limit geometry offer of
             PlanSuspended suspension → Nothing <$ suspend suspension
             PlanUnsupported gaps → do
               atomically (modelEdit_ (suspendTarget target))

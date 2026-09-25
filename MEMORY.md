@@ -133,8 +133,11 @@ or filed. Next audit starts after `425e97b`, plus changed specs/docs.
   package. #216 supplies GLFW's optional Vulkan interop component. #219 adds
   the native Vulkan roots (instance, messenger, one shared device, per-target
   surfaces) and the `hetoimasia-gpu-vulkan-glfw` integration that runs them
-  under the graphics owner ([contract](docs/gpu_backend.md)); nothing is
-  recorded or submitted yet. Fonts and renderers remain plans.
+  under the graphics owner ([contract](docs/gpu_backend.md)). #222 adds
+  swapchain generations, and #223 managed resources, a scoped recorder with
+  exact retention, and the audited `unsafe` recording subset; a batch can be
+  recorded and discarded, and nothing is submitted yet. Fonts and renderers
+  remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.

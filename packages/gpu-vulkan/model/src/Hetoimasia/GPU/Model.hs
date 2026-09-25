@@ -99,10 +99,12 @@ module Hetoimasia.GPU.Model
   , reserveFrame
   , acquireImage
   , recordBatch
+  , extendBatch
   , discardBatch
   , resetRecorder
   , resetSubmissionFence
   , submitFrames
+  , submissionCarries
   , enqueuePresentation
   , skipUnsubmittedFrame
   , closeSubmittedFrame

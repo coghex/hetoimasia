@@ -20,6 +20,12 @@
 -- transfer usages the retired proof harness asked for, and never fall back to
 -- a UNORM or an arbitrary format.
 --
+-- Native verification reads rendered images back, which needs the images to
+-- be transfer sources. 'planGenerationWith' 'CaptureWhenOffered' adds that
+-- usage wherever the surface offers it, and otherwise plans exactly what
+-- 'planGeneration' does: capture is never a gap, and no normal target asks
+-- for it.
+--
 -- = The extent
 --
 -- D-30, in this order, which is the order of "Hetoimasia.Runtime.GLFW"'s
@@ -60,6 +66,8 @@ module Hetoimasia.GPU.Vulkan.Native.Presentation
   , PresentationGap (..)
   , PlanAnswer (..)
   , planGeneration
+  , CaptureUsage (..)
+  , planGenerationWith
 
     -- * The profile's values
   , formatB8G8R8A8Srgb
@@ -67,13 +75,14 @@ module Hetoimasia.GPU.Vulkan.Native.Presentation
   , colorSpaceSrgbNonlinear
   , presentModeFifo
   , imageUsageColorAttachment
+  , imageUsageTransferSource
   , compositeAlphaOpaque
   , compositeAlphaPreMultiplied
   , compositeAlphaPostMultiplied
   , compositeAlphaInherit
   ) where
 
-import Data.Bits ((.&.))
+import Data.Bits ((.&.), (.|.))
 import Data.Text (Text)
 import Data.Word (Word32)
 import Numeric.Natural (Natural)
@@ -256,7 +265,21 @@ data PlanAnswer
 -- suspended whatever else is true of its surface. Every gap in the profile is
 -- then named together, so a refusal names the whole of it.
 planGeneration ∷ Natural → TargetGeometry → SurfaceOffer → PlanAnswer
-planGeneration trackingLimit geometry offer = case chooseExtent geometry capabilities of
+planGeneration = planGenerationWith WithoutCapture
+
+-- | Whether a generation's images are also made transfer sources, so a
+-- verification can copy them into a readback buffer.
+data CaptureUsage
+  = WithoutCapture
+    -- ^ The profile alone: every normal target.
+  | CaptureWhenOffered
+    -- ^ Add transfer-source usage where the surface offers it. Where it does
+    -- not, the plan is the profile's, and a copy from its images is refused.
+  deriving (Eq, Show)
+
+-- | 'planGeneration', asking for capture usage or not.
+planGenerationWith ∷ CaptureUsage → Natural → TargetGeometry → SurfaceOffer → PlanAnswer
+planGenerationWith capture trackingLimit geometry offer = case chooseExtent geometry capabilities of
   ExtentWithheld suspension → PlanSuspended suspension
   ExtentChosen source extent → case (gaps, format, alpha) of
     ([], Just chosen, Just composite) →
@@ -267,13 +290,16 @@ planGeneration trackingLimit geometry offer = case chooseExtent geometry capabil
           , planExtent = extent
           , planExtentSource = source
           , planMinImages = requested
-          , planUsage = imageUsageColorAttachment
+          , planUsage = imageUsageColorAttachment .|. captured
           , planTransform = capabilityCurrentTransform capabilities
           , planCompositeAlpha = composite
           }
     _ → PlanUnsupported gaps
   where
     capabilities = offerCapabilities offer
+    captured
+      | capture == CaptureWhenOffered && capabilityUsage capabilities .&. imageUsageTransferSource /= 0 = imageUsageTransferSource
+      | otherwise = 0
     format =
       case [candidate | preferred ← [formatB8G8R8A8Srgb, formatR8G8B8A8Srgb], candidate ← offerFormats offer, candidate == SurfaceFormat preferred colorSpaceSrgbNonlinear] of
         chosen : _ → Just chosen
@@ -317,6 +343,9 @@ presentModeFifo = 2
 
 imageUsageColorAttachment ∷ Word32
 imageUsageColorAttachment = 0x10
+
+imageUsageTransferSource ∷ Word32
+imageUsageTransferSource = 0x1
 
 compositeAlphaOpaque ∷ Word32
 compositeAlphaOpaque = 0x1

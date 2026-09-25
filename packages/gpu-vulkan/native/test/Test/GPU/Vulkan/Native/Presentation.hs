@@ -25,6 +25,8 @@ spec = describe "Presentation" $ do
     colorSpaceSrgbNonlinear `shouldBe` fromIntegral srgb
     presentModeFifo `shouldBe` fromIntegral fifo
     imageUsageColorAttachment `shouldBe` color
+    let ImageUsageFlagBits transferSource = IMAGE_USAGE_TRANSFER_SRC_BIT
+    imageUsageTransferSource `shouldBe` transferSource
     [compositeAlphaOpaque, compositeAlphaPreMultiplied, compositeAlphaPostMultiplied, compositeAlphaInherit]
       `shouldBe` [opaque, pre, post, inherit]
 
@@ -87,6 +89,15 @@ spec = describe "Presentation" $ do
           usage = planUsage <$> planned (planGeneration 16 (eligible (SurfaceExtent 640 480)) (withUsage imageUsageColorAttachment))
       usage `shouldBe` Just imageUsageColorAttachment
       fmap (.&. transfer) usage `shouldBe` Just 0
+
+    it "adds transfer-source usage for a verification capture only where the surface offers it, and never makes it a gap" $ do
+      let offering = withUsage (imageUsageColorAttachment .|. imageUsageTransferSource)
+          geometry = eligible (SurfaceExtent 640 480)
+      planUsage <$> planned (planGeneration 16 geometry offering) `shouldBe` Just imageUsageColorAttachment
+      planUsage <$> planned (planGenerationWith CaptureWhenOffered 16 geometry offering)
+        `shouldBe` Just (imageUsageColorAttachment .|. imageUsageTransferSource)
+      planGenerationWith CaptureWhenOffered 16 geometry (withUsage imageUsageColorAttachment)
+        `shouldBe` planGeneration 16 geometry (withUsage imageUsageColorAttachment)
 
     it "reports every gap of an unsupported surface together, and falls back to no UNORM or arbitrary format" $ do
       let unorm = SurfaceFormat 44 colorSpaceSrgbNonlinear

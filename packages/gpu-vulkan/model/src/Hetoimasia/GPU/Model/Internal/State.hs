@@ -64,10 +64,12 @@ module Hetoimasia.GPU.Model.Internal.State
   , reserveFrame
   , acquireImage
   , recordBatch
+  , extendBatch
   , discardBatch
   , resetRecorder
   , resetSubmissionFence
   , submitFrames
+  , submissionCarries
   , enqueuePresentation
   , skipUnsubmittedFrame
   , closeSubmittedFrame
@@ -405,6 +407,9 @@ data Batch = Batch
 
 data Submission = Submission
   { submissionFrames ∷ ![(Natural, Natural)]
+  , submissionBatches ∷ !(Set BatchId)
+    -- ^ The batches it consumed, as their full identities: session, target
+    -- incarnation and number.
   , submissionSubjects ∷ !(Set SubjectKey)
   , submissionUncertain ∷ !Bool
   }
@@ -1595,6 +1600,37 @@ recordBatch identity references model =
                           , BatchId (frameTarget identity) batch
                           )
 
+-- | Extend a recorded batch's references before the next command that names
+-- them is recorded into it. The batch keeps its one identity; each subject is
+-- retained once however many commands use it, so naming a subject the batch
+-- already holds is ordinary repeated use and changes nothing. A request that
+-- names one subject twice is misuse, and so is any subject whose logical
+-- release or ended CPU use has been certified, whether or not the batch
+-- already holds it: nothing may record through it again. Nothing is charged:
+-- the batch's one record was reserved when it was recorded, and a reference is
+-- an entry in a subject's hold, not a record of its own.
+extendBatch ∷ BatchId → [ResourceId] → GpuModel → Outcome GpuModel
+extendBatch identity references model =
+  scheduling_ model $
+  resolved (running model) $ \() →
+    resolved (resolveBatch model identity) $ \(number, batch) →
+      resolved (traverse (resolveResource model) references) $ \resolvedResources →
+        let keys = map (uncurry ResourceKey . fst) resolvedResources
+            unique = Set.fromList keys
+         in if Set.size unique /= length keys
+              then Rejected (DuplicateSubject ResourceIdentity)
+              else
+                if any (sealed model) keys
+                  then Rejected (WrongPhase ResourceIdentity)
+                  else
+                    let added = Set.difference unique (batchSubjects batch)
+                        retained = foldl' (\current key → editHolds key (retainRecorded number) current) model (Set.toList added)
+                     in Admitted
+                          retained
+                            { gpuBatches =
+                                Map.insert number batch {batchSubjects = Set.union (batchSubjects batch) added} (gpuBatches retained)
+                            }
+
 -- | Whether a subject has been certified as recordable no longer: either the
 -- owner released it, or it certified that no retained capability can reach it.
 sealed ∷ GpuModel → SubjectKey → Bool
@@ -1746,6 +1782,13 @@ submitFrames identities outcome model
                       submission
                       Submission
                         { submissionFrames = [(number, slot) | (number, slot, _) ← frames]
+                        , submissionBatches =
+                            Set.fromList
+                              [ BatchId (targetIdOf charged (batchTargetNumber record) target) number
+                              | number ← batches
+                              , Just record ← [Map.lookup number (gpuBatches charged)]
+                              , Just target ← [Map.lookup (batchTargetNumber record) (gpuTargets charged)]
+                              ]
                         , submissionSubjects = subjects
                         , submissionUncertain = uncertain
                         }
@@ -1755,6 +1798,16 @@ submitFrames identities outcome model
          in if uncertain
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
               else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
+
+-- | Whether an outstanding submission consumed this exact batch — this
+-- session's, this target incarnation's, this number: the positive evidence
+-- that a batch's recorded work was submitted, rather than discarded, reset or
+-- skipped. Another session's batch of the same number is not it. 'Nothing' when the submission is not outstanding — never
+-- issued, another session's, or already completed.
+submissionCarries ∷ SubmissionId → BatchId → GpuModel → Maybe Bool
+submissionCarries submission batch model = case resolveSubmission model submission of
+  Right (_, record) → Just (batch `Set.member` submissionBatches record)
+  Left _ → Nothing
 
 -- | Raise a replacement request on a target. Requests are counted rather than
 -- flagged, so a publication can satisfy exactly the request it was begun for.

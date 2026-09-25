@@ -58,6 +58,7 @@ import Vulkan.Zero (zero)
 
 import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, Quiesced, afterLastCallback, captureUserData)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Commands (unsafeImports)
 
 -- | The C callback every capture messenger registers.
 captureMessengerCallback ∷ PFN_vkDebugUtilsMessengerCallbackEXT
@@ -130,8 +131,9 @@ data NativeFfiConfiguration = NativeFfiConfiguration
   , ffiHaskellCallbacks ∷ ![Text]
     -- ^ Haskell callbacks this package installs into Vulkan: none.
   , ffiUnsafeImports ∷ ![Text]
-    -- ^ Genuine @unsafe@ Vulkan imports this package declares: none yet. The
-    -- audited recording subset is VK-11's.
+    -- ^ Genuine @unsafe@ Vulkan calls this package declares: VK-11's audited
+    -- recording subset, by entry point. The capture callback's own import is
+    -- the address of a C function, not a call, and is not among them.
   }
   deriving (Eq, Show)
 
@@ -146,7 +148,7 @@ nativeFfiConfiguration =
     , ffiBindingDarwinLibDirs = False
     , ffiCaptureCallback = "hetoimasia_vulkan_capture_messenger (C) → hetoimasia_capture_callback (C)"
     , ffiHaskellCallbacks = []
-    , ffiUnsafeImports = []
+    , ffiUnsafeImports = unsafeImports
     }
 
 -- | The configuration as the lines an evidence record prints.
@@ -158,6 +160,7 @@ describeFfiConfiguration configuration =
   , ("capture callback", ffiCaptureCallback configuration)
   , ("Haskell callbacks installed", listed (ffiHaskellCallbacks configuration))
   , ("unsafe imports declared", listed (ffiUnsafeImports configuration))
+  , ("safe calls", "everything else: waits, submission, presentation, pipeline creation, construction and destruction, through the binding")
   ]
   where
     onOff enabled = if enabled then "on" else "off"

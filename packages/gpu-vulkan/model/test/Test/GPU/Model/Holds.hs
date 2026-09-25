@@ -5,7 +5,7 @@ module Test.GPU.Model.Holds (spec) where
 
 import Data.List (sort)
 import Hetoimasia.GPU.Model
-import Hetoimasia.GPU.Model.Budget (BudgetRequest (requestedFrameSlots), defaultBudgetRequest)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (ObjectBudget), BudgetRequest (requestedFrameSlots), defaultBudgetRequest, objectLimit)
 import Hetoimasia.GPU.Model.Identity
 import Test.GPU.Model.Support
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
@@ -158,6 +158,107 @@ spec = describe "holds" $ do
     recorded rebuilt (ResourceSubject original) `shouldBe` [batch]
     disposalEligible (ResourceSubject original) rebuilt `shouldBe` False
     recorded rebuilt (ResourceSubject replacement) `shouldBe` []
+
+  it "extends one batch incrementally, retaining each subject once however often or however overlapping its use" $ do
+    model ← freshModel
+    (active, target, generation) ← activeTarget 2 model
+    (resourced, pipeline) ← aResource 1024 active
+    (resourced', layout) ← aResource 1024 resourced
+    (resourced'', other) ← aResource 1024 resourced'
+    (framed, frame) ← acquiredFrame target resourced''
+    (opened, batch) ← admitted "recording an empty batch" (recordBatch frame [] framed)
+    -- The frame's own generation is retained from the start.
+    recorded opened (GenerationSubject generation) `shouldBe` [batch]
+    recorded opened (ResourceSubject pipeline) `shouldBe` []
+
+    -- A binding that names a pipeline and, transitively, its layout.
+    bound ← admitted_ "retaining a pipeline and its layout" (extendBatch batch [pipeline, layout] opened)
+    -- The same binding again, and another pipeline sharing that layout: repeated
+    -- and overlapping use, not duplicates.
+    rebound ← admitted_ "retaining the same pipeline again" (extendBatch batch [pipeline, layout] bound)
+    overlapping ← admitted_ "retaining another pipeline over the same layout" (extendBatch batch [other, layout] rebound)
+    recorded overlapping (ResourceSubject pipeline) `shouldBe` [batch]
+    recorded overlapping (ResourceSubject layout) `shouldBe` [batch]
+    recorded overlapping (ResourceSubject other) `shouldBe` [batch]
+    -- One batch, one record: extending charged nothing.
+    usageBatches (usage overlapping) `shouldBe` 1
+    usageObjects (usage overlapping) `shouldBe` usageObjects (usage opened)
+
+    -- Discarding it discharges every reference it gained along the way.
+    dropped ← admitted_ "discarding the batch" (discardBatch batch overlapping)
+    [recorded dropped (ResourceSubject subject) | subject ← [pipeline, layout, other]] `shouldBe` [[], [], []]
+    recorded dropped (GenerationSubject generation) `shouldBe` []
+
+  it "refuses an extension naming one subject twice, or a sealed subject even one it already holds, and changes nothing" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    (resourced, held) ← aResource 1024 active
+    (resourced', fresh) ← aResource 1024 resourced
+    (framed, frame) ← acquiredFrame target resourced'
+    (opened, batch) ← admitted "recording" (recordBatch frame [held] framed)
+
+    rejected_ "naming one subject twice in one request" (extendBatch batch [fresh, fresh] opened)
+      >>= (`shouldBe` DuplicateSubject ResourceIdentity)
+    released ← admitted_ "releasing the held resource" (releaseResource held opened)
+    -- The batch already holds it, but a new command would record through a
+    -- released handle.
+    rejected_ "extending with a released subject the batch already holds" (extendBatch batch [held] released)
+      >>= (`shouldBe` WrongPhase ResourceIdentity)
+    rejected_ "extending with a released subject beside a live one" (extendBatch batch [fresh, held] released)
+      >>= (`shouldBe` WrongPhase ResourceIdentity)
+    recorded released (ResourceSubject fresh) `shouldBe` []
+    recorded released (ResourceSubject held) `shouldBe` [batch]
+
+    -- A discarded batch is consumed, and extends no further.
+    dropped ← admitted_ "discarding the batch" (discardBatch batch released)
+    rejected_ "extending a discarded batch" (extendBatch batch [fresh] dropped)
+      >>= (`shouldBe` AlreadyConsumed BatchIdentity)
+
+  it "reserves a batch's record when it is recorded, so an exhausted object budget refuses recording but not extension" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    (resourced, resource) ← aResource 1024 active
+    (framed, frame) ← acquiredFrame target resourced
+    (opened, batch) ← admitted "recording" (recordBatch frame [] framed)
+    let remaining = objectLimit (modelBudgets opened) - usageObjects (usage opened)
+    (full, _) ← admitted "reserving every remaining object" (beginAllocation 0 remaining opened)
+    backpressured "recording a second batch" (recordBatch frame [] full) >>= (`shouldBe` ObjectBudget)
+    extended ← admitted_ "extending the batch already recorded" (extendBatch batch [resource] full)
+    recorded extended (ResourceSubject resource) `shouldBe` [batch]
+
+  it "says which batches a submission consumed, so a reset batch is never mistaken for a submitted one" $ do
+    model ← freshModel
+    (active, target, _) ← activeTarget 2 model
+    (resourced, resource) ← aResource 1024 active
+    (framed, frame) ← acquiredFrame target resourced
+    (first, resetBatch) ← admitted "recording a batch" (recordBatch frame [resource] framed)
+    reset ← admitted_ "resetting the recorder" (resetRecorder frame first)
+    (second, carriedBatch) ← admitted "recording another batch" (recordBatch frame [resource] reset)
+    (submitted, answer) ← admitted "submitting the frame" (submitFrames [frame] SubmissionAccepted second)
+    submission ← case answer of
+      SubmissionRecorded identity → pure identity
+      other → fail ("expected a submission record, got " ++ show other)
+    submissionCarries submission carriedBatch submitted `shouldBe` Just True
+    submissionCarries submission resetBatch submitted `shouldBe` Just False
+    completed ← admitted_ "completing it" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) submitted)
+    submissionCarries submission carriedBatch completed `shouldBe` Nothing
+
+  it "never says a submission consumed another session's batch of the same number" $ do
+    ours ← freshModel
+    theirs ← freshModel
+    (oursActive, oursTarget, _) ← activeTarget 2 ours
+    (theirsActive, theirsTarget, _) ← activeTarget 2 theirs
+    (oursFramed, oursFrame) ← acquiredFrame oursTarget oursActive
+    (theirsFramed, theirsFrame) ← acquiredFrame theirsTarget theirsActive
+    (oursRecorded, ourBatch) ← admitted "recording ours" (recordBatch oursFrame [] oursFramed)
+    (_, theirBatch) ← admitted "recording theirs" (recordBatch theirsFrame [] theirsFramed)
+    batchNumber theirBatch `shouldBe` batchNumber ourBatch
+    (submitted, answer) ← admitted "submitting ours" (submitFrames [oursFrame] SubmissionAccepted oursRecorded)
+    submission ← case answer of
+      SubmissionRecorded identity → pure identity
+      other → fail ("expected a submission record, got " ++ show other)
+    submissionCarries submission ourBatch submitted `shouldBe` Just True
+    submissionCarries submission theirBatch submitted `shouldBe` Just False
 
   it "refuses to record against a subject whose release or ended CPU use has been certified" $ do
     model ← freshModel

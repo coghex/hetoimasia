@@ -14,7 +14,11 @@ description:
     child-before-parent destruction over an open native layer — and VK-10's
     swapchain generations above them: the presentation profile and extent
     policy as pure decisions, and each target's generations built, replaced and
-    destroyed by the model's identities and holds. It depends on no window
+    destroyed by the model's identities and holds — and VK-11's
+    renderer-facing boundary above them: managed resources keyed by the
+    model's identities, a scoped recorder that retains every generation a
+    command references before recording it, sealed single-use batches, readback
+    memory, and the audited unsafe recording subset. It depends on no window
     system: a surface arrives as its handle and the action that destroys it.
     .
     It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
@@ -63,9 +67,17 @@ library
         Hetoimasia.GPU.Vulkan.Native.Generations
         Hetoimasia.GPU.Vulkan.Native.Presentation
         Hetoimasia.GPU.Vulkan.Native.Profile
+        Hetoimasia.GPU.Vulkan.Native.Recording
+        Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
+        Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Roots
         Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Shader
+    -- VK-11's audited recording subset: the package's only genuine `unsafe`
+    -- Vulkan imports. Private, so nothing outside the package can record
+    -- through them; see the module and docs/gpu_backend.md, "The FFI audit".
+    other-modules:
+        Hetoimasia.GPU.Vulkan.Native.Internal.Commands
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
     -- from the provisioned Vulkan prefix `tools/vulkan/run.sh` passes to
@@ -171,6 +183,8 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Generations
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
+        Test.GPU.Vulkan.Native.Recording
+        Test.GPU.Vulkan.Native.RecordingStandIn
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn
     ghc-options: -threaded -rtsopts
@@ -178,6 +192,8 @@ test-suite native-tests
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
