@@ -182,7 +182,13 @@ cd "$root"
 fingerprint="packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
 generate_fingerprint() {
   if [ ! -e "$fingerprint" ]; then
-    trap 'rm -f "$root/$fingerprint"' EXIT
+    # The directory too, when this created it: Git records no empty
+    # directory, so one left behind is an addition the candidate lacks.
+    if [ -d "$(dirname "$fingerprint")" ]; then
+      trap 'rm -f "$root/$fingerprint"' EXIT
+    else
+      trap 'rm -f "$root/$fingerprint"; rmdir "$root/$(dirname "$fingerprint")" 2>/dev/null' EXIT
+    fi
   fi
   "$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/vulkan: glslang wrapper reports /'
   cabal run -v1 "${cabal_flags[@]}" hetoimasia-gpu-vulkan-native:exe:hetoimasia-shader-fingerprint -- \
