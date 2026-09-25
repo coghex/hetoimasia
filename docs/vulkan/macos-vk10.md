@@ -19,7 +19,7 @@ retirement, the diagnostic verdict after the last teardown callback — took
 5.496 s against the 30-second watchdog. The receipts record `Darwin` and the
 local prefix's own toolchain map — the MoltenVK driver, the 1.3.296 layer with
 `+synchronization` — and no `ci-image` entry, so neither can satisfy a Linux
-plan.
+plan. The Linux evidence is [`linux-vk10.md`](linux-vk10.md).
 
 VK-10's native cases ran over the shared roots. A shown 160×120 window's target
 built its generation on the graphics owner's thread from the surface's concrete
