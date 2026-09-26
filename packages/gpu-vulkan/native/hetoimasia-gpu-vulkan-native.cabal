@@ -77,8 +77,26 @@ library
     -- VK-11's audited recording subset: the package's only genuine `unsafe`
     -- Vulkan imports. Private, so nothing outside the package can record
     -- through them; see the module and docs/gpu_backend.md, "The FFI audit".
+    --
+    -- Internal.Recording.* is the managed recording's implementation, split by
+    -- responsibility (#265); Recording re-exports its public names unchanged.
+    -- Each is private because it exports what clients must never reach:
+    -- Layer is the native layer's shape, re-exported whole; State holds the
+    -- records, the recording's representation and the handles' constructors,
+    -- which Recording exports only abstractly; Construction, Recorder
+    -- (whose Recorder's representation stays hidden), Batches, Readback and
+    -- Disposal each own one stage of a generation's or a batch's life and
+    -- expose steps, such as retiring completed batches, that only another
+    -- stage may take. See packages/gpu-vulkan/native/README.md.
     other-modules:
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
     -- from the provisioned Vulkan prefix `tools/vulkan/run.sh` passes to
@@ -174,7 +192,9 @@ test-suite shader-tests
 -- the loader only because the library does, so it is built and run through
 -- `tools/vulkan/run.sh test` — the group `test.vulkan-headless` — which points
 -- Cabal at the provisioned prefix. It shares `test/` with the shader suite and has its own
--- main.
+-- main. Its recording visibility examples typecheck external clients against
+-- the built package through `hetoimasia-test-support`'s harness, with the
+-- `ghc` on PATH, as the shader suite's client does.
 test-suite native-tests
     import: language
     type: exitcode-stdio-1.0
@@ -186,6 +206,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.RecordingStandIn
+        Test.GPU.Vulkan.Native.RecordingVisibility
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn
     ghc-options: -threaded -rtsopts
@@ -201,4 +222,5 @@ test-suite native-tests
         vulkan >=3.27 && <3.28,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
-        hetoimasia-gpu-vulkan-native
+        hetoimasia-gpu-vulkan-native,
+        hetoimasia-test-support ==0.1.0.0

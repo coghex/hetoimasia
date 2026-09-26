@@ -13,6 +13,7 @@ import qualified Test.GPU.Vulkan.Native.Generations as Generations
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Profile as Profile
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
+import qualified Test.GPU.Vulkan.Native.RecordingVisibility as RecordingVisibility
 import qualified Test.GPU.Vulkan.Native.Roots as Roots
 import Test.Hspec (describe)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
@@ -26,3 +27,4 @@ main =
       Presentation.spec
       Generations.spec
       Recording.spec
+      RecordingVisibility.spec
