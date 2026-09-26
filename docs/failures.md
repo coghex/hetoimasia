@@ -16,8 +16,31 @@ component and application lifecycle are not part of it.
 The module owns no state, defines no central engine error type or component
 taxonomy, and works over any `Exception` instance. A component's exception type
 stays with that component. The only things it takes from
-[the logging module](logging.md) are the validated `Component` name and the
-`SourceLocation` record; it needs no logger.
+[the logging family](logging.md#module-structure) are the validated `Component`
+name and the `SourceLocation` record; it needs no logger.
+
+## Module structure
+
+`Hetoimasia.Foundation.Failure` is the only failure module a client imports. It
+defines raising, the operation boundary, and inspection, and re-exports the rest
+from two hidden modules of the foundation's main library:
+
+| Module | Owns |
+| --- | --- |
+| `Failure.Base` | The abstract `Operation` and its naming operations |
+| `Failure.Types` | The origin, context, site, cause, and evidence records, and the private annotation that carries them on an exception's context, with its `ExceptionAnnotation` instance and the rendering that instance needs |
+
+`Failure.Base` imports no other foundation module. `Failure.Types` and the
+facade take `Component` and `SourceLocation` from the logging family's hidden
+`Log.Component` and `Log.Base` modules directly, never from the logging facade
+or the modules holding its records, filters, layout, or sinks, so failure
+attribution does not depend on log emission.
+
+The annotation type is shared between `Failure.Types` and the facade, and the
+facade does not export it: evidence is still attached only by `throwFailure`,
+`throwFailureSTM`, and `withOperationContext`. `Operation` stays abstract.
+Failure escaping stays separate from the logger's quoting even where the rules
+match, because the two render different contracts.
 
 ## Public interface
 
@@ -298,6 +321,13 @@ cover:
   an asynchronous cause left without an origin; a faulting identifier raising
   its own exception; and rollback of an escaping failure and of only the
   caught action's writes.
+
+The external-client examples in
+`packages/foundation/test/Test/Foundation/Logging/Opacity.hs`, selected by
+`--test-options='--match "Logging and failure opacity"'`, check that a client
+reaches the failure family through the facade alone: every public name imports,
+`Failure.Base` and `Failure.Types` are refused as hidden modules, and the
+`Operation` constructor is refused through the facade.
 
 The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

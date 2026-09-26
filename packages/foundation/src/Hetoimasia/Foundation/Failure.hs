@@ -39,10 +39,19 @@
 -- boundary all rethrow an asynchronous exception with the context it already
 -- had.
 --
--- Raising and inspecting a failure need no logger. This module imports only the
--- validated 'Component' and 'SourceLocation' types from
--- "Hetoimasia.Foundation.Log", owns no state, defines no central error type, and
--- works over any 'Exception' instance.
+-- Raising and inspecting a failure need no logger. This module owns no state,
+-- defines no central error type, and works over any 'Exception' instance. It
+-- defines raising, the operation boundary, and inspection, and re-exports the
+-- rest from private modules of the foundation package:
+--
+-- * @Hetoimasia.Foundation.Failure.Base@: the abstract 'Operation' and its
+--   naming operations.
+-- * @Hetoimasia.Foundation.Failure.Types@: the evidence records, and the
+--   private annotation that carries them together with its rendering.
+--
+-- Both import only the validated 'Component' and the 'SourceLocation' record,
+-- from the logging family's private @Log.Component@ and @Log.Base@ modules, so
+-- failure attribution depends on no logger, filter, format, or sink.
 --
 -- See @docs/failures.md@ for the same contract in prose.
 module Hetoimasia.Foundation.Failure
@@ -84,7 +93,6 @@ import Control.Exception
   , toException
   , tryWithContext
   )
-import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context
   ( ExceptionContext
   , addExceptionAnnotation
@@ -92,8 +100,7 @@ import Control.Exception.Context
   )
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.STM (STM, throwSTM)
-import Data.Char (isControl, ord)
-import Data.List (intercalate, sortOn)
+import Data.List (sortOn)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -106,148 +113,18 @@ import GHC.Stack
   , srcLocFile
   , srcLocStartLine
   )
-import Hetoimasia.Foundation.Log (Component, SourceLocation (..), componentText)
-
--- | The stable name of an operation a component performs, such as
--- @load-texture@. Like a 'Component', it is a name chosen in code, not a value
--- built from a request; per-request values belong in the identifiers.
-newtype Operation = Operation Text
-  deriving (Eq, Ord, Show)
-
--- | Name an operation.
-operation ∷ Text → Operation
-operation = Operation
-
--- | The operation's name.
-operationText ∷ Operation → Text
-operationText (Operation name) = name
-
--- | The source information available for one site.
-data FailureSite = FailureSite
-  { siteLocation ∷ !SourceLocation
-    -- ^ The outermost frame: the call site outside every function that
-    -- declared 'HasCallStack'.
-  , siteCallStack ∷ ![SourceLocation]
-    -- ^ Every frame, innermost first, as 'getCallStack' orders them.
-  }
-  deriving (Eq, Show)
-
--- | Where an engine failure was raised, and by what.
-data FailureOrigin = FailureOrigin
-  { originComponent ∷ !Component
-  , originOperation ∷ !Operation
-  , originIdentifiers ∷ ![(Text, Text)]
-    -- ^ Caller-supplied identifiers, such as a resource or request name.
-  , originSite ∷ !(Maybe FailureSite)
-    -- ^ The caller's site; 'Nothing' only when the caller's call stack was
-    -- empty.
-  }
-  deriving (Eq, Show)
-
--- | An operation an outer boundary was performing when a failure passed
--- through it.
-data OperationContext = OperationContext
-  { contextComponent ∷ !Component
-  , contextOperation ∷ !Operation
-  , contextIdentifiers ∷ ![(Text, Text)]
-  , contextBoundary ∷ !(Maybe FailureSite)
-    -- ^ Where the boundary observing the failure was entered. This is the
-    -- observation boundary, never the failure's throw site.
-  }
-  deriving (Eq, Show)
-
--- | What is known about where a failure came from.
-data FailureCause
-  = EngineOrigin !FailureOrigin
-    -- ^ Raised by 'throwFailure' or 'throwFailureSTM', whose throw site is
-    -- known.
-  | NativeCause
-    -- ^ No engine origin was recorded: a native or library exception, or one
-    -- thrown without either. Its throw site is unknown, and no site is
-    -- invented for it.
-  deriving (Eq, Show)
-
--- | The origin evidence an exception carries, and every operation context
--- added to it, in the order they were attached.
-data FailureEvidence = FailureEvidence
-  { failureCause ∷ !FailureCause
-  , failureContexts ∷ ![OperationContext]
-    -- ^ Innermost boundary first.
-  }
-  deriving (Eq, Show)
-
--- | The annotation this module attaches. It is not exported, so evidence can
--- only be attached by 'throwFailure', 'throwFailureSTM', and
--- 'withOperationContext'.
---
--- Each entry records how many entries its context already held when it was
--- attached. Inspection orders by that position, so attachment order is a
--- property this module defines rather than a consequence of how @base@ stores
--- annotations.
-data Evidence
-  = OriginEntry !Int !FailureOrigin
-  | ContextEntry !Int !OperationContext
-
-instance ExceptionAnnotation Evidence where
-  displayExceptionAnnotation (OriginEntry _ origin) =
-    "failure origin: "
-      <> describe (originComponent origin) (originOperation origin) (originIdentifiers origin)
-      <> " raised at "
-      <> describeSite (originSite origin)
-  displayExceptionAnnotation (ContextEntry _ context) =
-    "during operation: "
-      <> describe (contextComponent context) (contextOperation context) (contextIdentifiers context)
-      <> " observed at "
-      <> describeSite (contextBoundary context)
-
-entryPosition ∷ Evidence → Int
-entryPosition (OriginEntry position _) = position
-entryPosition (ContextEntry position _) = position
-
--- | One entry renders as one line. Every caller-supplied text is double-quoted
--- and escaped with the rules the logger applies to the values it quotes, so an
--- operation or identifier carrying a newline or a quote cannot split the line or
--- forge another entry. A 'Component' is validated and needs no quoting.
-describe ∷ Component → Operation → [(Text, Text)] → String
-describe component operationName identifiers =
-  Text.unpack (componentText component)
-    <> " "
-    <> quoted (operationText operationName)
-    <> case identifiers of
-      [] → ""
-      _ →
-        " ("
-          <> intercalate ", " [quoted key <> "=" <> quoted value | (key, value) ← identifiers]
-          <> ")"
-
-describeSite ∷ Maybe FailureSite → String
-describeSite Nothing = "an unknown site"
-describeSite (Just site) =
-  quoted (sourceFile location)
-    <> ":"
-    <> show (sourceLine location)
-    <> " in "
-    <> quoted (sourceFunction location)
-  where
-    location = siteLocation site
-
-quoted ∷ Text → String
-quoted value = "\"" <> concatMap escaped (Text.unpack value) <> "\""
-
-escaped ∷ Char → String
-escaped '"' = "\\\""
-escaped '\\' = "\\\\"
-escaped '\n' = "\\n"
-escaped '\r' = "\\r"
-escaped '\t' = "\\t"
-escaped character
-  | isControl character = "\\u" <> hex4 (ord character)
-  | otherwise = [character]
-
-hex4 ∷ Int → String
-hex4 value = map nibble [4096, 256, 16, 1]
-  where
-    nibble place = "0123456789ABCDEF" !! ((value `div` place) `mod` 16)
+import Hetoimasia.Foundation.Failure.Base (Operation, operation, operationText)
+import Hetoimasia.Foundation.Failure.Types
+  ( Evidence (..)
+  , FailureCause (..)
+  , FailureEvidence (..)
+  , FailureOrigin (..)
+  , FailureSite (..)
+  , OperationContext (..)
+  , entryPosition
+  )
+import Hetoimasia.Foundation.Log.Base (SourceLocation (..))
+import Hetoimasia.Foundation.Log.Component (Component)
 
 -- | Throw an engine failure with its origin attached.
 --

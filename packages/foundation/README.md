@@ -67,7 +67,8 @@ performing, including to a native exception, which keeps its type and is
 reported with an unknown throw site. `failureEvidence` reads the evidence back
 with no logger. The exception is never wrapped, so typed catches still match,
 and cancellation is left unannotated. It imports only the `Component` and
-`SourceLocation` types from the logging module. See
+`SourceLocation` types, from the logging family's hidden `Log.Component` and
+`Log.Base` modules rather than the logger. See
 [docs/failures.md](../../docs/failures.md).
 
 `Hetoimasia.Foundation.Recovery` runs one complete owned `IO` operation under
@@ -155,6 +156,27 @@ runtime owns step policy and GLFW owns native wait conversion. See
 Depends on `base`, `deepseq`, `stm`, `text`, `containers`, and `time`. It must not import runtime,
 rendering, scripting, application, or game modules. Add a helper here only when
 it has an independent purpose; this is not a miscellaneous bucket.
+
+## Module map
+
+The logging and failure families each have one public facade over hidden
+modules of the main library. A client imports the facade; the hidden modules
+are refused. See [docs/logging.md](../../docs/logging.md#module-structure) and
+[docs/failures.md](../../docs/failures.md#module-structure) for their dependency
+direction.
+
+| Logical module | Source path | Cabal component | Visibility | Purpose |
+| --- | --- | --- | --- | --- |
+| `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
+| `Hetoimasia.Foundation.Log.Base` | `src/Hetoimasia/Foundation/Log/Base.hs` | main library | hidden | Levels, source locations, and the format and variable-name options |
+| `Hetoimasia.Foundation.Log.Component` | `src/Hetoimasia/Foundation/Log/Component.hs` | main library | hidden | The validated `Component`, its constructors and operations, and shared quoting |
+| `Hetoimasia.Foundation.Log.Types` | `src/Hetoimasia/Foundation/Log/Types.hs` | main library | hidden | Filter, entry, sink, metadata-provider, and logger records |
+| `Hetoimasia.Foundation.Log.Filter` | `src/Hetoimasia/Foundation/Log/Filter.hs` | main library | hidden | Startup configuration parsing and admission |
+| `Hetoimasia.Foundation.Log.Format` | `src/Hetoimasia/Foundation/Log/Format.hs` | main library | hidden | The deterministic record layout and escaping |
+| `Hetoimasia.Foundation.Log.Sink` | `src/Hetoimasia/Foundation/Log/Sink.hs` | main library | hidden | Handle and callback sinks, serialized writes, and forwarding |
+| `Hetoimasia.Foundation.Failure` | `src/Hetoimasia/Foundation/Failure.hs` | main library | exposed | Public failure facade; raising, operation boundaries, and inspection |
+| `Hetoimasia.Foundation.Failure.Base` | `src/Hetoimasia/Foundation/Failure/Base.hs` | main library | hidden | The abstract `Operation` and its naming operations |
+| `Hetoimasia.Foundation.Failure.Types` | `src/Hetoimasia/Foundation/Failure/Types.hs` | main library | hidden | Origin, context, site, cause, and evidence records, and the private failure annotation |
 
 ## Tests
 
