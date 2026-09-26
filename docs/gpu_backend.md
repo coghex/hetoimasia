@@ -67,8 +67,13 @@ the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recor
 — managed resources and the recorder over an open native layer —
 `Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`, its production layer, and
 `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
-embedded shaders. The audited `unsafe` subset is the private module
-`Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, which no client can import.
+embedded shaders. The package's private modules, which no client can import,
+are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`,
+and the recording's implementation under
+`Hetoimasia.GPU.Vulkan.Native.Internal.Recording`: `Layer`, `State`,
+`Construction`, `Recorder`, `Batches`, `Readback` and `Disposal`, which the
+public recording module re-exports as it always exported them (see
+[How the recording is built](#how-the-recording-is-built)).
 
 ## The ownership graph
 
@@ -439,6 +444,33 @@ native layer, `RecordingOps`, whose production form is
 stand-in. A `Recording` is created over the session's roots and generations by
 the graphics owner, and every operation is refused with `RefusedNotOwner` on any
 other thread.
+
+### How the recording is built
+
+`Hetoimasia.GPU.Vulkan.Native.Recording` is the entry point and holds no code of
+its own: it re-exports, with unchanged names, signatures and constructor
+visibility, what seven private modules under
+`Hetoimasia.GPU.Vulkan.Native.Internal.Recording` implement. The split (#265)
+moved code and changed no behaviour; each module's Haddock states what it owns.
+
+| Module | Responsibility | Depends on |
+| --- | --- | --- |
+| `Layer` | The native layer's shape: `RecordingOps` and the command, layout and request vocabulary. No state, no call. | — |
+| `State` | The `Recording` and the three maps it holds; handles, refusals, failures and views; the owner check, the live-generation check, the model helpers and a generation's one native destruction. | `Layer` |
+| `Construction` | Creating, replacing, naming and releasing managed resources, each in one masked step. | `Layer`, `State` |
+| `Batches` | Discard, reset, submission evidence, and freeing a slot of completed batches: invalidate natively, then discharge. | `Layer`, `State` |
+| `Recorder` | `recordFrame`, the `Recorder` and its commands, retention before each native call, and label balancing. | `Layer`, `State`, `Batches` |
+| `Readback` | Host reads gated on completion evidence, host fills, and the atom-aligned mapped range. | `Layer`, `State` |
+| `Disposal` | Destroying released generations child before parent, recording disposals, and retirement. | `State` |
+
+The graph is acyclic, and no module adds state: the managed records, the frame
+storages and the batch records are the `Recording`'s three maps, created by
+`State`, and each module edits only the entries its own operation concerns, on
+the graphics owner's thread — the table in the public module's Haddock names
+which. A `Recorder`'s own references belong to the one `recordFrame` that made
+it. `Recording.Vulkan` and `Recording.Shaders` still import the public module,
+and no new module declares a foreign import, so `Internal.Commands` remains the
+only home of the `unsafe` subset.
 
 ### The boundary as delivered
 
@@ -921,6 +953,17 @@ storage refused without a reset, and a destroyed storage taking its completed
 batch's record with it; invalid viewports and scissors refused; and the FFI audit held to the package's import
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
+
+#265's examples, `Recording visibility across the package boundary`, compile
+external clients through the shared harness (`Test.Support.ExternalClient`)
+against the built package and the dependency store, typechecking only: one that
+imports every name the public recording module exports, with the constructors
+it exports, and the entry points of `Recording.Shaders` and `Recording.Vulkan`
+must compile; one per `Internal.Recording` module must be refused as a hidden
+module of this package (`GHC-87110`), never as a missing one; and one per
+abstract handle — `Recording`, `PipelineLayout`, `Pipeline`, `FrameStorage`,
+`Readback`, `Recorder` — naming its constructor must be refused because the
+public module does not export it (`GHC-10237`).
 
 #250's examples are there too, over the same stand-ins with naming turned on or
 left off: the naming scheme's object types held to the binding's and its bound;

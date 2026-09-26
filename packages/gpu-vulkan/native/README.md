@@ -44,7 +44,20 @@ destroys it.
   discard or a reset invalidates natively before their references are
   discharged; readback reads gated on completion evidence, with non-coherent
   memory invalidated and flushed over atom-aligned ranges; and destruction on
-  the owner once every hold has ended.
+  the owner once every hold has ended. It is the entry point only: its code
+  lives in private modules under
+  `Hetoimasia.GPU.Vulkan.Native.Internal.Recording`, which it re-exports
+  unchanged and no client can import. `Layer` is the native layer's shape;
+  `State` holds the `Recording`, its managed records, frame storages and batch
+  records, the handles' hidden constructors, and the checks every operation
+  shares; `Construction` makes, names, replaces and releases managed
+  resources; `Recorder` owns `recordFrame` and each lent recorder; `Batches`
+  discards, resets and records the submission of batches, invalidating
+  natively before discharging; `Readback` gates host reads on completion
+  evidence; and `Disposal` destroys released generations child before parent.
+  Only `State` creates state, and the public module's Haddock tables which
+  module writes which part of it (see
+  [the backend contract](../../../docs/gpu_backend.md#how-the-recording-is-built)).
 - `Hetoimasia.GPU.Vulkan.Native.Naming` is #250's naming scheme as pure
   decisions: every debug name and recording label derived from identities the
   backend already holds, bounded at 64 bytes, and the object types they name.
@@ -90,7 +103,9 @@ that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
 points Cabal at the provisioned loader and headers. Its headless suite,
 `native-tests` (`test/RootsMain.hs`), runs the profile's, the roots', the
 presentation planner's, the generations' and the recording's examples over
-stand-in native layers, and the shader suite runs beside it,
+stand-in native layers, and external clients proving the recording's
+implementation modules hidden and its public imports intact; the shader suite
+runs beside it,
 both in the validation group `test.vulkan-headless`; its native cases run in
 the window integration's native suite, `test.vulkan-native` — see
 [the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
