@@ -10,6 +10,7 @@
 module Main (main) where
 
 import qualified Test.GPU.Vulkan.Native.Generations as Generations
+import qualified Test.GPU.Vulkan.Native.GenerationsVisibility as GenerationsVisibility
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Profile as Profile
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
@@ -26,5 +27,6 @@ main =
       Roots.spec
       Presentation.spec
       Generations.spec
+      GenerationsVisibility.spec
       Recording.spec
       RecordingVisibility.spec

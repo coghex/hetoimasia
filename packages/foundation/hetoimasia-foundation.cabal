@@ -47,6 +47,32 @@ library
         Hetoimasia.Foundation.Resource.Collection
         Hetoimasia.Foundation.Time
         Hetoimasia.Foundation.Worker
+    -- Hidden modules of this library: the public Log and Failure modules
+    -- re-export what clients may use from them, and a client importing one
+    -- directly is refused. Unlike the internal sublibrary below, which other
+    -- components of this package share, these serve this library alone.
+    --   Log.Base: levels, source locations and small options, below every other
+    --     logging module and imported by failure attribution.
+    --   Log.Component: the validated Component, private so its constructor
+    --     stays unexported, with the quoting its diagnostics share.
+    --   Log.Types: the filter, entry, sink, metadata and logger records,
+    --     private so the LogSink and Logger constructors stay unexported.
+    --   Log.Filter: configuration parsing, and the admission predicate the
+    --     facade does not export.
+    --   Log.Format: the record layout and escaping behind formatEntry.
+    --   Log.Sink: sink construction and serialized writes behind the facade.
+    --   Failure.Base: Operation, private so its constructor stays unexported.
+    --   Failure.Types: the evidence records and the failure annotation, private
+    --     so the annotation stays unexported and only the facade attaches it.
+    other-modules:
+        Hetoimasia.Foundation.Failure.Base
+        Hetoimasia.Foundation.Failure.Types
+        Hetoimasia.Foundation.Log.Base
+        Hetoimasia.Foundation.Log.Component
+        Hetoimasia.Foundation.Log.Filter
+        Hetoimasia.Foundation.Log.Format
+        Hetoimasia.Foundation.Log.Sink
+        Hetoimasia.Foundation.Log.Types
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -97,6 +123,7 @@ test-suite foundation-tests
         Test.Foundation.Logging.Context
         Test.Foundation.Logging.Filtering
         Test.Foundation.Logging.Layout
+        Test.Foundation.Logging.Opacity
         Test.Foundation.Logging.Sink
         Test.Foundation.Logging.Spec
         Test.Foundation.Logging.Support
