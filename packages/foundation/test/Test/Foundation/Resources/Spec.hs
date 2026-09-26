@@ -73,6 +73,7 @@ import qualified Test.Foundation.Resources.Collection as Collection
 import qualified Test.Foundation.Resources.Cost as Cost
 import qualified Test.Foundation.Resources.Construction as Construction
 import qualified Test.Foundation.Resources.Opacity as Opacity
+import qualified Test.Foundation.Resources.Visibility as Visibility
 import Test.Foundation.Resources.Buffer
   ( Buffer (..)
   , Outcomes (..)
@@ -278,6 +279,10 @@ spec = describe "Resources" $ do
   -- The facade's opacity is a property of what the package exports rather than
   -- of a value, so it is asserted by compiling clients outside the package.
   Opacity.spec
+
+  -- Which of the family's modules a client can import at all is asserted the
+  -- same way.
+  Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
 

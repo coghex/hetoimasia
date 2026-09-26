@@ -60,10 +60,16 @@
 -- inside a scope stays directly reachable above it.
 --
 -- This module owns no application state and imports no logger, runtime
--- environment, graphics, or scripting module. Its representations live in a
--- hidden implementation module of this library, which lets
+-- environment, graphics, or scripting module. Its representations live in the
+-- package's private @internal@ sublibrary, reached through the package-private
+-- facade "Hetoimasia.Foundation.Resource.Internal", which lets
 -- 'Hetoimasia.Foundation.Recovery.allocComponent' build a 'Scoped' value from
--- inside the library while this module exports every type closed.
+-- inside the package while this module exports every type closed. Behind that
+-- facade, "Hetoimasia.Foundation.Resource.Cleanup" owns cleanup identity and
+-- evidence, "Hetoimasia.Foundation.Resource.Types" and
+-- "Hetoimasia.Foundation.Resource.Assembly" the composite representation and
+-- its staged construction, and "Hetoimasia.Foundation.Resource.Scoped" the
+-- continuation type.
 --
 -- See @docs/resources.md@ for the same contract in prose, including the caller
 -- patterns that discard evidence and the preserving path to use instead.
