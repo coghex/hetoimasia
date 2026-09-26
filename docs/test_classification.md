@@ -54,7 +54,9 @@ The native suite's physical monitor hotplug and owner-loop interaction examples
 remain inactive unless their dedicated environment variables request them.
 Ordinary native integration returns when the observed condition occurs; a
 timeout is failure, not the intended successful path. Local desktop execution
-still requires fresh per-session human consent under AGENTS.md.
+takes the per-command opt-in: the owner's standing approval covers runs an issue
+or pull request needs (AGENTS.md), and these optional probes run only when the
+owner asks for them.
 
 At baseline `da81087bb2c81e844588a0fc30197bd99201c6b9`, the local audit measured
 passing execution at approximately 13 seconds for

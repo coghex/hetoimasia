@@ -287,7 +287,8 @@ seconds are D-21's budget for the whole native execution: on Linux the isolated
 X11 display the command starts for itself, the shared session and its roots,
 every example and child, retirement, the diagnostic verdict computed after the
 last teardown callback, and the display's own teardown. On macOS the same
-command needs the human's per-session `desktop` consent, as
+command carries the `desktop` opt-in on its own command, under the owner's
+standing approval for runs an issue or pull request needs, as
 [A local run and its receipt](#a-local-run-and-its-receipt) describes. A missing
 loader, device, layer or display fails the group; an empty selection fails the
 suite, and the suite's own report names its non-empty selection. Its inputs are

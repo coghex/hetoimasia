@@ -12,8 +12,9 @@ retention and frame-ownership model. The production Lua scheduler, mod-process
 host, native Vulkan backend, fonts, and rendering modules remain planned.
 
 The original GLFW arc and its completion repairs (#115–#118 and #123) are
-merged and reviewed; epic #86 is complete. Native desktop tests now require
-explicit per-session consent (#124). The children of the
+merged and reviewed; epic #86 is complete. Native desktop tests require an
+explicit per-command opt-in (#124), given under the owner's standing approval
+(2026-09-26) for runs an issue or pull request needs. The children of the
 [package-owned tests](docs/test_architecture_design.md) (#49),
 [scheduling and native wake](docs/runtime_scheduling_design.md) (#131), and
 [window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140)

@@ -5163,8 +5163,8 @@ acquisition before the setup check, so before any native step; that the
 private-session parent starts no child without consent and starts one with
 it, through a recorded launcher; and that a directly invoked child refuses
 before its scenario is looked up, keeping the unknown-scenario exit for an
-approved one. Each refusal message names the variable, the approved command,
-and the isolated alternative.
+approved one. Each refusal message names the variable, the desktop opt-in, the
+owner's standing approval, and the isolated alternative.
 
 The native examples cover:
 

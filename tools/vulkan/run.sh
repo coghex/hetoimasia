@@ -31,7 +31,8 @@
 # and teardown are part of the run. A run that already carries consent — the
 # isolated display it was started inside, or the desktop opt-in — uses it, and
 # no second display is started. On macOS `HETOIMASIA_NATIVE_SESSION=desktop`
-# must be on the run's own command, and this supplies none. Every argument after `--` reaches the executable.
+# must be on the run's own command, and this supplies none. Every argument
+# after `--` reaches the executable.
 #
 # Every input comes from one place: `tools/native/native.py prepare`, which
 # refuses the prefix unless it is exactly what this configuration provisions

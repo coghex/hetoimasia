@@ -396,5 +396,5 @@ Any eventual implementation keeps its code, required contracts, tests, and
 retained evidence in one PR under the repository's normal workflow. Use
 package-owned Hspec tests, explicit concurrency coordination, and the validation
 planner. Performance claims require measurements. Native desktop disruption
-requires separate human consent. This report grants none and publishes no
+requires separate human consent (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). This report grants none and publishes no
 tracker mutation.

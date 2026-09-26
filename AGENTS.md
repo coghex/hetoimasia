@@ -125,9 +125,9 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   runs their headless suites (`native-tests`, `shader-tests`,
   `integration-tests`) — the group `test.vulkan-headless` — and needs no
   consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
-  windows and presents on macOS, so it takes the same per-session desktop
-  approval as `glfw-native-tests`; on Linux its runner starts an isolated X11
-  display. See [gpu_backend.md](docs/gpu_backend.md#the-native-suite).
+  windows and presents on macOS, so it takes the same desktop opt-in, under the
+  same standing approval, as `glfw-native-tests`; on Linux its runner starts an
+  isolated X11 display. See [gpu_backend.md](docs/gpu_backend.md#the-native-suite).
 - Without the GLFW SDK, build and run the foundation, runtime, Lua host, and
   root suites with `--project-file cabal.project.cpu`, which shares
   `cabal.project.common` with `cabal.project` and leaves out `hetoimasia-glfw`,

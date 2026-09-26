@@ -241,7 +241,7 @@ and evidence identity; retain the proof's historical results as historical.
   driver waits. Record toolchain, layers and driver identity. Do not assert an
   unmeasured speedup or add noisy timing thresholds to required CI. Existing
   Linux-only remote CI, local macOS verification and explicit human approval for
-  desktop disruption still apply.
+  desktop disruption still apply (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)).
 - **Scope and constraints:** code, required contract updates and evidence belong
   together in each implementation PR. This finding does not authorize changing
   Lua's FFI settings, rewriting the foundation logger, broad RTS tuning, a new
@@ -396,7 +396,7 @@ machine is available. Neither is a claim of current support or native evidence.
   define the qualification groups and their promotion to small
   required-when-affected checks when support is established. Extensive desktop
   and compositor-specific probes remain optional. Preserve local macOS testing
-  and explicit human consent for desktop disruption. Do not block the existing
+  and explicit human consent for desktop disruption (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). Do not block the existing
   macOS/X11 milestone on Windows or full desktop-platform parity.
 
 **Handoff context:**
