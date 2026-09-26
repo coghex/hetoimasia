@@ -3,9 +3,10 @@
 Hetoimasia is a modular Haskell game-engine project. Read [MEMORY.md](MEMORY.md)
 for continuity, [the foundation design](docs/engine_foundation_design.md) for
 boundaries, and [workflow.md](docs/workflow.md) for Kanban delivery.
-The durable owner direction is [vision.md](docs/vision.md); `$guide` checks
-issues and merged work against it and records snapshot-scoped coverage in
-`docs/guide/` while development continues. It does not grant issue/PR approval.
+The durable owner direction is [vision.md](docs/vision.md); `$guide` (`/guide`
+in Claude Code) checks issues and merged work against it, records snapshot-scoped
+coverage in `docs/guide/` and resumes from [its cursor](docs/guide/CURSOR.md)
+while development continues. It does not grant issue/PR approval.
 These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Architecture
@@ -15,6 +16,9 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 - Keep Cabal components in separate source directories. Expose small public
   interfaces; hide implementation modules. Do not share root `app/` sources
   with libraries to evade a component boundary.
+- Follow [module conventions](docs/module_conventions.md): `Base` and `Types`
+  are flexible defaults; dedicated type modules are welcome. Preserve acyclic
+  dependencies. The planned math package imports no other local or graphics package.
 - The application entry point assembles services. Pass narrow services or
   abstract handles to consumers; do not introduce a universal `EngineEnv`,
   service locator, or global mutable registry.

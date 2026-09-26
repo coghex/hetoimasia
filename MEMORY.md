@@ -8,65 +8,31 @@ Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
 [the memory archive](docs/history/memory_before_2026-09-17.md). Read only the
 owning subsystem's contract/design when continuing its work.
 
-For a fresh architectural review, start with [the vision guide](docs/vision.md)
-and run `$guide`. Its reports in `docs/guide/` record the exact code and tracker
-versions checked, findings and pending concurrent work. The skill is installed
-at `~/.codex/skills/guide/SKILL.md`; it is advisory and does not replace Kanban
-approval or project-review records.
-
-The [first guide review](docs/guide/2026-09-20T183233Z-d40c387-6e92.md) covers
-seven later merged PRs through `d40c387`, the current issue specifications,
-743 passing headless examples and the remaining amendments/housekeeping.
-The owner accepted legacy coverage through `a89d419`; together these complete
-the guide's historical review queue through `d40c387`. Those five findings are
-now processed; implementation remains tracked in #201, #208, #211 and #212,
-and qualification gates remain in force. The [next guide review](docs/guide/2026-09-20T201612Z-8b2fcfd-ff7e.md)
-extends coverage through `8b2fcfd` (PR #210). Its two findings are now processed:
-graphics-owner design under #155 and the wording repair #224. The
-[third guide review](docs/guide/2026-09-21T035017Z-9f72b04-768f.md) extends coverage
-through `9f72b04` (PRs #213/#214), checks the newly approved Vulkan and repair
-issues, and records the owner-approved amendments now posted to #216/#220, with
-coordination on #229/#221. GUIDE-3 is filed as #234, so all three findings have
-tracker destinations. Posting the amendments does not claim
-their implementations are complete or replace canonical readiness review.
-`$guide continue` handles one follow-up at a time without repeating old audits.
-
-The [fourth guide review](docs/guide/2026-09-21T140419Z-25a37d2.md) extends completed
-coverage through `25a37d2`, including #235's Wayland/backport work and #236's X11
-repair. Its 170 selected existing examples pass; two new probes on each Bash
-reproduce missed high-status/signal termination in the X11 observer. GUIDE-1
-is filed as #237; all findings in this report are processed. The
-earlier pending #235 handoff is now covered; the next report below advances
-this review boundary. GLFW-UP-1 remains in its existing upgrade report, and native Wayland,
-Vulkan and Lua qualification gates remain unchanged.
-
-The [complete guide continuation](docs/guide/2026-09-23T165422Z-68ddbbc-complete.md)
-closes every review gap through `68ddbbc`: all eight merged PRs #238–#245 and
-the direct documentation delta are covered, including the earlier report's
-148 passing owner/protected/opacity examples. New checks: 98 headless Vulkan
-examples pass; workflow has 497 passes and one reproduced flake-lab failure.
-GUIDE-1 is filed as [#246](https://github.com/coghex/hetoimasia/issues/246)
-after owner approval: repair macOS exited-group EPERM overwriting timeout
-outcomes. GUIDE-2's two footprint passages are corrected in the docs worktree,
-awaiting documentation landing: 60 MiB is the last reported sample before
-termination. No new issue is needed. Filing #246 does not establish readiness or a fix.
-The earlier owner-approved [amendment to #237](https://github.com/coghex/hetoimasia/issues/237#issuecomment-5798902077)
-is posted; its X11 repair remains open. Next audit starts after `68ddbbc`, plus
-changed effective issue specs. Separate report queues and qualification gates
-remain open; completed coverage is not their resolution.
-
-The [2026-09-24 guide review](docs/guide/2026-09-24T140902Z-425e97b.md) extends
-complete coverage through `425e97b`: PRs #247/#248/#249/#252 and the direct
-documentation landing. #246/#237/#217/#216 are closed and the footprint wording
-is published. One new repair is reproduced: diagnostic finalization can replace
-an earlier body failure with a later cancellation. Resume its GUIDE-1 before
-composing the diagnostics into #219. #251 and #221 are independent next work;
-#220 needs a fresh canonical gate after its synchronization-validation amendment.
-The report records exact issue fingerprints and checks; no issue was drafted
-or filed. Next audit starts after `425e97b`, plus changed specs/docs.
+For an architectural review, run `$guide` (Codex) or `/guide` (Claude Code);
+the skill lives at `~/.codex/skills/guide/` and Claude Code links to it. It
+checks merged work and changed issues against [the vision](docs/vision.md) and
+records each run in `docs/guide/`. Start from
+[the guide cursor](docs/guide/CURSOR.md): it holds the resume boundary, open
+guide findings, pending handoff and the latest alignment reading per principle.
+Guide is advisory and does not replace Kanban approval or project-review records.
 
 ## Direction and owner preferences
 
+- Owner decision 2026-09-26: [module conventions](docs/module_conventions.md)
+  settle flexible `Base`/`Types`, dedicated type modules, and independent
+  `packages/math` for abstract mathematical structures and operations. Math
+  imports no other local or graphics package; its API remains undesigned.
+  Finish structural refactors before resuming the feature backlog. #267/#265
+  is merged at `9e2f033` and guide-audited at that pin.
+  Owner sequencing clarification: refactor existing code into the flexible
+  `Base`/`Types` layers first; defer the GPU-model `State.hs` decomposition until
+  that refactor is complete. Package scope and delivery slices still need
+  planning. Defer math-package implementation; it blocks neither refactor.
+  Module-specific types live under the owning module's directory, such as
+  `Camera/Types.hs`, `Camera/Base.hs` or dedicated `Camera/Vertex.hs`.
+  Keep `Base`/`Types` below roughly 600 lines; split coherent subcomponents
+  when they grow. The foundation layout is being proposed in
+  [its refactor design](docs/designs/foundation_modules_design.md).
 - On 2026-09-23 the owner requested documentation-only tracing design, with no
   issue drafts or filing. [Runtime tracing](docs/runtime_tracing_design.md)
   proposes opt-in GHC eventlog capture, bounded engine records and offline

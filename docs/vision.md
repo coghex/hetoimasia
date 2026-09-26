@@ -27,6 +27,14 @@ and game managers are not the new architecture. A future 2D module should make
 migrating game behavior practical without promising source compatibility.
 See [foundation direction](engine_foundation_design.md) and [AGENTS](../AGENTS.md).
 
+Owner decision 2026-09-26: use flexible subsystem-local `Base`/`Types`
+conventions, allowing dedicated type modules and explicit low-level local
+contracts. Shared mathematics and mathematical structures belong in a separate
+`packages/math` Cabal package, independent of every other local package and of
+graphics packages. Rendering policy and API adapters stay with graphics.
+The package is planned; numerical APIs remain to be designed. See
+[module conventions](module_conventions.md) for the accepted boundaries.
+
 ### V-2. Build infrastructure methodically
 
 Logging, failures, resources, messaging, supervision, timing and window ownership
