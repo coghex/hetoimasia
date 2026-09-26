@@ -20,7 +20,10 @@ import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (allocResource)
+import GHC.Clock (getMonotonicTime)
 import System.Exit (ExitCode (..))
+import System.Posix.Signals (nullSignal, signalProcess)
+import Text.Read (readMaybe)
 import Test.GLFW.Native.Consent
   ( Consent (..)
   , NativeSessionRefused (..)
@@ -315,6 +318,23 @@ spec = describe "the native opt-in" $ do
                 }
       verdict ← try (Private.launchWith gate failing "session-lifecycle")
       either (\(_ ∷ SomeException) → True) (const False) verdict `shouldBe` True
+
+    -- A real process, but no session and no private-session child, so it
+    -- needs no consent: the shell exits at once while the sleep it started
+    -- keeps the shell's output open.
+    it "keeps its deadline through output collection, ending a descendant that holds the child's output open" $ do
+      started ← getMonotonicTime
+      launched ← Private.launchCommand 1 "sh" ["-c", "sleep 300 & echo \"$!\"; exit 0"]
+      elapsed ← subtract started <$> getMonotonicTime
+      Private.launchedEnd launched `shouldBe` Private.ChildExpired 1 ExitSuccess
+      -- A generous failure bound, not a performance threshold: without the
+      -- deadline the launcher would wait for the sleep's 300 seconds.
+      elapsed `shouldSatisfy` (< 1 + 2 * Private.terminationGrace + 10)
+      descendant ←
+        maybe (fail ("the shell printed no descendant: " <> show (Private.launchedOut launched))) pure $
+          readMaybe (takeWhile (/= '\n') (Private.launchedOut launched))
+      gone ← try (signalProcess nullSignal (fromInteger descendant))
+      either (\(_ ∷ SomeException) → True) (const False) gone `shouldBe` True
 
     it "refuses a directly invoked child before looking up its scenario, and keeps the unknown-scenario exit for an approved one" $ do
       let plan consent name = either (\(code, message) → Left (code, message)) (Right . map fst) (Private.childPlan consent name)

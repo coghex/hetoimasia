@@ -2,11 +2,15 @@
 -- private-session child itself runs, such as a compositor's readiness probe.
 --
 -- A child runs in a process group of its own, with every byte it writes read
--- concurrently, and is waited for until its deadline. One still running then is
--- sent @SIGTERM@ with its whole group, then @SIGKILL@ after 'terminationGrace'
--- seconds, and is reaped either way, so a hung child and anything it started in
--- its group never outlive the example that launched it. A failure of the waiting
--- itself, an interruption included, kills the group before it propagates.
+-- concurrently, and its deadline covers both its exit and the end of its
+-- output: a child that exits while a descendant still holds its output open is
+-- not finished. One unfinished at the deadline is sent @SIGTERM@ with its whole
+-- group, then @SIGKILL@ after 'terminationGrace' seconds, and is reaped either
+-- way; output still held open from outside the group after that is given up on,
+-- keeping what was read. Whatever the child left running in its group is
+-- killed once it is done, so neither a hung child nor anything it started
+-- outlives the example that launched it. A failure of the waiting itself, an
+-- interruption included, kills the group before it propagates.
 --
 -- The deadline is enforced from outside the child and reported as
 -- 'ChildExpired'. Nothing here decides what an expiry means; a caller that
@@ -20,12 +24,14 @@ module Test.GLFW.Native.Child
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
-import Control.Exception (SomeException, onException, try)
-import Control.Monad (void)
+import Control.Exception (SomeException, catch, finally, onException, try)
+import Control.Monad (forM_, unless, void)
+import qualified Data.ByteString as ByteString
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import qualified Data.Text as Text
+import Data.Text.Encoding (decodeUtf8Lenient)
 import System.Exit (ExitCode)
-import System.IO (hGetContents')
 import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcessGroup)
 import System.Posix.Types (ProcessID)
 import System.Process
@@ -42,8 +48,9 @@ data ChildEnd
   = ChildExited !ExitCode
     -- ^ It exited by itself within its deadline.
   | ChildExpired !Double !ExitCode
-    -- ^ It was still running when its deadline, in seconds, passed. It was
-    -- terminated with its process group and reaped with this status.
+    -- ^ It had not finished when its deadline, in seconds, passed: it was still
+    -- running, or a descendant still held its output open. Its process group
+    -- was terminated, and it was reaped with this status.
   deriving (Eq, Show)
 
 -- | What a bounded child left: how it ended, everything it wrote, and the
@@ -77,33 +84,49 @@ launchCommandIn environment deadline command arguments = do
         , create_group = True
         }
   pid ← getPid handle >>= maybe (ioError (userError ("the child " <> command <> " exited before its identifier was read"))) pure
-  outText ← newEmptyMVar
-  errText ← newEmptyMVar
-  mapM_
-    ( \(piped, into) →
-        forkIO $
-          maybe (pure "") (fmap (either (\(_ ∷ SomeException) → "") id) . try . hGetContents') piped
-            >>= putMVar into
-    )
-    [(pipedOut, outText), (pipedErr, errText)]
+  outBytes ← newIORef ByteString.empty
+  errBytes ← newIORef ByteString.empty
+  outDone ← newTVarIO False
+  errDone ← newTVarIO False
+  forM_ [(pipedOut, outBytes, outDone), (pipedErr, errBytes, errDone)] $ \(piped, into, done) →
+    forkIO $
+      (mapM_ (drainInto into) piped `catch` \(_ ∷ SomeException) → pure ())
+        `finally` atomically (writeTVar done True)
   exited ← newTVarIO Nothing
   _ ← forkIO (waitForProcess handle >>= atomically . writeTVar exited . Just)
   let reaped = readTVar exited >>= maybe retry pure
-      reapedWithin seconds = do
+      -- Finished means reaped with both pipes at end of file: a descendant
+      -- that still holds the child's output keeps it unfinished.
+      finished = reaped <* (readTVar outDone >>= check) <* (readTVar errDone >>= check)
+      within seconds done = do
         timer ← registerDelay (max 1 (round (seconds * 1000000)))
-        atomically ((Just <$> reaped) `orElse` (Nothing <$ (readTVar timer >>= check)))
+        atomically ((Just <$> done) `orElse` (Nothing <$ (readTVar timer >>= check)))
       killGroup = signalGroup sigKILL pid >> atomically reaped
   end ←
-    ( reapedWithin deadline >>= \case
+    ( within deadline finished >>= \case
         Just status → pure (ChildExited status)
         Nothing → do
           signalGroup sigTERM pid
-          reapedWithin terminationGrace >>= \case
+          within terminationGrace finished >>= \case
             Just status → pure (ChildExpired deadline status)
-            Nothing → ChildExpired deadline <$> killGroup
+            Nothing → do
+              signalGroup sigKILL pid
+              -- Bounded too: output held open from outside the group is given
+              -- up on, and what was read so far is kept.
+              _ ← within terminationGrace finished
+              ChildExpired deadline <$> atomically reaped
     )
       `onException` killGroup
-  Launched end <$> takeMVar outText <*> takeMVar errText <*> pure pid
+  -- Anything the child started in its group and left running goes with it.
+  signalGroup sigKILL pid
+  Launched end <$> decoded outBytes <*> decoded errBytes <*> pure pid
+  where
+    drainInto into piped = do
+      chunk ← ByteString.hGetSome piped 4096
+      unless (ByteString.null chunk) $ do
+        atomicModifyIORef' into (\held → (held <> chunk, ()))
+        drainInto into piped
+    decoded bytes = Text.unpack . decodeUtf8Lenient <$> readIORef bytes
 
 -- | Signal a child's process group, which it leads; a group already gone is
 -- not an error.
