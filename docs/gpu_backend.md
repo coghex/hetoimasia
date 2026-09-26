@@ -68,8 +68,13 @@ the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recor
 `Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`, its production layer, and
 `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
 embedded shaders. The package's private modules, which no client can import,
-are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`,
-and the recording's implementation under
+are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`;
+the generations' implementation under
+`Hetoimasia.GPU.Vulkan.Native.Internal.Generations`: `State`, `Uses`,
+`Disposal`, `Reconciliation`, `Step`, `Retirement` and `Observation`, which the
+public generations module re-exports as it always exported them (see
+[How the generations are built](#how-the-generations-are-built)); and the
+recording's implementation under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Recording`: `Layer`, `State`,
 `Construction`, `Recorder`, `Batches`, `Readback` and `Disposal`, which the
 public recording module re-exports as it always exported them (see
@@ -431,6 +436,34 @@ VK-12 and VK-13.
   generation whose holds have ended, and raises `GenerationsRetained` —
   manufacturing no evidence — if any remains, which retains the surface, the
   window and every parent.
+
+### How the generations are built
+
+`Hetoimasia.GPU.Vulkan.Native.Generations` is the entry point and holds no code
+of its own: it re-exports, with unchanged names, signatures and constructor
+visibility, what seven private modules under
+`Hetoimasia.GPU.Vulkan.Native.Internal.Generations` implement. The split (#266)
+moved code and changed no behaviour; each module's Haddock states what it owns.
+
+| Module | Responsibility | Depends on |
+| --- | --- | --- |
+| `State` | The `Generations` and its one map of target records, each with its generation records; the conditions, standings and swapchain results; the constructors and `trackTarget`; the three failures; and the lookup, edit, ended-CPU-use and asynchrony helpers every other module shares. | — |
+| `Uses` | `noteSwapchainResult`, and holding and ending a CPU use of the active generation, in `STM` on any thread. | `State` |
+| `Disposal` | Destroying every retired generation whose holds ended, views newest first and then the swapchain, each in one masked step; and the model's progress turn that records the disposals. | `State` |
+| `Reconciliation` | One target brought to its latest geometry: eligibility and suspension, planning, settling, recovery through the model's episode, capacity and the one-generation path, and the masked construction, naming and publication of a candidate with its `oldSwapchain` handover. | `State`, `Disposal` |
+| `Step` | `stepGenerations` — disposal, then each named target's reconciliation, then one progress turn — and `generationsDeadline`. | `State`, `Disposal`, `Reconciliation` |
+| `Retirement` | `retireTargetGenerations`: close, retire the active generation, dispose, and forget the target only once none remains. | `State`, `Disposal` |
+| `Observation` | `readTargetGenerations` and its views. | `State` |
+
+The graph is acyclic, and no module adds state: the target records and their
+generation records are the one map `State` creates, and each module edits only
+what its own operation concerns — the table in the public module's Haddock
+names which. A `GenerationUse`'s ended flag belongs to its holder, and a
+construction's note of the creation call in progress to that one construction.
+`Generations` and `GenerationUse` stay abstract: their constructors are
+exported only by `State` and `Uses`, which clients cannot import. The
+recording's private modules still import the public module, and no new module
+declares a foreign import.
 
 ## Recording through managed resources
 
@@ -852,8 +885,8 @@ retains its parents.
 | Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
 | Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
 | Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
-| Generation records | The generations | The owner's step builds, replaces and destroys; any thread holds and ends a CPU use, or reports a swapchain result, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
-| Swapchain results | The generations | The owner reports; its step consumes | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
+| Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
+| Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 | Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
@@ -954,6 +987,14 @@ batch's record with it; invalid viewports and scissors refused; and the FFI audi
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 
+#266's examples, `Generations visibility across the package boundary`, compile
+external clients the same way: one that imports every name the public
+generations module exports, with the constructors it exports, must compile;
+one per `Internal.Generations` module must be refused as a hidden module of
+this package (`GHC-87110`), never as a missing one; and one naming the
+constructor of each abstract type — `Generations`, `GenerationUse` — must be
+refused because the public module does not export it (`GHC-10237`).
+
 #265's examples, `Recording visibility across the package boundary`, compile
 external clients through the shared harness (`Test.Support.ExternalClient`)
 against the built package and the dependency store, typechecking only: one that
@@ -996,6 +1037,9 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). #250's are retained as
 the recording's split into private modules, are retained as
 [`docs/vulkan/macos-recording-split.md`](vulkan/macos-recording-split.md) and
 [`docs/vulkan/linux-recording-split.md`](vulkan/linux-recording-split.md).
+#266's, taken again over the generations' split into private modules, are
+retained as [`docs/vulkan/macos-generations-split.md`](vulkan/macos-generations-split.md)
+and [`docs/vulkan/linux-generations-split.md`](vulkan/linux-generations-split.md).
 The macOS evidence for the owner's standing desktop approval, taken again over
 the suites' consent wording, is retained as
 [`docs/vulkan/macos-standing-approval.md`](vulkan/macos-standing-approval.md);

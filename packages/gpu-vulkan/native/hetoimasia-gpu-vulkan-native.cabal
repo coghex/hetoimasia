@@ -88,8 +88,26 @@ library
     -- Disposal each own one stage of a generation's or a batch's life and
     -- expose steps, such as retiring completed batches, that only another
     -- stage may take. See packages/gpu-vulkan/native/README.md.
+    --
+    -- Internal.Generations.* is the swapchain generations' implementation,
+    -- split by responsibility (#266); Generations re-exports its public names
+    -- unchanged. Each is private because it exports what clients must never
+    -- reach: State holds the target and generation records and the
+    -- constructor of Generations, which Generations exports only abstractly;
+    -- Uses holds GenerationUse's constructor; Disposal, Reconciliation, Step,
+    -- Retirement and Observation each own one part of a generation's or a
+    -- target's life and expose steps, such as a single target's
+    -- reconciliation or the model's progress turn, that only another part may
+    -- take.
     other-modules:
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Retirement
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Step
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Uses
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal
@@ -192,9 +210,9 @@ test-suite shader-tests
 -- the loader only because the library does, so it is built and run through
 -- `tools/vulkan/run.sh test` — the group `test.vulkan-headless` — which points
 -- Cabal at the provisioned prefix. It shares `test/` with the shader suite and has its own
--- main. Its recording visibility examples typecheck external clients against
--- the built package through `hetoimasia-test-support`'s harness, with the
--- `ghc` on PATH, as the shader suite's client does.
+-- main. Its recording and generations visibility examples typecheck external
+-- clients against the built package through `hetoimasia-test-support`'s
+-- harness, with the `ghc` on PATH, as the shader suite's client does.
 test-suite native-tests
     import: language
     type: exitcode-stdio-1.0
@@ -202,6 +220,7 @@ test-suite native-tests
     hs-source-dirs: test
     other-modules:
         Test.GPU.Vulkan.Native.Generations
+        Test.GPU.Vulkan.Native.GenerationsVisibility
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Recording

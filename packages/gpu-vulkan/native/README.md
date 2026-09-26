@@ -34,7 +34,21 @@ destroys it.
   destruction child before parent once every hold has ended. Its calls are the
   roots' `GenerationOps`. `newGenerationsCapturing` also makes a generation's
   images transfer sources where the surface offers it, for a verification
-  capture; no normal target is built that way.
+  capture; no normal target is built that way. It is the entry point only: its
+  code lives in private modules under
+  `Hetoimasia.GPU.Vulkan.Native.Internal.Generations`, which it re-exports
+  unchanged and no client can import. `State` holds the `Generations`, its
+  target and generation records, the conditions, standings and failures, and
+  the helpers every other module shares; `Uses` notes swapchain results and
+  holds and ends CPU uses in `STM`; `Disposal` destroys generations whose holds
+  ended, child before parent, and runs the model's progress turn;
+  `Reconciliation` brings one target to its latest geometry — planning,
+  settling, recovery, capacity, construction and publication; `Step` owns the
+  owner's step and its deadline; `Retirement` retires a target's generations
+  before its surface; and `Observation` reads a target's view. Only `State`
+  creates state, and the public module's Haddock tables which module writes
+  which part of it (see
+  [the backend contract](../../../docs/gpu_backend.md#how-the-generations-are-built)).
 - `Hetoimasia.GPU.Vulkan.Native.Recording` is VK-11's renderer-facing boundary
   over an open native layer (`RecordingOps`): opaque managed handles — a
   pipeline layout, a pipeline, a frame slot's command storage, a readback
@@ -103,10 +117,9 @@ that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
 points Cabal at the provisioned loader and headers. Its headless suite,
 `native-tests` (`test/RootsMain.hs`), runs the profile's, the roots', the
 presentation planner's, the generations' and the recording's examples over
-stand-in native layers, and external clients proving the recording's
-implementation modules hidden and its public imports intact; the shader suite
-runs beside it,
-both in the validation group `test.vulkan-headless`; its native cases run in
+stand-in native layers, and external clients proving the generations' and the
+recording's implementation modules hidden and their public imports intact; the
+shader suite runs beside it, both in the validation group `test.vulkan-headless`; its native cases run in
 the window integration's native suite, `test.vulkan-native` — see
 [the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
 
