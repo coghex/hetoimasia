@@ -44,11 +44,15 @@
 ** for p from a record free for p + 1 when the capacity is one, and a one-record
 ** queue is a valid configuration here.
 **
-** Every record's space is carved out of three arrays allocated once: the
-** records, `queue_capacity * object_limit` object records, and
-** `queue_capacity * text_budget` bytes of text. A record's text budget is
-** shared by its message id name, its message and every object name, in that
-** order, so a record never copies more than the budget in total.
+** Every record's space is carved out of four arrays allocated once: the
+** records, `queue_capacity * object_limit` object records,
+** `queue_capacity * 2 * label_limit` label records — a record's queue labels
+** first, then its command-buffer labels — and `queue_capacity * text_budget`
+** bytes of text. A record's text budget is shared by its message id name, its
+** message, every object name, every queue label name and every command-buffer
+** label name, in that order, so a record never copies more than the budget in
+** total. Nothing is allocated after the storage is built: the producer only
+** copies into what these arrays already hold.
 */
 #include "hetoimasia_vulkan_capture.h"
 
@@ -65,6 +69,20 @@ typedef struct capture_object {
   int has_name;
 } capture_object;
 
+typedef struct capture_label {
+  uint32_t name_offset;
+  uint32_t name_length;
+  int has_name;
+} capture_label;
+
+/* One of a record's two label arrays: what the callback reported, and what was
+   copied into `labels`. */
+typedef struct capture_labels {
+  uint32_t reported;
+  uint32_t count;
+  capture_label *labels;
+} capture_labels;
+
 struct hetoimasia_capture_record {
   _Atomic uint64_t sequence;
   uint32_t severity;
@@ -80,6 +98,8 @@ struct hetoimasia_capture_record {
   uint32_t object_count;
   char *text;
   capture_object *objects;
+  capture_labels queue_labels;
+  capture_labels cmd_buf_labels;
 };
 
 struct hetoimasia_capture_storage {
@@ -88,6 +108,7 @@ struct hetoimasia_capture_storage {
   hetoimasia_capture_limits limits;
   struct hetoimasia_capture_record *records;
   capture_object *objects;
+  capture_label *labels;
   char *text;
   _Atomic uint64_t enqueue;
   /* The consumer's position. Only the single consumer reads or writes it. */
@@ -147,7 +168,7 @@ int hetoimasia_capture_create(
 {
   *out = NULL;
   if (limits == NULL || limits->queue_capacity == 0 || limits->text_budget == 0
-      || limits->object_limit == 0) {
+      || limits->object_limit == 0 || limits->label_limit == 0) {
     return HETOIMASIA_CAPTURE_INVALID_LIMIT;
   }
 
@@ -156,6 +177,8 @@ int hetoimasia_capture_create(
   size_t record_bytes = checked_multiply(capacity, sizeof(struct hetoimasia_capture_record), &overflow);
   size_t object_slots = checked_multiply(capacity, limits->object_limit, &overflow);
   size_t object_bytes = checked_multiply(object_slots, sizeof(capture_object), &overflow);
+  size_t label_slots = checked_multiply(checked_multiply(capacity, 2, &overflow), limits->label_limit, &overflow);
+  size_t label_bytes = checked_multiply(label_slots, sizeof(capture_label), &overflow);
   size_t text_bytes = checked_multiply(capacity, limits->text_budget, &overflow);
   /* Positions run on a 64-bit counter and wrap only after 2^64 records. */
   if (overflow) {
@@ -165,11 +188,13 @@ int hetoimasia_capture_create(
   hetoimasia_capture_storage *storage = calloc(1, sizeof *storage);
   struct hetoimasia_capture_record *records = malloc(record_bytes);
   capture_object *objects = malloc(object_bytes);
+  capture_label *labels = malloc(label_bytes);
   char *text = malloc(text_bytes);
-  if (storage == NULL || records == NULL || objects == NULL || text == NULL) {
+  if (storage == NULL || records == NULL || objects == NULL || labels == NULL || text == NULL) {
     free(storage);
     free(records);
     free(objects);
+    free(labels);
     free(text);
     return HETOIMASIA_CAPTURE_OUT_OF_MEMORY;
   }
@@ -188,6 +213,7 @@ int hetoimasia_capture_create(
     free(storage);
     free(records);
     free(objects);
+    free(labels);
     free(text);
     return HETOIMASIA_CAPTURE_NO_SLOT;
   }
@@ -209,6 +235,7 @@ int hetoimasia_capture_create(
   storage->limits = *limits;
   storage->records = records;
   storage->objects = objects;
+  storage->labels = labels;
   storage->text = text;
   storage->dequeue = 0;
   atomic_init(&storage->enqueue, 0);
@@ -218,6 +245,8 @@ int hetoimasia_capture_create(
     atomic_init(&record->sequence, 2 * (uint64_t) position);
     record->text = text + position * limits->text_budget;
     record->objects = objects + position * limits->object_limit;
+    record->queue_labels.labels = labels + position * 2 * (size_t) limits->label_limit;
+    record->cmd_buf_labels.labels = record->queue_labels.labels + limits->label_limit;
   }
   /* Published last: admission opens only once the storage is whole. */
   atomic_store(&slot->storage, storage);
@@ -234,6 +263,11 @@ size_t hetoimasia_capture_record_size(void)
 size_t hetoimasia_capture_object_size(void)
 {
   return sizeof(capture_object);
+}
+
+size_t hetoimasia_capture_label_size(void)
+{
+  return sizeof(capture_label);
 }
 
 void *hetoimasia_capture_user_data(const hetoimasia_capture_storage *storage)
@@ -253,6 +287,7 @@ void hetoimasia_capture_free(hetoimasia_capture_storage *storage)
   atomic_store(&slot->storage, NULL);
   free(storage->records);
   free(storage->objects);
+  free(storage->labels);
   free(storage->text);
   free(storage);
   /* The slot keeps its latches and counters until it is claimed again, so a
@@ -286,6 +321,46 @@ static uint32_t bounded_copy(char *destination, const char *source, uint32_t roo
     *truncated = 1;
   }
   return copied;
+}
+
+/*
+** Copy one of the callback's label arrays into `destination`, in the callback's
+** order: at most `limit` labels, each name under what the shared budget has
+** left. Excess labels, a positive count with a NULL array, and a name the budget
+** cut all set `*truncated`.
+*/
+static void copy_labels(
+  capture_labels *destination,
+  char *text,
+  uint32_t *used,
+  uint32_t budget,
+  uint32_t limit,
+  uint32_t reported,
+  const hetoimasia_capture_label *source,
+  int *truncated)
+{
+  destination->reported = reported;
+  destination->count = 0;
+  if (reported > 0 && source == NULL) {
+    *truncated = 1;
+    return;
+  }
+  uint32_t wanted = reported;
+  if (wanted > limit) {
+    wanted = limit;
+    *truncated = 1;
+  }
+  for (uint32_t index = 0; index < wanted; index++) {
+    capture_label *label = &destination->labels[index];
+    label->has_name = source[index].label_name != NULL;
+    label->name_offset = *used;
+    label->name_length = 0;
+    if (label->has_name) {
+      label->name_length = bounded_copy(text + *used, source[index].label_name, budget - *used, truncated);
+      *used += label->name_length;
+    }
+  }
+  destination->count = wanted;
 }
 
 /* Fill a claimed record. Answers whether anything had to be cut. */
@@ -345,6 +420,13 @@ static int fill(
     }
     record->object_count = wanted;
   }
+
+  copy_labels(
+    &record->queue_labels, record->text, &used, budget, limits->label_limit,
+    data->queue_label_count, data->queue_labels, &truncated);
+  copy_labels(
+    &record->cmd_buf_labels, record->text, &used, budget, limits->label_limit,
+    data->cmd_buf_label_count, data->cmd_buf_labels, &truncated);
 
   record->truncated = truncated;
   return truncated;
@@ -547,6 +629,36 @@ uint32_t hetoimasia_capture_record_object_name_length(const hetoimasia_capture_r
   return record->objects[index].name_length;
 }
 
+static const capture_labels *labels_of(const hetoimasia_capture_record *record, int queue)
+{
+  return queue ? &record->queue_labels : &record->cmd_buf_labels;
+}
+
+uint32_t hetoimasia_capture_record_labels_reported(const hetoimasia_capture_record *record, int queue)
+{
+  return labels_of(record, queue)->reported;
+}
+
+uint32_t hetoimasia_capture_record_label_count(const hetoimasia_capture_record *record, int queue)
+{
+  return labels_of(record, queue)->count;
+}
+
+int hetoimasia_capture_record_label_has_name(const hetoimasia_capture_record *record, int queue, uint32_t index)
+{
+  return labels_of(record, queue)->labels[index].has_name;
+}
+
+const char *hetoimasia_capture_record_label_name(const hetoimasia_capture_record *record, int queue, uint32_t index)
+{
+  return record->text + labels_of(record, queue)->labels[index].name_offset;
+}
+
+uint32_t hetoimasia_capture_record_label_name_length(const hetoimasia_capture_record *record, int queue, uint32_t index)
+{
+  return labels_of(record, queue)->labels[index].name_length;
+}
+
 int hetoimasia_capture_status(void *user_data, uint64_t *counters, int *latches)
 {
   uint64_t generation;
@@ -587,8 +699,20 @@ uint32_t hetoimasia_capture_offer(
   const int32_t *object_types,
   const uint64_t *object_handles,
   const char *const *object_names,
+  uint32_t queue_label_count,
+  const char *const *queue_label_names,
+  uint32_t cmd_buf_label_count,
+  const char *const *cmd_buf_label_names,
   int null_data)
 {
+  hetoimasia_capture_label queue_labels[queue_label_count > 0 ? queue_label_count : 1];
+  hetoimasia_capture_label cmd_buf_labels[cmd_buf_label_count > 0 ? cmd_buf_label_count : 1];
+  for (uint32_t index = 0; queue_label_names != NULL && index < queue_label_count; index++) {
+    queue_labels[index] = (hetoimasia_capture_label) {.label_name = queue_label_names[index]};
+  }
+  for (uint32_t index = 0; cmd_buf_label_names != NULL && index < cmd_buf_label_count; index++) {
+    cmd_buf_labels[index] = (hetoimasia_capture_label) {.label_name = cmd_buf_label_names[index]};
+  }
   hetoimasia_capture_object_name objects[object_count > 0 ? object_count : 1];
   for (uint32_t index = 0; object_types != NULL && index < object_count; index++) {
     objects[index].s_type = 0;
@@ -604,10 +728,10 @@ uint32_t hetoimasia_capture_offer(
     .message_id_name = id_name,
     .message_id_number = id_number,
     .message = message,
-    .queue_label_count = 0,
-    .queue_labels = NULL,
-    .cmd_buf_label_count = 0,
-    .cmd_buf_labels = NULL,
+    .queue_label_count = queue_label_count,
+    .queue_labels = queue_label_names == NULL ? NULL : queue_labels,
+    .cmd_buf_label_count = cmd_buf_label_count,
+    .cmd_buf_labels = cmd_buf_label_names == NULL ? NULL : cmd_buf_labels,
     .object_count = object_count,
     .objects = object_types == NULL ? NULL : objects,
   };
@@ -621,7 +745,7 @@ uint32_t hetoimasia_capture_offer_held(
   while (__atomic_load_n(gate, __ATOMIC_SEQ_CST) == 0) {
     sched_yield();
   }
-  return hetoimasia_capture_offer(user_data, severity, 0x2, NULL, 0, message, 0, NULL, NULL, NULL, 0);
+  return hetoimasia_capture_offer(user_data, severity, 0x2, NULL, 0, message, 0, NULL, NULL, NULL, 0, NULL, 0, NULL, 0);
 }
 
 uint32_t hetoimasia_capture_offer_announced(

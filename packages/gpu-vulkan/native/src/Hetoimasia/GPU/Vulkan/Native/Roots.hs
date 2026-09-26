@@ -39,6 +39,27 @@
 --    so every child's destruction still reports somewhere, and the instance's
 --    destruction is the last call that can invoke the capture's callback.
 --
+-- = Names
+--
+-- When the instance enabled @VK_EXT_debug_utils@ and the device offers its
+-- naming call ('opsInstrumentation'), the roots name what they own once a
+-- device exists to name it through ("Hetoimasia.GPU.Vulkan.Native.Naming"):
+-- the device and its one queue at the first admission, and each target's
+-- surface before the target is admitted, under the 'TargetId' the model is
+-- about to issue it. A naming call runs on the
+-- owner's thread like every other call here, and one that raised fails the
+-- admission exactly as any other native failure there does: a surface whose
+-- name could not be set is not admitted, so it is still its creator's, and the
+-- roots' own names are attempted again at the next admission. Two roots are
+-- never named. The instance: naming requires external synchronization of the
+-- object named, and the surface bridge's lease lets the main thread use the
+-- instance while the owner runs. The explicit messenger: the pinned loader
+-- answers its own wrapper for it and forwards a naming call without
+-- translating that wrapper, which MoltenVK then reads as one of its own objects
+-- and crashes on (#250), so no naming call is ever made for it; its
+-- diagnostics are the capture's, which names it nowhere. Without the extension
+-- nothing is named and nothing fails.
+--
 -- A destruction that raised is uncertain: it is recorded, never attempted
 -- again, and every parent that must outlive it is retained — a later step
 -- answers 'RootsRetained' and destroys nothing. No timeout, cancellation or
@@ -125,6 +146,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
 
     -- * For the generations above the roots
   , readRootsDevice
+  , readRootsInstrumentation
+  , nameRootsObject
   , rootsGenerationOps
   , rootsCall
   , stateRootsModel
@@ -144,6 +167,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (unless, when)
+import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -168,12 +192,21 @@ import Hetoimasia.GPU.Model
   )
 import Hetoimasia.GPU.Model.Budget (Budgets)
 import Hetoimasia.GPU.Model.Identity (DeviceId, SessionIdentity, TargetClass, TargetId, sessionIdentity)
+import Data.ByteString (ByteString)
+import Hetoimasia.GPU.Vulkan.Native.Naming
+  ( Instrumentation (..)
+  , NativeObjectKind (..)
+  , deviceName
+  , queueName
+  , surfaceName
+  )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan, SurfaceOffer)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DevicePlan (..)
-  , InstancePlan
+  , InstancePlan (..)
   , InstanceRequest
   , TargetRejection (..)
+  , debugUtilsExtension
   , planInstance
   , selectDevice
   , InstanceOffer
@@ -212,6 +245,14 @@ data RootOps q inst msgr phys dev = RootOps
     -- ^ Whether that queue family of that device presents to that surface.
   , opsDeviceLoss ∷ SomeException → Bool
     -- ^ Whether a failure one of these calls raised is the loss of the device.
+  , opsDeviceHandle ∷ dev → Word64
+    -- ^ The device's dispatchable handle, as its pointer's value.
+  , opsDeviceQueue ∷ dev → Word32 → IO Word64
+    -- ^ @vkGetDeviceQueue@: the dispatchable handle of the device's first
+    -- queue of that family, as its pointer's value.
+  , opsInstrumentation ∷ dev → IO (Maybe Instrumentation)
+    -- ^ The device's naming call, when it offers one. The roots ask only when
+    -- the instance enabled @VK_EXT_debug_utils@; 'Nothing' names nothing.
   , opsGenerations ∷ GenerationOps phys dev
     -- ^ The calls a target's swapchain generations are built and destroyed
     -- with ("Hetoimasia.GPU.Vulkan.Native.Generations").
@@ -313,6 +354,10 @@ data Roots q inst msgr phys dev = Roots
   , rootsModel ∷ !(TVar GpuModel)
   , rootsAdmitting ∷ !(TVar Bool)
   , rootsLoss ∷ !(TVar (Maybe GraphicsDeviceLost))
+  , rootsDebugUtils ∷ !(TVar Bool)
+    -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
+  , rootsNamed ∷ !(TVar Bool)
+    -- ^ Whether the device and its queue have been named.
   , rootsSession ∷ !SessionIdentity
   , rootsDeviceIdentity ∷ !DeviceId
   }
@@ -336,6 +381,8 @@ newRoots ops budgets clock = do
     <*> newTVarIO model
     <*> newTVarIO True
     <*> newTVarIO Nothing
+    <*> newTVarIO False
+    <*> newTVarIO False
     <*> pure session
     <*> pure device
 
@@ -451,6 +498,7 @@ startRoots roots request = do
   offer ← opsInstanceOffer ops
   plan ← either throwIO pure (planInstance request offer)
   created ← creating (rootsInstance roots) (opsCreateInstance ops plan)
+  atomically (writeTVar (rootsDebugUtils roots) (debugUtilsExtension `elem` planInstanceExtensions plan))
   _ ← creating (rootsMessenger roots) (opsCreateMessenger ops created)
   pure plan
   where
@@ -511,16 +559,52 @@ admitRootTarget roots classification surface = do
   where
     ops = rootsOps roots
     handle = targetSurfaceHandle surface
-    admit = atomically $ do
-      model ← readTVar (rootsModel roots)
-      case admitTarget classification model of
-        Admitted (next, target) → do
-          writeTVar (rootsModel roots) next
-          modifyTVar' (rootsTargets roots) $
-            Map.insert target (TargetRecord classification handle (targetSurfaceDestroy surface) Nothing)
-          pure (Right target)
+    -- The surface is named under the identity the model is about to issue, and
+    -- admitted only if the model still issues exactly that one: every
+    -- mutation of the model's targets is this owner's, so it does, and a model
+    -- that moved regardless is asked again rather than trusted.
+    admit = do
+      nameRoots roots
+      predicted ← atomically (admitTarget classification <$> readTVar (rootsModel roots))
+      case predicted of
+        Admitted (_, target) → do
+          instrumented ← readRootsInstrumentation roots
+          for_ instrumented $ \(_, instrumentation) →
+            nameRootsObject roots instrumentation ObjectSurface handle (surfaceName target)
+          settled ← atomically $ do
+            model ← readTVar (rootsModel roots)
+            case admitTarget classification model of
+              Admitted (next, admitted)
+                | admitted == target → do
+                    writeTVar (rootsModel roots) next
+                    modifyTVar' (rootsTargets roots) $
+                      Map.insert target (TargetRecord classification handle (targetSurfaceDestroy surface) Nothing)
+                    pure (Just (Right target))
+                | otherwise → pure Nothing
+              Backpressure kind → pure (Just (Left (TargetBudgetExhausted kind)))
+              Rejected _ → pure (Just (Left TargetAdmissionClosed))
+          maybe admit pure settled
         Backpressure kind → pure (Left (TargetBudgetExhausted kind))
         Rejected _ → pure (Left TargetAdmissionClosed)
+
+-- | Name the device and its queue, once, when the device offers naming. A
+-- call that raised leaves them unnamed, to be named again at the next
+-- admission. The explicit messenger is never named (see "Names" above).
+nameRoots ∷ Roots q inst msgr phys dev → IO ()
+nameRoots roots = do
+  named ← readTVarIO (rootsNamed roots)
+  unless named $
+    readRootsInstrumentation roots >>= \case
+      Nothing → pure ()
+      Just (device, instrumentation) → do
+        let ops = rootsOps roots
+            name = nameRootsObject roots instrumentation
+        name ObjectDevice (opsDeviceHandle ops device) deviceName
+        family ← fmap (planQueueFamily . fst) <$> atomically (readRootsDevice roots)
+        for_ family $ \index → do
+          queue ← guarded roots "vkGetDeviceQueue" (opsDeviceQueue ops device index)
+          name ObjectQueue queue (queueName index 0)
+        atomically (writeTVar (rootsNamed roots) True)
 
 -- | Destroy one target's surface and forget the target.
 --
@@ -753,6 +837,23 @@ readRootsDevice roots =
   readTVar (rootsDevice roots) >>= \case
     Live selected → pure (Just (selectedPlan selected, selectedDevice selected))
     _ → pure Nothing
+
+-- | The live device and its naming call, when the instance enabled
+-- @VK_EXT_debug_utils@ and the device offers one. 'Nothing' means nothing is
+-- named or labelled, which is never a failure.
+readRootsInstrumentation ∷ Roots q inst msgr phys dev → IO (Maybe (dev, Instrumentation))
+readRootsInstrumentation roots = do
+  (enabled, device) ← atomically ((,) <$> readTVar (rootsDebugUtils roots) <*> readRootsDevice roots)
+  case device of
+    Just (_, live) | enabled → fmap ((,) live) <$> opsInstrumentation (rootsOps roots) live
+    _ → pure Nothing
+
+-- | Name one native object through the device's naming call, on the owner's
+-- thread, latching device loss if that is what it raised. A call that raised
+-- named nothing, and its failure is the caller's.
+nameRootsObject ∷ Roots q inst msgr phys dev → Instrumentation → NativeObjectKind → Word64 → ByteString → IO ()
+nameRootsObject roots instrumentation kind handle name =
+  guarded roots "vkSetDebugUtilsObjectNameEXT" (instrumentName instrumentation kind handle name)
 
 -- | The generation calls of the roots' native layer.
 rootsGenerationOps ∷ Roots q inst msgr phys dev → GenerationOps phys dev

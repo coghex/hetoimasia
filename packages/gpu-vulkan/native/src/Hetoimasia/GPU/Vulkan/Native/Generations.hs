@@ -56,6 +56,17 @@
 -- and a fresh generation built without it. No target reserves or releases
 -- anything of another's.
 --
+-- = Names
+--
+-- When the roots offer naming ('readRootsInstrumentation'), a construction
+-- names its swapchain, each of its images and each of its views from the
+-- candidate's 'GenerationId' and the image's index
+-- ("Hetoimasia.GPU.Vulkan.Native.Naming"), each immediately after the call that
+-- produced it and before the generation is published, so nothing can record
+-- against an unnamed image. A naming call that raised fails the construction
+-- as any other of its native calls does: the candidate is retired, never
+-- published, and destroyed once its holds end.
+--
 -- = Destruction
 --
 -- A retired generation keeps its swapchain, its images and its views until the
@@ -211,11 +222,14 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , Roots
   , SwapchainRequest (..)
   , failRootsSession
+  , nameRootsObject
   , readRootsDevice
+  , readRootsInstrumentation
   , rootsCall
   , rootsGenerationOps
   , stateRootsModel
   )
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), imageViewName, swapchainImageName, swapchainName)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -736,6 +750,8 @@ reconcile generations now target geometry = do
           outcome ← tryWithContext $ do
             generationsAfterAdmission generations candidate
             (devicePlan, device) ← readDevice >>= maybe (throwIO DeviceAbsent) pure
+            instrumentation ← fmap snd <$> readRootsInstrumentation roots
+            let name kind handle label = for_ instrumentation (\instrumented → nameRootsObject roots instrumented kind handle label)
             limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
             let request = SwapchainRequest surface planned (planQueueFamily devicePlan) (snd <$> handing)
             -- Passing @oldSwapchain@ retires it whatever the creation answers,
@@ -748,6 +764,7 @@ reconcile generations now target geometry = do
             swapchain ←
               creating "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request) $ \created →
                 editGeneration generations candidate (\entry → entry {genSwapchain = Just created})
+            name ObjectSwapchain swapchain (swapchainName candidate)
             allowInterrupt
             images ← rootsCall roots "vkGetSwapchainImagesKHR" (opsSwapchainImages ops device swapchain)
             atomically (editGeneration generations candidate (\entry → entry {genImages = images}))
@@ -756,10 +773,12 @@ reconcile generations now target geometry = do
             if count == 0 || count > limit
               then pure count
               else do
-                forM_ images $ \image → do
-                  _ ←
+                forM_ (zip [0 ..] images) $ \(index, image) → do
+                  name ObjectImage image (swapchainImageName candidate index)
+                  view ←
                     creating "vkCreateImageView" (opsCreateImageView ops device image (surfaceFormat (planFormat planned))) $ \created →
                       editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [created]})
+                  name ObjectImageView view (imageViewName candidate index)
                   allowInterrupt
                 pure count
           case outcome of

@@ -15,7 +15,8 @@
 -- buffer sized for the generation's extent; records one batch — into
 -- rendering, the pipeline, viewport and scissor, a triangle, out of
 -- rendering, the copy into the readback buffer with its host-read barrier,
--- and the image left ready to present — through the audited unsafe subset;
+-- and the image left ready to present — through the audited unsafe subset,
+-- inside the batch's label and, around the rendering, the pass's (#250);
 -- discards it without submitting; and releases and destroys every resource
 -- before the roots go.
 --
@@ -40,6 +41,10 @@ module Test.GPU.Vulkan.Native.Recording
   , runRecording
   , recordingSection
   , spec
+
+    -- * The fixture-private frame, for the other private recording cases
+  , acquireInModel
+  , settleInModel
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
@@ -447,11 +452,12 @@ spec outcome = describe "VK-11 managed recording" $ do
   it "established every step of its private roots, its generation and its managed resources" $
     onFacts outcome $ \_ → pure ()
 
-  it "recorded one sealed batch of eleven commands against the generation's image" $
+  it "recorded one sealed batch of eleven commands against the generation's image, inside the batch's and the pass's labels" $
     onFacts outcome $ \facts → do
       let batch = observedBatch (factsObserved facts)
       fmap viewBatchStanding batch `shouldBe` Just BatchSealed
-      fmap viewBatchCommands batch `shouldBe` Just 11
+      -- The eleven, and the two labels' openings and closings.
+      fmap viewBatchCommands batch `shouldBe` Just 15
 
   it "held every managed resource the batch referenced, and no longer once the discard invalidated it" $
     onFacts outcome $ \facts → do

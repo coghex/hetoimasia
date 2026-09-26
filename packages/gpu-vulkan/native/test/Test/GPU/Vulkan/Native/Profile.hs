@@ -2,8 +2,19 @@
 -- the session takes.
 module Test.GPU.Vulkan.Native.Profile (spec) where
 
+import qualified Data.ByteString as ByteString
+import qualified Data.Text as Text
+import Hetoimasia.GPU.Vulkan.Native.Naming
+  ( NativeObjectKind (..)
+  , boundedName
+  , deviceName
+  , maximumNameBytes
+  , objectTypeCode
+  , queueName
+  )
 import Hetoimasia.GPU.Vulkan.Native.Profile
 import Test.GPU.Vulkan.Native.StandIn (standInDevice)
+import Vulkan.Core10.Enums.ObjectType (ObjectType (..))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Vulkan.Extensions.VK_EXT_debug_utils (data EXT_DEBUG_UTILS_EXTENSION_NAME)
 import Vulkan.Extensions.VK_EXT_surface_maintenance1 (data EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
@@ -16,6 +27,35 @@ import Vulkan.Extensions.VK_KHR_swapchain (data KHR_SWAPCHAIN_EXTENSION_NAME)
 
 spec ∷ Spec
 spec = describe "Profile" $ do
+  describe "names" $ do
+    it "spells every named object's type as the binding does" $
+      [(kind, objectTypeCode kind) | kind ← [minBound .. maxBound]]
+        `shouldBe` [ (kind, code)
+                   | (kind, ObjectType code) ←
+                       [ (ObjectDevice, OBJECT_TYPE_DEVICE)
+                       , (ObjectQueue, OBJECT_TYPE_QUEUE)
+                       , (ObjectSurface, OBJECT_TYPE_SURFACE_KHR)
+                       , (ObjectSwapchain, OBJECT_TYPE_SWAPCHAIN_KHR)
+                       , (ObjectImage, OBJECT_TYPE_IMAGE)
+                       , (ObjectImageView, OBJECT_TYPE_IMAGE_VIEW)
+                       , (ObjectCommandPool, OBJECT_TYPE_COMMAND_POOL)
+                       , (ObjectCommandBuffer, OBJECT_TYPE_COMMAND_BUFFER)
+                       , (ObjectPipelineLayout, OBJECT_TYPE_PIPELINE_LAYOUT)
+                       , (ObjectPipeline, OBJECT_TYPE_PIPELINE)
+                       , (ObjectShaderModule, OBJECT_TYPE_SHADER_MODULE)
+                       , (ObjectBuffer, OBJECT_TYPE_BUFFER)
+                       , (ObjectDeviceMemory, OBJECT_TYPE_DEVICE_MEMORY)
+                       ]
+                   ]
+
+    it "bounds every name at 64 bytes, and never lets a NUL end one early" $ do
+      maximumNameBytes `shouldBe` 64
+      ByteString.length (boundedName (Text.replicate 200 "x")) `shouldBe` 64
+      boundedName "a\NULb" `shouldBe` "ab"
+      -- The largest queue identity the device can report still fits.
+      ByteString.length (queueName maxBound maxBound) `shouldSatisfy` (<= maximumNameBytes)
+      [deviceName, queueName 0 0] `shouldBe` ["hetoimasia device", "hetoimasia queue family 0 index 0"]
+
   describe "the instance" $ do
     it "asks for the surface extensions, the capture's and the maintenance chain's, and nothing the loader lacks" $ do
       plan ← rightOf (planInstance request (offer ["VK_KHR_surface", "VK_KHR_xcb_surface", debugUtilsExtension, getSurfaceCapabilities2Extension, surfaceMaintenance1Extension]))

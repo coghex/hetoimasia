@@ -11,12 +11,14 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
 import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
 import Control.Monad (void)
+import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
 import Data.Maybe (isJust)
 import Data.Word (Word64)
 import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), sessionState)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TargetRecordBudget))
 import Hetoimasia.GPU.Model.Identity (TargetClass (..), TargetId)
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), maximumNameBytes, surfaceName)
 import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
@@ -284,6 +286,69 @@ spec = describe "Roots" $ do
       sessionState model `shouldBe` SessionRunning
       checkRoots roots `shouldReturn` ()
 
+  describe "names" $ do
+    it "names the device, its queue and every surface from existing identities once the device exists, and never the messenger" $ do
+      (standIn, roots) ← fresh
+      offerNaming standIn
+      _ ← startRoots roots standardRequest
+      first ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      second ← admitted roots OptionalTarget (surfaceNumbered standIn 11)
+      namesGiven standIn
+        `shouldReturn` [ (ObjectDevice, 3, "hetoimasia device")
+                       , (ObjectQueue, 4, "hetoimasia queue family 0 index 0")
+                       , (ObjectSurface, 10, surfaceName first)
+                       , (ObjectSurface, 11, surfaceName second)
+                       ]
+      (map (\(_, _, name) → ByteString.length name) <$> namesGiven standIn) `shouldReturn'''` all (<= maximumNameBytes)
+      -- Nothing is named before the device that names it exists, and each
+      -- root is named once.
+      recorded ← calls standIn
+      takeWhile (not . isNamed) recorded `shouldSatisfy` elem (CreatedDevice "stand-in device" 0)
+      times standIn (QueriedQueue 0) `shouldReturn` 1
+      surfaceName first `shouldBe` "target 0.1 surface"
+      -- No naming call is dispatched for the explicit messenger, handle 2,
+      -- however many admissions follow.
+      _ ← admitted roots OptionalTarget (surfaceNumbered standIn 12)
+      (\given → [handle | (_, handle, _) ← given, handle == 2]) <$> namesGiven standIn `shouldReturn` []
+
+    it "names nothing, asks for no queue and fails nothing when the device offers no naming" $ do
+      (standIn, roots) ← started
+      _ ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      _ ← admitted roots RequiredTarget (surfaceNumbered standIn 11)
+      namesGiven standIn `shouldReturn` []
+      times standIn (QueriedQueue 0) `shouldReturn` 0
+
+    it "leaves a surface whose naming raised unadmitted and its creator's, and admits it named later" $ do
+      (standIn, roots) ← fresh
+      offerNaming standIn
+      _ ← startRoots roots standardRequest
+      _ ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      failNaming standIn ObjectSurface
+      raised @NamingFailure (admitRootTarget roots OptionalTarget (surfaceNumbered standIn 11)) `shouldReturn` True
+      -- The roots hold no record of it and never destroy it: it is still its
+      -- creator's.
+      map targetViewSurface <$> atomically (readRootTargets roots) `shouldReturn` [10]
+      surfacesDestroyed standIn `shouldReturn` []
+      restoreNaming standIn ObjectSurface
+      target ← admitted roots OptionalTarget (surfaceNumbered standIn 11)
+      map targetViewSurface <$> atomically (readRootTargets roots) `shouldReturn` [10, 11]
+      last <$> namesGiven standIn `shouldReturn` (ObjectSurface, 11, surfaceName target)
+
+    it "keeps a device whose naming raised owned for retirement, and names it again at the next admission" $ do
+      (standIn, roots) ← fresh
+      offerNaming standIn
+      _ ← startRoots roots standardRequest
+      failNaming standIn ObjectDevice
+      raised @NamingFailure (admitRootTarget roots RequiredTarget (surfaceNumbered standIn 10)) `shouldReturn` True
+      view ← atomically (readRootsView roots)
+      viewDevice view `shouldBe` RootLive
+      viewTargets view `shouldBe` []
+      restoreNaming standIn ObjectDevice
+      _ ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      map (\(kind, _, _) → kind) <$> namesGiven standIn
+        `shouldReturn` [ObjectDevice, ObjectDevice, ObjectQueue, ObjectSurface]
+      devicesCreated standIn `shouldReturn` 1
+
 -- | Fresh roots over a fresh stand-in, with the default budgets.
 fresh ∷ IO (StandIn, StandInRoots)
 fresh = do
@@ -306,6 +371,14 @@ admitted roots classification surface =
 -- | Whether the action raised this exception type.
 raised ∷ ∀ e a. Exception e ⇒ IO a → IO Bool
 raised action = either (isJust . fromException @e) (const False) <$> try @SomeException action
+
+isNamed ∷ Call → Bool
+isNamed = \case
+  Named {} → True
+  _ → False
+
+shouldReturn''' ∷ IO a → (a → Bool) → IO ()
+shouldReturn''' action predicate = action >>= \value → predicate value `shouldBe` True
 
 -- | How many devices the roots have created.
 devicesCreated ∷ StandIn → IO Int

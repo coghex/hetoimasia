@@ -65,6 +65,7 @@ library
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
         Hetoimasia.GPU.Vulkan.Native.Generations
+        Hetoimasia.GPU.Vulkan.Native.Naming
         Hetoimasia.GPU.Vulkan.Native.Presentation
         Hetoimasia.GPU.Vulkan.Native.Profile
         Hetoimasia.GPU.Vulkan.Native.Recording

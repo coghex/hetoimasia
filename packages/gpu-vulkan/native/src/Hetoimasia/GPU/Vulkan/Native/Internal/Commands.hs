@@ -35,6 +35,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
   , setScissorUnsafe
   , drawUnsafe
   , copyImageToBufferUnsafe
+  , beginLabelUnsafe
+  , endLabelUnsafe
   ) where
 
 import Control.Exception (throwIO)
@@ -60,6 +62,7 @@ import Vulkan.Core10.Handles (CommandBuffer (..), CommandBuffer_T)
 import Vulkan.Core13 (DependencyInfo, RenderingInfo)
 import Vulkan.Dynamic (DeviceCmds (..))
 import Vulkan.Exception (VulkanException (..))
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsLabelEXT)
 
 -- | Every genuine @unsafe@ import this module declares, by the Vulkan entry
 -- point it calls. 'Hetoimasia.GPU.Vulkan.Native.Diagnostics.nativeFfiConfiguration'
@@ -77,6 +80,8 @@ unsafeImports =
   , "vkCmdSetScissor"
   , "vkCmdDraw"
   , "vkCmdCopyImageToBuffer"
+  , "vkCmdBeginDebugUtilsLabelEXT"
+  , "vkCmdEndDebugUtilsLabelEXT"
   ]
 
 foreign import ccall unsafe "dynamic"
@@ -153,6 +158,16 @@ foreign import ccall unsafe "dynamic"
     → Ptr BufferImageCopy
     → IO ()
 
+foreign import ccall unsafe "dynamic"
+  mkCmdBeginDebugUtilsLabelEXT
+    ∷ FunPtr (Ptr CommandBuffer_T → Ptr DebugUtilsLabelEXT → IO ())
+    → Ptr CommandBuffer_T
+    → Ptr DebugUtilsLabelEXT
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdEndDebugUtilsLabelEXT ∷ FunPtr (Ptr CommandBuffer_T → IO ()) → Ptr CommandBuffer_T → IO ()
+
 -- | The entry point the command buffer's device resolved, which must exist.
 resolved ∷ String → FunPtr a → IO (FunPtr a)
 resolved name entry = do
@@ -217,3 +232,13 @@ copyImageToBufferUnsafe ∷ CommandBuffer → Image → ImageLayout → Buffer �
 copyImageToBufferUnsafe buffer image layout destination region = do
   entry ← resolved "vkCmdCopyImageToBuffer" (pVkCmdCopyImageToBuffer (commands buffer))
   withCStruct region $ \pointer → mkCmdCopyImageToBuffer entry (handle buffer) image layout destination 1 pointer
+
+beginLabelUnsafe ∷ CommandBuffer → DebugUtilsLabelEXT → IO ()
+beginLabelUnsafe buffer label = do
+  entry ← resolved "vkCmdBeginDebugUtilsLabelEXT" (pVkCmdBeginDebugUtilsLabelEXT (commands buffer))
+  withCStruct label $ \pointer → mkCmdBeginDebugUtilsLabelEXT entry (handle buffer) pointer
+
+endLabelUnsafe ∷ CommandBuffer → IO ()
+endLabelUnsafe buffer = do
+  entry ← resolved "vkCmdEndDebugUtilsLabelEXT" (pVkCmdEndDebugUtilsLabelEXT (commands buffer))
+  mkCmdEndDebugUtilsLabelEXT entry (handle buffer)

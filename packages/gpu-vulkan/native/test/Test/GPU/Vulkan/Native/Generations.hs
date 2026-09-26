@@ -33,6 +33,7 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Budget (BudgetKind (GenerationBudget), BudgetRequest (..), Budgets, defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Generations
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), imageViewName, swapchainImageName, swapchainName)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
@@ -353,6 +354,52 @@ spec = describe "Generations" $ do
       stepAt rig 0 (seen 640 480)
       length . filter isView <$> swapchainCalls rig `shouldReturn` 0
       viewActive <$> generationsOf rig `shouldReturn` Nothing
+
+  describe "names" $ do
+    it "names the swapchain, each image and each view from the candidate's generation as each is made, before publishing it" $ do
+      rig ← newRig
+      offerNaming (rigStandIn rig)
+      stepAt rig 0 (seen 640 480)
+      [generation] ← activeGenerations rig
+      recorded ← calls (rigStandIn rig)
+      [call | call ← recorded, namedCall call || isCreated call || enumeratedCall call || viewCall call]
+        `shouldBe` [ CreatedSwapchain 100 10 (640, 480) Nothing
+                   , Named ObjectSwapchain 100 (swapchainName generation)
+                   , EnumeratedImages 100
+                   , Named ObjectImage 100000 (swapchainImageName generation 0)
+                   , CreatedView 101 100000
+                   , Named ObjectImageView 101 (imageViewName generation 0)
+                   , Named ObjectImage 100001 (swapchainImageName generation 1)
+                   , CreatedView 102 100001
+                   , Named ObjectImageView 102 (imageViewName generation 1)
+                   , Named ObjectImage 100002 (swapchainImageName generation 2)
+                   , CreatedView 103 100002
+                   , Named ObjectImageView 103 (imageViewName generation 2)
+                   ]
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
+    it "names nothing when the device offers no naming, and builds exactly the same generation" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      namesGiven (rigStandIn rig) `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
+    it "fails a construction whose naming raised: the candidate is retired unpublished and destroyed child before parent" $ do
+      rig ← newRig
+      offerNaming (rigStandIn rig)
+      failNaming (rigStandIn rig) ObjectImageView
+      stepAt rig 0 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` ConstructionFailed "NamingFailure ObjectImageView"
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      [candidate] ← activeGenerations rig
+      standingOf rig candidate `shouldReturn` Just GenerationRetiredHeld
+      atomically (useGeneration (rigGenerations rig) candidate) >>= either (const (pure ())) (const (expectationFailure "the unnamed candidate was usable"))
+      viewTargetActive <$> modelTarget rig `shouldReturn` Nothing
+      -- The view that exists, then the swapchain, go before the next attempt.
+      restoreNaming (rigStandIn rig) ObjectImageView
+      stepAt rig 200 (seen 640 480)
+      destroyed rig `shouldReturn` [DestroyedView 101, DestroyedSwapchain 100]
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
 
   describe "failure" $ do
     it "leaves a failed replacement retired, never reacquires from or hands over the retired handle, and builds afresh" $ do
@@ -795,6 +842,17 @@ destroyed rig = filter (\call → isDestroyedSwapchain call || isDestroyedView c
     isDestroyedView = \case
       DestroyedView _ → True
       _ → False
+
+namedCall, enumeratedCall, viewCall ∷ Call → Bool
+namedCall = \case
+  Named {} → True
+  _ → False
+enumeratedCall = \case
+  EnumeratedImages _ → True
+  _ → False
+viewCall = \case
+  CreatedView _ _ → True
+  _ → False
 
 isDestroyedSwapchain ∷ Call → Bool
 isDestroyedSwapchain = \case

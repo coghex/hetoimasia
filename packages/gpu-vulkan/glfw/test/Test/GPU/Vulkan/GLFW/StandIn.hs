@@ -330,6 +330,11 @@ nativeLayer events native capture =
         step events native AtSupport (SupportQueried surface)
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , -- The stand-in device offers no naming, so nothing is named and its
+      -- queue is never asked for.
+      opsDeviceHandle = fromIntegral
+    , opsDeviceQueue = \_ _ → pure 4
+    , opsInstrumentation = \_ → pure Nothing
     , opsGenerations =
         GenerationOps
           { opsSurfaceOffer = \_ _ → do

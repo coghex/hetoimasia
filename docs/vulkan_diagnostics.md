@@ -58,18 +58,20 @@ Nothing on that path is Haskell. For each report it:
    not fit, publishes it, and counts it as admitted;
 7. returns 0, `VK_FALSE`, the non-aborting answer the API asks for.
 
-It never allocates, waits for space, takes a lock, performs I/O, calls Vulkan or
-raises. The queue is a bounded multi-producer, single-consumer ring after
+It never allocates — on the Haskell heap or the C heap: every record, object and
+label it can fill was allocated with the storage — and never waits for space,
+takes a lock, performs I/O, calls Vulkan or raises. The queue is a bounded multi-producer, single-consumer ring after
 Vyukov's bounded queue, with a sequence encoding that also works for a queue of
 one; a producer that loses a race retries only against the position that beat
 it.
 
 The diagnostics package knows the callback data only through a layout mirror of
-`VkDebugUtilsMessengerCallbackDataEXT` and `VkDebugUtilsObjectNameInfoEXT` in
-its header. `packages/gpu-vulkan/native/cbits/hetoimasia_vulkan_native.c` is the
+`VkDebugUtilsMessengerCallbackDataEXT`, `VkDebugUtilsObjectNameInfoEXT` and
+`VkDebugUtilsLabelEXT` in its header. `packages/gpu-vulkan/native/cbits/hetoimasia_vulkan_native.c` is the
 one translation unit that sees both that header and the Vulkan headers, and it
 asserts at compile time that every mirrored field has the same offset and size,
-that both structures have the same size, and that the severity bits agree. A
+that all three structures have the same size — so both array strides agree too —
+and that the severity bits agree. A
 header whose layout differed would fail the native build rather than be read
 through the wrong offsets. The capture's C is compiled with
 `-fno-strict-aliasing` because it reads Vulkan's structures through that mirror.
@@ -80,18 +82,20 @@ through the wrong offsets. The capture's C is compiled with
 | --- | --- |
 | Severity bits and message-type bits | copied |
 | Message id number | copied |
-| Message id name, message text, object names | copied in that order under **one shared text budget per record**, 4 KiB by default; each string is copied byte by byte up to what the budget has left, never measured or decoded whole first |
+| Message id name, message text, object names, queue label names, command-buffer label names | copied in that order under **one shared text budget per record**, 4 KiB by default; each string is copied byte by byte up to what the budget has left, never measured or decoded whole first |
 | Object type and handle | at most the object limit, 16 by default; the count the callback carried is kept beside them |
+| Queue labels, command-buffer labels | two separate fields, each at most the label limit, 4 by default, in the callback's order; each keeps the count the callback carried beside the ones copied, and a label whose name was NULL is kept without one |
 
-A record whose text ran out, whose objects exceeded the limit, or whose callback
-data claimed objects and passed no array, is admitted cut and counted as
-truncated. Labels are not captured.
+A record whose text ran out, whose objects or labels exceeded their limits, or
+whose callback data claimed objects or labels and passed no array, is admitted
+cut and counted as truncated — once per record, however many of those applied.
+A label's colour is not copied.
 
 ### Limits
 
 `CaptureConfig` carries the queue capacity (1,024 records by default), the text
-budget (4,096 bytes), the object limit (16), and the worker's poll interval
-(2,000 microseconds). `validateCaptureConfig` checks them without performing IO
+budget (4,096 bytes), the object limit (16), the label limit (4 of each kind),
+and the worker's poll interval (2,000 microseconds). `validateCaptureConfig` checks them without performing IO
 and `withDiagnosticCapture` runs it first, so a rejected configuration raises
 `CaptureConfigError` before anything is allocated:
 
@@ -99,9 +103,10 @@ and `withDiagnosticCapture` runs it first, so a rejected configuration raises
   unsigned 32-bit value — an `Int` is finite, so this is the whole of "positive
   and finite";
 - the bytes the storage would allocate — capacity times the fixed record size,
-  the text budget, and the object records — are computed exactly and must fit in
-  both a C `size_t` and an `Int` (`AllocationUnrepresentable` otherwise); the C
-  constructor repeats that check with overflow-checked multiplication;
+  the text budget, the object records, and two arrays of label records — are
+  computed exactly and must fit in both a C `size_t` and an `Int`
+  (`AllocationUnrepresentable` otherwise); the C constructor repeats that check
+  with overflow-checked multiplication, label records included;
 - the poll interval must be positive;
 - the process must run the threaded runtime.
 
@@ -279,6 +284,24 @@ Every record has the component `gpu.vulkan.diagnostics`, the constant message
 | `object.<n>`, `object.<n>.name` | each copied object's `type:0xhandle`, and its name when present |
 | `truncated` | `true` when the record was cut |
 
+A record's labels are its **scoped context**: the worker delivers each record
+through a logger derived for that record alone (`withFields`), carrying
+
+| Context field | Value |
+| --- | --- |
+| `queue.labels`, `cmdbuf.labels` | how many queue and command-buffer labels the callback carried, when any |
+| `queue.label.<n>`, `cmdbuf.label.<n>` | each copied label's name, numbered from 1 in the callback's order; a label with no name has no field |
+
+so a record's labels never reach another record's entry. The order, and which
+regions are listed, are the reporting layer's own: the pinned layers were seen
+to list a batch's still-open region twice, and Linux's to list a pass region
+that had already closed as well
+([macOS](vulkan/macos-vkr2.md), [Linux](vulkan/linux-vkr2.md)). The native
+package's recorder
+opens a label around every batch and every rendering pass
+([gpu_backend.md](gpu_backend.md#names-and-labels)); nothing opens queue labels
+yet.
+
 Delivering a record and counting it delivered are one masked step: the sink's
 own blocking stays interruptible, so a cancellation still reaches a stuck sink,
 but none can land between a write that completed and its count, and the
@@ -383,7 +406,7 @@ proof checks the binding flags against the pin.
 
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
 | --- | --- | --- | --- | --- | --- |
-| C storage: queue, objects, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
+| C storage: queue, objects, labels, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
 | C slot: announcements, close flag, generation, latches, counters | the lifetime, then its slot's next claimant | producers on any thread; the lifetime, closing | the lifetime; `captureStatus` | any | static; claimed at entry, reset only when claimed again |
 | Status snapshot | the lifetime | step 4, once, before the free | `captureStatus` once the slot serves another lifetime | the lifetime's | per lifetime |
 | Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
@@ -405,7 +428,10 @@ Its examples offer records through `hetoimasia_capture_offer`, a package-local
 producer entry that builds the callback data on a C frame and calls the
 production producer with it — the storage they exercise is the production C, not
 a Haskell stand-in. `Capture` drives the storage directly: bounded copying at
-each limit and one byte past it, the shared budget, saturation and the drop
+each limit and one byte past it, the shared budget, both label arrays apart and
+in order with what each reported, each at its limit and one past it, a label
+count with no array, the budget's copy order through the labels, one truncation
+for a record cut twice, and label space reused cleanly, saturation and the drop
 counter with the error latch surviving it, error latching ahead of admission,
 truncation counting, contained producer failures, counters saturating at their
 ceilings, eight threads racing for positions while a consumer drains, closing
@@ -413,7 +439,7 @@ waiting for a producer that has announced itself, a report that begins only
 after closing and freeing, slot reclamation beyond the table's size, and a
 stale user data naming nothing.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
-fields, the worker's own group, the verdict's issues, sink failure beside a
+fields, a record's labels in its own scoped context and no other's, the worker's own group, the verdict's issues, sink failure beside a
 preserved primary failure, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, a failed body kept
@@ -440,4 +466,7 @@ instance of its own in a child process; see
 are retained as `docs/vulkan/linux-vk6.md` and `docs/vulkan/macos-vk6.md`. Every
 validation-enabled instance there, and the shared roots', also enables
 synchronization validation through its create info, and the suite's
-`synchronization-hazard` case proves the capture receives its reports.
+`synchronization-hazard` case proves the capture receives its reports. The
+`debug-names` case provokes one validation error on a named managed resource
+inside a labelled batch and requires the delivered record to carry that
+resource's name and, where the pinned layer reports them, the batch's label.

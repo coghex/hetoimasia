@@ -31,6 +31,7 @@ import Control.Exception.Context (getExceptionAnnotations)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
+import qualified Data.Text as Text
 import Test.Hspec
   ( Spec
   , describe
@@ -136,6 +137,32 @@ spec = describe "Lifetime" $ do
         [] → expectationFailure "nothing was delivered"
       verdictDelivered verdict `shouldBe` 4
       verdictIssues verdict `shouldBe` [ErrorLatched]
+
+    it "delivers a record's labels in that record's own scoped context, and no other's" $ do
+      (logger, recorded) ← recordingLogger everythingFilter
+      _ ←
+        capturing logger $ \capture → do
+          offerTo
+            capture
+            (plainOffer SeverityError "inside a labelled region")
+              { offerQueueLabels = Just [Just "submission 2"]
+              , offerCommandBufferLabels = Just [Just "batch 7", Just "pass 7", Nothing]
+              }
+          offerTo capture (plainOffer SeverityWarning "outside every region")
+      entries ← recordedEntries recorded
+      case map entryFields entries of
+        [labelled, bare] → do
+          Map.filterWithKey (\key _ → any (`Text.isPrefixOf` key) ["queue.", "cmdbuf."]) labelled
+            `shouldBe` Map.fromList
+              [ ("queue.labels", "1")
+              , ("queue.label.1", "submission 2")
+              , ("cmdbuf.labels", "3")
+              , ("cmdbuf.label.1", "batch 7")
+              , ("cmdbuf.label.2", "pass 7")
+              ]
+          Map.lookup "text" labelled `shouldBe` Just "inside a labelled region"
+          Map.filterWithKey (\key _ → any (`Text.isPrefixOf` key) ["queue.", "cmdbuf."]) bare `shouldBe` Map.empty
+        other → expectationFailure ("expected two records, got " <> show (length other))
 
     it "is clean when only warnings and commentary arrived, and every one was delivered" $ do
       (logger, _) ← recordingLogger everythingFilter

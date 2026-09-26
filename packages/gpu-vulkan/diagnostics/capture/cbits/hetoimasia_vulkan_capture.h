@@ -13,8 +13,8 @@
 ** So it runs no Haskell, allocates nothing, never waits for space, performs no
 ** I/O, calls no Vulkan function and cannot raise. It classifies the severity
 ** and latches an error before it attempts admission, copies what it admits
-** under one per-record text budget and one object limit, and when the queue is
-** full it counts the loss and returns. Every result is `VK_FALSE`, the
+** under one per-record text budget, one object limit and one label limit, and
+** when the queue is full it counts the loss and returns. Every result is `VK_FALSE`, the
 ** non-aborting answer the API asks callbacks for.
 **
 ** There is exactly one consumer: the drain worker, or after it has finished,
@@ -63,9 +63,17 @@ typedef struct hetoimasia_capture_object_name {
 } hetoimasia_capture_object_name;
 
 /*
-** The layout of `VkDebugUtilsMessengerCallbackDataEXT`. Labels are not
-** captured, so their element type is left opaque.
+** The layout of `VkDebugUtilsLabelEXT`. Only the name is read; the colour is
+** mirrored so the element stride is the headers'.
 */
+typedef struct hetoimasia_capture_label {
+  int32_t s_type;
+  const void *next;
+  const char *label_name;
+  float color[4];
+} hetoimasia_capture_label;
+
+/* The layout of `VkDebugUtilsMessengerCallbackDataEXT`. */
 typedef struct hetoimasia_capture_callback_data {
   int32_t s_type;
   const void *next;
@@ -74,18 +82,22 @@ typedef struct hetoimasia_capture_callback_data {
   int32_t message_id_number;
   const char *message;
   uint32_t queue_label_count;
-  const void *queue_labels;
+  const hetoimasia_capture_label *queue_labels;
   uint32_t cmd_buf_label_count;
-  const void *cmd_buf_labels;
+  const hetoimasia_capture_label *cmd_buf_labels;
   uint32_t object_count;
   const hetoimasia_capture_object_name *objects;
 } hetoimasia_capture_callback_data;
 
-/* The limits one storage is built with. Every one must be at least 1. */
+/*
+** The limits one storage is built with. Every one must be at least 1. The label
+** limit bounds the queue labels and the command-buffer labels separately.
+*/
 typedef struct hetoimasia_capture_limits {
   uint32_t queue_capacity;
   uint32_t text_budget;
   uint32_t object_limit;
+  uint32_t label_limit;
 } hetoimasia_capture_limits;
 
 typedef struct hetoimasia_capture_storage hetoimasia_capture_storage;
@@ -110,11 +122,12 @@ int hetoimasia_capture_create(
 
 /*
 ** The bytes one queued record occupies beside its text budget, and the bytes
-** one captured object occupies, so a configuration can be checked against the
-** allocation it would need before anything is allocated.
+** one captured object and one captured label occupy, so a configuration can be
+** checked against the allocation it would need before anything is allocated.
 */
 size_t hetoimasia_capture_record_size(void);
 size_t hetoimasia_capture_object_size(void);
+size_t hetoimasia_capture_label_size(void);
 
 /* The user data every messenger registering this storage carries. */
 void *hetoimasia_capture_user_data(const hetoimasia_capture_storage *storage);
@@ -181,6 +194,17 @@ int hetoimasia_capture_record_object_has_name(const hetoimasia_capture_record *r
 const char *hetoimasia_capture_record_object_name(const hetoimasia_capture_record *record, uint32_t index);
 uint32_t hetoimasia_capture_record_object_name_length(const hetoimasia_capture_record *record, uint32_t index);
 
+/*
+** A record's labels, in the callback's order. `queue` chooses the queue labels
+** when non-zero and the command-buffer labels otherwise. "Reported" is the count
+** the callback carried; "count" is how many were copied.
+*/
+uint32_t hetoimasia_capture_record_labels_reported(const hetoimasia_capture_record *record, int queue);
+uint32_t hetoimasia_capture_record_label_count(const hetoimasia_capture_record *record, int queue);
+int hetoimasia_capture_record_label_has_name(const hetoimasia_capture_record *record, int queue, uint32_t index);
+const char *hetoimasia_capture_record_label_name(const hetoimasia_capture_record *record, int queue, uint32_t index);
+uint32_t hetoimasia_capture_record_label_name_length(const hetoimasia_capture_record *record, int queue, uint32_t index);
+
 /* The counters, each saturating at UINT64_MAX. */
 #define HETOIMASIA_CAPTURE_OFFERED 0
 #define HETOIMASIA_CAPTURE_ADMITTED 1
@@ -214,7 +238,8 @@ void hetoimasia_capture_preset_counter(hetoimasia_capture_storage *storage, int 
 ** callback data on this frame and calling `hetoimasia_capture_callback` with
 ** it. `null_data` passes NULL callback data instead, which is how a
 ** producer-side failure is exercised. `object_names` may be NULL, and so may
-** any entry in it.
+** any entry in it. A label count with a NULL name array passes a NULL label
+** array; a NULL entry in a name array passes a label whose name is NULL.
 */
 uint32_t hetoimasia_capture_offer(
   void *user_data,
@@ -227,6 +252,10 @@ uint32_t hetoimasia_capture_offer(
   const int32_t *object_types,
   const uint64_t *object_handles,
   const char *const *object_names,
+  uint32_t queue_label_count,
+  const char *const *queue_label_names,
+  uint32_t cmd_buf_label_count,
+  const char *const *cmd_buf_label_names,
   int null_data);
 
 /*

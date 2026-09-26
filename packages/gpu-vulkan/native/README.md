@@ -45,11 +45,18 @@ destroys it.
   discharged; readback reads gated on completion evidence, with non-coherent
   memory invalidated and flushed over atom-aligned ranges; and destruction on
   the owner once every hold has ended.
+- `Hetoimasia.GPU.Vulkan.Native.Naming` is #250's naming scheme as pure
+  decisions: every debug name and recording label derived from identities the
+  backend already holds, bounded at 64 bytes, and the object types they name.
+  The roots, the generations and the recording name what they create and label
+  what they record through it whenever the device offers `VK_EXT_debug_utils`'s
+  calls; the debug messenger is never named (see
+  [the backend contract](../../../docs/gpu_backend.md#names-and-labels)).
 - `Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan` is its production layer:
   construction, destruction and memory maintenance through the binding's safe
   calls, and every recorded command through the private
   `Hetoimasia.GPU.Vulkan.Native.Internal.Commands` — the audited `unsafe`
-  recording subset. `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders` embeds the
+  recording subset, the two command-buffer label calls included. `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders` embeds the
   verification pipeline's triangle shaders.
 
 - `Hetoimasia.GPU.Vulkan.Native.Diagnostics` builds the two debug-utils

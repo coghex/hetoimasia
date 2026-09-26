@@ -34,6 +34,7 @@ import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
 
 -- | One native call the recording made, in the order it made it.
@@ -72,6 +73,9 @@ data RecordingStep
   | AtBegin
   | AtEnd
   | AtRecord
+    -- ^ Every recorded command but a label's.
+  | AtBeginLabel
+  | AtEndLabel
   | AtFlush
   deriving (Eq, Ord, Show)
 
@@ -155,7 +159,13 @@ recordingStandInOps standIn =
         handle ← fresh standIn
         handle <$ step standIn AtCreateLayout (CreatedLayout handle)
     , opsDestroyPipelineLayout = \_ handle → step standIn AtDestroyLayout (DestroyedLayout handle)
-    , opsCreatePipeline = \_ request → do
+    , opsCreatePipeline = \_ request name → do
+        -- Its shader modules are numbers too, named as the production layer
+        -- names them and gone once it returns.
+        vertex ← fresh standIn
+        name VertexStage vertex
+        fragment ← fresh standIn
+        name FragmentStage fragment
         handle ← fresh standIn
         handle <$ step standIn AtCreatePipeline (CreatedPipeline handle (requestLayout request) (requestColorFormat request))
     , opsDestroyPipeline = \_ handle → step standIn AtDestroyPipeline (DestroyedPipeline handle)
@@ -207,5 +217,10 @@ recordingStandInOps standIn =
     , opsRecord = \commands native → do
         action ← readTVarIO (recordingDuringRecord standIn)
         action native
-        step standIn AtRecord (Recorded commands native)
+        let at = case native of
+              CommandBeginLabel _ → AtBeginLabel
+              CommandEndLabel → AtEndLabel
+              _ → AtRecord
+        step standIn at (Recorded commands native)
+    , opsCommandBufferHandle = id
     }
