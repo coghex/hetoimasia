@@ -4,7 +4,13 @@
 > above the "Captured evidence" marker is written by hand; below it are the
 > lines the native run printed at its end, the environment section of the
 > `vk2-compatibility` record, and the two receipts the validation runner wrote,
-> verbatim.
+> verbatim. The per-scenario records the native receipt lists are retained
+> unchanged beside this file, at the receipt's own relative paths under
+> [`macos-log-failure-split/`](macos-log-failure-split/evidence/test.vulkan-native/);
+> the logs it lists are reproduced verbatim at the end of this file, because
+> the validation catalog classifies no `.log` path under `docs/` and an
+> unclassified file would select every group and change the inputs these
+> receipts identify.
 
 This is the local macOS evidence for issue #269, the logging and failure
 modules' split into public facades over hidden modules, taken as
@@ -50,6 +56,30 @@ vulkan-native-tests: private vk6-capture: ExitSuccess in 3.9881e-2s
 vulkan-native-tests: private vk7-roots: ExitSuccess in 0.158333s
 vulkan-native-tests: the process ran for 1.611071s, fixtures, examples and teardown included
 ```
+
+### The per-scenario records
+
+Each private scenario's record and log, as the receipt's `evidence` list names
+them. The records are files relative to `macos-log-failure-split/`; the logs
+are the sections below.
+
+| scenario | record | log | verdict | examples |
+| --- | --- | --- | --- | --- |
+| `debug-names` | [`debug-names.md`](macos-log-failure-split/evidence/test.vulkan-native/debug-names.md) | [`debug-names.log`](#debug-nameslog) | pass | 6, 0 failures |
+| `synchronization-hazard` | [`synchronization-hazard.md`](macos-log-failure-split/evidence/test.vulkan-native/synchronization-hazard.md) | [`synchronization-hazard.log`](#synchronization-hazardlog) | pass | 5, 0 failures |
+| `vk11-recording` | [`vk11-recording.md`](macos-log-failure-split/evidence/test.vulkan-native/vk11-recording.md) | [`vk11-recording.log`](#vk11-recordinglog) | pass | 7, 0 failures |
+| `vk2-compatibility` | [`vk2-compatibility.md`](macos-log-failure-split/evidence/test.vulkan-native/vk2-compatibility.md) | [`vk2-compatibility.log`](#vk2-compatibilitylog) | pass | 74, 0 failures |
+| `vk5-bridge` | [`vk5-bridge.md`](macos-log-failure-split/evidence/test.vulkan-native/vk5-bridge.md) | [`vk5-bridge.log`](#vk5-bridgelog) | pass | 10, 0 failures, 1 pending |
+| `vk6-capture` | [`vk6-capture.md`](macos-log-failure-split/evidence/test.vulkan-native/vk6-capture.md) | [`vk6-capture.log`](#vk6-capturelog) | pass | 9, 0 failures |
+| `vk7-roots` | [`vk7-roots.md`](macos-log-failure-split/evidence/test.vulkan-native/vk7-roots.md) | [`vk7-roots.log`](#vk7-rootslog) | pass | 10, 0 failures |
+
+Three scenarios provoke a validation error on purpose and record it as a
+latched verdict issue while their own verdict passes, as the earlier records
+did: `debug-names` its one expected `VUID-vkCmdCopyImageToBuffer-pRegions-00183`
+on the named command buffer and readback buffer, `synchronization-hazard` its
+two unbarriered writes to one buffer, and `vk6-capture` the
+`VUID-vkCmdSetViewport-viewportCount-arraylength` it sends through an unsafe
+import. The headless receipt lists no evidence files.
 
 ### The `vk2-compatibility` record's environment
 
@@ -193,4 +223,226 @@ vulkan-native-tests: the process ran for 1.611071s, fixtures, examples and teard
   },
   "worker": "local"
 }
+```
+
+### The per-scenario logs
+
+#### `debug-names.log`
+
+```
+
+#250 names and labels
+  established every step of its private roots, its generation and its managed resources, on a device that offers naming [✔]
+  recorded the batch inside its labels, and the report left it sealed and discardable [✔]
+  received the provoked report while the overrunning copy was recorded, and no error from any other step [✔]
+  carried the readback buffer, with the name the backend gave it, among the report's objects [✔]
+  carried the enclosing batch's label among the report's command-buffer labels, wherever the layer reports any [✔]
+  lost nothing, and failed its verdict after the last teardown callback for the latched error alone [✔]
+
+Finished in 0.0003 seconds
+6 examples, 0 failures
+vulkan-native-tests debug-names: every check passed
+```
+
+#### `synchronization-hazard.log`
+
+```
+
+Synchronization validation's negative control
+  established every step of its private roots [✔]
+  reported the deliberate write-after-write hazard from inside the second write [✔]
+  reported no error but the hazard it provoked, from no other step [✔]
+  completed its capture: every report admitted and delivered, and its worker finished [✔]
+  failed its verdict, after its last teardown callback, for the latched error and nothing else [✔]
+
+Finished in 0.0004 seconds
+5 examples, 0 failures
+vulkan-native-tests synchronization-hazard: every check passed
+```
+
+#### `vk11-recording.log`
+
+```
+
+VK-11 managed recording
+  established every step of its private roots, its generation and its managed resources [✔]
+  recorded one sealed batch of eleven commands against the generation's image, inside the batch's and the pass's labels [✔]
+  held every managed resource the batch referenced, and no longer once the discard invalidated it [✔]
+  exposed no readback bytes, since nothing was submitted [✔]
+  constructed, released and destroyed every managed resource [✔]
+  received no validation error during any step [✔]
+  completed its capture, and its verdict after the last teardown callback is clean [✔]
+
+Finished in 0.0004 seconds
+7 examples, 0 failures
+vulkan-native-tests vk11-recording: every check passed
+```
+
+#### `vk2-compatibility.log`
+
+```
+
+A whole run
+  releases the same ten entries, in the same order [✔]
+  retains nothing and destroys every handle in plan order [✔]
+  counts the boundary as an entry that ran and not as a handle destroyed [✔]
+  reports the ordinary destruction rules, not device loss [✔]
+A present fence that times out
+  retains that slot's present fence and presentation semaphore, the swapchain, and every parent above them [✔]
+  destroys only what does not depend on the unretired present [✔]
+  names the reason on each retained handle [✔]
+  is not device loss, however long the wait went unsatisfied [✔]
+A teardown boundary that fails without device loss
+  prohibits every release whose safety the boundary was to establish [✔]
+  reports the boundary failure as the reason rather than a presentation [✔]
+  is not discharged by a later valid present fence [✔]
+Later valid present-fence evidence
+  permits ordered release once the fence signals during teardown [✔]
+Device loss
+  permits destruction under the specification's own rule [✔]
+  is never reached by promoting a timeout to it [✔]
+  is established by the boundary alone as readily as by a fence [✔]
+A present rejected out-of-date or surface-lost
+  counts its enqueued operations and holds the slot [✔]
+  releases the slot only on the fence, never on the error result [✔]
+  creates no obligation for the specified no-effect results [✔]
+An exception in place of a result
+  classifies a thrown Vulkan result as that result [✔]
+  treats an exception carrying no result as evidence of nothing [✔]
+  treats a boundary that threw as a boundary that failed [✔]
+A run that stopped before the boundary was registered
+  releases what it registered [✔]
+  still withholds when a registered boundary reached no result at all [✔]
+A recycled slot
+  is not discharged by the completion of the present before it [✔]
+The record a stopped run renders
+  keeps the failing step and the failed verdict [✔]
+  renders the retained handles, their reasons, and the disposition [✔]
+  still claims nothing the run did not establish [✔]
+The loaded Vulkan loader
+  accepts the recorded loader [✔]
+  refuses an alternate loader found ahead of it on the search path, naming both [✔]
+  refuses a run whose runner named no recorded loader [✔]
+  refuses an entry point attributed to no image [✔]
+The native run
+  established every step it started [✔]
+The recorded environment
+  selected the driver by an absolute manifest path rather than by default discovery [✔]
+  cleared every conflicting discovery override it found [✔]
+  identifies the exact sources it proved, by their content [✔]
+  names a repository revision alongside it [✔]
+  ran with validation actually loaded, so a clean run means something [✔]
+  enabled synchronization validation through the instance's own create info [✔]
+  recorded the layers the pinned path offers [✔]
+One loader
+  gives GLFW and the binding the same vkGetInstanceProcAddr address [✔]
+  attributes that address to one image [✔]
+  resolves an ordinary instance command to the same address on both sides [✔]
+  records which driver was actually loaded, not which one was configured [✔]
+The runtime profile
+  enabled Vulkan 1.3 dynamic rendering and synchronization2 rather than assuming them [✔]
+  enabled the portability subset exactly when the device advertised it [✔]
+  found one queue family with both graphics and real surface presentation [✔]
+  presents through a format whose usages include transfer-source capture [✔]
+  enabled the selected maintenance extension with its whole dependency chain [✔]
+  resolved a release entry point, and records which spelling answered [✔]
+  built a swapchain with room to hold an abandoned image [✔]
+Presentation completion
+  observed every present fence signalled [✔]
+  retires every presentation semaphore on its present fence and never on the rendering fence [✔]
+  recycles the semaphore pool only on present-fence evidence [✔]
+  withholds a delayed frame's slot until its present fence, not until its rendering fence [✔]
+Safe abandonment
+  returns an acquired, unrendered image after a tracked cleanup submission consumed its acquisition semaphore [✔]
+  returns a submitted, unpresented image after its rendering completed and its semaphore was settled [✔]
+  needs no swapchain rebuild for either path [✔]
+  keeps making progress on the same swapchain afterwards [✔]
+The capture path
+  reads a known payload back through transfer-source usage [✔]
+Callbacks and the FFI
+  re-entered Haskell during creation, submission, and destruction [✔]
+  still reached Haskell after the explicit messenger was destroyed [✔]
+  found its callback storage still valid while the instance was destroyed [✔]
+  ran on the threaded RTS with GLFW on the process main thread [✔]
+  recorded no validation error and no failed callback [✔]
+Teardown
+  released everything it acquired, with nothing failing and nothing retained [✔]
+  destroyed the explicit messenger after every resource it should have watched [✔]
+The operation and result matrix
+  covers acquisition, submission, presentation, oldSwapchain creation, and destruction [✔]
+  states the device-loss destruction rule from the specification and induces no device loss [✔]
+  labels every row as either a specification citation or an observation to resolve [✔]
+  actually observed every result it claims to observe [✔]
+The matrix's observation labels
+  claims nothing for a run that stopped [✔]
+  does not call a VK_SUCCESS row observed when every result was suboptimal [✔]
+  does not call a release row observed when a release failed [✔]
+  records the oldSwapchain failure case, which retires the old swapchain anyway [✔]
+
+Finished in 0.0034 seconds
+74 examples, 0 failures
+vulkan-native-tests vk2-compatibility: every check passed
+```
+
+#### `vk5-bridge.log`
+
+```
+
+VK-5 loader-aware surface bridge
+  established every step of its session [✔]
+  made the capability from the binding's own vkGetInstanceProcAddr [✔]
+  had GLFW resolve through that exact entry point while the session was live [✔]
+  had GLFW and the binding resolve an instance entry point into one image [✔]
+  copied the platform's required instance extensions [✔]
+  created a surface for the attached window, which the binding accepted [✔]
+  refused the attachment's disposal fact and the instance's release while the surface was owed [✔]
+  destroyed the surface through Vulkan on another thread, and then granted both [✔]
+  restored GLFW's default loader after termination [✔]
+  restored GLFW's default loader after a failed initialization, where the platform can fail one [‐]
+    # PENDING: GLFW 3.4's Cocoa initialization has no failure an application can provoke, and Cocoa is the only backend this platform admits
+
+Finished in 0.0006 seconds
+10 examples, 0 failures, 1 pending
+vulkan-native-tests vk5-bridge: every check passed
+```
+
+#### `vk6-capture.log`
+
+```
+
+VK-6 validation capture
+  established every step of its session [✔]
+  installed a C callback from the executable's own image, and no Haskell callback [✔]
+  heard instance creation through the create-info chain [✔]
+  delivered a message from inside a genuine unsafe import [✔]
+  latched the validation error an unsafe recording call provoked, from inside that call [✔]
+  heard vkDestroyInstance after the explicit messenger was destroyed, and delivered it [✔]
+  counted every delivery in its final verdict [✔]
+  found no error but the one it provoked [✔]
+  records the FFI configuration the toolchain pin qualified [✔]
+
+Finished in 0.0006 seconds
+9 examples, 0 failures
+vulkan-native-tests vk6-capture: every check passed
+```
+
+#### `vk7-roots.log`
+
+```
+
+VK-7 Vulkan roots
+  established every step of its session [✔]
+  made no native call that raised [✔]
+  created each window's surface through GLFW on the process main thread [✔]
+  made every root's creation and destruction, and every surface's destruction, on the graphics owner's thread [✔]
+  created the instance, then the explicit messenger, then one device against the first window's surface [✔]
+  admitted both windows' targets, each required, on that one shared device [✔]
+  retired the first-created window's target alone, leaving the device, the instance and the second target live [✔]
+  destroyed every surface, then the device, then the explicit messenger, then the instance [✔]
+  delivered every report, both messengers' teardown reports included, with the instance's destruction as the quiescence evidence [✔]
+  reported no validation error [✔]
+
+Finished in 0.0004 seconds
+10 examples, 0 failures
+vulkan-native-tests vk7-roots: every check passed
 ```
