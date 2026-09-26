@@ -1000,6 +1000,10 @@ The macOS evidence for the owner's standing desktop approval, taken again over
 the suites' consent wording, is retained as
 [`docs/vulkan/macos-standing-approval.md`](vulkan/macos-standing-approval.md);
 its Linux execution is CI's.
+#269's, taken again over the logging and failure modules' split into public
+facades over hidden modules, are retained as
+[`docs/vulkan/macos-log-failure-split.md`](vulkan/macos-log-failure-split.md);
+their Linux execution is CI's.
 
 ## The native suite
 

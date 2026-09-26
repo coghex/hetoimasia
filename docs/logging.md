@@ -12,6 +12,36 @@ conventions new subsystems follow. The logging arc is complete; queues,
 rotation, telemetry, JSON output, live reload, and a logging monad are not part
 of it.
 
+## Module structure
+
+`Hetoimasia.Foundation.Log` is the only logging module a client imports. It
+defines the logger operations — construction, scoped context, flushing,
+emission, and call-site extraction — and re-exports everything else from hidden
+modules of the foundation's main library, each owning one responsibility:
+
+| Module | Owns |
+| --- | --- |
+| `Log.Base` | `LogLevel`, `SourceLocation`, and the small option records `FormatOptions` and `LogVariables` |
+| `Log.Component` | The validated `Component`, its constructors and operations, and the quoting every diagnostic and record shares |
+| `Log.Types` | The filter, entry, sink, metadata-provider, and logger records |
+| `Log.Filter` | Startup configuration parsing and the admission predicate |
+| `Log.Format` | The record layout and its bare-or-quoted rule |
+| `Log.Sink` | Handle and callback sinks, their serialized writes, and forwarding to a sink |
+
+Dependencies run one way: `Log.Types` imports `Log.Base` and `Log.Component`;
+the filter, format, and sink modules consume those; the facade composes them.
+`Log.Base` and `Log.Component` sit below everything else, which is what lets
+[failure attribution](failures.md#module-structure) import `Component` and
+`SourceLocation` without the logger, filter, format, or sink.
+
+A client that imports one of the hidden modules is refused, and `Component`,
+`LogSink`, and `Logger` stay abstract through the facade. The external-client
+examples in
+[`packages/foundation/test/Test/Foundation/Logging/Opacity.hs`](../packages/foundation/test/Test/Foundation/Logging/Opacity.hs)
+check both boundaries for the logging and failure families, selected by
+`--test-options='--match "Logging and failure opacity"'` on
+`hetoimasia-foundation:foundation-tests`.
+
 ## Public interface
 
 A `Logger` is an opaque value. `mkLoggerWith` is its only constructor:
