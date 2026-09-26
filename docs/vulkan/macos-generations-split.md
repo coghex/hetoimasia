@@ -29,22 +29,21 @@ machine's current Command Line Tools and SDK; its `vulkan`,
 differ from #265's. The Linux evidence is
 [`linux-generations-split.md`](linux-generations-split.md).
 
-The split moves code and changes no behaviour, so this run is the same
-evidence VK-10 retained, taken again over the new modules. The shared roots'
-generation cases did what they did before: a shown 160×120 window's target
-built its generation on the graphics owner's thread from the surface's
-concrete extent — 320×240 at content scale 2.0 — in `B8G8R8A8_SRGB` (format
-50) with a view of each of its 3 images, and a window resized through the
-host's command port was replaced, the old generation retired only after the
-example ended the CPU use it held. The shared session's destruction order shows
-each target's image views, then its swapchain, before its surface, and every one
-of them before the device. The two children that build a capturing generation
-on private roots — `vk11-recording` and `debug-names` — each built one at
-320×240 with 3 images, recorded into it, and destroyed it before its surface
-with no validation error at either generation step; `debug-names` failed its
-verdict for its one deliberately provoked
-`VUID-vkCmdCopyImageToBuffer-pRegions-00183` alone. The shared session's
-verdict was clean.
+The split moves code and changes no behaviour, so this run is the same evidence
+VK-10 retained, taken again over the new modules. The shared roots' generation
+cases did what they did before: a shown 160×120 window's target built its
+generation on the graphics owner's thread from the surface's concrete extent —
+320×240 at content scale 2.0 — in `B8G8R8A8_SRGB` (format 50) with a view of
+each of its 3 images, and a window resized through the host's command port was
+replaced, the old generation retired only after the example ended the CPU use it
+held. The shared session's destruction order shows each target's image views,
+then its swapchain, before its surface, and every one of them before the device.
+The two children that build a capturing generation on private roots —
+`vk11-recording`, whose record names it 320×240 with 3 images, and `debug-names`
+— each recorded into it and destroyed it before its surface, with no validation
+error at either generation step; `debug-names` failed its verdict for its one
+deliberately provoked `VUID-vkCmdCopyImageToBuffer-pRegions-00183` alone. The
+shared session's verdict was clean.
 
 The plan selected: `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `smoke.console`, `test.vulkan-headless`, `test.vulkan-native`, `test.workflow`.
 
