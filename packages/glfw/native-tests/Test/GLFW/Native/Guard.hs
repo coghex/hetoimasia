@@ -116,13 +116,13 @@ spec = describe "the native opt-in" $ do
       consentFrom "darwin" [(consentVariable, isolatedValue ":42"), ("DISPLAY", ":42")]
         `shouldBe` Left (IsolationOffPlatform ":42" "darwin")
 
-    it "names the missing consent, the approved command, and the isolated alternative in every refusal" $
+    it "names the missing consent, the desktop opt-in, the standing approval, and the isolated alternative in every refusal" $
       mapM_
         ( \refusal → do
             let message = refusalMessage refusal
             message `shouldContain` consentVariable
             message `shouldContain` (consentVariable <> "=" <> desktopValue)
-            message `shouldContain` "ask"
+            message `shouldContain` "standing approval"
             message `shouldContain` "tools/display/x11.sh"
             message `shouldContain` "tools/display/wayland.sh"
             message `shouldContain` "DISPLAY, WAYLAND_DISPLAY, and CI are not consent"

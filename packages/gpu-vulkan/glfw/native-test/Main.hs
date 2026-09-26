@@ -25,7 +25,8 @@
 -- without it the suite is an ordinary Hspec run that selects as asked.
 --
 -- which on Linux starts an isolated X11 display for it, and on macOS needs
--- the human's @HETOIMASIA_NATIVE_SESSION=desktop@ on that one command. See
+-- the desktop opt-in, @HETOIMASIA_NATIVE_SESSION=desktop@ on the run's own
+-- command, given under the owner's standing approval (AGENTS.md). See
 -- docs/gpu_backend.md.
 module Main (main) where
 

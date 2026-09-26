@@ -116,8 +116,8 @@ test-suite integration-tests
 -- executable. It opens windows and creates devices, so it enters no session
 -- without the run's consent: on Linux `tools/vulkan/run.sh native` runs it
 -- inside the isolated X11 display `tools/display/x11.sh` starts, and on macOS
--- the human's `HETOIMASIA_NATIVE_SESSION=desktop` must be on the one approved
--- command. It is the catalog group `test.vulkan-native`, built in that group's
+-- `HETOIMASIA_NATIVE_SESSION=desktop` must be on the run's own command, given
+-- under the owner's standing approval (AGENTS.md). It is the catalog group `test.vulkan-native`, built in that group's
 -- preparation stage and timed without its compilation. See
 -- docs/gpu_backend.md.
 test-suite vulkan-native-tests

@@ -125,9 +125,9 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   runs their headless suites (`native-tests`, `shader-tests`,
   `integration-tests`) — the group `test.vulkan-headless` — and needs no
   consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
-  windows and presents on macOS, so it takes the same per-session desktop
-  approval as `glfw-native-tests`; on Linux its runner starts an isolated X11
-  display. See [gpu_backend.md](docs/gpu_backend.md#the-native-suite).
+  windows and presents on macOS, so it takes the same desktop opt-in, under the
+  same standing approval, as `glfw-native-tests`; on Linux its runner starts an
+  isolated X11 display. See [gpu_backend.md](docs/gpu_backend.md#the-native-suite).
 - Without the GLFW SDK, build and run the foundation, runtime, Lua host, and
   root suites with `--project-file cabal.project.cpu`, which shares
   `cabal.project.common` with `cabal.project` and leaves out `hetoimasia-glfw`,
@@ -205,16 +205,18 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   checks must stay headless; future windowed launches must be explicit. No debug server or port is defined yet.
 - `glfw-native-tests` shows, focuses, resizes, minimizes, maximizes, and takes
   fullscreen windows on the desktop it runs on, and refuses to enter a session
-  without per-run consent. Before starting a native session on a person's
-  desktop, describe that disruption, ask the human user for explicit approval,
-  and wait for acceptance; then supply `HETOIMASIA_NATIVE_SESSION=desktop` on
-  that one command, as [docs/glfw.md](docs/glfw.md#the-native-suite) shows.
-  Approval covers only the agreed session: do not reprompt during it, and do
-  not carry it forward. An issue acceptance command, a PR approval, a
-  persistent shell setting, or a periodic testing request is not permission
-  for later desktop disruption, and the opt-in is an operational guard, never
-  proof that the conversation happened. Never set the variable in a profile
-  or in a script an agent runs on its own. On Linux,
+  without per-run consent; `vulkan-native-tests` does the same. The owner gave
+  standing approval on 2026-09-26 for these desktop sessions on the owner's
+  machine: when an issue or pull request needs a native group — the planner
+  requires it, or a request or acceptance command names it — run it without
+  asking, supplying `HETOIMASIA_NATIVE_SESSION=desktop` on that one command, as
+  [docs/glfw.md](docs/glfw.md#the-native-suite) shows. Saying that windows will
+  appear is fine; never wait for a reply. The variable stays an operational
+  guard, so a command that did not ask for a desktop never opens windows: never
+  set it in a profile, a persistent environment, or a script that runs on its
+  own. Periodic testing and flake-lab rotations are not covered and use the
+  desktop only when the owner asks for that run. The owner can withdraw this
+  approval; per-session asking then applies again. On Linux,
   `bash tools/display/x11.sh -- <command>` runs the suite on an isolated X11
   display, supplies its own consent for that display alone, and needs no
   approval. Dry runs and the approval-free selections need none either.

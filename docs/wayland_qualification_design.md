@@ -332,7 +332,7 @@ The qualification reuses the pinned Linux image, the native cache and the
 validation catalog, defines its groups and their promotion to small
 required-when-affected checks when support is established, and keeps extensive
 desktop and compositor-specific probes optional. Local macOS testing and the
-human's explicit consent for desktop disruption are preserved.
+human's explicit consent for desktop disruption are preserved. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 
 Decisions D-7 through D-11 were made by the owner on 2026-09-20 in review of
 this document's first draft.

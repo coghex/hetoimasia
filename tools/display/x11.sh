@@ -26,8 +26,8 @@
 # display alone: the child chain (the validation runner, cabal, the suite, and
 # its private-session children) inherits it, nothing else does, and a run that
 # never establishes the display gives it to nothing. This never stands in for
-# the human's HETOIMASIA_NATIVE_SESSION=desktop on a real desktop, which no
-# script supplies.
+# the desktop opt-in, HETOIMASIA_NATIVE_SESSION=desktop on a run's own command,
+# which no script supplies.
 #
 #   tools/display/x11.sh [--summary FILE] [--retain DIRECTORY] -- COMMAND [ARGUMENT...]
 #

@@ -2,14 +2,13 @@
 -- initializes GLFW, creates a window, touches a driver, or starts a child.
 --
 -- The suite opens windows and presents to them, so it disrupts whatever
--- desktop it runs on exactly as @glfw-native-tests@ does. AGENTS.md requires an
--- agent to describe that disruption, ask the human user for explicit approval,
--- and wait for acceptance before starting such a session, and that conversation
--- cannot be proven by software. So this is an operational guard, read once
--- before anything native happens:
+-- desktop it runs on exactly as @glfw-native-tests@ does. The owner's standing
+-- approval (AGENTS.md, 2026-09-26) covers such a session whenever an issue or
+-- pull request needs it; this is the operational guard that keeps every other
+-- command from opening windows, read once before anything native happens:
 --
--- * @HETOIMASIA_NATIVE_SESSION=desktop@ is the human's approval for one run on
---   the local desktop, supplied on the approved command itself.
+-- * @HETOIMASIA_NATIVE_SESSION=desktop@ is the opt-in for one run on the local
+--   desktop, supplied on the run's own command.
 -- * @HETOIMASIA_NATIVE_SESSION=isolated-x11:DISPLAY@ is what
 --   @tools/display/x11.sh@ gives the command it runs once its private X11
 --   display is up, and authorizes only that display.
@@ -82,7 +81,7 @@ readConsent = consentFrom os <$> getEnvironment
 
 describeConsent ∷ Consent → Text
 describeConsent = \case
-  Desktop → "the human user's explicit approval for this one run on the local desktop"
+  Desktop → "the desktop opt-in on this run's command, under the owner's standing approval"
   IsolatedX11 display → "the isolated X11 display " <> Text.pack display
 
 refusalReason ∷ Refusal → Text
@@ -104,13 +103,13 @@ refusalReason = \case
       <> Text.pack platform
 
 -- | One message naming what is missing, what the suite would do to the desktop,
--- how a human approves a run, and the isolated alternative.
+-- how a run opts in, and the isolated alternative.
 refusalMessage ∷ Refusal → Text
 refusalMessage refusal =
   "this run is not authorized to enter a native session: "
     <> refusalReason refusal
-    <> ". The Vulkan native suite opens windows on the desktop it runs on and presents to them, so an agent describes that disruption, asks the human user for explicit approval, and waits for acceptance; the approved command then carries "
+    <> ". The Vulkan native suite opens windows on the desktop it runs on and presents to them, so only a command that asks for the desktop carries "
     <> Text.pack consentVariable
     <> "="
     <> Text.pack desktopValue
-    <> " for that one run. On Linux, `bash tools/vulkan/run.sh native <component>` runs the suite on an isolated X11 display it starts instead, and needs no approval. DISPLAY and CI are not consent."
+    <> " for that one run; the owner's standing approval covers runs an issue or pull request needs (AGENTS.md), and periodic testing asks the owner first. On Linux, `bash tools/vulkan/run.sh native <component>` runs the suite on an isolated X11 display it starts instead, and needs no approval. DISPLAY and CI are not consent."

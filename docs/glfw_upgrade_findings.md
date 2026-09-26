@@ -84,7 +84,7 @@ Sources: [GLFW downloads](https://www.glfw.org/download.html) and
 - **Qualification:** Run affected headless Hspec/workflow groups and real Linux
   X11 and isolated Wayland checks, including no-seat session entry and helper
   behavior. Run relevant Cocoa checks locally with explicit human approval
-  before desktop disruption. Request necessary optional groups explicitly;
+  before desktop disruption (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). Request necessary optional groups explicitly;
   unavailable evidence is not success. Recheck any delivered Vulkan/GLFW bridge
   affected by the upgrade. Keep remote CI Linux-only and Windows deferred.
 - **Contract reconciliation:** Audit version-dependent capabilities, native shim

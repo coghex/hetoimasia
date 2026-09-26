@@ -1640,7 +1640,7 @@ validation and image/lifecycle assertions. D-21 settles required-when-affected
 native checks, their execution budget and the local macOS/remote Linux split;
 the verification strategy specifies evidence and applicability. Lengthy stress,
 performance and extra-hardware probes remain optional. Local disruptive macOS
-evidence needs the human's explicit approval each session.
+evidence needs the human's explicit approval each session. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 Use the package-owned suite layout already delivered by #129/#130. Backend
 contracts belong beside the backend; root tests own application composition,
 and tool tests own provisioning/selection. Do not move them into one root suite.
@@ -2235,6 +2235,7 @@ assuming Linux's green check enforces a local requirement:
 - Preserve the human's explicit per-session approval before any local test
   disrupts their desktop, even when the test is required and the solver owns
   running it. No consent means local verification remains pending, not passed.
+  *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
   Isolated Linux X11 needs no desktop approval. Do not infer consent from an
   issue approval or turn the native-session opt-in into a persistent setting.
 

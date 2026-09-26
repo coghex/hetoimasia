@@ -81,13 +81,13 @@ Guide is advisory and does not replace Kanban approval or project-review records
 - Prefer Hspec. Python probes need a boundary Hspec cannot reasonably exercise.
   Use coordinated concurrency tests, not sleeps; preserve fail-on-empty and
   meaningful external-client opacity checks. Scope tests to changed contracts.
-- Remote CI is Linux-only; macOS native evidence is local. Before any test
-  disrupts the human's desktop, **ask for the human user's explicit approval**,
-  explain the disruption, and wait. Approval covers only that agreed session.
-  Issue/PR approval and acceptance commands do not authorize desktop use.
-  Supply `HETOIMASIA_NATIVE_SESSION=desktop` only on the approved command.
-  Isolated X11 through `tools/display/x11.sh` and approval-free native selectors
-  need no desktop approval. The environment flag is a guard, not proof of consent.
+- Remote CI is Linux-only; macOS native evidence is local. Owner decision
+  2026-09-26: desktop-disrupting native runs an issue or PR needs have
+  **standing approval** — run them without asking, with
+  `HETOIMASIA_NATIVE_SESSION=desktop` on that one command. Never set the flag
+  persistently. Periodic testing and flake-lab rotations still need the owner's
+  request for that run. Isolated X11 through `tools/display/x11.sh` and
+  approval-free native selectors need no consent at all.
 
 ## Implemented and reviewed
 
