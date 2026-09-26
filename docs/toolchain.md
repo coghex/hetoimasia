@@ -373,9 +373,11 @@ In summary, all on the qualified toolchain:
 - Every headless validation group has a passing local receipt, produced by the
   planner and runner against a committed candidate.
 - `test.glfw-native` has no local receipt on purpose. It takes over the desktop
-  it runs on, and [AGENTS.md](../AGENTS.md) requires explicit per-run human
-  approval before an agent starts such a session; qualifying a toolchain is not
-  that approval. Linux CI runs the group on its own isolated X11 display.
+  it runs on, and when this qualification was recorded
+  [AGENTS.md](../AGENTS.md) required explicit per-run human approval before an
+  agent started such a session. Since 2026-09-26 the owner's standing approval
+  covers a run an issue or pull request needs, with the desktop opt-in on that
+  run's own command. Linux CI runs the group on its own isolated X11 display.
 - `tools/toolchain/qualify-binding.sh` exits zero on local macOS and inside the
   pinned Linux container, reporting the pinned pair and the required flags on
   both.

@@ -323,6 +323,7 @@ Retain the owner's accepted desktop policy: before opening native windows,
 requesting focus, or manipulating fullscreen/display state locally, ask the
 human user for explicit approval and wait for acceptance for that session.
 Issue approval or a previous session's permission is not standing consent.
+*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 Isolated Linux X11 CI remains non-optional when affected. Issue #124 implements
 the native opt-in guard; this migration preserves it and does not duplicate it.
 

@@ -195,6 +195,7 @@ D-4 accepts the corresponding rule for graphics dependents.
 Use Hspec and scripted lifetimes for failure/ordering proofs, isolated X11 for
 native window lifetime, and local Cocoa only after asking for and receiving
 the human user's explicit approval for that test session. No hosted macOS CI.
+*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 GLFW-only evidence is not GPU-completion evidence.
 
 ### D-4. Protect retirement between worker drain and dependency release

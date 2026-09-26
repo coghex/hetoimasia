@@ -329,8 +329,10 @@ Move rendering off the thread that owns the pump.
 
 The probe is in the tree and is selectable at any time. It is pending unless
 `HETOIMASIA_INTERACTION_PROBE_SECONDS` asks for it, so no routine run, CI run,
-or mandatory validation group performs it, and it needs the same explicit human
-approval every desktop session needs. The command, the variables, and what the
+or mandatory validation group performs it. It is interactive and never selected
+by the planner, so the owner's standing approval for runs an issue or pull
+request needs (2026-09-26, AGENTS.md) does not reach it: it runs when the owner
+asks for it, with the owner performing the interactions. The command, the variables, and what the
 report contains are in
 [docs/glfw.md](glfw.md#the-interaction-probe). What an owner turn offers the
 trace, the bound, and its loss and fault reporting are asserted headlessly over

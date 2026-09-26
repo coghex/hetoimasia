@@ -314,7 +314,7 @@ test-suite glfw-tests
 -- group — so it is neither part of glfw-tests nor of the CPU groups, and
 -- `cabal build all` compiles it without running it. It enters no session and
 -- starts no child without the per-run consent Test.GLFW.Native.Consent reads:
--- the human's HETOIMASIA_NATIVE_SESSION=desktop on one approved command, or
+-- HETOIMASIA_NATIVE_SESSION=desktop on the run's own command, or
 -- the value tools/display/x11.sh gives the command it isolates.
 test-suite glfw-native-tests
     import: language

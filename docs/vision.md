@@ -193,9 +193,11 @@ non-optional groups and PR requests. Optional probes stay optional and may be
 run by periodic testing.
 
 Required Vulkan native checks should stay under 30 seconds; broader probes
-are opt-in. Each platform supplies its own evidence. Ask for the **human user's
-explicit approval before every desktop-disrupting test session**; issue approval
-is not desktop consent. Isolated scripted displays are a separate approved path.
+are opt-in. Each platform supplies its own evidence. Desktop-disrupting native
+sessions an issue or pull request needs run under the owner's **standing
+approval** (owner decision 2026-09-26), always through an explicit per-command
+opt-in so nothing else opens windows; periodic testing still asks first.
+Isolated scripted displays are a separate approved path.
 Pure/model tests do not establish visual results, performance or confinement.
 See [validation](validation.md) and [test architecture](test_architecture_design.md).
 

@@ -280,8 +280,10 @@ both platforms.
 - **Performance.** Lavapipe is a software driver and MoltenVK is a translation
   layer. Both give API and image-correctness evidence and neither gives hardware
   performance coverage.
-- **Hosted macOS CI.** macOS evidence is local and requires a human's per-run
-  approval, exactly as D-3 and AGENTS.md require. Nothing here changes that.
+- **Hosted macOS CI.** macOS evidence is local. It was taken under a human's
+  per-run approval, as D-3 and AGENTS.md then required; since 2026-09-26 the
+  owner's standing approval covers runs an issue or pull request needs, with the
+  desktop opt-in on each run's command (AGENTS.md).
 - **The production environment.** At the time of this proof the CI image carried
   no Vulkan input and the native manifest described GLFW alone; promoting the
   recipe was left to VK-4 rather than taken as a side effect here. VK-4 (#208)
@@ -303,8 +305,9 @@ pre-PR evidence. The toolchain must be the one
 Every instance it creates now also enables synchronization validation, which the
 retained records above predate.
 
-macOS, only after a human has approved that session, because the suite opens a
-window on the desktop it runs on and presents to it:
+macOS, under the owner's standing approval for runs an issue or pull request
+needs, with the desktop opt-in on the run's own command, because the suite opens
+a window on the desktop it runs on and presents to it:
 
 ```bash
 bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests

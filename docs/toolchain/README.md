@@ -29,10 +29,11 @@ these can never satisfy a Linux plan. See
 [validation.md](../validation.md#planning-and-verifying-against-the-image).
 
 `test.glfw-native` is selected by the plan and has no receipt here. It shows,
-focuses, resizes, and takes fullscreen windows on the desktop it runs on, and
-[AGENTS.md](../../AGENTS.md) requires explicit per-run human approval before an
-agent starts such a session. Qualifying a toolchain is not that approval. Linux
-CI runs the group on its own isolated X11 display.
+focuses, resizes, and takes fullscreen windows on the desktop it runs on. Under
+[AGENTS.md](../../AGENTS.md) the owner's standing approval covers such a session
+when an issue or pull request needs the group, with the desktop opt-in on that
+run's own command; this qualification record ran none. Linux CI runs the group
+on its own isolated X11 display.
 
 ## Linux
 

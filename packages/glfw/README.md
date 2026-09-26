@@ -185,10 +185,9 @@ for the private X11 display it starts, and needs no approval:
 bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct
 ```
 
-On a real desktop — Cocoa on macOS — an agent first describes that
-disruption, asks the human user for explicit approval, and waits for
-acceptance; the approved run, and only that run, then carries the consent on
-its own command:
+On a real desktop — Cocoa on macOS — the owner's standing approval covers a
+run an issue or pull request needs, so an agent runs it without asking, and
+only that run carries the consent on its own command:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct

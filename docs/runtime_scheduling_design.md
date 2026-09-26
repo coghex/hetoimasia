@@ -33,7 +33,8 @@ concrete precondition
   submissions wake the native owner without weakening session lifetime.
 - **Done when:** scripted clocks and native X11 evidence establish bounded
   catch-up, fair owner turns, safe wake/termination races, and independent
-  window suspension. Cocoa evidence is collected only after human approval.
+  window suspension. Cocoa evidence is collected only after human approval
+  (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)).
 - **Users and operators:** engine/game authors, background workers submitting
   commands, and agents running focused validation.
 - **Arc label:** existing `runtime`; crossing slices also use the existing
@@ -113,6 +114,7 @@ the main thread; remote CI is Linux-only. Before any disruptive local test,
 ask for the human user's explicit approval and wait for acceptance. Necessary
 disruption is allowed within that approved session; a command in an issue body
 does not provide that approval. Isolated X11 testing needs no desktop approval.
+*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 
 ### D-4. Degrade wake failure without undoing accepted work
 
@@ -343,7 +345,8 @@ evidence uses the same production path, only after human approval; no remote
 macOS CI. TIME-3 must retain the first production wake/teardown evidence on both
 platforms before merge. Later slices use focused headless and selected Linux
 checks; additional local native runs are chosen for the changed boundary and
-require their own human approval. A model result is not native wake evidence.
+require their own human approval. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+A model result is not native wake evidence.
 Test failures and missing
 required environments must never be reported as passes.
 

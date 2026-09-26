@@ -786,8 +786,8 @@ spec = describe "The Vulkan project boundary" $ do
         output `shouldNotContain` "vulkan: ghc"
 
   it "never supplies the native-session consent itself" $ do
-    -- AGENTS.md: the human's approval is given on one approved command, never
-    -- by a script an agent runs on its own, and `tools/display/x11.sh` is the
+    -- AGENTS.md: the desktop opt-in is given on the run's own command, never
+    -- by a script that runs on its own, and `tools/display/x11.sh` is the
     -- only thing that may supply the isolated-display value. The runner only
     -- ever reads it, to decide whether to start that isolated display.
     script ← readFile runner

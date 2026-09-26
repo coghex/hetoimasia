@@ -37,7 +37,7 @@ spec gate fixture timings = describe "Vulkan native" $ do
 -- process's, so they are checked without a session.
 consent ∷ Spec
 consent = do
-  it "accepts the human's approval for one run on the desktop, on either platform" $ do
+  it "accepts the desktop opt-in for one run, on either platform" $ do
     consentFrom "darwin" [("HETOIMASIA_NATIVE_SESSION", "desktop")] `shouldBe` Right Desktop
     consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "desktop")] `shouldBe` Right Desktop
 

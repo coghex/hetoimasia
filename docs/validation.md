@@ -287,7 +287,8 @@ seconds are D-21's budget for the whole native execution: on Linux the isolated
 X11 display the command starts for itself, the shared session and its roots,
 every example and child, retirement, the diagnostic verdict computed after the
 last teardown callback, and the display's own teardown. On macOS the same
-command needs the human's per-session `desktop` consent, as
+command carries the `desktop` opt-in on its own command, under the owner's
+standing approval for runs an issue or pull request needs, as
 [A local run and its receipt](#a-local-run-and-its-receipt) describes. A missing
 loader, device, layer or display fails the group; an empty selection fails the
 suite, and the suite's own report names its non-empty selection. Its inputs are
@@ -335,8 +336,9 @@ fixture and its small, stable session, thread, and window examples, described in
 so only the [display worker](#the-display-worker) may execute it, and like
 `test.workflow` it is outside the mandatory floor and runs only when affected or
 requested. The suite enters no session without per-run consent: in CI the
-display helper supplies it for the isolated display it starts, and on a
-person's desktop only the human's explicit approval does, as
+display helper supplies it for the isolated display it starts, and on the
+owner's desktop the explicit opt-in on the run's own command does, given under
+the owner's standing approval for runs an issue or pull request needs, as
 [the native suite](glfw.md#the-native-suite) describes. Its inputs are the native suite's Cabal closure — the suite, the GLFW
 package, and the foundation library — plus `tools/display/`, `tools/native/`,
 and `tools/ci-image/`, so a change to the display setup, the native recipe, or
@@ -987,7 +989,7 @@ on Linux with no consent of its own, so the display's startup and teardown are
 part of the execution the runner measures and watches, and a display that
 cannot be established is that execution failing — with a receipt — rather than
 a job failing before any group began. A command already running inside an
-isolated display, or carrying a human's desktop approval, uses that session and
+isolated display, or carrying the desktop opt-in, uses that session and
 starts no second one. The helper keeps its server and window-manager logs in
 the group's evidence directory (`--retain`), and the suite writes each private
 scenario's output and record there too; the worker uploads them with its
@@ -2054,9 +2056,10 @@ windowing session. The group's catalog command is fixed, and the suite refuses
 to enter a session without consent, so the consent is supplied on the runner's
 own command and inherited by `cabal` and the suite. This is a run on the
 person's desktop: the examples show, focus, resize, minimize, maximize, and
-take fullscreen windows there, so an agent first describes that disruption,
-asks the human user for explicit approval, and waits for acceptance, exactly as
-[the native suite](glfw.md#the-native-suite) requires. Only then:
+take fullscreen windows there. When an issue or pull request needs the group,
+the owner's standing approval covers the run, as
+[the native suite](glfw.md#the-native-suite) describes: the agent runs it
+without asking, and only this command carries the consent:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop \
@@ -2066,8 +2069,8 @@ HETOIMASIA_NATIVE_SESSION=desktop \
 ```
 
 Without the consent the group fails before initializing GLFW and writes no
-passing receipt. The approval covers this one run; it is never a profile
-setting or part of a script an agent runs on its own. That receipt records
+passing receipt. The opt-in belongs to this one command; it is never a profile
+setting or part of a script that runs on its own. That receipt records
 `Darwin` as its runner OS, and remote CI never runs macOS, so it is local
 evidence only: it can never satisfy a Linux plan.
 
@@ -2085,10 +2088,10 @@ python3 -I tools/validation/run.py test.vulkan-headless --plan plan.json --recei
 ```
 
 `test.vulkan-native` opens windows and presents to one of them on the person's
-desktop, under MoltenVK and Cocoa, for a few seconds. An agent first describes
-that disruption, asks the human user for explicit approval for that session,
-and waits for acceptance, exactly as for the GLFW native suite; only then does
-the one approved command carry the consent:
+desktop, under MoltenVK and Cocoa, for a few seconds. As for the GLFW native
+suite, the owner's standing approval covers a run an issue or pull request
+needs, so the agent runs it without asking, and only this command carries the
+consent:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop \
@@ -2127,9 +2130,10 @@ features, and glslang the local prefix provisioned. It never names the Linux
 image: a Darwin plan carries no `ci-image` entry and records `Darwin` as its
 runner OS, so it can never satisfy a Linux plan or receipt, and a Linux receipt
 can never stand in for it. Retain the receipts, and the evidence directory's
-per-scenario records, with the pull request. Without the human's approval the
-native group is not run, and the pull request says local macOS verification is
-pending, never passed. A change to anything either group consumes invalidates
+per-scenario records, with the pull request. When the native group cannot run
+— no desktop session is available, or the owner has withdrawn the standing
+approval — the pull request says local macOS verification is pending, never
+passed. A change to anything either group consumes invalidates
 the evidence under the ordinary rules and needs a new run before merge; a
 documentation-only change may reuse it.
 

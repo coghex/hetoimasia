@@ -2,16 +2,16 @@
 -- native session or starts a private-session child.
 --
 -- The native examples show, focus, resize, minimize, maximize, and take
--- fullscreen windows on whatever desktop they run on. The owner permits that
--- disruption, but only once an agent has described it, asked the human user
--- for explicit approval, and waited for acceptance. That conversation cannot
--- be proven by software, so this module is an operational guard: a run enters
--- a native session only when its environment carries one of two consents,
--- read once at startup.
+-- fullscreen windows on whatever desktop they run on. The owner gave standing
+-- approval on 2026-09-26 for that disruption on the owner's machine whenever an
+-- issue or pull request needs a native run (AGENTS.md). This module is the
+-- operational guard that keeps every other command from opening windows: a run
+-- enters a native session only when its environment carries one of these
+-- consents, read once at startup.
 --
--- * @HETOIMASIA_NATIVE_SESSION=desktop@ is the human's approval for this one
---   run on the local desktop. It is supplied on the approved command itself,
---   never in a shell profile or in a script an agent runs on its own.
+-- * @HETOIMASIA_NATIVE_SESSION=desktop@ is the opt-in for this one run on the
+--   local desktop. It is supplied on the run's own command, never in a shell
+--   profile, a persistent environment, or a script that runs on its own.
 -- * @HETOIMASIA_NATIVE_SESSION=isolated-x11:DISPLAY@ is what
 --   @tools/display/x11.sh@ gives the command it runs once its private X11
 --   display is up. It authorizes only that display: it must match @DISPLAY@,
@@ -55,7 +55,7 @@ import System.Info (os)
 -- | The authorization a run carries.
 data Consent
   = Desktop
-    -- ^ The human user approved this run on the local desktop.
+    -- ^ This run opted in to the local desktop.
   | IsolatedX11 String
     -- ^ The isolated display helper started this run on the named display.
   | IsolatedWayland String
@@ -88,7 +88,7 @@ data Refusal
 consentVariable ∷ String
 consentVariable = "HETOIMASIA_NATIVE_SESSION"
 
--- | The value the human user supplies for one approved desktop run.
+-- | The value a run's own command supplies to opt in to the local desktop.
 desktopValue ∷ String
 desktopValue = "desktop"
 
@@ -196,13 +196,13 @@ refusalReason = \case
       <> platform
 
 -- | One message naming what is missing, what the native examples would do to
--- the desktop, how a human approves a run, and the isolated alternative.
+-- the desktop, how a run opts in, and the isolated alternative.
 refusalMessage ∷ Refusal → String
 refusalMessage refusal =
   "this run is not authorized to enter a native session: "
     <> refusalReason refusal
-    <> ". The native examples show, focus, resize, minimize, maximize, and take fullscreen windows on the desktop they run on, so an agent describes that disruption, asks the human user for explicit approval, and waits for acceptance; the approved command then carries "
+    <> ". The native examples show, focus, resize, minimize, maximize, and take fullscreen windows on the desktop they run on, so only a command that asks for the desktop carries "
     <> consentVariable
     <> "="
     <> desktopValue
-    <> " for that one run. On Linux, `bash tools/display/x11.sh -- <command>` runs the command on an isolated X11 display instead, and `bash tools/display/wayland.sh -- <command>` on an isolated Wayland socket; neither needs approval. DISPLAY, WAYLAND_DISPLAY, and CI are not consent."
+    <> " for that one run; the owner's standing approval covers runs an issue or pull request needs (AGENTS.md), and periodic testing asks the owner first. On Linux, `bash tools/display/x11.sh -- <command>` runs the command on an isolated X11 display instead, and `bash tools/display/wayland.sh -- <command>` on an isolated Wayland socket; neither needs approval. DISPLAY, WAYLAND_DISPLAY, and CI are not consent."

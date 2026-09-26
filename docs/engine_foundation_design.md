@@ -157,8 +157,10 @@ Compile components against declared dependencies and keep CPU consumers
 headless. Test failure, cancellation and cleanup contracts in their owning
 packages. Graphics behavior needs native evidence and captured pixels where
 applicable; headless tests alone prove no image. Performance claims require
-retained measurements. Native desktop sessions require per-session human
-consent; approved isolated Linux displays do not.
+retained measurements. Native desktop sessions require an explicit
+per-command opt-in, given under the owner's standing approval (2026-09-26) for
+runs an issue or pull request needs; approved isolated Linux displays need
+none.
 
 Game saves and game-specific determinism remain application-owned. A later
 Synarchy migration must preserve or explicitly migrate those contracts.

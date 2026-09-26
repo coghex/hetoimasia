@@ -145,7 +145,7 @@ production renderer here from which to claim an observed rendering defect.
 **Handoff context:**
 
 - **Expected first task:** a bounded local qualification experiment on the current macOS/GLFW profile. Record native-pump entry/exit, owner update progress and actual callbacks during move, resize and menu interactions. Use owned bounded capture so measurement itself does not add synchronous logging stalls; retain the command, platform identity and observations. Inspect Synarchy's corresponding flow as context, not as proof.
-- **Acceptance:** distinguish an observed stall from an inferred risk, report which interactions reproduce it, and retain a verdict including any unperformed cases. Linux evidence cannot substitute for the requested Cocoa experiment. Desktop disruption requires the human user's explicit approval for that session; this report is not permission to launch it. Prefer Hspec where practical and document any manual interaction or probe boundary.
+- **Acceptance:** distinguish an observed stall from an inferred risk, report which interactions reproduce it, and retain a verdict including any unperformed cases. Linux evidence cannot substitute for the requested Cocoa experiment. Desktop disruption requires the human user's explicit approval for that session; this report is not permission to launch it. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).* Prefer Hspec where practical and document any manual interaction or probe boundary.
 - **Decision after evidence:** before VK-16, choose and document temporary acceptance of a stall, a narrowly controlled redraw path, or a separate rendering owner. State what happens to other windows, simulation and queued commands during the interaction; continuous simulation is not automatically required by a redraw policy.
 - **Scope and constraints:** this finding authorizes investigation first. Keep current record-only callbacks and main-thread ownership until a reviewed design explicitly changes them. It does not authorize callback reentrancy, rendering inside a callback or a render-worker redesign. Do not make this experiment a routine disruptive CI test or a prerequisite for every earlier Vulkan slice.
 - **Remaining uncertainty:** actual platform behavior and the resulting rendering policy; settle them before integrated rendering relies on continuous owner turns.
@@ -241,7 +241,7 @@ and evidence identity; retain the proof's historical results as historical.
   driver waits. Record toolchain, layers and driver identity. Do not assert an
   unmeasured speedup or add noisy timing thresholds to required CI. Existing
   Linux-only remote CI, local macOS verification and explicit human approval for
-  desktop disruption still apply.
+  desktop disruption still apply (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)).
 - **Scope and constraints:** code, required contract updates and evidence belong
   together in each implementation PR. This finding does not authorize changing
   Lua's FFI settings, rewriting the foundation logger, broad RTS tuning, a new
@@ -396,7 +396,7 @@ machine is available. Neither is a claim of current support or native evidence.
   define the qualification groups and their promotion to small
   required-when-affected checks when support is established. Extensive desktop
   and compositor-specific probes remain optional. Preserve local macOS testing
-  and explicit human consent for desktop disruption. Do not block the existing
+  and explicit human consent for desktop disruption (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). Do not block the existing
   macOS/X11 milestone on Windows or full desktop-platform parity.
 
 **Handoff context:**
