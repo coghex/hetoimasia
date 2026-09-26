@@ -2450,7 +2450,7 @@ native evidence obligations even when its implementation can run in parallel.
 - **Depends on:** `VK-1`.
 - **Ordering:** critical path; hard gate for native delivery.
 - **Relevant decisions:** D-2, D-9–D-14, D-17, D-23–D-25.
-- **Acceptance signals:** Real present-fence retirement and successful unused-image cleanup on both profiles; callback/dispatch identity verified; exceptional paths distinguished as specification or injected evidence. Explicit human approval precedes disruptive local execution.
+- **Acceptance signals:** Real present-fence retirement and successful unused-image cleanup on both profiles; callback/dispatch identity verified; exceptional paths distinguished as specification or injected evidence. Explicit human approval precedes disruptive local execution. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
 - **Out of scope:** Production managed backend or a claim that a prototype satisfies final CI/lifecycle coverage.
 - **Open questions:** Q-2 deliberately open. Stop dependent native slices and consult the owner if proof fails or needs a policy change; do not waive the gate.
 
