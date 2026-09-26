@@ -992,7 +992,10 @@ and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
 worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
 and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
-[`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md).
+[`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
+the recording's split into private modules, are retained as
+[`docs/vulkan/macos-recording-split.md`](vulkan/macos-recording-split.md) and
+[`docs/vulkan/linux-recording-split.md`](vulkan/linux-recording-split.md).
 
 ## The native suite
 
