@@ -996,6 +996,10 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). #250's are retained as
 the recording's split into private modules, are retained as
 [`docs/vulkan/macos-recording-split.md`](vulkan/macos-recording-split.md) and
 [`docs/vulkan/linux-recording-split.md`](vulkan/linux-recording-split.md).
+The macOS evidence for the owner's standing desktop approval, taken again over
+the suites' consent wording, is retained as
+[`docs/vulkan/macos-standing-approval.md`](vulkan/macos-standing-approval.md);
+its Linux execution is CI's.
 
 ## The native suite
 
