@@ -36,6 +36,7 @@ import qualified Test.GLFW.Dynamic as Dynamic
 import qualified Test.GLFW.Host as Host
 import qualified Test.GLFW.Input as Input
 import qualified Test.GLFW.Interop as Interop
+import qualified Test.GLFW.Connection as Connection
 import qualified Test.GLFW.Linking as Linking
 import qualified Test.GLFW.Mode as Mode
 import qualified Test.GLFW.Monitor as Monitor
@@ -57,6 +58,7 @@ spec = describe "GLFW" $ do
   Session.spec
   Interop.spec
   Wake.spec
+  Connection.spec
   Notify.spec
   Window.spec
   Command.spec

@@ -96,6 +96,20 @@
 -- cannot reach any later session, which has a gate of its own. A construction
 -- that rolls back never lends a capability at all.
 --
+-- = Connection status
+--
+-- A Wayland session resolves the private connection-status probe of
+-- "Hetoimasia.GLFW.Internal.Connection" once GLFW has initialized and the
+-- selected backend is verified, and a library that cannot supply one refuses
+-- the session with 'ConnectionProbeUnavailable', attributed to initialization.
+-- Event processing asks 'requireConnection' before and after every native poll
+-- or wait, windows or none, and a probe that finds the transport closed, a
+-- protocol failure, or cannot establish the status at all fails that processing
+-- with 'ConnectionFailed', naming the cause. The failure is latched: the
+-- session is terminal for event processing from then on, which raises it again
+-- without probing or pumping, and nothing reconnects. X11 and Cocoa sessions
+-- resolve no probe, so their event processing makes no probe call.
+--
 -- = Native errors
 --
 -- Each native call an operation makes is bracketed by the capture described in
@@ -191,6 +205,12 @@
 -- |                    |                   | session's release    | on any      | between            | retained for good     |
 -- |                    |                   | restores it          | thread      |                    | when uncertain        |
 -- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
+-- | Connection probe   | The session       | Entry resolves it on | Owner       | The session        | Latched once event    |
+-- | and its latched    |                   | Wayland; event       |             |                    | processing confirms a |
+-- | failure            |                   | processing runs it   |             |                    | failure; never        |
+-- |                    |                   | and latches what it  |             |                    | cleared               |
+-- |                    |                   | confirms             |             |                    |                       |
+-- +--------------------+-------------------+----------------------+-------------+--------------------+-----------------------+
 -- | Interaction trace  | The session       | An activated probe   | Owner, and  | Stopped unless a   | Emptied by each take; |
 -- |                    | ('Trace')         | starts, takes, and   | callbacks   | probe starts it;   | stopped storage holds |
 -- |                    |                   | stops it; the pump,  | inside its  | never started by   | nothing               |
@@ -224,6 +244,10 @@ module Hetoimasia.GLFW.Internal.Session
   , sessionAssemblyWith
   , sessionBackend
   , takeAsynchronousReports
+
+    -- * The Wayland connection-status probe
+  , sessionProbesConnection
+  , requireConnection
 
     -- * The loader integration capability
   , SessionIntegration
@@ -338,6 +362,13 @@ import Hetoimasia.GLFW.Internal.Capture
   , takeOtherReports
   , takeOwnerReports
   , takeWakeReports
+  )
+import Hetoimasia.GLFW.Internal.Connection
+  ( ConnectionFailed (..)
+  , ConnectionProbe (..)
+  , ConnectionProbeUnavailable (..)
+  , ConnectionStatus (..)
+  , EventBoundary
   )
 import Hetoimasia.GLFW.Internal.Control
   ( WindowCapabilities
@@ -487,6 +518,11 @@ data Native = Native
     -- ^ Select the platform, and keep the working directory unchanged.
   , nativeInitialize ∷ IO Bool
   , nativeCurrentBackend ∷ IO (Maybe Backend)
+  , nativeConnectionProbe ∷ IO (Either Text ConnectionProbe)
+    -- ^ Resolve the private connection-status probe of the initialized
+    -- session, or say why this library cannot. The session asks only once it
+    -- has verified that it is on Wayland, on the owner thread; an X11 or
+    -- Cocoa session never asks, and never probes.
   , nativeTerminate ∷ IO ()
   , nativeResetWindowHints ∷ IO ()
   , nativeSetWindowHint ∷ WindowHint → IO ()
@@ -723,6 +759,12 @@ data Session = Session
   , sessionIntegrated ∷ !(Maybe SessionIntegration)
     -- ^ The loader integration capability this session took at entry, if it
     -- was entered through 'sessionAssemblyWith'.
+  , sessionProbe ∷ !(Maybe ConnectionProbe)
+    -- ^ The connection-status probe resolved at entry: present on Wayland
+    -- only.
+  , sessionConnection ∷ !(IORef (Maybe ConnectionFailed))
+    -- ^ The connection failure event processing confirmed, once it has; never
+    -- cleared, so the session stays terminal.
   }
 
 -- | The loader integration capability the session took at entry, or 'Nothing'
@@ -961,6 +1003,9 @@ backendIdentifiers backend = [("backend", backendText backend)]
 -- | Raise initialization        | none                         |               |
 -- | reports; verify the backend |                              |               |
 -- +-----------------------------+------------------------------+---------------+
+-- | Resolve the connection      | none                         |               |
+-- | probe, on Wayland only      |                              |               |
+-- +-----------------------------+------------------------------+---------------+
 -- | Allocate the monitor        | Free if safe                 | seventh       |
 -- | callback's storage          |                              |               |
 -- +-----------------------------+------------------------------+---------------+
@@ -1013,6 +1058,7 @@ assembleSession native config integration = do
   trace ← restoredStep newTrace
   health ← restoredStep (newTVarIO WakePathHealthy)
   notifying ← restoredStep (newTVarIO 0)
+  connection ← restoredStep (newIORef Nothing)
   acquirePart
     "glfw session occupancy"
     (releaseRank 7)
@@ -1045,6 +1091,7 @@ assembleSession native config integration = do
   restoredStep $ do
     raiseReported initializeOperation (backendIdentifiers backend) NativeCallReturned initialized
     verifySelected native capture backend
+  probe ← restoredStep (resolveProbe native capture backend)
   source ←
     restoredStep (newMonitorSource (nativeMonitor native) capture (nativeFeatureUnavailable native) identity)
   storage ←
@@ -1094,6 +1141,8 @@ assembleSession native config integration = do
       , sessionWakeHealth = health
       , sessionNotifying = notifying
       , sessionIntegrated = integration
+      , sessionProbe = probe
+      , sessionConnection = connection
       }
 
 admit ∷ Native → SessionConfig → IO Backend
@@ -1234,6 +1283,55 @@ verifySelected native capture backend = do
       verifyOperation
       (backendIdentifiers backend)
       (BackendNotSelected backend reported)
+
+-- | Resolve the connection-status probe a Wayland session requires, once GLFW
+-- has initialized and selected Wayland. A library that cannot supply it refuses
+-- the session with 'ConnectionProbeUnavailable', attributed to initialization,
+-- and the rollback terminates GLFW. Any other backend resolves nothing and makes
+-- no call.
+resolveProbe ∷ Native → Capture → Backend → IO (Maybe ConnectionProbe)
+resolveProbe native capture backend = case backend of
+  Wayland → do
+    settleStrayOwnerReports capture
+    resolved ← nativeConnectionProbe native
+    reports ← takeOwnerReports capture
+    raiseReported initializeOperation (backendIdentifiers backend) NativeCallReturned reports
+    either
+      (throwFailure glfwComponent initializeOperation (backendIdentifiers backend) . ConnectionProbeUnavailable)
+      (pure . Just)
+      resolved
+  X11 → pure Nothing
+  Cocoa → pure Nothing
+
+-- | Whether the session resolved a connection-status probe at entry, which it
+-- does on Wayland and nowhere else.
+sessionProbesConnection ∷ Session → Bool
+sessionProbesConnection = maybe False (const True) . sessionProbe
+
+-- | Confirm, at one event-processing boundary on the owner thread, that the
+-- session's display connection is still usable; the caller has already checked
+-- the owner and liveness.
+--
+-- A session whose connection failure is latched raises that same failure
+-- without probing. Otherwise a Wayland session runs its probe once: a healthy
+-- status returns, and any other latches a 'ConnectionFailed' carrying the cause,
+-- this boundary, and whatever GLFW reported on the owner thread during the
+-- processing so far, and raises it attributed to the caller's operation. A
+-- session without a probe makes no call.
+requireConnection ∷ Session → Operation → [(Text, Text)] → EventBoundary → IO ()
+requireConnection session operationName identifiers boundary =
+  readIORef (sessionConnection session) >>= \case
+    Just latched → throwFailure glfwComponent operationName identifiers latched
+    Nothing → case sessionProbe session of
+      Nothing → pure ()
+      Just (ConnectionProbe probe) →
+        probe >>= \case
+          ConnectionHealthy → pure ()
+          ConnectionEnded cause → do
+            reports ← takeOwnerReports (sessionCapture session)
+            let failure = ConnectionFailed cause boundary reports
+            atomicWriteIORef (sessionConnection session) (Just failure)
+            throwFailure glfwComponent operationName identifiers failure
 
 terminate ∷ Native → Capture → ThreadId → IORef Bool → IORef Bool → Backend → IO ()
 terminate native capture owner teardown live backend =

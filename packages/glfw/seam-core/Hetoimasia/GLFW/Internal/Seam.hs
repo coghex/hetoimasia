@@ -25,6 +25,12 @@
 -- Each seam has its own guard, so examples never share occupancy with each
 -- other or with a production session.
 --
+-- A Wayland session's connection-status probe is scripted by
+-- 'scriptConnectionProbe': its resolution at entry is recorded as
+-- 'ResolveConnectionProbe' and each status read as 'ProbeConnection', so an
+-- example can see the probe run at both event-processing boundaries, and see
+-- that an X11 or Cocoa session never resolves or runs one.
+--
 -- A wake's empty-event post is recorded as 'PostEmptyEvent' and runs the
 -- script's 'scriptPostEmptyEvent' step on the calling thread. While that step
 -- runs the calling thread's wake mark is the call's, so an error the step
@@ -175,6 +181,7 @@ import Foreign.Ptr (Ptr, castFunPtrToPtr, castPtrToFunPtr, intPtrToPtr, nullPtr,
 import Hetoimasia.Foundation.Failure (operation)
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback, WakeMark, noWakeMark)
+import Hetoimasia.GLFW.Internal.Connection (ConnectionProbe (..), ConnectionStatus (..))
 import Hetoimasia.GLFW.Internal.Control (WindowCapabilities)
 import Hetoimasia.GLFW.Internal.Command
   ( AdmissionHooks (..)
@@ -241,6 +248,10 @@ data NativeCall
   | SetInitHints Backend
   | Initialize
   | QueryPlatform
+  | ResolveConnectionProbe
+    -- ^ A Wayland session resolved its connection-status probe at entry.
+  | ProbeConnection
+    -- ^ One status read of that probe, at an event-processing boundary.
   | Terminate
   | ResetWindowHints
   | SetWindowHint WindowHint
@@ -412,6 +423,10 @@ data SeamScript = SeamScript
   , scriptInitialize ∷ Reporter → IO Bool
   , scriptReportedPlatform ∷ Maybe Backend → Maybe Backend
     -- ^ What the platform query answers, given the backend last hinted.
+  , scriptConnectionProbe ∷ Either Text (IO ConnectionStatus)
+    -- ^ The connection-status probe a Wayland session resolves: each status
+    -- read runs the action, or resolution answers why the scripted library
+    -- cannot supply one.
   , scriptTerminate ∷ Reporter → IO ()
   , scriptDetachErrorCallback ∷ Reporter → IO ()
   , scriptCreateWindow ∷ Reporter → IO Bool
@@ -460,6 +475,7 @@ defaultScript =
     , scriptPlatformSupported = const True
     , scriptInitialize = \_ → pure True
     , scriptReportedPlatform = id
+    , scriptConnectionProbe = Right (pure ConnectionHealthy)
     , scriptTerminate = \_ → pure ()
     , scriptDetachErrorCallback = \_ → pure ()
     , scriptCreateWindow = \_ → pure True
@@ -945,6 +961,9 @@ seamNative seam =
     , nativeCurrentBackend = do
         record QueryPlatform
         scriptReportedPlatform script <$> readIORef (seamHinted seam)
+    , nativeConnectionProbe = do
+        record ResolveConnectionProbe
+        pure (ConnectionProbe . (record ProbeConnection >>) <$> scriptConnectionProbe script)
     , nativeTerminate = do
         record Terminate
         scriptTerminate script reporter

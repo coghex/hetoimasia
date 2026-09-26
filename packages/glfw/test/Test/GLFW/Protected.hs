@@ -49,7 +49,7 @@ import Control.Exception
   )
 import Data.Unique (newUnique)
 import Control.Monad (forM, forM_, void, when)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnException, BlockedOnSTM), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
 import Data.List (sort)
@@ -106,7 +106,15 @@ import Hetoimasia.GLFW.Internal.Seam
   )
 import Hetoimasia.GLFW.Command (SubmitResult (SubmitClosed), createWindowCommand, submitWindowCommand)
 import Hetoimasia.GLFW.Demand (PublishResult (DemandSlotClosed), immediateDemand, publishDemand)
-import Hetoimasia.GLFW.Session (defaultSessionConfig)
+import Hetoimasia.GLFW.Internal.Connection (ConnectionStatus (..))
+import Hetoimasia.GLFW.Session
+  ( Backend (Wayland)
+  , ConnectionCause (..)
+  , ConnectionFailed (..)
+  , EventBoundary (..)
+  , SessionConfig (requestedBackend)
+  , defaultSessionConfig
+  )
 import Hetoimasia.GLFW.Window
 import Hetoimasia.Runtime.Application (runManagedApplication)
 import Hetoimasia.Runtime.GLFW.Internal
@@ -247,6 +255,14 @@ spec = describe "GLFW protected host" $ do
       (boundedExample (testFailedStep Required))
     it "leaves a recognized optional step unavailable with its evidence, which is still no permission to destroy"
       (boundedExample (testFailedStep Optional))
+
+  describe "a confirmed Wayland connection loss" $ do
+    it "is the primary failure when it initiates the failure, and retirement still precedes the window and the session"
+      (boundedExample testLossInitiatesFailure)
+    it "leaves an earlier failure primary when the drain finds it, retaining the loss beside it"
+      (boundedExample testLossFoundDuringCleanup)
+    it "supplies no attachment-completion fact: the attachment stays unretired until its own evidence arrives"
+      (boundedExample testLossSuppliesNoFacts)
 
   describe "configuration" $
     it "refuses a window limit below one, below its configured windows, or above the bound its counts derive from"
@@ -443,6 +459,162 @@ noteClosedAdmission journal host owner = atomically $ do
     case seen of
       Just view | viewPhase view == AttachmentActive → pure ()
       _ → note journal AdmissionClosed
+
+-- ---------------------------------------------------------------------------
+-- A confirmed Wayland connection loss
+
+-- | A 'pollingSeam' whose sessions are Wayland ones, with the connection-status
+-- probe answering the status held in the 'IORef'.
+connectionSeam ∷ TVar [Flag] → IORef ConnectionStatus → IO Seam
+connectionSeam journal status = do
+  held ← newIORef Nothing
+  seam ←
+    newSeam
+      defaultScript
+        { scriptDestroyWindow = \_ → do
+            destroyed ← readIORef held >>= maybe (pure 0) (fmap latestDestroyed . seamCalls)
+            atomically (note journal (WindowGone destroyed))
+        , scriptTerminate = \_ → atomically (note journal SessionEnded)
+        , scriptConnectionProbe = Right (readIORef status)
+        }
+  writeIORef held (Just seam)
+  pure seam
+
+-- | 'protectedRunHere' over a Wayland session of the seam, caught on the
+-- designated main thread itself so the failure keeps the cleanup evidence its
+-- context carries.
+waylandProtectedRun
+  ∷ Seam
+  → HostConfig
+  → (WindowHost → IO ())
+  → (WindowHost → RuntimeControl → IO a)
+  → IO (ConnectionFailed, SomeException)
+waylandProtectedRun seam config inside action =
+  waylandProtectedRunAs seam config inside action
+
+waylandProtectedRunAs
+  ∷ Exception e
+  ⇒ Seam
+  → HostConfig
+  → (WindowHost → IO ())
+  → (WindowHost → RuntimeControl → IO a)
+  → IO (e, SomeException)
+waylandProtectedRunAs seam config inside action =
+  asProcessMainThread seam . caughtAs $
+    runProtectedWindowApplication
+      (withLoggingLifetime quietLogger)
+      "protected-host-example"
+      ( \_ use →
+          withProtectedWindowHostIn
+            quietLogger
+            (seamSession seam defaultSessionConfig {requestedBackend = Just Wayland})
+            config
+            (\host → inside host >> use host)
+      )
+      id
+      (\host _ → pure host)
+      action
+
+-- | Owner turns that lose the connection during the first update: the next
+-- turn's event processing is the first to find it.
+losingTurns ∷ IORef ConnectionStatus → WindowHost → RuntimeControl → IO ()
+losingTurns status host control =
+  runOwnerLoop host control $
+    LoopHooks
+      { loopLogger = quietLogger
+      , loopEvent = noApplicationEvents
+      , loopUpdate = \_ → Continue <$ atomicWriteIORef status lostConnection
+      }
+
+lostConnection ∷ ConnectionStatus
+lostConnection = ConnectionEnded (TransportClosed (Just 32))
+
+-- | The owner loop's event processing finds the loss, so it is the primary
+-- failure; the attachment still retires, by its owner's own certified facts,
+-- before its window is destroyed and the session ends.
+testLossInitiatesFailure ∷ Expectation
+testLossInitiatesFailure = do
+  journal ← newTVarIO []
+  status ← newIORef ConnectionHealthy
+  seam ← connectionSeam journal status
+  owned ← newTVarIO Nothing
+  (primary, _) ←
+    waylandProtectedRun seam (settings [windowNamed "alpha"]) (attaching journal owned) (losingTurns status)
+  connectionCause primary `shouldBe` TransportClosed (Just 32)
+  connectionBoundary primary `shouldBe` BeforeEvents
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The action fails first; the loss is found only by the drain's own event
+-- processing, so the action's failure stays primary and the loss is retained
+-- beside it under the boundary's label.
+testLossFoundDuringCleanup ∷ Expectation
+testLossFoundDuringCleanup = do
+  journal ← newTVarIO []
+  status ← newIORef ConnectionHealthy
+  seam ← connectionSeam journal status
+  owned ← newTVarIO Nothing
+  (primary, caught) ←
+    waylandProtectedRunAs
+        seam
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            -- The owner has nothing to certify at the drain's first
+            -- opportunity, so that round pumps events before any fact.
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = Await : map Certify allRetirementFacts}
+            atomically (writeTVar owned (Just owner))
+        )
+        (\_ _ → atomicWriteIORef status lostConnection >> throwIO (Scripted "action"))
+  primary `shouldBe` Scripted "action"
+  map (fmap connectionCause) (retainedAs' "glfw protected retirement" caught)
+    `shouldBe` [Just (TransportClosed (Just 32))]
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | An owner with no safe progress path keeps its attachment through the loss:
+-- once the drain has found the loss and the owner has stalled, the attachment
+-- holds no fact at all, and only its own evidence, published independently,
+-- retires it.
+testLossSuppliesNoFacts ∷ Expectation
+testLossSuppliesNoFacts = do
+  journal ← newTVarIO []
+  status ← newIORef ConnectionHealthy
+  seam ← connectionSeam journal status
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  seen ← newTVarIO Nothing
+  helper ← forkIO $ do
+    owner ← awaitHeld owned
+    host ← awaitHeld hostHeld
+    view ← atomically $ do
+      afterStall owner
+      held ← readTVar (ownerAcknowledgement owner) >>= maybe retry pure
+      hostAttachmentView host (acknowledgedAttachment held) >>= maybe retry pure
+    atomically (writeTVar seen (Just view))
+    publishFacts journal host owner allRetirementFacts
+  (primary, _) ←
+    waylandProtectedRun
+        seam
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+            atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
+        )
+        (losingTurns status)
+  void (pure helper)
+  connectionCause primary `shouldBe` TransportClosed (Just 32)
+  stalled ← readTVarIO seen >>= maybe (unexpected "the helper saw no stalled attachment") pure
+  viewRecorded stalled `shouldBe` Map.empty
+  sort (viewMissing stalled) `shouldBe` sort allRetirementFacts
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The connection failures a failure retained under one cleanup label.
+retainedAs' ∷ Text → SomeException → [Maybe ConnectionFailed]
+retainedAs' label caught =
+  [ fromException (exceptionOf (cleanupFailureException failure))
+  | failure ← cleanupFailures caught
+  , cleanupFailureLabel failure == label
+  ]
 
 -- ---------------------------------------------------------------------------
 -- The seam and the runner

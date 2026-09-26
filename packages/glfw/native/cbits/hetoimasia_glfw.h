@@ -58,6 +58,13 @@ void hetoimasia_glfw_inject_cursor_enter_for_check(GLFWwindow* window, int enter
 void hetoimasia_glfw_inject_scroll_for_check(GLFWwindow* window, double x, double y);
 void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused);
 
+/* Invoke the window's registered close callback, for the native examples only:
+ * an injected close request, never evidence of one the platform generated. It
+ * reaches no platform handle, so it is available on every backend, and it is
+ * how the Wayland examples exercise close-request handling that no client can
+ * provoke from the compositor. Call it on the session's owner thread. */
+void hetoimasia_glfw_inject_close_for_check(GLFWwindow* window);
+
 /* Non-zero when every input callback slot is empty. The destroy path records
  * this immediately before glfwDestroyWindow; the native examples read it. */
 int hetoimasia_glfw_input_callbacks_cleared_for_check(GLFWwindow* window);
@@ -75,6 +82,45 @@ int hetoimasia_glfw_take_input_callbacks_cleared_for_check(void);
  * what an X11 or Cocoa handle exposes. On a Wayland session it answers zero
  * before asking GLFW for any X11 handle, so no GLFW error is reported. */
 int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits);
+
+/* The private, read-only Wayland connection-status probe the Wayland
+ * qualification design's D-13 permits in the production shim. It is the one
+ * production path that reaches a native Wayland object, and it hands nothing
+ * native back: only a status, a reason, and an errno, copied into ints.
+ *
+ * It uses glfwGetWaylandDisplay, wl_display_get_error, and wl_display_get_fd,
+ * with a zero-timeout poll(2) of the display's socket for peer closure. It never
+ * reads or dispatches protocol messages, flushes, creates windows, reconnects,
+ * or closes GLFW's connection; GLFW stays the connection's owner. The two
+ * libwayland symbols are resolved once per process from the library GLFW itself
+ * loads, and that library is never closed, so they stay valid through the
+ * final query. Call both functions on the session's owner thread while the
+ * session is live. */
+#define HETOIMASIA_CONNECTION_HEALTHY 0
+#define HETOIMASIA_CONNECTION_TRANSPORT_CLOSED 1
+#define HETOIMASIA_CONNECTION_PROTOCOL_FAILURE 2
+#define HETOIMASIA_CONNECTION_PROBE_FAILED 3
+
+/* Why the probe is unavailable or could not answer. */
+#define HETOIMASIA_PROBE_READY 0
+#define HETOIMASIA_PROBE_NO_LIBRARY 1
+#define HETOIMASIA_PROBE_NO_SYMBOL 2
+#define HETOIMASIA_PROBE_NOT_WAYLAND 3
+#define HETOIMASIA_PROBE_NO_DISPLAY 4
+#define HETOIMASIA_PROBE_NO_DESCRIPTOR 5
+#define HETOIMASIA_PROBE_POLL_FAILED 6
+#define HETOIMASIA_PROBE_INVALID_DESCRIPTOR 7
+#define HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM 8
+
+/* Resolve the probe for the initialized session: HETOIMASIA_PROBE_READY when
+ * it can answer, otherwise the reason it cannot. */
+int hetoimasia_glfw_wayland_probe_resolve(void);
+
+/* One status read: a HETOIMASIA_CONNECTION_ value. For a transport closure,
+ * error is the errno the display latched, or zero when only the socket reported
+ * the closure; for a protocol failure it is that latched errno; for a probe
+ * failure, reason is a HETOIMASIA_PROBE_ value and error any errno behind it. */
+int hetoimasia_glfw_wayland_connection_status(int* reason, int* error);
 
 /* The production finite event wait: glfwWaitEventsTimeout, recording which OS
  * thread waits and a sequence number for each wait, which only the native

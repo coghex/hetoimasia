@@ -587,6 +587,7 @@ import Hetoimasia.GLFW.Internal.Capture
   , settleStrayOwnerReports
   , takeOwnerReports
   )
+import Hetoimasia.GLFW.Internal.Connection (EventBoundary (..))
 import Hetoimasia.GLFW.Internal.Session
   ( Native (..)
   , NativeFailure (..)
@@ -608,6 +609,7 @@ import Hetoimasia.GLFW.Internal.Session
   , poisonSession
   , raiseReported
   , refreshMonitors
+  , requireConnection
   , requireUnpoisoned
   , resolveMonitorPointer
   , sessionCapture
@@ -2290,13 +2292,24 @@ reconcileEventsOperation = operation "reconcile window events"
 -- here: each window's captures are reconciled at its next owner boundary, such
 -- as 'reconcileWindowEvents'. An error reported on the owner thread during the
 -- call fails it with 'NativeFailure', attributed to @process window events@.
+--
+-- On Wayland the session's connection-status probe runs immediately before the
+-- poll or wait and immediately after it, whether or not the session has
+-- windows ('requireConnection'). A connection found unusable before the call
+-- fails the processing with 'ConnectionFailed' and pumps nothing; one found
+-- unusable after it fails the processing with that cause rather than with
+-- whatever GLFW reported, which the failure keeps beside it. Either way the
+-- session latches the failure and every later processing raises it without a
+-- native call. X11 and Cocoa sessions make no probe call.
 processWindowEvents ∷ Session → EventProcessing → IO ()
 processWindowEvents session processing =
   ownerOperation session processEventsOperation identifiers $ do
     settleStrayOwnerReports capture
+    requireConnection session processEventsOperation identifiers BeforeEvents
     recordingPump (sessionTrace session) mode $ case processing of
       ProcessPending → nativePollEvents native
       AwaitEventsFor seconds → nativeWaitEventsTimeout native seconds
+    requireConnection session processEventsOperation identifiers AfterEvents
     reports ← takeOwnerReports capture
     raiseReported processEventsOperation identifiers NativeCallReturned reports
   where

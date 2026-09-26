@@ -12,7 +12,7 @@
 -- The dynamic window examples build the host with no windows or a few, create
 -- and close windows through the loop, and read each window's terminal phase from
 -- the observations its client capabilities carry.
-module Test.GLFW.Native.Host (spec) where
+module Test.GLFW.Native.Host (spec, testCloseOrder) where
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
@@ -346,6 +346,8 @@ scheduledSettings name = (defaultHostConfig [hiddenTestWindowConfig name 160 120
 -- every window still open.
 type CloseStep = (Disposition, WindowPhase, [Disposition])
 
+-- | Create one window per entry of the order through a worker's requests, then
+-- close them in that order, observing every window still open after each close.
 testCloseOrder ∷ Shared → [Int] → Expectation
 testCloseOrder shared order = do
   report ←
@@ -361,17 +363,17 @@ testCloseOrder shared order = do
   case report of
     Left message → expectationFailure message
     Right (steps, finals) → do
-      map (\(_, _, observed) → length observed) steps `shouldBe` [2, 1, 0]
+      map (\(_, _, observed) → length observed) steps `shouldBe` reverse [0 .. length order - 1]
       forM_ steps $ \(closed, phase, observed) → do
         closed `shouldSatisfy` \case
           Performed (WindowCloseBegun _) → True
           _ → False
         phase `shouldBe` WindowReleased
         observed `shouldSatisfy` all performedObservation
-      finals `shouldBe` replicate 3 WindowReleased
+      finals `shouldBe` replicate (length order) WindowReleased
 
--- | A service that creates three windows through the host's port, closes them
--- in the given order, and after each close observes every window still open
+-- | A service that creates one window per entry of the order through the host's
+-- port, closes them in that order, and after each close observes every window still open
 -- through that window's own port, then runs until stopped.
 creatingAndClosing
   ∷ WindowHost
@@ -381,7 +383,7 @@ creatingAndClosing
 creatingAndClosing host order result =
   workerDefinition "creating and closing" (\_ → pure ()) $ \token () → do
     outcome ← try $ do
-      created ← forM ["first", "second", "third"] $ \name → do
+      created ← forM (take (length order) ["first", "second", "third"]) $ \name → do
         (_, ticket) ← settleRequest token (hostCommandPort host) (createWindowCommand (hiddenTestWindowConfig name 160 120))
         atomically (pollWindowClient ticket) >>= maybe (throwIO (Stopped "a creation handed nothing over")) pure
       steps ← forM (zip [1 ..] order) $ \(position, index) → do

@@ -41,7 +41,7 @@ execute every buildable probe. Use named suites and selectors instead.
 | `diagnostics-tests` / `test.vulkan-diagnostics` | Conditional: the production C validation capture and its diagnostic lifetime, with injected sinks and explicit coordination; no Vulkan device |
 | `workflow-tests` / `test.workflow` | Conditional: planner, receipts, review gate, image/toolchain/native recipes, packaging, and documentation workflow contracts |
 | `glfw-native-tests` / `test.glfw-native` | Conditional: real session, event wake, window, control, modes, monitors, host, input, and private lifetime integration on isolated X11 in CI |
-| Native Wayland selector / `test.glfw-wayland` | Optional explicit-request CI integration; excluded from coordinated local testing because CI owns that signal |
+| Native Wayland selection / `test.glfw-wayland` | Required-when-affected CI integration on the isolated headless compositor since WL-3 (#207); excluded from coordinated local testing because CI owns that signal |
 
 The workflow suite retains two short runner contracts using one-second test
 deadlines: timeout kills descendants, including a child ignoring TERM. These
@@ -49,6 +49,13 @@ protect CI's execution boundary and are in the conditional tooling tier. They
 are distinct from the display-helper experiments exhausting production startup
 deadlines. Sleeping stub processes are killed by their fixtures; `sleep 300`
 in a stub is not by itself a 300-second passing-test duration.
+
+The native suite retains one deliberately non-exiting child for the same
+reason (#207): the private-session launcher's deadline contract, that a child
+still running at its deadline is terminated with its process group, reaped, and
+failed whatever success it printed first. It runs with its own five-second
+deadline rather than the 120-second one every other private child has, so it
+costs a routine `test.glfw-native` run seconds, not minutes.
 
 The native suite's physical monitor hotplug and owner-loop interaction examples
 remain inactive unless their dedicated environment variables request them.
