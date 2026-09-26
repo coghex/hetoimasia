@@ -818,7 +818,7 @@ No macOS remote CI is introduced.
 
 All first-arc acceptance is headless and needs no desktop interaction. If a later
 integration test opens windows or changes focus/display state, ask for the human
-user's explicit approval before that local session. No Vulkan API or graphics
+user's explicit approval before that local session (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). No Vulkan API or graphics
 completion token belongs in these Lua tests.
 
 ### P-13. Untrusted processes, permissions, and enforced limits

@@ -41,6 +41,7 @@ native cases VK-2 and VK-5 through VK-7 once ran in the proof harness run in
 child processes with roots of their own, beside a synchronization-validation
 control. It is the validation group `test.vulkan-native`, built in a
 preparation stage and timed without its compilation under a thirty-second
-watchdog; on macOS it needs the human's per-session desktop approval.
+watchdog; on macOS it runs on the owner's desktop under the owner's standing
+approval, with the consent on its own command.
 [`docs/gpu_backend.md`](../../../docs/gpu_backend.md#the-native-suite) is its
 contract.

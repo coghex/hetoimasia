@@ -1088,10 +1088,10 @@ bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-te
 ```
 
 On Linux the native mode starts an isolated X11 display for the run and needs
-no approval. On macOS the suite opens windows on the person's desktop, so an
-agent first describes that disruption, asks the human user for explicit
-approval for that session, and waits for acceptance; then, and only on that
-one command:
+no approval. On macOS the suite opens windows on the owner's desktop. The
+owner's standing approval covers a run an issue or pull request needs (see
+[the GLFW native suite](glfw.md#the-native-suite)), so the agent runs it
+without asking, with the consent on that one command:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete

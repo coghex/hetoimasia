@@ -122,7 +122,7 @@ spec = describe "the native opt-in" $ do
             let message = refusalMessage refusal
             message `shouldContain` consentVariable
             message `shouldContain` (consentVariable <> "=" <> desktopValue)
-            message `shouldContain` "ask"
+            message `shouldContain` "standing approval"
             message `shouldContain` "tools/display/x11.sh"
             message `shouldContain` "tools/display/wayland.sh"
             message `shouldContain` "DISPLAY, WAYLAND_DISPLAY, and CI are not consent"

@@ -75,8 +75,9 @@ Run `cabal update` if the local Hackage index does not cover the pinned
 configuration but runs no tests or native session. The package and root suites,
 `glfw-tests` included, initialize no GLFW; the separate native suite requires Cocoa locally or isolated X11 on Linux,
 and refuses to enter a session without the per-run consent
-[docs/glfw.md](docs/glfw.md#the-native-suite) describes — on a person's
-desktop, a human's explicit approval for that one run.
+[docs/glfw.md](docs/glfw.md#the-native-suite) describes — on the owner's
+desktop, the opt-in on that command, given under the owner's standing approval
+for runs an issue or pull request needs.
 
 Expected smoke output on stderr — three `INFO` records in the
 [logging record layout](docs/logging.md#record-layout), with the timestamp,

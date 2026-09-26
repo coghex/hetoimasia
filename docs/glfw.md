@@ -4938,7 +4938,7 @@ configuration without running either, and the dry run lists the native examples
 without entering a session.
 Running the native examples themselves takes the per-run consent
 [the native suite](#the-native-suite) describes: the isolated display helper's
-own on Linux, or a human's explicit approval on a real desktop.
+own on Linux, or the desktop opt-in on a real desktop.
 
 - **`glfw-tests`** is the package's headless suite, rooted at one `GLFW` group,
   and initializes nothing, opens no window, and needs no display.
@@ -5126,7 +5126,7 @@ test environment.
 | Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
-| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is a human's approval for this one run on the local desktop; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`; `isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its command, accepted only on Linux, only when `WAYLAND_DISPLAY` names exactly that socket, and only when `DISPLAY` is unset — a set `DISPLAY`, empty or not, could serve an X11 or XWayland session in the compositor's place, so it is refused. Each refusal names what disagreed: the socket against `WAYLAND_DISPLAY`, the `DISPLAY` that should not be there, or the platform. Anything else — the variable unset, empty, or another value, a bare `DISPLAY` or `WAYLAND_DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
+| Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is the opt-in for this one run on the local desktop, given under the owner's standing approval for runs an issue or pull request needs; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`; `isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its command, accepted only on Linux, only when `WAYLAND_DISPLAY` names exactly that socket, and only when `DISPLAY` is unset — a set `DISPLAY`, empty or not, could serve an X11 or XWayland session in the compositor's place, so it is refused. Each refusal names what disagreed: the socket against `WAYLAND_DISPLAY`, the `DISPLAY` that should not be there, or the platform. Anything else — the variable unset, empty, or another value, a bare `DISPLAY` or `WAYLAND_DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
 | Platform | The rule is the fixture's, not the session's, and it follows the run's consent. Under `desktop` or `isolated-x11` on Linux the session is entered only when `DISPLAY` names a display and `WAYLAND_DISPLAY` is absent, and it must select X11; on macOS it must select Cocoa. Under `isolated-wayland:<socket>` the session is entered only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is unset, it requests Wayland by name — nothing selects Wayland otherwise — and it must select Wayland. Anything else fails every native example with `DisplayUnavailable`: no other platform is selected instead, and no request falls back to the other backend. |
 
 The fixture's settlement rules are proven against a scripted owner that records
@@ -5345,21 +5345,23 @@ bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=di
 
 On a real desktop — Cocoa on macOS, or an X11 desktop of a person's own — the
 examples show, focus, resize, minimize, maximize, and take fullscreen windows
-there. An agent first describes that disruption, asks the human user for
-explicit approval, and waits for acceptance. The approved run then carries the
-consent on its own command, and nowhere else:
+there. The owner gave standing approval on 2026-09-26 for these sessions on the
+owner's machine when an issue or pull request needs them — the planner requires
+the group, or a request or acceptance command names it — so an agent runs them
+without asking and without waiting for a reply. The run carries the consent on
+its own command, and nowhere else:
 
 ```bash
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
 ```
 
-The approval covers that one agreed session and is not reprompted during it;
-it does not carry to a later run. An issue acceptance command, a PR approval,
-a persistent shell setting, or a periodic testing request is not that
-approval. Never set the variable in a shell profile or in a script an agent
-runs on its own: the suite cannot tell that a conversation happened, only that
-the command it was given carries the value. Without it, the full command
+Periodic testing and flake-lab rotations are not covered: they use the desktop
+only when the owner asks for that run. The owner can withdraw the standing
+approval, and per-session asking then applies again. Never set the variable in
+a shell profile, a persistent environment, or a script that runs on its own: it
+is the guard that keeps every command that did not ask for a desktop from
+opening windows. Without it, the full command
 fails before initializing GLFW, with the refusal on stderr and zero
 acquisitions in its report, and `--private-session <scenario>` invoked
 directly refuses the same way. See

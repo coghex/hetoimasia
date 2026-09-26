@@ -13,8 +13,8 @@
 -- example that needs no session, but each example that uses the shared
 -- session or starts a private-session child is refused before its body runs,
 -- the session is never acquired, and the run ends with one line on stderr
--- naming what was missing and a non-zero exit. A human's approval for one run
--- is @HETOIMASIA_NATIVE_SESSION=desktop@ on that command;
+-- naming what was missing and a non-zero exit. A run's opt-in to the local
+-- desktop is @HETOIMASIA_NATIVE_SESSION=desktop@ on that command;
 -- @tools/display/x11.sh@ supplies its own consent for the isolated X11
 -- display it starts.
 --
