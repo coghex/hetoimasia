@@ -11,7 +11,8 @@ never asserted.
 
 Workflow run [36274457569](https://github.com/coghex/hetoimasia/actions/runs/36274457569),
 job `glfw-native`, group `test.glfw-wayland`, for pull request
-[#278](https://github.com/coghex/hetoimasia/pull/278) at commit `22e966a`. The
+[#278](https://github.com/coghex/hetoimasia/pull/278) at commit `22e966a`, executed on
+GitHub's merge candidate `305d7ff`. The
 plan step resolved that candidate's input identity as
 `bba4281597797e82c96f326173ab8ac7d0861eea4ddbc684f52c2df829faf773`. The group's
 receipt is in that run's `validation-receipts-glfw-native` artifact as
@@ -35,12 +36,24 @@ That has to be rechecked whenever the head moves for any other reason.
 | Selected backend | `Wayland`, as `glfwGetPlatform` answered for the shared session the consent `isolated-wayland:hetoimasia-758` authorized |
 | Toolchain | GHC 9.14.1, Cabal 3.18.1.0, `x86_64-linux` |
 
-The exact command, as the display worker ran it:
+The exact command, as the display worker ran it, with its `--toolchain`
+arguments expanded from the run's verified toolchain file, which lists them in
+name order — the same map the group's receipt declares:
 
 ```bash
 bash tools/display/wayland.sh --summary "$GITHUB_STEP_SUMMARY" -- \
   python3 -I tools/validation/run.py test.glfw-wayland --plan plan.json --receipts receipts \
-  --worker glfw-native --runner-class display --toolchain ...
+  --worker glfw-native --runner-class display \
+  --toolchain 'cabal=3.18.1.0' \
+  --toolchain 'ci-image=sha256:74c08dc539d2364b640a9560edc4560ce0e5e55a70db82b8ddbf906c9feab612' \
+  --toolchain 'ghc=9.14.1' \
+  --toolchain 'glslang=15.1.0 96ea85d4228d' \
+  --toolchain 'native-manifest=8c6860a3616749bf1d3f0af52d6dda7f70b69ef82fb2f4095ab1641ac3da86fd' \
+  --toolchain 'vulkan=0a53afbd93d705f228556e9c4bbcacd4c1e0e79b1216b2c8f68458668d384a71' \
+  --toolchain 'vulkan-driver=lvp 1.4.318 9d69cae2004b' \
+  --toolchain 'vulkan-layers=VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization' \
+  --toolchain 'vulkan-loader=1.3.275 e833b010f814' \
+  --toolchain 'weston=13.0.0-4build3'
 ```
 
 which runs the group's catalog command:
