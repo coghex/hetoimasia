@@ -10,6 +10,7 @@ import qualified Test.Foundation.Logging.Configuration as Configuration
 import qualified Test.Foundation.Logging.Context as Context
 import qualified Test.Foundation.Logging.Filtering as Filtering
 import qualified Test.Foundation.Logging.Layout as Layout
+import qualified Test.Foundation.Logging.Opacity as Opacity
 import qualified Test.Foundation.Logging.Sink as Sink
 import qualified Test.Foundation.Logging.Worker as Worker
 import Test.Hspec (Spec, describe)
@@ -23,3 +24,4 @@ spec = describe "Logging" $ do
   Sink.spec
   Worker.spec
   Configuration.spec
+  Opacity.spec
