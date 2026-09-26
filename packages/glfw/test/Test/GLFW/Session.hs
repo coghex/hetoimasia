@@ -197,6 +197,7 @@ testLinuxBackendSelection = do
                    , SetInitHints Wayland
                    , Initialize
                    , QueryPlatform
+                   , ResolveConnectionProbe
                    , CreateMonitorCallback
                    , AttachMonitorCallback
                    , QueryMonitors

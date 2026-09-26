@@ -19,6 +19,13 @@
  * GLFW_PLATFORM_UNAVAILABLE report the session would capture. An unavailable
  * answer is this shim's, not the window's: closure and size constraints are
  * GLFW's own on every backend.
+ *
+ * The Wayland connection-status probe is production code, and the one
+ * production path here that reaches a native Wayland object; see the header.
+ * Only Linux carries it. It is not declared through glfw3native.h, which would
+ * pull in the Wayland client headers for one pointer the shim never
+ * dereferences: glfwGetWaylandDisplay is declared below with an incomplete
+ * struct type, exactly as GLFW's own header declares it.
  */
 #if defined(__linux__)
 #define _GNU_SOURCE
@@ -101,15 +108,35 @@ int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
     return 1;
 }
 
+/* No Wayland on Cocoa: a Wayland session is refused before initialization, and
+ * the probe answers unavailable if asked. */
+int hetoimasia_glfw_wayland_probe_resolve(void)
+{
+    return HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM;
+}
+
+int hetoimasia_glfw_wayland_connection_status(int* reason, int* error)
+{
+    *reason = HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM;
+    *error = 0;
+    return HETOIMASIA_CONNECTION_PROBE_FAILED;
+}
+
 #elif defined(__linux__)
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
 #include <X11/Xutil.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+struct wl_display;
+GLFWAPI struct wl_display* glfwGetWaylandDisplay(void);
 
 static atomic_int waiting_thread = 0;
 
@@ -226,6 +253,110 @@ int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
     return answered;
 }
 
+/* The two libwayland-client functions the probe reads through, resolved once
+ * per process. The library is the one GLFW 3.4 loads at run time rather than
+ * links, so dlopen answers GLFW's own handle; it is never closed, which keeps
+ * the symbols valid through the final query of the last session. */
+static pthread_once_t probe_once = PTHREAD_ONCE_INIT;
+static int probe_resolution = HETOIMASIA_PROBE_NO_LIBRARY;
+static int (*probe_display_error)(struct wl_display*) = NULL;
+static int (*probe_display_fd)(struct wl_display*) = NULL;
+
+static void resolve_probe_symbols(void)
+{
+    void* library = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_LOCAL);
+    if (library == NULL) {
+        probe_resolution = HETOIMASIA_PROBE_NO_LIBRARY;
+        return;
+    }
+    probe_display_error = (int (*)(struct wl_display*)) dlsym(library, "wl_display_get_error");
+    probe_display_fd = (int (*)(struct wl_display*)) dlsym(library, "wl_display_get_fd");
+    probe_resolution = probe_display_error != NULL && probe_display_fd != NULL
+        ? HETOIMASIA_PROBE_READY
+        : HETOIMASIA_PROBE_NO_SYMBOL;
+}
+
+/* glfwGetPlatform reports no error, so the platform is asked first and
+ * glfwGetWaylandDisplay, which would report GLFW_PLATFORM_UNAVAILABLE on
+ * another platform, is called only on Wayland. */
+int hetoimasia_glfw_wayland_probe_resolve(void)
+{
+    pthread_once(&probe_once, resolve_probe_symbols);
+    if (probe_resolution != HETOIMASIA_PROBE_READY)
+        return probe_resolution;
+    if (glfwGetPlatform() != GLFW_PLATFORM_WAYLAND)
+        return HETOIMASIA_PROBE_NOT_WAYLAND;
+    if (glfwGetWaylandDisplay() == NULL)
+        return HETOIMASIA_PROBE_NO_DISPLAY;
+    return HETOIMASIA_PROBE_READY;
+}
+
+/* The latched error is read first. libwayland latches EPROTO for a protocol
+ * error the compositor sent and the transport's errno — EPIPE for a read that
+ * found the socket closed — for a transport failure, so a non-zero answer
+ * names its own cause. It is not enough alone: a flush that fails with EPIPE
+ * deliberately latches nothing in libwayland 1.22, which is exactly the path
+ * GLFW's disconnect handling takes. So the socket is then polled with a zero
+ * timeout for hangup, which reports the peer's closure without consuming any
+ * protocol data: POLLIN is not requested, and POLLHUP and POLLERR are always
+ * reported. */
+int hetoimasia_glfw_wayland_connection_status(int* reason, int* error)
+{
+    struct wl_display* display;
+    struct pollfd status;
+    int latched;
+    int descriptor;
+    int ready;
+    *reason = HETOIMASIA_PROBE_READY;
+    *error = 0;
+    pthread_once(&probe_once, resolve_probe_symbols);
+    if (probe_resolution != HETOIMASIA_PROBE_READY) {
+        *reason = probe_resolution;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    if (glfwGetPlatform() != GLFW_PLATFORM_WAYLAND) {
+        *reason = HETOIMASIA_PROBE_NOT_WAYLAND;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    display = glfwGetWaylandDisplay();
+    if (display == NULL) {
+        *reason = HETOIMASIA_PROBE_NO_DISPLAY;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    latched = probe_display_error(display);
+    if (latched == EPROTO) {
+        *error = latched;
+        return HETOIMASIA_CONNECTION_PROTOCOL_FAILURE;
+    }
+    if (latched != 0) {
+        *error = latched;
+        return HETOIMASIA_CONNECTION_TRANSPORT_CLOSED;
+    }
+    descriptor = probe_display_fd(display);
+    if (descriptor < 0) {
+        *reason = HETOIMASIA_PROBE_NO_DESCRIPTOR;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    status.fd = descriptor;
+    status.events = POLLRDHUP;
+    status.revents = 0;
+    do
+        ready = poll(&status, 1, 0);
+    while (ready < 0 && errno == EINTR);
+    if (ready < 0) {
+        *reason = HETOIMASIA_PROBE_POLL_FAILED;
+        *error = errno;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    if (status.revents & POLLNVAL) {
+        *reason = HETOIMASIA_PROBE_INVALID_DESCRIPTOR;
+        return HETOIMASIA_CONNECTION_PROBE_FAILED;
+    }
+    if (status.revents & (POLLHUP | POLLRDHUP | POLLERR))
+        return HETOIMASIA_CONNECTION_TRANSPORT_CLOSED;
+    return HETOIMASIA_CONNECTION_HEALTHY;
+}
+
 #else
 
 /* No supported platform: no thread is accepted as the session owner. */
@@ -254,6 +385,18 @@ int hetoimasia_glfw_size_limits_for_check(GLFWwindow* window, int* limits)
     (void) window;
     (void) limits;
     return 0;
+}
+
+int hetoimasia_glfw_wayland_probe_resolve(void)
+{
+    return HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM;
+}
+
+int hetoimasia_glfw_wayland_connection_status(int* reason, int* error)
+{
+    *reason = HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM;
+    *error = 0;
+    return HETOIMASIA_CONNECTION_PROBE_FAILED;
 }
 
 #endif
@@ -337,6 +480,14 @@ void hetoimasia_glfw_inject_focus_for_check(GLFWwindow* window, int focused)
     glfwSetWindowFocusCallback(window, callback);
     if (callback != NULL)
         callback(window, focused);
+}
+
+void hetoimasia_glfw_inject_close_for_check(GLFWwindow* window)
+{
+    GLFWwindowclosefun callback = glfwSetWindowCloseCallback(window, NULL);
+    glfwSetWindowCloseCallback(window, callback);
+    if (callback != NULL)
+        callback(window);
 }
 
 static atomic_int last_input_callbacks_cleared = 0;

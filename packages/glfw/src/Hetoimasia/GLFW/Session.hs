@@ -12,6 +12,15 @@
 -- "Hetoimasia.GLFW.Command", and it ends. The window host's owner loop in
 -- "Hetoimasia.Runtime.GLFW" processes its native events.
 --
+-- A Wayland session ends terminally when its compositor connection is lost.
+-- Event processing confirms that with a private connection-status probe, never
+-- from close requests, and fails with 'ConnectionFailed', naming a transport
+-- closure, a protocol failure, or a probe that could not answer; nothing
+-- reconnects. The probe itself is not public, and no native pointer or
+-- descriptor is: the failure is all an application observes. A library that
+-- cannot supply the probe refuses a Wayland session with
+-- 'ConnectionProbeUnavailable'. X11 and Cocoa sessions do neither.
+--
 -- 'sessionWake' lends the session's wake capability: any thread may pass it to
 -- 'wakeSession' to end the owner's native event wait. A wake is a hint, answered
 -- with a typed 'WakeOutcome', and the capability is terminal once its session
@@ -71,9 +80,21 @@ module Hetoimasia.GLFW.Session
   , NativeOutcome (..)
   , NativeFailure (..)
   , AsynchronousErrorsUnobserved (..)
+
+    -- * Connection loss
+  , ConnectionFailed (..)
+  , ConnectionCause (..)
+  , EventBoundary (..)
+  , ConnectionProbeUnavailable (..)
   ) where
 
 import Hetoimasia.Foundation.Resource (Scoped, allocComposite, withScoped)
+import Hetoimasia.GLFW.Internal.Connection
+  ( ConnectionCause (..)
+  , ConnectionFailed (..)
+  , ConnectionProbeUnavailable (..)
+  , EventBoundary (..)
+  )
 import Hetoimasia.GLFW.Internal.Native (productionNative)
 import Hetoimasia.GLFW.Internal.Notify (DegradationAttempt (..))
 import Hetoimasia.GLFW.Internal.Session

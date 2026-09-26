@@ -2,9 +2,12 @@
 
 At the 2026-09-22 review baseline (`master@da81087`), WL-1/#204 and
 WL-2/#205 are delivered: the Linux recipe includes Wayland and the session
-admits an explicit Wayland request while retaining X11 as its default. Full
-native qualification and connection-loss evidence remain open in WL-3/#207;
-selection support alone does not establish that profile. This arc supplies
+admits an explicit Wayland request while retaining X11 as its default.
+WL-3/#207 then supplies the D-13 probe, the D-12 native evidence under the
+isolated compositor, and the required-when-affected `test.glfw-wayland`; its
+run is retained in [the qualification record](wayland_qualification_record.md)
+and the supported profile is stated in [glfw.md](glfw.md#wayland). Selection
+support alone does not establish that profile. This arc supplies
 native Wayland support and the evidence that establishes it, in the order
 the owner approved on 2026-09-20 through [RR-7](runtime_review_findings.md): provision
 the inputs, settle the selection and capability contract, collect headless

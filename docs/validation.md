@@ -132,7 +132,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
-| `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/the shared session/on an isolated Wayland session/` | yes | no | any |
+| `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -345,20 +345,25 @@ and `tools/ci-image/`, so a change to the display setup, the native recipe, or
 the image recipe selects it; the image's digest and native manifest are already
 part of every Linux candidate's identity.
 
-`test.glfw-wayland` is the same suite's `on an isolated Wayland session` group,
-selected by that group's own path so it is the only work the group runs: the
-backend a requested Wayland session selected, and both X11 test-check drivers
-answering unavailable there without provoking a GLFW report. It declares the
-same inputs and the same `display` runner class as `test.glfw-native`, but it is
-**optional**: it runs only when a pull request requests it, and the
-[display worker](#the-display-worker) runs it under
-`tools/display/wayland.sh` rather than `x11.sh`, which is what gives it a
-Wayland session to select. Making it required when affected is WL-3's decision,
-not this group's.
+`test.glfw-wayland` is the same suite's `on an isolated Wayland session` tree,
+the whole Wayland selection, selected by that tree's own path so it is the only
+work the group runs: every required case of the Wayland qualification design's
+D-12 matrix — backend selection, independent window lifetimes, supported
+controls and observations, explicit unsupported outcomes, wake, shutdown,
+failure cleanup, and the four connection-loss situations, each in a bounded
+child that ends a compositor of its own — and both X11 test-check drivers
+answering unavailable there without provoking a GLFW report. Under the
+isolated Wayland consent none of them is skipped; a case that cannot run fails.
+It declares the same inputs and the same `display` runner class as
+`test.glfw-native`, and since WL-3 (#207) it is **required when affected**, as
+D-11 decided: any change that selects `test.glfw-native` selects it too. The
+[display worker](#the-display-worker) runs it under `tools/display/wayland.sh`
+rather than `x11.sh`, which is what gives it a Wayland session to select. The
+retained evidence of the run that promoted it is
+[the Wayland qualification record](wayland_qualification_record.md).
 
 The local-only probes are `test.x11-helper`, `test.wayland-helper`,
 `test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
-`test.glfw-wayland` is also optional, but can be explicitly requested in CI.
 Optional is a selection rule; it does not imply Python, a particular executor,
 or automatic eligibility for `$autotest`. See the
 [classification policy](test_classification.md) before adding a new group.
@@ -1008,14 +1013,16 @@ bash tools/display/wayland.sh --summary "$GITHUB_STEP_SUMMARY" -- <command>
 ```
 
 It starts the image's pinned Weston for that one command and stops it
-afterwards. The optional `test.glfw-wayland` runs under it: the native suite
-now accepts the `isolated-wayland:<socket>` consent this helper supplies, on
-Linux, only when `WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is
-unset. Its two examples then assert that the session it requested selected
-Wayland on that socket, and that both X11 test-check drivers answer unavailable
-there while the session's asynchronous reports stay empty — which is what shows
-neither reached for an X11 handle. Because the group is optional it runs only
-when requested, so an ordinary pull request still starts no compositor. What also exercises the
+afterwards. `test.glfw-wayland` runs under it: the native suite accepts the
+`isolated-wayland:<socket>` consent this helper supplies, on Linux, only when
+`WAYLAND_DISPLAY` names exactly that socket and `DISPLAY` is unset, and its
+Wayland tree then runs every required case on that socket. The connection-loss
+children never end this compositor: each starts one of its own, in a private
+runtime directory, and ends that. The backend-selection case that asks for
+Wayland in an X11-only environment runs its child under `tools/display/x11.sh`
+from inside this helper's run, since the image carries both. The group is
+required when affected, so any pull request that selects `test.glfw-native`
+starts this compositor too. What also exercises the
 helper against a real compositor is the `ci-image` workflow's dispatch-only
 [`route: wayland-probe`](#the-builder), which runs
 `bash tools/display/wayland.sh -- true` inside the described image with the

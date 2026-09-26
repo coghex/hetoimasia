@@ -290,6 +290,32 @@ spec = describe "the native opt-in" $ do
       refusals gate `shouldReturn` 0
       readIORef launched `shouldReturn` ["session-lifecycle"]
 
+    it "fails a child that expired at its deadline even though it printed that every check passed" $ do
+      gate ← newGate (Right Desktop)
+      let expired _ =
+            pure
+              Private.Launched
+                { Private.launchedEnd = Private.ChildExpired Private.childDeadline (ExitFailure (-15))
+                , Private.launchedOut = "glfw-native-tests session-lifecycle: every check passed\n"
+                , Private.launchedErr = ""
+                , Private.launchedPid = 0
+                }
+      verdict ← try (Private.launchWith gate expired "session-lifecycle")
+      either (\(_ ∷ SomeException) → True) (const False) verdict `shouldBe` True
+
+    it "fails a child that exited with success output but a failing status" $ do
+      gate ← newGate (Right Desktop)
+      let failing _ =
+            pure
+              Private.Launched
+                { Private.launchedEnd = Private.ChildExited (ExitFailure 1)
+                , Private.launchedOut = "glfw-native-tests session-lifecycle: every check passed\n"
+                , Private.launchedErr = ""
+                , Private.launchedPid = 0
+                }
+      verdict ← try (Private.launchWith gate failing "session-lifecycle")
+      either (\(_ ∷ SomeException) → True) (const False) verdict `shouldBe` True
+
     it "refuses a directly invoked child before looking up its scenario, and keeps the unknown-scenario exit for an approved one" $ do
       let plan consent name = either (\(code, message) → Left (code, message)) (Right . map fst) (Private.childPlan consent name)
       case plan (Left NoConsent) "session-lifecycle" of
@@ -328,15 +354,21 @@ recordingOwner = do
     )
 
 -- | A launcher that records each scenario it is asked for and reports every
--- check passed, without starting anything.
-recordingLauncher ∷ IO (IORef [String], String → IO (ExitCode, String, String))
+-- check passed, in time, without starting anything.
+recordingLauncher ∷ IO (IORef [String], String → IO Private.Launched)
 recordingLauncher = do
   launched ← newIORef []
   pure
     ( launched
     , \name → do
         modifyIORef' launched (<> [name])
-        pure (ExitSuccess, "glfw-native-tests " <> name <> ": every check passed\n", "")
+        pure
+          Private.Launched
+            { Private.launchedEnd = Private.ChildExited ExitSuccess
+            , Private.launchedOut = "glfw-native-tests " <> name <> ": every check passed\n"
+            , Private.launchedErr = ""
+            , Private.launchedPid = 0
+            }
     )
 
 refused ∷ Either SomeException a → Bool

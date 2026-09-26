@@ -10,7 +10,9 @@
 -- use that shared session; the owner-loop interaction probe uses it too, but
 -- only when its own activation variable asks for it, and is pending otherwise; the
 -- private-session examples run lifecycles no shared session can host in a child
--- process. Every group that uses the session or starts a child runs under the
+-- process; and the Wayland tree ("Test.GLFW.Native.Wayland") holds every
+-- required case of the Wayland evidence, run only under the isolated Wayland
+-- consent and pending under any other. Every group that uses the session or starts a child runs under the
 -- run's consent hook, so without consent each of its examples is refused
 -- before its body.
 module Test.GLFW.Native.Spec (spec) where
@@ -26,6 +28,7 @@ import qualified Test.GLFW.Native.Monitor as Monitor
 import qualified Test.GLFW.Native.Private as Private
 import qualified Test.GLFW.Native.Session as Session
 import qualified Test.GLFW.Native.Wake as Wake
+import qualified Test.GLFW.Native.Wayland as Wayland
 import Test.GLFW.Native.Support (Shared (sharedGate), consented)
 import qualified Test.GLFW.Native.Window as Window
 import Test.Hspec (Spec, describe)
@@ -45,3 +48,4 @@ spec shared = describe "GLFW native" $ do
     Input.spec shared
     Interaction.spec shared
     Private.spec (sharedGate shared)
+    Wayland.spec shared

@@ -16,10 +16,32 @@
 -- consent carries to it and it is never asked again. A child started directly
 -- from an unapproved shell reads its own environment and refuses, on stderr
 -- with 'refusedExit', before any scenario is looked up or any session entered.
+-- The consent also decides which backend a child's sessions request: the
+-- isolated Wayland consent's children request Wayland, exactly as the shared
+-- session does, and every other consent's take the platform's own backend.
+--
+-- Every child is bounded. 'launchChild' gives it 'childDeadline' seconds, in
+-- a process group of its own ("Test.GLFW.Native.Child"); one still running then
+-- is sent @SIGTERM@ with its whole group, then @SIGKILL@ after
+-- 'terminationGrace' seconds, and is reaped either way. An expired child is a
+-- failed case whatever it printed: 'launchWith' decides expiry before it reads
+-- a line of output, so a child that printed its success line and then hung
+-- cannot pass. The deadline-expiry example proves this against a real child
+-- that never exits.
 module Test.GLFW.Native.Private
   ( spec
   , privateSessionFlag
   , runScenario
+
+    -- * Bounded children
+  , ChildEnd (..)
+  , Launched (..)
+  , childDeadline
+  , terminationGrace
+  , launchChild
+  , launchCommand
+  , privateScenario
+  , privateScenarioReporting
 
     -- * For the headless regressions
   , launchWith
@@ -28,12 +50,12 @@ module Test.GLFW.Native.Private
   , unknownScenarioExit
   ) where
 
-import Control.Concurrent (forkIO, forkOS)
+import Control.Concurrent (forkIO, forkOS, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import qualified Control.Concurrent.STM as STM
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
-import Control.Monad (unless, void, when, (>=>))
+import Control.Monad (forever, unless, void, when, (>=>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Ptr (nullFunPtr)
 import qualified Data.Text as Text
@@ -80,10 +102,12 @@ import Hetoimasia.GLFW.Window
 import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
-import System.Process (readProcessWithExitCode)
+import System.Posix.Signals (nullSignal, signalProcess)
+import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommand, terminationGrace)
 import Test.GLFW.Native.Consent (Consent, Refusal, refusalMessage)
-import Test.GLFW.Native.Support (Gate, admit, hostBackend)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldContain)
+import Test.GLFW.Native.Support (Gate, admit, consentBackend, consentSessionConfig, hostBackend)
+import qualified Test.GLFW.Native.WaylandScenarios as WaylandScenarios
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
 
 -- | The argument that makes this executable a private-session child.
 privateSessionFlag ∷ String
@@ -109,31 +133,84 @@ spec gate = describe "private sessions in a child process" $ do
   it "keeps a second real window live, resizable, and observing while the first's owner retires, and creates or destroys no native window across a detach and reattach" $
     privateScenarioReporting gate "public-attachments"
 
+  it "fails a child that outlives its deadline, terminating and reaping it, however much success it printed first" $ do
+    _ ← admit gate
+    launched ← launchChild expiryDeadline [privateSessionFlag, deadlineScenario]
+    putStrLn ("glfw-native-tests deadline evidence: the non-exiting child ended " <> show (launchedEnd launched) <> " and printed " <> show (lines (launchedOut launched)))
+    hFlush stdout
+    launchedEnd launched `shouldSatisfy` \case
+      ChildExpired _ _ → True
+      ChildExited _ → False
+    -- It printed its success line before it hung: exactly the partial output
+    -- that must not pass.
+    launchedOut launched `shouldContain` successLine deadlineScenario
+    -- Reaped: no process answers to its identifier any longer.
+    reaped ← try (signalProcess nullSignal (launchedPid launched))
+    either (\(_ ∷ SomeException) → True) (const False) reaped `shouldBe` True
+    -- And the verdict every private example goes through fails it.
+    verdict ← try (launchWith gate (\_ → pure launched) deadlineScenario)
+    either (\(_ ∷ SomeException) → True) (const False) verdict `shouldBe` True
+
+-- | Run a scenario in a bounded child, once the gate admits the run, and check
+-- that the child reported every check passed.
 privateScenario ∷ Gate → String → IO ()
-privateScenario gate = launchWith gate $ \name → do
-  executable ← getExecutablePath
-  readProcessWithExitCode executable [privateSessionFlag, name] ""
+privateScenario gate = launchWith gate (\name → launchChild childDeadline [privateSessionFlag, name])
 
 -- | 'privateScenario', printing the child's report of each check, so the run
 -- retains the scenario's evidence and not only its verdict.
 privateScenarioReporting ∷ Gate → String → IO ()
 privateScenarioReporting gate = launchWith gate $ \name → do
-  executable ← getExecutablePath
-  launched@(_, out, _) ← readProcessWithExitCode executable [privateSessionFlag, name] ""
-  putStr out
+  launched ← launchChild childDeadline [privateSessionFlag, name]
+  putStr (launchedOut launched)
   hFlush stdout
   pure launched
 
 -- | Run one scenario through a launcher, once the gate admits the run, and
--- check that the child reported every check passed. A refused run raises the
--- refusal on the example's thread and never calls the launcher.
-launchWith ∷ Gate → (String → IO (ExitCode, String, String)) → String → IO ()
+-- check that the child exited in time, successfully, and reported every check
+-- passed. Expiry is decided first, so an expired child fails whatever it
+-- printed. A refused run raises the refusal on the example's thread and never
+-- calls the launcher.
+launchWith ∷ Gate → (String → IO Launched) → String → IO ()
 launchWith gate launch name = do
   _ ← admit gate
-  (status, out, err) ← launch name
-  unless (status == ExitSuccess) $
-    expectationFailure ("the private " <> name <> " process exited " <> show status <> ":\n" <> out <> err)
-  out `shouldContain` ("glfw-native-tests " <> name <> ": every check passed")
+  Launched end out err _ ← launch name
+  case end of
+    ChildExpired seconds reapedWith →
+      expectationFailure
+        ( "the private "
+            <> name
+            <> " process was still running at its "
+            <> show seconds
+            <> "-second deadline; it was terminated with its process group and reaped ("
+            <> show reapedWith
+            <> "), which fails the case whatever it printed:\n"
+            <> out
+            <> err
+        )
+    ChildExited status → do
+      unless (status == ExitSuccess) $
+        expectationFailure ("the private " <> name <> " process exited " <> show status <> ":\n" <> out <> err)
+      out `shouldContain` successLine name
+
+-- | The line a child prints once every check of its scenario passed.
+successLine ∷ String → String
+successLine name = "glfw-native-tests " <> name <> ": every check passed"
+
+-- | The stated deadline for every private-session child: far beyond what any
+-- scenario takes, so reaching it means the child hung.
+childDeadline ∷ Double
+childDeadline = 120
+
+-- | The deadline-expiry example's own, shorter deadline: its child prints and
+-- then hangs by design, so nothing is gained by waiting 'childDeadline'.
+expiryDeadline ∷ Double
+expiryDeadline = 5
+
+-- | This executable as a bounded child with these arguments.
+launchChild ∷ Double → [String] → IO Launched
+launchChild deadline arguments = do
+  executable ← getExecutablePath
+  launchCommand deadline executable arguments
 
 -- | The child's exit when its own environment carries no consent.
 refusedExit ∷ ExitCode
@@ -149,7 +226,7 @@ unknownScenarioExit = ExitFailure 2
 childPlan ∷ Either Refusal Consent → String → Either (ExitCode, String) [(String, IO String)]
 childPlan consent name = case consent of
   Left refusal → Left (refusedExit, "glfw-native-tests " <> name <> ": " <> refusalMessage refusal)
-  Right _ → case lookup name scenarios of
+  Right granted → case lookup name (scenarios granted) of
     Nothing → Left (unknownScenarioExit, "glfw-native-tests: unknown private session scenario " <> show name)
     Just checks → Right checks
 
@@ -164,19 +241,23 @@ runScenario consent name = case childPlan consent name of
     mapM_ (runCheck failures) checks
     count ← readIORef failures
     if count == 0
-      then putStrLn ("glfw-native-tests " <> name <> ": every check passed")
+      then putStrLn (successLine name)
       else do
         putStrLn ("glfw-native-tests " <> name <> ": " <> show count <> " check(s) failed")
         exitFailure
 
-scenarios ∷ [(String, [(String, IO String)])]
-scenarios =
+-- | Every scenario, for a child running under this consent.
+scenarios ∷ Consent → [(String, [(String, IO String)])]
+scenarios consent =
   [ ( "session-lifecycle"
-    , [ ("enters and leaves a real session", enterAndLeave)
-      , ("enters a second session after a complete teardown", enterAndLeave)
+    , [ ("enters and leaves a real session", enterAndLeave consent)
+      , ("enters a second session after a complete teardown", enterAndLeave consent)
       , ("observes an initialization error before any event polling", initializationError)
-      , ("enters a session after the failed initialization rolled back", enterAndLeave)
+      , ("enters a session after the failed initialization rolled back", enterAndLeave consent)
       ]
+    )
+  , ( deadlineScenario
+    , [("prints this scenario's success line and then never exits, as a hung child would", neverExits)]
     )
   , ( "callback-fault"
     , [("rethrows a fault raised inside a real native callback at the owner boundary", callbackFault)]
@@ -209,6 +290,19 @@ scenarios =
       ]
     )
   ]
+    <> WaylandScenarios.scenarios consent
+
+-- | The deliberately non-exiting child the deadline-expiry example launches.
+deadlineScenario ∷ String
+deadlineScenario = "deadline-expiry"
+
+-- | Print the scenario's success line, then never exit. Only a deadline ends
+-- this child, which is the point.
+neverExits ∷ IO String
+neverExits = do
+  putStrLn (successLine deadlineScenario)
+  hFlush stdout
+  forever (threadDelay 1000000)
 
 runCheck ∷ IORef Int → (String, IO String) → IO ()
 runCheck failures (name, check) = do
@@ -220,13 +314,16 @@ runCheck failures (name, check) = do
       putStrLn ("FAIL " <> name <> ": " <> displayException failure)
   hFlush stdout
 
-enterAndLeave ∷ IO String
-enterAndLeave = do
-  (backend, reports) ← withSession defaultSessionConfig $ \session → do
+-- | Enter and fully leave a session requesting what this consent's sessions
+-- request: Wayland under the isolated compositor, the platform's own backend
+-- otherwise.
+enterAndLeave ∷ Consent → IO String
+enterAndLeave consent = do
+  (backend, reports) ← withSession (consentSessionConfig consent) $ \session → do
     reports ← takeAsynchronousReports session
     pure (sessionBackend session, reports)
-  unless (backend == hostBackend) $
-    failCheck ("the session selected " <> show backend <> ", not " <> show hostBackend)
+  unless (backend == consentBackend consent) $
+    failCheck ("the session selected " <> show backend <> ", not " <> show (consentBackend consent))
   pure ("backend " <> show backend <> ", asynchronous reports " <> show reports)
 
 -- | A production table whose size callback copies a payload that raises, so the

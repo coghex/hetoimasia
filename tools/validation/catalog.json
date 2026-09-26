@@ -395,14 +395,14 @@
     },
     {
       "id": "test.glfw-wayland",
-      "description": "The native suite's Wayland-only examples, on the isolated headless compositor tools/display/wayland.sh starts: that a session requesting Wayland selected Wayland on the socket its consent authorized, and that both X11 test-check drivers answer unavailable there without provoking a GLFW report. Optional and requested by name; the selector names that group and nothing else.",
+      "description": "The native suite's whole Wayland selection, on the isolated headless compositor tools/display/wayland.sh starts: every required case of the Wayland qualification design's D-12 matrix (backend selection, independent window lifetimes, supported controls and observations, explicit unsupported outcomes, wake, shutdown, failure cleanup, and connection loss in children that end compositors of their own), and that both X11 test-check drivers answer unavailable there. Required when affected, with test.glfw-native's inputs; the selector names that tree and nothing else.",
       "command": [
         "cabal",
         "test",
         "glfw-native-tests",
         "--test-show-details=direct",
         "--test-option=--match",
-        "--test-option=/GLFW native/the shared session/on an isolated Wayland session/"
+        "--test-option=/GLFW native/on an isolated Wayland session/"
       ],
       "component": "hetoimasia-glfw:test:glfw-native-tests",
       "inputs": [
@@ -415,7 +415,7 @@
       "runner": "display",
       "timeout_seconds": 1800,
       "category": "test",
-      "optional": true
+      "optional": false
     },
     {
       "id": "test.macos-confinement",

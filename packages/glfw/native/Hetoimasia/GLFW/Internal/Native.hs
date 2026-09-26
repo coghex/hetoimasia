@@ -27,6 +27,13 @@
 -- imported with @ccall@: their argument is a function pointer whose C type the
 -- CAPI wrapper cannot spell, and it is passed and returned as a plain pointer.
 --
+-- The Wayland connection-status probe of the Wayland qualification design's
+-- D-13 is reached through the shim's
+-- @hetoimasia_glfw_wayland_probe_resolve@ and
+-- @hetoimasia_glfw_wayland_connection_status@, which answer only ints: the
+-- display pointer and its descriptor never leave C, and the probe reads,
+-- never dispatches or flushes. It is resolved for a Wayland session only.
+--
 -- Every GLFW function is a @safe@ import. Any of them may report an error
 -- through the callback, which re-enters Haskell and is only permitted from a
 -- safe call, and a safe call lets other Haskell threads run while it is in C.
@@ -69,6 +76,7 @@ module Hetoimasia.GLFW.Internal.Native
   , injectCursorEnterForCheck
   , injectScrollForCheck
   , injectFocusForCheck
+  , injectCloseForCheck
   , inputCallbacksClearedForCheck
   , takeInputCallbacksClearedForCheck
   ) where
@@ -78,6 +86,7 @@ import Control.Monad (void)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int32)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CDouble (CDouble), CFloat (CFloat), CInt (CInt), CUInt (CUInt), CULLong (CULLong), CULong (CULong))
@@ -86,6 +95,7 @@ import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (Storable, peek, peekElemOff)
 import Hetoimasia.GLFW.Internal.Capture (ErrorCallback)
+import Hetoimasia.GLFW.Internal.Connection (ConnectionCause (..), ConnectionProbe (..), ConnectionStatus (..))
 import Hetoimasia.GLFW.Internal.Monitor
   ( MonitorCallback
   , MonitorCallbackStorage (MonitorCallbackStorage)
@@ -130,6 +140,7 @@ productionNative =
         c_glfwInitHint glfwCocoaChdirResources glfwFalse
     , nativeInitialize = (== glfwTrue) <$> c_glfwInit
     , nativeCurrentBackend = platformBackend <$> c_glfwGetPlatform
+    , nativeConnectionProbe = resolveConnectionProbe
     , nativeTerminate = c_glfwTerminate
     , nativeResetWindowHints = c_glfwDefaultWindowHints
     , nativeSetWindowHint = setWindowHint
@@ -549,6 +560,47 @@ windowStateForCheck window =
   where
     attribute code = (/= glfwFalse) <$> c_glfwGetWindowAttrib window code
 
+-- | The session's connection-status probe, once the shim can answer for it.
+resolveConnectionProbe ∷ IO (Either Text ConnectionProbe)
+resolveConnectionProbe = do
+  reason ← c_waylandProbeResolve
+  pure $
+    if reason == probeReady
+      then Right (ConnectionProbe connectionStatus)
+      else Left (probeReasonText reason 0)
+
+-- | One zero-timeout status read, copied out of C.
+connectionStatus ∷ IO ConnectionStatus
+connectionStatus =
+  alloca $ \reasonOut → alloca $ \errorOut → do
+    status ← c_waylandConnectionStatus reasonOut errorOut
+    reason ← peek reasonOut
+    code ← peek errorOut
+    pure (classify status reason code)
+  where
+    classify status reason code
+      | status == connectionHealthy = ConnectionHealthy
+      | status == connectionTransportClosed =
+          ConnectionEnded (TransportClosed (if code == 0 then Nothing else Just (fromIntegral code)))
+      | status == connectionProtocolFailure = ConnectionEnded ProtocolFailure
+      | otherwise = ConnectionEnded (ProbeFailure (probeReasonText reason code))
+
+-- | Why the probe cannot answer, in words, with the errno behind it if any.
+probeReasonText ∷ CInt → CInt → Text
+probeReasonText reason code =
+  described <> if code == 0 then "" else " (errno " <> Text.pack (show code) <> ")"
+  where
+    described
+      | reason == probeNoLibrary = "libwayland-client.so.0, the library GLFW loads, could not be loaded"
+      | reason == probeNoSymbol = "libwayland-client does not provide wl_display_get_error and wl_display_get_fd"
+      | reason == probeNotWayland = "GLFW did not initialize the Wayland platform"
+      | reason == probeNoDisplay = "GLFW holds no Wayland display"
+      | reason == probeNoDescriptor = "the Wayland display answered no socket descriptor"
+      | reason == probePollFailed = "the zero-timeout poll of the display's socket failed"
+      | reason == probeInvalidDescriptor = "the display's socket descriptor is not open"
+      | reason == probeUnsupportedPlatform = "this platform has no Wayland"
+      | otherwise = "the shim answered unknown reason " <> Text.pack (show reason)
+
 createWindow ∷ Int32 → Int32 → Text → IO (Ptr NativeWindow)
 createWindow width height title =
   ByteString.useAsCString (encodeUtf8 title) $ \native →
@@ -588,6 +640,13 @@ foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_progress_for_ch
 
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_take_wait_noted_for_check"
   c_takeWaitNotedForCheck ∷ IO CInt
+
+-- Safe: both call GLFW, which may report through the error callback.
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wayland_probe_resolve"
+  c_waylandProbeResolve ∷ IO CInt
+
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_wayland_connection_status"
+  c_waylandConnectionStatus ∷ Ptr CInt → Ptr CInt → IO CInt
 
 foreign import capi safe "hetoimasia_glfw.h glfwPlatformSupported"
   c_glfwPlatformSupported ∷ CInt → IO CInt
@@ -824,6 +883,9 @@ foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_scroll_for_ch
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_focus_for_check"
   c_injectFocusForCheck ∷ Ptr NativeWindow → CInt → IO ()
 
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_inject_close_for_check"
+  c_injectCloseForCheck ∷ Ptr NativeWindow → IO ()
+
 -- | Invoke the registered key callback through its C function pointer, for the
 -- native examples only. This is the actual trampoline GLFW holds, not the
 -- feed's private producer.
@@ -850,6 +912,12 @@ injectScrollForCheck window x y = c_injectScrollForCheck window (CDouble x) (CDo
 injectFocusForCheck ∷ Ptr NativeWindow → Bool → IO ()
 injectFocusForCheck window focused = c_injectFocusForCheck window (boolean focused)
 
+-- | Invoke the registered close callback through its C function pointer, for
+-- the native examples only: an injected close request, available on every
+-- backend and never evidence of one the platform generated.
+injectCloseForCheck ∷ Ptr NativeWindow → IO ()
+injectCloseForCheck = c_injectCloseForCheck
+
 inputCallbacksClearedForCheck ∷ Ptr NativeWindow → IO Bool
 inputCallbacksClearedForCheck window = (/= 0) <$> c_inputCallbacksClearedForCheck window
 
@@ -865,6 +933,18 @@ foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_note_input_callbacks
 foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_take_input_callbacks_cleared_for_check"
   c_takeInputCallbacksClearedForCheck ∷ IO CInt
 
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_CONNECTION_HEALTHY" connectionHealthy ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_CONNECTION_TRANSPORT_CLOSED" connectionTransportClosed ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_CONNECTION_PROTOCOL_FAILURE" connectionProtocolFailure ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_READY" probeReady ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_NO_LIBRARY" probeNoLibrary ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_NO_SYMBOL" probeNoSymbol ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_NOT_WAYLAND" probeNotWayland ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_NO_DISPLAY" probeNoDisplay ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_NO_DESCRIPTOR" probeNoDescriptor ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_POLL_FAILED" probePollFailed ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_INVALID_DESCRIPTOR" probeInvalidDescriptor ∷ CInt
+foreign import capi "hetoimasia_glfw.h value HETOIMASIA_PROBE_UNSUPPORTED_PLATFORM" probeUnsupportedPlatform ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_TRUE" glfwTrue ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_FALSE" glfwFalse ∷ CInt
 foreign import capi "hetoimasia_glfw.h value GLFW_PLATFORM" glfwPlatformHint ∷ CInt

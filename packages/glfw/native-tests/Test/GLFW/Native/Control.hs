@@ -16,7 +16,7 @@
 -- events between observations, within a bound of turns, and compares the
 -- observation with what the platform reports rather than with the request
 -- wherever the platform decides the result.
-module Test.GLFW.Native.Control (spec) where
+module Test.GLFW.Native.Control (spec, withTwo, converge, returnedWithRevision) where
 
 import Control.Monad (void)
 import Data.Text (Text)

@@ -637,10 +637,16 @@ is the wake path's degradation warning, under `glfw.wake`.
    the selected backend, or entry is `BackendNotSelected`. A Wayland hint that
    GLFW answers with X11 fails here and terminates: the hint asked for Wayland,
    so an X11 session is not presented as one.
-8. **Monitor callback.** The monitor callback's storage is allocated, its detach
+8. **Connection probe.** A Wayland session resolves the private
+   connection-status probe [Wayland connection loss](#wayland-connection-loss)
+   describes. A library that cannot supply it refuses the session with
+   `ConnectionProbeUnavailable`, attributed to `initialize`, and terminates:
+   without the probe a lost compositor connection could not be confirmed. X11
+   and Cocoa sessions resolve nothing and make no call here.
+9. **Monitor callback.** The monitor callback's storage is allocated, its detach
    is registered, and it is attached with `glfwSetMonitorCallback`. An
    attachment that raises poisons the guard.
-9. **Monitor inventory.** The monitors are enumerated and described, anything
+10. **Monitor inventory.** The monitors are enumerated and described, anything
    the callback captured since attachment is folded in, and the prepared
    inventory becomes revision zero of a fresh snapshot. See [Monitors](#monitors).
 
@@ -717,6 +723,109 @@ real exclusion, not a flag read before the FFI call. A capability retained past
 its session is terminal forever. It cannot reach a later session, even one with
 the same backend, because that session has its own gate. A construction that
 rolls back never lends a capability.
+
+## Wayland
+
+### The supported profile
+
+A session enters native Wayland only when its configuration requests
+`Wayland`, on Linux, with the pinned GLFW 3.4 prefix built with both backends;
+the platform's own default stays X11, and no request is served by the other
+backend. What that session supports is what WL-3 (#207) demonstrated under the
+pinned headless Weston `tools/display/wayland.sh` starts, recorded with its CI
+run in [the Wayland qualification record](wayland_qualification_record.md):
+
+- entry selecting Wayland on the socket it was pointed at, and an unrequested
+  session still selecting X11;
+- windows created and closed independently, each closure retiring only its own
+  window while the session and the other window stay usable;
+- title, size, visibility, and size-limit commands, with size and visibility
+  observed as the native boundary reports them; size limits are command
+  delivery and engine-side constraint handling only, because `xdg_toplevel`
+  limits are not readable from the client and a compositor may disregard them;
+- framebuffer extent and content scale as observations, never requests, with
+  the framebuffer following a resize the application made;
+- global placement, focus, and borderless-over-monitor requests answered
+  unsupported, and placement and iconified observations unavailable, with none
+  of their native operations or getters invoked ([the audited Wayland
+  row](#the-audited-wayland-row));
+- the cross-thread wake ending a native wait the owner was blocked in;
+- sessions left and entered again in one process, and forced or injected
+  failures rolled back completely;
+- a lost compositor connection ending the session, as the next section
+  describes.
+
+The remaining gaps are stated rather than estimated:
+
+- **One compositor.** Only packaged Weston under its headless backend is
+  qualified. Desktop compositors, their decorations, and compositor-specific
+  behaviour are not; their probes stay optional and none exists.
+- **No hardware.** No GPU, display, input device, or output hotplug was
+  involved. Rendering on Wayland is WL-4's, deferred until the Vulkan surface
+  slices exist, and nothing here claims presentation or GPU completion.
+- **Close requests.** A compositor-generated close request has not been
+  demonstrated on Wayland: no client can make the compositor send one, and the
+  X11 close driver is unavailable there (D-9). The examples exercise close
+  handling with requests injected through the window's own close callback,
+  labelled as injected.
+- **Minimization, suspension, and occlusion.** Not established through the
+  pinned GLFW 3.4 integration, whose direct `xdg-shell` path binds protocol
+  version 1; nothing infers that a window is drawable from an unknown state.
+- **Reconnection.** A lost connection is terminal. Nothing reconnects or
+  recovers.
+
+### Wayland connection loss
+
+GLFW 3.4's Wayland event loop reports a lost compositor connection through no
+error at all: when its display flush fails it cancels the read, issues a close
+request for every window, and returns (`src/wl_window.c:1142-1160,1222-1250`).
+A close request is therefore neither necessary nor sufficient evidence of a
+loss, and an application may reject ordinary close requests. Under the Wayland
+qualification design's D-13 the production shim instead carries a private,
+read-only connection-status probe, and the session consults it.
+
+The probe runs on the owner thread and hands back only a status. It reads the
+display's latched error with `wl_display_get_error` and polls the display's
+socket, from `wl_display_get_fd`, with a zero timeout for hangup; it never
+reads or dispatches protocol messages, flushes, creates windows, reconnects, or
+closes GLFW's connection, which stays GLFW's. The two libwayland symbols are
+resolved once per process from the library GLFW itself loads, which is never
+closed. `wl_display_get_error` alone would not do: libwayland 1.22 latches
+nothing when a flush fails with `EPIPE`, which is exactly the path GLFW's
+disconnect handling takes, so the socket's own hangup is read too.
+
+`processWindowEvents` asks the probe immediately before and immediately after
+every native poll or wait, whether or not the session has windows. A status
+other than healthy fails that processing with `ConnectionFailed`, attributed to
+`process window events`, naming the cause and the boundary that found it:
+
+| Cause | When |
+| --- | --- |
+| `TransportClosed` | The display latched a transport error — `EPIPE` for a read that found the socket closed, with its `errno` — or the socket reported the peer gone with nothing latched. |
+| `ProtocolFailure` | The display latched `EPROTO`: the compositor reported a fatal protocol error. |
+| `ProbeFailure` | The probe could not establish the status at all — no display, no descriptor, a failed `poll` — and says why. This is reported as itself: the connection can no longer be vouched for, which is not a claim that it ended. |
+
+None is described as the compositor having crashed. A loss found before the
+call pumps nothing on the lost connection; one found after it fails the
+processing with that cause rather than with whatever GLFW reported during the
+call, and the failure keeps those reports beside the cause. Native errors the
+probe's own GLFW call might report are taken by the same capture as the
+processing's.
+
+The failure is terminal, as D-10 decides. The session latches it, and every
+later event processing raises the same failure with no probe and no native
+call; nothing reconnects. Other owner operations are unchanged and report
+whatever GLFW reports. In the window host the owner loop's processing raises
+it, which ends the loop, and the protected exit retires every attachment under
+the existing boundary before any window or the session is released: a loss
+that initiates the failure is primary, a loss the drain finds after an earlier
+failure is retained beside that primary, and a loss certifies no retirement
+fact, so an attachment still retires only on its own evidence. No completion
+is fabricated for work the compositor can no longer settle.
+
+The probe is not public, and no native pointer or descriptor is: an
+application observes only `ConnectionFailed`, and `ConnectionProbeUnavailable`
+at entry. X11 and Cocoa sessions resolve no probe and make no probe call.
 
 ## Native error evidence
 
@@ -961,6 +1070,17 @@ examples also invoke the registered input trampolines through
   confound the production one. As each wait returns, the shim records its
   sequence number and whether a production wake named it. The shim holds no
   queue or game logic.
+- The Wayland connection-status probe of
+  [Wayland connection loss](#wayland-connection-loss) is production code in the
+  shim, `hetoimasia_glfw_wayland_probe_resolve` and
+  `hetoimasia_glfw_wayland_connection_status`, both `safe` imports because each
+  calls GLFW. They answer only ints — a status, a reason, and an `errno` — so
+  the display pointer and its descriptor never leave C. `glfwGetWaylandDisplay`
+  is declared there with an incomplete `struct wl_display`, as GLFW's own
+  header declares it, so the shim includes no Wayland client header; it is
+  called only after `glfwGetPlatform`, which reports no error, answers Wayland.
+  Only Linux carries a working probe; Cocoa and any other platform answer
+  unavailable.
 
 The window callback setters are `ccall` imports for the same reason. Each
 callback wrapper only drops the window pointer and calls the model's callback,
@@ -1294,6 +1414,14 @@ constraints are held by GLFW on every backend, and `Nothing` from the reader is
 never evidence that a window has none. A compositor-generated close request has
 not been demonstrated on Wayland through this integration, and nothing here
 claims otherwise; automating one is not attempted.
+
+`injectCloseForCheck` is the one close driver every backend has: it invokes
+the window's registered close callback through its C function pointer, so the
+model latches a close request exactly as it would a platform's. It is an
+injected request and is labelled as one wherever the Wayland examples use it —
+for the healthy-connection control and for requests left pending across a
+connection loss — and it is never evidence of a request the compositor
+generated.
 
 ### Release
 
@@ -4817,6 +4945,7 @@ see [the Vulkan native suite](gpu_backend.md#the-native-suite).
 | Wake path degradation | The session | The first expected platform failure of a notification degrades it; the owner's boundary claims and settles its one report | Any; STM | The session | Never healthy again; a later session has its own |
 | Notification obligations | The session | An admitting or publishing transaction registers one; the notifying thread discharges it in the transaction that records what its wake left; owner boundaries wait for zero | Any; STM | The session | Zero whenever every committed admission and publication has been notified |
 | Wake reports | The session's error capture | The callback writes on the wake call's OS thread; the call takes them | The wake call's OS thread | One wake call's native call | Removed when the call returns |
+| Connection probe and its latched failure | The session | Wayland entry resolves the probe; event processing runs it at both boundaries and latches the failure it confirms | Owner | The session | Latched once confirmed; never cleared, so event processing stays terminal |
 | Interaction trace | The session | An activated probe starts, takes, and stops it; the pump, the owner loop, and the window callbacks offer records | Owner, and callbacks inside its pump calls; atomic | Stopped unless a probe starts it | Emptied by each take; stopped storage holds nothing |
 | Monitor capture latch | The session | The monitor callback writes; refreshes fold and clear it | Callback: inside owner calls; folds: owner | The session | Cleared by each committed refresh; a fault is taken when rethrown |
 | Monitor identity counter | The session | Refreshes issue from it | Owner | The session | Never reissued |
@@ -5123,7 +5252,7 @@ test environment.
 | Selection | The Hspec tree is built, listed, and filtered before any example runs. A `--dry-run`, a listing, or a selection that never reaches a native operation acquires nothing, and a selection matching no example fails. |
 | Acquisition | Lazily, by the first dispatched operation, and at most once. The run's last line reports how many times the shared session was acquired, and the run fails if that is more than once. |
 | Windows | Every window example creates and releases its own private window inside one operation. No window is shared: no example yet demonstrates the reset and isolation a shared window would need. |
-| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. |
+| Private sessions | Sessions entered and left in sequence, a forced initialization failure and its rollback, a session over a faulting native table, and wakes racing termination cannot coexist with the shared session, so each scenario runs in a child process of the same executable, started with `--private-session <scenario>`. No example ends the shared session. The parent starts no child without consent, the child inherits the parent's consent and is not asked again, and a child started directly from a shell without consent refuses on stderr with exit status 3 before it looks up its scenario; an unknown scenario under consent still exits 2. The consent also chooses what a child's sessions request: Wayland under the isolated compositor's consent, the platform's own backend otherwise. Every child is bounded by a stated deadline of 120 seconds, in a process group of its own: one still running then is sent `SIGTERM` with its group, `SIGKILL` five seconds later if it has not exited, and is reaped either way. An expired child fails its example whatever it printed, because expiry is decided before a line of its output is read. |
 | Thread identity | Checked with the native main-thread shim, `isCurrentThreadBound`, and the owner's `ThreadId` at setup, inside every dispatched operation, before release, and after release. A failed check fails its operation or release, and the run. |
 | Settlement | A waiting example also watches the owner, so an owner that fails wakes it with the owner's own failure. A cancelled example's queued operation is settled without running; one already running finishes and its reply is dropped. An acquisition failure answers every operation and is never retried. A failure crossing between the owner and an example is rethrown with the context it was raised with, so its failure evidence and retained cleanup failures survive. The session is released only once the Hspec run has finished, and a release failure beside a primary failure is kept as cleanup evidence. Once an owner failure or cancellation begins settlement, the owner's wait for the run stays interruptible but absorbs further owner cancellation — with or without a release failure — and the report keeps the failure that began the settlement as primary, including against a cancellation deferred through the uninterruptible release. |
 | Consent | No native operation runs and no child starts without the run's consent, read once from `HETOIMASIA_NATIVE_SESSION` at startup. `desktop` is the opt-in for this one run on the local desktop, given under the owner's standing approval for runs an issue or pull request needs; `isolated-x11:<display>` is what `tools/display/x11.sh` gives the command it runs, accepted only on Linux and only when it names the current `DISPLAY`; `isolated-wayland:<socket>` is what `tools/display/wayland.sh` gives its command, accepted only on Linux, only when `WAYLAND_DISPLAY` names exactly that socket, and only when `DISPLAY` is unset — a set `DISPLAY`, empty or not, could serve an X11 or XWayland session in the compositor's place, so it is refused. Each refusal names what disagreed: the socket against `WAYLAND_DISPLAY`, the `DISPLAY` that should not be there, or the platform. Anything else — the variable unset, empty, or another value, a bare `DISPLAY` or `WAYLAND_DISPLAY`, `CI` — refuses each example that uses the session or starts a child before its body runs, with `NativeSessionRefused`, so no body forks, waits, or dispatches without consent; any operation that still reaches the dispatcher is refused on the example's own thread before it is dispatched, and the owner's acquisition asks again before initializing GLFW. The session is never acquired and the report shows zero acquisitions. The run then ends with one line on stderr naming what was missing and the isolated alternative, and a non-zero exit, so its summary is never a pass. Building, listing, and filtering the tree, a dry run, and the examples that use only a scripted owner or a recorded launcher need no consent. |
@@ -5171,17 +5300,69 @@ The native examples cover:
 - the platform's backend selected explicitly, on an isolated X11 display under
   Linux; pending instead on a run the isolated compositor authorized, which
   selects the other backend;
-- under `on an isolated Wayland session`, the group `test.glfw-wayland`
-  selects: a requested Wayland session selecting Wayland, on the isolated
-  compositor's own socket with `DISPLAY` unset; and both test-check drivers
-  answering unavailable on that session — `requestCloseForCheck` `False`,
-  `sizeLimitsForCheck` `Nothing` — while `takeAsynchronousReports` returns no
-  report, which is the evidence that neither asked GLFW for the X11 handle it
-  would have refused. Both are listed on every platform, so a dry run names
-  them and the catalog can ask for them anywhere, but each asserts only against
-  a session the isolated Wayland consent authorized: an X11 or Cocoa run
-  reaches the body and reports it pending rather than asserting Wayland against
-  the session it actually has;
+- under `on an isolated Wayland session`, the whole tree the group
+  `test.glfw-wayland` selects (`Test.GLFW.Native.Wayland`): every required case
+  of the Wayland qualification design's D-12 matrix. Each is listed on every
+  platform, so a dry run names them and a macOS run lists them without
+  acquiring anything, but each runs only under the isolated Wayland consent: an
+  X11 or Cocoa run reaches the hook and reports it pending rather than
+  asserting Wayland against the session it actually has. Under that consent
+  nothing is skipped, and a case that cannot run fails. The cases:
+  - **backend selection:** the shared session requesting Wayland selects it, on
+    the compositor's own socket with `DISPLAY` unset; in a child, a session
+    requesting nothing still resolves to X11 and fails `glfwInit` with GLFW's
+    `GLFW_PLATFORM_UNAVAILABLE` naming the missing `DISPLAY`, never
+    `UnsupportedBackend`; and a child run under `tools/display/x11.sh` from
+    inside the compositor's run, with its runtime directory an empty one of its
+    own, requests Wayland and fails `glfwInit` with `GLFW_PLATFORM_ERROR` for
+    the connection. Compiled-support rejection has no native form — a prefix
+    built with Wayland cannot be asked to lack it — and is proven over the seam
+    in `glfw-tests`;
+  - **independent window lifetimes:** two hidden windows created through a
+    worker's requests and closed in both orders through the real owner loop,
+    each closure releasing only its own window while the other still observes
+    and executes through its own port;
+  - **supported controls and observations:** a title and a size settled and
+    observed as `glfwGetWindowTitle` and `glfwGetWindowSize` report them;
+    showing and hiding reflected in visibility; size limits delivered and an
+    out-of-constraint size refused engine-side, with nothing read back; and
+    framebuffer extent and content scale sampled, the framebuffer following
+    the resize the example induced at the sampled scale, printed as evidence;
+  - **explicit unsupported outcomes:** in a child over a production table that
+    records every call of `glfwSetWindowPos`, `glfwGetWindowPos`,
+    `glfwFocusWindow`, `glfwSetWindowMonitor`, and
+    `glfwGetWindowAttrib(GLFW_ICONIFIED)`, placement, focus, and
+    borderless-over-monitor requests settle unsupported with reasons, placement
+    and iconified observations are `Unavailable`, and none of those calls is
+    made;
+  - **wake:** the session wake examples above, run again on Wayland;
+  - **shutdown:** the `session-lifecycle` child entering, leaving, and
+    re-entering Wayland sessions, after which the parent's shared session
+    still serves with one acquisition;
+  - **failure cleanup:** in a child, a Cocoa request forced past the model's
+    refusal, labelled injected, failing `glfwInit` with no cleanup failure,
+    freeing every error callback storage, and followed by a Wayland session;
+    and an injected failure sampling a real new window, beside an injected
+    failure releasing its already-freed callback storage, kept primary and
+    retained respectively, with every input callback cleared before the one
+    real window is destroyed and a later window created;
+  - **connection loss:** four children, each ending a compositor of its own —
+    packaged Weston, headless, in a private runtime directory — and never the
+    one the consent names. With injected close requests rejected and one left
+    pending, the compositor is ended and the next processing confirms
+    `TransportClosed` before it pumps anything; with no window, the next finite
+    wait does the same; with the owner observed blocked inside a 30-second
+    wait, the compositor is ended from another thread, the wait returns well
+    inside its bound, and the probe after it confirms the loss. Each then
+    raises the same failure again with no probe and no pump. The fourth, the
+    healthy control, keeps its compositor running: an injected close request
+    is rejected, the probe answers healthy at every boundary, and the session
+    stays live. It is not evidence of a compositor-generated close request.
+    A child that hangs fails at its deadline; a watchdog kill is never a pass;
+  - **test-check helpers:** both drivers answering unavailable on that
+    session — `requestCloseForCheck` `False`, `sizeLimitsForCheck` `Nothing` —
+    while `takeAsynchronousReports` returns no report, which is the evidence
+    that neither asked GLFW for the X11 handle it would have refused;
 - operations running on the bound process main thread that entered the session,
   never on the Hspec worker, and a single acquisition;
 - nested entry on the owner thread, entry from a bound worker and from an
@@ -5316,6 +5497,11 @@ The native examples cover:
   for events with `glfwWaitEventsTimeout` — returning as soon as one arrives,
   within a bound of 100 boundaries of at most 50 ms — until the fault is
   rethrown;
+- a deliberately non-exiting child, started with its own five-second deadline,
+  that prints its scenario's success line and then never exits: the launcher
+  reports it expired, it was terminated and reaped — no process answers to its
+  identifier afterwards — and the verdict every private example goes through
+  fails it despite the success line it printed;
 - in a private process, the real monitor callback detached while it is still the
   callback GLFW holds, with none held afterwards, before `glfwTerminate`, and its
   storage freed after the error callback's detach, with the closed inventory
@@ -5341,6 +5527,14 @@ no approval and touches no desktop:
 
 ```bash
 bash tools/display/x11.sh -- cabal test glfw-native-tests --test-show-details=direct
+```
+
+The Wayland tree runs the same way under the headless compositor's helper,
+exactly as `test.glfw-wayland` does:
+
+```bash
+bash tools/display/wayland.sh -- cabal test glfw-native-tests --test-show-details=direct \
+  --test-option=--match --test-option='/GLFW native/on an isolated Wayland session/'
 ```
 
 On a real desktop — Cocoa on macOS, or an X11 desktop of a person's own — the
