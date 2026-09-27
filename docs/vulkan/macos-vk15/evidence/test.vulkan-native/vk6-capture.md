@@ -16,7 +16,7 @@ arrived inside it.
 
 - capture limits: 1024 queued records, 16384 bytes of text per record (the default is 4096; see the proof README), 16 objects per record
 - device: Apple M3 Max
-- messenger callback: 0x00000001058519ac in /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-231-terminal-failure-teardown/dist-vulkan/build/aarch64-osx/ghc-9.14.1/hetoimasia-gpu-vulkan-glfw-0.1.0.0/t/vulkan-native-tests/opt/build/vulkan-native-tests/vulkan-native-tests as hetoimasia_vulkan_capture_messenger
+- messenger callback: 0x00000001016259ac in /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-231-terminal-failure-teardown/dist-vulkan/build/aarch64-osx/ghc-9.14.1/hetoimasia-gpu-vulkan-glfw-0.1.0.0/t/vulkan-native-tests/opt/build/vulkan-native-tests/vulkan-native-tests as hetoimasia_vulkan_capture_messenger
 - this executable: /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-231-terminal-failure-teardown/dist-vulkan/build/aarch64-osx/ghc-9.14.1/hetoimasia-gpu-vulkan-glfw-0.1.0.0/t/vulkan-native-tests/opt/build/vulkan-native-tests/vulkan-native-tests
 - unsafe imports this session declares: vkSubmitDebugUtilsMessageEXT, vkCmdSetViewport
 - binding safe-foreign-calls in binding.pin: on
@@ -111,7 +111,7 @@ the step whose reports it was.
 | vkCreateInstance | info | mvk-info | MoltenVK version 1.4.0, supporting Vulkan version 1.4.323. 	The following 145 Vulkan extensions are supported: 	VK_KHR_16bit_storage v1 	VK_KHR_8bit_storage ... |
 | vkCreateInstance | info | mvk-info | GPU device: 	model: Apple M3 Max 	type: Integrated 	vendorID: 0x106b 	deviceID: 0x1a070209 	pipelineCacheUUID: 000028A0-1A07-0209-0000-000100000000 	GPU memo... |
 | vkCreateInstance | info | mvk-info | Created VkInstance for Vulkan version 1.3.323, as requested by app, with the following 1 Vulkan extensions enabled: 	VK_EXT_debug_utils v2 |
-| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x10d518180, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| ... |
+| vkCreateInstance | info | WARNING-CreateInstance-status-message | Validation Information: [ WARNING-CreateInstance-status-message ] Object 0: handle = 0x10931d420, type = VK_OBJECT_TYPE_INSTANCE; \| MessageID = 0x23dfd876 \| ... |
 | vkSubmitDebugUtilsMessageEXT, through an unsafe import | info | hetoimasia-vulkan-proof-unsafe-submit | delivered from inside an unsafe foreign call |
 | vkCreateDevice | info | Loader Message | Inserted device layer "VK_LAYER_KHRONOS_validation" (/usr/local/lib/libVkLayer_khronos_validation.dylib) |
 | vkCreateDevice | info | Loader Message | vkCreateDevice layer callstack setup to: |
