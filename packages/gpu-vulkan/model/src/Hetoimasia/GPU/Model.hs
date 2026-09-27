@@ -128,6 +128,7 @@ module Hetoimasia.GPU.Model
   , beginTargetRecovery
   , recordRecoveryFailure
   , recordRecoverySuccess
+  , declareTargetUnrecoverable
 
     -- * Allocation attempts
   , RetryVerdict (..)

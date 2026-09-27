@@ -57,6 +57,8 @@ noteSwapchainResult generations generation result = do
           pure True
     _ → pure False
   where
+    strongest (Just SwapchainSurfaceLost) _ = SwapchainSurfaceLost
+    strongest _ SwapchainSurfaceLost = SwapchainSurfaceLost
     strongest (Just SwapchainOutOfDate) _ = SwapchainOutOfDate
     strongest _ latest = latest
 

@@ -25,6 +25,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , declareUnsupported
   , StandInFailure (..)
   , StandInLoss (..)
+  , StandInSurfaceLost (..)
 
     -- * The surface bridge
   , Bridge
@@ -40,8 +41,10 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , newRig
   , newRigOf
   , visibleRig
+  , visibleRigOf
   , resizeFramebuffer
   , publishObservation
+  , nudgeOwner
   , offerExtent
   , twoWindows
   , creationsBegun
@@ -96,11 +99,12 @@ import Hetoimasia.GLFW.Seam
   , seamIntegratedSession
   , seamIntegration
   )
-import Hetoimasia.GLFW.Vulkan (requiredInstanceExtensions)
+import Hetoimasia.GLFW.Vulkan (Replacement (..), replaceWindowSurface, requiredInstanceExtensions)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, setWindowSizeCommand)
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
+import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, defaultCaptureConfig)
@@ -140,9 +144,10 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
   , imageUsageColorAttachment
   , presentModeFifo
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), RootOps (..), SwapchainRequest (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), NativeFailure (..), RootOps (..), SwapchainRequest (..))
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
+  , acknowledgedAttachment
   , AttachmentProtocol (..)
   , GraphicsOwner
   , GraphicsOwnerConfig (..)
@@ -233,6 +238,7 @@ data Step
   | AtDestroyDevice
   | AtDestroyMessenger
   | AtDestroyInstance
+  | AtCreateSwapchain
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a scripted step does instead of simply succeeding.
@@ -243,6 +249,15 @@ data Scripted
     -- ^ Raises 'StandInLoss', which this layer classifies as device loss.
   | HoldsUntil !(TVar Bool)
     -- ^ Holds, uninterruptibly as a native call does, until released.
+  | LosesSurface
+    -- ^ Raises 'StandInSurfaceLost', which this layer classifies as the
+    -- surface's loss (VK-14).
+
+-- | @VK_ERROR_SURFACE_LOST_KHR@, as the stand-in raises it.
+newtype StandInSurfaceLost = StandInSurfaceLost Text
+  deriving (Eq, Show)
+
+instance Exception StandInSurfaceLost
 
 newtype StandInFailure = StandInFailure Text
   deriving (Eq, Show)
@@ -286,6 +301,7 @@ step events native at event = do
   case scripted of
     Just Fails → throwIO (StandInFailure (Text.pack (show at)))
     Just Loses → throwIO (StandInLoss (Text.pack (show at)))
+    Just LosesSurface → throwIO (StandInSurfaceLost (Text.pack (show at)))
     _ → pure ()
 
 -- | The stand-in native layer. The instance is 1, the messenger 2 and the
@@ -330,6 +346,7 @@ nativeLayer events native capture =
         step events native AtSupport (SupportQueried surface)
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , opsNativeFailure = \failure → FailedSurfaceLost <$ (fromException failure ∷ Maybe StandInSurfaceLost)
     , -- The stand-in device offers no naming, so nothing is named and its
       -- queue is never asked for.
       opsDeviceHandle = fromIntegral
@@ -358,7 +375,7 @@ nativeLayer events native capture =
           , opsCreateSwapchain = \_ request → do
               handle ← fresh
               let extent = planExtent (requestPlan request)
-              handle <$ record events (SwapchainCreated handle (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
+              handle <$ step events native AtCreateSwapchain (SwapchainCreated handle (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
           , opsSwapchainImages = \_ swapchain → pure [swapchain * 10 + index | index ← [0 .. 2]]
           , opsCreateImageView = \_ _ _ → do
               handle ← fresh
@@ -452,9 +469,17 @@ surfaceBridge events bridge =
         -- The production bridge knows its attachment through its access; the
         -- stand-in learns it from the construction step it wraps.
         cell ← newIORef Nothing
-        let protocol = build (create cell)
+        let protocol = build (\lease → readIORef cell >>= maybe (throwIO (StandInFailure "a surface was created outside a construction step")) (\attachment → create attachment lease))
         answered ← attachWindowGraphics host window protocol {protocolConstruct = \attachment acknowledgement → writeIORef cell (Just attachment) >> protocolConstruct protocol attachment acknowledgement}
         atomically (stateTVar (bridgeRaiseAfterAttach bridge) (\pending → (pending, Nothing))) >>= maybe (pure answered) throwIO
+    , -- The replacement's admission is the GLFW package's own, over the
+      -- seam's loader-aware session and protected host: only the
+      -- acknowledgement's attachment, active, with its window not closing.
+      -- What it creates is the stand-in's.
+      bridgeReplace = \host acknowledgement lease →
+        replaceWindowSurface host acknowledgement (\_ → create (acknowledgedAttachment acknowledgement) lease) >>= \case
+          ReplacementRan created → pure (Right created)
+          ReplacementRefused refusal → pure (Left (Text.pack (show refusal)))
     , bridgeObligations = \lease → Map.elems <$> readTVar (leaseOwed lease)
     , bridgeObligationAttachment = obligationTarget
     , bridgeObligationHandle = obligationSurface
@@ -463,8 +488,7 @@ surfaceBridge events bridge =
     }
   where
     scriptsFor surface = Map.findWithDefault [] surface <$> readTVarIO (bridgeScripts bridge)
-    create cell lease = do
-      attachment ← readIORef cell >>= maybe (throwIO (StandInFailure "a surface was created outside a construction step")) pure
+    create attachment lease = do
       admitted ← atomically $ do
         open ← readTVar (leaseAdmitting lease)
         if open
@@ -551,6 +575,8 @@ data Rig = Rig
     -- refuses a handover's announcement.
   , rigFramebuffer ∷ !(TVar (Int, Int))
     -- ^ What every window's framebuffer size query answers.
+  , rigNudges ∷ !(TVar Natural)
+    -- ^ How many times 'nudgeOwner' has republished an observation.
   }
 
 -- | A rig over one hidden window.
@@ -575,6 +601,11 @@ creationsBegun rig = subtract 100 <$> readTVar (bridgeNext (rigBridge rig))
 visibleRig ∷ IO Rig
 visibleRig = newRigVisible True [hiddenTestWindowConfig "visible" 64 48]
 
+-- | A rig over this many windows the seam reports visible, each with a 640 by
+-- 480 framebuffer.
+visibleRigOf ∷ Int → IO Rig
+visibleRigOf count = newRigVisible True [hiddenTestWindowConfig (Text.pack ("visible " <> show number)) 64 48 | number ← [1 .. count]]
+
 -- | Change what the window's framebuffer size query answers, and resize it
 -- through the host's command port, from the calling thread, so the owner loop
 -- samples and publishes the new framebuffer. The loop must be turning.
@@ -596,12 +627,25 @@ publishObservation host service window = do
   -- with the window's own.
   void (publishGraphicsObservation (vulkanGraphicsOwner host) service (observedRevision observation + 1) observation (windowRenderEligibility observation) Nothing)
 
+-- | Republish the window's unchanged observation at a revision above every
+-- one published so far, which takes the owner a round. A result reported
+-- from another thread wakes nothing, so an example that reports one — as an
+-- acquisition or a presentation on the owner's thread would — nudges the
+-- owner this way.
+nudgeOwner ∷ Rig → VulkanHost Scene → GraphicsService → WindowId → IO ()
+nudgeOwner rig host service window = do
+  client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
+  observation ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+  bump ← atomically (stateTVar (rigNudges rig) (\held → (held + 1, held + 1)))
+  void (publishGraphicsObservation (vulkanGraphicsOwner host) service (observedRevision observation + 1 + bump * 1000) observation (windowRenderEligibility observation) Nothing)
+
 newRigWith ∷ [WindowConfig] → IO Rig
 newRigWith = newRigVisible False
 
 newRigVisible ∷ Bool → [WindowConfig] → IO Rig
 newRigVisible visible windows = do
   framebuffer ← newTVarIO (640, 480)
+  nudges ← newTVarIO 0
   events ← newTVarIO []
   owner ← newTVarIO Nothing
   posts ← newTVarIO (0 ∷ Int)
@@ -646,6 +690,7 @@ newRigVisible visible windows = do
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
       , rigFramebuffer = framebuffer
+      , rigNudges = nudges
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound

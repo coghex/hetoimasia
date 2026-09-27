@@ -41,9 +41,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
 
     -- * The generations
   , Generations (..)
-  , newGenerations
-  , newGenerationsCapturing
-  , newGenerationsHooked
+  , makeGenerations
   , settlingPeriod
   , trackTarget
 
@@ -145,8 +143,17 @@ data TargetCondition
   | RecoveryWaiting !Instant
     -- ^ The model's episode admits the next attempt at this instant.
   | RecoverySpent
-    -- ^ The episode is spent; the model escalated through the target's
-    -- designation.
+    -- ^ The episode is spent, or the session's device cannot present to the
+    -- surface recovery replaced; the model escalated through the target's
+    -- designation. Its retired generations still go as their holds end.
+  | SurfaceLost
+    -- ^ The target's surface was lost (VK-14). Its active generation is
+    -- retired, nothing is acquired, and once every generation of it has been
+    -- destroyed the surface is released and a replacement asked for, as a
+    -- recovery attempt of the target's episode.
+  | SurfaceReplacing
+    -- ^ A recovery attempt the episode admitted is waiting for a replacement
+    -- surface on the same window.
   | PresentationUnsupported ![PresentationGap]
     -- ^ A structured target failure: the surface cannot serve the profile.
   | Closing
@@ -156,6 +163,9 @@ data TargetCondition
 data SwapchainResult
   = SwapchainOutOfDate
   | SwapchainSuboptimal
+  | SwapchainSurfaceLost
+    -- ^ @VK_ERROR_SURFACE_LOST_KHR@: the surface itself must be replaced
+    -- (VK-14), which outranks any other result.
   deriving (Eq, Show)
 
 data TargetRecord = TargetRecord
@@ -169,8 +179,8 @@ data TargetRecord = TargetRecord
     -- was planned from, and since when both have been what they are.
   , recordResult ∷ !(Maybe SwapchainResult)
   , recordResultUnseen ∷ !Bool
-    -- ^ A result was reported since the target's last reconciliation, so a
-    -- step is owed at once.
+    -- ^ A result was reported, or a replacement surface installed, since the
+    -- target's last reconciliation, so a step is owed at once.
   , recordLastPlanned ∷ !(Maybe (SurfaceExtent, TargetGeometry))
     -- ^ The extent and observed geometry of the last construction begun.
   , recordFailed ∷ !Bool
@@ -178,6 +188,9 @@ data TargetRecord = TargetRecord
   , recordRecovering ∷ !Bool
     -- ^ A recovery attempt the model admitted is outstanding.
   , recordConstructions ∷ !Natural
+  , recordSurfaceLost ∷ !Bool
+    -- ^ The surface 'recordSurface' names was lost (VK-14): nothing is planned
+    -- or built on it, and it is released and replaced.
   }
 
 -- | The generations of one session's targets, over its roots.
@@ -194,19 +207,11 @@ data Generations q inst msgr phys dev = Generations
     -- in turn.
   }
 
-newGenerations ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerations = newGenerationsHooked (\_ → pure ())
-
--- | 'newGenerations' whose every plan also asks for transfer-source usage
--- where the surface offers it ('CaptureWhenOffered'), so a verification can
--- read its images back. No normal target is built this way.
-newGenerationsCapturing ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerationsCapturing roots = (\targets → Generations roots targets (\_ → pure ()) CaptureWhenOffered) <$> newTVarIO Map.empty <*> newTVarIO 0
-
--- | 'newGenerations' with the examples' seam, which runs right after the model
--- admits each candidate. Nothing in production sets it.
-newGenerationsHooked ∷ (GenerationId → IO ()) → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerationsHooked hook roots = (\targets → Generations roots targets hook WithoutCapture) <$> newTVarIO Map.empty <*> newTVarIO 0
+-- | The generations' state, with the examples' seam and the capture usage.
+-- The public constructors are "Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal"'s,
+-- which also register the generations' disposer with the roots.
+makeGenerations ∷ (GenerationId → IO ()) → CaptureUsage → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+makeGenerations hook capture roots = (\targets → Generations roots targets hook capture) <$> newTVarIO Map.empty <*> newTVarIO 0
 
 -- | How long the geometry a replacement would be built from must stay the
 -- same before it is built: 16 ms.
@@ -234,6 +239,7 @@ trackTarget generations target classification surface =
         , recordFailed = False
         , recordRecovering = False
         , recordConstructions = 0
+        , recordSurfaceLost = False
         }
 
 -- ---------------------------------------------------------------------------

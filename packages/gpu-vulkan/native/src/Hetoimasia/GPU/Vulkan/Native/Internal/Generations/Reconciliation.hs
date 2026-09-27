@@ -7,6 +7,16 @@
 -- constructs, names and publishes a candidate, handing the active generation
 -- over as @oldSwapchain@ only when the creation that passes it is called.
 --
+-- A lost surface (VK-14) — reported by a swapchain call, or raised by the
+-- surface's query or a swapchain's creation — retires the active generation and
+-- marks the surface lost; nothing is planned or built on it again, and
+-- "Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface" replaces it. A
+-- swapchain or view creation that raised out of memory created nothing, so it
+-- is recovered as an allocation ("Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation"):
+-- one reclamation pass, and the one call again only if the pass disposed of
+-- something — never after the creation handed the active generation over as
+-- @oldSwapchain@, which that call retired whatever it answered.
+--
 -- Admission through a construction's settlement is one masked region, and each
 -- native effect is recorded in the same masked step that made it. A creation a
 -- cancellation interrupted inside its call leaves its candidate uncertain and
@@ -67,11 +77,13 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Budget (imageTrackingLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, ImageId, TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal (disposeEligible)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationEffectUncertain (..)
   , GenerationStanding (..)
   , Generations (..)
   , NativeGeneration (..)
+  , SwapchainResult (..)
   , TargetCondition (..)
   , TargetRecord (..)
   , editGeneration
@@ -86,6 +98,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
   , GraphicsDeviceLost
+  , NativeFailure (..)
   , SwapchainRequest (..)
   , failRootsSession
   , nameRootsObject
@@ -93,6 +106,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsInstrumentation
   , rootsCall
   , rootsGenerationOps
+  , rootsNativeFailure
   , stateRootsModel
   )
 
@@ -109,6 +123,10 @@ reconcile generations now target geometry = do
     Nothing → pure Nothing
     Just (record, view)
       | viewTargetPhase view `elem` [TargetRetiring, TargetUnavailable] → pure Nothing
+      -- A lost surface is the surface recovery's: nothing is planned or built
+      -- on it.
+      | recordSurfaceLost record → pure Nothing
+      | recordResult record == Just SwapchainSurfaceLost → Nothing <$ loseSurface
       | otherwise → case recordCondition record of
           RecoverySpent → pure Nothing
           PresentationUnsupported _ → pure Nothing
@@ -140,15 +158,19 @@ reconcile generations now target geometry = do
     plan record active reported =
       readDevice >>= \case
         Nothing → pure Nothing
-        Just (devicePlan, _) → do
-          offer ← rootsCall roots "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" (opsSurfaceOffer ops (planDevice devicePlan) (recordSurface record))
-          limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
-          case planGenerationWith (generationsCapture generations) limit geometry offer of
-            PlanSuspended suspension → Nothing <$ suspend suspension
-            PlanUnsupported gaps → do
-              atomically (modelEdit_ (suspendTarget target))
-              Nothing <$ setCondition (PresentationUnsupported gaps)
-            Planned planned → classify record active reported planned
+        Just (devicePlan, _) →
+          tryWithContext (rootsCall roots "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" (opsSurfaceOffer ops (planDevice devicePlan) (recordSurface record))) >>= \case
+            Left failure@(ExceptionWithContext _ exception)
+              | rootsNativeFailure roots exception == Just FailedSurfaceLost → Nothing <$ loseSurface
+              | otherwise → rethrowIO failure
+            Right offer → do
+              limit ← imageTrackingLimit . modelBudgets <$> atomically (stateRootsModel roots (\model → (model, model)))
+              case planGenerationWith (generationsCapture generations) limit geometry offer of
+                PlanSuspended suspension → Nothing <$ suspend suspension
+                PlanUnsupported gaps → do
+                  atomically (modelEdit_ (suspendTarget target))
+                  Nothing <$ setCondition (PresentationUnsupported gaps)
+                Planned planned → classify record active reported planned
     classify record active reported planned
       -- A retry after a failed construction is a recovery attempt. If the
       -- geometry has moved since that construction was planned, it waits for
@@ -334,7 +356,7 @@ reconcile generations now target geometry = do
             for_ handing $ \(previous, _) →
               atomically (editGeneration generations previous (\entry → entry {genHandedOver = True}))
             swapchain ←
-              creating "vkCreateSwapchainKHR" (opsCreateSwapchain ops device request) $ \created →
+              creating "vkCreateSwapchainKHR" (recoveringCreation roots "vkCreateSwapchainKHR" (fst <$> handing) (opsCreateSwapchain ops device request)) $ \created →
                 editGeneration generations candidate (\entry → entry {genSwapchain = Just created})
             name ObjectSwapchain swapchain (swapchainName candidate)
             allowInterrupt
@@ -348,7 +370,7 @@ reconcile generations now target geometry = do
                 forM_ (zip [0 ..] images) $ \(index, image) → do
                   name ObjectImage image (swapchainImageName candidate index)
                   view ←
-                    creating "vkCreateImageView" (opsCreateImageView ops device image (surfaceFormat (planFormat planned))) $ \created →
+                    creating "vkCreateImageView" (recoveringCreation roots "vkCreateImageView" Nothing (opsCreateImageView ops device image (surfaceFormat (planFormat planned)))) $ \created →
                       editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [created]})
                   name ObjectImageView view (imageViewName candidate index)
                   allowInterrupt
@@ -368,6 +390,9 @@ reconcile generations now target geometry = do
                   rethrowIO failure
                 _ → do
                   failed candidate (Text.pack (displayException exception))
+                  -- A creation that answered the surface lost has lost it for
+                  -- every later construction too: the surface is replaced.
+                  when (rootsNativeFailure roots exception == Just FailedSurfaceLost) loseSurface
                   if isAsynchronous exception then rethrowIO failure else rethrowUnlessOrdinary failure
     -- Device loss was latched by the call that raised it and is the owner's
     -- failure; any other failure is this construction's, and is settled.
@@ -423,6 +448,27 @@ reconcile generations now target geometry = do
               maybe False ((== TargetUnavailable) . viewTargetPhase) (targetView target model)
                 || sessionState model == SessionFailed RequiredTargetUnrecoverable
         when spent (modifyRecord (\entry → entry {recordCondition = RecoverySpent}))
+    -- The surface is lost: the active generation is retired — nothing is
+    -- acquired from it again, and it goes once its holds end — and nothing more
+    -- is planned or built on the surface. A target whose episode was spent by
+    -- the construction that found the loss stays spent.
+    loseSurface = atomically $ do
+      record ← lookupRecord
+      for_ record $ \entry → do
+        for_ (recordActive entry) $ \generation → do
+          modelEdit_ (retireGeneration generation)
+          editGeneration generations generation (\native → native {genStanding = GenerationRetiredHeld})
+          retireCpu generation
+        modifyRecord $ \held →
+          held
+            { recordActive = Nothing
+            , recordSurfaceLost = True
+            , recordResult = Nothing
+            , recordResultUnseen = True
+            , recordSettling = Nothing
+            , recordFailed = False
+            , recordCondition = if recordCondition held == RecoverySpent then RecoverySpent else SurfaceLost
+            }
     uncertain candidate reason = atomically $ do
       editGeneration generations candidate (\entry → entry {genStanding = GenerationUncertain reason})
       failRootsSession roots CleanupFailed

@@ -202,6 +202,10 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , BatchInvalidationFailed (..)
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
+
+    -- * Allocation recovery (VK-14)
+  , AllocationNotRecovered (..)
+  , RecoveryEnd (..)
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (discardBatch, noteBatchSubmitted, resetFrameRecorder)
@@ -213,7 +217,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , releaseManaged
   , replacePipeline
   )
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResources, retireRecording)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResources, newRecording, retireRecording)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( ClearColor (..)
   , ImageLayout (..)
@@ -256,7 +261,6 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
-  , newRecording
   , readBatch
   , readBatches
   , readManaged

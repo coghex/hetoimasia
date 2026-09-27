@@ -92,6 +92,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , beginTargetRecovery
   , recordRecoveryFailure
   , recordRecoverySuccess
+  , declareTargetUnrecoverable
 
     -- * Allocation attempts
   , beginAllocation
@@ -2628,6 +2629,26 @@ exhaustTarget number target model = case targetClassOf target of
         , escalation
         )
 
+
+-- | Declare that this target cannot be recovered at all, whatever its episode
+-- has left: the session's one device can no longer present to what the target
+-- would be rebuilt on, and no second device is ever made. It is disposed of
+-- exactly as a spent episode is — an optional target unavailable while the
+-- session continues, a required one failing the session — and answers the
+-- escalation, or 'Nothing' when close already won, the target is already
+-- unavailable, or the session has already failed, since then there is nothing
+-- left for it to decide.
+--
+-- It settles no attempt: an attempt still outstanding is reported first, with
+-- 'recordRecoveryFailure', whose last failure may already have exhausted the
+-- target.
+declareTargetUnrecoverable ∷ TargetId → GpuModel → Outcome (GpuModel, Maybe Escalation)
+declareTargetUnrecoverable identity model =
+  scheduling model $
+  resolved (resolveTarget model identity) $ \(number, target) →
+    if stillRecovering model target
+      then let (next, escalation) = exhaustTarget number target model in Admitted (next, Just escalation)
+      else Admitted (model, Nothing)
 
 -- | Record that the attempt just made succeeded. It settles the attempt so the
 -- episode can admit another later; it does not give the spent attempt back,

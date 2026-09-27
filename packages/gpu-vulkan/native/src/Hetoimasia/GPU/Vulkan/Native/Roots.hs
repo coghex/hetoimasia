@@ -102,6 +102,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
     RootOps (..)
   , GenerationOps (..)
   , SwapchainRequest (..)
+  , NativeFailure (..)
 
     -- * The roots
   , Roots
@@ -118,6 +119,10 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , SurfaceDestruction (..)
   , admitRootTarget
   , retireRootTarget
+  , releaseRootSurface
+  , installRootSurface
+  , rootSurfaceHeld
+  , SurfaceStillHeld (..)
   , RootsNotStarted (..)
   , UnknownRootTarget (..)
   , SurfaceDestructionFailed (..)
@@ -149,9 +154,15 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsInstrumentation
   , nameRootsObject
   , rootsGenerationOps
+  , rootsNativeFailure
   , rootsCall
   , stateRootsModel
   , failRootsSession
+
+    -- * Reclamation (VK-14)
+  , SubjectDisposer (..)
+  , registerRootsDisposer
+  , readRootsDisposers
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
@@ -178,10 +189,12 @@ import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
-  ( GpuModel
+  ( DisposalResult
+  , GpuModel
   , Outcome (..)
   , SessionFailureCause (..)
-  , TargetView (viewTargetGenerations)
+  , TargetPhase (TargetRetiring, TargetUnavailable)
+  , TargetView (viewTargetGenerations, viewTargetPhase)
   , admitTarget
   , closeTarget
   , escalateSession
@@ -191,7 +204,7 @@ import Hetoimasia.GPU.Model
   , targetView
   )
 import Hetoimasia.GPU.Model.Budget (Budgets)
-import Hetoimasia.GPU.Model.Identity (DeviceId, SessionIdentity, TargetClass, TargetId, sessionIdentity)
+import Hetoimasia.GPU.Model.Identity (DeviceId, HoldSubject, SessionIdentity, TargetClass, TargetId, sessionIdentity)
 import Data.ByteString (ByteString)
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( Instrumentation (..)
@@ -245,6 +258,10 @@ data RootOps q inst msgr phys dev = RootOps
     -- ^ Whether that queue family of that device presents to that surface.
   , opsDeviceLoss ∷ SomeException → Bool
     -- ^ Whether a failure one of these calls raised is the loss of the device.
+  , opsNativeFailure ∷ SomeException → Maybe NativeFailure
+    -- ^ Which of the results recovery acts on a failure one of these calls
+    -- raised was, if any (VK-14). Device loss is 'opsDeviceLoss''s, never
+    -- this.
   , opsDeviceHandle ∷ dev → Word64
     -- ^ The device's dispatchable handle, as its pointer's value.
   , opsDeviceQueue ∷ dev → Word32 → IO Word64
@@ -276,6 +293,20 @@ data GenerationOps phys dev = GenerationOps
   , opsDestroyImageView ∷ dev → Word64 → IO ()
   , opsDestroySwapchain ∷ dev → Word64 → IO ()
   }
+
+-- | A native result recovery acts on, as the layer classifies a failure a call
+-- raised.
+data NativeFailure
+  = FailedOutOfMemory
+    -- ^ @VK_ERROR_OUT_OF_HOST_MEMORY@ or @VK_ERROR_OUT_OF_DEVICE_MEMORY@. Only
+    -- the operation that raised it knows whether it had any effect.
+  | FailedSurfaceLost
+    -- ^ @VK_ERROR_SURFACE_LOST_KHR@: the target's surface is unusable, and
+    -- recovering it needs a new one on the same window.
+  | FailedNativeWindowInUse
+    -- ^ @VK_ERROR_NATIVE_WINDOW_IN_USE_KHR@: a swapchain Vulkan still counts
+    -- as the window's is in the way.
+  deriving (Eq, Ord, Show)
 
 -- | One swapchain creation: the surface, the plan, the session's queue family,
 -- and the active generation's swapchain being handed over, if any.
@@ -338,8 +369,26 @@ data TargetSurface = TargetSurface
 data TargetRecord = TargetRecord
   { recordClass ∷ !TargetClass
   , recordSurface ∷ !Word64
-  , recordDestroy ∷ IO SurfaceDestruction
+    -- ^ The surface held, or the last one when none is ('recordDestroy').
+  , recordDestroy ∷ !(Maybe (IO SurfaceDestruction))
+    -- ^ How the surface held is destroyed; 'Nothing' once recovery released a
+    -- lost one ('releaseRootSurface') and until a replacement is installed.
   , recordUncertain ∷ !(Maybe Text)
+  }
+
+-- | How a layer above the roots disposes of the subjects it owns, for a
+-- reclamation pass (VK-14): the roots know no generation's or managed
+-- resource's native objects, and each layer registers what destroys its own.
+data SubjectDisposer = SubjectDisposer
+  { disposerDispose ∷ HoldSubject → IO (Maybe DisposalResult)
+    -- ^ Destroy the subject natively, on the owner's thread, if it is this
+    -- layer's and every native object above it allows it now, answering what
+    -- the destruction did; 'Nothing', having made no call, otherwise. A
+    -- destruction and the record of it are one masked step, as the layer's
+    -- own disposal makes them.
+  , disposerForget ∷ [HoldSubject] → STM ()
+    -- ^ Forget the native records of subjects the model has recorded as
+    -- disposed, in the transaction that recorded them.
   }
 
 -- | One graphics session's roots.
@@ -358,6 +407,9 @@ data Roots q inst msgr phys dev = Roots
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
     -- ^ Whether the device and its queue have been named.
+  , rootsDisposers ∷ !(TVar [SubjectDisposer])
+    -- ^ What each layer above disposes of its own subjects with, registered
+    -- as the layer is made.
   , rootsSession ∷ !SessionIdentity
   , rootsDeviceIdentity ∷ !DeviceId
   }
@@ -383,6 +435,7 @@ newRoots ops budgets clock = do
     <*> newTVarIO Nothing
     <*> newTVarIO False
     <*> newTVarIO False
+    <*> newTVarIO []
     <*> pure session
     <*> pure device
 
@@ -438,6 +491,12 @@ data SurfaceDestructionFailed = SurfaceDestructionFailed !TargetId !Text
 instance Exception SurfaceDestructionFailed where
   displayException (SurfaceDestructionFailed target reason) =
     "destroying the surface of " <> show target <> " did not complete: " <> Text.unpack reason
+
+-- | A replacement surface was offered for a target that still holds one.
+newtype SurfaceStillHeld = SurfaceStillHeld TargetId
+  deriving (Eq, Show)
+
+instance Exception SurfaceStillHeld
 
 -- | A target's surface was not destroyed because the model still holds
 -- swapchain generations of that target: they are the surface's children, and
@@ -578,7 +637,7 @@ admitRootTarget roots classification surface = do
                 | admitted == target → do
                     writeTVar (rootsModel roots) next
                     modifyTVar' (rootsTargets roots) $
-                      Map.insert target (TargetRecord classification handle (targetSurfaceDestroy surface) Nothing)
+                      Map.insert target (TargetRecord classification handle (Just (targetSurfaceDestroy surface)) Nothing)
                     pure (Just (Right target))
                 | otherwise → pure Nothing
               Backpressure kind → pure (Just (Left (TargetBudgetExhausted kind)))
@@ -631,27 +690,118 @@ retireRootTarget roots target =
         -- Read before the destruction, so nothing that can fail stands
         -- between a destruction that returned and its record.
         now ← readInstant (rootsClock roots)
+        let forget = atomically $ do
+              modifyTVar' (rootsTargets roots) (Map.delete target)
+              modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
+                -- The model forgets a retiring target with nothing left at
+                -- its next progress turn, which frees its record for a later
+                -- one.
+                Admitted closed → fst (runProgressTurn silentEvidence now closed)
+                _ → model
+        case recordDestroy record of
+          -- Recovery already destroyed the lost surface, and nothing replaced
+          -- it: there is nothing left to destroy.
+          Nothing → forget
+          Just destroy →
+            mask_ $
+              tryWithContext destroy >>= \case
+                Right SurfaceDestroyed → forget
+                Right (SurfaceDestructionUncertain failure) → settleUncertain roots target False failure
+                Left failure → settleUncertain roots target False failure
+
+-- | Record a surface destruction that did not complete as uncertain, never to be
+-- attempted again, and raise 'SurfaceDestructionFailed' — or re-raise the
+-- cancellation that ended it. Recovery's destruction also fails the session:
+-- a cleanup failure is never permission to try again.
+settleUncertain ∷ Roots q inst msgr phys dev → TargetId → Bool → ExceptionWithContext SomeException → IO a
+settleUncertain roots target failing failure@(ExceptionWithContext _ exception) = do
+  let reason = Text.pack (displayException exception)
+  atomically $ do
+    modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
+    when failing (failRootsSession roots CleanupFailed)
+  if isAsynchronous exception
+    then rethrowIO failure
+    else throwIO (SurfaceDestructionFailed target reason)
+
+-- | Destroy a target's lost surface and keep the target, so a replacement can
+-- be installed on the same window (VK-14).
+--
+-- It is refused, with 'TargetGenerationsRemain', while the model holds any
+-- swapchain generation of the target: they are the surface's children and go
+-- first. The destruction runs once, masked with its record, as
+-- 'retireRootTarget''s does; one that did not complete is uncertain, retained
+-- with the device and the instance above it, never attempted again, and fails
+-- the session with 'CleanupFailed' before 'SurfaceDestructionFailed' is
+-- raised. A surface already released is released: nothing is called.
+releaseRootSurface ∷ Roots q inst msgr phys dev → TargetId → IO ()
+releaseRootSurface roots target =
+  readTVarIO (rootsTargets roots) >>= \records → case Map.lookup target records of
+    Nothing → throwIO (UnknownRootTarget target)
+    Just record → case (recordUncertain record, recordDestroy record) of
+      (Just reason, _) → throwIO (SurfaceDestructionFailed target reason)
+      (Nothing, Nothing) → pure ()
+      (Nothing, Just destroy) → do
+        remaining ← atomically (maybe 0 viewTargetGenerations . targetView target <$> readTVar (rootsModel roots))
+        when (remaining > 0) (throwIO (TargetGenerationsRemain target remaining))
         mask_ $
-          tryWithContext (recordDestroy record) >>= \case
+          tryWithContext destroy >>= \case
             Right SurfaceDestroyed →
-              atomically $ do
-                modifyTVar' (rootsTargets roots) (Map.delete target)
-                modifyTVar' (rootsModel roots) $ \model → case closeTarget target model of
-                  -- The model forgets a retiring target with nothing left at
-                  -- its next progress turn, which frees its record for a later
-                  -- one.
-                  Admitted closed → fst (runProgressTurn silentEvidence now closed)
-                  _ → model
-            Right (SurfaceDestructionUncertain failure) → settleUncertain failure
-            Left failure → settleUncertain failure
+              atomically (modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordDestroy = Nothing}) target))
+            Right (SurfaceDestructionUncertain failure) → settleUncertain roots target True failure
+            Left failure → settleUncertain roots target True failure
+
+-- | Install a replacement surface for a target whose lost surface was released,
+-- once the session's device can still present to it (VK-14).
+--
+-- The surface is checked against the session's one queue family with
+-- @vkGetPhysicalDeviceSurfaceSupportKHR@, as a later target's is at
+-- admission; one it cannot present to is refused with
+-- 'TargetSurfaceUnsupported', and no second device or queue is ever made. A
+-- target that has begun retiring, or is unavailable, and roots that admit
+-- nothing more refuse it with 'TargetAdmissionClosed': close wins over a late
+-- replacement. On 'Right' the roots own the surface and destroy it as the
+-- target's; on 'Left', or a raise, it is still its creator's. A target that
+-- still holds a surface raises 'SurfaceStillHeld'.
+installRootSurface ∷ Roots q inst msgr phys dev → TargetId → TargetSurface → IO (Either TargetRejection ())
+installRootSurface roots target surface = do
+  open ← atomically ((&&) <$> readTVar (rootsAdmitting roots) <*> (not . isJust <$> readTVar (rootsLoss roots)))
+  records ← readTVarIO (rootsTargets roots)
+  case Map.lookup target records of
+    Nothing → throwIO (UnknownRootTarget target)
+    Just record
+      | isJust (recordDestroy record) → throwIO (SurfaceStillHeld target)
+      | not open || isJust (recordUncertain record) → pure (Left TargetAdmissionClosed)
+      | otherwise → do
+          closing ← atomically (retiringTarget <$> readTVar (rootsModel roots))
+          (instanceRoot, device) ← atomically ((,) <$> readTVar (rootsInstance roots) <*> readTVar (rootsDevice roots))
+          case (instanceRoot, device) of
+            _ | closing → pure (Left TargetAdmissionClosed)
+            (Live created, Live selected) → do
+              let plan = selectedPlan selected
+              supported ←
+                guarded roots "vkGetPhysicalDeviceSurfaceSupportKHR" $
+                  opsSurfaceSupport (rootsOps roots) created (planDevice plan) (planQueueFamily plan) handle
+              if not supported
+                then pure (Left (TargetSurfaceUnsupported (planQueueFamily plan)))
+                else do
+                  instrumented ← readRootsInstrumentation roots
+                  for_ instrumented $ \(_, instrumentation) →
+                    nameRootsObject roots instrumentation ObjectSurface handle (surfaceName target)
+                  atomically $ do
+                    model ← readTVar (rootsModel roots)
+                    held ← Map.lookup target <$> readTVar (rootsTargets roots)
+                    case held of
+                      Just current
+                        | not (retiringTarget model)
+                        , Nothing ← recordDestroy current → do
+                            modifyTVar' (rootsTargets roots) $
+                              Map.insert target current {recordSurface = handle, recordDestroy = Just (targetSurfaceDestroy surface)}
+                            pure (Right ())
+                      _ → pure (Left TargetAdmissionClosed)
+            _ → pure (Left TargetAdmissionClosed)
   where
-    settleUncertain failure@(ExceptionWithContext _ exception) = do
-      let reason = Text.pack (displayException exception)
-      atomically $
-        modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
-      if isAsynchronous exception
-        then rethrowIO failure
-        else throwIO (SurfaceDestructionFailed target reason)
+    handle = targetSurfaceHandle surface
+    retiringTarget model = maybe True ((`elem` [TargetRetiring, TargetUnavailable]) . viewTargetPhase) (targetView target model)
 
 -- ---------------------------------------------------------------------------
 -- Device loss
@@ -859,6 +1009,11 @@ nameRootsObject roots instrumentation kind handle name =
 rootsGenerationOps ∷ Roots q inst msgr phys dev → GenerationOps phys dev
 rootsGenerationOps = opsGenerations . rootsOps
 
+-- | Which result recovery acts on a failure a native call raised was, as the
+-- roots' native layer classifies it.
+rootsNativeFailure ∷ Roots q inst msgr phys dev → SomeException → Maybe NativeFailure
+rootsNativeFailure = opsNativeFailure . rootsOps
+
 -- | Run one native call against the roots' device, latching device loss if
 -- that is what it raised, exactly as the roots' own calls are run.
 rootsCall ∷ Roots q inst msgr phys dev → Text → IO a → IO a
@@ -883,3 +1038,17 @@ readRootsInstance roots =
   readTVar (rootsInstance roots) >>= \case
     Live created → pure (Just created)
     _ → pure Nothing
+
+-- | Register what disposes of one layer's subjects in a reclamation pass.
+registerRootsDisposer ∷ Roots q inst msgr phys dev → SubjectDisposer → STM ()
+registerRootsDisposer roots disposer = modifyTVar' (rootsDisposers roots) (<> [disposer])
+
+-- | Every layer's disposer, in the order they were registered.
+readRootsDisposers ∷ Roots q inst msgr phys dev → STM [SubjectDisposer]
+readRootsDisposers = readTVar . rootsDisposers
+
+-- | Whether the target holds a live surface: 'False' once recovery released a
+-- lost one, until a replacement is installed, and for a target these roots do
+-- not hold.
+rootSurfaceHeld ∷ Roots q inst msgr phys dev → TargetId → STM Bool
+rootSurfaceHeld roots target = maybe False (isJust . recordDestroy) . Map.lookup target <$> readTVar (rootsTargets roots)

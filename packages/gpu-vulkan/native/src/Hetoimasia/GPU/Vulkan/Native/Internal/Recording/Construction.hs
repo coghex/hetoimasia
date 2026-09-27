@@ -22,7 +22,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', readTVarIO)
-import Control.Exception (SomeException, mask_, rethrowIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
+import qualified Data.Text as Text
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
@@ -66,11 +67,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , destroyNative
   , editManaged
+  , isAsynchronous
   , liveNative
   , modelAnswer
   , modelEdit
   , owned
   )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation)
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
   , ShaderStage
@@ -84,10 +87,12 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( nameRootsObject
+  ( NativeFailure (..)
+  , nameRootsObject
   , readRootsDevice
   , readRootsInstrumentation
   , rootsCall
+  , rootsNativeFailure
   , rootsSessionIdentity
   , stateRootsModel
   )
@@ -242,36 +247,46 @@ construct recording bytes objects name create replacing =
                           _ → Nothing
                       , model
                       )
-                tryWithContext @SomeException (rootsCall roots name (create (recordingOps recording) device issued)) >>= \case
-                  Left failure → do
-                    atomically $ do
+                let creation = rootsCall roots name (create (recordingOps recording) device issued)
+                    abandoned = atomically $ do
                       modelEdit roots (recordAllocationFailure allocation)
                       modelEdit roots (abandonAllocation allocation)
-                    rethrowIO failure
-                  Right native → do
-                    committed ← atomically $ do
-                      answer ← case replacing of
-                        Nothing → modelAnswer roots (createResource allocation)
-                        Just old → modelAnswer roots (rebuildResource old allocation)
-                      case answer of
-                        Right resource → do
-                          modifyTVar' (recordingManaged recording) (Map.insert resource (ManagedRecord native ManagedLive))
-                          for_ replacing $ \old → do
-                            -- The rebuild released the old generation; its CPU
-                            -- use ends with it, since no handle may record it.
-                            modelEdit roots (endResourceCpuUse old)
-                            editManaged recording old (\entry → entry {managedStanding = ManagedReplaced resource})
-                          pure (Right resource)
-                        Left refusal → do
-                          modelEdit roots (abandonAllocation allocation)
-                          pure (Left refusal)
-                    case committed of
-                      Right resource → nameManaged recording resource native
-                      Left refusal → do
-                        -- The model refused to record what now exists, so
-                        -- nothing can reference it: destroy it at once.
-                        destroyNative recording device native
-                        pure (Left refusal)
+                native ← tryWithContext @SomeException creation >>= \case
+                  -- A creation that raised created nothing, so its rollback is
+                  -- complete: out of memory is recovered as an allocation, with
+                  -- one reclamation pass and the creation once more only if the
+                  -- model permits the attempt's retry (VK-14). Nothing else is.
+                  Left (ExceptionWithContext _ exception)
+                    | not (isAsynchronous exception)
+                    , rootsNativeFailure roots exception == Just FailedOutOfMemory →
+                        recoverAllocation roots name allocation Nothing (Text.pack (displayException exception)) (failingAgain creation) >>= \case
+                          Right native → pure native
+                          Left notRecovered → abandoned >> throwIO notRecovered
+                  Left failure → abandoned >> rethrowIO failure
+                  Right native → pure native
+                committed ← atomically $ do
+                  answer ← case replacing of
+                    Nothing → modelAnswer roots (createResource allocation)
+                    Just old → modelAnswer roots (rebuildResource old allocation)
+                  case answer of
+                    Right resource → do
+                      modifyTVar' (recordingManaged recording) (Map.insert resource (ManagedRecord native ManagedLive))
+                      for_ replacing $ \old → do
+                        -- The rebuild released the old generation; its CPU
+                        -- use ends with it, since no handle may record it.
+                        modelEdit roots (endResourceCpuUse old)
+                        editManaged recording old (\entry → entry {managedStanding = ManagedReplaced resource})
+                      pure (Right resource)
+                    Left refusal → do
+                      modelEdit roots (abandonAllocation allocation)
+                      pure (Left refusal)
+                case committed of
+                  Right resource → nameManaged recording resource native
+                  Left refusal → do
+                    -- The model refused to record what now exists, so
+                    -- nothing can reference it: destroy it at once.
+                    destroyNative recording device native
+                    pure (Left refusal)
   where
     roots = recordingRoots recording
 

@@ -21,6 +21,7 @@ module Test.GPU.Vulkan.Native.StandIn
   , standInDevice
   , StandInFailure (..)
   , StandInLoss (..)
+  , StandInResult (..)
 
     -- * Naming
   , offerNaming
@@ -56,6 +57,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Hetoimasia.Foundation.Time (scriptedInstant, scriptedSource, zeroDuration)
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), Budgets, defaultBudgetRequest, validateBudgets)
@@ -79,6 +81,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), NativeObjectKi
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
+  , NativeFailure (..)
   , RootOps (..)
   , Roots
   , SwapchainRequest (..)
@@ -148,6 +151,13 @@ data Scripted
   | WaitsInterruptibly !(TVar Bool)
     -- ^ Blocks, interruptibly, until the variable is true, then succeeds — so
     -- a cancellation can end the call part-way, leaving its outcome unknown.
+  | Answers !NativeFailure
+    -- ^ Raises 'StandInResult' with this result every time, which the
+    -- stand-in classifies as that native result (VK-14).
+  | AnswersOnce !NativeFailure
+    -- ^ The same, once; the step then succeeds again.
+  | AnswersOnceAfter !Int !NativeFailure
+    -- ^ Succeeds this many more times, then behaves as 'AnswersOnce'.
 
 newtype StandInFailure = StandInFailure Step
   deriving (Eq, Show)
@@ -158,6 +168,13 @@ newtype StandInLoss = StandInLoss Step
   deriving (Eq, Show)
 
 instance Exception StandInLoss
+
+-- | A native result recovery acts on, raised at a step — named, so another
+-- layer's stand-in can raise it too.
+data StandInResult = StandInResult !Text !NativeFailure
+  deriving (Eq, Show)
+
+instance Exception StandInResult
 
 data StandIn = StandIn
   { standCalls ∷ !(TVar [Call])
@@ -297,6 +314,10 @@ step standIn at call = do
       Just (SucceedsThenFails remaining)
         | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (SucceedsThenFails (remaining - 1)))
         | otherwise → pure (Just Fails)
+      Just (AnswersOnce result) → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.delete at)
+      Just (AnswersOnceAfter remaining result)
+        | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (AnswersOnceAfter (remaining - 1) result))
+        | otherwise → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.delete at)
       other → pure other
   case scripted of
     Nothing → pure ()
@@ -307,6 +328,9 @@ step standIn at call = do
     -- cancellation aimed at its thread meanwhile is delivered once it returns.
     Just (HoldsUntil gate) → uninterruptibleMask_ (atomically (readTVar gate >>= check))
     Just (WaitsInterruptibly gate) → atomically (readTVar gate >>= check)
+    Just (Answers result) → throwIO (StandInResult (Text.pack (show at)) result)
+    Just (AnswersOnce result) → throwIO (StandInResult (Text.pack (show at)) result)
+    Just (AnswersOnceAfter _ result) → throwIO (StandInResult (Text.pack (show at)) result)
 
 -- | The stand-in's native layer. Handles are numbers: the instance is 1, the
 -- messenger 2 and the device 3; a surface is whatever number it was made with.
@@ -347,6 +371,7 @@ standInOps standIn =
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
+    , opsNativeFailure = \failure → (\(StandInResult _ result) → result) <$> fromException failure
     , opsDeviceHandle = fromIntegral
     , opsDeviceQueue = \_ family → 4 <$ record standIn (QueriedQueue family)
     , opsInstrumentation = \_ → do

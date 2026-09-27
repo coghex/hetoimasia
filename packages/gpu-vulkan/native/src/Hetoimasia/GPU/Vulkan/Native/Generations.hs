@@ -177,6 +177,11 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , useGeneration
   , endGenerationUse
 
+    -- * Recovering a lost surface (VK-14)
+  , ReplacementAnswer (..)
+  , offerReplacementSurface
+  , replacementSurfaceFailed
+
     -- * Retirement
   , retireTargetGenerations
 
@@ -191,8 +196,11 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , GenerationDestructionFailed (..)
   , GenerationEffectUncertain (..)
   , GenerationsRetained (..)
+  , AllocationNotRecovered (..)
+  , RecoveryEnd (..)
   ) where
 
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
   ( GenerationView (..)
   , TargetGenerationsView (..)
@@ -207,11 +215,18 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , GenerationsRetained (..)
   , SwapchainResult (..)
   , TargetCondition (..)
-  , newGenerations
-  , newGenerationsCapturing
-  , newGenerationsHooked
   , settlingPeriod
   , trackTarget
+  )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
+  ( newGenerations
+  , newGenerationsCapturing
+  , newGenerationsHooked
+  )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface
+  ( ReplacementAnswer (..)
+  , offerReplacementSurface
+  , replacementSurfaceFailed
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Step
   ( StepSummary (..)

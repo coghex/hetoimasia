@@ -5,7 +5,7 @@
 -- answers in, the checks each operation begins with, and the read-only views
 -- of that state.
 --
--- This module creates the state ('newRecording') and defines the only edits
+-- This module creates the state ('makeRecording') and defines the only edits
 -- made to it ('editManaged', 'editBatch'); the modules that construct,
 -- record, discharge, read back and dispose apply those edits, each to the
 -- entries its own operation concerns, on the graphics owner's thread. The
@@ -26,7 +26,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 
     -- * The recording
   , Recording (..)
-  , newRecording
+  , makeRecording
   , Refusal (..)
 
     -- * Handles
@@ -169,14 +169,16 @@ data Recording q inst msgr phys dev cmd = Recording
   , recordingBatches ∷ !(TVar (Map BatchId BatchRecord))
   }
 
--- | A recording over these roots and generations, owned by the calling
--- thread, which must be the graphics owner's.
-newRecording
+-- | The recording's state, owned by the calling thread. The public
+-- constructor is "Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal"'s
+-- 'Hetoimasia.GPU.Vulkan.Native.Recording.newRecording', which also registers
+-- the recording's disposer with the roots.
+makeRecording
   ∷ RecordingOps dev cmd
   → Roots q inst msgr phys dev
   → Generations q inst msgr phys dev
   → IO (Recording q inst msgr phys dev cmd)
-newRecording ops roots generations = do
+makeRecording ops roots generations = do
   thread ← myThreadId
   Recording ops roots generations thread <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty
 

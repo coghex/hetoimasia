@@ -10,8 +10,13 @@
 -- them, their frame storages, and the batch records of destroyed storages from
 -- the recording's state ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State")
 -- once the model records the disposal; it owns no state of its own.
+--
+-- It also makes the recording: 'newRecording' registers the recording's
+-- 'SubjectDisposer' with the roots, so a reclamation pass (VK-14) destroys a
+-- released generation exactly as 'disposeResources' would.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal
-  ( disposeResources
+  ( newRecording
+  , disposeResources
   , retireRecording
   ) where
 
@@ -47,10 +52,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , destroyNative
   , editManaged
   , isAsynchronous
+  , makeRecording
   , modelEdit
   , owner
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession, readRootsDevice, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (RecordingOps)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, SubjectDisposer (..), failRootsSession, readRootsDevice, registerRootsDisposer, stateRootsModel)
 
 -- | Destroy every released generation whose holds the model reports ended,
 -- and record the disposals with the model. A pipeline layout waits for every
@@ -81,36 +89,85 @@ disposeResources recording now = owner recording (go [])
         managed ← readTVar (recordingManaged recording)
         model ← stateRootsModel roots (\model → (model, model))
         device ← readRootsDevice roots
-        let dependants layout =
-              [ () | ManagedRecord (NativePipeline _ over _) standing ← Map.elems managed, over == layout, standing /= ManagedDestroyedPending
-              ]
-            eligible resource record =
-              releasedStanding (managedStanding record)
-                && disposalEligible (ResourceSubject resource) model
-                && case managedNative record of
-                  NativeLayout _ → null (dependants resource)
-                  _ → True
+        let eligible resource record =
+              disposalEligible (ResourceSubject resource) model && destroyableNow managed resource record
         pure (sortOn (kindOrder . managedNative . snd) (Map.toList (Map.filterWithKey eligible managed)), snd <$> device)
       results ← case device of
         Nothing → pure []
-        Just handle → forM candidates $ \(resource, record) → (,) resource <$> destroyOne handle resource record
+        Just handle → forM candidates $ \(resource, record) → (,) resource <$> destroyOne recording handle resource record
       pure ([resource | (resource, Nothing) ← results], [(resource, reason) | (resource, Just reason) ← results])
-    destroyOne device resource record = mask_ $
-      tryWithContext @SomeException (destroyNative recording device (managedNative record)) >>= \case
-        Right () → Nothing <$ atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedDestroyedPending}))
-        Left failure@(ExceptionWithContext _ exception) → do
-          let reason = Text.pack (displayException exception)
-          atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedUncertain reason}))
-          if isAsynchronous exception then rethrowIO failure else pure (Just reason)
     kindOrder = \case
       NativePipeline {} → 0 ∷ Int
       NativeStorage {} → 1
       NativeReadback {} → 2
       NativeLayout _ → 3
+
+-- | Whether a generation may be destroyed natively now, as far as the
+-- recording knows: it was released or replaced, and a pipeline layout has no
+-- pipeline left that was built over it. The model decides its holds.
+destroyableNow ∷ Map.Map ResourceId (ManagedRecord cmd) → ResourceId → ManagedRecord cmd → Bool
+destroyableNow managed resource record =
+  releasedStanding (managedStanding record) && case managedNative record of
+    NativeLayout _ → null [() | ManagedRecord (NativePipeline _ over _) standing ← Map.elems managed, over == resource, standing /= ManagedDestroyedPending]
+    _ → True
+  where
     releasedStanding = \case
       ManagedReleased → True
       ManagedReplaced _ → True
       _ → False
+
+-- | Destroy one generation's native objects and record what the destruction
+-- did, in one masked step. Answers the reason, if it did not complete.
+destroyOne ∷ Recording q inst msgr phys dev cmd → dev → ResourceId → ManagedRecord cmd → IO (Maybe Text.Text)
+destroyOne recording device resource record = mask_ $
+  tryWithContext @SomeException (destroyNative recording device (managedNative record)) >>= \case
+    Right () → Nothing <$ atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedDestroyedPending}))
+    Left failure@(ExceptionWithContext _ exception) → do
+      let reason = Text.pack (displayException exception)
+      atomically $ do
+        editManaged recording resource (\entry → entry {managedStanding = ManagedUncertain reason})
+        failRootsSession (recordingRoots recording) CleanupFailed
+      if isAsynchronous exception then rethrowIO failure else pure (Just reason)
+
+-- | A recording over these roots and generations, owned by the calling
+-- thread, which must be the graphics owner's.
+newRecording
+  ∷ RecordingOps dev cmd
+  → Roots q inst msgr phys dev
+  → Generations q inst msgr phys dev
+  → IO (Recording q inst msgr phys dev cmd)
+newRecording ops roots generations = do
+  recording ← makeRecording ops roots generations
+  recording <$ atomically (registerRootsDisposer roots (disposer recording))
+
+-- | What a reclamation pass disposes of the recording's subjects with: a
+-- released generation the model offers — every hold on it ended — is
+-- destroyed as 'disposeResources' destroys one, unless a pipeline built over
+-- it, when it is a layout, still exists. Another layer's subject is not the
+-- recording's.
+disposer ∷ Recording q inst msgr phys dev cmd → SubjectDisposer
+disposer recording =
+  SubjectDisposer
+    { disposerDispose = \case
+        ResourceSubject resource → do
+          (managed, device) ← atomically ((,) <$> readTVar (recordingManaged recording) <*> readRootsDevice (recordingRoots recording))
+          case (Map.lookup resource managed, device) of
+            (Just record, Just (_, handle))
+              | destroyableNow managed resource record →
+                  Just . maybe DisposalCompleted (const DisposalFailed) <$> destroyOne recording handle resource record
+            _ → pure Nothing
+        _ → pure Nothing
+    , disposerForget = \subjects → forget recording [resource | ResourceSubject resource ← subjects]
+    }
+
+-- | Forget the records of generations the model recorded as disposed: each
+-- managed record, its frame storage, and the batch records of a destroyed
+-- storage — submitted batches whose submission completed.
+forget ∷ Recording q inst msgr phys dev cmd → [ResourceId] → STM ()
+forget recording disposed = do
+  modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
+  modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
+  modifyTVar' (recordingBatches recording) (Map.filter ((`notElem` disposed) . batchStorage))
 
 -- | One model progress turn answering for this recording's resources only,
 -- forgetting every one the model recorded as disposed. Answers those, and
@@ -128,13 +185,11 @@ progress recording now = do
     let (next, turn) = runProgressTurn silentEvidence {disposalEvidence = answer} now model
      in (turn, next)
   let disposed = [resource | ResourceSubject resource ← turnDisposed report]
-  modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
-  modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
   -- A storage is disposable only once no batch or submission holds it, so a
   -- batch record still naming a destroyed storage is a submitted one whose
   -- submission completed: it goes with its storage. A readback it copied into
   -- keeps its own evidence.
-  modifyTVar' (recordingBatches recording) (Map.filter ((`notElem` disposed) . batchStorage))
+  forget recording disposed
   pure (disposed, turnActions report > 0)
 
 -- | Release every live handle, destroy every generation whose holds have

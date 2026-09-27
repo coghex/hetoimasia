@@ -10,8 +10,15 @@
 -- destroyed or uncertain, and removes the ones the model recorded as disposed,
 -- in the records of "Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State";
 -- it owns no state of its own.
+--
+-- It also makes the generations: 'newGenerations' and its variants register
+-- the generations' 'SubjectDisposer' with the roots, so a reclamation pass
+-- (VK-14) destroys a retired generation exactly as the owner's step would.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
-  ( disposeEligible
+  ( newGenerations
+  , newGenerationsCapturing
+  , newGenerationsHooked
+  , disposeEligible
   , progress
   ) where
 
@@ -42,6 +49,7 @@ import Hetoimasia.GPU.Model
   )
 import Hetoimasia.GPU.Model.Budget (progressActionLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, HoldSubject (..), TargetId)
+import Hetoimasia.GPU.Vulkan.Native.Presentation (CaptureUsage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationDestructionFailed (..)
   , GenerationStanding (..)
@@ -50,15 +58,62 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , TargetRecord (..)
   , editGeneration
   , isAsynchronous
+  , lookupGeneration
+  , makeGenerations
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
+  , Roots
+  , SubjectDisposer (..)
   , failRootsSession
+  , registerRootsDisposer
   , readRootsDevice
   , rootsCall
   , rootsGenerationOps
   , stateRootsModel
   )
+
+-- | The generations of one session's targets, over its roots.
+newGenerations ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+newGenerations = newGenerationsHooked (\_ → pure ())
+
+-- | 'newGenerations' whose every plan also asks for transfer-source usage
+-- where the surface offers it ('CaptureWhenOffered'), so a verification can
+-- read its images back. No normal target is built this way.
+newGenerationsCapturing ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+newGenerationsCapturing roots = registered =<< makeGenerations (\_ → pure ()) CaptureWhenOffered roots
+
+-- | 'newGenerations' with the examples' seam, which runs right after the model
+-- admits each candidate. Nothing in production sets it.
+newGenerationsHooked ∷ (GenerationId → IO ()) → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+newGenerationsHooked hook roots = registered =<< makeGenerations hook WithoutCapture roots
+
+registered ∷ Generations q inst msgr phys dev → IO (Generations q inst msgr phys dev)
+registered generations = generations <$ atomically (registerRootsDisposer (generationsRoots generations) (disposer generations))
+
+-- | What a reclamation pass disposes of the generations' subjects with: a
+-- retired generation the model offers — every hold on it ended — is destroyed
+-- as 'disposeEligible' destroys one, child before parent, each destruction
+-- recorded in its own masked step. One already destroyed, or still building,
+-- is not this pass's to destroy, and neither is another layer's subject.
+disposer ∷ Generations q inst msgr phys dev → SubjectDisposer
+disposer generations =
+  SubjectDisposer
+    { disposerDispose = \case
+        GenerationSubject generation → do
+          found ← atomically ((,) <$> lookupGeneration generations generation <*> readRootsDevice (generationsRoots generations))
+          case found of
+            (Just native, Just (_, device))
+              | genStanding native == GenerationRetiredHeld →
+                  Just . maybe DisposalCompleted (const DisposalFailed) <$> destroyGeneration generations device generation native
+            _ → pure Nothing
+        _ → pure Nothing
+    , disposerForget = \subjects → do
+        let disposed = [generation | GenerationSubject generation ← subjects]
+        when (not (null disposed)) $
+          modifyTVar' (generationsTargets generations) $
+            Map.map (\record → record {recordGenerations = foldr Map.delete (recordGenerations record) disposed})
+    }
 
 -- | Destroy every retired generation whose holds have all ended — of one
 -- target, or, in the owner's step, of all of them — and record the disposals

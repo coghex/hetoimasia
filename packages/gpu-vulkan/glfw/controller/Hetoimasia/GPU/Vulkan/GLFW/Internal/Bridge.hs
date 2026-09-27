@@ -30,6 +30,7 @@ import Hetoimasia.GLFW.Vulkan
   , InstanceRelease (..)
   , LeaseStanding (..)
   , LoaderIntegration
+  , Replacement (..)
   , SurfaceCreation (..)
   , SurfaceInstance
   , SurfaceObligation
@@ -41,10 +42,11 @@ import Hetoimasia.GLFW.Vulkan
   , obligationAttachment
   , obligationHandle
   , releaseSurfaceInstance
+  , replaceWindowSurface
   , surfaceObligation
   )
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW (AttachmentId, AttachmentProtocol, GraphicsAttachment, WindowHost)
+import Hetoimasia.Runtime.GLFW (Acknowledgement, AttachmentId, AttachmentProtocol, GraphicsAttachment, WindowHost)
 
 -- | What one surface creation left, from the controller's side.
 data Created obligation
@@ -78,6 +80,12 @@ data SurfaceBridge lease obligation = SurfaceBridge
       → IO GraphicsAttachment
     -- ^ Attach a protocol whose construction step may create surfaces for
     -- that attachment, on the main thread; the step is handed the creation.
+  , bridgeReplace ∷ WindowHost → Acknowledgement → lease → IO (Either Text (Created obligation))
+    -- ^ Create a replacement surface on the main thread for an attachment that
+    -- is still live — its acknowledgement's — under that same attachment, never
+    -- releasing or reattaching it (VK-14). 'Left' is the bridge's refusal
+    -- before any native effect: the attachment is retiring or was replaced, its
+    -- window is closing, or the lease is releasing.
   , bridgeObligations ∷ lease → STM [obligation]
     -- ^ Every obligation against the lease not yet confirmed destroyed, which
     -- is how one whose creator lost its answer is found.
@@ -115,6 +123,10 @@ vulkanSurfaceBridge integration =
     { bridgeLease = leaseSurfaceInstance integration
     , bridgeAttach = \host window build →
         attachWindowGraphicsWithSurfaces host window (\access → build (fmap created . createWindowSurface access))
+    , bridgeReplace = \host acknowledgement lease →
+        replaceWindowSurface host acknowledgement (\access → created <$> createWindowSurface access lease) >>= \case
+          ReplacementRan answer → pure (Right answer)
+          ReplacementRefused refusal → pure (Left (Text.pack (show refusal)))
     , bridgeObligations = leasedObligations
     , bridgeObligationAttachment = obligationAttachment
     , bridgeObligationHandle = obligationHandle

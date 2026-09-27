@@ -114,6 +114,14 @@ library
     -- target's life and expose steps, such as a single target's
     -- reconciliation or the model's progress turn, that only another part may
     -- take.
+    --
+    -- Internal.Reclamation is VK-14's allocation recovery: one bounded
+    -- reclamation pass through the disposers each layer registers with the
+    -- roots, and the one retry the model's allocation attempt permits. It is
+    -- private because only the operations that own a failed allocation may
+    -- decide it had no effect. Internal.Generations.Surface is VK-14's
+    -- surface-loss recovery for a target's generations, which the public
+    -- Generations re-exports.
     other-modules:
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
@@ -123,12 +131,14 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Progress
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Submission
+        Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Retirement
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Step
+        Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Uses
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
@@ -250,6 +260,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.GenerationsVisibility
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
+        Test.GPU.Vulkan.Native.Reclamation
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.RecordingStandIn
         Test.GPU.Vulkan.Native.RecordingVisibility
