@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -202,7 +202,7 @@ submitFrames frames request =
           atomically $ do
             answered Model.submitFrames framesOf SubmissionFailedWithoutEffect
             editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (Text.pack (displayException exception))})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception))
           rethrowIO failure
         Right () → do
           atomically (editSlot frames key (\sync → sync {syncFenceState = FenceIdle}))

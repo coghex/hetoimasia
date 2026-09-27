@@ -151,7 +151,7 @@ retainStorage   ∷ DiagnosticCapture → IO ()
 capturePhase    ∷ DiagnosticCapture → STM CapturePhase
 captureStatus   ∷ DiagnosticCapture → IO CaptureStatus
 deliveredCount  ∷ DiagnosticCapture → STM Word64
-captureSinkFailure ∷ DiagnosticCapture → STM (Maybe Text)
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
 ```
 
 The lifetime is established before any messenger exists: it allocates the
@@ -373,10 +373,12 @@ owner's next checkpoint makes an error-severity report the session's primary
 failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
 
 `captureSinkFailure` answers the same way for the consumer: the failure that
-stopped delivery, described, from the moment the worker met it rather than only
-once the verdict is reached. It is set once and never cleared, it never touches
-a latch, and the verdict still carries the failure itself as
-`ConsumerSinkFailed`. The controller's watch reads it beside the error latch, so
+stopped delivery (`sinkFailureReason`), from the moment the worker met it
+rather than only once the verdict is reached, and whether the error latch was
+already set at that moment (`sinkFailureAfterError`), so an owner that learns
+of both at one checkpoint can tell which came first. It is set once and never
+cleared, it never touches a latch, and the verdict still carries the failure
+itself as `ConsumerSinkFailed`. The controller's watch reads it beside the error latch, so
 a failed sink is a terminal status of its own at the owner's next checkpoint —
 never a replacement for an earlier failure, and never permission to release
 anything.
@@ -451,7 +453,8 @@ after closing and freeing, slot reclamation beyond the table's size, and a
 stale user data naming nothing.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
 fields, a record's labels in its own scoped context and no other's, the worker's own group, the verdict's issues, sink failure beside a
-preserved primary failure and observable while the lifetime still captures, a record produced while draining, the final drain,
+preserved primary failure and observable while the lifetime still captures,
+with whether an error had latched before it, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, a failed body kept
 primary over a cancellation during finalization with that cancellation beside

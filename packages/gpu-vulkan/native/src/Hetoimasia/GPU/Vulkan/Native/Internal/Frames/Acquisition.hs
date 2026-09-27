@@ -62,7 +62,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, modelAnswer, modelEdit, owned)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( failRootsSession
+  ( failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
   , rootsCall
@@ -179,7 +179,7 @@ tryAcquireFrame frames target =
               -- swapchain belongs to: which image is owned is unknown.
               modifyTVar' (framesLive frames) (Map.insert frame (FrameRecord image swapchain pool (StageUncertain mismatch)))
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreUncertain mismatch})
-              failRootsSession roots CleanupFailed
+              failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> mismatch)
               pure (Left mismatch)
           | otherwise → do
               modifyTVar' (framesLive frames) (Map.insert frame (FrameRecord image swapchain pool StageAcquired))
@@ -198,7 +198,7 @@ tryAcquireFrame frames target =
               -- its semaphore's signal is owed and nothing can settle it.
               let why = "the model refused an acquisition the swapchain made: " <> reason
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreUncertain why})
-              failRootsSession roots CleanupFailed
+              failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> why)
               pure (Left why)
           | otherwise → do
               giveBack frame

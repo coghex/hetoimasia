@@ -179,6 +179,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticCapture
   , DiagnosticVerdict
   , Quiesced
+  , SinkFailure (..)
   , afterLastCallback
   , captureSinkFailure
   , captureStatus
@@ -1045,14 +1046,20 @@ readVulkanModel (VulkanController state) = readRootsModel (stateRoots state)
 readVulkanTerminal ∷ VulkanController → STM TerminalReport
 readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots state)
 
--- | What a checkpoint learns from the capture: its error latch, set by any
+-- | What a checkpoint learns from the capture — its error latch, set by any
 -- error-severity report whatever became of the report's detail, and its
--- sink's failure.
+-- sink's failure — in the order they happened, so a checkpoint that learns of
+-- both latches the first as the primary.
 captureAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
   sink ← atomically (captureSinkFailure capture)
-  pure ([AlarmValidationError | latched] <> [AlarmSinkFailed reason | Just reason ← [sink]])
+  let validation = [AlarmValidationError | latched]
+  pure $ case sink of
+    Nothing → validation
+    Just failure
+      | sinkFailureAfterError failure → validation <> [AlarmSinkFailed (sinkFailureReason failure)]
+      | otherwise → AlarmSinkFailed (sinkFailureReason failure) : validation
 
 -- | The swapchain generations of the target this attachment is, while the
 -- owner holds it.

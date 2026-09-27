@@ -54,7 +54,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (owner)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, failRootsSessionBecause, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel)
 
 -- | One bounded owner step: at most the model's progress-action limit of native
 -- calls, each recorded in the same masked step that made it.
@@ -150,7 +150,7 @@ progressFrames frames now = owner recording $ do
                   atomically $ do
                     modifyTVar' (framesPresentations frames) (Map.adjust (\entry → entry {presentedStanding = PresentUncertain reason}) presentation)
                     editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason})
-                    failRootsSession roots CleanupFailed
+                    failRootsSessionBecause roots CleanupFailed (Text.pack (show presentation) <> ": " <> reason)
                   note failures (unlessLoss failure (PresentationUncertain presentation reason))
                 Right False → pure ()
                 Right True → do
@@ -179,7 +179,7 @@ progressFrames frames now = owner recording $ do
                     atomically $ do
                       editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
                       editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceUncertain reason})
-                      failRootsSession roots CleanupFailed
+                      failRootsSessionBecause roots CleanupFailed ("the cleanup fence of " <> Text.pack (show frame) <> ": " <> reason)
                     note failures (unlessLoss failure (FrameCleanupFailed frame reason))
                   Right False → pure ()
                   Right True → do
@@ -237,7 +237,7 @@ progressFrames frames now = owner recording $ do
           let reason = "the model refused a retirement its present fence proved"
           modifyTVar' (framesPresentations frames) (Map.adjust (\entry → entry {presentedStanding = PresentUncertain reason}) presentation)
           editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason})
-          failRootsSession roots CleanupFailed
+          failRootsSessionBecause roots CleanupFailed (Text.pack (show presentation) <> ": " <> reason)
       pure applied
     release handle frame record = mask_ $ do
       let index = fromIntegral (imageIndex (recordImage record)) ∷ Word32
@@ -246,7 +246,7 @@ progressFrames frames now = owner recording $ do
           let reason = "vkReleaseSwapchainImagesEXT raised: " <> describe failure
           atomically $ do
             editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> reason)
           -- The caller notes it; the frame keeps its image.
           pure (Left (unlessLoss failure (FrameCleanupFailed frame reason)))
         Right () → do
@@ -353,7 +353,7 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
       case outcome of
         Right () → [] <$ atomically (modifyTVar' (framesSlots frames) (Map.delete key))
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = "destroying the slot's synchronization raised: " <> Text.pack (displayException exception)
+          let reason = "destroying the synchronization of slot " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception)
           atomically $ do
             editSlot frames key (\entry → entry {syncFenceState = FenceUncertain reason, syncCleanupState = FenceUncertain reason, syncDestruction = Just reason})
             failRootsSessionBecause roots CleanupFailed reason
@@ -368,7 +368,7 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
       case outcome of
         Right () → [] <$ atomically (modifyTVar' (framesPool frames) (Map.delete key))
         Left failure@(ExceptionWithContext _ exception) → do
-          let reason = "destroying the presentation-pool record raised: " <> Text.pack (displayException exception)
+          let reason = "destroying the presentation-pool record " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception)
           atomically $ do
             editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason, poolRenderedState = SemaphoreUncertain reason, poolDestruction = Just reason})
             failRootsSessionBecause roots CleanupFailed reason

@@ -59,6 +59,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   , FinalizationEvidence (..)
   , VerdictIssue (..)
+  , SinkFailure (..)
   , captureSinkFailure
   , captureStatus
   , capturePhase
@@ -275,9 +276,20 @@ spec = describe "Lifetime" $ do
           phase ← atomically (capturePhase capture)
           pure (before, during, phase)
       before `shouldBe` Nothing
-      during `shouldSatisfy` (not . Text.null)
+      sinkFailureReason during `shouldSatisfy` (not . Text.null)
+      -- Nothing had latched an error when the sink failed.
+      sinkFailureAfterError during `shouldBe` False
       phase `shouldBe` PhaseCapturing
       consumerName (verdictConsumer verdict) `shouldBe` "sink failed"
+
+    it "records that it followed an error the capture had already latched" $ do
+      (logger, _) ← failingLogger
+      (failure, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityError "the error the sink cannot take")
+          requestDrain capture
+          bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+      sinkFailureAfterError failure `shouldBe` True
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger

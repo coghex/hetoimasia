@@ -29,6 +29,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , StandInLoss (..)
   , injectedMessageId
   , reportErrorNow
+  , reportWarningNow
+  , awaitSinkRecorded
 
     -- * The surface bridge
   , Bridge
@@ -116,7 +118,7 @@ import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand,
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
-import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureSinkFailure, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext, requestDrain)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( VulkanHandover (..)
@@ -289,10 +291,20 @@ data Native = Native
 -- | Report one error-severity message into the session's capture now, from
 -- the calling thread, as a layer reporting from inside some other call would.
 reportErrorNow ∷ Rig → ByteString → IO ()
-reportErrorNow rig text =
-  readTVarIO (nativeCapture (rigNative rig)) >>= \case
-    Just capture → report capture severityError text
-    Nothing → throwIO (StandInFailure "the session has no capture yet")
+reportErrorNow rig text = sessionCapture rig >>= \capture → report capture severityError text
+
+-- | The same at warning severity; the worker is asked to drain at once.
+reportWarningNow ∷ Rig → ByteString → IO ()
+reportWarningNow rig text = sessionCapture rig >>= \capture → report capture severityWarning text >> requestDrain capture
+
+-- | Wait until the capture has recorded its sink's failure.
+awaitSinkRecorded ∷ Rig → IO ()
+awaitSinkRecorded rig = sessionCapture rig >>= \capture → atomically (captureSinkFailure capture >>= check . isJust)
+
+sessionCapture ∷ Rig → IO DiagnosticCapture
+sessionCapture rig =
+  readTVarIO (nativeCapture (rigNative rig))
+    >>= maybe (throwIO (StandInFailure "the session has no capture yet")) pure
 
 -- | Have every surface report this concrete current extent from now on, or
 -- leave the extent to the application.

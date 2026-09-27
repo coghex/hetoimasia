@@ -118,6 +118,7 @@ spec = describe "Vulkan controller" $ do
     it "latches a validation error reported inside a native call as the primary at the owner's next checkpoint, refusing every later handover naming it" (bounded testValidationStops)
     it "latches an error whose record a full capture dropped, since the latch is set before the record is admitted" (bounded testDroppedErrorStops)
     it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
+    it "keeps a sink failure that came first as the primary when a validation error arrives before the next checkpoint" (bounded testSinkThenError)
     it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
     it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
@@ -885,6 +886,43 @@ testSinkFailure = do
   -- The consumer's own terminal status, not a validation error.
   verdictIssues verdict `shouldSatisfy` elem ConsumerUnsuccessful
   verdictIssues verdict `shouldSatisfy` notElem ErrorLatched
+
+testSinkThenError ∷ IO ()
+testSinkThenError = do
+  rig ← twoWindows
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    [first, _] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    _ ← superviseGraphicsOwner control owner
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    -- The owner is idle now. The sink fails on a warning, and only then does
+    -- an error arrive: both are pending when the owner next checks.
+    failingSink rig
+    reportWarningNow rig "a warning the sink cannot take"
+    awaitSinkRecorded rig
+    reportErrorNow rig "an error after the sink failed"
+    scene ← prepare ()
+    let poke remaining = do
+          _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+          paced ← registerDelay 20000
+          failed ← atomically $
+            (readOwnerFailure owner >>= check . isJust >> pure True)
+              `orElse` (readTVar paced >>= check >> pure False)
+          if failed || remaining <= (0 ∷ Int) then pure () else poke (remaining - 1)
+    poke 500
+    atomically (readVulkanTerminal (vulkanController host) >>= writeTVar observed . Just)
+    checkRuntime control
+  failure ← raisedAs @GraphicsSessionFailed outcome
+  failure `shouldSatisfy` \case
+    GraphicsSessionFailed (TerminalSinkFailed _) → True
+    _ → False
+  Just report ← atomically (readTVar observed)
+  reportPrimary report `shouldSatisfy` \case
+    Just (TerminalSinkFailed _) → True
+    _ → False
+  reportEvidence report `shouldBe` [LaterFailure TerminalValidationError]
 
 testRetentionReported ∷ IO ()
 testRetentionReported = do

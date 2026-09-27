@@ -515,7 +515,7 @@ freePoolOf frames frame =
 uncertain ∷ Frames q inst msgr phys dev cmd → SessionFailureCause → [FrameSlotId] → Text → STM ()
 uncertain frames cause members reason = do
   mapM_ (\frame → editFrame frames frame (\record → record {recordStage = StageUncertain reason})) members
-  failRootsSessionBecause (framesRoots frames) cause reason
+  failRootsSessionBecause (framesRoots frames) cause (Text.pack (show members) <> ": " <> reason)
 
 -- | The classification of a frame this owner holds no frame record of. One it
 -- presented is the presentation's now, and in the wrong phase for anything

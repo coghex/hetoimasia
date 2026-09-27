@@ -1320,7 +1320,10 @@ sources, is the session's **primary**:
 
 Latching the primary is one transaction: it closes the roots' admission and
 fails the model's session with the matching cause (`DiagnosticSinkFailed` for
-a sink). A failure after it never displaces it: it joins the latch's evidence
+a sink). Every cleanup failure is latched with its subject and what raised —
+the surface, root, generation, frame, slot, pool record, batch or resource —
+so several failures of one pass are each accounted for rather than collapsed
+into one. A failure after it never displaces it: it joins the latch's evidence
 as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
 failure the model recorded by itself before anything was latched is the primary
 it stands for, and one that describes the same failure as the model's cause —
@@ -1337,7 +1340,10 @@ thread.
 
 A checkpoint asks the capture for its alarms — the controller installs the
 capture's error latch and sink failure as the roots' diagnostic watch — latches
-them, and answers the primary. It raises nothing, calls nothing native and waits
+them in the order they happened, and answers the primary. The capture records,
+when its sink fails, whether the error latch was already set, so a sink failure
+followed by a validation error before the next checkpoint stays the primary
+with the error beside it, and the other way round. It raises nothing, calls nothing native and waits
 for nothing. The owner's ordinary operations pass through one:
 
 - the controller's progress step raises the primary — the loss as
@@ -1369,7 +1375,9 @@ back, a submission that raised is recorded as an uncertain effect — the model
 records a failed call's outcome whenever it happened, and refuses only new
 work — a presentation that raised keeps what the swapchain's `pResults` entry
 says it enqueued, and a presentation or submission that returned keeps its
-obligations. The loss is what the caller sees first.
+obligations. The loss is what the caller sees first: a presentation whose call
+raised the loss while its entry answered out of date or surface lost is
+recorded as enqueued, and then the loss is raised.
 
 ### Teardown after device loss
 
@@ -1647,8 +1655,11 @@ the generation, the surface and the device after it; a validation error
 latched as the primary and a teardown wait that then reports the loss, keeping
 the validation error and switching that teardown to the device-loss rules; the
 loss surviving a cleanup failure during teardown, which joins the evidence and
-is never retried; an unsubmitted recording whose pool reset reported the loss
-released without another reset; an uncertain effect with no loss retaining its
+is never retried; each of two storage destructions that failed in one
+disposal pass named beside the loss; an unsubmitted recording whose pool reset
+reported the loss released without another reset; a presentation whose call
+raised the loss while its entry answered out of date, recorded as enqueued and
+the loss still raised; an uncertain effect with no loss retaining its
 frame, its generation, the surface and the roots through the whole teardown; a
 validation error from the capture's watch refusing the next rendering and
 acquisition with no native call, then settling what was owned under the
@@ -1670,6 +1681,8 @@ teardown in order and the verdict carrying the error; the same error latched
 although a full capture dropped its record, since the latch is set before the
 record is admitted; a sink failure latched as
 its own status, with the verdict's consumer unsuccessful and no error latched;
+a sink failure that came before a validation error, both pending at one
+checkpoint, kept as the primary with the error beside it;
 an exit whose surface destruction failed, reporting the cleanup failure as its
 primary and what it retained beside it; a surface still in its native call when
 the drain closed the lease, whose destruction then failed, latched as a cleanup

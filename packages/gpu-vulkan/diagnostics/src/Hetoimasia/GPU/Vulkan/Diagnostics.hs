@@ -121,6 +121,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureCounters (..)
   , captureStatus
   , deliveredCount
+  , SinkFailure (..)
   , captureSinkFailure
 
     -- * The verdict
@@ -334,7 +335,7 @@ data DiagnosticCapture = DiagnosticCapture
   , handleQuiesced ∷ !(TVar Bool)
     -- ^ Set by 'afterLastCallback' once the owner's last callback-producing
     -- destruction has returned.
-  , handleSinkFailure ∷ !(TVar (Maybe Text))
+  , handleSinkFailure ∷ !(TVar (Maybe SinkFailure))
     -- ^ Set by the worker, once, when its sink first fails; never cleared.
   }
 
@@ -387,14 +388,23 @@ capturePhase = readTVar . handlePhase
 deliveredCount ∷ DiagnosticCapture → STM Word64
 deliveredCount = readTVar . handleDelivered
 
--- | The failure that stopped delivery, described, from the moment the worker
--- met it rather than only once the verdict is reached: a sink failure is a
--- terminal status an owner can observe at its checkpoints while the lifetime
--- still runs. It is set once and never cleared, and it says nothing about the
+-- | The failure that stopped delivery, from the moment the worker met it
+-- rather than only once the verdict is reached: a sink failure is a terminal
+-- status an owner can observe at its checkpoints while the lifetime still
+-- runs. It is set once and never cleared, and it says nothing about the
 -- latches: an error reported after the sink failed still latches, and the
 -- verdict still carries the failure itself as 'ConsumerSinkFailed'.
-captureSinkFailure ∷ DiagnosticCapture → STM (Maybe Text)
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
 captureSinkFailure = readTVar . handleSinkFailure
+
+-- | A sink failure as the worker met it: what failed, and whether the error
+-- latch was already set at that moment — so an owner that learns of both at
+-- one checkpoint can tell which came first.
+data SinkFailure = SinkFailure
+  { sinkFailureReason ∷ !Text
+  , sinkFailureAfterError ∷ !Bool
+  }
+  deriving (Eq, Show)
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
 --
@@ -826,8 +836,10 @@ drainWorker config logger storage capture =
                         | otherwise → mask_ $ do
                             writeIORef state (DrainReport (Just failure))
                             -- Published as soon as it is known, so an owner's
-                            -- checkpoint sees it while the lifetime runs.
-                            atomically (writeTVar (handleSinkFailure capture) (Just (Text.pack (displayException exception))))
+                            -- checkpoint sees it while the lifetime runs, with
+                            -- whether the error latch was set before it.
+                            latched ← maybe False statusErrorLatched <$> readStatus (handleUserData capture)
+                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure (Text.pack (displayException exception)) latched)))
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

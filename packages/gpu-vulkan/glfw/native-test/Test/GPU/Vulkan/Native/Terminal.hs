@@ -97,6 +97,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticCapture
   , DiagnosticVerdict (..)
   , Quiesced
+  , SinkFailure (..)
   , VerdictIssue (..)
   , captureSinkFailure
   , captureStatus
@@ -215,7 +216,7 @@ alarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
 alarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
   sink ← atomically (captureSinkFailure capture)
-  pure ([AlarmValidationError | latched] <> [AlarmSinkFailed reason | Just reason ← [sink]])
+  pure ([AlarmValidationError | latched] <> [AlarmSinkFailed (sinkFailureReason failure) | Just failure ← [sink]])
 
 -- ---------------------------------------------------------------------------
 -- A validation error during rendering

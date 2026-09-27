@@ -21,6 +21,7 @@ module Test.GPU.Vulkan.Native.Terminal (spec) where
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (SomeException, throwIO, toException)
 import Control.Monad (forM_, void)
+import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
@@ -49,7 +50,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , stepGenerations
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), recordFrame)
+import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), recordFrame, retireRecording)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
@@ -65,7 +66,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), duringReset, recordingCalls)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStep (AtDestroyStorage), duringReset, failAt, recordingCalls)
 import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
 
 spec ∷ Spec
@@ -122,6 +123,19 @@ spec = describe "Terminal failure" $ do
       tornDownUnderLoss rig
       length . filter isReset <$> recordingCalls (rigRecordingStandIn rig) `shouldReturn` resets
 
+    it "during a presentation the swapchain answered out of date: what was enqueued is recorded, and the loss still raised" $ do
+      rig ← newRig
+      frame ← owned rig
+      _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
+      scriptPresent (rigStandIn rig) [PresentRaising PresentStatusOutOfDate (toException (StandInLoss AtFrameCall))]
+      presentFrame (rigFrames rig) (ownedFrame frame) `raises` \loss → lostDuring loss == "vkQueuePresentKHR"
+      -- The presentation was enqueued, so its obligations were kept before the
+      -- loss went on to the caller.
+      map standingPresentedFrame <$> atomically (readPresentations (rigFrames rig)) `shouldReturn` [ownedFrame frame]
+      phaseOf rig (ownedFrame frame) `shouldReturn` Just FramePresentationEnqueued
+      primaryIs rig lostLoss
+      tornDownUnderLoss rig
+
     it "during idle progress: no fence is asked or waited on again, and none is recorded as signalled" $ do
       rig ← newRig
       _ ← pendingPresentation rig
@@ -177,6 +191,18 @@ spec = describe "Terminal failure" $ do
       length . filter isDestruction <$> frameCalls (rigStandIn rig) `shouldReturn` survivors
       primaryIs rig lostLoss
       clean rig
+
+    it "names each cleanup that failed in one disposal pass, beside the primary" $ do
+      rig ← newRig
+      loseFrameStep (rigStandIn rig) AtAcquire
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `raises` \(_ ∷ GraphicsDeviceLost) → True
+      -- Both slots' storages go in one pass, and both destructions fail.
+      failAt (rigRecordingStandIn rig) AtDestroyStorage
+      retireRecording (rigRecording rig) (at 5) `raises` \(_ ∷ SomeException) → True
+      primaryIs rig lostLoss
+      cleanups ← (\evidence → [reason | LaterFailure (TerminalCleanupFailed reason) ← evidence]) <$> evidenceOf rig
+      length cleanups `shouldBe` 2
+      length (nub cleanups) `shouldBe` 2
 
     it "retains an uncertain effect's parents through the whole teardown when the device was not lost" $ do
       rig ← newRig

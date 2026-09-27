@@ -49,7 +49,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall)
 
 -- | Skip an acquired frame nothing of which has been submitted: an ordinary
 -- outcome, not a failure. The frame's capability is consumed at once — it
@@ -200,7 +200,7 @@ cleanupSubmission frames device family frame semaphore stage waiting = do
           atomically $ do
             editFrame frames frame (\record → record {recordStage = StageFailed reason})
             editSlot frames key (\entry → entry {syncCleanupState = FenceUncertain reason})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> reason)
           pure $ Just $ case fromException exception ∷ Maybe GraphicsDeviceLost of
             Just _ → failure
             Nothing → ExceptionWithContext context (toException (FrameCleanupFailed frame reason))
