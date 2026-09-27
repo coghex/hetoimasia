@@ -743,11 +743,17 @@ The recorder tracks the frame image's layout and records each transition as one
 | --- | --- | --- | --- |
 | Undefined | Color attachment | Color-attachment output, none | Color-attachment output, color-attachment write |
 | Color attachment | Transfer source | Color-attachment output, color-attachment write | Copy, transfer read |
-| Color attachment | Present source | Color-attachment output, color-attachment write | None, none |
-| Transfer source | Present source | Copy, none | None, none |
+| Color attachment | Present source | Color-attachment output, color-attachment write | All commands, none |
+| Transfer source | Present source | Copy, none | All commands, none |
 
 Entering rendering waits on the color-attachment stage, which is where an
-acquisition's semaphore wait is made. Retention proves lifetime only: these
+acquisition's semaphore wait is made. Leaving for presentation names every
+stage as its destination, with no access: the presentation engine's read needs
+no visibility operation, but the layout transition must be ordered before the
+render-finished semaphore's signal, which the frames make at every stage. With
+no destination stage the transition chained into nothing that followed it, and
+on Lavapipe synchronization validation reported every presentation as
+`SYNC-HAZARD-PRESENT-AFTER-WRITE` (VK-13). Retention proves lifetime only: these
 layout and synchronization rules are the supported operations' own explicit
 contract, not an automatic hazard resolver.
 
