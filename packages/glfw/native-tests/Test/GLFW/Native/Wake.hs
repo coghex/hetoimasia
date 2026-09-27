@@ -195,8 +195,7 @@ wokenWaitBy fork session after act = do
 settle ∷ Session → IO ()
 settle session = do
   processWindowEvents session ProcessPending
-  -- DEMONSTRATION for #280, reverted in the next commit: the pending-only settle.
-  when (sessionBackend session == Wayland && False) $ do
+  when (sessionBackend session == Wayland) $ do
     awaitCompositor
     processWindowEvents session ProcessPending
   _ ← takeLastWaitForCheck
