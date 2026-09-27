@@ -110,9 +110,17 @@ Guide is advisory and does not replace Kanban approval or project-review records
   semaphore); what was enqueued is read from `pResults`, an unwritten entry is
   uncertain; a presentation retires only on its own present fence, and
   generations and closing windows retire incrementally from that evidence.
-  Both are driven on private roots by native cases; the controller wires in
-  neither the recording nor the frames (VK-16). Fonts and renderers remain
-  plans.
+  #231 adds the terminal latch: the first failure — device loss, a validation
+  error or sink failure read from the capture at a checkpoint, an uncertain
+  effect, a failed cleanup, a required target's exhaustion — is the primary,
+  refuses every later rendering, acquisition, submission, presentation and
+  handover naming it, and keeps later failures and retentions as evidence; the
+  device's loss is kept apart from the primary (model `noteDeviceLoss`). After
+  a loss the frames ask and wait on no fence and release what only the lost
+  device could discharge (`releaseToDeviceLoss`), never as completion. No
+  device loss is induced natively. All of it is driven on private roots by
+  native cases; the controller wires in neither the recording nor the frames
+  (VK-16). Fonts and renderers remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.

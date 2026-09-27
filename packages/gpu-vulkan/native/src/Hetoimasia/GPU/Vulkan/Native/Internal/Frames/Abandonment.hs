@@ -69,6 +69,10 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession,
 -- 'closeUnpresentedFrame' is its exit. A cleanup submission that raised retains
 -- the frame, its image and its synchronization for ever, fails the session and
 -- raises 'FrameCleanupFailed'.
+--
+-- After the device's loss no cleanup submission is made — the lost device
+-- would never complete one — and the frame waits, skipped ('StageLost'), for
+-- the device-loss release to let it go.
 skipFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal ())
 skipFrame frames frame =
   owned recording $

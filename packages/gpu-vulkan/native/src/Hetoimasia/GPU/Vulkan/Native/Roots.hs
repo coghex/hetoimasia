@@ -71,11 +71,25 @@
 -- the loss, closes admission and fails the model's session in one
 -- transaction, and then raises 'GraphicsDeviceLost' in its place, so the loss
 -- is the failure its caller sees first. Nothing is recreated or replayed. The
--- retirement that follows is the ordinary child-before-parent one: nothing has
--- been submitted in this slice, and Vulkan permits destroying a lost device's
--- objects without waiting for work that may never complete. An outcome that
--- is unknown rather than lost is not loss: it is an uncertain destruction, and
--- it retains its parents.
+-- retirement that follows is the ordinary child-before-parent one, and Vulkan
+-- permits destroying a lost device's objects without waiting for work that may
+-- never complete: what only the lost device could have discharged is released
+-- by the frames' device-loss release, never completed. An outcome that is
+-- unknown rather than lost is not loss: it is an uncertain destruction, and it
+-- retains its parents.
+--
+-- = The terminal latch
+--
+-- The loss is one source of the session's terminal failure. The latch
+-- ('latchTerminal') keeps the first failure from any source — the loss, a
+-- validation error or sink failure a checkpoint learns from the diagnostic
+-- watch, an uncertain effect, a failed cleanup, a required target's exhausted
+-- recovery — as the primary, closes admission and fails the model's session
+-- with it, and keeps every later failure, and what teardown retained, as
+-- evidence beside it. The loss itself is kept apart from the primary, so a
+-- later loss switches the teardown to its rules without displacing an earlier
+-- failure. A checkpoint ('checkpointRoots', 'checkRoots') asks the watch and
+-- answers the primary; retirement never passes through one.
 --
 -- = State
 --
@@ -93,6 +107,13 @@
 -- |                  |           | loss                        |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 -- | The loss latch   | The roots | Set once; any thread reads  | Any        | The session      | Never cleared             |
+-- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
+-- | The terminal     | The roots | 'latchTerminal' sets the    | Any, in    | The session      | Never cleared; evidence   |
+-- | latch            |           | primary once and appends    | STM        |                  | bounded, the rest counted |
+-- |                  |           | evidence; any thread reads  |            |                  |                           |
+-- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
+-- | The diagnostic   | The roots | Installed once; every       | The owner  | The session      | —                         |
+-- | watch            |           | checkpoint reads it         |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 --
 -- Every mutating operation is meant for one serialized owner — the graphics

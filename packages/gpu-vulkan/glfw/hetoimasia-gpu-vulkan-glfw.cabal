@@ -145,6 +145,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.Shared
         Test.GPU.Vulkan.Native.Spec
+        Test.GPU.Vulkan.Native.Terminal
         Test.Vulkan.Proof.Bridge
         Test.Vulkan.Proof.BridgeSpec
         Test.Vulkan.Proof.Construction

@@ -15,7 +15,10 @@ loop adapter here.
   graphics owner, whose operations are this package's controller.
   `handOverVulkanTarget` creates one window's surface through GLFW on the main
   thread, inside that window's attachment, and hands it to the owner as a
-  required or optional target.
+  required or optional target — or, once the session has failed, refuses naming
+  its primary failure. `readVulkanTerminal` reads the session's terminal latch:
+  that primary, the device's loss if it was observed, and what teardown found
+  and retained beside it.
 - The private `controller` sublibrary holds the controller —
   `GraphicsOperations` over the native roots — and the record through which it
   reaches the surface bridge, which the package's own examples replace with a

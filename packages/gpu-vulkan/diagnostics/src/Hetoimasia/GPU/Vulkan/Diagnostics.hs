@@ -92,6 +92,9 @@
 -- | wake and final     | this lifetime       | 'requestDrain'; the        | the worker                | per lifetime; final is set once |
 -- | requests           |                     | lifetime (final)           |                           |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
+-- | sink failure       | the worker          | the worker, once, when its | any thread, through       | per lifetime; never cleared     |
+-- |                    |                     | sink first fails           | 'captureSinkFailure'      |                                 |
+-- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 module Hetoimasia.GPU.Vulkan.Diagnostics
   ( -- * Configuration
     CaptureConfig (..)

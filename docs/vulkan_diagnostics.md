@@ -151,6 +151,7 @@ retainStorage   ∷ DiagnosticCapture → IO ()
 capturePhase    ∷ DiagnosticCapture → STM CapturePhase
 captureStatus   ∷ DiagnosticCapture → IO CaptureStatus
 deliveredCount  ∷ DiagnosticCapture → STM Word64
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe Text)
 ```
 
 The lifetime is established before any messenger exists: it allocates the
@@ -366,10 +367,19 @@ exception that is itself the finalization cancellation or group-closing
 failure, which the verdict already accompanies.
 
 Stopping graphics admission when the error latch is set is the owner's, at its
-checkpoints: this package exposes the latch and does nothing about it. VK-7's
-controller does not read it yet — it records and submits nothing, so there is
-no graphics work to stop — and stopping on a strict validation error is in
-VK-15's (#231) scope.
+checkpoints: this package exposes the latch and does nothing about it. VK-15's
+controller (#231) installs the latch as the roots' diagnostic watch, so the
+owner's next checkpoint makes an error-severity report the session's primary
+failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
+
+`captureSinkFailure` answers the same way for the consumer: the failure that
+stopped delivery, described, from the moment the worker met it rather than only
+once the verdict is reached. It is set once and never cleared, it never touches
+a latch, and the verdict still carries the failure itself as
+`ConsumerSinkFailed`. The controller's watch reads it beside the error latch, so
+a failed sink is a terminal status of its own at the owner's next checkpoint —
+never a replacement for an earlier failure, and never permission to release
+anything.
 
 ## Messengers on real objects
 
@@ -412,6 +422,7 @@ proof checks the binding flags against the pin.
 | Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
 | Taken and delivered counts | the worker | the worker | any thread; the lifetime once the worker is terminal | the worker's | per lifetime; only grow |
 | Wake and final requests | the lifetime | `requestDrain`; the lifetime, once, for final | the worker | any | per lifetime |
+| Sink failure | the worker | the worker, once, when its sink first fails | any thread, through `captureSinkFailure` | the worker's | per lifetime; never cleared |
 
 ## Testing
 
@@ -440,7 +451,7 @@ after closing and freeing, slot reclamation beyond the table's size, and a
 stale user data naming nothing.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
 fields, a record's labels in its own scoped context and no other's, the worker's own group, the verdict's issues, sink failure beside a
-preserved primary failure, a record produced while draining, the final drain,
+preserved primary failure and observable while the lifetime still captures, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, a failed body kept
 primary over a cancellation during finalization with that cancellation beside
