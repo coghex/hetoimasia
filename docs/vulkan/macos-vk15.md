@@ -18,13 +18,13 @@ describes: a Darwin plan, then `run.py` for `test.vulkan-headless` and — under
 the owner's standing approval for desktop runs an issue needs, carried on the
 command as `HETOIMASIA_NATIVE_SESSION=desktop` — `test.vulkan-native`, under
 MoltenVK and Cocoa, with the catalog's `--complete` command. Both passed at
-commit `650657c17d927595b5cc8aad172f1144d44d25b6`, input identity
-`2910c2f4e118b3b31ac1118b1a8376536603896e34c9edde2dc464a3c27a3f8c`. The plan also selected `test.vulkan`, `test.vulkan-diagnostics`,
+commit `f5f8a687ac913ce0ce02521d800fdeee5d244b1f`, input identity
+`60f102c0201ac595d400f48dd307df2f2e5bf23c601bed81d208717ad8f9615f`. The plan also selected `test.vulkan`, `test.vulkan-diagnostics`,
 `test.workflow` and the floor groups, which are CI's.
 
 The native group's preparation built the suite in
-1.446 s, and its watched native execution took
-3.998 s against the 30-second watchdog. The receipts
+9.318 s, and its watched native execution took
+3.583 s against the 30-second watchdog. The receipts
 record `Darwin` and the local prefix's own toolchain map — the
 MoltenVK 1.4.0 6e9ec5b29689 driver, the layer
 `VK_LAYER_KHRONOS_validation 1.3.296 dc6b9c2fd7b6 +synchronization` — and no `ci-image` entry, so neither
@@ -67,11 +67,12 @@ instance was destroyed; the owner's run ended without destruction evidence and
 without the target's terminal record, so the host still held the window. The
 watcher then wrote the record and terminated the process — the fixture's
 destructive boundary, never orderly cleanup — and the parent recorded the
-child's exit as a pass, in 0.147135s. No diagnostic verdict follows that case,
+child's exit as a pass, in 0.155806s. No diagnostic verdict follows that case,
 because its instance's messengers were never destroyed.
 
 The plan's local worker declaration is the one
 [docs/validation.md](../validation.md#a-local-run-and-its-receipt) shows.
+
 
 ## Captured evidence
 
@@ -85,18 +86,18 @@ vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 82
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 67 records delivered
-vulkan-native-tests: private debug-names: ExitSuccess in 0.200288s
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.9863e-2s
-vulkan-native-tests: private vk11-recording: ExitSuccess in 0.238178s
-vulkan-native-tests: private vk12-frames: ExitSuccess in 0.238716s
-vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.282055s
-vulkan-native-tests: private vk15-retention: ExitSuccess in 0.147135s
-vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.239013s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.71601s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.153877s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 6.3565e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 0.183723s
-vulkan-native-tests: the process ran for 3.17054s, fixtures, examples and teardown included
+vulkan-native-tests: private debug-names: ExitSuccess in 0.192478s
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.988e-2s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 0.207086s
+vulkan-native-tests: private vk12-frames: ExitSuccess in 0.231124s
+vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.292705s
+vulkan-native-tests: private vk15-retention: ExitSuccess in 0.155806s
+vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.237981s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.301283s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.157662s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 6.2997e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.189282s
+vulkan-native-tests: the process ran for 2.699231s, fixtures, examples and teardown included
 ```
 
 ### The per-scenario records
@@ -130,8 +131,8 @@ only because that error, and nothing else, is its verdict's issue.
 
 ### The `vk2-compatibility` record's environment
 
-- source digest: 30963ed2132665eb77164af57cce993ea966bfb7bfe1cd2fc75e6a1766dfc6d9
-- repository revision: 650657c17d927595b5cc8aad172f1144d44d25b6
+- source digest: ef63eee78f0d8ac72d0520fdfb084b8c83ccad5713862a4c817e2b7c32c286c9
+- repository revision: f5f8a687ac913ce0ce02521d800fdeee5d244b1f
 - platform: darwin/aarch64
 - session authorization: the desktop opt-in on this run's command, under the owner's standing approval
 - VK_DRIVER_FILES: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/e6630985-289e-425f-acfe-76a0c2a0a118/scratchpad/native/glfw/vulkan/share/vulkan/icd.d/MoltenVK_icd.json
@@ -157,8 +158,8 @@ only because that error, and nothing else, is its verdict's issue.
     "--",
     "--complete"
   ],
-  "duration_seconds": 3.998,
-  "ended_at": "2026-09-27T18:44:59.024Z",
+  "duration_seconds": 3.583,
+  "ended_at": "2026-09-27T19:36:55.855Z",
   "evidence": [
     "evidence/test.vulkan-native/debug-names.log",
     "evidence/test.vulkan-native/debug-names.md",
@@ -184,15 +185,15 @@ only because that error, and nothing else, is its verdict's issue.
     "evidence/test.vulkan-native/vk7-roots.md"
   ],
   "executed": true,
-  "executed_commit": "650657c17d927595b5cc8aad172f1144d44d25b6",
-  "executed_tree": "f2a7898af2d990c44224a619e112cf6d4396f9ea",
+  "executed_commit": "f5f8a687ac913ce0ce02521d800fdeee5d244b1f",
+  "executed_tree": "f938cb1e57527a77b1b91dd34e7d39cef1ec11af",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "650657c17d927595b5cc8aad172f1144d44d25b6",
-  "input_identity": "2910c2f4e118b3b31ac1118b1a8376536603896e34c9edde2dc464a3c27a3f8c",
+  "head_commit": "f5f8a687ac913ce0ce02521d800fdeee5d244b1f",
+  "input_identity": "60f102c0201ac595d400f48dd307df2f2e5bf23c601bed81d208717ad8f9615f",
   "outcome": "passed",
-  "plan_identity": "3a49d872226d7089e521ee9c930d3c3faafd1e20361b0ce6137901b4c4ae7fa0",
+  "plan_identity": "558dce352b094bb26c4c0e178eea0132fdcbf6f604016e0f19d0bfd3640151e2",
   "policy_version": "aad24a40fa339228b695fbdd3f5d43904e8c4ea20cb490c87d407bb31580490f",
   "preparation": {
     "command": [
@@ -201,12 +202,12 @@ only because that error, and nothing else, is its verdict's issue.
       "build",
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
-    "duration_seconds": 1.446,
-    "ended_at": "2026-09-27T18:44:55.026Z",
+    "duration_seconds": 9.318,
+    "ended_at": "2026-09-27T19:36:52.272Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-27T18:44:53.580Z",
+    "started_at": "2026-09-27T19:36:42.953Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "arm64",
@@ -215,7 +216,7 @@ only because that error, and nothing else, is its verdict's issue.
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-27T18:44:55.026Z",
+  "started_at": "2026-09-27T19:36:52.272Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -243,19 +244,19 @@ only because that error, and nothing else, is its verdict's issue.
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 9.251,
-  "ended_at": "2026-09-27T18:44:46.613Z",
+  "duration_seconds": 9.279,
+  "ended_at": "2026-09-27T19:36:42.571Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "650657c17d927595b5cc8aad172f1144d44d25b6",
-  "executed_tree": "f2a7898af2d990c44224a619e112cf6d4396f9ea",
+  "executed_commit": "f5f8a687ac913ce0ce02521d800fdeee5d244b1f",
+  "executed_tree": "f938cb1e57527a77b1b91dd34e7d39cef1ec11af",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "650657c17d927595b5cc8aad172f1144d44d25b6",
-  "input_identity": "2910c2f4e118b3b31ac1118b1a8376536603896e34c9edde2dc464a3c27a3f8c",
+  "head_commit": "f5f8a687ac913ce0ce02521d800fdeee5d244b1f",
+  "input_identity": "60f102c0201ac595d400f48dd307df2f2e5bf23c601bed81d208717ad8f9615f",
   "outcome": "passed",
-  "plan_identity": "3a49d872226d7089e521ee9c930d3c3faafd1e20361b0ce6137901b4c4ae7fa0",
+  "plan_identity": "558dce352b094bb26c4c0e178eea0132fdcbf6f604016e0f19d0bfd3640151e2",
   "policy_version": "aad24a40fa339228b695fbdd3f5d43904e8c4ea20cb490c87d407bb31580490f",
   "preparation": null,
   "runner_arch": "arm64",
@@ -264,7 +265,7 @@ only because that error, and nothing else, is its verdict's issue.
   "runner_python": "3.14.6",
   "schema_version": 4,
   "source_run_url": "",
-  "started_at": "2026-09-27T18:44:37.362Z",
+  "started_at": "2026-09-27T19:36:33.292Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -310,7 +311,7 @@ Synchronization validation's negative control
   completed its capture: every report admitted and delivered, and its worker finished [✔]
   failed its verdict, after its last teardown callback, for the latched error and nothing else [✔]
 
-Finished in 0.0006 seconds
+Finished in 0.0005 seconds
 5 examples, 0 failures
 vulkan-native-tests synchronization-hazard: every check passed
 ```
@@ -328,7 +329,7 @@ VK-11 managed recording
   received no validation error during any step [✔]
   completed its capture, and its verdict after the last teardown callback is clean [✔]
 
-Finished in 0.0006 seconds
+Finished in 0.0005 seconds
 7 examples, 0 failures
 vulkan-native-tests vk11-recording: every check passed
 ```
@@ -346,7 +347,7 @@ VK-12 frames
   received no validation error during any step [✔]
   completed its capture, and its verdict after the last teardown callback is clean [✔]
 
-Finished in 0.0005 seconds
+Finished in 0.0012 seconds
 7 examples, 0 failures
 vulkan-native-tests vk12-frames: every check passed
 ```
@@ -364,7 +365,7 @@ VK-13 presentation
   received no validation error during any step [✔]
   completed its capture, and its verdict after the last teardown callback is clean [✔]
 
-Finished in 0.0006 seconds
+Finished in 0.0007 seconds
 7 examples, 0 failures
 vulkan-native-tests vk13-presentation: every check passed
 ```
@@ -501,7 +502,7 @@ The matrix's observation labels
   does not call a release row observed when a release failed [✔]
   records the oldSwapchain failure case, which retires the old swapchain anyway [✔]
 
-Finished in 0.0042 seconds
+Finished in 0.0062 seconds
 74 examples, 0 failures
 vulkan-native-tests vk2-compatibility: every check passed
 ```
@@ -523,7 +524,7 @@ VK-5 loader-aware surface bridge
   restored GLFW's default loader after a failed initialization, where the platform can fail one [‐]
     # PENDING: GLFW 3.4's Cocoa initialization has no failure an application can provoke, and Cocoa is the only backend this platform admits
 
-Finished in 0.0009 seconds
+Finished in 0.0015 seconds
 10 examples, 0 failures, 1 pending
 vulkan-native-tests vk5-bridge: every check passed
 ```
@@ -543,7 +544,7 @@ VK-6 validation capture
   found no error but the one it provoked [✔]
   records the FFI configuration the toolchain pin qualified [✔]
 
-Finished in 0.0014 seconds
+Finished in 0.0006 seconds
 9 examples, 0 failures
 vulkan-native-tests vk6-capture: every check passed
 ```
@@ -564,7 +565,7 @@ VK-7 Vulkan roots
   delivered every report, both messengers' teardown reports included, with the instance's destruction as the quiescence evidence [✔]
   reported no validation error [✔]
 
-Finished in 0.0005 seconds
+Finished in 0.0006 seconds
 10 examples, 0 failures
 vulkan-native-tests vk7-roots: every check passed
 ```
