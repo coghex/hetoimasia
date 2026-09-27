@@ -19,6 +19,14 @@
 -- completed ('completeFence', 'completeAll'), which is the injected completion
 -- a native run gets from the device. A presentation's answer is scripted
 -- ('scriptPresent'); by default it succeeds.
+--
+-- A step can be made to lose the device ('loseFrameStep'): it raises the
+-- roots' stand-in's 'StandInLoss', which the roots classify as device loss.
+-- From then on the stand-in holds the frames to the device-loss rules instead:
+-- a fence or a semaphore may be destroyed whatever it was owed, and asking or
+-- waiting on a fence, resetting one, acquiring, submitting, presenting and
+-- releasing are each a violation — the lost device answers none of them with
+-- anything that could be evidence.
 module Test.GPU.Vulkan.Native.FramesStandIn
   ( FramesStandIn (..)
   , newFramesStandIn
@@ -28,6 +36,8 @@ module Test.GPU.Vulkan.Native.FramesStandIn
   , FrameStep (..)
   , failFrameStep
   , clearFrameStep
+  , loseFrameStep
+  , markDeviceLost
   , duringFrameCall
   , scriptAcquire
   , PresentScript (..)
@@ -47,6 +57,7 @@ import Control.Exception (Exception, SomeException, fromException, throwIO)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.IORef (writeIORef)
+import Data.Maybe (isJust)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -56,6 +67,7 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 
 import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..), SubmitBatch (..), WaitStage)
+import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
 
 -- | One native call the frames made, in the order it made it. A command buffer
 -- is its number, as the recording's stand-in makes it.
@@ -145,6 +157,10 @@ data FramesStandIn = FramesStandIn
     -- ^ How many images each swapchain has.
   , standViolations ∷ !(TVar [Text])
   , standDuring ∷ !(TVar (FrameCall → IO ()))
+  , standLosing ∷ !(TVar (Set FrameStep))
+    -- ^ Steps that lose the device.
+  , standLost ∷ !(TVar Bool)
+    -- ^ Whether the device has been lost.
   }
 
 newFramesStandIn ∷ IO FramesStandIn
@@ -162,6 +178,8 @@ newFramesStandIn =
     <*> pure 3
     <*> newTVarIO []
     <*> newTVarIO (\_ → pure ())
+    <*> newTVarIO Set.empty
+    <*> newTVarIO False
 
 -- | Every call so far, oldest first.
 frameCalls ∷ FramesStandIn → IO [FrameCall]
@@ -172,6 +190,15 @@ failFrameStep standIn at = atomically (modifyTVar' (standFailing standIn) (Set.i
 
 clearFrameStep ∷ FramesStandIn → FrameStep → IO ()
 clearFrameStep standIn at = atomically (modifyTVar' (standFailing standIn) (Set.delete at))
+
+-- | Make this step lose the device: it raises 'StandInLoss', after recording
+-- the call.
+loseFrameStep ∷ FramesStandIn → FrameStep → IO ()
+loseFrameStep standIn at = atomically (modifyTVar' (standLosing standIn) (Set.insert at))
+
+-- | The device was lost by a call outside the frames — a generation's, say.
+markDeviceLost ∷ FramesStandIn → IO ()
+markDeviceLost standIn = atomically (writeTVar (standLost standIn) True)
 
 -- | Run this inside every call, after its effect and before it returns.
 duringFrameCall ∷ FramesStandIn → (FrameCall → IO ()) → IO ()
@@ -219,14 +246,33 @@ imagesOwned standIn = Map.keys <$> readTVarIO (standOwned standIn)
 violate ∷ FramesStandIn → Text → STM ()
 violate standIn complaint = modifyTVar' (standViolations standIn) (complaint :)
 
--- | Record the call, run the hook, then fail if the step is scripted to.
+-- | Record the call, run the hook, then lose the device or fail if the step is
+-- scripted to. A call the lost device could only answer with a phantom is a
+-- violation.
 step ∷ FramesStandIn → [FrameStep] → FrameCall → IO ()
 step standIn at call = do
-  atomically (modifyTVar' (standJournal standIn) (call :))
+  atomically $ do
+    modifyTVar' (standJournal standIn) (call :)
+    lost ← readTVar (standLost standIn)
+    when (lost && phantom call) $ violate standIn ("made a call the lost device answers nothing to: " <> shown call)
   action ← readTVarIO (standDuring standIn)
   action call
+  losing ← readTVarIO (standLosing standIn)
+  when (any (`Set.member` losing) at) $ do
+    atomically (writeTVar (standLost standIn) True)
+    throwIO (StandInLoss AtFrameCall)
   failing ← readTVarIO (standFailing standIn)
   for_ at $ \each → when (Set.member each failing) (throwIO (FrameStepFailed each))
+  where
+    phantom = \case
+      QueriedFence _ → True
+      WaitedFence {} → True
+      ResetFence _ → True
+      Acquired {} → True
+      Submitted {} → True
+      Released {} → True
+      Presented {} → True
+      _ → False
 
 fresh ∷ FramesStandIn → IO Word64
 fresh standIn = atomically $ do
@@ -250,7 +296,9 @@ framesStandInOps standIn =
     , opsDestroySemaphore = \_ handle → do
         atomically $ do
           state ← Map.lookup handle <$> readTVar (standSemaphores standIn)
-          unless (state == Just Idle) $ violate standIn ("destroyed semaphore " <> shown handle <> " while " <> shown state)
+          -- A lost device's objects may be destroyed whatever they were owed.
+          lost ← readTVar (standLost standIn)
+          unless (state == Just Idle || lost) $ violate standIn ("destroyed semaphore " <> shown handle <> " while " <> shown state)
           modifyTVar' (standSemaphores standIn) (Map.delete handle)
         step standIn [AtDestroy] (DestroyedSemaphore handle)
     , opsCreateFence = \_ → do
@@ -261,7 +309,8 @@ framesStandInOps standIn =
     , opsDestroyFence = \_ handle → do
         atomically $ do
           state ← Map.lookup handle <$> readTVar (standFences standIn)
-          when (state == Just Pending) $ violate standIn ("destroyed pending fence " <> shown handle)
+          lost ← readTVar (standLost standIn)
+          when (state == Just Pending && not lost) $ violate standIn ("destroyed pending fence " <> shown handle)
           modifyTVar' (standFences standIn) (Map.delete handle)
         step standIn [AtDestroy] (DestroyedFence handle)
     , opsResetFence = \_ handle → do
@@ -352,7 +401,10 @@ framesStandInOps standIn =
             semaphore = presentWait request
             image = (presentSwapchain request, presentIndex request)
             enqueued = written `elem` [PresentStatusSuccess, PresentStatusSuboptimal, PresentStatusOutOfDate, PresentStatusSurfaceLost]
-        atomically (modifyTVar' (standJournal standIn) (Presented request written :))
+        atomically $ do
+          modifyTVar' (standJournal standIn) (Presented request written :)
+          lost ← readTVar (standLost standIn)
+          when lost $ violate standIn ("presented to the lost device: " <> shown request)
         action ← readTVarIO (standDuring standIn)
         -- A presentation that was enqueued has its effect, whatever it answers:
         -- the semaphore wait is the presentation engine's, the fence is
@@ -370,7 +422,9 @@ framesStandInOps standIn =
           modifyTVar' (standOwned standIn) (Map.delete image)
         writeIORef status written
         action (Presented request written)
-        for_ raised throwIO
+        for_ raised $ \failure → do
+          when (isJust (fromException failure ∷ Maybe StandInLoss)) $ atomically (writeTVar (standLost standIn) True)
+          throwIO failure
     , opsWaitFence = \_ fence timeout → do
         signalled ← atomically $
           (Map.lookup fence <$> readTVar (standFences standIn)) >>= \case

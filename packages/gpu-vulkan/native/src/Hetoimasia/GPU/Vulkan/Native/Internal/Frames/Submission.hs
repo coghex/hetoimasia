@@ -60,6 +60,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Recording (..)
   , Refusal (..)
   , batchHeld
+  , checkpointed
   , owned
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, rootsSessionIdentity, stateRootsModel)
@@ -107,7 +108,7 @@ data Member cmd = Member
 --   it was, so the loss is what the caller sees first.
 submitFrames ∷ Frames q inst msgr phys dev cmd → NonEmpty BatchId → IO (Either Refusal Submitted)
 submitFrames frames request =
-  owned recording $
+  owned recording . checkpointed recording $
     atomically validate >>= \case
       Left refusal → pure (Left refusal)
       Right (members, device, family) → submit members device family

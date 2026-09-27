@@ -81,14 +81,24 @@ skipFrame frames frame =
         case reset of
           Left refusal → pure (Left refusal)
           Right () → mask_ $
-            atomically (modelAnswer roots (fmap (\model → (model, ())) . skipUnsubmittedFrame frame)) >>= \case
+            atomically skipped >>= \case
               Left refusal → pure (Left refusal)
-              Right () →
+              Right True → pure (Right ())
+              Right False →
                 cleanupSubmission frames device family frame (syncAcquire sync) StageSkipping (editSlot frames (slotOf frame) (\entry → entry {syncAcquireState = SemaphoreWaitOwed}))
                   >>= maybe (pure (Right ())) rethrowIO
   where
     recording = framesRecording frames
     roots = framesRoots frames
+    -- The model skips the frame; after the device's loss nothing more is
+    -- owed here — a cleanup submission to the lost device would never
+    -- complete — and the device-loss release lets it go.
+    skipped = do
+      answer ← modelAnswer roots (fmap (\model → (model, ())) . skipUnsubmittedFrame frame)
+      lost ← lossObserved frames
+      case answer of
+        Right () | lost → Right True <$ editFrame frames frame (\record → record {recordStage = StageLost})
+        _ → pure (False <$ answer)
     checked = do
       live ← Map.lookup frame <$> readTVar (framesLive frames)
       slots ← readTVar (framesSlots frames)

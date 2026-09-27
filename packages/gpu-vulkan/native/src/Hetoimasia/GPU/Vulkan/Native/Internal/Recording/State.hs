@@ -51,6 +51,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
     -- * Shared steps
   , owned
   , owner
+  , checkpointed
   , liveNative
   , destroyNative
   , batchHeld
@@ -88,7 +89,7 @@ import Hetoimasia.GPU.Model.Identity
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (ReadbackAllocation (..), RecordingOps (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -205,6 +206,9 @@ data Refusal
   | RefusedInUse
     -- ^ A batch or a submission still holds what would be changed in place.
   | RefusedWrongKind
+  | RefusedSessionFailed !TerminalCause
+    -- ^ The session has failed, and this is its primary failure: no new
+    -- rendering, acquisition, submission or presentation is admitted.
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -316,6 +320,17 @@ owned ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal a) → IO (E
 owned recording action = do
   current ← myThreadId
   if current /= recordingOwner recording then pure (Left RefusedNotOwner) else action
+
+-- | Run an ordinary operation behind a safe owner checkpoint: once the session
+-- has failed — whatever the cause, and however it was learned: a native call's
+-- device loss, the capture's error latch or sink failure, or the model's own
+-- escalation — it is refused naming the primary failure, before anything
+-- native is done. Only new work passes through here; retirement never does.
+checkpointed ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal a) → IO (Either Refusal a)
+checkpointed recording action =
+  checkpointRoots (recordingRoots recording) >>= \case
+    Just primary → pure (Left (RefusedSessionFailed primary))
+    Nothing → action
 
 -- | Raise unless called on the graphics owner's thread: for the owner's own
 -- steps, which answer no refusal.

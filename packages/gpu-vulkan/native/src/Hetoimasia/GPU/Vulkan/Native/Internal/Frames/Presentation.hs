@@ -49,7 +49,7 @@ import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..
 import Hetoimasia.GPU.Vulkan.Native.Generations (SwapchainResult (..), noteSwapchainResult)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), owned)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, owned)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, stateRootsModel)
 
 -- | What a presentation's answer establishes about its effect.
@@ -148,7 +148,7 @@ classifyPresent noEffect raised status = case raised of
 -- recorded outcome, not a prompt return, and it never interrupts the call.
 presentFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal Presented)
 presentFrame frames frame =
-  owned recording $
+  owned recording . checkpointed recording $
     atomically validate >>= \case
       Left refusal → pure (Left refusal)
       Right (record, held, device, family) → present record held device family

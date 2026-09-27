@@ -30,11 +30,11 @@ import Control.Exception
   , toException
   , tryWithContext
   )
-import Control.Monad (forM, unless)
+import Control.Monad (forM, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (listToMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
@@ -51,9 +51,10 @@ import Hetoimasia.GPU.Model.Budget (progressActionLimit)
 import Hetoimasia.GPU.Model.Identity (FrameSlotId, PresentationId, SubmissionId, TargetId, frameTarget, imageIndex, presentationTarget)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment (cleanupSubmission)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (owner)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, failRootsSessionBecause, rootsCall, stateRootsModel)
 
 -- | One bounded owner step: at most the model's progress-action limit of native
 -- calls, each recorded in the same masked step that made it.
@@ -97,7 +98,12 @@ progressFrames frames now = owner recording $ do
   retired ← newIORef []
   cleanups ← newIORef []
   settled ← newIORef []
-  device ← atomically (deviceOf frames)
+  -- After the device's loss no fence is asked: one that answers may answer
+  -- for a device that no longer runs anything, and none of it would be
+  -- completion. The device-loss release is what lets go of it.
+  device ← atomically $ do
+    lost ← lossObserved frames
+    if lost then pure Nothing else deviceOf frames
   for_ device $ \(handle, family) → do
     -- The step's work, as one list rotated to start one place further on
     -- each step: a budget smaller than the work still reaches every piece of
@@ -110,8 +116,12 @@ progressFrames frames now = owner recording $ do
         passes done used = do
           work ← take (fromIntegral (limit - used)) <$> pending done
           unless (null work) $ do
-            mapM_ perform work
-            passes (map workKey work <> done) (used + fromIntegral (length work))
+            -- A call this step made may itself have lost the device, and then
+            -- nothing more is asked of it: the rest of the work waits for the
+            -- device-loss release.
+            mapM_ (\piece → atomically (lossObserved frames) >>= \lost → unless lost (perform piece)) work
+            lost ← atomically (lossObserved frames)
+            unless lost (passes (map workKey work <> done) (used + fromIntegral (length work)))
         perform = \case
           ObserveSubmission submission record → do
             fence ← fmap syncFence . Map.lookup (submissionSlot record) <$> readTVarIO (framesSlots frames)
@@ -288,7 +298,11 @@ drainWaitLimit = either (error . show) id (durationFromNanoseconds AllowZero 100
 awaitFrames ∷ Frames q inst msgr phys dev cmd → Instant → Duration → IO Progress
 awaitFrames frames now timeout = do
   owner (framesRecording frames) $ do
-    device ← atomically (deviceOf frames)
+    -- Nothing is waited on after the device's loss: the fence may never
+    -- signal.
+    device ← atomically $ do
+      lost ← lossObserved frames
+      if lost then pure Nothing else deviceOf frames
     for_ device $ \(handle, _) → do
       cursor ← readTVarIO (framesCursor frames)
       waited ← atomically $ do
@@ -318,6 +332,11 @@ awaitFrames frames now timeout = do
 -- and fails the session.
 retireTargetFrames ∷ Frames q inst msgr phys dev cmd → TargetId → IO ()
 retireTargetFrames frames target = owner (framesRecording frames) $ do
+  -- Once the device is lost, what it could have discharged is let go of
+  -- first, under the device-loss rule, and the synchronization below is then
+  -- destroyed without waiting for any of it.
+  lost ← atomically (lossObserved frames)
+  when lost (void (releaseFramesToDeviceLoss frames))
   live ← Map.keys . Map.filterWithKey (\frame _ → frameTarget frame == target) <$> readTVarIO (framesLive frames)
   presentations ← Map.keys . Map.filterWithKey (\presentation _ → presentationTarget presentation == target) <$> readTVarIO (framesPresentations frames)
   slots ← Map.toAscList . Map.filterWithKey (\(owner', _) _ → owner' == target) <$> readTVarIO (framesSlots frames)
@@ -325,7 +344,7 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
   device ← atomically (deviceOf frames)
   let quiet = null live && null presentations
   slotFailures ← fmap concat . forM slots $ \(key, sync) → case device of
-    Just (handle, _) | quiet, idleSlot sync → mask_ $ do
+    Just (handle, _) | quiet, idleSlot lost sync → mask_ $ do
       outcome ←
         tryWithContext @SomeException $ do
           rootsCall roots "vkDestroySemaphore" (opsDestroySemaphore ops handle (syncAcquire sync))
@@ -336,12 +355,12 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
         Left failure@(ExceptionWithContext _ exception) → do
           let reason = "destroying the slot's synchronization raised: " <> Text.pack (displayException exception)
           atomically $ do
-            editSlot frames key (\entry → entry {syncFenceState = FenceUncertain reason, syncCleanupState = FenceUncertain reason})
-            failRootsSession roots CleanupFailed
+            editSlot frames key (\entry → entry {syncFenceState = FenceUncertain reason, syncCleanupState = FenceUncertain reason, syncDestruction = Just reason})
+            failRootsSessionBecause roots CleanupFailed reason
           pure [failure]
     _ → pure []
   poolFailures ← fmap concat . forM pool $ \(key, sync) → case device of
-    Just (handle, _) | quiet, idlePool sync → mask_ $ do
+    Just (handle, _) | quiet, idlePool lost sync → mask_ $ do
       outcome ←
         tryWithContext @SomeException $ do
           rootsCall roots "vkDestroySemaphore" (opsDestroySemaphore ops handle (poolRendered sync))
@@ -351,8 +370,8 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
         Left failure@(ExceptionWithContext _ exception) → do
           let reason = "destroying the presentation-pool record raised: " <> Text.pack (displayException exception)
           atomically $ do
-            editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason, poolRenderedState = SemaphoreUncertain reason})
-            failRootsSession roots CleanupFailed
+            editPool frames key (\entry → entry {poolFenceState = FenceUncertain reason, poolRenderedState = SemaphoreUncertain reason, poolDestruction = Just reason})
+            failRootsSessionBecause roots CleanupFailed reason
           pure [failure]
     _ → pure []
   for_ (slotFailures <> poolFailures) rethrowIO
@@ -363,14 +382,23 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
   where
     roots = framesRoots frames
     ops = framesOps frames
-    idleSlot sync =
-      syncAcquireState sync == SemaphoreUnsignalled
-        && syncFenceState sync `elem` [FenceIdle, FenceSignalled]
-        && syncCleanupState sync `elem` [FenceIdle, FenceSignalled]
-    idlePool sync =
-      poolHolder sync == PoolFree
-        && poolRenderedState sync == SemaphoreUnsignalled
-        && poolFenceState sync `elem` [FenceIdle, FenceSignalled]
+    -- Under the device-loss rule a fence or a semaphore is destroyed whatever
+    -- it was owed, since that may never arrive; one whose destruction already
+    -- raised may already be gone, and is destroyed under no rule.
+    idleSlot lost sync
+      | isJust (syncDestruction sync) = False
+      | lost = True
+      | otherwise =
+          syncAcquireState sync == SemaphoreUnsignalled
+            && syncFenceState sync `elem` [FenceIdle, FenceSignalled]
+            && syncCleanupState sync `elem` [FenceIdle, FenceSignalled]
+    idlePool lost sync
+      | isJust (poolDestruction sync) = False
+      | lost = poolHolder sync == PoolFree
+      | otherwise =
+          poolHolder sync == PoolFree
+            && poolRenderedState sync == SemaphoreUnsignalled
+            && poolFenceState sync `elem` [FenceIdle, FenceSignalled]
 
 -- | One piece of a progress step's work.
 data Work

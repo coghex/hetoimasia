@@ -56,6 +56,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , framesRoots
   , framesGenerations
   , readModel
+  , lossObserved
   , deviceOf
   , editSlot
   , editPool
@@ -76,14 +77,14 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model (GpuModel, Outcome (..), PresentOutcome, SessionFailureCause, frameView)
+import Hetoimasia.GPU.Model (GpuModel, Outcome (..), PresentOutcome, SessionFailureCause, deviceLossObserved, frameView)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
 import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), ImageId, Misuse (..), PresentationId, SubmissionId, TargetId, frameSlotNumber, frameTarget)
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Recording (..))
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, failRootsSession, readRootsDevice, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, failRootsSessionBecause, readRootsDevice, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -101,6 +102,10 @@ data FenceState
     -- ^ It signalled: the submission that carried it has completed.
   | FenceUncertain !Text
     -- ^ A call on it raised; nothing uses it again.
+  | FenceLost
+    -- ^ It was pending when the device was lost. It may never signal, it is
+    -- never asked or waited on again, and it was not signalled: only the
+    -- device-loss rule lets it be destroyed.
   deriving (Eq, Show)
 
 -- | Where one binary semaphore stands. It is waited on only while a signal is
@@ -114,6 +119,9 @@ data SemaphoreState
   | SemaphoreWaitOwed
     -- ^ A submission waits on it; its fence is pending.
   | SemaphoreUncertain !Text
+  | SemaphoreLost
+    -- ^ A signal or a wait was owed when the device was lost; neither will be
+    -- observed, and only the device-loss rule lets it be destroyed.
   deriving (Eq, Show)
 
 -- | One frame slot's synchronization: its acquisition semaphore, the fence of
@@ -130,6 +138,9 @@ data SlotSync = SlotSync
   , syncFenceState ∷ !FenceState
   , syncCleanup ∷ !Word64
   , syncCleanupState ∷ !FenceState
+  , syncDestruction ∷ !(Maybe Text)
+    -- ^ Destroying the three raised: what raised. They may already be gone, so
+    -- they are never destroyed again, under any rule.
   }
   deriving (Eq, Show)
 
@@ -161,6 +172,9 @@ data PoolSync = PoolSync
   , poolFence ∷ !Word64
   , poolFenceState ∷ !FenceState
   , poolHolder ∷ !PoolHolder
+  , poolDestruction ∷ !(Maybe Text)
+    -- ^ Destroying the two raised: what raised. They are never destroyed
+    -- again, under any rule.
   }
   deriving (Eq, Show)
 -- | Where one frame this owner acquired stands.
@@ -188,6 +202,11 @@ data FrameStage
     -- ^ A native effect whose bookkeeping did not commit, or whose outcome is
     -- unknown — a submission's or a presentation's. Everything is retained and
     -- the session has failed.
+  | StageLost
+    -- ^ Skipped after the device was lost: its unsubmitted recording was
+    -- invalidated and the model skipped it, and no cleanup submission was
+    -- made, since the lost device would never complete one. The device-loss
+    -- release lets it go.
   deriving (Eq, Show)
 
 data FrameRecord = FrameRecord
@@ -458,6 +477,12 @@ readPresentations frames =
 readModel ∷ Frames q inst msgr phys dev cmd → STM GpuModel
 readModel frames = stateRootsModel (framesRoots frames) (\model → (model, model))
 
+-- | Whether the session's device has been lost — whatever failed the session
+-- first. From then on the frames make no cleanup submission, ask no fence and
+-- wait for nothing: the device-loss rule governs their teardown.
+lossObserved ∷ Frames q inst msgr phys dev cmd → STM Bool
+lossObserved frames = deviceLossObserved <$> readModel frames
+
 -- | The live device and the one queue family every target shares.
 deviceOf ∷ Frames q inst msgr phys dev cmd → STM (Maybe (dev, Word32))
 deviceOf frames = fmap (\(plan, device) → (device, planQueueFamily plan)) <$> readRootsDevice (framesRoots frames)
@@ -490,7 +515,7 @@ freePoolOf frames frame =
 uncertain ∷ Frames q inst msgr phys dev cmd → SessionFailureCause → [FrameSlotId] → Text → STM ()
 uncertain frames cause members reason = do
   mapM_ (\frame → editFrame frames frame (\record → record {recordStage = StageUncertain reason})) members
-  failRootsSession (framesRoots frames) cause
+  failRootsSessionBecause (framesRoots frames) cause reason
 
 -- | The classification of a frame this owner holds no frame record of. One it
 -- presented is the presentation's now, and in the wrong phase for anything

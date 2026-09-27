@@ -128,6 +128,20 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , latchDeviceLoss
   , checkRoots
 
+    -- * The terminal latch
+  , TerminalCause (..)
+  , TeardownEvidence (..)
+  , TerminalReport (..)
+  , GraphicsSessionFailed (..)
+  , DiagnosticAlarm (..)
+  , terminalEvidenceLimit
+  , latchTerminal
+  , noteTeardownEvidence
+  , watchRootsDiagnostics
+  , checkpointRoots
+  , readRootsTerminal
+  , terminalFailure
+
     -- * Retirement
   , retireRoots
   , destroyRoots
@@ -152,6 +166,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , rootsCall
   , stateRootsModel
   , failRootsSession
+  , failRootsSessionBecause
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
@@ -164,9 +179,10 @@ import Control.Exception
   , mask_
   , rethrowIO
   , throwIO
+  , toException
   , tryWithContext
   )
-import Control.Monad (unless, when)
+import Control.Monad (join, unless, when)
 import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -178,15 +194,20 @@ import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
 import Hetoimasia.GPU.Model
-  ( GpuModel
+  ( Escalation (..)
+  , GpuModel
   , Outcome (..)
   , SessionFailureCause (..)
+  , SessionState (..)
   , TargetView (viewTargetGenerations)
   , admitTarget
   , closeTarget
   , escalateSession
+  , escalations
   , newGpuModel
+  , noteDeviceLoss
   , runProgressTurn
+  , sessionState
   , silentEvidence
   , targetView
   )
@@ -354,6 +375,12 @@ data Roots q inst msgr phys dev = Roots
   , rootsModel ∷ !(TVar GpuModel)
   , rootsAdmitting ∷ !(TVar Bool)
   , rootsLoss ∷ !(TVar (Maybe GraphicsDeviceLost))
+    -- ^ The first loss observed, whatever failed the session first.
+  , rootsTerminal ∷ !(TVar TerminalReport)
+    -- ^ The terminal latch: the primary failure and what teardown found after
+    -- it.
+  , rootsWatch ∷ !(TVar (IO [DiagnosticAlarm]))
+    -- ^ What a checkpoint asks of the diagnostic capture.
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
@@ -381,6 +408,8 @@ newRoots ops budgets clock = do
     <*> newTVarIO model
     <*> newTVarIO True
     <*> newTVarIO Nothing
+    <*> newTVarIO (TerminalReport Nothing Nothing [] 0)
+    <*> newTVarIO (pure [])
     <*> newTVarIO False
     <*> newTVarIO False
     <*> pure session
@@ -672,20 +701,215 @@ guarded roots during call =
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
 
--- | Latch a device loss: close admission and fail the model's session in one
--- transaction. The first loss is kept.
+-- | Latch a device loss: close admission, fail the model's session and record
+-- the loss in it, in one transaction. The first loss is kept, and so is any
+-- earlier primary failure: the loss is then recorded beside it, and what it
+-- changes is the rules the teardown follows.
 latchDeviceLoss ∷ Roots q inst msgr phys dev → GraphicsDeviceLost → IO ()
-latchDeviceLoss roots loss = atomically $ do
-  held ← readTVar (rootsLoss roots)
-  unless (isJust held) (writeTVar (rootsLoss roots) (Just loss))
-  writeTVar (rootsAdmitting roots) False
-  modifyTVar' (rootsModel roots) (escalateSession DeviceLost)
+latchDeviceLoss roots loss = atomically (latchTerminal roots (TerminalDeviceLost loss))
 
--- | Raise the latched device loss, if there is one. It is what a progress
--- step calls, so an owner whose loss was latched outside a call it made
--- still ends its run with the loss as its failure.
+-- | A checkpoint that raises: the latched primary failure, if there is one —
+-- the loss as itself, anything else as 'GraphicsSessionFailed'. It is what a
+-- progress step calls, so an owner whose failure was latched outside a call
+-- it made still ends its run with that failure.
 checkRoots ∷ Roots q inst msgr phys dev → IO ()
-checkRoots roots = readTVarIO (rootsLoss roots) >>= maybe (pure ()) throwIO
+checkRoots roots = checkpointRoots roots >>= maybe (pure ()) (throwIO . terminalFailure)
+
+-- ---------------------------------------------------------------------------
+-- The terminal latch
+
+-- | Why a graphics session ended.
+data TerminalCause
+  = TerminalDeviceLost !GraphicsDeviceLost
+    -- ^ A queue or device call answered @VK_ERROR_DEVICE_LOST@ (D-17).
+  | TerminalValidationError
+    -- ^ The diagnostic capture latched an error-severity report (D-20). The
+    -- report itself is the capture's, and its verdict carries it.
+  | TerminalSinkFailed !Text
+    -- ^ The diagnostic consumer's sink failed (D-19): a terminal status of its
+    -- own, never a graphics failure's replacement.
+  | TerminalUncertainEffect !Text
+    -- ^ A native effect whose outcome is unknown; what it concerns is retained.
+  | TerminalCleanupFailed !Text
+    -- ^ A cleanup that raised; what it concerns is retained, never retried.
+  | TerminalRequiredTarget !(Maybe TargetId)
+    -- ^ A required target's recovery was exhausted (D-22).
+  deriving (Eq, Show)
+
+-- | Something the teardown found after the primary failure. It joins the
+-- report beside the primary and never displaces it.
+data TeardownEvidence
+  = LaterFailure !TerminalCause
+    -- ^ A failure after the first: a cleanup failure, an uncertain effect, a
+    -- loss observed after another cause, a sink failure.
+  | RetainedUnverified !Text
+    -- ^ Something whose disposal could not be verified, and which is
+    -- therefore retained with every parent it has.
+  deriving (Eq, Show)
+
+-- | The terminal latch as it stands: the primary failure, the device's loss if
+-- it was observed — which may be later than the primary, and is what switches
+-- a teardown to the device-loss rules — and the evidence teardown found after
+-- the primary, oldest first, with how much of it was dropped to keep it
+-- finite.
+data TerminalReport = TerminalReport
+  { reportPrimary ∷ !(Maybe TerminalCause)
+  , reportDeviceLost ∷ !(Maybe GraphicsDeviceLost)
+  , reportEvidence ∷ ![TeardownEvidence]
+  , reportEvidenceDropped ∷ !Natural
+  }
+  deriving (Eq, Show)
+
+-- | How much teardown evidence the latch keeps. The oldest is kept and later
+-- evidence beyond this is counted rather than kept: the first failures after
+-- the primary are the ones that explain it.
+terminalEvidenceLimit ∷ Int
+terminalEvidenceLimit = 64
+
+-- | A terminal failure other than device loss, as a checkpoint raises it.
+newtype GraphicsSessionFailed = GraphicsSessionFailed TerminalCause
+  deriving (Eq, Show)
+
+instance Exception GraphicsSessionFailed where
+  displayException (GraphicsSessionFailed cause) = "the graphics session has failed: " <> Text.unpack (describeCause cause)
+
+-- | The primary failure as a checkpoint raises it: a loss as itself, anything
+-- else as 'GraphicsSessionFailed'.
+terminalFailure ∷ TerminalCause → SomeException
+terminalFailure = \case
+  TerminalDeviceLost loss → toException loss
+  cause → toException (GraphicsSessionFailed cause)
+
+describeCause ∷ TerminalCause → Text
+describeCause = \case
+  TerminalDeviceLost loss → Text.pack (displayException loss)
+  TerminalValidationError → "the validation capture latched an error-severity report"
+  TerminalSinkFailed reason → "the diagnostic sink failed: " <> reason
+  TerminalUncertainEffect reason → "a native effect's outcome is unknown: " <> reason
+  TerminalCleanupFailed reason → "a cleanup did not complete: " <> reason
+  TerminalRequiredTarget target → "the recovery of the required target " <> maybe "" (Text.pack . show) target <> " was exhausted"
+
+-- | What a checkpoint learns from the diagnostic capture.
+data DiagnosticAlarm
+  = AlarmValidationError
+    -- ^ The capture's error latch is set.
+  | AlarmSinkFailed !Text
+    -- ^ The capture's consumer met a sink failure.
+  deriving (Eq, Show)
+
+-- | The model's cause, for a terminal cause.
+modelCause ∷ TerminalCause → SessionFailureCause
+modelCause = \case
+  TerminalDeviceLost _ → DeviceLost
+  TerminalValidationError → ValidationError
+  TerminalSinkFailed _ → DiagnosticSinkFailed
+  TerminalUncertainEffect _ → UnknownSubmissionEffect
+  TerminalCleanupFailed _ → CleanupFailed
+  TerminalRequiredTarget _ → RequiredTargetUnrecoverable
+
+-- | The terminal cause a model's own failure stands for, when the model failed
+-- by itself — a required target's exhausted recovery, or a disposal it
+-- offered that failed — rather than through the latch.
+fromModel ∷ GpuModel → Maybe TerminalCause
+fromModel model = case sessionState model of
+  SessionRunning → Nothing
+  SessionFailed cause → Just $ case cause of
+    DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "the model" "the session's device was lost")
+    ValidationError → TerminalValidationError
+    DiagnosticSinkFailed → TerminalSinkFailed "the diagnostic sink failed"
+    UnknownSubmissionEffect → TerminalUncertainEffect "the model recorded an effect whose outcome is unknown"
+    CleanupFailed → TerminalCleanupFailed "a disposal the model offered failed"
+    RequiredTargetUnrecoverable →
+      TerminalRequiredTarget (case [target | RequiredTargetFailedSession target ← escalations model] of
+        target : _ → Just target
+        [] → Nothing)
+
+-- | Latch a terminal failure, in one transaction: the first is the primary,
+-- and the model's session fails with it; a later one joins the evidence
+-- beside it. Admission closes either way, and a device loss is also recorded
+-- as the loss, however late it came.
+--
+-- A model that failed by itself before anything was latched was first, and
+-- its cause is the primary — unless it is the same kind of failure this one
+-- describes, which is then the primary with its detail: a transition that
+-- recorded an uncertain effect in the model and the latch that says what the
+-- effect was are one failure, not two.
+latchTerminal ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
+latchTerminal roots cause = do
+  model ← readTVar (rootsModel roots)
+  report ← readTVar (rootsTerminal roots)
+  case reportPrimary report of
+    Nothing → do
+      let primary = case fromModel model of
+            Just first | modelCause first /= modelCause cause → first
+            _ → cause
+      writeTVar (rootsTerminal roots) report {reportPrimary = Just primary}
+      unless (primary == cause) (noteTeardownEvidence roots (LaterFailure cause))
+    Just primary → unless (primary == cause) (noteTeardownEvidence roots (LaterFailure cause))
+  writeTVar (rootsAdmitting roots) False
+  case cause of
+    TerminalDeviceLost loss → do
+      held ← readTVar (rootsLoss roots)
+      unless (isJust held) (writeTVar (rootsLoss roots) (Just loss))
+      modifyTVar' (rootsTerminal roots) (\current → current {reportDeviceLost = Just (maybe loss id (reportDeviceLost current))})
+      modifyTVar' (rootsModel roots) noteDeviceLoss
+    _ → modifyTVar' (rootsModel roots) (escalateSession (modelCause cause))
+
+-- | Keep one piece of teardown evidence beside the primary, within
+-- 'terminalEvidenceLimit'. The same evidence twice is kept once.
+noteTeardownEvidence ∷ Roots q inst msgr phys dev → TeardownEvidence → STM ()
+noteTeardownEvidence roots evidence =
+  modifyTVar' (rootsTerminal roots) $ \report →
+    if evidence `elem` reportEvidence report
+      then report
+      else
+        if length (reportEvidence report) >= terminalEvidenceLimit
+          then report {reportEvidenceDropped = reportEvidenceDropped report + 1}
+          else report {reportEvidence = reportEvidence report <> [evidence]}
+
+-- | Install what a checkpoint asks of the diagnostic capture. Roots with none
+-- installed hear no alarm.
+watchRootsDiagnostics ∷ Roots q inst msgr phys dev → IO [DiagnosticAlarm] → STM ()
+watchRootsDiagnostics roots = writeTVar (rootsWatch roots)
+
+-- | A safe owner checkpoint: ask the diagnostic capture for its alarms and
+-- latch each — an error-severity report as 'TerminalValidationError', a sink
+-- failure as 'TerminalSinkFailed' — take a failure the model recorded by
+-- itself as the primary if nothing was latched before it, and answer the
+-- primary. It raises nothing, calls nothing native, and waits for nothing.
+--
+-- Only the owner's ordinary operations checkpoint. Retirement does not: it
+-- runs because the session has failed, and a checkpoint there would only
+-- rethrow that.
+checkpointRoots ∷ Roots q inst msgr phys dev → IO (Maybe TerminalCause)
+checkpointRoots roots = do
+  alarms ← join (readTVarIO (rootsWatch roots))
+  atomically $ do
+    mapM_
+      ( latchTerminal roots . \case
+          AlarmValidationError → TerminalValidationError
+          AlarmSinkFailed reason → TerminalSinkFailed reason
+      )
+      alarms
+    report ← readTVar (rootsTerminal roots)
+    case reportPrimary report of
+      Just primary → pure (Just primary)
+      Nothing → do
+        model ← readTVar (rootsModel roots)
+        case fromModel model of
+          Nothing → pure Nothing
+          Just first → do
+            latchTerminal roots first
+            pure (Just first)
+
+-- | The terminal latch, as any thread may read it. A failure the model
+-- recorded by itself and no checkpoint has latched yet is answered as the
+-- primary it will be.
+readRootsTerminal ∷ Roots q inst msgr phys dev → STM TerminalReport
+readRootsTerminal roots = do
+  report ← readTVar (rootsTerminal roots)
+  model ← readTVar (rootsModel roots)
+  pure (maybe report {reportPrimary = fromModel model} (const report) (reportPrimary report))
 
 -- ---------------------------------------------------------------------------
 -- Retirement
@@ -870,12 +1094,21 @@ stateRootsModel roots = stateTVar (rootsModel roots)
 
 -- | Enter the session-level safety failure: an effect whose outcome is
 -- unknown, or a cleanup that failed. Admission closes and the model's session
--- fails with the cause, in one transaction; nothing is rolled back, and every
--- parent of what is unverified stays retained.
+-- fails with the cause, in one transaction, through the terminal latch;
+-- nothing is rolled back, and every parent of what is unverified stays
+-- retained.
 failRootsSession ∷ Roots q inst msgr phys dev → SessionFailureCause → STM ()
-failRootsSession roots cause = do
-  writeTVar (rootsAdmitting roots) False
-  modifyTVar' (rootsModel roots) (escalateSession cause)
+failRootsSession roots cause = failRootsSessionBecause roots cause (Text.pack (show cause))
+
+-- | 'failRootsSession', saying what failed.
+failRootsSessionBecause ∷ Roots q inst msgr phys dev → SessionFailureCause → Text → STM ()
+failRootsSessionBecause roots cause reason = latchTerminal roots $ case cause of
+  DeviceLost → TerminalDeviceLost (GraphicsDeviceLost "a native call" reason)
+  ValidationError → TerminalValidationError
+  DiagnosticSinkFailed → TerminalSinkFailed reason
+  UnknownSubmissionEffect → TerminalUncertainEffect reason
+  CleanupFailed → TerminalCleanupFailed reason
+  RequiredTargetUnrecoverable → TerminalRequiredTarget Nothing
 
 -- | The live instance, for the caller that leases it to a surface bridge.
 readRootsInstance ∷ Roots q inst msgr phys dev → STM (Maybe inst)

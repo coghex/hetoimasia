@@ -189,6 +189,9 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , Progress (..)
   , retireTargetFrames
 
+    -- * Device loss
+  , releaseFramesToDeviceLoss
+
     -- * Observation
   , FrameStage (..)
   , FrameStanding (..)
@@ -220,6 +223,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
   , skipFrame
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (tryAcquireFrame)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
   ( AcquireResult (..)
   , FrameOps (..)
