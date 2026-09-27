@@ -24,6 +24,10 @@
 --   present fences, a resized window's old generation retired only on that
 --   evidence, the first window closed while the second keeps presenting, and
 --   the session retired with every fence observed (#227);
+-- * @vk14-recovery@ — VK-14's recovery: a lost surface and its swapchain
+--   replaced on the same live window while a second window keeps presenting,
+--   and an allocation that ran out of memory recovered by reclaiming a
+--   retired generation (#229);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -71,6 +75,7 @@ import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
+import qualified Test.GPU.Vulkan.Native.Recovery as Recovery
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
@@ -140,6 +145,12 @@ scenarios =
       $ \_ journal → do
         outcome ← Presentation.runPresentation journal
         pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
+  , Scenario
+      "vk14-recovery"
+      "replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing"
+      $ \_ journal → do
+        outcome ← Recovery.runRecovery journal
+        pure (Recovery.spec outcome, section "The VK-14 recovery record" (Recovery.recoverySection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

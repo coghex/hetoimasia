@@ -250,6 +250,8 @@ spec = describe "Allocation recovery" $ do
         AcquisitionPending PendingSurfaceLost → pure ()
         other → expectationFailure ("the acquisition answered " <> show other)
       length . filter isAcquisition <$> frameCalls (rigStandIn rig) `shouldReturn` before
+      -- Nothing of the lost acquisition is held: the target's frames retire.
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
       clean rig
 
     it "keeps a presentation that answered the surface lost enqueued, and retires its generation only once its present fence has" $ do

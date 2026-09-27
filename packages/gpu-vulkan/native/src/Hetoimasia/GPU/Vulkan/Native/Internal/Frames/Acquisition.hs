@@ -190,7 +190,11 @@ tryAcquireFrame frames target =
               when suboptimal (void (noteSwapchainResult generations generation SwapchainSuboptimal))
               pure (Right (AcquisitionOwned (OwnedFrame frame image suboptimal)))
         Right ReservationReturned → pure (Right (AcquisitionPending PendingNoImage))
-        Right ReplacementRequested → case result of
+        -- The model gave the reservation back, its pool record with it; the
+        -- native record it was bound to is freed untouched too, as any given-
+        -- back reservation's is, or it would stay bound to a frame that no
+        -- longer exists and hold the target's retirement back for ever.
+        Right ReplacementRequested → freePoolOf frames frame >> case result of
           AcquiringOutOfDate → do
             void (noteSwapchainResult generations generation SwapchainOutOfDate)
             pure (Right (AcquisitionPending PendingReplacement))
