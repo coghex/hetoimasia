@@ -94,6 +94,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , rootsCall
   , rootsGenerationOps
   , stateRootsModel
+  , syncRootsDiagnostics
   )
 
 -- | Reconcile one target with its latest geometry. Answers the generation it
@@ -213,7 +214,11 @@ reconcile generations now target geometry = do
         _ →
           atomically unretiredRemains >>= \case
             True → pure Nothing
-            False →
+            False → do
+              -- Asking for an attempt may find the episode spent, which
+              -- exhausts a required target: what the capture already holds is
+              -- latched first.
+              syncRootsDiagnostics roots
               atomically (modelEdit (beginTargetRecovery now target)) >>= \case
                 Just (RecoveryAttempt _) → do
                   atomically (modifyRecord (\entry → entry {recordRecovering = True}))
@@ -411,6 +416,10 @@ reconcile generations now target geometry = do
       () <$ setCondition (ConstructionFailed reason)
     settleRecovery succeeded = do
       recovering ← maybe False recordRecovering <$> lookupRecordIO
+      -- A failed attempt may exhaust a required target, which fails the
+      -- session in the model by itself: what the capture already holds is
+      -- latched first.
+      when (recovering && not succeeded) (syncRootsDiagnostics roots)
       when recovering $ atomically $ do
         if succeeded
           then modelEdit_ (recordRecoverySuccess target)

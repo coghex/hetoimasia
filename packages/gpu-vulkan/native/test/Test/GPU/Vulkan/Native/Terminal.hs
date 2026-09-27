@@ -18,12 +18,12 @@
 -- device is lost natively and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (SomeException, throwIO, toException)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty ((:|)))
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model
   ( DeviceLossRelease (..)
@@ -221,6 +221,25 @@ spec = describe "Terminal failure" $ do
         _ → False
       clean rig
 
+    it "keeps a validation error reported inside a submission whose effect is then unknown as the primary" $ do
+      rig ← newRig
+      frame ← owned rig
+      batch ← sealed rig frame
+      -- The submission's own checkpoint reads nothing; the error is reported
+      -- from inside the call, which then raises with an effect the frames
+      -- cannot know.
+      looks ← newTVarIO (0 ∷ Int)
+      atomically $
+        watchRootsDiagnostics (rigRoots rig) $ do
+          seen ← atomically (stateTVar looks (\count → (count, count + 1)))
+          pure [AlarmValidationError | seen > 0]
+      failFrameStep (rigStandIn rig) AtSubmit
+      submitFrames (rigFrames rig) (batch :| []) `raises` \(FrameEffectUncertain {}) → True
+      primaryIs rig (== TerminalValidationError)
+      evidenceOf rig `shouldReturn'` (`shouldSatisfy` \case [LaterFailure (TerminalUncertainEffect _)] → True; _ → False)
+      _ ← closeTargetFrames (rigFrames rig) (rigTarget rig)
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → frames == [ownedFrame frame]
+
   describe "diagnostic alarms at a checkpoint" $ do
     it "latches a validation error the capture reported, refusing the next rendering with no native call" $ do
       rig ← newRig
@@ -297,6 +316,34 @@ spec = describe "Terminal failure" $ do
       tryAcquireFrame (rigFrames rig) healthy `shouldReturn` Left (RefusedSessionFailed (TerminalRequiredTarget (Just required)))
       clean rig
 
+    it "keeps a validation error the capture held before the step that would exhaust a required target as the primary, and recovers no further" $ do
+      rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
+      (required, healthy) ← twoTargets rig
+      -- The error reaches the capture, and no checkpoint reads it, before the
+      -- step that exhausts the required target.
+      alarms ← newTVarIO []
+      atomically (watchRootsDiagnostics (rigRoots rig) (readTVarIO alarms))
+      exhaustRecoveryAfter rig required (atomically (writeTVar alarms [AlarmValidationError]))
+      -- The error was latched before the attempt that would have spent the
+      -- episode, so the session had failed and recovery went no further.
+      primaryIs rig (== TerminalValidationError)
+      evidenceOf rig `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed ValidationError
+      viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
+      tryAcquireFrame (rigFrames rig) healthy `shouldReturn` Left (RefusedSessionFailed TerminalValidationError)
+      clean rig
+
+    it "keeps a required target's exhausted recovery as the primary when a validation error follows it" $ do
+      rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
+      (required, healthy) ← twoTargets rig
+      alarms ← newTVarIO []
+      atomically (watchRootsDiagnostics (rigRoots rig) (readTVarIO alarms))
+      exhaustRecovery rig required
+      atomically (writeTVar alarms [AlarmValidationError])
+      tryAcquireFrame (rigFrames rig) healthy `shouldReturn` Left (RefusedSessionFailed (TerminalRequiredTarget (Just required)))
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
     it "leaves another healthy target rendering when an optional target's recovery is exhausted" $ do
       rig ← newRigClassed [OptionalTarget, OptionalTarget] defaultBudgetRequest
       (optional, healthy) ← twoTargets rig
@@ -362,14 +409,24 @@ tornDownUnderLoss rig = do
 -- geometry, each a recovery attempt, until the episode is spent.
 exhaustRecovery ∷ Rig → TargetId → IO ()
 exhaustRecovery rig target = do
-  forM_ (zip [20 ..] [SwapchainOutOfDate, SwapchainSuboptimal, SwapchainOutOfDate, SwapchainOutOfDate, SwapchainSuboptimal]) $ \(instant, result) → do
+  exhaustRecoveryAfter rig target (pure ())
+  viewCondition <$> generationsOn rig target `shouldReturn` RecoverySpent
+
+-- | Exhaust a target's recovery, running an action just before the step that
+-- spends its episode: the step after the fourth result, whose attempt is the
+-- episode's last.
+exhaustRecoveryAfter ∷ Rig → TargetId → IO () → IO ()
+exhaustRecoveryAfter rig target beforeSpending = do
+  forM_ (zip3 [0 ∷ Int ..] [20 ..] [SwapchainOutOfDate, SwapchainSuboptimal, SwapchainOutOfDate, SwapchainOutOfDate, SwapchainSuboptimal]) $ \(index, instant, result) → do
     active ← activeGenerationOn rig target
     _ ← atomically (noteSwapchainResult (rigGenerations rig) active result)
+    when (index == 3) $ do
+      sessionState <$> modelOf rig `shouldReturn` SessionRunning
+      beforeSpending
     step instant
     step instant
   -- Past every recovery delay.
   step 5000
-  viewCondition <$> generationsOn rig target `shouldReturn` RecoverySpent
   where
     step instant = void (stepGenerations (rigGenerations rig) (at instant) (geometries (rigTargets rig) (SurfaceExtent 640 480)))
 

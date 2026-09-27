@@ -1335,7 +1335,18 @@ as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
 failure the model recorded by itself before anything was latched is the primary
 it stands for, and one that describes the same failure as the model's cause —
 an uncertain submission the model recorded and the step that says what it was —
-is one failure, with the step's detail. The device's loss is also kept apart
+is one failure, with the step's detail. Because a validation report or a sink
+failure can reach the capture between two checkpoints, the owner latches what
+the capture already holds (`syncRootsDiagnostics`) immediately before it
+records a failure the model would take by itself — asking for or settling a
+recovery attempt that may exhaust a required target, and recording a
+submission whose effect is unknown — so a diagnostic failure that happened
+first stays the primary and the owner's failure joins the evidence; a
+required target's recovery then goes no further, since the session has
+already failed. A failure that has claimed the capture's order but not yet
+published its alarm is waited for there, briefly, since its publication
+follows the claim at once; this is not a checkpoint and refuses nothing. The
+device's loss is also kept apart
 from the primary (`reportDeviceLost`), whenever it is observed: a session that
 a validation error failed first and whose teardown then meets the loss keeps
 the validation error as its primary and switches that teardown to the
@@ -1686,9 +1697,13 @@ acquisition with `RefusedDiagnosticPending`, latching nothing and leaving the
 model running, until the capture's alarms name the sink failure as the primary
 with the error beside it; a sink failure latched as a status of its own,
 authorizing no release, and a sink failure and a validation error after a loss joining the
-evidence behind it; and a required target's exhausted recovery failing the
+evidence behind it; a required target's exhausted recovery failing the
 session and refusing the other target, while an optional target's leaves the
-other rendering. The model's own suite adds `Device loss`: the loss kept beside
+other rendering; a validation error in the capture before the step that would
+exhaust a required target kept as the primary, with recovery going no further,
+and one that follows the exhaustion kept behind it; and a validation error
+reported inside a submission that then raised with an unknown effect kept as
+the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
 an earlier cause, the release refused before the loss, a submission and a
 presentation released without being completed or retired and their cycle
 dropped uncredited, an uncertain effect retained until the loss, an acquired
