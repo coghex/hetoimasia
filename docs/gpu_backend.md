@@ -418,7 +418,9 @@ nothing, and the package's public module does not offer one.
   `ConstructionFailed`. The next construction is a fresh one — never passed the
   retired handle, never replaying the failed call — and a recovery attempt. It
   begins only once every swapchain of the target that Vulkan still counts as
-  unretired has been destroyed, so a failed candidate that was created goes
+  unretired has been destroyed, and, since it hands nothing over, every
+  retired chain still standing too — the one the failed replacement handed over
+  included, however long its holds keep it (VK-14), so a failed candidate that was created goes
   first, and so does an old generation a cancelled replacement never handed
   over; a retry that must wait for one spends no recovery attempt.
 - **A newer resize during a replacement** is not lost: the replacement publishes
@@ -1355,7 +1357,9 @@ changes nothing and never reaches the replacement. Then, on the owner's thread:
    roots ask `vkGetPhysicalDeviceSurfaceSupportKHR` of the session's one queue
    family and install it (`installRootSurface`), and the next step builds a
    fresh generation on it — handing nothing over — whose publication settles
-   the attempt as a success, or whose failure spends the next.
+   the attempt as a success, or whose failure spends the next. A loss the
+   replacement's own query reports before then fails that attempt with it, so
+   the episode admits the next, or is spent.
 
 | What the replacement came to | What happens |
 | --- | --- |
@@ -1758,7 +1762,11 @@ spending nothing while a repeated failure at unchanged geometry spends the
 episode; a lost surface taken from a generation already retired, and a late
 report about it never reaching the replacement; and a creation's retry that
 raised device loss, latched and raised, or a lost surface, replaced, rather
-than either being read as a failed retry. `Allocation recovery`, over the
+than either being read as a failed retry; an attempt in flight failed when the
+replacement surface's own query reports it lost, the next admitted after its
+delay; and a fresh construction kept waiting, charging nothing, while the chain
+a failed replacement handed over is still held, then created only after that
+chain's destruction. `Allocation recovery`, over the
 frames' rig, covers: a creation that
 ran out of memory made once more after one pass reclaimed a retired
 generation; no retry without progress, the original failure reported with the

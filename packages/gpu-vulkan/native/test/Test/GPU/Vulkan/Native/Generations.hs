@@ -959,6 +959,45 @@ spec = describe "Generations" $ do
         viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
         destroyed rig >>= (`shouldSatisfy` elem (DestroyedSwapchain 100))
 
+    it "fails the attempt in flight when the replacement surface's own query reports it lost, and admits the next through the episode" $ do
+      rig ← lostAndReleased
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      script (rigStandIn rig) AtSurfaceOffer (AnswersOnce FailedSurfaceLost)
+      -- Nothing was built on it, so the same step lets the lost replacement
+      -- go, and the next attempt waits its delay rather than being refused as
+      -- outstanding, asking for no step now.
+      wantedAt rig 4 `shouldReturn` []
+      wantedAt rig 5 `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 104)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      surfacesDestroyed rig `shouldReturn` [DestroyedSurface 10, DestroyedSurface 20]
+      wantedAt rig 104 `shouldReturn` [rigTarget rig]
+      recoveryAttempts rig `shouldReturn` 2
+
+    it "keeps a fresh construction waiting while the chain a failed replacement handed over is still held, and destroys it first" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedNativeWindowInUse)
+      resize rig 10 800 600
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      -- Held, the retired chain stays, and nothing fresh is created or
+      -- charged, however long the episode's delays run.
+      forM_ [40, 200, 700, 2000] $ \instant → stepAt rig instant (seen 800 600)
+      length . filter isCreated <$> swapchainCalls rig `shouldReturn` 2
+      recoveryAttempts rig `shouldReturn` 0
+      atomically (endGenerationUse (rigGenerations rig) use)
+      stepAt rig 2100 (seen 800 600)
+      later ← swapchainCalls rig
+      [call | call ← later, isDestroyedSwapchain call || isCreated call]
+        `shouldBe` [ CreatedSwapchain 100 10 (640, 480) Nothing
+                   , CreatedSwapchain 104 10 (800, 600) (Just 100)
+                   , DestroyedSwapchain 100
+                   , CreatedSwapchain 105 10 (800, 600) Nothing
+                   ]
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
     it "tells an ordinary resize, which spends nothing, from a repeated failure at unchanged geometry, which spends the episode" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)

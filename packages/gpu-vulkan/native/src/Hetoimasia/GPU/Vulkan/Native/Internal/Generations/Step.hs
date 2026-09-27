@@ -116,5 +116,6 @@ releasable model (target, record) =
   recordSurfaceLost record
     && Map.null (recordGenerations record)
     && recordCondition record == SurfaceLost
+    && not (recordRecovering record)
     && sessionState model == SessionRunning
     && maybe False ((`notElem` [TargetRetiring, TargetUnavailable]) . viewTargetPhase) (targetView target model)

@@ -246,16 +246,22 @@ reconcile generations now target geometry = do
                 -- settlement in this same step, so there is nothing to begin.
                 _ → pure Nothing
     -- Every swapchain Vulkan still counts as unretired, other than the active
-    -- one a construction hands over, must be gone before a fresh one is made
-    -- for the same surface.
+    -- one a construction hands over, must be gone before a new one is made for
+    -- the same surface. A fresh construction — one with no active generation
+    -- to hand over, as after a failed replacement — also waits for every
+    -- retired chain still standing, the one that failed replacement handed
+    -- over included, however long its holds keep it: its images are finished
+    -- or abandoned and it is destroyed before a creation with a null
+    -- @oldSwapchain@ (VK-14).
     unretiredRemains = do
       record ← lookupRecord
       pure $ case record of
         Nothing → True
         Just entry →
           or
-            [ isJust (genSwapchain native) && not (genHandedOver native)
-            | (generation, native) ← Map.toList (recordGenerations entry)
+            [ isJust (genSwapchain native) && (not (genHandedOver native) || fresh)
+            | let fresh = recordActive entry == Nothing
+            , (generation, native) ← Map.toList (recordGenerations entry)
             , Just generation /= recordActive entry
             , genStanding native /= GenerationDestroyedPending
             ]
@@ -459,10 +465,19 @@ reconcile generations now target geometry = do
     loseSurface = atomically $ do
       record ← lookupRecord
       for_ record $ \entry → do
+        -- An attempt still in flight — a replacement surface whose own
+        -- query reported it lost before its generation was built — failed
+        -- with the surface, so the episode can admit the next, or is spent.
+        when (recordRecovering entry) $ modelEdit_ (recordRecoveryFailure now target)
         for_ (recordActive entry) $ \generation → do
           modelEdit_ (retireGeneration generation)
           editGeneration generations generation (\native → native {genStanding = GenerationRetiredHeld})
           retireCpu generation
+        model ← stateRootsModel roots (\model → (model, model))
+        let spent =
+              recordCondition entry == RecoverySpent
+                || maybe False ((== TargetUnavailable) . viewTargetPhase) (targetView target model)
+                || sessionState model == SessionFailed RequiredTargetUnrecoverable
         modifyRecord $ \held →
           held
             { recordActive = Nothing
@@ -471,7 +486,8 @@ reconcile generations now target geometry = do
             , recordResultUnseen = True
             , recordSettling = Nothing
             , recordFailed = False
-            , recordCondition = if recordCondition held == RecoverySpent then RecoverySpent else SurfaceLost
+            , recordRecovering = False
+            , recordCondition = if spent then RecoverySpent else SurfaceLost
             }
     uncertain candidate reason = atomically $ do
       editGeneration generations candidate (\entry → entry {genStanding = GenerationUncertain reason})
